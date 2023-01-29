@@ -16,10 +16,15 @@ unsetopt beep caseglob
 export PATH=~/.dotfiles/bin:${PATH}
 export PYTHONIOENCODING='UTF-8'; # Make Python use UTF-8 encoding for output to stdin, stdout, and stderr.
 
+# Plugins #
 plug "zsh-users/zsh-syntax-highlighting"
 plug "zsh-users/zsh-autosuggestions"
 plug "esc/conda-zsh-completion"
-plug "zap-zsh/fzf"  # reverse search
+# plug "zap-zsh/fzf"
+
+# fuzzy search with Ctrl + R
+- [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
+
 # More plugins: https://github.com/unixorn/awesome-zsh-plugins
 # More completions: https://github.com/zsh-users/zsh-completions
 
