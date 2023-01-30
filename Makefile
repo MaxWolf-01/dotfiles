@@ -4,6 +4,7 @@ miniconda:
 	mkdir ~/miniconda
 	wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 	bash Miniconda3-latest-Linux-x86_64.sh -b -u -p ~/miniconda # batch mode (no questions), update, path
+	export PATH=~/miniconda/bin:$PATH
 	conda init zsh
 	rm Miniconda3-latest-Linux-x86_64.sh
 
@@ -14,7 +15,9 @@ rm_miniconda:
 docker:
 	curl -fsSL https://get.docker.com -o get-docker.sh
 	sudo sh ./get-docker.sh
+	sudo usermod -a -G docker $USER
 	rm get-docker.sh
+	echo "Reboot to apply changes"
 
 clone_repos:
 	echo "TODO"

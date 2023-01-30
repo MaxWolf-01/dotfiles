@@ -14,6 +14,8 @@ unsetopt beep caseglob
 # TODO setopt should handle this
 
 export PATH=~/.dotfiles/bin:${PATH}
+export PATH=~/minconda/bin:${PATH}
+
 export PYTHONIOENCODING='UTF-8'; # Make Python use UTF-8 encoding for output to stdin, stdout, and stderr.
 
 # Plugins #
