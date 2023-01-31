@@ -20,6 +20,9 @@ docker:
 	echo "Reboot to apply changes"
 
 miscl:
+	# latest jetbrains toolbox (https://github.com/nagygergo/jetbrains-toolbox-install)
+	curl -fsSL https://raw.githubusercontent.com/nagygergo/jetbrains-toolbox-install/master/jetbrains-toolbox.sh | bash
+	cd /usr/local/bin && ./jetbrains-toolbox
 	# local github actions runner
 	curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo zsh
 
