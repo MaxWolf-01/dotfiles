@@ -1,4 +1,4 @@
-install_all: miniconda docker clone_repos
+all: miniconda docker miscl clone_repos
 
 miniconda:
 	mkdir ~/miniconda
@@ -18,6 +18,10 @@ docker:
 	sudo usermod -a -G docker $USER
 	rm get-docker.sh
 	echo "Reboot to apply changes"
+
+miscl:
+	# local github actions runner
+	curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo zsh
 
 clone_repos:
 	echo "TODO"

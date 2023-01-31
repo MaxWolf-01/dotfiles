@@ -18,7 +18,7 @@ export PATH=~/minconda/bin:${PATH}
 
 export PYTHONIOENCODING='UTF-8'; # Make Python use UTF-8 encoding for output to stdin, stdout, and stderr.
 
-# Plugins #
+# Plugins #  TODO just replace with my own custom function for that?
 plug "zsh-users/zsh-syntax-highlighting"
 plug "zsh-users/zsh-autosuggestions"
 plug "esc/conda-zsh-completion"
