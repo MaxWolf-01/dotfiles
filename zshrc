@@ -10,8 +10,6 @@ export HISTCONTROL='ignoreboth';  # Omit duplicates and commands that begin with
 
 setopt autocd notify appendhistory  # https://zsh.sourceforge.io/Doc/Release/Options.html
 unsetopt beep caseglob
-# shopt -s autocd  # Change directory when typing a directory name
-# TODO setopt should handle this
 
 export PATH=~/.dotfiles/bin:${PATH}
 export PATH=~/minconda/bin:${PATH}
@@ -22,7 +20,6 @@ export PYTHONIOENCODING='UTF-8'; # Make Python use UTF-8 encoding for output to 
 plug "zsh-users/zsh-syntax-highlighting"
 plug "zsh-users/zsh-autosuggestions"
 plug "esc/conda-zsh-completion"
-# plug "zap-zsh/fzf"
 
 # fuzzy search with Ctrl + R
 - [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
