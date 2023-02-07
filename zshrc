@@ -8,7 +8,7 @@ HISTSIZE=1000000
 SAVEHIST=1000000
 export HISTCONTROL='ignoreboth';  # Omit duplicates and commands that begin with a space from history.
 
-setopt autocd notify appendhistory  # https://zsh.sourceforge.io/Doc/Release/Options.html
+setopt autocd notify appendhistory complete_aliases hist_ignore_all_dups # https://zsh.sourceforge.io/Doc/Release/Options.html
 unsetopt beep caseglob
 
 export PATH=~/.dotfiles/bin:${PATH}
