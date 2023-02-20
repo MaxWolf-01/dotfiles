@@ -19,7 +19,7 @@ export PYTHONIOENCODING='UTF-8'; # Make Python use UTF-8 encoding for output to 
 # Plugins #  TODO just replace with my own custom function for that?
 plug "zsh-users/zsh-syntax-highlighting"
 plug "zsh-users/zsh-autosuggestions"
-plug "esc/conda-zsh-completion"
+# plug "esc/conda-zsh-completion"
 
 # fuzzy search with Ctrl + R
 - [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
@@ -28,7 +28,6 @@ plug "esc/conda-zsh-completion"
 # More completions: https://github.com/zsh-users/zsh-completions
 
 # Theme #
-curl -sSL "https://github.com/zthxxx/jovial/raw/master/jovial.zsh-theme" -o ~/.dotfiles/jovial.zsh-theme
 source ~/.dotfiles/jovial.zsh-theme
 
 # https://github.com/trapd00r/LS_COLORS
