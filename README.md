@@ -25,7 +25,7 @@ cd ~/.dotfiles
 [//]: # (TODO sync.sh file; obsidian vault sync aliases, ...)
 
 Optional next steps:
-- Use Makefile to set up ssh, clone repos, ...
+- Use Makefile to set up ssh, obsidian, ...
 
 ### Credits
 - [Dotbot](https://github.com/anishathalye/dotbot/tree/da928a4c6b65148bfda3138674da1730c143f396)

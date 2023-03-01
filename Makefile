@@ -34,6 +34,14 @@ sshkeys:
 	ssh-keygen -t rsa -b 4096
 	echo "Use `ssh-copy-id <user>@<host> / <host>` to add keys to hosts"
 
+obsidian-sync:
+	cd /storage/emulated/0
+	mkdir -pv obsidian && cd obsidian
+	git clone https://github.com/MaxWolf-01/knowledge-base.git
+
+# TODO find solution / write script for saving daily/template settings
+
+
 clone_repos:
 	echo "TODO"
     # TODO private env file with repo names
