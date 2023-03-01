@@ -29,4 +29,4 @@ plug "zsh-users/zsh-autosuggestions"
 - [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
 
 # Theme #
-source ~/.dotfiles/jovial.zsh-theme
+source ~/jovial.zsh-theme
