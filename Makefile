@@ -1,5 +1,7 @@
 all: miniconda docker miscl clone_repos
 
+miscl: toolbox act ssh
+
 miniconda:
 	mkdir ~/miniconda
 	wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
@@ -19,18 +21,23 @@ docker:
 	rm get-docker.sh
 	echo "Reboot to apply changes"
 
-miscl:
+toolbox:
 	# latest jetbrains toolbox (https://github.com/nagygergo/jetbrains-toolbox-install)
 	curl -fsSL https://raw.githubusercontent.com/nagygergo/jetbrains-toolbox-install/master/jetbrains-toolbox.sh | bash
 	cd /usr/local/bin && ./jetbrains-toolbox
+
+act:
 	# local github actions runner
 	curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo zsh
+
+sshkeys:
+	ssh-keygen -t rsa -b 4096
+	echo "Use `ssh-copy-id <user>@<host> / <host>` to add keys to hosts"
 
 clone_repos:
 	echo "TODO"
     # TODO private env file with repo names
     # https://stackoverflow.com/questions/10929453/read-a-file-line-by-line-assigning-the-value-to-a-variable
-
 
 nvidia:
 	echo "TODO"
