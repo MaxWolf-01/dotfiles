@@ -8,3 +8,4 @@ mv dotfiles .dotfiles
 cd ~/.dotfiles
 ./install
 ```
+*reboot*
