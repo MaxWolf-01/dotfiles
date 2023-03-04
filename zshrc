@@ -14,7 +14,6 @@ setopt autocd notify appendhistory complete_aliases hist_ignore_all_dups # https
 unsetopt beep caseglob
 
 export PATH=~/.dotfiles/bin:${PATH}
-export PATH=~/minconda/bin:${PATH}
 
 export PYTHONIOENCODING='UTF-8' # Make Python use UTF-8 encoding for output to stdin, stdout, and stderr.
 
@@ -23,10 +22,6 @@ export PYTHONIOENCODING='UTF-8' # Make Python use UTF-8 encoding for output to s
 # More completions: https://github.com/zsh-users/zsh-completions
 plug "zsh-users/zsh-syntax-highlighting"
 plug "zsh-users/zsh-autosuggestions"
-# plug "esc/conda-zsh-completion"
 
-# fuzzy search with Ctrl + R TODO broken?
-- [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
-
-# Theme #
-source ~/jovial.zsh-theme
+# # fuzzy search with Ctrl + R TODO broken?
+# - [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh

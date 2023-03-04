@@ -1,23 +1,22 @@
-# Dotfiles
+# Proxmox dotfiles
 
-If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.  
-But if you're starting from scratch anyway, I would recommend you don't fork the repo but just copy the bits and pieces you need.
+Less bloat here.
 
 ### Installation
 
-```commandline
-sudo apt-get install -y gh git
-gh auth login
-git clone https://github.com/MaxWolf-01/dotfiles.git
+```bash
+apt update
+apt-get install -y git
+ssh-keygen -t rsa -b 4096
+echo "Put your public key on github -> settings -> SSH and GPG keys"
+```
+```bash
+git clone -b proxmox --single-branch https://github.com/MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
 ./install
 ```
 *reboot*
-
-Optional next steps:
-- Use Makefile to install miniconda, docker, ...
-
 
 ### Credits
 - [Dotbot](https://github.com/anishathalye/dotbot/tree/da928a4c6b65148bfda3138674da1730c143f396)
@@ -28,3 +27,7 @@ Optional next steps:
   - [dotfiles.github.io](https://dotfiles.github.io/)
 
 [//]: # (TODO example image with theme, ls colors, ...)
+
+[//]: # (# PVE pve-no-subscription repository provided by proxmox.com,)
+[//]: # (# NOT recommended for production use)
+[//]: # (deb http://download.proxmox.com/debian/pve bullseye pve-no-subscription)
