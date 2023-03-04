@@ -18,7 +18,9 @@ cd ~/.dotfiles
 Optional next steps:
 - Use Makefile to install miniconda, docker, ...
 
-### Helpful functions
+### Helpful ...
+
+**Functions**
 
 - ``o`` (open file explorer)
 - ``mcd`` (make directory and cd into it)
@@ -30,6 +32,11 @@ Optional next steps:
 - ``newsshpwd`` (change the ssh passphrase of given key)
 - pip / conda installs in base env throw an error
 - and more ... (see functions)
+
+**Scripts**
+
+- ``sshperm`` (change permissions of .ssh folder and keys)
+
 
 ### Credits
 - [Dotbot](https://github.com/anishathalye/dotbot/tree/da928a4c6b65148bfda3138674da1730c143f396)
