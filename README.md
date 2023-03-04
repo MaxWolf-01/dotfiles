@@ -1,10 +1,10 @@
 # Dotfiles
 
-If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.  
-But if you're starting from scratch anyway, I would recommend you don't fork the repo but just copy the bits and pieces you need.
-
 All the common config is in the [master](https://github.com/MaxWolf-01/dotfiles/tree/master) branch. (Which is my Ubuntu config for now aswell).  
 As of now I also have os specific configs for [proxmox](https://github.com/MaxWolf-01/dotfiles/tree/proxmox) and [android](https://github.com/MaxWolf-01/dotfiles/tree/android).
+
+If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.  
+But if you're starting from scratch anyway, I would recommend you don't fork the repo but just copy the bits and pieces you need.
 
 ### Installation
 
