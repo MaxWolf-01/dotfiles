@@ -1,6 +1,8 @@
 # Proxmox dotfiles
 
-Less bloat here.
+Less bloat here.  
+
+Use ``make dark`` / ``make light`` to switch between dark and light theme of the web interface.
 
 ### Installation
 
@@ -45,6 +47,7 @@ cd ~/.dotfiles
 - ``sshperm`` (change permissions of .ssh folder and keys)
 
 ### Credits
+- [Proxmox Dark Theme](https://github.com/Weilbyte/PVEDiscordDark)
 - [Dotbot](https://github.com/anishathalye/dotbot/tree/da928a4c6b65148bfda3138674da1730c143f396)
 - [Jovial Theme](https://github.com/zthxxx/jovial)
 - Zsh
