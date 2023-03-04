@@ -46,4 +46,5 @@ Optional next steps:
 - More resources on dotfiles:
   - [dotfiles.github.io](https://dotfiles.github.io/)
 
-[//]: # (TODO example image with theme, ls colors, ...)
+### Visuals
+![screenshot](https://user-images.githubusercontent.com/69987866/222907218-967d172c-b294-4389-9afb-3134bc815ea8.png)
