@@ -27,6 +27,7 @@ Optional next steps:
 - ``fs`` (determine size of a file or total size of a directory)
 - ``gz`` (compare original and gzipped file size)
 - ``tre`` (`tre` is a shorthand for `tree` with hidden files and color enabled, ignoring the `.git` directory, listing directories first.)
+- ``newsshpwd`` (change the ssh passphrase of given key)
 - pip / conda installs in base env throw an error
 - and more ... (see functions)
 
