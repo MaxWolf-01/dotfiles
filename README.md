@@ -7,11 +7,12 @@ Less bloat here.
 ```bash
 apt update
 apt-get install -y git
-ssh-keygen -t rsa -b 4096
+ssh-keygen -t ed25519 -C "69987866+MaxWolf-01@users.noreply.github.com"
+ssh-add ~/.ssh/id_ed25519
 echo "Put your public key on github -> settings -> SSH and GPG keys"
 ```
 ```bash
-git clone -b proxmox --single-branch https://github.com/MaxWolf-01/dotfiles.git
+git clone -b proxmox --single-branch git@github.com:MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
 ./install
