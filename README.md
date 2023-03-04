@@ -16,7 +16,7 @@ termux-setup-storate
 pkg update && pkg upgrade
 pkg install gh git
 gh auth login
-git clone https://github.com/MaxWolf-01/dotfiles.git
+git clone -b android --single-branch https://github.com/MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
 ./install
