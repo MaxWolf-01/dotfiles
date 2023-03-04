@@ -25,3 +25,6 @@ plug "zsh-users/zsh-autosuggestions"
 
 # # fuzzy search with Ctrl + R TODO broken?
 # - [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
+
+# Theme
+source ~/jovial.zsh-theme
