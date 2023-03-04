@@ -27,11 +27,5 @@ cd ~/.dotfiles
 - More resources on dotfiles:
   - [dotfiles.github.io](https://dotfiles.github.io/)
 
-[//]: # (TODO example image with theme, ls colors, ...)
-
-[//]: # (# PVE pve-no-subscription repository provided by proxmox.com,)
-[//]: # (# NOT recommended for production use)
-[//]: # (deb http://download.proxmox.com/debian/pve bullseye pve-no-subscription)
-
 ### Visuals
 ![screenshot](https://user-images.githubusercontent.com/69987866/222906712-a760aab9-39dc-40aa-91e2-dd5e89290749.png)
