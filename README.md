@@ -5,7 +5,7 @@ But if you're starting from scratch anyway, I would recommend you don't fork the
 
 ### Installation
 
-```commandline
+```bash
 sudo apt-get install -y gh git
 gh auth login
 git clone https://github.com/MaxWolf-01/dotfiles.git
