@@ -5,14 +5,25 @@ But if you're starting from scratch anyway, I would recommend you don't fork the
 
 ### Installation
 
+Setup ssh for private github repos:
 ```bash
-sudo apt-get install -y gh git
-gh auth login
-git clone https://github.com/MaxWolf-01/dotfiles.git
+# use your github email to generate a new ssh key
+ssh-keygen -t ed25519 -C "69987866+MaxWolf-01@users.noreply.github.com"
+# change permissions of .ssh folder and keys
+find ~/.ssh/ -type f -exec chmod 600 {} \; && find ~/.ssh/ -type d -exec chmod 700 {} \; && find ~/.ssh/ -type f -name "*.pub" -exec chmod 644 {} \;
+ssh-add ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub
+echo "Put your public key on github -> settings -> SSH and GPG keys"
+```
+
+```bash
+sudo apt-get update && apt-get install -y git
+git clone git@github.com:MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
 ./install
 ```
+
 *reboot*
 
 Optional next steps:
