@@ -20,7 +20,7 @@ echo "Put your public key on github -> settings -> SSH and GPG keys"
 ```
 
 ```bash
-sudo apt-get update && apt-get install -y git
+sudo apt-get update && sudo apt-get install -y git
 git clone git@github.com:MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
