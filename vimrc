@@ -1,3 +1,13 @@
 " line numbers https://linuxize.com/post/how-to-show-line-numbers-in-vim/
-:set number
-:set relativenumber
+set number
+set relativenumber
+
+" https://stackoverflow.com/a/234578/17777085
+filetype plugin indent on
+" show existing tab with 4 spaces width
+set tabstop=4
+" when indenting with '>', use 4 spaces width
+set shiftwidth=4
+" On pressing tab, insert 4 spaces
+set expandtab
+
