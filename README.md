@@ -9,14 +9,16 @@ Download and install [termux](https://github.com/termux/termux-app#github) apk [
 
 ### Installation
 
-Don't worry about warnings from `termux-setup-storage` about deleting data. Should be fine.
+Don't worry about warnings from `termux-setup-storage` about deleting all your data. *Should* be fine.  
+``~/storage/shared`` in your termux home directory [is symlinked](https://android.stackexchange.com/a/185949) ``/storage/emulated/0`` (where downloads folder etc. are on Android)
 
 ```bash
 export DEBIAN_FRONTEND=noninteractive
-termux-setup-storate
+termux-setup-storage
 pkg update && pkg upgrade
 pkg install gh git
 gh auth login
+cd /data/data/com.termux/files/home  # == ~
 git clone -b android --single-branch https://github.com/MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
