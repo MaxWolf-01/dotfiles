@@ -34,10 +34,15 @@ sshkeys:
 	ssh-keygen -t rsa -b 4096
 	echo "Use `ssh-copy-id <user>@<host> / <host>` to add keys to hosts"
 
-clone_repos:
-	echo "TODO"
-    # TODO private env file with repo names
-    # https://stackoverflow.com/questions/10929453/read-a-file-line-by-line-assigning-the-value-to-a-variable
+clone_repos: obsidian_vault
+
+obsidian_vault:
+	vault_dir=~/repos/obsidian
+	mkdir -pv $vault_dir  && cd $vault_dir
+	git clone git@github.com:MaxWolf-01/knowledge-base.git
+	cd knowledge-base
+	git clone git@github.com:MaxWolf-01/.obsidian-pc.git
+
 
 nvidia:
 	echo "TODO"
