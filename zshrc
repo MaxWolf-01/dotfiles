@@ -25,8 +25,8 @@ plug "zsh-users/zsh-syntax-highlighting"
 plug "zsh-users/zsh-autosuggestions"
 # plug "esc/conda-zsh-completion"
 
-# fuzzy search with Ctrl + R TODO broken?
-- [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
+# fuzzy search with Ctrl + R
+[ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
 
 # Theme #
 source ~/jovial.zsh-theme
