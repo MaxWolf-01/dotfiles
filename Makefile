@@ -1,6 +1,3 @@
-all: miniconda docker miscl clone_repos
-
-miscl: toolbox act ssh
 
 miniconda:
 	mkdir ~/miniconda
@@ -21,31 +18,13 @@ docker:
 	rm get-docker.sh
 	echo "Reboot to apply changes"
 
-toolbox:
-	# latest jetbrains toolbox (https://github.com/nagygergo/jetbrains-toolbox-install)
-	curl -fsSL https://raw.githubusercontent.com/nagygergo/jetbrains-toolbox-install/master/jetbrains-toolbox.sh | bash
-	cd /usr/local/bin && ./jetbrains-toolbox
-
-act:
-	# local github actions runner
-	curl -s https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo zsh
-
 sshkeys:
 	ssh-keygen -t rsa -b 4096
 	echo "Use `ssh-copy-id <user>@<host> / <host>` to add keys to hosts"
 
-obsidian-sync:
-	cd /storage/emulated/0
-	mkdir -pv obsidian && cd obsidian
-	git clone https://github.com/MaxWolf-01/knowledge-base.git
-
-# TODO find solution / write script for saving daily/template settings
-
-
-clone_repos:
-	echo "TODO"
-    # TODO private env file with repo names
-    # https://stackoverflow.com/questions/10929453/read-a-file-line-by-line-assigning-the-value-to-a-variable
-
-nvidia:
-	echo "TODO"
+obsidian-vaults:
+	cd ~/storage/shared  # https://android.stackexchange.com/a/185949
+	mkdir obsidian && cd obsidian
+	git clone https://github.com/MaxWolf-01/knowledge-base
+	cd knowledge-base
+	git clone https://github.com/MaxWolf-01/.obsidian-mobile

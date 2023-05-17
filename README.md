@@ -1,3 +1,4 @@
+
 # Android dotfiles
 
 If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.    
@@ -22,10 +23,16 @@ cd ~/.dotfiles
 ./install
 ```
 
-[//]: # (TODO sync.sh file; obsidian vault sync aliases, ...)
-
 Optional next steps:
 - Use Makefile to set up ssh, obsidian, ...
+
+#### Obsidian
+
+Use ``make obsidian-vaults`` to clone obsidian vault. 
+An "obsidian" folder will be created in your home directory.
+
+[//]: # (TODO sync.sh script, aliases etc.)
+[//]: # (TODO script / alias for updating vault configs)
 
 ### Credits
 - [Dotbot](https://github.com/anishathalye/dotbot/tree/da928a4c6b65148bfda3138674da1730c143f396)
