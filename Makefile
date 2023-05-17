@@ -37,11 +37,10 @@ sshkeys:
 clone_repos: obsidian_vault
 
 obsidian_vault:
-	vault_dir=~/repos/obsidian
-	mkdir -pv $vault_dir  && cd $vault_dir
-	git clone git@github.com:MaxWolf-01/knowledge-base.git
-	cd knowledge-base
-	git clone git@github.com:MaxWolf-01/.obsidian-pc.git
+	export vault_dir=~/repos/obsidian; \
+	mkdir -pv $$vault_dir; \
+	cd $$vault_dir && git clone git@github.com:MaxWolf-01/knowledge-base.git; \
+	cd knowledge-base && git clone git@github.com:MaxWolf-01/.obsidian-pc.git && mv .obsidian-pc .obsidian
 
 
 nvidia:
