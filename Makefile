@@ -6,7 +6,7 @@ miniconda:
 	mkdir ~/miniconda
 	wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 	bash Miniconda3-latest-Linux-x86_64.sh -b -u -p ~/miniconda # batch mode (no questions), update, path
-	conda init zsh
+	~/miniconda/bin/conda init zsh
 	rm Miniconda3-latest-Linux-x86_64.sh
 	echo "To use miniconda, add the following to your .zshrc and start a new shell: PATH=~/miniconda/bin:$PATH"
 
