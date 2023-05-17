@@ -1,14 +1,18 @@
 # Dotfiles
 
-All the common config is in the [master](https://github.com/MaxWolf-01/dotfiles/tree/master) branch. (Which is my Ubuntu config for now aswell).  
-As of now I also have os specific configs for [proxmox](https://github.com/MaxWolf-01/dotfiles/tree/proxmox) and [android](https://github.com/MaxWolf-01/dotfiles/tree/android).
+All the common config is in the [master](https://github.com/MaxWolf-01/dotfiles/tree/master) branch.  
+As of now I also have os specific configs for 
+[ubuntu](https://github.com/MaxWolf-01/dotfiles/tree/ubuntu),
+[proxmox](https://github.com/MaxWolf-01/dotfiles/tree/proxmox) and 
+[android](https://github.com/MaxWolf-01/dotfiles/tree/android).  
+Master is mostly identical to ubuntu for now.
 
 If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.  
 But if you're starting from scratch anyway, I would recommend you don't fork the repo but just copy the bits and pieces you need.
 
 ### Installation
 
-Setup ssh for private github repos:
+Setup ssh for private github repos (optional):
 ```bash
 # use your github email to generate a new ssh key
 ssh-keygen -t ed25519 -C "69987866+MaxWolf-01@users.noreply.github.com"
@@ -62,4 +66,6 @@ Optional next steps:
   - [dotfiles.github.io](https://dotfiles.github.io/)
 
 ### Visuals
-![screenshot](https://user-images.githubusercontent.com/69987866/222907218-967d172c-b294-4389-9afb-3134bc815ea8.png)
+![screenshot-ubuntu](https://user-images.githubusercontent.com/69987866/222907218-967d172c-b294-4389-9afb-3134bc815ea8.png)
+![screenshot-proxmox](https://user-images.githubusercontent.com/69987866/222906712-a760aab9-39dc-40aa-91e2-dd5e89290749.png)
+![screenshot-android](TODO)
