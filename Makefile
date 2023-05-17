@@ -6,9 +6,9 @@ miniconda:
 	mkdir ~/miniconda
 	wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 	bash Miniconda3-latest-Linux-x86_64.sh -b -u -p ~/miniconda # batch mode (no questions), update, path
-	export PATH=~/miniconda/bin:$PATH
-	conda init zsh
+	~/miniconda/bin/conda init zsh
 	rm Miniconda3-latest-Linux-x86_64.sh
+	echo "To use miniconda, add the following to your .zshrc and start a new shell: PATH=~/miniconda/bin:$PATH"
 
 rm_miniconda:
 	rm -rf ~/miniconda
@@ -34,10 +34,14 @@ sshkeys:
 	ssh-keygen -t rsa -b 4096
 	echo "Use `ssh-copy-id <user>@<host> / <host>` to add keys to hosts"
 
-clone_repos:
-	echo "TODO"
-    # TODO private env file with repo names
-    # https://stackoverflow.com/questions/10929453/read-a-file-line-by-line-assigning-the-value-to-a-variable
+clone_repos: obsidian_vault
+
+obsidian_vault:
+	export vault_dir=~/repos/obsidian; \
+	mkdir -pv $$vault_dir; \
+	cd $$vault_dir && git clone git@github.com:MaxWolf-01/knowledge-base.git; \
+	cd knowledge-base && git clone git@github.com:MaxWolf-01/.obsidian-pc.git && mv .obsidian-pc .obsidian
+
 
 nvidia:
 	echo "TODO"
