@@ -22,9 +22,8 @@ sshkeys:
 	ssh-keygen -t rsa -b 4096
 	echo "Use `ssh-copy-id <user>@<host> / <host>` to add keys to hosts"
 
-obsidian-vaults:
-	cd ~/storage/shared  # https://android.stackexchange.com/a/185949
-	mkdir obsidian && cd obsidian
-	git clone https://github.com/MaxWolf-01/knowledge-base
-	cd knowledge-base
-	git clone https://github.com/MaxWolf-01/.obsidian-mobile
+obsidian-vault:
+	export vault_dir=~/storage/shared/obsidian; \  # https://android.stackexchange.com/a/185949
+	mkdir -pv $$vault_dir; \
+	cd $$vault_dir && git clone https://github.com/MaxWolf-01/knowledge-base; \
+	cd knowledge-base && git clone https://github.com/MaxWolf-01/.obsidian-mobile && mv .obsidian-mobile .obsidian
