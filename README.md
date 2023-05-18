@@ -28,12 +28,13 @@ cd ~/.dotfiles
 *open new shell*
 
 Optional next steps:
-- Use Makefile to set up ssh, obsidian, ...
+- Use Makefile to set up miniconda, ...
 
 #### Obsidian
 
-Use ``make obsidian-vaults`` to clone obsidian vault. 
-An "obsidian" folder will be created in your home directory.
+Use the script ``obsidian_clone_vaults`` to clone the obsidian vault. 
+An "obsidian" folder will be created in the android home directory.  
+To automatically commit, pull and push, run ``obsidian_sync``. Make sure to aalways sync before and after you work on one of them, or you'll need to deal with merge conflicts (``obsidian_push_branch_with_conflicts`` to reset master to origin, then you can merge the branch via pc).
 
 [//]: # (TODO sync.sh script, aliases etc.)
 [//]: # (TODO script / alias for updating vault configs)
