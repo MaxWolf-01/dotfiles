@@ -81,4 +81,5 @@ Optional next steps:
 ### Visuals
 ![screenshot-ubuntu](https://user-images.githubusercontent.com/69987866/222907218-967d172c-b294-4389-9afb-3134bc815ea8.png)  
 ![screenshot-proxmox](https://user-images.githubusercontent.com/69987866/222906712-a760aab9-39dc-40aa-91e2-dd5e89290749.png)  
-![screenshot-android](https://github.com/MaxWolf-01/dotfiles/assets/69987866/a6469cd2-c2ab-42f5-a212-f62e367b4fad)  
+![screenshot-android](https://github.com/MaxWolf-01/dotfiles/assets/69987866/bab21cc9-6d40-4a7b-a021-feccf843d290)
+
