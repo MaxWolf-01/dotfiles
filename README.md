@@ -48,4 +48,5 @@ To automatically commit, pull and push, run ``obsidian_sync``. Make sure to aalw
   - [dotfiles.github.io](https://dotfiles.github.io/)
 
 ### Visuals
-![screenshot-android](https://github.com/MaxWolf-01/dotfiles/assets/69987866/a6469cd2-c2ab-42f5-a212-f62e367b4fad)  
+![screenshot-android](https://github.com/MaxWolf-01/dotfiles/assets/69987866/54ade9f2-239f-427a-9888-d8469d0e3134)
+ 
