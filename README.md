@@ -6,9 +6,12 @@ Use ``make dark`` / ``make light`` to switch between dark and light theme of the
 
 ### Installation
 
+To be able to ``apt-get update`` add this line ``deb http://download.proxmox.com/debian/pve bookworm pvetest`` to ``/etc/apt/sources.list``.  
+Or via the web interface (node > Updates > Repositories > Add > Test). [^1]
+
 
 ```bash
-apt-get install -y git  # apt-get update: 401 Unauthorized
+apt-get update && apt-get install -y git
 cd ~ && git clone -b proxmox --single-branch https://github.com/MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
@@ -61,3 +64,6 @@ cd ~/.dotfiles
 
 ### Visuals
 ![proxmox-screenshot](https://user-images.githubusercontent.com/69987866/222906712-a760aab9-39dc-40aa-91e2-dd5e89290749.png)
+
+### Footnotes
+[^1]: [Proxmox Repository Doc](https://pve.proxmox.com/pve-docs/pve-admin-guide.html#sysadmin_package_repositories:~:text=3.1.3.%20Proxmox%20VE%20No%2DSubscription%20Repository)
