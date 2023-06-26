@@ -1,4 +1,5 @@
 dark:
+	# Should be available automatically in newer versions I think
 	bash <(curl -s https://raw.githubusercontent.com/Weilbyte/PVEDiscordDark/master/PVEDiscordDark.sh ) install
 	echo "Proxmox Dark Theme installed"
 
