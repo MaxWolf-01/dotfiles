@@ -8,8 +8,8 @@ Use ``make dark`` / ``make light`` to switch between dark and light theme of the
 
 
 ```bash
-apt-get update && apt-get install -y git
-cd ~ && git clone -b proxmox --single-branch https://github.com/MaxWolf-01/knowledge-base.git
+apt-get install -y git  # apt-get update: 401 Unauthorized
+cd ~ && git clone -b proxmox --single-branch https://github.com/MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
 ./install
