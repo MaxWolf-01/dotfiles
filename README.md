@@ -1,41 +1,18 @@
-# Dotfiles
+# LXC Dotfiles
 
-All the common config is in the [master](https://github.com/MaxWolf-01/dotfiles/tree/master) branch.  
-As of now I also have os specific configs for 
-[ubuntu](https://github.com/MaxWolf-01/dotfiles/tree/ubuntu),
-[proxmox](https://github.com/MaxWolf-01/dotfiles/tree/proxmox) and 
-[android](https://github.com/MaxWolf-01/dotfiles/tree/android) with specific installation instructions.  
-Master is mostly identical to ubuntu for now.
-
-If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.  
-But if you're starting from scratch anyway, I would recommend you don't fork the repo but just copy the bits and pieces you need.
+Minimal setup for LXC containers.
 
 ### Installation
 
-Setup ssh for private github repos (optional):
 ```bash
-# use your github email to generate a new ssh key
-ssh-keygen -t ed25519 -C "69987866+MaxWolf-01@users.noreply.github.com"
-# change permissions of .ssh folder and keys
-find ~/.ssh/ -type f -exec chmod 600 {} \; && find ~/.ssh/ -type d -exec chmod 700 {} \; && find ~/.ssh/ -type f -name "*.pub" -exec chmod 644 {} \;
-ssh-add ~/.ssh/id_ed25519
-cat ~/.ssh/id_ed25519.pub
-echo "Put your public key on github -> settings -> SSH and GPG keys"
-```
-
-```bash
-sudo apt-get update && sudo apt-get install -y git
-cd ~
-git clone git@github.com:MaxWolf-01/dotfiles.git
+apt-get update && apt-get install -y git
+cd ~ && git clone -b lxc --single-branch https://github.com/MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles
 cd ~/.dotfiles
 ./install
 ```
 
 *reboot*
-
-Optional next steps:
-- Use Makefile to install miniconda, docker, ...
 
 ```./install``` is idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
 
@@ -77,9 +54,3 @@ Optional next steps:
 - Various functions and aliases from other great dotfiles repos (see top of [functions](https://github.com/MaxWolf-01/dotfiles/blob/master/zsh/functions))
 - More resources on dotfiles:
   - [dotfiles.github.io](https://dotfiles.github.io/)
-
-### Visuals
-![screenshot-ubuntu](https://user-images.githubusercontent.com/69987866/222907218-967d172c-b294-4389-9afb-3134bc815ea8.png)  
-![screenshot-proxmox](https://user-images.githubusercontent.com/69987866/222906712-a760aab9-39dc-40aa-91e2-dd5e89290749.png)  
-![screenshot-android](https://github.com/MaxWolf-01/dotfiles/assets/69987866/bab21cc9-6d40-4a7b-a021-feccf843d290)
-
