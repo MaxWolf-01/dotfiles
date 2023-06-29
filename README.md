@@ -30,6 +30,8 @@ cd ~/.dotfiles
 Optional next steps:
 - Use Makefile to set up miniconda, ...
 
+```./install``` is idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
+
 #### Obsidian
 
 Use the script ``obsidian_clone_vaults`` to clone the obsidian vault. 
@@ -38,6 +40,38 @@ To automatically commit, pull and push, run ``obsidian_sync``. Make sure to aalw
 
 [//]: # (TODO sync.sh script, aliases etc.)
 [//]: # (TODO script / alias for updating vault configs)
+
+
+### Helpful ...
+
+**Functions**
+
+- ``o`` (open file explorer)
+- ``mcd`` (make directory and cd into it)
+- ``targz`` (create a .tar.gz archive, using `zopfli`, `pigz` or `gzip` for compression)
+- ``extract`` (extracts archived files / mounts disk images)
+- ``fs`` (determine size of a file or total size of a directory)
+- ``lsfs`` (list n largest files in a directory; smallest if n is negative; n defaults to 10)
+- ``gz`` (compare original and gzipped file size)
+- ``tre`` (`tre` is a shorthand for `tree` with hidden files and color enabled, ignoring the `.git` directory, listing directories first.)
+- ``newsshpwd`` (change the ssh passphrase of given key)
+- ``numel`` (number of elements in folder)
+- ``conda`` / ``pip`` (aliases prevent accidentally installing packages in the base env. Skip the alias by using `\conda` / `\pip` )
+- and more ... (see functions / aliases in [zsh folder](https://github.com/MaxWolf-01/dotfiles/tree/master/zsh))
+
+**Scripts**
+
+- ``sshperm`` (change permissions of .ssh folder and keys)
+
+**Plugins**
+
+- [fzf](https://github.com/junegunn/fzf) - fuzzy finder for commands (Ctrl + R) and files (Ctrl + T), (Alt + C) to cd into selected dir. Examples:
+  - ``vim <Ctrl + T>`` OR ``vim **<tab>`` (trigger `**` can be changed in [exports](https://github.com/MaxWolf-01/dotfiles/blob/master/zsh/exports))
+  - ``git switch $(git branch -a | fzf)``
+- [Zap](https://github.com/zap-zsh/zap) plugin manger
+- [Zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting)
+- [Zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions)
+- ...
 
 ### Credits
 - [Dotbot](https://github.com/anishathalye/dotbot/tree/da928a4c6b65148bfda3138674da1730c143f396)
