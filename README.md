@@ -8,7 +8,7 @@ But if you're starting from scratch anyway, I would recommend you don't fork the
 
 ### Installation
 
-Setup ssh for private github repos (optional):
+Setup ssh for private github repos:
 ```bash
 # use your github email to generate a new ssh key
 ssh-keygen -t ed25519 -C "69987866+MaxWolf-01@users.noreply.github.com"
@@ -44,6 +44,7 @@ Optional next steps:
 - ``targz`` (create a .tar.gz archive, using `zopfli`, `pigz` or `gzip` for compression)
 - ``extract`` (extracts archived files / mounts disk images)
 - ``fs`` (determine size of a file or total size of a directory)
+- ``lsfs`` (list n largest files in a directory; smallest if n is negative; n defaults to 10)
 - ``gz`` (compare original and gzipped file size)
 - ``tre`` (`tre` is a shorthand for `tree` with hidden files and color enabled, ignoring the `.git` directory, listing directories first.)
 - ``newsshpwd`` (change the ssh passphrase of given key)
