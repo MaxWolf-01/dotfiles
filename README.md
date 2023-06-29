@@ -25,6 +25,7 @@ cd ~/.dotfiles
 - ``targz`` (create a .tar.gz archive, using `zopfli`, `pigz` or `gzip` for compression)
 - ``extract`` (extracts archived files / mounts disk images)
 - ``fs`` (determine size of a file or total size of a directory)
+- ``lsfs`` (list n largest files in a directory; smallest if n is negative; n defaults to 10)
 - ``gz`` (compare original and gzipped file size)
 - ``tre`` (`tre` is a shorthand for `tree` with hidden files and color enabled, ignoring the `.git` directory, listing directories first.)
 - ``newsshpwd`` (change the ssh passphrase of given key)
