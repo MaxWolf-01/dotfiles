@@ -24,7 +24,7 @@ docker:
 toolbox:
 	# latest jetbrains toolbox (https://github.com/nagygergo/jetbrains-toolbox-install)
 	curl -fsSL https://raw.githubusercontent.com/nagygergo/jetbrains-toolbox-install/master/jetbrains-toolbox.sh | bash
-	cd /usr/local/bin && ./jetbrains-toolbox
+	cd ~/.local/bin/ && ./jetbrains-toolbox
 
 act:
 	# local github actions runner
