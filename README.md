@@ -16,7 +16,7 @@ Don't worry about warnings from `termux-setup-storage` about deleting all your d
 export DEBIAN_FRONTEND=noninteractive
 termux-setup-storage
 pkg update && pkg upgrade
-pkg install gh git
+pkg install gh git python
 gh auth login
 cd /data/data/com.termux/files/home  # == ~
 git clone -b android --single-branch https://github.com/MaxWolf-01/dotfiles.git
@@ -34,7 +34,7 @@ Optional next steps:
 
 #### Obsidian
 
-Use the script ``obsidian_clone_vaults`` to clone the obsidian vault. 
+Use the script ``obsidian_clone_vault`` to clone the obsidian vault. 
 An "obsidian" folder will be created in the android home directory.  
 To automatically commit, pull and push, run ``obsidian_sync``. Make sure to aalways sync before and after you work on one of them, or you'll need to deal with merge conflicts (``obsidian_push_branch_with_conflicts`` to reset master to origin, then you can merge the branch via pc).
 
