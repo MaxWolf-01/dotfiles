@@ -1,6 +1,8 @@
-all: miniconda docker miscl clone_repos
+all: miniconda docker apps miscl clone_repos
 
-miscl: toolbox act ssh
+apps: toolbox obsidian
+
+miscl: act ssh
 
 miniconda:
 	mkdir ~/miniconda
@@ -33,6 +35,39 @@ act:
 sshkeys:
 	ssh-keygen -t rsa -b 4096
 	echo "Use `ssh-copy-id <user>@<host> / <host>` to add keys to hosts"
+
+obsidian:
+	# Setup a downlaoded Obsidian AppImage with icon as .desktop file
+	OBSIDIAN_APPIMAGE=$$(find ~/Downloads -name 'Obsidian*.AppImage'); \
+	if [ -z "$$OBSIDIAN_APPIMAGE" ]; then \
+		echo "Error: No Obsidian AppImage found in Downloads."; \
+		exit 1; \
+	fi; \
+	COUNT=$$(echo "$$OBSIDIAN_APPIMAGE" | wc -l); \
+	if [ $$COUNT -gt 1 ]; then \
+		echo "Warning: Multiple Obsidian AppImages found. Using the first one."; \
+	fi; \
+	OBSIDIAN_APPIMAGE=$$(echo "$$OBSIDIAN_APPIMAGE" | head -n 1); \
+	echo "Using Obsidian AppImage: $$OBSIDIAN_APPIMAGE"; \
+	mv $$OBSIDIAN_APPIMAGE ~/applications/; \
+	chmod +x ~/applications/$$(basename $$OBSIDIAN_APPIMAGE); \
+	# Create the .desktop file by replacing $HOME with the actual home directory
+	sed "s|\$$HOME|$$HOME|g" $$HOME/.dotfiles/desktop/obsidian.desktop > $$HOME/.local/share/applications/obsidian.desktop; \
+	update-desktop-database $$HOME/.local/share/applications/; \
+	echo "Obsidian app set up."
+
+# For extending the above make target either use shell script with params or this:
+#define setup_app
+#	APPIMAGE=$(find ~/Downloads -name '$(1)*.AppImage')
+#    #... (rest of the commands)
+#endef
+#
+#obsidian:
+#	$(call setup_app,Obsidian)
+#
+#another_app:
+#	$(call setup_app,AnotherApp)
+
 
 clone_repos: obsidian_vault
 
