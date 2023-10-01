@@ -80,3 +80,9 @@ obsidian_vault:
 
 nvidia:
 	echo "TODO"
+
+spg_vpn:
+	sudo apt-get update && sudo apt-get install network-manager-openconnect network-manager-openconnect-gnome; \
+	systemctl restart NetworkManager; \
+	apt-get install virt-viewer
+	
