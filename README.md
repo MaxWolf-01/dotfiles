@@ -1,14 +1,47 @@
 # Dotfiles
 
+### Overview
+
 All the common config is in the [master](https://github.com/MaxWolf-01/dotfiles/tree/master) branch.  
 As of now I also have os specific configs for 
 [ubuntu](https://github.com/MaxWolf-01/dotfiles/tree/ubuntu),
-[proxmox](https://github.com/MaxWolf-01/dotfiles/tree/proxmox) and 
-[android](https://github.com/MaxWolf-01/dotfiles/tree/android) with specific installation instructions.  
-Master is mostly identical to ubuntu for now.
+[proxmox](https://github.com/MaxWolf-01/dotfiles/tree/proxmox),
+[lxc(minimal)](https://github.com/MaxWolf-01/dotfiles/tree/lxc) and
+[android](https://github.com/MaxWolf-01/dotfiles/tree/android) with specific installation instructions and dotfiles tailored for the platform (e.g.: android, an unbloated bootstrap script for small containers, ...).  
+The master branch only serves as a base / for structure and the public Readme.  
+**For the latest, fully fledged config, take a look at the ubuntu branch, since this is the one I use on a daily basis.**
 
 If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.  
-But if you're starting from scratch anyway, I would recommend you don't fork the repo but just copy the bits and pieces you need.
+But if you're starting from scratch anyway (_which I recommend_, in order to become fammiliar with the functionality bit by bit and since these dotfiles are tailored specifically to me, your needs will be different), I would recommend you don't fork the repo but just copy the bits and pieces you need.
+
+##### Structure
+
+TODO add comments
+
+```bash
+dotfiles
+├── bin  # Custom scripts
+├── desktop
+├── dotbot
+├── git
+├── ssh
+├── vim
+├── zsh
+│   ├── plugin-files
+│   ├── aliases
+│   ├── colors
+│   ├── exports
+│   ├── functions
+│   ├── plugins
+│   ├── zsh_config
+│   └── zshrc
+├── .gitmodules
+├── bootstrap
+├── install
+├── install.conf.yaml
+├── Makefile
+└── zap_zsh_install
+```
 
 ### Installation
 
