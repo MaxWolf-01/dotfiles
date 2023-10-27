@@ -1,10 +1,44 @@
 # Ubuntu Dotfiles
 
-All the common config is in the [master](https://github.com/MaxWolf-01/dotfiles/tree/master) branch.
-Master is mostly identical to ubuntu for now.
+### Overview
+
+All the common config is in the [master](https://github.com/MaxWolf-01/dotfiles/tree/master) branch.  
+As of now I also have os specific configs for 
+[ubuntu](https://github.com/MaxWolf-01/dotfiles/tree/ubuntu),
+[proxmox](https://github.com/MaxWolf-01/dotfiles/tree/proxmox),
+[lxc(minimal)](https://github.com/MaxWolf-01/dotfiles/tree/lxc) and
+[android](https://github.com/MaxWolf-01/dotfiles/tree/android) with specific installation instructions and dotfiles tailored for the platform (e.g.: android, an unbloated bootstrap script for small containers, ...).  
+The master branch only serves as a base / for structure and the public Readme.  
+**For the latest, fully fledged config, take a look at the this branch, since this is the one I use on a daily basis.**
 
 If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.  
-But if you're starting from scratch anyway, I would recommend you don't fork the repo but just copy the bits and pieces you need.
+But if you're starting from scratch anyway (_which I recommend_, in order to become fammiliar with the functionality bit by bit and since these dotfiles are tailored specifically to me, your needs will be different), I would recommend you don't fork the repo but just copy the bits and pieces you need.
+
+##### Structure
+
+```bash
+dotfiles
+├── bin  # custom scripts
+├── desktop # ubuntu specifc: desktop shortcuts, icons
+├── [dotbot](https://github.com/anishathalye/dotbot)
+├── git  # git config mapt to ~/.gitconig, ...
+├── ssh  # ssh config maps to ~/.ssh
+├── vim  # vim config
+├── zsh
+│   ├── plugin-files # place for plugin / theme scripts
+│   ├── aliases # aliases for zsh, git, ...
+│   ├── colors # colors for filetypes in shell
+│   ├── exports # env vars and path configs
+│   ├── functions # custom functions see below
+│   ├── plugins # sourcing plugins
+│   ├── zsh_config # zsh specific settings
+│   └── zshrc  # putting it all together
+├── .gitmodules # for dotbot
+├── bootstrap # installing packages, plugins, theme, ...
+├── install # idempotent main script
+├── install.conf.yaml # setup dirs, symlinks, ...
+└── Makefile # targets for installing various apps
+```
 
 ### Installation
 
