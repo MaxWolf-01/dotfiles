@@ -5,7 +5,7 @@
 use strict;
 
 my $action = '';
-my $filename = 'desktop/keybindings.csv'; # default filename if arg not specified
+my $filename = $ENV{'HOME'} . '/.dotfiles/desktop/keybindings.csv'; # default filename if arg not specified
 
 for my $arg (@ARGV){
     if ($arg eq "-e" or $arg eq "--export"){
