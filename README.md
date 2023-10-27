@@ -68,6 +68,7 @@ Optional next steps:
 - Use Makefile to install miniconda, docker, ...
 
 ```./install``` is idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
+But make sure to export your keyboard shortcuts via ./bin/keybindings.pl before you execute the script, otherwise they get overwritten by mine.
 
 ### Helpful ...
 
