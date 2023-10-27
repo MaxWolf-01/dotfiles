@@ -16,31 +16,28 @@ But if you're starting from scratch anyway (_which I recommend_, in order to bec
 
 ##### Structure
 
-TODO add comments
-
 ```bash
 dotfiles
-├── bin  # Custom scripts
-├── desktop
-├── dotbot
-├── git
-├── ssh
-├── vim
+├── bin  # custom scripts
+├── desktop # ubuntu specifc: desktop shortcuts, icons
+├── [dotbot](https://github.com/anishathalye/dotbot)
+├── git  # git config mapt to ~/.gitconig, ...
+├── ssh  # ssh config maps to ~/.ssh
+├── vim  # vim config
 ├── zsh
-│   ├── plugin-files
-│   ├── aliases
-│   ├── colors
-│   ├── exports
-│   ├── functions
-│   ├── plugins
-│   ├── zsh_config
-│   └── zshrc
-├── .gitmodules
-├── bootstrap
-├── install
-├── install.conf.yaml
-├── Makefile
-└── zap_zsh_install
+│   ├── plugin-files # place for plugin / theme scripts
+│   ├── aliases # aliases for zsh, git, ...
+│   ├── colors # colors for filetypes in shell
+│   ├── exports # env vars and path configs
+│   ├── functions # custom functions see below
+│   ├── plugins # sourcing plugins
+│   ├── zsh_config # zsh specific settings
+│   └── zshrc  # putting it all together
+├── .gitmodules # for dotbot
+├── bootstrap # installing packages, plugins, theme, ...
+├── install # idempotent main script
+├── install.conf.yaml # setup dirs, symlinks, ...
+└── Makefile # targets for installing various apps
 ```
 
 ### Installation
