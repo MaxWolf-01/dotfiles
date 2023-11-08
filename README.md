@@ -111,4 +111,4 @@ But make sure to export your keyboard shortcuts via ./bin/keybindings.pl before 
   - [dotfiles.github.io](https://dotfiles.github.io/)
 
 ### Visuals
-![screenshot](https://user-images.githubusercontent.com/69987866/222907218-967d172c-b294-4389-9afb-3134bc815ea8.png)
+![screenshot](https://github-production-user-asset-6210df.s3.amazonaws.com/69987866/281566583-dbcb2895-8ae7-4ed0-9a7a-b31ae9e71a26.png)
