@@ -1,4 +1,4 @@
-all: miniconda docker apps miscl clone_repos
+all: mamba docker apps miscl clone_repos
 
 apps: toolbox obsidian
 
@@ -11,6 +11,14 @@ miniconda:
 	~/miniconda/bin/conda init zsh
 	rm Miniconda3-latest-Linux-x86_64.sh
 	echo "To use miniconda, add the following to your .zshrc and start a new shell: PATH=~/miniconda/bin:$PATH"
+
+mamba:
+	# comes with conda and faster mamba
+	curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64sh"
+	bash Miniforge3-Linux-x86_64.sh -b
+	rm Miniforge3-Linux-x86_64.sh
+	# Support envs from previous conda installation
+	conda config --append envs_dirs ~/miniconda3/envs/
 
 rm_miniconda:
 	rm -rf ~/miniconda
@@ -83,6 +91,9 @@ nvidia:
 
 spg_vpn:
 	sudo apt-get update && sudo apt-get install network-manager-openconnect network-manager-openconnect-gnome; \
-	systemctl restart NetworkManager; \
-	apt-get install virt-viewer
-	
+	sudo systemctl restart NetworkManager; \
+	sudo apt-get install virt-viewer
+
+pip_global_pkgs:
+	pip3 install --user ruff
+
