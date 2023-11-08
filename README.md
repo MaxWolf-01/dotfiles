@@ -110,7 +110,7 @@ Optional next steps:
   - [dotfiles.github.io](https://dotfiles.github.io/)
 
 ### Visuals
-![screenshot-ubuntu](https://user-images.githubusercontent.com/69987866/222907218-967d172c-b294-4389-9afb-3134bc815ea8.png)  
+![screenshot-ubuntu](https://github-production-user-asset-6210df.s3.amazonaws.com/69987866/281566583-dbcb2895-8ae7-4ed0-9a7a-b31ae9e71a26.png)  
 ![screenshot-proxmox](https://user-images.githubusercontent.com/69987866/222906712-a760aab9-39dc-40aa-91e2-dd5e89290749.png)  
 ![screenshot-android](https://github.com/MaxWolf-01/dotfiles/assets/69987866/bab21cc9-6d40-4a7b-a021-feccf843d290)
 
