@@ -1,8 +1,8 @@
 all: mamba docker apps miscl clone_repos
 
-apps: toolbox obsidian
+apps: toolbox obsidian vim_copilot
 
-miscl: act ssh
+miscl: act pip_global_pkgs
 
 miniconda:
 	mkdir ~/miniconda
@@ -35,6 +35,9 @@ toolbox:
 	# latest jetbrains toolbox (https://github.com/nagygergo/jetbrains-toolbox-install)
 	curl -fsSL https://raw.githubusercontent.com/nagygergo/jetbrains-toolbox-install/master/jetbrains-toolbox.sh | bash
 	cd ~/.local/bin/ && ./jetbrains-toolbox
+
+vim_copilot:
+	git clone https://github.com/github/copilot.vim.git ~/.vim/pack/github/start/copilot.vim
 
 act:
 	# local github actions runner
