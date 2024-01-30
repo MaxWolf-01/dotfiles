@@ -34,10 +34,9 @@ dotfiles
 │   ├── zsh_config # zsh specific settings
 │   └── zshrc  # putting it all together
 ├── .gitmodules # for dotbot
-├── bootstrap # installing packages, plugins, theme, ...
-├── install # idempotent main script
-├── install.conf.yaml # setup dirs, symlinks, ...
-└── Makefile # targets for installing various apps
+├── setup # installing packages, plugins, theme, ...
+├── install # idempotent main install script (basic & quick setup)
+├── install.conf.yaml # setup dir structure, symlinks, ...
 ```
 
 ### Installation
@@ -65,7 +64,7 @@ cd ~/.dotfiles
 *open new shell* (or reboot when in doubt)
 
 Optional next steps:
-- Use Makefile to install miniconda, docker, ...
+- Run ``./setup miniconda/docker/.../all``
 
 ```./install``` is idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
 But make sure to export your keyboard shortcuts via ./bin/keybindings.pl before you execute the script, otherwise they get overwritten by mine.
