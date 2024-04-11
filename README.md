@@ -138,5 +138,4 @@ toggle shortcuts, ...
 
 <img src="https://github-production-user-asset-6210df.s3.amazonaws.com/69987866/281566583-dbcb2895-8ae7-4ed0-9a7a-b31ae9e71a26.png" width="350">
 <img src="https://user-images.githubusercontent.com/69987866/222906712-a760aab9-39dc-40aa-91e2-dd5e89290749.png" width="350">
-<br>
 <img src="https://github.com/MaxWolf-01/dotfiles/assets/69987866/54ade9f2-239f-427a-9888-d8469d0e3134" width="250">
