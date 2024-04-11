@@ -1,10 +1,10 @@
 # Linux Dotfiles
 
-I use these dotfiles for my daily driver Ubuntu and Android setup, as well as proxmox and LXCs.i
+I use these dotfiles for my daily driver Ubuntu and Android setup, as well as proxmox and LXCs.
 
 ### Overview
 
-If you plan on cloning / forking this repo, **make sure to change the github user information in gitconfig**.  
+If you plan on cloning / forking this repo, be aware that all config is tailored to me (e.g. paths, usernames, ...) and make sure to change .gitconfig to your name and email.
 But if you're starting from scratch anyway (_which I recommend_, in order to become fammiliar with the functionality bit
 by bit).
 Since these dotfiles are tailored specifically to me, your needs and preferences will be different and I would recommend you just copy the bits and pieces you need.
