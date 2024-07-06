@@ -47,7 +47,8 @@ sudo apt autoremove && sudo apt clean
 Pre-requisites:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git
+sudo apt-get update && sudo apt-get install -y git gh
+gh auth login
 ```
 
 ```bash
