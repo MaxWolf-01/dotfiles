@@ -33,9 +33,18 @@ dotfiles
 ├── install.conf.yaml # setup dir structure, symlinks, ...
 ```
 
-### Setup (Regular)
+### Setup (Desktop)
 
-Get pre-requisites:
+<details>
+  <summary>Post (distro-) installation steps</summary>
+  
+  ```bash
+sudo apt update && sudo apt full-upgrade
+sudo apt autoremove && sudo apt clean
+  ```
+</details>
+
+Pre-requisites:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
