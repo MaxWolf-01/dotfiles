@@ -105,7 +105,7 @@ Scripts for pushing conflicts to deal with them in an IDE and fixing occasional 
 
 **Functions**
 
-- ``o`` (open file explorer)
+- ``o`` (open file explorer or the file given as argument)
 - ``mcd`` (make directory and cd into it)
 - ``targz`` (create a .tar.gz archive, using `zopfli`, `pigz` or `gzip` for compression)
 - ``extract`` (extracts archived files / mounts disk images)
@@ -116,7 +116,7 @@ Scripts for pushing conflicts to deal with them in an IDE and fixing occasional 
   directories first.)
 - ``newsshpwd`` (change the ssh passphrase of given key)
 - ``numel`` (number of elements in folder)
-  using `\conda` / `\pip` )
+- ``archive_md` (archive websites as markdown using [dhravya/markdowner](https://github.com/dhravya/markdowner)
 - and many more ... (see functions / aliases in [zsh folder](https://github.com/MaxWolf-01/dotfiles/tree/master/zsh))
 
 Various **scripts**, such as gnome keyboard shortcut backup/restore, laptop battery limiter, backup scripts, nightlight
