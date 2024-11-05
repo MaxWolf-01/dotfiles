@@ -1,0 +1,1 @@
+return { "basedpyright-langserver", "--stdio" }
