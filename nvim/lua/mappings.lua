@@ -1,6 +1,21 @@
 local map = vim.keymap.set
 
 -- ====================================================================
+-- basic
+-- ====================================================================
+
+-- disable U (scary behvaior)
+map("n", "U", "<NOP>", { noremap = true, silent = true })
+-- centered cursor when scrolling
+map("n", "<C-d>", "<C-d>zz", { noremap = true, silent = true })
+map("n", "<C-u>", "<C-u>zz", { noremap = true, silent = true })
+-- ctrl+s saves in both normal and insert modes; insert returns to insert
+map("n", "<C-s>", ":w<CR>", { noremap = true, silent = true })
+map("i", "<C-s>", "<Esc>:w<CR>a", { noremap = true, silent = true })
+-- preserve paste register when pasting over selection
+map("x", "<leader>p", "\"_dP", { noremap = true, silent = true })
+
+-- ====================================================================
 -- lsp
 -- ====================================================================
 
@@ -38,4 +53,3 @@ map("n", "gr", ":Telescope lsp_references<CR>", { silent = true })
 map("n", "gl", ":Telescope diagnostics<CR>", { silent = true })
 
 -- https://github.com/lukasl-dev/nixos/blob/master/dots/nvim/lua/mappings.lua
-
