@@ -14,6 +14,8 @@ map("n", "<C-s>", ":w<CR>", { noremap = true, silent = true })
 map("i", "<C-s>", "<Esc>:w<CR>a", { noremap = true, silent = true })
 -- preserve paste register when pasting over selection
 map("x", "<leader>p", "\"_dP", { noremap = true, silent = true })
+-- show dashboard
+map("n", "<leader>d", ":Dashboard<CR>", { silent = true })
 
 -- ====================================================================
 -- lsp
