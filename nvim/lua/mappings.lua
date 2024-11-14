@@ -8,23 +8,23 @@ local opts = {    -- default options
 -- basic
 -- ====================================================================
 
-map("n", "<leader>d", ":Dashboard<CR>", opts)            -- show dashboard
-map("n", "U", "<NOP>", opts)                             -- disable U (scary behvaior)
+map("n", "<leader>d", ":Dashboard<CR>", opts)      -- show dashboard: https://github.com/nvimdev/dashboard-nvim
+map("n", "U", "<NOP>", opts)                       -- disable U (scary behvaior)
 -- Scroling and finding
-map("n", "<C-d>", "<C-d>zz", opts)                       -- centered cursor when scrolling down
-map("n", "<C-u>", "<C-u>zz", opts)                       -- centered cursor when scrolling up
-map('n', 'n', 'nzzzv')                                   -- Next search result stays centered
-map('n', 'N', 'Nzzzv')                                   -- Previous search result stays centered
+map("n", "<C-d>", "<C-d>zz", opts)                 -- centered cursor when scrolling down
+map("n", "<C-u>", "<C-u>zz", opts)                 -- centered cursor when scrolling up
+map('n', 'n', 'nzzzv')                             -- Next search result stays centered
+map('n', 'N', 'Nzzzv')                             -- Previous search result stays centered
 -- Saving and quitting
-map("n", "<C-s>", ":w<CR>", opts)                        -- ctrl+s saves in normal ...
-map("i", "<C-s>", "<Esc>:w<CR>a", opts)                  -- ... and in insert mode returns to insert
-map('n', '<leader>w', ':w<CR>')                          -- Save with space+w
-map('n', '<leader>q', ':q<CR>')                          -- Quit with space+q
-map("x", "<leader>p", "\"_dP", opts)                     -- preserve paste register when pasting over selection
+map("n", "<C-s>", ":w<CR>", opts)                  -- ctrl+s saves in normal ...
+map("i", "<C-s>", "<Esc>:w<CR>a", opts)            -- ... and in insert mode returns to insert
+map('n', '<leader>w', ':w<CR>')                    -- Save with space+w
+map('n', '<leader>q', ':q<CR>')                    -- Quit with space+q
+map("x", "<leader>p", "\"_dP", opts)               -- preserve paste register when pasting over selection
 -- Directory Navigation
-map('n', '<leader>cd', ':cd %:p:h<CR>:pwd<CR>')          -- cd to dir of current file and show it
-map('n', '<leader>cdww', ':lcd %:p:h<CR>:pwd<CR>', opts) -- window-local cd to dir of current file and show it
-map('n', '<leader>cdr', function()                       -- cd to git root of current file (if in git repo)
+map('n', '<leader>cd', ':cd %:p:h<CR>:pwd<CR>')    -- cd to dir of current file and show it
+map('n', '<leader>cdww', ':lcd %:p:h<CR>:pwd<CR>') -- window-local cd to dir of current file and show it
+map('n', '<leader>cdr', function()                 -- cd to git root of current file (if in git repo)
   local handle = io.popen('git rev-parse --is-inside-work-tree 2>/dev/null')
   if handle then
     local result = handle:read("*a")
@@ -36,7 +36,7 @@ map('n', '<leader>cdr', function()                       -- cd to git root of cu
       vim.notify("Not in a git repository", vim.log.levels.WARN)
     end
   end
-end, opts)
+end)
 map('n', '<leader>cdwr', function() -- window-local cd to git root of current file (if in git repo)
   local handle = io.popen('git rev-parse --is-inside-work-tree 2>/dev/null')
   if handle then
@@ -49,14 +49,28 @@ map('n', '<leader>cdwr', function() -- window-local cd to git root of current fi
       vim.notify("Not in a git repository", vim.log.levels.WARN)
     end
   end
-end, opts)
+end)
+
+-- window navigation
+-- to use ALT+{h,j,k,l} to navigate windows from any mode:
+map("t", "<A-h>", "<C-\\><C-N><C-w>h", opts)
+map("t", "<A-j>", "<C-\\><C-N><C-w>j", opts)
+map("t", "<A-k>", "<C-\\><C-N><C-w>k", opts)
+map("t", "<A-l>", "<C-\\><C-N><C-w>l", opts)
+map("i", "<A-h>", "<C-\\><C-N><C-w>h", opts)
+map("i", "<A-j>", "<C-\\><C-N><C-w>j", opts)
+map("i", "<A-k>", "<C-\\><C-N><C-w>k", opts)
+map("i", "<A-l>", "<C-\\><C-N><C-w>l", opts)
+map("n", "<A-h>", "<C-w>h", opts)
+map("n", "<A-j>", "<C-w>j", opts)
+map("n", "<A-k>", "<C-w>k", opts)
+map("n", "<A-l>", "<C-w>l", opts)
 
 
--- terminal stuff
+-- terminal stuff: http://neovim.io/doc/user/terminal.html#terminal
 map('n', '<leader>tt', ':lcd %:p:h<CR>:terminal<CR>', opts) -- open terminal in dir of current file
 map('n', '<leader>T', ':terminal<CR>', opts)                -- open terminal in working directory
 map('t', '<S-Esc>', '<C-\\><C-n>', opts)                    -- all other mappings didn't work
--- vim.keymap.set('t', 'jk', '<C-\\><C-n>', { noremap = true })
 map('n', '<leader>tr', function()                           -- terminal in git root (if in git repo)
   local handle = io.popen('git rev-parse --is-inside-work-tree 2>/dev/null')
   if handle then
