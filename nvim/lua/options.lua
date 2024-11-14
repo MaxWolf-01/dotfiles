@@ -1,7 +1,10 @@
+-- https://vimhelp.org/options.txt.html
+---------------------------------------
+
 local o = vim.opt
 
-o.colorcolumn = "80"
-o.showmode = false
+o.colorcolumn = "120"
+o.showmode = true
 
 o.number = true
 o.relativenumber = true
@@ -23,4 +26,3 @@ o.undofile = true
 o.clipboard = "unnamedplus"
 o.cursorline = true
 o.cursorlineopt = "number"
-
