@@ -13,14 +13,14 @@ map("n", "U", "<NOP>", opts)                       -- disable U (scary behvaior)
 -- Scroling and finding
 map("n", "<C-d>", "<C-d>zz", opts)                 -- centered cursor when scrolling down
 map("n", "<C-u>", "<C-u>zz", opts)                 -- centered cursor when scrolling up
-map('n', '/', '/zz', opts)                         -- centered seach result
 map('n', 'n', 'nzzzv')                             -- next search result stays centered
 map('n', 'N', 'Nzzzv')                             -- previous search result stays centered
 -- Saving and quitting
 map("n", "<C-s>", ":w<CR>", opts)                  -- ctrl+s saves in normal ...
 map("i", "<C-s>", "<Esc>:w<CR>a", opts)            -- ... and in insert mode returns to insert
-map('n', '<leader>w', ':w<CR>')                    -- Save with space+w
-map('n', '<leader>q', ':q<CR>')                    -- Quit with space+q
+map('n', '<leader>ww', ':w<CR>')                   -- save with space+ww
+map('n', '<leader>wq', ':wq<CR>')                  -- quit with space+wq
+map('n', '<leader>qq', ':qq<CR>')                  -- save quit with space+qq
 map("x", "<leader>p", "\"_dP", opts)               -- preserve paste register when pasting over selection
 -- Directory Navigation
 map('n', '<leader>cd', ':cd %:p:h<CR>:pwd<CR>')    -- cd to dir of current file and show it
