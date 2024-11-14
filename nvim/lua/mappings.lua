@@ -13,8 +13,9 @@ map("n", "U", "<NOP>", opts)                       -- disable U (scary behvaior)
 -- Scroling and finding
 map("n", "<C-d>", "<C-d>zz", opts)                 -- centered cursor when scrolling down
 map("n", "<C-u>", "<C-u>zz", opts)                 -- centered cursor when scrolling up
-map('n', 'n', 'nzzzv')                             -- Next search result stays centered
-map('n', 'N', 'Nzzzv')                             -- Previous search result stays centered
+map('n', '/', '/zz', opts)                         -- centered seach result
+map('n', 'n', 'nzzzv')                             -- next search result stays centered
+map('n', 'N', 'Nzzzv')                             -- previous search result stays centered
 -- Saving and quitting
 map("n", "<C-s>", ":w<CR>", opts)                  -- ctrl+s saves in normal ...
 map("i", "<C-s>", "<Esc>:w<CR>a", opts)            -- ... and in insert mode returns to insert
@@ -50,9 +51,14 @@ map('n', '<leader>cdwr', function() -- window-local cd to git root of current fi
     end
   end
 end)
-
--- window navigation
--- to use ALT+{h,j,k,l} to navigate windows from any mode:
+-- window splits
+vim.keymap.set('n', '<leader>vv', ':vsplit<CR>')
+vim.keymap.set('n', '<leader>vh', ':split<CR>')
+-- window resizing
+map('n', '<S-A-h>', ':vertical resize +4<CR>')
+map('n', '<S-A-j>', ':resize -4<CR>')
+map('n', '<S-A-k>', ':resize +4<CR>')
+-- use ALT+{h,j,k,l} to navigate windows from any mode
 map("t", "<A-h>", "<C-\\><C-N><C-w>h", opts)
 map("t", "<A-j>", "<C-\\><C-N><C-w>j", opts)
 map("t", "<A-k>", "<C-\\><C-N><C-w>k", opts)
@@ -65,8 +71,7 @@ map("n", "<A-h>", "<C-w>h", opts)
 map("n", "<A-j>", "<C-w>j", opts)
 map("n", "<A-k>", "<C-w>k", opts)
 map("n", "<A-l>", "<C-w>l", opts)
-
-
+map('n', '<S-A-l>', ':vertical resize -4<CR>')
 -- terminal stuff: http://neovim.io/doc/user/terminal.html#terminal
 map('n', '<leader>tt', ':lcd %:p:h<CR>:terminal<CR>', opts) -- open terminal in dir of current file
 map('n', '<leader>T', ':terminal<CR>', opts)                -- open terminal in working directory
