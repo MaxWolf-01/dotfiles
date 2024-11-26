@@ -10,6 +10,7 @@ local opts = {    -- default options
 
 map("n", "<leader>d", ":Dashboard<CR>", opts)      -- show dashboard: https://github.com/nvimdev/dashboard-nvim
 map("n", "U", "<NOP>", opts)                       -- disable U (scary behvaior)
+map("n", "<leader>ca", ":%y<CR>", opts)            -- copy all
 -- Scroling and finding
 map("n", "<C-d>", "<C-d>zz", opts)                 -- centered cursor when scrolling down
 map("n", "<C-u>", "<C-u>zz", opts)                 -- centered cursor when scrolling up
@@ -20,7 +21,7 @@ map("n", "<C-s>", ":w<CR>", opts)                  -- ctrl+s saves in normal ...
 map("i", "<C-s>", "<Esc>:w<CR>a", opts)            -- ... and in insert mode returns to insert
 map('n', '<leader>ww', ':w<CR>')                   -- save with space+ww
 map('n', '<leader>wq', ':wq<CR>')                  -- quit with space+wq
-map('n', '<leader>qq', ':qq<CR>')                  -- save quit with space+qq
+map('n', '<leader>qq', ':q<CR>')                   -- save quit with space+qq
 map("x", "<leader>p", "\"_dP", opts)               -- preserve paste register when pasting over selection
 -- Directory Navigation
 map('n', '<leader>cd', ':cd %:p:h<CR>:pwd<CR>')    -- cd to dir of current file and show it
@@ -52,12 +53,12 @@ map('n', '<leader>cdwr', function() -- window-local cd to git root of current fi
   end
 end)
 -- window splits
-vim.keymap.set('n', '<leader>vv', ':vsplit<CR>')
-vim.keymap.set('n', '<leader>vh', ':split<CR>')
+map('n', '<leader>vv', ':vsplit<CR>', opts)
+map('n', '<leader>vh', ':split<CR>', opts)
 -- window resizing
-map('n', '<S-A-h>', ':vertical resize +4<CR>')
-map('n', '<S-A-j>', ':resize -4<CR>')
-map('n', '<S-A-k>', ':resize +4<CR>')
+map('n', '<S-A-h>', ':vertical resize +4<CR>', opts)
+map('n', '<S-A-j>', ':resize -4<CR>', opts)
+map('n', '<S-A-k>', ':resize +4<CR>', opts)
 -- use ALT+{h,j,k,l} to navigate windows from any mode
 map("t", "<A-h>", "<C-\\><C-N><C-w>h", opts)
 map("t", "<A-j>", "<C-\\><C-N><C-w>j", opts)
@@ -75,7 +76,7 @@ map('n', '<S-A-l>', ':vertical resize -4<CR>')
 -- terminal stuff: http://neovim.io/doc/user/terminal.html#terminal
 map('n', '<leader>tt', ':lcd %:p:h<CR>:terminal<CR>', opts) -- open terminal in dir of current file
 map('n', '<leader>T', ':terminal<CR>', opts)                -- open terminal in working directory
-map('t', '<S-Esc>', '<C-\\><C-n>', opts)                    -- all other mappings didn't work
+map('t', '<S-Esc>', [[<C-\><C-n>]], opts)                   -- all other mappings didn't work
 map('n', '<leader>tr', function()                           -- terminal in git root (if in git repo)
   local handle = io.popen('git rev-parse --is-inside-work-tree 2>/dev/null')
   if handle then
