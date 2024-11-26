@@ -5,8 +5,7 @@ I use these dotfiles for my daily driver Ubuntu and Android setup, as well as pr
 ### Overview
 
 If you plan on cloning / forking this repo, be aware that all config is tailored to me (e.g. paths, usernames, ...) and make sure to change .gitconfig to your name and email.
-But if you're starting from scratch anyway (_which I recommend_, in order to become fammiliar with the functionality bit
-by bit).
+But if you're starting from scratch anyway (_which I recommend_, in order to become fammiliar with the functionality bit by bit).
 Since these dotfiles are tailored specifically to me, your needs and preferences will be different and I would recommend you just copy the bits and pieces you need.
 
 ```bash
@@ -45,78 +44,61 @@ sudo apt autoremove && sudo apt clean
 </details>
 
 Pre-requisites:
-
 ```bash
 sudo apt-get update && sudo apt-get install -y git gh
 gh auth login
 ```
 
 ```bash
-cd ~ && git clone git@github.com:MaxWolf-01/dotfiles.git
-# or
 cd ~ && git clone --depth 1 git@github.com:MaxWolf-01/dotfiles.git
 ```
 
 ```bash
-mv dotfiles .dotfiles && cd ~/.dotfiles && ./install
+mv dotfiles .dotfiles && cd ~/.dotfiles && ./install && ./setup minimal 
 ```
+or for a more complete setup use `./setup cli` or `./setup ubuntu`.
 
 *open new shell* (or reboot when in doubt)
 
-Optional next steps:
-
-Run ``./setup all`` to install packages, plugins, themes, ...
-Works on Ubuntu.
-Run ``./setup minimal`` for an unbloated setup with essential cli tools and a minimal zsh setup on any system.
-For more/specific setups, check out `setup`.
-
-```./install``` is idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new
-changes, which will update the symlinks etc.
-But make sure to export your gnome keyboard shortcuts via `./bin/keybindings.pl` before you execute the script,
-otherwise they
-get overwritten by mine.
+`./install` and most functions in `setup` are idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
+But make sure to export your gnome keyboard shortcuts via `./bin/keybindings.pl` before you execute the script, otherwise they get overwritten by mine.
 
 ### Setup (Android)
 
-Download and install [termux](https://github.com/termux/termux-app#github)
-apk [from f-droid](https://f-droid.org/en/packages/com.termux/).
-Don't worry about warnings from `termux-setup-storage` about deleting all your data. *Should* be fine.  
-``~/storage/shared`` in your termux home
-directory [is symlinked](https://android.stackexchange.com/a/185949) ``/storage/emulated/0`` (where downloads folder
-etc. are on Android)
-
+Download and install [termux](https://github.com/termux/termux-app)
+apk [from f-droid](https://f-droid.org/en/packages/com.termux/), then:
 ```bash
 export DEBIAN_FRONTEND=noninteractive
 termux-setup-storage
 pkg update && pkg upgrade && pkg install git
 cd /data/data/com.termux/files/home && git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git
-mv dotfiles .dotfiles && cd ~/.dotfiles && ./install
-./setup android
+mv dotfiles .dotfiles && cd ~/.dotfiles && ./install && ./setup android
 ```
+Don't worry about warnings from `termux-setup-storage` about deleting all your data. *Should* be fine.  
+`~/storage/shared` in your termux home directory [is symlinked](https://android.stackexchange.com/a/185949) `/storage/emulated/0` (where downloads folder etc. are on Android).
 
-``./setup android`` will install essential packages and setup up [**Obsidian**](https://obsidian.md/).
+`./setup android` will install essential packages and sets up [**Obsidian**](https://obsidian.md/):
 An "obsidian" folder will be created in the android home directory.  
-To automatically commit, pull and push, run ``sync``.
-Aliases for android specifically are in [zsh/android](https://github.com/MaxWolf-01/dotfiles/tree/master/zsh/android).
-Make sure to always sync before and after you work on one of them, or you'll need to deal with merge conflicts.
+To automatically commit, pull and push, run `sync`.
+Other aliases for android specifically are in [zsh/android](https://github.com/MaxWolf-01/dotfiles/tree/master/zsh/android).
 Scripts for pushing conflicts to deal with them in an IDE and fixing occasional corrupt git objects are in `bin`.
 
 ### What's in it?
 
 **Functions**
 
-- ``o`` (open file explorer or the file given as argument)
-- ``mcd`` (make directory and cd into it)
-- ``targz`` (create a .tar.gz archive, using `zopfli`, `pigz` or `gzip` for compression)
-- ``extract`` (extracts archived files / mounts disk images)
-- ``fs`` (determine size of a file or total size of a directory)
-- ``lsfs`` (list n largest files and folder in a directory, recursively; smallest if n is negative; n defaults to 10)
-- ``gz`` (compare original and gzipped file size)
-- ``tre`` (`tre` is a shorthand for `tree` with hidden files and color enabled, ignoring the `.git` directory, listing
+- `o` (open file explorer or the file given as argument)
+- `mcd` (make directory and cd into it)
+- `targz` (create a .tar.gz archive, using `zopfli`, `pigz` or `gzip` for compression)
+- `extract` (extracts archived files / mounts disk images)
+- `fs` (determine size of a file or total size of a directory)
+- `lsfs` (list n largest files and folder in a directory, recursively; smallest if n is negative; n defaults to 10)
+- `gz` (compare original and gzipped file size)
+- `tre` (`tre` is a shorthand for `tree` with hidden files and color enabled, ignoring the `.git` directory, listing
   directories first.)
-- ``newsshpwd`` (change the ssh passphrase of given key)
-- ``numel`` (number of elements in folder)
-- ``archive_md` (archive websites as markdown using [dhravya/markdowner](https://github.com/dhravya/markdowner)
+- `newsshpwd`` (change the ssh passphrase of given key)
+- `numel`` (number of elements in folder)
+- `archive_md` (archive websites as markdown using [dhravya/markdowner](https://github.com/dhravya/markdowner)
 - and many more ... (see functions / aliases in [zsh folder](https://github.com/MaxWolf-01/dotfiles/tree/master/zsh))
 
 Various **scripts**, such as gnome keyboard shortcut backup/restore, laptop battery limiter, backup scripts, nightlight
