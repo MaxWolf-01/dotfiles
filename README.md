@@ -70,7 +70,7 @@ apk [from f-droid](https://f-droid.org/en/packages/com.termux/), then:
 ```bash
 export DEBIAN_FRONTEND=noninteractive
 termux-setup-storage
-pkg update && pkg upgrade && pkg install git gh && gh auth login
+pkg update && pkg upgrade && pkg install git gh python && gh auth login
 cd /data/data/com.termux/files/home && git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git
 mv dotfiles .dotfiles && cd ~/.dotfiles && ./install && ./setup android
 ```
