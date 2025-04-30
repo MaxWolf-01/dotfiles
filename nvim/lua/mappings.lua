@@ -10,14 +10,14 @@ local opts = {    -- default options
 -- basic
 -- ====================================================================
 
-map("n", "<leader>d", ":Dashboard<CR>", opts) -- show dashboard: https://github.com/nvimdev/dashboard-nvim
-map("n", "U", "<NOP>", opts)                  -- disable U (scary behvaior)
-map("n", "<leader>ca", ":%y<CR>", opts)       -- copy all
+map("n", "<leader><leader>", ":Dashboard<CR>", opts) -- show dashboard: https://github.com/nvimdev/dashboard-nvim
+map("n", "U", "<NOP>", opts)                         -- disable U (scary behvaior)
+map("n", "<leader>ca", ":%y<CR>", opts)              -- copy all
 -- Scroling and finding
-map("n", "<C-d>", "<C-d>zz", opts)            -- centered cursor when scrolling down
-map("n", "<C-u>", "<C-u>zz", opts)            -- centered cursor when scrolling up
-map('n', 'n', 'nzzzv')                        -- next search result stays centered
-map('n', 'N', 'Nzzzv')                        -- previous search result stays centered
+map("n", "<C-d>", "<C-d>zz", opts)                   -- centered cursor when scrolling down
+map("n", "<C-u>", "<C-u>zz", opts)                   -- centered cursor when scrolling up
+map('n', 'n', 'nzzzv')                               -- next search result stays centered
+map('n', 'N', 'Nzzzv')                               -- previous search result stays centered
 -- Clear highlights on search when pressing <Esc> in normal mode. See `:help hlsearch`
 vim.keymap.set('n', '<Esc>', '<cmd>nohlsearch<CR>')
 -- Saving and quitting
@@ -139,6 +139,7 @@ map("n", "<leader>fgc", ":Telescope git_commits<CR>", opts)
 map("n", "<leader>fgs", ":Telescope git_status<CR>", opts)
 map("n", "<leader>fr", ":Telescope oldfiles<CR>", opts)
 map("n", "<leader>fw", ":Telescope live_grep<CR>", opts)
+map("n", "<leader>fW", ":Telescope live_grep word_match=-w<CR>", opts)
 map("n", "<leader>fs", ":Telescope grep_string<CR>", opts)
 map("n", "<leader>fb", ":Telescope buffers<CR>", opts)
 map("n", "<leader>fh", ":Telescope help_tags<CR>", opts)
