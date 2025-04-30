@@ -1,3 +1,5 @@
+-- TODO restructure with claude, add comments as descriptions
+
 local map = vim.keymap.set
 local opts = {    -- default options
   noremap = true, -- non-recursive, i.e. ignore other mappings; true per default
@@ -8,14 +10,16 @@ local opts = {    -- default options
 -- basic
 -- ====================================================================
 
-map("n", "<leader>d", ":Dashboard<CR>", opts)      -- show dashboard: https://github.com/nvimdev/dashboard-nvim
-map("n", "U", "<NOP>", opts)                       -- disable U (scary behvaior)
-map("n", "<leader>ca", ":%y<CR>", opts)            -- copy all
+map("n", "<leader>d", ":Dashboard<CR>", opts) -- show dashboard: https://github.com/nvimdev/dashboard-nvim
+map("n", "U", "<NOP>", opts)                  -- disable U (scary behvaior)
+map("n", "<leader>ca", ":%y<CR>", opts)       -- copy all
 -- Scroling and finding
-map("n", "<C-d>", "<C-d>zz", opts)                 -- centered cursor when scrolling down
-map("n", "<C-u>", "<C-u>zz", opts)                 -- centered cursor when scrolling up
-map('n', 'n', 'nzzzv')                             -- next search result stays centered
-map('n', 'N', 'Nzzzv')                             -- previous search result stays centered
+map("n", "<C-d>", "<C-d>zz", opts)            -- centered cursor when scrolling down
+map("n", "<C-u>", "<C-u>zz", opts)            -- centered cursor when scrolling up
+map('n', 'n', 'nzzzv')                        -- next search result stays centered
+map('n', 'N', 'Nzzzv')                        -- previous search result stays centered
+-- Clear highlights on search when pressing <Esc> in normal mode. See `:help hlsearch`
+vim.keymap.set('n', '<Esc>', '<cmd>nohlsearch<CR>')
 -- Saving and quitting
 map("n", "<C-s>", ":w<CR>", opts)                  -- ctrl+s saves in normal ...
 map("i", "<C-s>", "<Esc>:w<CR>a", opts)            -- ... and in insert mode returns to insert
@@ -129,9 +133,17 @@ map("n", "-", "<CMD>Oil<CR>", opts)
 -- telescope
 -- ====================================================================
 
-map("n", "<leader>ff", ":Telescope find_files<CR>", opts)
+map("n", "<leader>ff", ":Telescope find_files hidden=true no_ignore=true<CR>", opts)
+map("n", "<leader>fgf", ":Telescope git_files hidden=true no_ignore=true<CR>", opts)
+map("n", "<leader>fgc", ":Telescope git_commits<CR>", opts)
+map("n", "<leader>fgs", ":Telescope git_status<CR>", opts)
+map("n", "<leader>fr", ":Telescope oldfiles<CR>", opts)
 map("n", "<leader>fw", ":Telescope live_grep<CR>", opts)
+map("n", "<leader>fs", ":Telescope grep_string<CR>", opts)
 map("n", "<leader>fb", ":Telescope buffers<CR>", opts)
+map("n", "<leader>fh", ":Telescope help_tags<CR>", opts)
+map("n", "<leader>fc", ":Telescope commands<CR>", opts)
+map("n", "<leader>fk", ":Telescope keymaps<CR>", opts)
 map("n", "gi", ":Telescope lsp_implementations<CR>", opts)
 map("n", "gd", ":Telescope lsp_definitions<CR>", opts)
 map("n", "gr", ":Telescope lsp_references<CR>", opts)

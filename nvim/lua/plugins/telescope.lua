@@ -20,9 +20,22 @@ return {
         height = 0.80,
       },
       mappings = {
-        n = { ["q"] = require("telescope.actions").close },
+        n = {
+          ["q"] = require("telescope.actions").close,
+          ["H"] = "preview_scrolling_left",
+          ["L"] = "preview_scrolling_right",
+        },
+        i = {
+          ["<C-j>"] = "move_selection_next",
+          ["<C-k>"] = "move_selection_previous",
+          ["<C-n>"] = "move_selection_next",
+          ["<C-p>"] = "move_selection_previous",
+
+          ["<C-c>"] = "close",
+
+          ["<C-h>"] = "which_key",
+        },
       },
     },
   },
 }
-
