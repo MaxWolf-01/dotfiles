@@ -149,5 +149,13 @@ map("n", "gi", ":Telescope lsp_implementations<CR>", opts)
 map("n", "gd", ":Telescope lsp_definitions<CR>", opts)
 map("n", "gr", ":Telescope lsp_references<CR>", opts)
 map("n", "gl", ":Telescope diagnostics<CR>", opts)
+local builtin = require 'telescope.builtin'
+local function fuzzy_find_current_buffer()
+  builtin.current_buffer_fuzzy_find(require('telescope.themes').get_dropdown {
+    winblend = 10,
+    previewer = false,
+  })
+end
+map('n', '<leader>/', fuzzy_find_current_buffer, { desc = '[/] Fuzzily search in current buffer' })
+map('n', '<C-f>', fuzzy_find_current_buffer, { desc = 'Fuzzily search in current buffer' })
 
--- https://github.com/lukasl-dev/nixos/blob/master/dots/nvim/lua/mappings.lua
