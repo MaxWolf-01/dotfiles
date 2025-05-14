@@ -118,8 +118,8 @@ map("n", "<leader>a", ":Lspsaga code_action<CR>", opts)
 -- diagnostic
 -- ====================================================================
 
-map("n", "[d", vim.diagnostic.goto_prev, opts)
-map("n", "]d", vim.diagnostic.goto_next, opts)
+map('n', ']d', function() vim.diagnostic.jump({ count = 1, float = true }) end, opts)
+map('n', '[d', function() vim.diagnostic.jump({ count = -1, float = true }) end, opts)
 map("n", "gef", vim.diagnostic.open_float, opts)
 map("n", "geq", vim.diagnostic.setqflist, opts)
 
@@ -145,10 +145,13 @@ map("n", "<leader>fb", ":Telescope buffers<CR>", opts)
 map("n", "<leader>fh", ":Telescope help_tags<CR>", opts)
 map("n", "<leader>fc", ":Telescope commands<CR>", opts)
 map("n", "<leader>fk", ":Telescope keymaps<CR>", opts)
-map("n", "gi", ":Telescope lsp_implementations<CR>", opts)
-map("n", "gd", ":Telescope lsp_definitions<CR>", opts)
-map("n", "gr", ":Telescope lsp_references<CR>", opts)
-map("n", "gl", ":Telescope diagnostics<CR>", opts)
+map("n", "<leader>fd", ":Telescope lsp_definitions<CR>", opts)
+map("n", "<leader>fr", ":Telescope lsp_references<CR>", opts)
+map("n", "<leader>fi", ":Telescope lsp_implementations<CR>", opts)
+map("n", "<leader>ft", ":Telescope lsp_type_definitions<CR>", opts)
+map("n", "<leader>fs", ":Telescope lsp_document_symbols<CR>", opts)
+map("n", "<leader>fS", ":Telescope lsp_workspace_symbols<CR>", opts)
+map("n", "<leader>fl", ":Telescope diagnostics<CR>", opts)
 local builtin = require 'telescope.builtin'
 local function fuzzy_find_current_buffer()
   builtin.current_buffer_fuzzy_find(require('telescope.themes').get_dropdown {
@@ -159,3 +162,5 @@ end
 map('n', '<leader>/', fuzzy_find_current_buffer, { desc = '[/] Fuzzily search in current buffer' })
 map('n', '<C-f>', fuzzy_find_current_buffer, { desc = 'Fuzzily search in current buffer' })
 
+map("n", "K", vim.lsp.buf.hover, opts)
+map("n", "<C-k>", vim.lsp.buf.signature_help, opts)
