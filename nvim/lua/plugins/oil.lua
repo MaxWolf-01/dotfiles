@@ -5,6 +5,9 @@ return {
   event = "BufWinEnter",
 
   opts = {
+    view_options = {
+      show_hidden = true,
+    },
     columns = {
       "icon",
       "permissions",
@@ -12,4 +15,3 @@ return {
     },
   },
 }
-

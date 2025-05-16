@@ -12,14 +12,14 @@ local opts = {    -- default options
 
 map("n", "<leader><leader>", ":Dashboard<CR>", opts) -- show dashboard: https://github.com/nvimdev/dashboard-nvim
 map("n", "U", "<NOP>", opts)                         -- disable U (scary behvaior)
-map("n", "<leader>ca", ":%y<CR>", opts)              -- copy all
+map("n", "<leader>y", ":%y<CR>", opts)               -- copy all
 -- Scroling and finding
 map("n", "<C-d>", "<C-d>zz", opts)                   -- centered cursor when scrolling down
 map("n", "<C-u>", "<C-u>zz", opts)                   -- centered cursor when scrolling up
-map('n', 'n', 'nzzzv')                               -- next search result stays centered
-map('n', 'N', 'Nzzzv')                               -- previous search result stays centered
+map('n', 'n', 'nzzzv', opts)                         -- next search result stays centered
+map('n', 'N', 'Nzzzv', opts)                         -- previous search result stays centered
 -- Clear highlights on search when pressing <Esc> in normal mode. See `:help hlsearch`
-vim.keymap.set('n', '<Esc>', '<cmd>nohlsearch<CR>')
+map('n', '<Esc>', '<cmd>nohlsearch<CR>')
 -- Saving and quitting
 map("n", "<C-s>", ":w<CR>", opts)                  -- ctrl+s saves in normal ...
 map("i", "<C-s>", "<Esc>:w<CR>a", opts)            -- ... and in insert mode returns to insert
@@ -94,34 +94,47 @@ map('n', '<leader>tr', function()                           -- terminal in git r
     end
   end
 end, opts)
+map('t', '<Esc><Esc>', '<C-\\><C-n>', { desc = 'Exit terminal mode' })
 
 -- ====================================================================
 -- lsp
 -- ====================================================================
-
-map("n", "gD", vim.lsp.buf.declaration, opts)
-map("n", "gd", vim.lsp.buf.definition, opts)
-map("n", "gi", vim.lsp.buf.implementation, opts)
-map("n", "gs", vim.lsp.buf.signature_help, opts)
--- TODO see :help vim.lsp.buf<Tab>
+-- navigation
+map("n", "gd", vim.lsp.buf.definition, { desc = "Go to definition" })
+map("n", "gD", vim.lsp.buf.declaration, { desc = "Go to declaration" })
+map("n", "gr", vim.lsp.buf.references, { desc = "Go to references" })
+map("n", "gi", vim.lsp.buf.implementation, { desc = "Go to implementation" })
+map("n", "gt", vim.lsp.buf.type_definition, { desc = "Go to type definition" })
+-- information
+map("n", "K", vim.lsp.buf.hover, { desc = "Show hover documentation" })
+map("n", "<C-k>", vim.lsp.buf.signature_help, { desc = "Show signature help" })
+-- actions
+map("n", "<leader>la", vim.lsp.buf.code_action, { desc = "Code actions" })
+map("n", "<leader>lr", vim.lsp.buf.rename, { desc = "Rename symbol" })
+map("n", "<leader>lf", vim.lsp.buf.format, { desc = "Format document" })
+-- diagnostics
+map("n", "<leader>ld", vim.diagnostic.open_float, { desc = "Line diagnostics" })
+map("n", "[d", function() vim.diagnostic.goto_prev({ float = true }) end, { desc = "Previous diagnostic" })
+map("n", "]d", function() vim.diagnostic.goto_next({ float = true }) end, { desc = "Next diagnostic" })
+map("n", "[e", function() vim.diagnostic.goto_prev({ severity = vim.diagnostic.severity.ERROR }) end,
+  { desc = "Previous error" })
+map("n", "]e", function() vim.diagnostic.goto_next({ severity = vim.diagnostic.severity.ERROR }) end,
+  { desc = "Next error" })
+map("n", "[w", function() vim.diagnostic.goto_prev({ severity = vim.diagnostic.severity.WARN }) end,
+  { desc = "Previous warning" })
+map("n", "]w", function() vim.diagnostic.goto_next({ severity = vim.diagnostic.severity.WARN }) end,
+  { desc = "Next warning" })
+map("n", "<leader>lq", vim.diagnostic.setloclist, { desc = "Diagnostics to loclist" })
+map("n", "<leader>lQ", vim.diagnostic.setqflist, { desc = "Diagnostics to quickfix" })
 
 -- ====================================================================
 -- lspsaga https://nvimdev.github.io/lspsaga/
 -- ====================================================================
 
-map("n", "<leader>rn", ":Lspsaga rename <CR>", opts)
-map("n", "<leader>rN", ":Lspsaga rename ++project<CR>", opts)
--- map("n", "<leader>RN", ":Lspsaga project_replace <CR>", d_opts)
-map("n", "<leader>a", ":Lspsaga code_action<CR>", opts)
-
--- ====================================================================
--- diagnostic
--- ====================================================================
-
-map('n', ']d', function() vim.diagnostic.jump({ count = 1, float = true }) end, opts)
-map('n', '[d', function() vim.diagnostic.jump({ count = -1, float = true }) end, opts)
-map("n", "gef", vim.diagnostic.open_float, opts)
-map("n", "geq", vim.diagnostic.setqflist, opts)
+-- TODO
+-- map("n", "<leader>lR", ":Lspsaga rename ++project<CR>", { desc = "Rename across project", silent = true })
+-- map("n", "<leader>la", ":Lspsaga code_action<CR>", { desc = "Code actions (saga)", silent = true })
+-- map("n", "<leader>lo", ":Lspsaga outline<CR>", { desc = "Show document outline", silent = true })
 
 -- ====================================================================
 -- oil
@@ -136,10 +149,8 @@ map("n", "-", "<CMD>Oil<CR>", opts)
 map("n", "<leader>ff", ":Telescope find_files hidden=true<CR>", opts)
 map("n", "<leader>fa", ":Telescope find_files hidden=true no_ignore=true<CR>", opts)
 map("n", "<leader>fg", ":Telescope git_files hidden=true<CR>", opts)
-map("n", "<leader>fG", ":Telescope git_commits<CR>", opts)
-map("n", "<leader>gst", ":Telescope git_status<CR>", opts)
 map("n", "<leader>ft", ":Telescope oldfiles<CR>", opts)
-map("n", "<leader>fw", ":Telescope live_grep<CR>", opts)
+map("n", "<leader>fw", ":Telescope live_grep hidden=true<CR>", opts)
 map("n", "<leader>fW", ":Telescope live_grep word_match=-w<CR>", opts)
 map("n", "<leader>fl", ":Telescope grep_string<CR>", opts) -- literal search (no regex)
 map("n", "<leader>fb", ":Telescope buffers<CR>", opts)
@@ -163,5 +174,28 @@ end
 map('n', '<leader>/', fuzzy_find_current_buffer, { desc = '[/] Fuzzily search in current buffer' })
 map('n', '<C-f>', fuzzy_find_current_buffer, { desc = 'Fuzzily search in current buffer' })
 
-map("n", "K", vim.lsp.buf.hover, opts)
-map("n", "<C-k>", vim.lsp.buf.signature_help, opts)
+-- ====================================================================
+-- Git
+-- ====================================================================
+
+-- telescope
+map("n", "<leader>gc", ":Telescope git_commits<CR>", opts)
+map("n", "<leader>gfh", ":Telescope git_bcommits<CR>", opts)
+map("n", "<leader>gst", ":Telescope git_status<CR>", opts)
+map("n", "<leader>gbr", ":Telescope git_branches<CR>", opts)
+
+-- gitsigns.nvim
+map("n", "<leader>gh", ":Gitsigns preview_hunk<CR>", { desc = "Preview hunk", silent = true })
+map("n", "<leader>gs", ":Gitsigns stage_hunk<CR>", { desc = "Stage hunk", silent = true })
+map("n", "<leader>gS", ":Gitsigns stage_buffer<CR>", { desc = "Stage buffer", silent = true })
+map("n", "<leader>gr", ":Gitsigns reset_hunk<CR>", { desc = "Reset hunk", silent = true })
+map("n", "<leader>gu", ":Gitsigns undo_stage_hunk<CR>", { desc = "Undo stage hunk", silent = true })
+map("n", "<leader>gR", ":Gitsigns reset_buffer<CR>", { desc = "Reset buffer", silent = true })
+map("n", "[h", ":Gitsigns prev_hunk<CR>", { desc = "Previous hunk", silent = true })
+map("n", "]h", ":Gitsigns next_hunk<CR>", { desc = "Next hunk", silent = true })
+map("n", "<leader>gtd", ":Gitsigns toggle_deleted<CR>", { desc = "Toggle deleted", silent = true })
+-- TODO replace with hunk.nvim?
+map("n", "<leader>gd", ":Gitsigns diffthis<CR>", { desc = "Diff this", silent = true })
+map("n", "<leader>gD", ":Gitsigns diffthis HEAD<CR>", { desc = "Diff with HEAD", silent = true })
+
+-- TODO fugitive.vim for blaming entire buffer, ...
