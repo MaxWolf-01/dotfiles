@@ -21,11 +21,15 @@ map('n', 'N', 'Nzzzv', opts)                         -- previous search result s
 -- Clear highlights on search when pressing <Esc> in normal mode. See `:help hlsearch`
 map('n', '<Esc>', '<cmd>nohlsearch<CR>')
 -- Saving and quitting
-map("n", "<C-s>", ":w<CR>", opts)                  -- ctrl+s saves in normal ...
-map("i", "<C-s>", "<Esc>:w<CR>a", opts)            -- ... and in insert mode returns to insert
-map('n', '<leader>ww', ':w<CR>')                   -- save with space+ww
-map('n', '<leader>wq', ':wq<CR>')                  -- quit with space+wq
-map('n', '<leader>qq', ':q<CR>')                   -- save quit with space+qq
+map("n", "<C-s>", ":w<CR>", opts)       -- ctrl+s saves in normal ...
+map("i", "<C-s>", "<Esc>:w<CR>a", opts) -- ... and in insert mode returns to insert
+map('n', '<leader>ww', ':w<CR>', opts)
+map('n', '<leader>wq', ':wq<CR>', opts)
+map('n', '<leader>wa', ':wa<CR>', opts)
+map('n', '<leader>wx', ':wqa<CR>', opts)
+map('n', '<leader>qa', ':qa<CR>', opts)
+map('n', '<leader>qq', ':q<CR>', opts)
+
 map("x", "<leader>p", "\"_dP", opts)               -- preserve paste register when pasting over selection
 -- Directory Navigation
 map('n', '<leader>cd', ':cd %:p:h<CR>:pwd<CR>')    -- cd to dir of current file and show it
@@ -161,8 +165,6 @@ map("n", "<leader>fd", ":Telescope lsp_definitions<CR>", opts)
 map("n", "<leader>fD", ":Telescope lsp_type_definitions<CR>", opts)
 map("n", "<leader>fr", ":Telescope lsp_references<CR>", opts)
 map("n", "<leader>fi", ":Telescope lsp_implementations<CR>", opts)
-map("n", "<leader>fs", ":Telescope lsp_document_symbols<CR>", opts)
-map("n", "<leader>fS", ":Telescope lsp_workspace_symbols<CR>", opts)
 map("n", "<leader>fx", ":Telescope diagnostics<CR>", opts)
 local builtin = require 'telescope.builtin'
 local function fuzzy_find_current_buffer()
@@ -174,6 +176,8 @@ end
 map('n', '<leader>/', fuzzy_find_current_buffer, { desc = '[/] Fuzzily search in current buffer' })
 map('n', '<C-f>', fuzzy_find_current_buffer, { desc = 'Fuzzily search in current buffer' })
 
+map("n", "<leader>fs", ":Telescope prosession<CR>", { desc = "Find / switch session", silent = true })
+
 -- ====================================================================
 -- Git
 -- ====================================================================
@@ -184,7 +188,7 @@ map("n", "<leader>gfh", ":Telescope git_bcommits<CR>", opts)
 map("n", "<leader>gst", ":Telescope git_status<CR>", opts)
 map("n", "<leader>gbr", ":Telescope git_branches<CR>", opts)
 
--- gitsigns.nvim
+-- https://github.com/lewis6991/gitsigns.nvim
 map("n", "<leader>gh", ":Gitsigns preview_hunk<CR>", { desc = "Preview hunk", silent = true })
 map("n", "<leader>gs", ":Gitsigns stage_hunk<CR>", { desc = "Stage hunk", silent = true })
 map("n", "<leader>gS", ":Gitsigns stage_buffer<CR>", { desc = "Stage buffer", silent = true })
@@ -199,3 +203,12 @@ map("n", "<leader>gd", ":Gitsigns diffthis<CR>", { desc = "Diff this", silent = 
 map("n", "<leader>gD", ":Gitsigns diffthis HEAD<CR>", { desc = "Diff with HEAD", silent = true })
 
 -- TODO fugitive.vim for blaming entire buffer, ...
+
+
+-- ====================================================================
+-- Sessions
+-- ====================================================================
+
+-- https://github.com/dhruvasagar/vim-prosession
+map("n", "<leader>sd", ":ProsessionDelete<CR>", { desc = "Delete current session", silent = true })
+map("n", "<leader>sc", ":ProsessionClean<CR>", { desc = "Clean stale session files", silent = true })
