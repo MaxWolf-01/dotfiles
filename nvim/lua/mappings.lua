@@ -65,6 +65,7 @@ map('n', '<leader>vv', ':vsplit<CR>', opts)
 map('n', '<leader>vh', ':split<CR>', opts)
 -- window resizing
 map('n', '<S-A-h>', ':vertical resize +4<CR>', opts)
+map('n', '<S-A-l>', ':vertical resize -4<CR>') -- decrease width
 map('n', '<S-A-j>', ':resize -4<CR>', opts)
 map('n', '<S-A-k>', ':resize +4<CR>', opts)
 -- use ALT+{h,j,k,l} to navigate windows from any mode
@@ -150,9 +151,9 @@ map("n", "-", "<CMD>Oil<CR>", opts)
 -- telescope
 -- ====================================================================
 
-map("n", "<leader>ff", ":Telescope find_files hidden=true<CR>", opts)
-map("n", "<leader>fa", ":Telescope find_files hidden=true no_ignore=true<CR>", opts)
+map("n", "<leader>ff", ":Telescope git_files hidden=true show_untracked=true<CR>", opts)
 map("n", "<leader>fg", ":Telescope git_files hidden=true<CR>", opts)
+map("n", "<leader>fa", ":Telescope find_files hidden=false no_ignore=true<CR>", opts)
 map("n", "<leader>ft", ":Telescope oldfiles<CR>", opts)
 map("n", "<leader>fw", ":Telescope live_grep hidden=true<CR>", opts)
 map("n", "<leader>fW", ":Telescope live_grep word_match=-w<CR>", opts)
