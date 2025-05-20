@@ -11,15 +11,14 @@ vim.diagnostic.config({
       [vim.diagnostic.severity.WARN] = "DiagnosticSignWarn",
       [vim.diagnostic.severity.INFO] = "DiagnosticSignInfo",
       [vim.diagnostic.severity.HINT] = "DiagnosticSignHint",
-    }
-  }
+    },
+  },
 })
-
 
 local function on_attach(_, _) end
 
 local function on_init(client, _)
-  if client.supports_method "textDocument/semanticTokens" then
+  if client.supports_method("textDocument/semanticTokens") then
     client.server_capabilities.semanticTokensProvider = nil
   end
 end
@@ -50,11 +49,10 @@ end
 
 return {
   "neovim/nvim-lspconfig",
-
   config = function()
     local lsp_files = vim.api.nvim_get_runtime_file("lua/lsps/*.lua", true)
     for _, file in ipairs(lsp_files) do
-      local lsp_name = file:match "([^/]+)%.%w+$"
+      local lsp_name = file:match("([^/]+)%.%w+$")
 
       local opts = require("lsps." .. lsp_name)
       opts.capabilities = get_capabilities()

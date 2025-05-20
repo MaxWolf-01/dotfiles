@@ -1,9 +1,9 @@
 -- TODO restructure with claude, add comments as descriptions
 
 local map = vim.keymap.set
-local opts = {    -- default options
+local opts = { -- default options
   noremap = true, -- non-recursive, i.e. ignore other mappings; true per default
-  silent = true,  -- prevents command from being echoed in the command line
+  silent = true, -- prevents command from being echoed in the command line
 }
 
 -- ====================================================================
@@ -11,63 +11,63 @@ local opts = {    -- default options
 -- ====================================================================
 
 map("n", "<leader><leader>", ":Dashboard<CR>", opts) -- show dashboard: https://github.com/nvimdev/dashboard-nvim
-map("n", "U", "<NOP>", opts)                         -- disable U (scary behvaior)
-map("n", "<leader>y", ":%y<CR>", opts)               -- copy all
+map("n", "U", "<NOP>", opts) -- disable U (scary behvaior)
+map("n", "<leader>y", ":%y<CR>", opts) -- copy all
 -- Scroling and finding
-map("n", "<C-d>", "<C-d>zz", opts)                   -- centered cursor when scrolling down
-map("n", "<C-u>", "<C-u>zz", opts)                   -- centered cursor when scrolling up
-map('n', 'n', 'nzzzv', opts)                         -- next search result stays centered
-map('n', 'N', 'Nzzzv', opts)                         -- previous search result stays centered
+map("n", "<C-d>", "<C-d>zz", opts) -- centered cursor when scrolling down
+map("n", "<C-u>", "<C-u>zz", opts) -- centered cursor when scrolling up
+map("n", "n", "nzzzv", opts) -- next search result stays centered
+map("n", "N", "Nzzzv", opts) -- previous search result stays centered
 -- Clear highlights on search when pressing <Esc> in normal mode. See `:help hlsearch`
-map('n', '<Esc>', '<cmd>nohlsearch<CR>')
+map("n", "<Esc>", "<cmd>nohlsearch<CR>")
 -- Saving and quitting
-map("n", "<C-s>", ":w<CR>", opts)       -- ctrl+s saves in normal ...
+map("n", "<C-s>", ":w<CR>", opts) -- ctrl+s saves in normal ...
 map("i", "<C-s>", "<Esc>:w<CR>a", opts) -- ... and in insert mode returns to insert
-map('n', '<leader>ww', ':w<CR>', opts)
-map('n', '<leader>wq', ':wq<CR>', opts)
-map('n', '<leader>wa', ':wa<CR>', opts)
-map('n', '<leader>wx', ':wqa<CR>', opts)
-map('n', '<leader>qa', ':qa<CR>', opts)
-map('n', '<leader>qq', ':q<CR>', opts)
+map("n", "<leader>ww", ":w<CR>", opts)
+map("n", "<leader>wq", ":wq<CR>", opts)
+map("n", "<leader>wa", ":wa<CR>", opts)
+map("n", "<leader>wx", ":wqa<CR>", opts)
+map("n", "<leader>qa", ":qa<CR>", opts)
+map("n", "<leader>qq", ":q<CR>", opts)
 
-map("x", "<leader>p", "\"_dP", opts)               -- preserve paste register when pasting over selection
+map("x", "<leader>p", '"_dP', opts) -- preserve paste register when pasting over selection
 -- Directory Navigation
-map('n', '<leader>cd', ':cd %:p:h<CR>:pwd<CR>')    -- cd to dir of current file and show it
-map('n', '<leader>cdww', ':lcd %:p:h<CR>:pwd<CR>') -- window-local cd to dir of current file and show it
-map('n', '<leader>cdr', function()                 -- cd to git root of current file (if in git repo)
-  local handle = io.popen('git rev-parse --is-inside-work-tree 2>/dev/null')
+map("n", "<leader>cd", ":cd %:p:h<CR>:pwd<CR>") -- cd to dir of current file and show it
+map("n", "<leader>cdww", ":lcd %:p:h<CR>:pwd<CR>") -- window-local cd to dir of current file and show it
+map("n", "<leader>cdr", function() -- cd to git root of current file (if in git repo)
+  local handle = io.popen("git rev-parse --is-inside-work-tree 2>/dev/null")
   if handle then
     local result = handle:read("*a")
     handle:close()
     if result ~= "" then -- If in git repo
-      vim.cmd('cd ' .. vim.fn.system('git rev-parse --show-toplevel'):gsub('\n', ''))
-      vim.cmd('pwd')
+      vim.cmd("cd " .. vim.fn.system("git rev-parse --show-toplevel"):gsub("\n", ""))
+      vim.cmd("pwd")
     else
       vim.notify("Not in a git repository", vim.log.levels.WARN)
     end
   end
 end)
-map('n', '<leader>cdwr', function() -- window-local cd to git root of current file (if in git repo)
-  local handle = io.popen('git rev-parse --is-inside-work-tree 2>/dev/null')
+map("n", "<leader>cdwr", function() -- window-local cd to git root of current file (if in git repo)
+  local handle = io.popen("git rev-parse --is-inside-work-tree 2>/dev/null")
   if handle then
     local result = handle:read("*a")
     handle:close()
     if result ~= "" then -- If in git repo
-      vim.cmd('lcd ' .. vim.fn.system('git rev-parse --show-toplevel'):gsub('\n', ''))
-      vim.cmd('pwd')
+      vim.cmd("lcd " .. vim.fn.system("git rev-parse --show-toplevel"):gsub("\n", ""))
+      vim.cmd("pwd")
     else
       vim.notify("Not in a git repository", vim.log.levels.WARN)
     end
   end
 end)
 -- window splits
-map('n', '<leader>vv', ':vsplit<CR>', opts)
-map('n', '<leader>vh', ':split<CR>', opts)
+map("n", "<leader>vv", ":vsplit<CR>", opts)
+map("n", "<leader>vh", ":split<CR>", opts)
 -- window resizing
-map('n', '<S-A-h>', ':vertical resize +4<CR>', opts)
-map('n', '<S-A-l>', ':vertical resize -4<CR>') -- decrease width
-map('n', '<S-A-j>', ':resize -4<CR>', opts)
-map('n', '<S-A-k>', ':resize +4<CR>', opts)
+map("n", "<S-A-h>", ":vertical resize +4<CR>", opts)
+map("n", "<S-A-l>", ":vertical resize -4<CR>") -- decrease width
+map("n", "<S-A-j>", ":resize -4<CR>", opts)
+map("n", "<S-A-k>", ":resize +4<CR>", opts)
 -- use ALT+{h,j,k,l} to navigate windows from any mode
 map("t", "<A-h>", "<C-\\><C-N><C-w>h", opts)
 map("t", "<A-j>", "<C-\\><C-N><C-w>j", opts)
@@ -81,25 +81,25 @@ map("n", "<A-h>", "<C-w>h", opts)
 map("n", "<A-j>", "<C-w>j", opts)
 map("n", "<A-k>", "<C-w>k", opts)
 map("n", "<A-l>", "<C-w>l", opts)
-map('n', '<S-A-l>', ':vertical resize -4<CR>')
+map("n", "<S-A-l>", ":vertical resize -4<CR>")
 -- terminal stuff: http://neovim.io/doc/user/terminal.html#terminal
-map('n', '<leader>tt', ':lcd %:p:h<CR>:terminal<CR>', opts) -- open terminal in dir of current file
-map('n', '<leader>T', ':terminal<CR>', opts)                -- open terminal in working directory
-map('t', '<S-Esc>', [[<C-\><C-n>]], opts)                   -- all other mappings didn't work
-map('n', '<leader>tr', function()                           -- terminal in git root (if in git repo)
-  local handle = io.popen('git rev-parse --is-inside-work-tree 2>/dev/null')
+map("n", "<leader>tt", ":lcd %:p:h<CR>:terminal<CR>", opts) -- open terminal in dir of current file
+map("n", "<leader>T", ":terminal<CR>", opts) -- open terminal in working directory
+map("t", "<S-Esc>", [[<C-\><C-n>]], opts) -- all other mappings didn't work
+map("n", "<leader>tr", function() -- terminal in git root (if in git repo)
+  local handle = io.popen("git rev-parse --is-inside-work-tree 2>/dev/null")
   if handle then
     local result = handle:read("*a")
     handle:close()
     if result ~= "" then
-      vim.cmd('lcd ' .. vim.fn.system('git rev-parse --show-toplevel'):gsub('\n', ''))
-      vim.cmd('terminal')
+      vim.cmd("lcd " .. vim.fn.system("git rev-parse --show-toplevel"):gsub("\n", ""))
+      vim.cmd("terminal")
     else
       vim.notify("Not in a git repository", vim.log.levels.WARN)
     end
   end
 end, opts)
-map('t', '<Esc><Esc>', '<C-\\><C-n>', { desc = 'Exit terminal mode' })
+map("t", "<Esc><Esc>", "<C-\\><C-n>", { desc = "Exit terminal mode" })
 
 -- ====================================================================
 -- lsp
@@ -111,24 +111,25 @@ map("n", "gr", vim.lsp.buf.references, { desc = "Go to references" })
 map("n", "gi", vim.lsp.buf.implementation, { desc = "Go to implementation" })
 map("n", "gt", vim.lsp.buf.type_definition, { desc = "Go to type definition" })
 -- information
+
 map("n", "K", vim.lsp.buf.hover, { desc = "Show hover documentation" })
 map("n", "<C-k>", vim.lsp.buf.signature_help, { desc = "Show signature help" })
+
 -- actions
+
 map("n", "<leader>la", vim.lsp.buf.code_action, { desc = "Code actions" })
 map("n", "<leader>lr", vim.lsp.buf.rename, { desc = "Rename symbol" })
 map("n", "<leader>lf", vim.lsp.buf.format, { desc = "Format document" })
+
 -- diagnostics
-map("n", "<leader>ld", vim.diagnostic.open_float, { desc = "Line diagnostics" })
-map("n", "[d", function() vim.diagnostic.goto_prev({ float = true }) end, { desc = "Previous diagnostic" })
-map("n", "]d", function() vim.diagnostic.goto_next({ float = true }) end, { desc = "Next diagnostic" })
-map("n", "[e", function() vim.diagnostic.goto_prev({ severity = vim.diagnostic.severity.ERROR }) end,
-  { desc = "Previous error" })
-map("n", "]e", function() vim.diagnostic.goto_next({ severity = vim.diagnostic.severity.ERROR }) end,
-  { desc = "Next error" })
-map("n", "[w", function() vim.diagnostic.goto_prev({ severity = vim.diagnostic.severity.WARN }) end,
-  { desc = "Previous warning" })
-map("n", "]w", function() vim.diagnostic.goto_next({ severity = vim.diagnostic.severity.WARN }) end,
-  { desc = "Next warning" })
+
+map("n", "[d", function() vim.diagnostic.jump({ count = -1, float = true }) end, { desc = "Previous diagnostic" })
+map("n", "]d", function() vim.diagnostic.jump({ count = 1, float = true }) end, { desc = "Next diagnostic" })
+map("n", "[e", function() vim.diagnostic.jump({ count = -1, severity = vim.diagnostic.severity.ERROR, float = true }) end, { desc = "Previous error" })
+map("n", "]e", function() vim.diagnostic.jump({ count = 1, severity = vim.diagnostic.severity.ERROR, float = true }) end, { desc = "Next error" })
+map("n", "[w", function() vim.diagnostic.jump({ count = -1, severity = vim.diagnostic.severity.WARN, float = true }) end, { desc = "Previous warning" })
+map("n", "]w", function() vim.diagnostic.jump({ count = 1, severity = vim.diagnostic.severity.WARN, float = true }) end, { desc = "Next warning" })
+
 map("n", "<leader>lq", vim.diagnostic.setloclist, { desc = "Diagnostics to loclist" })
 map("n", "<leader>lQ", vim.diagnostic.setqflist, { desc = "Diagnostics to quickfix" })
 
@@ -167,15 +168,15 @@ map("n", "<leader>fD", ":Telescope lsp_type_definitions<CR>", opts)
 map("n", "<leader>fr", ":Telescope lsp_references<CR>", opts)
 map("n", "<leader>fi", ":Telescope lsp_implementations<CR>", opts)
 map("n", "<leader>fx", ":Telescope diagnostics<CR>", opts)
-local builtin = require 'telescope.builtin'
+local builtin = require("telescope.builtin")
 local function fuzzy_find_current_buffer()
-  builtin.current_buffer_fuzzy_find(require('telescope.themes').get_dropdown {
+  builtin.current_buffer_fuzzy_find(require("telescope.themes").get_dropdown({
     winblend = 10,
     previewer = false,
-  })
+  }))
 end
-map('n', '<leader>/', fuzzy_find_current_buffer, { desc = '[/] Fuzzily search in current buffer' })
-map('n', '<C-f>', fuzzy_find_current_buffer, { desc = 'Fuzzily search in current buffer' })
+map("n", "<leader>/", fuzzy_find_current_buffer, { desc = "[/] Fuzzily search in current buffer" })
+map("n", "<C-f>", fuzzy_find_current_buffer, { desc = "Fuzzily search in current buffer" })
 
 map("n", "<leader>fs", ":Telescope prosession<CR>", { desc = "Find / switch session", silent = true })
 
@@ -204,7 +205,6 @@ map("n", "<leader>gd", ":Gitsigns diffthis<CR>", { desc = "Diff this", silent = 
 map("n", "<leader>gD", ":Gitsigns diffthis HEAD<CR>", { desc = "Diff with HEAD", silent = true })
 
 -- TODO fugitive.vim for blaming entire buffer, ...
-
 
 -- ====================================================================
 -- Sessions
