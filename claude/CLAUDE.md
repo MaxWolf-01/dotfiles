@@ -1,0 +1,1 @@
+/home/max/.claude/CLAUDE.md
