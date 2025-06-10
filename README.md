@@ -56,12 +56,15 @@ cd ~ && git clone --depth 1 git@github.com:MaxWolf-01/dotfiles.git
 ```bash
 mv dotfiles .dotfiles && cd ~/.dotfiles && ./install && ./setup minimal 
 ```
-or for a more complete setup use `./setup cli` or `./setup ubuntu`.
 
-*open new shell* (or reboot when in doubt)
+Then *open new shell* (or reboot when in doubt), and optionally execute additional setup functions, such as:
+```bash
+./setup cli
+./setup ubuntu
+```
 
 `./install` and most functions in `setup` are idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
-But make sure to export your gnome keyboard shortcuts via `./bin/keybindings.pl` before you execute the script, otherwise they get overwritten by mine.
+But make sure to export your gnome keyboard shortcuts via `./bin/keybindings.pl` before you execute `./setup ubuntu`, otherwise they get overwritten by mine.
 
 ### Setup (Android)
 
