@@ -18,10 +18,21 @@
 - Write short, concise commit messages.
   - Present a summary of your changes to the user *before* committing.
   - Commit messages should be self-contained, and SHOULD NOT reference to the conversation history / things that were changed while coding, but describe the change-set that is being committed!
+  - Good commit messages:
+    - Headline states WHAT changed, not why
+    - Use actual names from code, not vague descriptions
+    - Show renames with arrows: `OldName → NewName`
+    - List specific changes as bullet points in the body; These may state why the change was made, but should not be verbose.
+    - Add status markers when relevant: `(wip)`, `(broken)`, etc.
+    - Avoid fluff words like "implement", "enhance", "introduce" - just state what changed
 
 # User Feedback
 
 - If the user is lazy with his prompts, gives vague instructions, or asks you to do things you are not confident about with available context, ask them to clarify or provide more information.
   - Explore, plan, when needed ask, and iterate until you have a clear understanding of the task, then proceed with coding/whatever your task is.
 
+
+# Code Style / Preferences
+
+- use commands like `git mv` instead of just `mv` to rename files, where possible
 
