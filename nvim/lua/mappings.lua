@@ -17,6 +17,15 @@ map("n", "<leader>y", ":%y<CR>", opts) -- copy all
 map("n", "<Esc>", "<cmd>nohlsearch<CR>") -- Clear highlights on search when pressing <Esc> in normal mode. See `:help hlsearch`
 map("x", "<leader>p", '"_dP', opts) -- preserve paste register when pasting over selection
 
+-- Code blocks
+
+map("n", "dic", "V?```<CR>jo/```<CR>kd", { desc = "Delete inside code block" })
+map("n", "dac", "V?```<CR>o/```<CR>d", { desc = "Delete around code block" })
+map("n", "yic", "V?```<CR>jo/```<CR>ky", { desc = "Yank inside code block" })
+map("n", "yac", "V?```<CR>o/```<CR>y", { desc = "Yank around code block" })
+map("n", "cic", "V?```<CR>jo/```<CR>kc", { desc = "Change inside code block" })
+map("n", "cac", "V?```<CR>o/```<CR>c", { desc = "Change around code block" })
+
 -- Scroling and finding
 
 map("n", "<C-d>", "<C-d>zz", opts) -- centered cursor when scrolling down
