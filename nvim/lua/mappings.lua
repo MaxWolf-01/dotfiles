@@ -38,7 +38,7 @@ map("n", "N", "Nzzzv", opts) -- previous search result stays centered
 map("n", "<C-s>", ":w<CR>", opts) -- ctrl+s saves in normal ...
 map("i", "<C-s>", "<Esc>:w<CR>a", opts) -- ... and in insert mode returns to insert
 map("n", "<leader>ww", ":w<CR>", opts)
-map("n", "<leader>wq", ":wq<CR>", opts)
+map("n", "<leader>wqq", ":wq<CR>", opts)
 map("n", "<leader>wa", ":wa<CR>", opts)
 map("n", "<leader>wx", ":wqa<CR>", opts)
 map("n", "<leader>qa", ":qa<CR>", opts)
@@ -184,7 +184,7 @@ map("n", "<leader>fa", ":Telescope find_files hidden=false no_ignore=true<CR>", 
 map("n", "<leader>ft", ":Telescope oldfiles<CR>", opts)
 map("n", "<leader>fb", ":Telescope buffers<CR>", opts)
 
-map("n", "<leader>fw", ":Telescope live_grep hidden=true<CR>", opts)
+map("n", "<leader>fw", ":Telescope live_grep hidden=true<CR>", opts) -- TODO!! It does not search in hidden files!
 map("n", "<leader>fW", ":Telescope live_grep word_match=-w<CR>", opts)
 map("n", "<leader>fl", ":Telescope grep_string<CR>", opts) -- literal search (no regex)
 local builtin = require("telescope.builtin")
