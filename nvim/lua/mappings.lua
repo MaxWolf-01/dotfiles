@@ -25,6 +25,8 @@ map("n", "yic", "V?```<CR>jo/```<CR>ky", { desc = "Yank inside code block" })
 map("n", "yac", "V?```<CR>o/```<CR>y", { desc = "Yank around code block" })
 map("n", "cic", "V?```<CR>jo/```<CR>kc", { desc = "Change inside code block" })
 map("n", "cac", "V?```<CR>o/```<CR>c", { desc = "Change around code block" })
+map("n", "gcic", "V?```<CR>jo/```<CR>kgc", { desc = "Comment inside code block" })
+map("n", "gcac", "V?```<CR>o/```<CR>gc", { desc = "Comment around code block" })
 
 -- Scroling and finding
 

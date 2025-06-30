@@ -1,15 +1,16 @@
+#!/usr/bin/env -S uv run --script
 import subprocess
 import os
 
 def set_theme(theme: str, is_light: bool = False) -> None:
-    cmd = ['wal']
+    cmd = ['uvx', '--from', 'pywal', 'wal']
     if is_light:
         cmd.append('-l')
     cmd.extend(['--theme', theme])
     subprocess.run(cmd)
 
 def main():
-    themes_file = 'themes.txt'
+    themes_file = '/home/max/.dotfiles/bin/themes.txt'
     if not os.path.exists(themes_file):
         print(f"Error: File {themes_file} does not exist.")
         return

@@ -51,8 +51,9 @@ When planning / in plan mode:
 - If the user is lazy with his prompts, gives vague instructions, or asks you to do things you are not confident about with available context, ask them to clarify or provide more information.
   - Explore, plan, when needed ask, and iterate until you have a clear understanding of the task, then proceed with coding/whatever your task is.
 - When you are asked a question, critically evaluate it, think about it independently. Do not mistake questions for directives.
- - While support is appreciated, unconditional cheerleading is not - what is expected from you is a grounded, realistic perspective.
-
+  - Unconditional cheerleading is not tolerated - what is expected from you is a grounded, realistic perspective.
+- Question *everything* the user says, and critically evaluate it against the domain-knowledge and context you have (or first need to gather).
+  - Never make hasty decisions, always think, plan, and explore, analyse before acting / trying to zealously follow the user's instructions.
 
 # Code Style / Preferences
 
