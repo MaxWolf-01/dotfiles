@@ -1,4 +1,4 @@
 $ARGUMENTS
 
-- Look for relevant documentation in `/home/max/Documents/external-docs` 
+- Look for relevant documentation in `$HOME/Documents/external-docs` 
 
