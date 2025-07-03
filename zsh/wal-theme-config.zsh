@@ -5,13 +5,13 @@
 # Available themes (uncomment one)
 
 # Generate a theme from an image
-# WAL_THEME_IMAGE="/home/max/Pictures/cli-themes/andromeda"
-# WAL_THEME_IMAGE="/home/max/Pictures/cli-themes/kanagawa"
-# WAL_THEME_IMAGE="/home/max/Pictures/cli-themes/vaporwave-kanagawa"
-# WAL_THEME_IMAGE="/home/max/Pictures/cli-themes/black-hole"
+# WAL_THEME_IMAGE="$HOME/Pictures/cli-themes/andromeda"
+# WAL_THEME_IMAGE="$HOME/Pictures/cli-themes/kanagawa"
+# WAL_THEME_IMAGE="$HOME/Pictures/cli-themes/vaporwave-kanagawa"
+# WAL_THEME_IMAGE="$HOME/Pictures/cli-themes/black-hole"
 # Or use a custom JSON theme
-WAL_THEME_FILE="/home/max/.dotfiles/zsh/wal-themes/ghibli-dark.json"
-# WAL_THEME_FILE="/home/max/.dotfiles/zsh/wal-themes/ghibli-dark-original.json"
+WAL_THEME_FILE="$HOME/.dotfiles/zsh/wal-themes/ghibli-dark.json"
+# WAL_THEME_FILE="$HOME/.dotfiles/zsh/wal-themes/ghibli-dark-original.json"
 # Or use a built-in theme instead
 # WAL_THEME_NAME="base16-atelier-cave"
 

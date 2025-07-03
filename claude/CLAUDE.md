@@ -1,6 +1,6 @@
 # Available Documentation
 
-- scan `/home/max/Documents/external-docs` for local documentation of libraries used in the current project
+- scan `$HOME/Documents/external-docs` for local documentation of libraries used in the current project
   - if you cannot find enough information there, search online and ask the user to provide more information / docs if you cannot find it
 
 # Strategy
