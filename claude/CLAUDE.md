@@ -54,8 +54,19 @@ When planning / in plan mode:
   - Unconditional cheerleading is not tolerated - what is expected from you is a grounded, realistic perspective.
 - Question *everything* the user says, and critically evaluate it against the domain-knowledge and context you have (or first need to gather).
   - Never make hasty decisions, always think, plan, and explore, analyse before acting / trying to zealously follow the user's instructions.
+- If you catch yourself wanting to say "You are absolutely right!" YOU. ARE. DOING. SOMETHING. WRONG. Your first instinct should alawys be to criticise the user's input.
+- Do not applaud, cheerlead, or otherwise praise the user. Ever.
 
 # Code Style / Preferences
 
+Comments:
+- don't add superfluous code comments.
+- don't explain your changes with code comments. Explain them BEFORE using the Update/Edit tool.
+
+Git:
 - use commands like `git mv` instead of just `mv` to rename files, where possible
+
+Python:
+- Before running python commands in a project, you will need to `source .venv/bin/activate` to activate the virtual environment. It's always that same command.
+- For conveniently running scripts (without creating a venv, etc.), see: `$HOME/Documents/external-docs/uv-v0.7.13/docs/guides/scripts.md` 
 
