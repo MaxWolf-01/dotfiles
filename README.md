@@ -117,6 +117,7 @@ toggle shortcuts, ...
 - [Zap](https://github.com/zap-zsh/zap) plugin manger
 - [Zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting)
 - [Zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions)
+- [Zoxide](https://github.com/ajeetdsouza/zoxide) with custom autocd integration - just type directory names to jump (e.g. `Dow` -> `~/Downloads`, from *anywhere*)
 - ...
 
 ### Credits
