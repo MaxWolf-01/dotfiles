@@ -6,7 +6,7 @@ I use these dotfiles for my daily driver Ubuntu and Android setup, as well as pr
 <summary>Quick setup</summary>
 
 ```bash
-git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.github
+git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git
 cd dotfiles && ./install && ./setup minimal && ./setup cli
 ```
 
