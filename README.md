@@ -2,6 +2,14 @@
 
 I use these dotfiles for my daily driver Ubuntu and Android setup, as well as proxmox and LXCs.
 
+<details>
+<summary>Quick setup</summary>
+```bash
+git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.github
+cd dotfiles && ./install && ./setup minimal && ./setup cli
+```
+</details>
+
 ### Overview
 
 If you plan on cloning / forking this repo, be aware that all config is tailored to me (e.g. paths, usernames, ...) and make sure to change .gitconfig to your name and email.
