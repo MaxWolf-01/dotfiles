@@ -7,7 +7,7 @@ I use these dotfiles for my daily driver Ubuntu and Android setup, as well as pr
 
 ```bash
 git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git
-cd dotfiles && ./install && ./setup minimal && ./setup cli
+mv dotfiles ~/.dotfiles && cd ~/.dotfiles && ./install && ./setup minimal && ./setup cli
 ```
 
 </details>
