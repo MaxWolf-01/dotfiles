@@ -45,6 +45,10 @@ format_duration() {
 # Extract simple name for notifications
 sync_name="${rsync_dest##*@}"  # Get hostname from user@host
 
+# Create local log directory
+log_dir="$HOME/logs/backup"
+mkdir -p "$log_dir"
+
 # Read directories from file (already relative paths)
 dirs=()
 dir_count=0
@@ -136,28 +140,29 @@ else
         error_message="Unknown error occurred during rsync"
     fi
 
-    if [ -n "${ntfy_topic:-}" ]; then
-        # Create a temporary file with full log
-        full_log=$(mktemp)
-        {
-            echo "=== RSYNC ERROR LOG ==="
-            echo "Directories file: $backup_dirs_file"
-            echo "Destination: $rsync_dest:$rsync_dest_path"
-            echo "Start time: $(date -d @$sync_start_time)"
-            echo "Duration: $(format_duration $sync_duration)"
-            echo "Directories to sync: $dir_count"
-            echo ""
-            echo "=== ERROR OUTPUT ==="
-            cat "$error_log" 2>/dev/null || echo "No error output captured"
-            echo ""
-            echo "=== RSYNC OUTPUT ==="
-            cat "$sync_output" 2>/dev/null || echo "No rsync output captured"
-        } > "$full_log"
+    # Save error log locally
+    local_log_file="$log_dir/rsync_error_${sync_name}_$(date +%Y%m%d_%H%M%S).log"
+    {
+        echo "=== RSYNC ERROR LOG ==="
+        echo "Directories file: $backup_dirs_file"
+        echo "Destination: $rsync_dest:$rsync_dest_path"
+        echo "Start time: $(date -d @$sync_start_time)"
+        echo "Duration: $(format_duration $sync_duration)"
+        echo "Directories to sync: $dir_count"
+        echo ""
+        echo "=== ERROR OUTPUT ==="
+        cat "$error_log" 2>/dev/null || echo "No error output captured"
+        echo ""
+        echo "=== RSYNC OUTPUT ==="
+        cat "$sync_output" 2>/dev/null || echo "No rsync output captured"
+    } > "$local_log_file"
+    echo "Error log saved to: $local_log_file"
 
+    if [ -n "${ntfy_topic:-}" ]; then
         # Send error notification with log file attached
         filename="rsync_error_${sync_name}_$(date +%Y%m%d_%H%M%S).log"
         curl -s \
-            -T "$full_log" \
+            -T "$local_log_file" \
             -H "Filename: $filename" \
             -H "Title: ❌ Rsync Failed - $sync_name" \
             -H "Priority: 5" \
@@ -166,7 +171,6 @@ else
 
         # Give ntfy time to process the attachment
         sleep 2
-        rm -f "$full_log"
     fi
 
     exit 1

@@ -3,6 +3,9 @@
 
 set -uo pipefail
 
+# Ensure Linuxbrew binaries are in PATH (for when run via sudo/anacron)
+export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+
 # Usage: restic_backup.sh <config_file>
 #
 # Expected config variables:
@@ -61,6 +64,10 @@ format_duration() {
 # Extract config name for notifications
 config_name=$(basename "$config_file" .conf)
 
+# Create local log directory
+log_dir="$HOME/logs/backup"
+mkdir -p "$log_dir"
+
 # Check if repository exists
 if ! restic --repo "$repo_path" --password-file "$password_file" cat config >/dev/null 2>&1; then
     echo "Initializing restic repository at $repo_path"
@@ -82,8 +89,7 @@ trap "rm -f $backup_output $error_log" EXIT
 echo "Starting backup for $config_name..."
 backup_start_time=$(date +%s)
 
-# Show progress only once per minute to reduce output spam
-export RESTIC_PROGRESS_FPS=0.016666
+export RESTIC_PROGRESS_FPS=0.05 # every 20s
 # Determine if we should calculate progress estimate (default: false for cron jobs)
 if [ "${show_progress:-false}" = "true" ]; then
     scan_option=""
@@ -229,27 +235,28 @@ else
         error_message="Unknown error occurred during backup"
     fi
 
-    if [ -n "${ntfy_topic:-}" ]; then
-        # Create a temporary file with full log
-        full_log=$(mktemp)
-        {
-            echo "=== BACKUP ERROR LOG ==="
-            echo "Config: $config_file"
-            echo "Repository: $repo_path"
-            echo "Start time: $(date -d @$backup_start_time)"
-            echo "Duration: $(format_duration $backup_duration)"
-            echo ""
-            echo "=== ERROR OUTPUT ==="
-            cat "$error_log" 2>/dev/null || echo "No error output captured"
-            echo ""
-            echo "=== BACKUP OUTPUT ==="
-            cat "$backup_output" 2>/dev/null || echo "No backup output captured"
-        } > "$full_log"
+    # Save error log locally
+    local_log_file="$log_dir/restic_error_${config_name}_$(date +%Y%m%d_%H%M%S).log"
+    {
+        echo "=== BACKUP ERROR LOG ==="
+        echo "Config: $config_file"
+        echo "Repository: $repo_path"
+        echo "Start time: $(date -d @$backup_start_time)"
+        echo "Duration: $(format_duration $backup_duration)"
+        echo ""
+        echo "=== ERROR OUTPUT ==="
+        cat "$error_log" 2>/dev/null || echo "No error output captured"
+        echo ""
+        echo "=== BACKUP OUTPUT ==="
+        cat "$backup_output" 2>/dev/null || echo "No backup output captured"
+    } > "$local_log_file"
+    echo "Error log saved to: $local_log_file"
 
+    if [ -n "${ntfy_topic:-}" ]; then
         # Send error notification with log file attached
         filename="backup_error_${config_name}_$(date +%Y%m%d_%H%M%S).log"
         curl -s \
-            -T "$full_log" \
+            -T "$local_log_file" \
             -H "Filename: $filename" \
             -H "Title: ❌ Restic Backup Failed - $config_name" \
             -H "Priority: 5" \
@@ -258,7 +265,6 @@ else
 
         # Give ntfy time to process the attachment
         sleep 2
-        rm -f "$full_log"
     fi
 
     exit 1
