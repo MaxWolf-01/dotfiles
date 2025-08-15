@@ -1,5 +1,5 @@
 
-Comments:
+Code Comments:
 - don't add superfluous code comments.
 - don't explain your changes with code comments. Explain them BEFORE using the Update/Edit tool.
 
