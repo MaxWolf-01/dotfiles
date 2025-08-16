@@ -1,16 +1,31 @@
 #!/bin/bash
 set -uo pipefail
 
-if [ $# -ne 5 ]; then
-    echo "Usage: $0 <dirs_file> <dest> <dest_path> <excludes_file> <ntfy_topic>"
+if [ $# -lt 4 ]; then
+    echo "Usage: $0 <dirs_file> <dest> <dest_path> <ntfy_topic> [excludes_file1] [excludes_file2...]"
+    echo "  ntfy_topic: notification topic (use empty string '' to disable notifications)"
+    echo "  excludes_file: zero or more exclude files"
     exit 1
 fi
 
 backup_dirs_file="$1"
 rsync_dest="$2"
 rsync_dest_path="$3"
-rsync_excludes="$4"
-ntfy_topic="$5"
+ntfy_topic="$4"
+shift 4  # Remove first 4 params, leaving only exclude files
+
+# Collect all remaining arguments as exclude files
+exclude_files=("$@")
+
+# Build rsync exclude options and validate files exist
+exclude_opts=()
+for exclude_file in "${exclude_files[@]}"; do
+    if [ ! -f "$exclude_file" ]; then
+        echo "ERROR: Exclude file not found: $exclude_file"
+        exit 1
+    fi
+    exclude_opts+=("--exclude-from=$exclude_file")
+done
 
 # Helper function to format bytes to human readable
 format_bytes() {
@@ -89,7 +104,7 @@ fi
 
 rsync -avz --delete --backup --relative \
     --backup-dir="rsync-deleted-$(date +%Y%m%d)" \
-    --exclude-from="$rsync_excludes" \
+    ${exclude_opts[@]+"${exclude_opts[@]}"} \
     --stats \
     "${dirs[@]}" "$rsync_dest:$rsync_dest_path/" 2>&1 | tee "$sync_output"
 
