@@ -14,6 +14,7 @@
 # added: 
 #   --batch option for cheaper processing 
 #   --output-dir option to specify output directory 
+#   --prefix-images option to control image filename prefixing (useful for Obsidian wikilinks)
 
 import os
 import json
@@ -418,6 +419,12 @@ def sanitize_filename(title):
     default=None,
     help="Output directory for processed papers (default: ./papers).",
 )
+@click.option(
+    "--prefix-images/--no-prefix-images",
+    is_flag=True,
+    default=True,
+    help="Prefix image filenames with paper name (default)/Use original image names.",
+)
 def arxiv_to_markdown(
     arxiv_url,
     api_key,
@@ -430,6 +437,7 @@ def arxiv_to_markdown(
     pages,
     batch,
     output_dir,
+    prefix_images,
 ):
     """Process an arXiv paper (given its URL) and convert it to markdown using Mistral OCR.
 
@@ -612,12 +620,19 @@ def arxiv_to_markdown(
 
                                 # For extracted images, save to disk
                                 if extract_images:
-                                    # Create a suitable filename if it doesn't have an extension
-                                    if "." not in image_id:
+                                    # Parse the image_id using pathlib
+                                    img_path = Path(image_id)
+                                    
+                                    # If no extension, add one from mime type
+                                    if not img_path.suffix:
                                         ext = mime_type.split("/")[1]
-                                        image_filename = f"{image_id}.{ext}"
+                                        img_path = img_path.with_suffix(f".{ext}")
+                                    
+                                    # Build final filename
+                                    if prefix_images:
+                                        image_filename = f"{sanitized_title}-{img_path.name}"
                                     else:
-                                        image_filename = image_id
+                                        image_filename = img_path.name
 
                                     image_path = image_dir / image_filename
 
