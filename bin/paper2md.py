@@ -15,6 +15,7 @@
 #   --batch option for cheaper processing 
 #   --output-dir option to specify output directory 
 #   --prefix-images option to control image filename prefixing (useful for Obsidian wikilinks)
+#   support for local PDF files in addition to arXiv URLs
 
 import os
 import json
@@ -356,7 +357,12 @@ def sanitize_filename(title):
 
 
 @click.command()
-@click.argument("arxiv_url")
+@click.argument("input_source")
+@click.option(
+    "--title",
+    help="Custom title for local PDF files (ignored for arXiv URLs).",
+    default=None,
+)
 @click.option(
     "--api-key",
     help="Mistral API key. If not provided, will use MISTRAL_API_KEY environment variable.",
@@ -426,7 +432,8 @@ def sanitize_filename(title):
     help="Prefix image filenames with paper name (default)/Use original image names.",
 )
 def arxiv_to_markdown(
-    arxiv_url,
+    input_source,
+    title,
     api_key,
     model,
     json_output,
@@ -439,16 +446,22 @@ def arxiv_to_markdown(
     output_dir,
     prefix_images,
 ):
-    """Process an arXiv paper (given its URL) and convert it to markdown using Mistral OCR.
+    """Process a PDF paper and convert it to markdown using Mistral OCR.
 
-    ARXIV_URL is the URL of the arXiv paper (abs, PDF, or HTML format).
-    The script will download the PDF version, process it with OCR, and save the result
-    in the papers/ directory with a sanitized filename based on the paper title.
+    INPUT_SOURCE can be either:
+    - An arXiv URL (abs, PDF, or HTML format) - will download and process the PDF
+    - A local path to a PDF file - will process the file directly
+    
+    The result is saved in the papers/ directory with a sanitized filename.
 
     \b
     Examples:
-      python arxiv_ocr.py https://arxiv.org/abs/1706.03762 --api-key YOUR_API_KEY
-      python arxiv_ocr.py https://arxiv.org/abs/1706.03762 --pages 5 --html
+      # Process an arXiv paper
+      python paper2md.py https://arxiv.org/abs/1706.03762 --api-key YOUR_API_KEY
+      
+      # Process a local PDF
+      python paper2md.py /path/to/paper.pdf --api-key YOUR_API_KEY
+      python paper2md.py paper.pdf --title "My Custom Paper Title" --pages 5
     """
     # Validate API key
     if not api_key:
@@ -461,39 +474,79 @@ def arxiv_to_markdown(
         papers_dir = output_dir if output_dir else Path("papers")
         papers_dir.mkdir(parents=True, exist_ok=True)
 
-        # Extract arXiv ID from URL
-        if not silent:
-            click.echo(f"Extracting arXiv ID from URL: {arxiv_url}", err=True)
-        arxiv_id = extract_arxiv_id(arxiv_url)
-        if not silent:
-            click.echo(f"Found arXiv ID: {arxiv_id}", err=True)
+        # Determine if input is an arXiv URL or local file
+        is_arxiv = False
+        arxiv_id = None
+        submission_date = None
+        bibtex_content = None
+        
+        if input_source.startswith("http") or "arxiv.org" in input_source:
+            # It's an arXiv URL
+            is_arxiv = True
+            
+            # Extract arXiv ID from URL
+            if not silent:
+                click.echo(f"Extracting arXiv ID from URL: {input_source}", err=True)
+            arxiv_id = extract_arxiv_id(input_source)
+            if not silent:
+                click.echo(f"Found arXiv ID: {arxiv_id}", err=True)
 
-        # Get paper metadata
-        if not silent:
-            click.echo("Fetching paper metadata...", err=True)
-        paper_title, submission_date = get_paper_metadata(arxiv_id)
+            # Get paper metadata
+            if not silent:
+                click.echo("Fetching paper metadata...", err=True)
+            paper_title, submission_date = get_paper_metadata(arxiv_id)
+            
+            # Download PDF
+            if not silent:
+                click.echo(f"Downloading PDF from arXiv...", err=True)
+            pdf_content = get_arxiv_pdf(arxiv_id)
+
+            # Download BibTeX citation
+            if not silent:
+                click.echo(f"Downloading BibTeX citation...", err=True)
+            bibtex_content = get_arxiv_bibtex(arxiv_id)
+            if bibtex_content:
+                if not silent:
+                    click.echo(f"BibTeX citation retrieved successfully", err=True)
+            else:
+                if not silent:
+                    click.echo(f"Could not retrieve BibTeX citation", err=True)
+                    
+        else:
+            # It's a local file
+            local_pdf_path = Path(input_source)
+            
+            # Check if file exists
+            if not local_pdf_path.exists():
+                raise click.ClickException(f"File not found: {input_source}")
+            
+            # Check if it's a PDF
+            if local_pdf_path.suffix.lower() != ".pdf":
+                raise click.ClickException(f"File must be a PDF: {input_source}")
+            
+            if not silent:
+                click.echo(f"Processing local PDF: {local_pdf_path}", err=True)
+            
+            # Read PDF content
+            with open(local_pdf_path, "rb") as f:
+                pdf_content = f.read()
+            
+            # Use custom title or extract from filename
+            if title:
+                paper_title = title
+            else:
+                # Use filename without extension as title
+                paper_title = local_pdf_path.stem
+                
+            if not silent:
+                click.echo(f"Paper title: {paper_title}", err=True)
+        
+        # Sanitize the title for use as filename
         sanitized_title = sanitize_filename(paper_title)
         if not silent:
-            click.echo(f"Paper title: {paper_title}", err=True)
             if submission_date:
                 click.echo(f"Submission date: {submission_date}", err=True)
             click.echo(f"Sanitized filename: {sanitized_title}", err=True)
-
-        # Download PDF
-        if not silent:
-            click.echo(f"Downloading PDF from arXiv...", err=True)
-        pdf_content = get_arxiv_pdf(arxiv_id)
-
-        # Download BibTeX citation
-        if not silent:
-            click.echo(f"Downloading BibTeX citation...", err=True)
-        bibtex_content = get_arxiv_bibtex(arxiv_id)
-        if bibtex_content:
-            if not silent:
-                click.echo(f"BibTeX citation retrieved successfully", err=True)
-        else:
-            if not silent:
-                click.echo(f"Could not retrieve BibTeX citation", err=True)
 
         # Create temp file for PDF
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_pdf:
@@ -512,9 +565,11 @@ def arxiv_to_markdown(
                 # Upload PDF to Mistral
                 if not silent:
                     click.echo(f"Uploading file to Mistral...", err=True)
+                # Use arxiv_id for arXiv papers, sanitized_title for local files
+                upload_filename = f"{arxiv_id}.pdf" if is_arxiv else f"{sanitized_title}.pdf"
                 uploaded_file = client.files.upload(
                     file={
-                        "file_name": f"{arxiv_id}.pdf",
+                        "file_name": upload_filename,
                         "content": pdf_content,
                     },
                     purpose="ocr",
@@ -756,10 +811,13 @@ def arxiv_to_markdown(
                     click.echo(f"Results saved to {output_file}", err=True)
                     if bibtex_content:
                         click.echo(f"BibTeX citation saved to {bibtex_file}", err=True)
-                    click.echo(f"Original arXiv URL: {arxiv_url}", err=True)
-                    click.echo(
-                        f"PDF URL: https://arxiv.org/pdf/{arxiv_id}.pdf", err=True
-                    )
+                    if is_arxiv:
+                        click.echo(f"Original arXiv URL: {input_source}", err=True)
+                        click.echo(
+                            f"PDF URL: https://arxiv.org/pdf/{arxiv_id}.pdf", err=True
+                        )
+                    else:
+                        click.echo(f"Source PDF: {input_source}", err=True)
 
             finally:
                 # Clean up uploaded file
