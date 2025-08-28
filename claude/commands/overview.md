@@ -18,6 +18,10 @@ Create an OVERVIEW.md with these sections IN THIS EXACT ORDER:
 </instructions>
 
 <output_structure>
+0. **Table of Contents**
+   - Simple, top-level sections only (no sub-sections)
+   - Links using markdown anchors compatible with both GitHub and Obsidian
+
 1. **TLDR** 
    - Repository purpose in 2-3 sentences
    - Primary technologies/frameworks used
@@ -48,7 +52,20 @@ Create an OVERVIEW.md with these sections IN THIS EXACT ORDER:
 4. **Key Components**
    - Component name: Purpose and responsibilities
    - Integration points with other components
-   - Coupled with code examples if relevant, see (5)
+   - Include concise code examples showing interfaces/contracts where helpful
+   <code_style>
+   - For interfaces/base classes: Use compact signature-only format with inline comments
+   - Example:
+     ```python
+     class BaseClass:
+         def method1(self, arg) -> result  # Brief description
+         def method2(self) -> output  # What it does
+         @property
+         def attribute(self) -> type  # Purpose
+     ```
+   - For data structures: Show actual representation with example values
+   - Keep examples scannable - avoid excessive whitespace between methods
+   </code_style>
 
 5. **Code Examples**
    <requirements>
