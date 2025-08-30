@@ -147,7 +147,27 @@ map("n", "<C-q>", vim.lsp.buf.signature_help, { desc = "Show signature help" })
 
 map("n", "<leader>la", vim.lsp.buf.code_action, { desc = "Code actions" })
 map("n", "<leader>lr", vim.lsp.buf.rename, { desc = "Rename symbol" })
-map("n", "<leader>lf", vim.lsp.buf.format, { desc = "Format document" })
+map("n", "<leader>lf", function()
+  require("conform").format({ async = true, lsp_fallback = true })
+end, { desc = "Format document" })
+
+-- formatting toggles
+
+map("n", "<leader>tf", function()
+  vim.g.autoformat = not vim.g.autoformat
+  local status = vim.g.autoformat and "ON" or "OFF"
+  vim.notify("Auto-format: " .. status, vim.log.levels.INFO)
+end, { desc = "Toggle global auto-format" })
+
+map("n", "<leader>tF", function()
+  if vim.b.autoformat_disabled then
+    vim.b.autoformat_disabled = false
+    vim.notify("Buffer auto-format: ON", vim.log.levels.INFO)
+  else
+    vim.b.autoformat_disabled = true
+    vim.notify("Buffer auto-format: OFF", vim.log.levels.INFO)
+  end
+end, { desc = "Toggle buffer auto-format" })
 
 -- diagnostics
 

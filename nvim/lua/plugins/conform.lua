@@ -1,16 +1,16 @@
 return {
   "stevearc/conform.nvim",
 
-  event = "BufWritePre",
+  event = { "BufReadPre", "BufNewFile" },
+  cmd = { "ConformInfo" },
 
-  opts = {
-    format_on_save = {
-      timeout_ms = 500,
-      lsp_fallback = true,
-    },
-  },
+  init = function()
+    -- Initialize global autoformat to false (disabled by default)
+    -- This runs before setup, ensuring the variable exists
+    vim.g.autoformat = vim.g.autoformat or false
+  end,
 
-  config = function(opts)
+  config = function()
     local formatters = {}
 
     local files = vim.api.nvim_get_runtime_file("lua/fmts/*.lua", true)
@@ -23,15 +23,26 @@ return {
       end
     end
 
-    -- TODO: this is currently needeed?
-    vim.api.nvim_create_autocmd("BufWritePre", {
-      pattern = "*",
-      callback = function(args)
-        require("conform").format({ bufnr = args.buf })
+    -- Setup conform with our config
+    require("conform").setup({
+      formatters_by_ft = formatters,
+      
+      -- Dynamic format_on_save that checks toggle state
+      format_on_save = function(bufnr)
+        -- Check buffer-local override first
+        if vim.b[bufnr].autoformat_disabled then
+          return nil
+        end
+        -- Then check global setting (default is false)
+        if not vim.g.autoformat then
+          return nil
+        end
+        -- Format with timeout and LSP fallback
+        return {
+          timeout_ms = 500,
+          lsp_fallback = true,
+        }
       end,
     })
-
-    opts.formatters_by_ft = formatters
-    require("conform").setup(opts)
   end,
 }
