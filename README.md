@@ -3,11 +3,36 @@
 I use these dotfiles for my daily driver Ubuntu and Android setup, as well as proxmox and LXCs.
 
 <details>
-<summary>Quick setup</summary>
+<summary>Quick setup (Desktop)</summary>
 
 ```bash
-git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git
-mv dotfiles ~/.dotfiles && cd ~/.dotfiles && ./install && ./setup minimal && ./setup cli
+sudo apt-get update && sudo apt-get install -y git gh openssh-client
+gh auth login -w -s admin:public_key
+git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
+cd ~/.dotfiles
+./install && ./setup minimal && ./setup cli
+```
+Create + upload SSH key to GitHub, verify, switch remote to SSH
+```bash
+./setup sshkeys
+gh ssh-key add ~/.ssh/id_ed25519.pub -t "$(hostname)-dotfiles-$(date +%F)"
+ssh -T git@github.com || true
+git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
+```
+</details>
+
+<details>
+<summary>Quick setup (Pods)</summary>
+
+```bash
+apt-get update && apt-get install -y git gh openssh-client
+gh auth login -w -s admin:public_key
+git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
+cd ~/.dotfiles && ./install && ./setup minimal && ./setup cli
+./setup sshkeys
+gh ssh-key add ~/.ssh/id_ed25519.pub -t "pod-$(hostname)-$(date +%F)"
+ssh -T git@github.com || true
+git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
 ```
 
 </details>
@@ -53,24 +78,29 @@ sudo apt autoremove && sudo apt clean
   ```
 </details>
 
-Pre-requisites:
+Pre-requisites and install flow:
 ```bash
-sudo apt-get update && sudo apt-get install -y git gh
-gh auth login
-```
+sudo apt-get update && sudo apt-get install -y git gh openssh-client
+gh auth login -w -s admin:public_key
 
-```bash
-cd ~ && git clone --depth 1 git@github.com:MaxWolf-01/dotfiles.git
-```
+# Clone via HTTPS (no SSH required yet)
+git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
+cd ~/.dotfiles
 
-```bash
-mv dotfiles .dotfiles && cd ~/.dotfiles && ./install && ./setup minimal 
-```
+# Base install
+./install && ./setup minimal
 
-Then *open new shell* (or reboot when in doubt), and optionally execute additional setup functions, such as:
-```bash
+# SSH enablement for private repos
+./setup sshkeys
+gh ssh-key add ~/.ssh/id_ed25519.pub -t "$(hostname)-dotfiles-$(date +%F)"
+ssh -T git@github.com || true
+git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
+
+# Optional (new shell recommended), add-ons
 ./setup cli
 ./setup ubuntu
+# After SSH confirmed working:
+# ./setup secrets
 ```
 
 `./install` and most functions in `setup` are idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
