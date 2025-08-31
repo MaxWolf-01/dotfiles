@@ -24,27 +24,10 @@ local function on_init(client, _)
 end
 
 local function get_capabilities()
-  return require("cmp_nvim_lsp").default_capabilities()
+  return require("blink.cmp").get_lsp_capabilities()
 
-  -- local capabilities = vim.lsp.protocol.make_client_capabilities()
-  -- capabilities.textDocument.completion.completionItem = {
-  --   documentationFormat = { "markdown", "plaintext" },
-  --   snippetSupport = true,
-  --   preselectSupport = true,
-  --   insertReplaceSupport = true,
-  --   labelDetailsSupport = true,
-  --   deprecatedSupport = true,
-  --   commitCharactersSupport = true,
-  --   tagSupport = { valueSet = { 1 } },
-  --   resolveSupport = {
-  --     properties = {
-  --       "documentation",
-  --       "detail",
-  --       "additionalTextEdits",
-  --     },
-  --   },
-  -- }
-  -- return capabilities
+  -- Note: blink.cmp's get_lsp_capabilities() already includes the default capabilities
+  -- and adds completion-specific capabilities automatically
 end
 
 return {
