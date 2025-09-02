@@ -25,7 +25,7 @@ return {
         auto_show_delay_ms = 200,
       },
       ghost_text = { 
-        enabled = true  -- Show inline preview of selected item
+        enabled = false -- Show inline preview of selected item
       },
     },
     
