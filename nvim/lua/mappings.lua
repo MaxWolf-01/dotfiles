@@ -147,9 +147,8 @@ map("n", "<C-q>", vim.lsp.buf.signature_help, { desc = "Show signature help" })
 
 map("n", "<leader>la", vim.lsp.buf.code_action, { desc = "Code actions" })
 map("n", "<leader>lr", vim.lsp.buf.rename, { desc = "Rename symbol" })
-map("n", "<leader>lf", function()
-  require("conform").format({ async = true, lsp_fallback = true })
-end, { desc = "Format document" })
+map("n", "<leader>lf", function() require("conform").format({ async = true, lsp_fallback = true }) end, { desc = "Format document" })
+map("n", "<leader>lF", function() require("conform").format({ async = true, lsp_fallback = false, formatters = { "ruff_fix" } }) end, { desc = "Ruff fix (imports)" })
 
 -- formatting toggles
 

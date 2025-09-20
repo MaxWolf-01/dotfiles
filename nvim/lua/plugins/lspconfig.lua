@@ -56,7 +56,7 @@ return {
         end
       end
 
-      require("lspconfig")[lsp_name].setup(require("lsps." .. lsp_name))
+      require("lspconfig")[lsp_name].setup(opts)
     end
   end,
 }
