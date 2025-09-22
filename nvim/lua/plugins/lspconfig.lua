@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-global
 vim.diagnostic.config({
   signs = {
     text = {
@@ -15,48 +16,49 @@ vim.diagnostic.config({
   },
 })
 
-local function on_attach(_, _) end
-
-local function on_init(client, _)
-  if client.supports_method("textDocument/semanticTokens") then
-    client.server_capabilities.semanticTokensProvider = nil
-  end
-end
-
-local function get_capabilities()
-  return require("blink.cmp").get_lsp_capabilities()
-
-  -- Note: blink.cmp's get_lsp_capabilities() already includes the default capabilities
-  -- and adds completion-specific capabilities automatically
-end
-
 return {
   "neovim/nvim-lspconfig",
   config = function()
-    local lsp_files = vim.api.nvim_get_runtime_file("lua/lsps/*.lua", true)
-    for _, file in ipairs(lsp_files) do
-      local lsp_name = file:match("([^/]+)%.%w+$")
-
-      local opts = require("lsps." .. lsp_name)
-      opts.capabilities = get_capabilities()
-
-      local overriden_on_attach = opts.on_attach
-      opts.on_attach = function(client, bufnr)
-        on_attach(client, bufnr)
-        if overriden_on_attach then
-          overriden_on_attach(client, bufnr)
-        end
+    local caps = require("blink.cmp").get_lsp_capabilities()
+    local function on_attach(_, _) end
+    local function on_init(client, _)
+      if client.supports_method("textDocument/semanticTokens") then
+        client.server_capabilities.semanticTokensProvider = nil
       end
+    end
 
-      local overriden_on_init = opts.on_init
-      opts.on_init = function(client, result)
-        on_init(client, result)
-        if overriden_on_init then
-          overriden_on_init(client, result)
-        end
-      end
+    -- Enable servers via the 0.11 API; upstream configs live under runtime lsp/<name>.lua
+    local servers = {
+      "bashls",
+      "biome",
+      "cmake",
+      "docker_compose_language_service",
+      "dockerls",
+      "elixirls",
+      "gleam",
+      "golangci_lint_ls",
+      "gopls",
+      "hls",
+      "html",
+      "jdtls",
+      "jsonls",
+      "lua_ls",
+      "nil_ls",
+      "nixd",
+      "pyright",
+      "rust_analyzer",
+      "tailwindcss",
+      "taplo",
+      "ts_ls",
+      "zls",
+    }
 
-      require("lspconfig")[lsp_name].setup(opts)
+    for _, s in ipairs(servers) do
+      vim.lsp.enable(s, {
+        capabilities = caps,
+        on_attach = on_attach,
+        on_init = on_init,
+      })
     end
   end,
 }

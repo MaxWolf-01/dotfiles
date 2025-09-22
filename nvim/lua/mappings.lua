@@ -263,3 +263,57 @@ map("n", "<leader>gD", ":Gitsigns diffthis HEAD<CR>", { desc = "Diff with HEAD",
 -- https://github.com/dhruvasagar/vim-prosession
 map("n", "<leader>sd", ":ProsessionDelete<CR>", { desc = "Delete current session", silent = true })
 map("n", "<leader>sc", ":ProsessionClean<CR>", { desc = "Clean stale session files", silent = true })
+
+-- ====================================================================
+-- dap
+-- ====================================================================
+
+local dap = require("dap")
+local dapui = require("dapui")
+
+-- Core controls
+map("n", "<leader>dc", dap.continue, { desc = "DAP: Continue/Start", silent = true })
+map("n", "<leader>dn", dap.step_over, { desc = "DAP: Step over", silent = true })
+map("n", "<leader>di", dap.step_into, { desc = "DAP: Step into", silent = true })
+map("n", "<leader>do", dap.step_out, { desc = "DAP: Step out", silent = true })
+map("n", "<leader>dx", dap.terminate, { desc = "DAP: Terminate", silent = true })
+
+-- Breakpoints
+map("n", "<leader>db", dap.toggle_breakpoint, { desc = "DAP: Toggle breakpoint", silent = true })
+map("n", "<leader>dB", function() dap.set_breakpoint(vim.fn.input("Breakpoint condition: ")) end, { desc = "DAP: Conditional breakpoint", silent = true })
+map("n", "<leader>dl", function() dap.set_breakpoint(nil, nil, vim.fn.input("Log point message: ")) end, { desc = "DAP: Log point", silent = true })
+map("n", "<leader>dC", function() dap.clear_breakpoints() end, { desc = "DAP: Clear breakpoints", silent = true })
+
+-- UI / REPL / Inspect
+map("n", "<leader>du", dapui.toggle, { desc = "DAP UI: Toggle", silent = true })
+map("n", "<leader>dR", dap.repl.open, { desc = "DAP: REPL", silent = true })
+map({ "n", "v" }, "<leader>de", function() require("dap.ui.widgets").hover() end, { desc = "DAP: Eval (hover)", silent = true })
+
+-- Quick attach to localhost:5678
+map("n", "<leader>da", function()
+  require("dap").run({
+    type = "python",
+    request = "attach",
+    name = "Attach (localhost:5678)",
+    connect = { host = "127.0.0.1", port = 5678 },
+  })
+end, { desc = "DAP: Attach localhost:5678", silent = true })
+
+-- Telescope-DAP pickers
+map("n", "<leader>dtc", ":Telescope dap commands<CR>", { desc = "DAP: Telescope commands", silent = true })
+map("n", "<leader>dtb", ":Telescope dap list_breakpoints<CR>", { desc = "DAP: Telescope breakpoints", silent = true })
+map("n", "<leader>dtv", function()
+  if require("dap").session() then
+    vim.cmd("Telescope dap variables")
+  else
+    vim.notify("DAP: no active session (variables)", vim.log.levels.WARN)
+  end
+end, { desc = "DAP: Telescope variables", silent = true })
+map("n", "<leader>dtf", function()
+  if require("dap").session() then
+    vim.cmd("Telescope dap frames")
+  else
+    vim.notify("DAP: no active session (frames)", vim.log.levels.WARN)
+  end
+end, { desc = "DAP: Telescope frames", silent = true })
+map("n", "<leader>dtg", ":Telescope dap configurations<CR>", { desc = "DAP: Telescope configurations", silent = true })
