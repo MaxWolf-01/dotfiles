@@ -25,6 +25,19 @@ return {
 
     -- Setup conform with our config
     require("conform").setup({
+      -- Always use uvx-backed ruff for consistency with your environment
+      formatters = {
+        ruff_format = {
+          command = "uvx",
+          args = { "ruff", "format", "--stdin-filename", "$FILENAME", "-" },
+          stdin = true,
+        },
+        ruff_fix = {
+          command = "uvx",
+          args = { "ruff", "check", "--fix", "--stdin-filename", "$FILENAME", "-" },
+          stdin = true,
+        },
+      },
       formatters_by_ft = formatters,
       
       -- Dynamic format_on_save that checks toggle state

@@ -28,10 +28,10 @@ debug() {
       return 2
     fi
     local module="$1"; shift
-    uv run --with debugpy -- -X frozen_modules=off -m debugpy --listen "${host}:${port}" ${waitflag} --module "${module}" "$@"
+    uv run --with debugpy -- python -X frozen_modules=off -m debugpy --listen "${host}:${port}" ${waitflag} --module "${module}" "$@"
   else
     local script="$1"; shift
-    uv run --with debugpy -- -X frozen_modules=off -m debugpy --listen "${host}:${port}" ${waitflag} "${script}" "$@"
+    uv run --with debugpy -- python -X frozen_modules=off -m debugpy --listen "${host}:${port}" ${waitflag} "${script}" "$@"
   fi
 }
 
