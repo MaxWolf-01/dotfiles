@@ -129,7 +129,7 @@ def get_arxiv_bibtex(arxiv_id):
         response = requests.get(bibtex_url, headers=headers)
 
         if response.status_code != 200:
-            print(f"Failed to get BibTeX: HTTP {response.status_code}")
+            click.echo(f"Failed to get BibTeX: HTTP {response.status_code}", err=True)
             return None
 
         # Extract BibTeX content from the response
@@ -146,7 +146,7 @@ def get_arxiv_bibtex(arxiv_id):
             return pre.get_text().strip()
 
         # Last resort: generate a basic BibTeX entry ourselves
-        print("Could not find BibTeX on the page, generating a basic entry")
+        click.echo("Could not find BibTeX on the page, generating a basic entry", err=True)
 
         # We'll need the title and authors
         abs_url = f"https://arxiv.org/abs/{arxiv_id}"
@@ -190,7 +190,7 @@ def get_arxiv_bibtex(arxiv_id):
             return bibtex
 
     except Exception as e:
-        print(f"Error fetching BibTeX: {str(e)}")
+        click.echo(f"Error fetching BibTeX: {str(e)}", err=True)
         return None
 
     return None
@@ -818,6 +818,28 @@ def arxiv_to_markdown(
                         )
                     else:
                         click.echo(f"Source PDF: {input_source}", err=True)
+
+                # Save/copy the source PDF next to README for convenience
+                try:
+                    pdf_out_path = output_dir / f"{sanitized_title}.pdf"
+                    # Write the PDF bytes we already have in memory
+                    with open(pdf_out_path, "wb") as pdf_out_f:
+                        pdf_out_f.write(pdf_content)
+                    if not silent:
+                        click.echo(f"Source PDF saved to {pdf_out_path}", err=True)
+                except Exception as e:
+                    if not silent:
+                        click.echo(
+                            f"Warning: Could not save source PDF: {str(e)}",
+                            err=True,
+                        )
+
+                # Print the README (or HTML) path to STDOUT for easy piping
+                # Keep other logs on STDERR so command substitution captures just the path
+                try:
+                    print(str(output_file))
+                except Exception:
+                    pass
 
             finally:
                 # Clean up uploaded file
