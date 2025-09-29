@@ -27,15 +27,19 @@ return {
     require("conform").setup({
       -- Always use uvx-backed ruff for consistency with your environment
       formatters = {
+        -- Use ruff as a formatter (stdout)
         ruff_format = {
           command = "uvx",
           args = { "ruff", "format", "--stdin-filename", "$FILENAME", "-" },
           stdin = true,
         },
+        -- Use ruff to apply fixes (imports) to a temp file, then read back
+        -- ruff cannot apply fixes via stdin; it needs a filename
         ruff_fix = {
           command = "uvx",
-          args = { "ruff", "check", "--fix", "--stdin-filename", "$FILENAME", "-" },
-          stdin = true,
+          args = { "ruff", "check", "--fix", "--select", "I", "--exit-zero", "--quiet", "$FILENAME" },
+          stdin = false,
+          require_tempfile = true,
         },
       },
       formatters_by_ft = formatters,
