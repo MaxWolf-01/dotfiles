@@ -180,6 +180,32 @@ map("n", "]w", function() vim.diagnostic.jump({ count = 1, severity = vim.diagno
 map("n", "<leader>lq", vim.diagnostic.setloclist, { desc = "Diagnostics to loclist" })
 map("n", "<leader>lQ", vim.diagnostic.setqflist, { desc = "Diagnostics to quickfix" })
 
+-- quick peek of diagnostics under cursor
+map("n", "gl", vim.diagnostic.open_float, { desc = "Line diagnostics" })
+
+-- toggles for diagnostics presentation
+map("n", "<leader>tv", function()
+  local cfg = vim.diagnostic.config()
+  local enabled = cfg.virtual_text ~= false
+  vim.diagnostic.config({ virtual_text = not enabled })
+  vim.notify("Diagnostics virtual text: " .. (enabled and "OFF" or "ON"), vim.log.levels.INFO)
+end, { desc = "Toggle diagnostics virtual text" })
+
+map("n", "<leader>tu", function()
+  local cfg = vim.diagnostic.config()
+  local enabled = cfg.underline ~= false
+  vim.diagnostic.config({ underline = not enabled })
+  vim.notify("Diagnostics underline: " .. (enabled and "OFF" or "ON"), vim.log.levels.INFO)
+end, { desc = "Toggle diagnostics underline" })
+
+-- If on Neovim with virtual_lines support, this toggles them
+map("n", "<leader>tV", function()
+  local cfg = vim.diagnostic.config()
+  local enabled = cfg.virtual_lines == true
+  vim.diagnostic.config({ virtual_lines = not enabled })
+  vim.notify("Diagnostics virtual lines: " .. (enabled and "OFF" or "ON"), vim.log.levels.INFO)
+end, { desc = "Toggle diagnostics virtual lines" })
+
 -- ====================================================================
 -- lspsaga https://nvimdev.github.io/lspsaga/
 -- ====================================================================

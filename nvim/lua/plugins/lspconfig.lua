@@ -1,5 +1,6 @@
 ---@diagnostic disable: undefined-global
 vim.diagnostic.config({
+  -- sign column symbols and highlights
   signs = {
     text = {
       [vim.diagnostic.severity.ERROR] = "",
@@ -13,6 +14,23 @@ vim.diagnostic.config({
       [vim.diagnostic.severity.INFO] = "DiagnosticSignInfo",
       [vim.diagnostic.severity.HINT] = "DiagnosticSignHint",
     },
+  },
+  -- inline virtual text to the right of the line
+  virtual_text = {
+    spacing = 1,
+    source = "if_many",
+    -- prefix = "●", -- uncomment to force a bullet prefix
+  },
+  -- underline the offending range
+  underline = true,
+  -- nicer sorting/behavior
+  severity_sort = true,
+  update_in_insert = false,
+  float = {
+    border = "rounded",
+    source = "always",
+    header = "",
+    prefix = "",
   },
 })
 
