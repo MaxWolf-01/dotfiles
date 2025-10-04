@@ -201,8 +201,6 @@ _configure_git_colors() {
 
 }
 
-# Initialize wal theme
-_apply_wal_theme
-_configure_wal_ls_colors
-_configure_git_colors
+# Initialize wal theme (non-blocking - runs in background)
+(_apply_wal_theme && _configure_wal_ls_colors && _configure_git_colors &)
 
