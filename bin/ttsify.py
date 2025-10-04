@@ -1,83 +1,137 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --quiet --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = [
-#   "click",
-#   "requests",
+#     "click",
+#     "requests",
 # ]
 # ///
+"""
+Transform markdown files into TTS-friendly format using OpenRouter API.
+Designed to handle large files by chunking at paragraph boundaries.
+"""
 
 import os
-import json
 from pathlib import Path
-from typing import Optional
 
 import click
 import requests
 
-
 DEFAULT_MODEL = "gpt-5-mini"
+CHUNK_SIZE = 37500  # ~9k tokens at 4 chars/token
 
 
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+def chunk_text(text: str, max_size: int = CHUNK_SIZE) -> list[str]:
+    """Split text into chunks at paragraph boundaries."""
+    if len(text) <= max_size:
+        return [text]
+
+    chunks = []
+    paragraphs = text.split("\n\n")
+    current = ""
+
+    for para in paragraphs:
+        # Single paragraph too large - split by lines
+        if len(para) > max_size:
+            for line in para.split("\n"):
+                if len(current) + len(line) + 1 > max_size:
+                    if current:
+                        chunks.append(current)
+                    current = line
+                else:
+                    current += ("\n" if current else "") + line
+        # Add paragraph to current chunk
+        elif len(current) + len(para) + 2 > max_size:
+            if current:
+                chunks.append(current)
+            current = para
+        else:
+            current += ("\n\n" if current else "") + para
+
+    if current:
+        chunks.append(current)
+
+    return chunks
 
 
-def resolve_input_file(input_path: Path) -> Path:
-    if input_path.is_dir():
-        candidate = input_path / "README.md"
-        if not candidate.exists():
-            raise click.ClickException(f"Directory has no README.md: {input_path}")
-        return candidate
-    if not input_path.exists():
-        raise click.ClickException(f"File not found: {input_path}")
-    return input_path
+def process_chunk(chunk: str, model: str, api_key: str, headers: dict, system_prompt: str) -> str:
+    """Send chunk to OpenRouter and return processed text."""
 
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Transform the following markdown into TTS-friendly markdown.\n\n<SOURCE_MARKDOWN>\n{chunk}\n</SOURCE_MARKDOWN>",
+            },
+        ],
+    }
 
-def build_prompt(default_rules: str, extra_prompt: Optional[str]) -> str:
-    if extra_prompt:
-        return default_rules.strip() + "\n\nUser Additional Instructions:\n" + extra_prompt.strip()
-    return default_rules
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=300,
+    )
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise click.ClickException(f"OpenRouter error {resp.status_code}: {detail}")
+
+    try:
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        # Debug output
+        debug_file = Path("/tmp/ttsify2_debug.txt")
+        debug_file.write_text(
+            f"Status: {resp.status_code}\n"
+            f"Content-Type: {resp.headers.get('Content-Type', 'unknown')}\n"
+            f"Body length: {len(resp.text)}\n\n"
+            f"Body:\n{resp.text[:2000]}"
+        )
+        raise click.ClickException(f"Failed to parse response: {e}\nDebug saved to {debug_file}")
 
 
 @click.command()
-@click.argument("input_path", type=click.Path(path_type=Path))
-@click.option("--output", "output_path", type=click.Path(path_type=Path), default=None,
-              help="Output file path (default: sibling TTS.md)")
-@click.option("--model", default=DEFAULT_MODEL, show_default=True,
-              help="OpenRouter model ID to use")
-@click.option("--api-key", envvar="OPENROUTER_API_KEY", default=None,
-              help="OpenRouter API key (or set OPENROUTER_API_KEY)")
-@click.option("--prompt-file", type=click.Path(path_type=Path), default=None,
-              help="Optional file with extra TTS transformation instructions")
-@click.option("--prompt", "extra_prompt", default=None,
-              help="Optional inline extra instructions (overrides --prompt-file)")
-def main(input_path: Path, output_path: Optional[Path], model: str, api_key: Optional[str],
-         prompt_file: Optional[Path], extra_prompt: Optional[str]):
-    """Convert README.md into a TTS-friendly TTS.md using OpenRouter.
+@click.argument("input_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--output", "-o", type=click.Path(path_type=Path), help="Output file")
+@click.option("--model", "-m", default=DEFAULT_MODEL, help="Model to use")
+def main(input_path: Path, output: Path | None, model: str):
+    """Transform markdown to TTS-friendly format."""
 
-    INPUT_PATH can be a README.md file or a directory containing README.md.
-    """
+    # Get API key
+    api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        raise click.ClickException(
-            "Missing OpenRouter API key. Provide --api-key or set OPENROUTER_API_KEY."
-        )
+        raise click.ClickException("OPENROUTER_API_KEY not set")
 
+    # Resolve input
     click.echo("[ttsify] Resolving input...", err=True)
-    readme_path = resolve_input_file(input_path)
-    click.echo(f"[ttsify] Reading: {readme_path}", err=True)
-    src_md = read_text(readme_path)
+    if input_path.is_dir():
+        readme = input_path / "README.md"
+        if not readme.exists():
+            raise click.ClickException(f"No README.md in {input_path}")
+        input_path = readme
 
-    # Determine output path
-    if output_path is None:
-        output_path = readme_path.with_name("TTS.md")
-    click.echo(f"[ttsify] Will write to: {output_path}", err=True)
+    click.echo(f"[ttsify] Reading: {input_path}", err=True)
+    text = input_path.read_text(encoding="utf-8")
 
-    # Load extra prompt
-    if extra_prompt is None and prompt_file is not None:
-        extra_prompt = read_text(prompt_file)
+    # Chunk if needed
+    chunks = chunk_text(text)
+    if len(chunks) > 1:
+        click.echo(f"[ttsify] Input is large, splitting into {len(chunks)} chunks", err=True)
 
-    # Default TTS transformation rules
+    # Resolve output
+    if output is None:
+        output = input_path.with_name("TTS.md")
+    click.echo(f"[ttsify] Will write to: {output}", err=True)
+
+    # System prompt
     default_rules = (
         "You are a technical editor producing TTS-friendly markdown from academic papers.\n"
         "Rewrite the input into a clear, linear narration optimized for listening.\n"
@@ -88,71 +142,45 @@ def main(input_path: Path, output_path: Optional[Path], model: str, api_key: Opt
         "- Keep figure captions, but remove markdown image links like ![img-0.jpeg](long-unnecessary-link-to-an-image.jpeg).\n"
         "- Remove citations like '[1][2]', but keep author names if present; turn 'et al.' into 'and colleagues'.\n"
         "- Omit the references section entirely.\n"
-        "- Omit metadata (DOI, arXiv ID, publication venue, emails, etc.).\n"
+        "- Omit metadata (DOI, arXiv ID, publication venue, emails, etc.). This includes repeated headers/footers in the text.\n"
         "- Keep markdown simple (headings, lists, paragraphs).\n"
     )
+    system_prompt = default_rules
 
-    system_prompt = build_prompt(default_rules, extra_prompt)
     click.echo(f"[ttsify] Model: {model}", err=True)
 
-    # Prepare OpenRouter request
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    # Prepare headers
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
-
-    # Optional attribution headers
-    referer = os.getenv("OPENROUTER_REFERER") or os.getenv("HTTP_REFERER")
-    title = os.getenv("OPENROUTER_TITLE")
-    if referer:
+    if referer := os.getenv("OPENROUTER_REFERER") or os.getenv("HTTP_REFERER"):
         headers["HTTP-Referer"] = referer
-    if title:
+    if title := os.getenv("OPENROUTER_TITLE"):
         headers["X-Title"] = title
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "Transform the following markdown into TTS-friendly markdown.\n\n"
-                    "<SOURCE_MARKDOWN>\n" + src_md + "\n</SOURCE_MARKDOWN>\n"
-                ),
-            },
-        ],
-    }
+    # Process chunks
+    results = []
+    for i, chunk in enumerate(chunks, 1):
+        if len(chunks) > 1:
+            click.echo(f"[ttsify] Processing chunk {i}/{len(chunks)}...", err=True)
+        else:
+            click.echo("[ttsify] Sending request to OpenRouter...", err=True)
 
-    try:
-        click.echo("[ttsify] Sending request to OpenRouter...", err=True)
-        resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
-    except Exception as e:
-        raise click.ClickException(f"OpenRouter request failed to send: {e}")
+        result = process_chunk(chunk, model, api_key, headers, system_prompt)
+        results.append(result)
 
-    if resp.status_code != 200:
-        # Try to include model/provider error if present
-        try:
-            detail = resp.json()
-        except Exception:
-            detail = resp.text
-        raise click.ClickException(
-            f"OpenRouter error {resp.status_code}: {detail}"
-        )
+        if len(chunks) == 1:
+            click.echo("[ttsify] Parsing response...", err=True)
 
-    try:
-        click.echo("[ttsify] Parsing response...", err=True)
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        raise click.ClickException(f"Failed to parse OpenRouter response: {e}")
-
-    # Write TTS.md
+    # Write output
     click.echo("[ttsify] Writing output...", err=True)
-    output_path.write_text(content, encoding="utf-8")
+    final = "\n\n".join(results)
+    output.write_text(final, encoding="utf-8")
     click.echo("[ttsify] Done.", err=True)
-    # Only stdout prints the path for chaining
-    click.echo(str(output_path))
+    # Print output path to stdout for chaining
+    click.echo(str(output))
 
 
 if __name__ == "__main__":
