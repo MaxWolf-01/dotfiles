@@ -12,6 +12,7 @@ Designed to handle large files by chunking at paragraph boundaries.
 """
 
 import os
+import re
 from pathlib import Path
 
 import click
@@ -144,6 +145,7 @@ def main(input_path: Path, output: Path | None, model: str):
         "- Omit the references section entirely.\n"
         "- Omit metadata (DOI, arXiv ID, publication venue, emails, etc.). This includes repeated headers/footers in the text.\n"
         "- Keep markdown simple (headings, lists, paragraphs).\n"
+        "- IMPORTANT: If an entire chunk should be omitted (e.g., it's only references), output exactly: <empty_chunk>brief reason</empty_chunk>\n"
     )
     system_prompt = default_rules
 
@@ -176,7 +178,17 @@ def main(input_path: Path, output: Path | None, model: str):
 
     # Write output
     click.echo("[ttsify] Writing output...", err=True)
-    final = "\n\n".join(results)
+    # Filter out empty chunks and log reasons
+    non_empty = []
+    for i, result in enumerate(results, 1):
+        match = re.search(r'<empty_chunk>(.*?)</empty_chunk>', result.strip(), re.DOTALL)
+        if match:
+            reason = match.group(1).strip()
+            click.echo(f"[ttsify] Chunk {i}/{len(results)} omitted: {reason}", err=True)
+        else:
+            non_empty.append(result)
+
+    final = "\n\n".join(non_empty)
     output.write_text(final, encoding="utf-8")
     click.echo("[ttsify] Done.", err=True)
     # Print output path to stdout for chaining
