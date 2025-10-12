@@ -45,11 +45,11 @@ _wal_adjust_brightness() {
 # Apply the theme
 _apply_wal_theme() {
     if [[ -n "$WAL_THEME_NAME" ]]; then
-        uvx --from pywal wal --theme "$WAL_THEME_NAME" &> /dev/null
+        wal --theme "$WAL_THEME_NAME" &> /dev/null
     elif [[ -n "$WAL_THEME_FILE" ]]; then
-        uvx --from pywal wal -f "$WAL_THEME_FILE" &> /dev/null
+        wal -f "$WAL_THEME_FILE" &> /dev/null
     elif [[ -n "$WAL_THEME_IMAGE" ]]; then
-        uvx --from pywal wal -i "$WAL_THEME_IMAGE" &> /dev/null
+        wal -i "$WAL_THEME_IMAGE" &> /dev/null
     fi
 }
 
