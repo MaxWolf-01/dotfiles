@@ -138,6 +138,19 @@ class CacheManager:
         with self.metadata_lock:
             return str(source_id) in self.metadata and image_id in self.metadata[str(source_id)]
 
+    def get_all_cached(self, source_id: SourceId) -> list[tuple[str, str]]:
+        """Get all cached images for a source as (image_id, timestamp) sorted by timestamp."""
+        with self.metadata_lock:
+            source_key = str(source_id)
+            if source_key not in self.metadata:
+                return []
+
+            items = [
+                (image_id, data['timestamp'])
+                for image_id, data in self.metadata[source_key].items()
+            ]
+            return sorted(items, key=lambda x: x[1])
+
 
 class HelioviewerClient:
     def __init__(self, source_id: SourceId):
@@ -182,32 +195,34 @@ class SunViewer:
         self.show_help = False
         self.window_size = WINDOW_SIZE
         self._setup_display()
-        
+
         self.font_large = pygame.font.Font(None, 24)
         self.font_small = pygame.font.Font(None, 18)
         self.clock = pygame.time.Clock()
-        
+
         self.client = HelioviewerClient(source_id)
         self.cache = CacheManager()
-        
+
         self.buffers: dict[SourceId, ImageBuffer] = {}
         self.image_ids: dict[SourceId, set[str]] = {}
         self.playback_indices: dict[SourceId, int] = {}
         self.current_surface: pygame.Surface | None = None
         self.last_image_time = "Loading..."
+
+        self.cached_scaled_surface: pygame.Surface | None = None
+        self.last_scaled_id: str | None = None
+        self.last_window_size = self.window_size
+        self.needs_redraw = True
         
         self.running = True
         self.fetch_lock = threading.Lock()
         self.prefetch_stop = threading.Event()
         self.prefetch_thread = None
-        
-        self.fps = 0.0
-        self.frame_count = 0
-        self.fps_update_time = time.time()
-        
+
         self.mode_message = ""
         self.mode_message_alpha = 0
-        
+        self.playback_counter = 0
+
         self._init_buffer(source_id)
     
     def _init_buffer(self, source_id: SourceId):
@@ -215,6 +230,38 @@ class SunViewer:
             self.buffers[source_id] = []
             self.image_ids[source_id] = set()
             self.playback_indices[source_id] = 0
+
+    def _load_from_cache(self, source_id: SourceId) -> int:
+        """Load all cached images for a source from disk. Returns count loaded."""
+        cached_items = self.cache.get_all_cached(source_id)
+        if not cached_items:
+            return 0
+
+        loaded = 0
+        for image_id, timestamp in cached_items:
+            if image_id in self.image_ids.get(source_id, set()):
+                continue
+
+            image = self.cache.load(source_id, image_id)
+            if not image:
+                continue
+
+            try:
+                surface = self._pil_to_surface(image)
+                with self.fetch_lock:
+                    self._init_buffer(source_id)
+                    self.buffers[source_id].append((surface, timestamp, image_id))
+                    self.image_ids[source_id].add(image_id)
+                loaded += 1
+            except:
+                continue
+
+        # Sort buffer by timestamp after loading
+        if loaded > 0:
+            with self.fetch_lock:
+                self.buffers[source_id].sort(key=lambda x: x[1])
+
+        return loaded
     
     def _setup_display(self):
         flags = pygame.FULLSCREEN if self.fullscreen else pygame.RESIZABLE
@@ -237,25 +284,41 @@ class SunViewer:
         scale = min(ww / sw, wh / sh)
         new_size = (int(sw * scale), int(sh * scale))
         return pygame.transform.smoothscale(surface, new_size)
+
+    def _get_scaled_surface(self, surface: pygame.Surface, image_id: str) -> pygame.Surface:
+        """Get scaled surface, using cache if available."""
+        if (self.cached_scaled_surface and
+            self.last_scaled_id == image_id and
+            self.last_window_size == self.window_size):
+            return self.cached_scaled_surface
+
+        scaled = self._scale_to_fit(surface)
+        self.cached_scaled_surface = scaled
+        self.last_scaled_id = image_id
+        self.last_window_size = self.window_size
+        return scaled
     
     def _show_message(self, text: str, duration: int = 2000):
         self.mode_message = text
         self.mode_message_alpha = 255
+        self.needs_redraw = True
         pygame.time.set_timer(pygame.USEREVENT + 1, duration)
     
     def _toggle_fullscreen(self):
         self.fullscreen = not self.fullscreen
         self._setup_display()
+        self.needs_redraw = True
     
     def _cycle_source(self, direction: int):
         sources = list(SOURCES.values())
         idx = sources.index(self.source_id)
         self.source_id = sources[(idx + direction) % len(sources)]
         self.client.source_id = self.source_id
-        
+
         self._init_buffer(self.source_id)
         self._start_prefetch(self.source_id)
-        
+        self.needs_redraw = True
+
         self._show_message(f"Source: {SOURCE_NAMES.get(self.source_id, 'Unknown')}")
     
     def _start_prefetch(self, source_id: SourceId):
@@ -273,20 +336,31 @@ class SunViewer:
     
     def _toggle_mode(self):
         self.mode = 'live' if self.mode == 'video' else 'video'
+        self.needs_redraw = True
+        self.playback_counter = 0
+        self.cached_scaled_surface = None
         self._show_message(f"Mode: {self.mode.upper()}")
-        
+
         if self.mode == 'live':
+            # Jump to most recent buffered image immediately
+            buffer = self.buffers.get(self.source_id, [])
+            if buffer:
+                with self.fetch_lock:
+                    self.current_surface, self.last_image_time, _ = buffer[-1]
+                    self.playback_indices[self.source_id] = len(buffer) - 1
+            # Also fetch a brand new image in the background
             threading.Thread(target=self._fetch_latest, daemon=True).start()
     
     def _fetch_latest(self):
         now = datetime.now(timezone.utc)
         data = self.client.get_closest_image(now - timedelta(seconds=30))
-        
+
         if data and 'id' in data:
             if (image := self.client.download_image(data['id'])):
                 surface = self._pil_to_surface(image)
                 self.current_surface = surface
                 self.last_image_time = data.get('date', 'Unknown')
+                self.needs_redraw = True
                 self.cache.save(self.source_id, data['id'], image, self.last_image_time)
     
     def _prefetch_historical(self, source_id: SourceId):
@@ -384,10 +458,11 @@ class SunViewer:
                                 self._init_buffer(self.source_id)
                                 bisect.insort(self.buffers[self.source_id], (surface, timestamp, image_id), key=lambda x: x[1])
                                 self.image_ids[self.source_id].add(image_id)
-                                
+
                                 if self.mode == 'live':
                                     self.current_surface = surface
                                     self.last_image_time = timestamp
+                                    self.needs_redraw = True
                         except:
                             pass
             except:
@@ -413,9 +488,11 @@ class SunViewer:
             self._cycle_source(1)
         elif key == pygame.K_i:
             self.show_info = not self.show_info
+            self.needs_redraw = True
             self._show_message(f"Info: {'ON' if self.show_info else 'OFF'}")
         elif key == pygame.K_h:
             self.show_help = not self.show_help
+            self.needs_redraw = True
         elif key == pygame.K_UP:
             self.video_fps = min(30, self.video_fps + 1)
             self._show_message(f"Video FPS: {self.video_fps}")
@@ -438,7 +515,7 @@ class SunViewer:
         wavelength_desc = WAVELENGTH_INFO.get(source_name, source_name)
         
         buffer = self.buffers.get(self.source_id, [])
-        buffer_info = f"Buffer: {len(buffer)} frames" if self.mode == 'video' else "Live"
+        buffer_info = f" | Buffer: {len(buffer)} frames" if self.mode == 'video' else ""
         fps_info = f" | Video FPS: {self.video_fps}" if self.mode == 'video' else ""
         
         delay_info = ""
@@ -452,8 +529,8 @@ class SunViewer:
         
         lines = [
             wavelength_desc,
-            f"Mode: {self.mode.upper()} | {buffer_info}{fps_info}",
-            f"Image: {self.last_image_time}{delay_info}",
+            f"Image: {self.last_image_time} UTC{delay_info}",
+            f"Mode: {self.mode.upper()}{buffer_info}{fps_info}",
         ]
         
         y = 10
@@ -473,16 +550,14 @@ class SunViewer:
             msg = self.font_large.render(self.mode_message, True, (255, 255, 255))
             msg.set_alpha(self.mode_message_alpha)
             msg_rect = msg.get_rect(center=(self.window_size[0] // 2, self.window_size[1] // 2))
-            
+
             bg = pygame.Surface((msg_rect.width + 20, msg_rect.height + 10))
             bg.set_alpha(int(self.mode_message_alpha * 0.7))
             bg.fill((0, 0, 0))
             bg_rect = bg.get_rect(center=(self.window_size[0] // 2, self.window_size[1] // 2))
-            
+
             self.screen.blit(bg, bg_rect)
             self.screen.blit(msg, msg_rect)
-            
-            self.mode_message_alpha = max(0, self.mode_message_alpha - 5)
     
     def _draw_help(self):
         overlay = pygame.Surface(self.window_size)
@@ -513,15 +588,38 @@ class SunViewer:
             y += 30
     
     def run(self):
+        # Load cached images first (fast, no API calls)
+        print(f"Loading cached images for source {self.source_id}...")
+        cached_count = self._load_from_cache(self.source_id)
+        print(f"Loaded {cached_count} cached images")
+
+        # Display latest cached image immediately if available
+        if cached_count > 0:
+            buffer = self.buffers.get(self.source_id, [])
+            if buffer:
+                self.current_surface, self.last_image_time, _ = buffer[-1]
+                self._show_message(f"Loaded {cached_count} cached images", 2000)
+        else:
+            self._show_message("Loading solar imagery...", 3000)
+
+        # Start background threads for fetching new images
         self._start_prefetch(self.source_id)
         threading.Thread(target=self._fetch_worker, daemon=True).start()
-        
-        self._show_message("Loading solar imagery...", 3000)
-        
-        playback_counter = 0
-        
+
+        current_image_id = None
+
         while self.running:
-            for event in pygame.event.get():
+            # Event handling: use wait() in live mode, get() in video mode
+            if self.mode == 'live' and self.mode_message_alpha == 0:
+                # In live mode with no animations, wait for events (near-zero CPU)
+                event = pygame.event.wait(timeout=100)
+                events = [event] if event.type != pygame.NOEVENT else []
+                events.extend(pygame.event.get())
+            else:
+                # In video mode or during animations, poll normally
+                events = pygame.event.get()
+
+            for event in events:
                 if event.type == pygame.QUIT:
                     self.running = False
                 elif event.type == pygame.KEYDOWN:
@@ -529,48 +627,59 @@ class SunViewer:
                 elif event.type == pygame.VIDEORESIZE and not self.fullscreen:
                     self.window_size = (event.w, event.h)
                     self.screen = pygame.display.set_mode(self.window_size, pygame.RESIZABLE)
+                    self.needs_redraw = True
                 elif event.type == pygame.USEREVENT + 1:
                     pygame.time.set_timer(pygame.USEREVENT + 1, 0)
-            
-            self.screen.fill((0, 0, 0))
-            
+                    self.needs_redraw = True
+
             buffer = self.buffers.get(self.source_id, [])
-            
+
             if self.mode == 'video' and buffer:
-                playback_counter += 1
+                self.playback_counter += 1
                 playback_interval = max(1, int(60 / self.video_fps))
-                
-                if playback_counter >= playback_interval:
-                    playback_counter = 0
+
+                if self.playback_counter >= playback_interval:
+                    self.playback_counter = 0
                     with self.fetch_lock:
                         if buffer:
                             idx = self.playback_indices.get(self.source_id, 0)
                             if idx >= len(buffer):
                                 idx = 0
-                            
-                            self.current_surface, self.last_image_time, _ = buffer[idx]
+
+                            self.current_surface, self.last_image_time, image_id = buffer[idx]
+                            if image_id != current_image_id:
+                                current_image_id = image_id
+                                self.needs_redraw = True
                             self.playback_indices[self.source_id] = (idx + 1) % len(buffer)
-            
-            if self.current_surface:
-                scaled = self._scale_to_fit(self.current_surface)
-                x = (self.window_size[0] - scaled.get_width()) // 2
-                y = (self.window_size[1] - scaled.get_height()) // 2
-                self.screen.blit(scaled, (x, y))
-            
-            if self.show_help:
-                self._draw_help()
-            else:
-                self._draw_info()
-            
-            pygame.display.flip()
-            
-            self.frame_count += 1
-            if (current_time := time.time()) - self.fps_update_time >= 1.0:
-                self.fps = self.frame_count / (current_time - self.fps_update_time)
-                self.frame_count = 0
-                self.fps_update_time = current_time
-            
-            self.clock.tick(60)
+
+            # Handle fade animation
+            if self.mode_message_alpha > 0:
+                self.mode_message_alpha = max(0, self.mode_message_alpha - 5)
+                self.needs_redraw = True
+
+            # Only redraw if something changed
+            if self.needs_redraw:
+                self.screen.fill((0, 0, 0))
+
+                if self.current_surface:
+                    scaled = self._get_scaled_surface(self.current_surface, current_image_id or "")
+                    x = (self.window_size[0] - scaled.get_width()) // 2
+                    y = (self.window_size[1] - scaled.get_height()) // 2
+                    self.screen.blit(scaled, (x, y))
+
+                if self.show_help:
+                    self._draw_help()
+                else:
+                    self._draw_info()
+
+                pygame.display.flip()
+                self.needs_redraw = False
+
+            # Frame rate control
+            if self.mode == 'video':
+                self.clock.tick(60)
+            elif self.mode_message_alpha > 0:
+                self.clock.tick(60)  # Higher rate during animations
         
         pygame.quit()
 
