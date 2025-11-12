@@ -408,8 +408,8 @@ def sanitize_filename(title):
 @click.option(
     "--pages",
     type=int,
-    default=20,
-    help="Limit processing to the first N pages (default: 20).",
+    default=50,
+    help="Limit processing to the first N pages (default: 50).",
 )
 @click.option(
     "--batch/--no-batch",
