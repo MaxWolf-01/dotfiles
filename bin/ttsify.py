@@ -55,12 +55,13 @@ def chunk_text(text: str, max_size: int = CHUNK_SIZE) -> list[str]:
     return chunks
 
 
-def process_chunk(chunk: str, model: str, api_key: str, headers: dict, system_prompt: str) -> str:
+def process_chunk(chunk: str, model: str, api_key: str, headers: dict, system_prompt: str, debug: bool = False) -> str:
     """Send chunk to OpenRouter and return processed text."""
 
     payload = {
         "model": model,
         "stream": False,
+        "max_tokens": 32768,  # Allow for large outputs
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -69,6 +70,16 @@ def process_chunk(chunk: str, model: str, api_key: str, headers: dict, system_pr
             },
         ],
     }
+
+    if debug:
+        debug_file = Path("/tmp/ttsify_debug.txt")
+        debug_file.write_text(
+            f"=== TTSIFY DEBUG ===\n\n"
+            f"Model: {model}\n"
+            f"Max tokens: {payload['max_tokens']}\n\n"
+            f"=== SYSTEM PROMPT ===\n{system_prompt}\n\n"
+            f"=== INPUT CHUNK ===\n{chunk}\n\n"
+        )
 
     resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -86,7 +97,15 @@ def process_chunk(chunk: str, model: str, api_key: str, headers: dict, system_pr
 
     try:
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        result = data["choices"][0]["message"]["content"].strip()
+
+        if debug:
+            with open("/tmp/ttsify_debug.txt", "a") as f:
+                f.write(f"\n=== MODEL RESPONSE ===\n{result}\n\n")
+                f.write(f"=== FULL API RESPONSE ===\n{resp.text}\n")
+            click.echo(f"[ttsify] Debug info saved to /tmp/ttsify_debug.txt", err=True)
+
+        return result
     except Exception as e:
         # Debug output
         debug_file = Path("/tmp/ttsify2_debug.txt")
@@ -103,7 +122,8 @@ def process_chunk(chunk: str, model: str, api_key: str, headers: dict, system_pr
 @click.argument("input_path", type=click.Path(exists=True, path_type=Path))
 @click.option("--output", "-o", type=click.Path(path_type=Path), help="Output file")
 @click.option("--model", "-m", default=DEFAULT_MODEL, help="Model to use")
-def main(input_path: Path, output: Path | None, model: str):
+@click.option("--debug", is_flag=True, help="Save debug info to /tmp/ttsify_debug.txt")
+def main(input_path: Path, output: Path | None, model: str, debug: bool):
     """Transform markdown to TTS-friendly format."""
 
     # Get API key
@@ -153,7 +173,7 @@ def main(input_path: Path, output: Path | None, model: str):
         "Only use <empty_chunk>brief reason</empty_chunk> if the ENTIRE chunk contains ONLY:\n"
         "  - A bibliography/references list with no other content, OR\n"
         "  - Appendices containing only equations/tables with no prose\n"
-        "Do NOT use <empty_chunk> for chunks containing actual paper content.\n"
+        "Do NOT use <empty_chunk> for chunks containing any amount of actual paper content.\n"
     )
     system_prompt = default_rules
 
@@ -178,7 +198,7 @@ def main(input_path: Path, output: Path | None, model: str):
         else:
             click.echo("[ttsify] Sending request to OpenRouter...", err=True)
 
-        result = process_chunk(chunk, model, api_key, headers, system_prompt)
+        result = process_chunk(chunk, model, api_key, headers, system_prompt, debug)
         results.append(result)
 
         if len(chunks) == 1:
@@ -186,17 +206,26 @@ def main(input_path: Path, output: Path | None, model: str):
 
     # Write output
     click.echo("[ttsify] Writing output...", err=True)
-    # Filter out empty chunks and log reasons
-    non_empty = []
+    # Process chunks: extract content before <empty_chunk> tags
+    processed = []
     for i, result in enumerate(results, 1):
-        match = re.search(r'<empty_chunk>(.*?)</empty_chunk>', result.strip(), re.DOTALL)
-        if match:
-            reason = match.group(1).strip()
-            click.echo(f"[ttsify] Chunk {i}/{len(results)} omitted: {reason}", err=True)
-        else:
-            non_empty.append(result)
+        # Check if entire chunk is empty (starts with <empty_chunk>)
+        if result.strip().startswith('<empty_chunk>'):
+            match = re.search(r'<empty_chunk>(.*?)</empty_chunk>', result.strip(), re.DOTALL)
+            if match:
+                reason = match.group(1).strip()
+                click.echo(f"[ttsify] Chunk {i}/{len(results)} omitted: {reason}", err=True)
+                continue
 
-    final = "\n\n".join(non_empty)
+        # Otherwise, remove any <empty_chunk> sections but keep content before them
+        cleaned = re.sub(r'##?\s*References.*?<empty_chunk>.*?</empty_chunk>', '', result, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r'<empty_chunk>.*?</empty_chunk>', '', cleaned, flags=re.DOTALL)
+        cleaned = cleaned.strip()
+
+        if cleaned:
+            processed.append(cleaned)
+
+    final = "\n\n".join(processed)
     output.write_text(final, encoding="utf-8")
     click.echo("[ttsify] Done.", err=True)
     # Print output path to stdout for chaining
