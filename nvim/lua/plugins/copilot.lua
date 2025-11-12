@@ -33,12 +33,14 @@ return {
     vim.keymap.set("i", "<A-d>", "copilot#Next()", { expr = true, silent = true })
     vim.keymap.set("i", "<A-a>", "copilot#Previous()", { expr = true, silent = true })
 
-    -- toggle Copilot on/off (uses buffer-scoped flag set by the plugin)
+    -- toggle Copilot on/off
     vim.keymap.set("n", "<leader>cc", function()
-      if vim.b.copilot_suggestion_enabled then
-        vim.cmd("Copilot disable")
-      else
+      if vim.b.copilot_enabled == 0 then
         vim.cmd("Copilot enable")
+        vim.notify("Copilot enabled", vim.log.levels.INFO)
+      else
+        vim.cmd("Copilot disable")
+        vim.notify("Copilot disabled", vim.log.levels.INFO)
       end
     end, { silent = true, desc = "Toggle Copilot" })
 

@@ -50,6 +50,7 @@ return {
       "bashls",
       "biome",
       "cmake",
+      "copilot",
       "docker_compose_language_service",
       "dockerls",
       "elixirls",

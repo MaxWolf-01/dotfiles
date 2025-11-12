@@ -4,10 +4,17 @@ return {
   version = 'v0.*',
   
   opts = {
-    keymap = { 
+    keymap = {
       preset = 'enter',  -- Enter to accept
-      ['<Tab>'] = { 'select_next', 'fallback' },  -- Add Tab navigation
-      ['<S-Tab>'] = { 'select_prev', 'fallback' },  -- Add Shift-Tab navigation
+      ['<Tab>'] = {
+        'snippet_forward',  -- First try snippet navigation
+        -- function()  -- Then try Sidekick NES
+        --   return require("sidekick").nes_jump_or_apply()
+        -- end,
+        'select_next',  -- Then blink menu navigation
+        'fallback'
+      },
+      ['<S-Tab>'] = { 'snippet_backward', 'select_prev', 'fallback' },
     },
     
     completion = {
