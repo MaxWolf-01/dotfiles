@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -euo pipefail
+set -uo pipefail
 
 playlist_file="${1:-}"
 output_dir="${2:-}"
