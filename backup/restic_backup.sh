@@ -10,7 +10,7 @@ export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
 #
 # Expected config variables:
 # repo_path - Path to restic repository
-# password_file - Path to password file
+# password_command - Command to output password (e.g., "sops -d /path/to/password")
 # backup_dirs_file - File containing directories to backup (relative paths)
 # base_path - Base path to prepend to directories (e.g., $HOME or $HOME/data-mirror/laptop)
 # exclude_file - (optional) File containing exclude patterns
@@ -61,17 +61,17 @@ format_duration() {
     fi
 }
 
-# Extract config name for notifications
-config_name=$(basename "$config_file" .conf)
+# Extract config name for notifications (parent_dir-filename)
+config_name="$(basename "$(dirname "$config_file")")-$(basename "$config_file" .conf)"
 
 # Create local log directory
 log_dir="$HOME/logs/backup"
 mkdir -p "$log_dir"
 
 # Check if repository exists
-if ! restic --repo "$repo_path" --password-file "$password_file" cat config >/dev/null 2>&1; then
+if ! restic --repo "$repo_path" --password-command "$password_command" cat config >/dev/null 2>&1; then
     echo "Initializing restic repository at $repo_path"
-    restic init --repo "$repo_path" --password-file "$password_file" || exit 1
+    restic init --repo "$repo_path" --password-command "$password_command" || exit 1
 fi
 
 # Validate base_path is set
@@ -114,7 +114,7 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
    restic --repo "$repo_path" backup \
     --option compression="$compression" \
     --files-from-verbatim - \
-    --password-file "$password_file" \
+    --password-command "$password_command" \
     $exclude_opts \
     $scan_option \
     --json 2>"$error_log" | tee "$backup_output"; then
@@ -162,7 +162,7 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
         --keep-daily "$keep_daily" \
         --keep-weekly "$keep_weekly" \
         --keep-monthly "$keep_monthly" \
-        --password-file "$password_file" >/dev/null 2>&1
+        --password-command "$password_command" >/dev/null 2>&1
 
     # Determine check arguments based on config
     check_args=""
@@ -177,7 +177,7 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
 
     # Run repository check
     echo "Checking repository integrity..."
-    if restic check --repo "$repo_path" --password-file "$password_file" $check_args >/dev/null 2>&1; then
+    if restic check --repo "$repo_path" --password-command "$password_command" $check_args >/dev/null 2>&1; then
         check_status="passed"
     else
         check_status="FAILED"
