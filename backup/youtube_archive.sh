@@ -62,18 +62,23 @@ while IFS='|' read -r url format name; do
 
     log_file="$log_dir/${name}_$(date +%Y%m%d_%H%M%S).log"
 
-    if output=$("${cmd[@]}" 2>&1 | tee "$log_file"); then
+    "${cmd[@]}" > "$log_file" 2>&1
+    exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
         echo "✓ $name"
     else
         ((failed++))
-        error=$(echo "$output" | tail -n 10)
-        echo "✗ $name FAILED"
-        echo "$error"
+        error=$(tail -n 20 "$log_file" | grep -i "error\|unavailable\|failed" | head -10)
+        echo "✗ $name (exit code: $exit_code)"
+        [ -n "$error" ] && echo "$error"
         echo "Full log: $log_file"
 
         if [ -n "$ntfy_topic" ]; then
+            summary="Playlist: $name, Exit code: $exit_code"
+            [ -n "$error" ] && summary="$summary\n$error"
             curl -s -H "Title: YouTube Download Failed: $name" -H "Priority: 4" -H "Tags: youtube,error" \
-                 -d "$error" "https://ntfy.sh/$ntfy_topic" || true
+                 -d "$summary" "https://ntfy.sh/$ntfy_topic" || true
         fi
     fi
 done < "$playlist_file"
