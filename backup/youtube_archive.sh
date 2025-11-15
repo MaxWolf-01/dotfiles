@@ -49,8 +49,6 @@ while IFS='|' read -r url format name; do
     mkdir -p "$playlist_dir"
     cd "$playlist_dir"
 
-    echo "Downloading $name..."
-
     # Build yt-dlp command based on format
     if [ "$format" = "audio" ]; then
         cmd=(yt-dlp -f "ba/b" --extract-audio --audio-format wav --audio-quality 0)
