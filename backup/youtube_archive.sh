@@ -28,12 +28,18 @@ fi
 # Count videos before
 before_count=$(find "$output_dir" -name "*.mp4" -o -name "*.webm" -o -name "*.mkv" -o -name "*.wav" 2>/dev/null | wc -l || echo "0")
 
-# Create log directory
+# Create log directory and run log
 log_dir="$HOME/logs/youtube"
 mkdir -p "$log_dir"
+run_log="$log_dir/run_$(date +%Y%m%d_%H%M%S).log"
+
+echo "=== YouTube Download - $(date) ===" | tee -a "$run_log"
+echo "Output dir: $output_dir" | tee -a "$run_log"
+echo "" | tee -a "$run_log"
 
 # Process each playlist
 failed=0
+failed_playlists=""
 while IFS='|' read -r url format name; do
     [ -z "$url" ] && continue
     [ "${url:0:1}" = "#" ] && continue
@@ -62,30 +68,30 @@ while IFS='|' read -r url format name; do
 
     log_file="$log_dir/${name}_$(date +%Y%m%d_%H%M%S).log"
 
+    echo "Downloading $name..." | tee -a "$run_log"
     "${cmd[@]}" > "$log_file" 2>&1
     exit_code=$?
 
-    if [ $exit_code -eq 0 ]; then
-        echo "✓ $name"
-    else
+    if [ $exit_code -ne 0 ]; then
         ((failed++))
-        error=$(tail -n 20 "$log_file" | grep -i "error\|unavailable\|failed" | head -10)
-        echo "✗ $name (exit code: $exit_code)"
-        [ -n "$error" ] && echo "$error"
-        echo "Full log: $log_file"
-
-        if [ -n "$ntfy_topic" ]; then
-            summary="Playlist: $name, Exit code: $exit_code"
-            [ -n "$error" ] && summary="$summary\n$error"
-            curl -s -H "Title: YouTube Download Failed: $name" -H "Priority: 4" -H "Tags: youtube,error" \
-                 -d "$summary" "https://ntfy.sh/$ntfy_topic" || true
-        fi
+        failed_playlists="${failed_playlists}${name} (exit ${exit_code}), "
+        echo "  Failed (exit code: $exit_code)" | tee -a "$run_log"
+    else
+        echo "  Success" | tee -a "$run_log"
     fi
 done < "$playlist_file"
 
 # Count videos after
 after_count=$(find "$output_dir" -name "*.mp4" -o -name "*.webm" -o -name "*.mkv" -o -name "*.wav" 2>/dev/null | wc -l || echo "0")
 new_videos=$((after_count - before_count))
+
+# Write summary to run log
+echo "" | tee -a "$run_log"
+echo "=== Summary ===" | tee -a "$run_log"
+echo "New videos: $new_videos" | tee -a "$run_log"
+echo "Failed playlists: $failed" | tee -a "$run_log"
+[ $failed -gt 0 ] && echo "Failed: $failed_playlists" | tee -a "$run_log"
+echo "Run log: $run_log" | tee -a "$run_log"
 
 # Send notification
 if [ -n "$ntfy_topic" ]; then
@@ -95,17 +101,10 @@ if [ -n "$ntfy_topic" ]; then
                  -d "Downloaded $new_videos new videos" "https://ntfy.sh/$ntfy_topic" || true
         else
             curl -s -H "Title: YouTube Download Complete" -H "Priority: 1" -H "Tags: youtube,info" \
-                 -d "No new videos found" "https://ntfy.sh/$ntfy_topic" || true
+                 -d "No new videos. Log: $run_log" "https://ntfy.sh/$ntfy_topic" || true
         fi
     else
-        curl -s -H "Title: YouTube Download Partial" -H "Priority: 3" -H "Tags: youtube,warning" \
-             -d "$failed playlists failed, $new_videos new videos" "https://ntfy.sh/$ntfy_topic" || true
+        curl -s -H "Title: YouTube Download - ${failed} Failed" -H "Priority: 3" -H "Tags: youtube,warning" \
+             -d "$new_videos new videos. Failed: $failed_playlists See: $run_log" "https://ntfy.sh/$ntfy_topic" || true
     fi
 fi
-
-# Print summary
-echo ""
-echo "=== Summary ==="
-echo "New videos: $new_videos"
-echo "Failed playlists: $failed"
-[ -n "$log_dir" ] && echo "Logs: $log_dir"
