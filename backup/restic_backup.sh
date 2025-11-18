@@ -3,9 +3,6 @@
 
 set -uo pipefail
 
-# Ensure Linuxbrew binaries are in PATH (for when run via sudo/anacron)
-export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-
 # Usage: restic_backup.sh <config_file>
 #
 # Expected config variables:
@@ -23,6 +20,24 @@ export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
 # ntfy_topic - (optional) Ntfy topic for notifications
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
 
+# Helper to send failure notification and exit
+send_failure_ntfy() {
+    local error_message="$1"
+    local config_name="$2"
+    local ntfy_topic="${3:-}"
+
+    if [ -n "$ntfy_topic" ]; then
+        curl -s \
+            -H "Title: ❌ Restic Backup Failed - $config_name" \
+            -H "Priority: 5" \
+            -H "Tags: backup,restic,$config_name,error" \
+            -d "$error_message" \
+            "https://ntfy.sh/$ntfy_topic"
+    fi
+    echo "$error_message"
+    exit 1
+}
+
 config_file="${1:-}"
 if [ -z "$config_file" ] || [ ! -f "$config_file" ]; then
     echo "Usage: $0 <config_file>"
@@ -30,6 +45,9 @@ if [ -z "$config_file" ] || [ ! -f "$config_file" ]; then
 fi
 
 source "$config_file"
+
+# Extract config name early for error notifications
+config_name="$(basename "$(dirname "$config_file")")-$(basename "$config_file" .conf)"
 
 # Helper function to format bytes to human readable
 format_bytes() {
@@ -61,23 +79,33 @@ format_duration() {
     fi
 }
 
-# Extract config name for notifications (parent_dir-filename)
-config_name="$(basename "$(dirname "$config_file")")-$(basename "$config_file" .conf)"
-
 # Create local log directory
 log_dir="$HOME/logs/backup"
 mkdir -p "$log_dir"
 
 # Check if repository exists
-if ! restic --repo "$repo_path" --password-command "$password_command" cat config >/dev/null 2>&1; then
+timestamp=$(date +%Y%m%d_%H%M%S)
+repo_check_log="$log_dir/repo_check_${config_name}_${timestamp}.log"
+if ! restic --repo "$repo_path" --password-command "$password_command" cat config >"$repo_check_log" 2>&1; then
     echo "Initializing restic repository at $repo_path"
-    restic init --repo "$repo_path" --password-command "$password_command" || exit 1
+    init_log="$log_dir/repo_init_${config_name}_${timestamp}.log"
+    if ! restic init --repo "$repo_path" --password-command "$password_command" >"$init_log" 2>&1; then
+        error_details=$(cat "$init_log" "$repo_check_log" 2>/dev/null)
+        send_failure_ntfy "Failed to initialize restic repository at $repo_path
+
+ERROR OUTPUT:
+$error_details
+
+Logs: $repo_check_log, $init_log
+Config: $config_file
+Repo: $repo_path
+Password command: $password_command" "$config_name" "${ntfy_topic:-}"
+    fi
 fi
 
 # Validate base_path is set
 if [ -z "${base_path:-}" ]; then
-    echo "Error: base_path not defined in config file"
-    exit 1
+    send_failure_ntfy "base_path not defined in config file" "$config_name" "${ntfy_topic:-}"
 fi
 
 # Create temporary files for capturing output
