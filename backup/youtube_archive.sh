@@ -25,9 +25,6 @@ if ! command -v yt-dlp &> /dev/null; then
     exit 1
 fi
 
-# Count videos before
-before_count=$(find "$output_dir" -name "*.mp4" -o -name "*.webm" -o -name "*.mkv" -o -name "*.wav" 2>/dev/null | wc -l || echo "0")
-
 # Create log directory and run log
 log_dir="$HOME/logs/youtube"
 mkdir -p "$log_dir"
@@ -38,8 +35,13 @@ echo "Output dir: $output_dir" | tee -a "$run_log"
 echo "" | tee -a "$run_log"
 
 # Process each playlist
-failed=0
+all_downloaded_titles=()
 failed_playlists=""
+error_unavailable=0
+error_copyright=0
+error_deleted=0
+error_other=0
+
 while IFS='|' read -r url format name; do
     [ -z "$url" ] && continue
     [ "${url:0:1}" = "#" ] && continue
@@ -70,39 +72,117 @@ while IFS='|' read -r url format name; do
     "${cmd[@]}" > "$log_file" 2>&1
     exit_code=$?
 
-    if [ $exit_code -ne 0 ]; then
-        ((failed++))
-        failed_playlists="${failed_playlists}${name} (exit ${exit_code}), "
+    # Parse log for downloaded videos and errors
+    downloaded_titles=()
+    while IFS= read -r line; do
+        # Extract downloaded video titles (look for [download] lines with actual downloads)
+        if [[ "$line" =~ \[download\]\ Destination:\ (.+)\.(wav|mp4|webm|mkv)$ ]]; then
+            filename=$(basename "${BASH_REMATCH[1]}")
+            # Clean up yt-dlp filename format: remove video ID suffix
+            title=$(echo "$filename" | sed -E 's/ \[[a-zA-Z0-9_-]{11}\]$//')
+            downloaded_titles+=("$title")
+        fi
+
+        # Count errors by type
+        if [[ "$line" =~ ERROR:.*unavailable|not\ available ]]; then
+            ((error_unavailable++))
+        elif [[ "$line" =~ ERROR:.*copyright\ claim ]]; then
+            ((error_copyright++))
+        elif [[ "$line" =~ ERROR:.*removed|deleted ]]; then
+            ((error_deleted++))
+        elif [[ "$line" =~ ^ERROR: ]]; then
+            ((error_other++))
+        fi
+    done < "$log_file"
+
+    # Determine if this is a real failure
+    is_failure=false
+    if [ $exit_code -ne 0 ] && [ ${#downloaded_titles[@]} -eq 0 ]; then
+        # Exit code 1 AND no downloads = real failure
+        is_failure=true
+    fi
+
+    if [ "$is_failure" = true ]; then
+        failed_playlists="${failed_playlists}${name}, "
         echo "  Failed (exit code: $exit_code)" | tee -a "$run_log"
     else
-        echo "  Success" | tee -a "$run_log"
+        if [ ${#downloaded_titles[@]} -gt 0 ]; then
+            echo "  Downloaded ${#downloaded_titles[@]} video(s)" | tee -a "$run_log"
+            all_downloaded_titles+=("${downloaded_titles[@]}")
+        else
+            echo "  No new videos" | tee -a "$run_log"
+        fi
     fi
 done < "$playlist_file"
-
-# Count videos after
-after_count=$(find "$output_dir" -name "*.mp4" -o -name "*.webm" -o -name "*.mkv" -o -name "*.wav" 2>/dev/null | wc -l || echo "0")
-new_videos=$((after_count - before_count))
 
 # Write summary to run log
 echo "" | tee -a "$run_log"
 echo "=== Summary ===" | tee -a "$run_log"
-echo "New videos: $new_videos" | tee -a "$run_log"
-echo "Failed playlists: $failed" | tee -a "$run_log"
-[ $failed -gt 0 ] && echo "Failed: $failed_playlists" | tee -a "$run_log"
+echo "Total downloaded: ${#all_downloaded_titles[@]}" | tee -a "$run_log"
+if [ ${#all_downloaded_titles[@]} -gt 0 ]; then
+    echo "Downloaded videos:" | tee -a "$run_log"
+    printf '  - %s\n' "${all_downloaded_titles[@]}" | tee -a "$run_log"
+fi
+
+error_count=$((error_unavailable + error_copyright + error_deleted + error_other))
+if [ $error_count -gt 0 ]; then
+    echo "Errors encountered:" | tee -a "$run_log"
+    [ $error_unavailable -gt 0 ] && echo "  - Unavailable: $error_unavailable" | tee -a "$run_log"
+    [ $error_copyright -gt 0 ] && echo "  - Copyright: $error_copyright" | tee -a "$run_log"
+    [ $error_deleted -gt 0 ] && echo "  - Deleted/Removed: $error_deleted" | tee -a "$run_log"
+    [ $error_other -gt 0 ] && echo "  - Other: $error_other" | tee -a "$run_log"
+fi
+
+if [ -n "$failed_playlists" ]; then
+    echo "Failed playlists: ${failed_playlists%, }" | tee -a "$run_log"
+fi
 echo "Run log: $run_log" | tee -a "$run_log"
 
 # Send notification
 if [ -n "$ntfy_topic" ]; then
-    if [ $failed -eq 0 ]; then
-        if [ $new_videos -gt 0 ]; then
-            curl -s -H "Title: YouTube Download Success" -H "Priority: 2" -H "Tags: youtube,success" \
-                 -d "Downloaded $new_videos new videos" "https://ntfy.sh/$ntfy_topic" || true
-        else
-            curl -s -H "Title: YouTube Download Complete" -H "Priority: 1" -H "Tags: youtube,info" \
-                 -d "No new videos. Log: $run_log" "https://ntfy.sh/$ntfy_topic" || true
-        fi
+    # Build notification message
+    msg=""
+    if [ ${#all_downloaded_titles[@]} -gt 0 ]; then
+        msg="Downloaded ${#all_downloaded_titles[@]} video(s):\n"
+        for title in "${all_downloaded_titles[@]}"; do
+            msg+="• $title\n"
+        done
     else
-        curl -s -H "Title: YouTube Download - ${failed} Failed" -H "Priority: 3" -H "Tags: youtube,warning" \
-             -d "$new_videos new videos. Failed: $failed_playlists See: $run_log" "https://ntfy.sh/$ntfy_topic" || true
+        msg="No new videos downloaded.\n"
     fi
+
+    if [ $error_count -gt 0 ]; then
+        msg+="\nErrors: "
+        error_parts=()
+        [ $error_unavailable -gt 0 ] && error_parts+=("${error_unavailable} unavailable")
+        [ $error_copyright -gt 0 ] && error_parts+=("${error_copyright} copyright")
+        [ $error_deleted -gt 0 ] && error_parts+=("${error_deleted} deleted")
+        [ $error_other -gt 0 ] && error_parts+=("${error_other} other")
+        msg+=$(IFS=", "; echo "${error_parts[*]}")
+    fi
+
+    if [ -n "$failed_playlists" ]; then
+        msg+="\n\nFailed: ${failed_playlists%, }"
+    fi
+
+    # Determine priority and title
+    if [ -n "$failed_playlists" ]; then
+        # Real failures get warning priority
+        title="YouTube Download - Failures"
+        priority=3
+        tags="youtube,warning"
+    elif [ ${#all_downloaded_titles[@]} -gt 0 ]; then
+        # Downloads succeeded
+        title="YouTube Download - ${#all_downloaded_titles[@]} New"
+        priority=2
+        tags="youtube,success"
+    else
+        # Nothing new
+        title="YouTube Download - Up to Date"
+        priority=1
+        tags="youtube,info"
+    fi
+
+    curl -s -H "Title: $title" -H "Priority: $priority" -H "Tags: $tags" \
+         -d "$msg" "https://ntfy.sh/$ntfy_topic" || true
 fi
