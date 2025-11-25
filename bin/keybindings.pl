@@ -6,6 +6,11 @@ use strict;
 
 my $action = '';
 my $filename = $ENV{'HOME'} . '/.dotfiles/desktop/keybindings.csv'; # default filename if arg not specified
+my $extensionsDir = $ENV{'HOME'} . '/.dotfiles/desktop/extensions';
+
+my $dconfExtensions = [
+    ['tilingshell', '/org/gnome/shell/extensions/tilingshell/'],
+];
 
 for my $arg (@ARGV){
     if ($arg eq "-e" or $arg eq "--export"){
@@ -80,10 +85,22 @@ sub export(){
         my ($binding) = $gs =~ /org.gnome.settings-daemon.plugins.media-keys.custom-keybinding binding (\'[^\n]+\')/g;
         my ($command) = $gs =~ /org.gnome.settings-daemon.plugins.media-keys.custom-keybinding command (\'[^\n]+\')/g;
         my ($name) = $gs =~ /org.gnome.settings-daemon.plugins.media-keys.custom-keybinding name (\'[^\n]+\')/g;
-        print $fh "custom\t$name\t$command\t$binding\n"    
+        print $fh "custom\t$name\t$command\t$binding\n"
     }
 
     close($fh);
+
+    # Export dconf-based extension settings
+    mkdir $extensionsDir unless -d $extensionsDir;
+    for my $ext (@$dconfExtensions){
+        my ($name, $path) = @$ext;
+        my $check = `dconf dump $path 2>/dev/null`;
+        if ($check){
+            my $extFile = "$extensionsDir/$name.dconf";
+            print "Exporting extension: $name\n";
+            system("dconf dump $path > $extFile");
+        }
+    }
 }
 
 sub import(){
@@ -115,7 +132,7 @@ sub import(){
         my $customlist = "";
         for (my $i=0; $i<$customcount; $i++){
             $customlist .= "," if ($customlist);
-            $customlist .= "'/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom$i/'";            
+            $customlist .= "'/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom$i/'";
         }
         $customlist = "[$customlist]";
         print "Importing list of custom keybindings.\n";
@@ -123,4 +140,14 @@ sub import(){
     }
 
     close($fh);
+
+    # Import dconf-based extension settings
+    for my $ext (@$dconfExtensions){
+        my ($name, $path) = @$ext;
+        my $extFile = "$extensionsDir/$name.dconf";
+        if (-e $extFile){
+            print "Importing extension: $name\n";
+            system("dconf load $path < $extFile");
+        }
+    }
 }
