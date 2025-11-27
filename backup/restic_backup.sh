@@ -49,6 +49,18 @@ source "$config_file"
 # Extract config name early for error notifications
 config_name="$(basename "$(dirname "$config_file")")-$(basename "$config_file" .conf)"
 
+# Validate required variables before using them (set -u would exit silently otherwise)
+required_vars="repo_path password_command backup_dirs_file base_path compression keep_last keep_daily keep_weekly keep_monthly"
+missing_vars=""
+for var in $required_vars; do
+    if [ -z "${!var:-}" ]; then
+        missing_vars="$missing_vars $var"
+    fi
+done
+if [ -n "$missing_vars" ]; then
+    send_failure_ntfy "Missing required config variables:$missing_vars" "$config_name" "${ntfy_topic:-}"
+fi
+
 # Helper function to format bytes to human readable
 format_bytes() {
     local bytes=$1
@@ -101,11 +113,6 @@ Config: $config_file
 Repo: $repo_path
 Password command: $password_command" "$config_name" "${ntfy_topic:-}"
     fi
-fi
-
-# Validate base_path is set
-if [ -z "${base_path:-}" ]; then
-    send_failure_ntfy "base_path not defined in config file" "$config_name" "${ntfy_topic:-}"
 fi
 
 # Create temporary files for capturing output
