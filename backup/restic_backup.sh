@@ -28,7 +28,7 @@ send_failure_ntfy() {
 
     if [ -n "$ntfy_topic" ]; then
         curl -s \
-            -H "Title: ❌ Restic Backup Failed - $config_name" \
+            -H "Title: ❌ $config_name - Backup Failed" \
             -H "Priority: 5" \
             -H "Tags: backup,restic,$config_name,error" \
             -d "$error_message" \
@@ -230,7 +230,7 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
 🔍 Integrity: $check_description check $check_status"
 
             curl -s \
-                -H "Title: ✅ Restic Backup Complete - $config_name" \
+                -H "Title: ✅ $config_name" \
                 -H "Priority: 2" \
                 -H "Tags: backup,restic,$config_name,success" \
                 -d "$message" \
@@ -247,7 +247,7 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
 ⚠️ The $check_description integrity check failed. Please investigate!"
 
             curl -s \
-                -H "Title: ⚠️ Restic Backup Warning - $config_name" \
+                -H "Title: ⚠️ $config_name - Integrity Check Failed" \
                 -H "Priority: 5" \
                 -H "Tags: backup,restic,$config_name,warning" \
                 -d "$message" \
@@ -293,7 +293,7 @@ else
         curl -s \
             -T "$local_log_file" \
             -H "Filename: $filename" \
-            -H "Title: ❌ Restic Backup Failed - $config_name" \
+            -H "Title: ❌ $config_name - Backup Failed" \
             -H "Priority: 5" \
             -H "Tags: backup,restic,$config_name,error" \
             "https://ntfy.sh/$ntfy_topic"
