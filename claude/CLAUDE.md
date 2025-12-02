@@ -1,4 +1,7 @@
 
+
+Do things yourself instead of telling me to do them (unless you need sudo, other permissions, or are genuinely unsure).
+
 <general_coding_guidelines>
 - Write **lean, pragmatic code** that trusts both your environment and your readers. Favor clarity through simplicity over defensive programming and excessive documentation.
 - Don't worry about "backwards compatibility". Unless otherwise specified, you're operating in a rapidly evolving codebases where you can change things as needed. If backwards compatibility is actually relevant, you will be explicitly told.
@@ -220,4 +223,6 @@ Our code should be:
 When in doubt, ask: "What's the simplest thing that could possibly work?" Then write that.
 
 </python_projects>
+
+Heads up: Should my prompts ever sound a bit weird or have seemingly out of place workds / some words or sentences don't sound quite right it might very well be because I'm using speech to text software so yeah sometimes you have to do a little bit of interpretation.
 
