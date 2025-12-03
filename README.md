@@ -101,6 +101,9 @@ git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
 ./setup ubuntu
 # After SSH confirmed working:
 # ./setup secrets
+
+# Nix (hosts: zephyrus)
+echo 'export NIX_HOST="zephyrus"' >> ~/.local_exports && source ~/.local_exports && hmswitch
 ```
 
 `./install` and most functions in `setup` are idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.

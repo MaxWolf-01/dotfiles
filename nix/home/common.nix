@@ -20,6 +20,7 @@ in
     git
     git-lfs
     jq
+    nemo
     neovim
     ripgrep
     tmux
