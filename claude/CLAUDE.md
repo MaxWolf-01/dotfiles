@@ -2,6 +2,8 @@
 
 Do things yourself instead of telling me to do them (unless you need sudo, other permissions, or are genuinely unsure).
 
+Output formatting: Markdown tables don't render in the CLI. Use plain text with bullet points, indentation, or simple aligned text instead.
+
 <general_coding_guidelines>
 - Write **lean, pragmatic code** that trusts both your environment and your readers. Favor clarity through simplicity over defensive programming and excessive documentation.
 - Don't worry about "backwards compatibility". Unless otherwise specified, you're operating in a rapidly evolving codebases where you can change things as needed. If backwards compatibility is actually relevant, you will be explicitly told.
