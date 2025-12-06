@@ -54,7 +54,8 @@ def post_to_discord(webhook_url: str, content: str) -> None:
     """Post message to Discord webhook, splitting if needed."""
     # Discord limit is 2000 chars
     if len(content) <= 2000:
-        httpx.post(webhook_url, json={"content": content})
+        resp = httpx.post(webhook_url, json={"content": content})
+        resp.raise_for_status()
         return
 
     # Split on double newlines, respecting the limit
@@ -70,7 +71,8 @@ def post_to_discord(webhook_url: str, content: str) -> None:
         chunks.append(current.strip())
 
     for chunk in chunks:
-        httpx.post(webhook_url, json={"content": chunk})
+        resp = httpx.post(webhook_url, json={"content": chunk})
+        resp.raise_for_status()
 
 
 def main() -> None:
@@ -80,9 +82,15 @@ def main() -> None:
     today = date.today()
     yesterday = today - timedelta(days=1)
 
+    print(f"Posting daily notes for {yesterday} and {today}")
     message = format_message(today, yesterday)
     post_to_discord(webhook_url, message)
+    print("Done")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {type(e).__name__}: {e}")
+        raise
