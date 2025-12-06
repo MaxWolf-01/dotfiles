@@ -10,14 +10,10 @@ sudo apt-get update && sudo apt-get install -y git gh openssh-client
 gh auth login -w -s admin:public_key
 git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles
-./install && ./setup minimal && ./setup cli
-```
-Create + upload SSH key to GitHub, verify, switch remote to SSH
-```bash
-./setup sshkeys
-gh ssh-key add ~/.ssh/id_ed25519.pub -t "$(hostname)-dotfiles-$(date +%F)"
-ssh -T git@github.com || true
-git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
+./install && ./setup minimal
+# Restart shell, set NIX_HOST in ~/.local_exports, then:
+# nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST
+./setup cli && ./setup ubuntu && ./setup secrets
 ```
 </details>
 
@@ -29,10 +25,6 @@ apt-get update && apt-get install -y git gh openssh-client
 gh auth login -w -s admin:public_key
 git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles && ./install && ./setup minimal && ./setup cli
-./setup sshkeys
-gh ssh-key add ~/.ssh/id_ed25519.pub -t "pod-$(hostname)-$(date +%F)"
-ssh -T git@github.com || true
-git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
 ```
 
 </details>
@@ -49,6 +41,7 @@ dotfiles
 ├── desktop # ubuntu specifc: desktop shortcuts, icons
 ├── [dotbot](https://github.com/anishathalye/dotbot)
 ├── git  # git config maps to ~/.gitconig, ...
+├── nix  # nix/home-manager configs (flake.nix in root)
 ├── ssh  # ssh config maps to ~/.ssh
 ├── vim  # vim config
 ├── secrets # priv. & encrypted repo (see git/hooks & setup secrets)
@@ -87,23 +80,23 @@ gh auth login -w -s admin:public_key
 git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles
 
-# Base install
+# Base install (installs Nix)
 ./install && ./setup minimal
+# Restart shell, then:
+echo 'export NIX_HOST="zephyrus"' >> ~/.local_exports && source ~/.local_exports
+nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST  # first time
+# hmswitch  # after first run
 
-# SSH enablement for private repos
+# Optional
+./setup cli
+./setup ubuntu
+./setup secrets
+
+# SSH for pushing (optional, gh auth works for cloning)
 ./setup sshkeys
 gh ssh-key add ~/.ssh/id_ed25519.pub -t "$(hostname)-dotfiles-$(date +%F)"
 ssh -T git@github.com || true
 git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
-
-# Optional (new shell recommended), add-ons
-./setup cli
-./setup ubuntu
-# After SSH confirmed working:
-# ./setup secrets
-
-# Nix (hosts: zephyrus)
-echo 'export NIX_HOST="zephyrus"' >> ~/.local_exports && source ~/.local_exports && hmswitch
 ```
 
 `./install` and most functions in `setup` are idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
