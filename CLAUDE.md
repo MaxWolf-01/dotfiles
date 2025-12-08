@@ -34,4 +34,5 @@ Setup flow:
 
 - Move config symlinks to HM for Nix-managed tools (nvim, kitty, ruff → home.file in respective modules)
 - Move ~/.icons to gnome.nix
+- nixGL for GPU acceleration in Electron apps (vesktop currently uses --disable-gpu)
 

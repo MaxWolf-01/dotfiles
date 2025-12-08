@@ -30,6 +30,7 @@ Code Comments:
 
 Git:
 - Use commands like `git mv` instead of just `mv` to rename files (if the file is tracked by git)
+- NEVER use `git add -A` or `git add .` - these can accidentally stage untracked files. Always explicitly add the specific files you intend to commit. If you need to add multiple files, list them explicitly or use `git add -u` (only tracked files).
 
 </general_coding_guidelines>
 
