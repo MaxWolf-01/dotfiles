@@ -52,7 +52,7 @@ gh auth login -w -s admin:public_key
 
 Clone and setup (symlinks, installs Nix):
 ```bash
-git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
+git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles && ./setup minimal
 ```
 
