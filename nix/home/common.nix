@@ -6,6 +6,9 @@
 
   programs.home-manager.enable = true;
 
+  # Non-NixOS: add ~/.nix-profile/share to XDG_DATA_DIRS so GNOME finds desktop entries
+  targets.genericLinux.enable = true;
+
   xdg.enable = true;
 
   programs.zsh = {
