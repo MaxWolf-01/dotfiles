@@ -9,8 +9,8 @@ in
   home.file.".config/vesktop/themes/custom.theme.css".source = config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
 
   home.packages = with pkgs; [
+    alacritty
     nemo
-    nerd-fonts.ubuntu-sans
     vesktop-wrapped
   ];
 

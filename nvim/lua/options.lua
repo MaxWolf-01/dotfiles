@@ -1,6 +1,8 @@
 -- https://vimhelp.org/options.txt.html | :help vim.opt | :help option-list
 -------------------
 
+vim.g.have_nerd_font = true
+
 local o = vim.opt
 
 -- Display and UI
