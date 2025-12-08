@@ -1,7 +1,4 @@
-{ pkgs, config, ... }:
-let
-  dotfiles = "${config.home.homeDirectory}/.dotfiles";
-in
+{ pkgs, ... }:
 {
   home.username = "max";
   home.homeDirectory = "/home/max";
@@ -11,9 +8,6 @@ in
 
   xdg.enable = true;
 
-  home.file.".config/vesktop/themes/custom.theme.css".source = config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
-
-  # Shell integration via programs modules
   programs.zsh = {
     enable = true;
     initExtra = ''
@@ -32,7 +26,6 @@ in
   };
 
   home.packages = with pkgs; [
-    # CLI tools
     age
     # btop - compiled from source in setup script for GPU support
     cargo
@@ -53,12 +46,5 @@ in
     tree
     uv
     vim
-
-    # Fonts
-    nerd-fonts.ubuntu-sans
-
-    # GUI apps
-    nemo
-    vesktop
   ];
 }

@@ -17,5 +17,19 @@
         ./nix/home/hosts/zephyrus.nix
       ];
     };
+    homeConfigurations."minimal" = home-manager.lib.homeManagerConfiguration {
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      modules = [
+        ./nix/home/common.nix
+        ./nix/home/hosts/minimal.nix
+      ];
+    };
+    homeConfigurations."xmg15" = home-manager.lib.homeManagerConfiguration {
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      modules = [
+        ./nix/home/common.nix
+        ./nix/home/hosts/xmg15.nix
+      ];
+    };
   };
 }
