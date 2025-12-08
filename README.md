@@ -1,33 +1,6 @@
 # Linux Dotfiles
 
-I use these dotfiles for my daily driver Ubuntu and Android setup, as well as proxmox and LXCs.
-
-<details>
-<summary>Quick setup (Desktop)</summary>
-
-```bash
-sudo apt-get update && sudo apt-get install -y git gh openssh-client
-gh auth login -w -s admin:public_key
-git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-cd ~/.dotfiles
-./install && ./setup minimal
-# Restart shell, set NIX_HOST in ~/.local_exports, then:
-# nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST
-./setup cli && ./setup ubuntu && ./setup secrets
-```
-</details>
-
-<details>
-<summary>Quick setup (Pods)</summary>
-
-```bash
-apt-get update && apt-get install -y git gh openssh-client
-gh auth login -w -s admin:public_key
-git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-cd ~/.dotfiles && ./install && ./setup minimal && ./setup cli
-```
-
-</details>
+Dotfiles for Ubuntu desktop, servers/containers, and Android. → [Setup instructions](#setup-desktop)
 
 ### Overview
 
@@ -37,70 +10,98 @@ Since these dotfiles are tailored specifically to me, your needs and preferences
 
 ```bash
 dotfiles
-├── bin  # custom scripts
-├── desktop # ubuntu specifc: desktop shortcuts, icons
-├── [dotbot](https://github.com/anishathalye/dotbot)
-├── git  # git config maps to ~/.gitconig, ...
-├── nix  # nix/home-manager configs (flake.nix in root)
-├── ssh  # ssh config maps to ~/.ssh
-├── vim  # vim config
-├── secrets # priv. & encrypted repo (see git/hooks & setup secrets)
+├── bin           # custom scripts
+├── desktop       # ubuntu: desktop shortcuts, icons
+├── git           # git config -> ~/.gitconfig, ...
+├── nix           # home-manager modules
+│   └── home
+│       ├── common.nix   # CLI tools (all hosts)
+│       ├── desktop.nix  # GUI apps
+│       ├── gnome.nix    # GNOME-specific
+│       ├── x11.nix      # X11: xclip
+│       ├── wayland.nix  # Wayland: wl-clipboard
+│       └── hosts/       # per-machine configs
+├── vim           # vim/neovim config
+├── secrets       # private encrypted repo (see setup secrets)
 ├── zsh
-│   ├── plugin-files # place for plugin / theme scripts
-│   ├── aliases # aliases for zsh, git, ...
-│   ├── colors # colors for filetypes in shell
-│   ├── exports # env vars and path configs
-│   ├── functions # custom functions
-│   ├── plugins # sourcing plugins
-│   ├── zsh_config # zsh specific settings
-│   └── zshrc  # putting it all together
-├── .gitmodules # for dotbot
-├── setup # installing packages, plugins, theme, platform specific setups, ...
-├── install # idempotent main install script (basic & quick setup)
-├── install.conf.yaml # setup dir structure, symlinks, ...
+│   ├── plugin-files  # plugin/theme scripts
+│   ├── aliases       # shell aliases
+│   ├── exports       # env vars, PATH
+│   ├── functions     # custom functions
+│   └── zshrc         # main config
+├── flake.nix     # nix flake (home-manager hosts)
+└── setup         # symlinks, package installers, platform setups
 ```
 
 ### Setup (Desktop)
 
 <details>
   <summary>Post (distro-) installation steps</summary>
-  
+
   ```bash
 sudo apt update && sudo apt full-upgrade
 sudo apt autoremove && sudo apt clean
   ```
 </details>
 
-Pre-requisites and install flow:
+Pre-requisites:
 ```bash
 sudo apt-get update && sudo apt-get install -y git gh openssh-client
 gh auth login -w -s admin:public_key
+```
 
-# Clone via HTTPS (no SSH required yet)
+Clone and setup (symlinks, installs Nix):
+```bash
 git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-cd ~/.dotfiles
+cd ~/.dotfiles && ./setup minimal
+```
 
-# Base install (installs Nix)
-./install && ./setup minimal
-# Restart shell, then:
-echo 'export NIX_HOST="zephyrus"' >> ~/.local_exports && source ~/.local_exports
-nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST  # first time
-# hmswitch  # after first run
+**Restart shell**, then set host and run Home Manager:
 
-# Optional
+Hosts: `zephyrus` (X11), `xmg15` (Wayland), `minimal` (CLI only)
+```bash
+echo 'export NIX_HOST="zephyrus"' >> ~/.local_exports
+source ~/.local_exports
+nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST
+```
+
+After first run, use `hmswitch` to apply changes.
+
+Additional setup:
+```bash
 ./setup cli
 ./setup ubuntu
 ./setup secrets
+```
 
-# SSH for pushing (optional, gh auth works for cloning)
+SSH for pushing (optional, gh auth works for cloning):
+```bash
 ./setup sshkeys
 gh ssh-key add ~/.ssh/id_ed25519.pub -t "$(hostname)-dotfiles-$(date +%F)"
 ssh -T git@github.com || true
 git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
 ```
 
-`./install` and most functions in `setup` are idempotent, so you can run it multiple times without breaking anything, i.e. after pulling new changes, which will update the symlinks etc.
-But make sure to export your gnome keyboard shortcuts via `./bin/keybindings.pl` before you execute `./setup ubuntu`, otherwise they get overwritten by mine.
+`./setup` functions are idempotent. Export your gnome keyboard shortcuts via `./bin/keybindings.pl` before `./setup ubuntu` to avoid overwriting them.
+
+<details>
+<summary>Setup (Server/Container)</summary>
+
+```bash
+apt-get update && apt-get install -y git gh openssh-client
+gh auth login -w -s admin:public_key
+git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
+cd ~/.dotfiles && ./setup minimal
+```
+
+**Restart shell**, then:
+
+```bash
+echo 'export NIX_HOST="minimal"' >> ~/.local_exports && source ~/.local_exports
+nix run home-manager/master -- switch --flake ~/.dotfiles#minimal
+./setup cli
+```
+</details>
 
 ### Setup (Android)
 
@@ -158,9 +159,9 @@ toggle shortcuts, ...
 
 ### Credits
 
-- [Dotbot](https://github.com/anishathalye/dotbot/tree/da928a4c6b65148bfda3138674da1730c143f396)
 - [Jovial Theme](https://github.com/zthxxx/jovial)
 - [Zsh](https://www.zsh.org/)
+- [Nix/Home Manager](https://github.com/nix-community/home-manager)
 - Various functions, aliases and scripts from other great dotfiles repos (see top
   of [functions](https://github.com/MaxWolf-01/dotfiles/blob/master/zsh/functions) / the respective scripts)
 - More resources on dotfiles:
