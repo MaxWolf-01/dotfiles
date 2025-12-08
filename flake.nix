@@ -9,27 +9,29 @@
     };
   };
 
-  outputs = { nixpkgs, home-manager, ... }: {
-    homeConfigurations."zephyrus" = home-manager.lib.homeManagerConfiguration {
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-      modules = [
+  outputs = { nixpkgs, home-manager, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs {
+        inherit system;
+        config.allowUnfree = true;
+      };
+      mkHome = modules: home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        inherit modules;
+      };
+    in {
+      homeConfigurations."zephyrus" = mkHome [
         ./nix/home/common.nix
         ./nix/home/hosts/zephyrus.nix
       ];
-    };
-    homeConfigurations."minimal" = home-manager.lib.homeManagerConfiguration {
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-      modules = [
+      homeConfigurations."minimal" = mkHome [
         ./nix/home/common.nix
         ./nix/home/hosts/minimal.nix
       ];
-    };
-    homeConfigurations."xmg19" = home-manager.lib.homeManagerConfiguration {
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-      modules = [
+      homeConfigurations."xmg19" = mkHome [
         ./nix/home/common.nix
         ./nix/home/hosts/xmg19.nix
       ];
     };
-  };
 }
