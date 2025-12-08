@@ -10,7 +10,7 @@ When writing scripts (especially ones run by systemd timers or cron): include in
 ## Home Manager
 
 Structure:
-- `flake.nix` in root defines hosts (zephyrus, xmg15, minimal)
+- `flake.nix` in root defines hosts (zephyrus, xmg19, minimal)
 - `nix/home/common.nix` - CLI tools for all hosts
 - `nix/home/desktop.nix` - GUI apps (vesktop, nemo, fonts)
 - `nix/home/gnome.nix` - GNOME-specific (tiling-shell, dconf)

@@ -58,7 +58,7 @@ cd ~/.dotfiles && ./setup minimal
 
 **Restart shell**, then set host and run Home Manager:
 
-Hosts: `zephyrus` (X11), `xmg15` (Wayland), `minimal` (CLI only)
+Hosts: `zephyrus` (X11), `xmg19` (Wayland), `minimal` (CLI only)
 ```bash
 echo 'export NIX_HOST="zephyrus"' >> ~/.local_exports
 source ~/.local_exports
