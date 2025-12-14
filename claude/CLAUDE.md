@@ -4,6 +4,10 @@ Do things yourself instead of telling me to do them (unless you need sudo, other
 
 Output formatting: Markdown tables don't render in the CLI. Use plain text with bullet points, indentation, or simple aligned text instead.
 
+On-demand packages: If a CLI tool isn't installed, run it on-demand:
+- Nix: `nix run nixpkgs#package -- args` or `nix shell nixpkgs#pkg1 nixpkgs#pkg2 -c command`
+- Python tools: `uv run --with package command` (or `uvx package`)
+
 <general_coding_guidelines>
 - Write **lean, pragmatic code** that trusts both your environment and your readers. Favor clarity through simplicity over defensive programming and excessive documentation.
 - Don't worry about "backwards compatibility". Unless otherwise specified, you're operating in a rapidly evolving codebases where you can change things as needed. If backwards compatibility is actually relevant, you will be explicitly told.
