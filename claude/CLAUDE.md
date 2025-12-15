@@ -232,3 +232,11 @@ When in doubt, ask: "What's the simplest thing that could possibly work?" Then w
 
 Heads up: Should my prompts ever sound a bit weird or have seemingly out of place workds / some words or sentences don't sound quite right it might very well be because I'm using speech to text software so yeah sometimes you have to do a little bit of interpretation.
 
+<permissions>
+Read-only commands are auto-approved in ~/.claude/settings.json.
+
+For `gh api`: Always use `-X GET` explicitly (e.g., `gh api -X GET repos/owner/repo`) — this is the only form that's auto-approved. POST/PUT/DELETE will prompt.
+
+Prefer `fd` over `find` — fd is read-only by design (no -delete, no -exec). Use `nix run nixpkgs#fd -- <args>` until fd is added to Nix packages.
+</permissions>
+
