@@ -1,7 +1,4 @@
-{ pkgs, config, ... }:
-let
-  dotfiles = "${config.home.homeDirectory}/.dotfiles";
-in
+{ pkgs, ... }:
 {
   home.username = "max";
   home.homeDirectory = "/home/max";
@@ -9,23 +6,48 @@ in
 
   programs.home-manager.enable = true;
 
+  # Non-NixOS: add ~/.nix-profile/share to XDG_DATA_DIRS so GNOME finds desktop entries
+  targets.genericLinux.enable = true;
+
   xdg.enable = true;
 
-  home.file.".config/vesktop/themes/custom.theme.css".source = config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
+  programs.zsh = {
+    enable = true;
+    initContent = ''
+      source ~/.dotfiles/zsh/zshrc
+    '';
+  };
+
+  programs.fzf = {
+    enable = true;
+    enableZshIntegration = true;
+  };
+
+  programs.zoxide = {
+    enable = true;
+    enableZshIntegration = true;
+  };
 
   home.packages = with pkgs; [
-    btop
+    age
+    # btop - compiled from source in setup script for GPU support
+    cargo
+    curl
+    dysk
     fastfetch
-    fzf
     git
     git-lfs
+    gnumake
+    go
     jq
-    nemo
     neovim
+    nvtopPackages.full
+    openssh
     ripgrep
+    sops
     tmux
     tree
-    vesktop
-    zoxide
+    uv
+    vim
   ];
 }

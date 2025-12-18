@@ -34,6 +34,9 @@ Code Comments:
 
 Git:
 - Use commands like `git mv` instead of just `mv` to rename files (if the file is tracked by git)
+- Assume parallel work: I may push commits immediately, pull on other machines, or create files without telling you. This means:
+  - Avoid `git add -A` or `git add .` - untracked files may exist that shouldn't be committed. Prefer explicit file lists or `git add -u` (tracked files only).
+  - Before history-rewriting (amend, rebase), check if the commit was pushed. When in doubt, make a new commit instead.
 
 </general_coding_guidelines>
 
