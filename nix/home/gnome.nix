@@ -11,7 +11,10 @@
 
   dconf.settings = {
     "org/gnome/shell" = {
-      enabled-extensions = [ "tilingshell@ferrarodomenico.com" ];
+      enabled-extensions = [
+        "tilingshell@ferrarodomenico.com"
+        "GPaste@gnome-shell-extensions.gnome.org"
+      ];
     };
 
     # Screen timeout: 1 hour before blanking
