@@ -62,6 +62,7 @@ Environment Management with uv:
     - NEVER USE `python ...` ALWAYS USE `uv run (--with ...) (python) ...`, where `--with` is not necessary if the deps are already in the venv, and `python` is only needed if you e.g. want to run `python -c` or similar.
 - Before running python commands in a project, you will need to `source .venv/bin/activate` to activate the virtual environment. It's always that same command.
 - When working in projects with pyproject.toml, also prefer to add / update deps via `uv add` instead of manually editing pyproject.toml. To install the deps run `uv sync` (with the required optional deps if any).
+- To type check, run `ty check`
 
 ## Key Principles
 
