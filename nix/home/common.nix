@@ -30,11 +30,14 @@
 
   home.packages = with pkgs; [
     age
+    ast-grep
     # btop - compiled from source in setup script for GPU support
     cargo
     curl
     dysk
     fastfetch
+    fastmod
+    fd
     git
     git-lfs
     gnumake

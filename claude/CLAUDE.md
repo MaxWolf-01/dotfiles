@@ -241,6 +241,29 @@ Read-only commands are auto-approved in ~/.claude/settings.json.
 
 For `gh api`: Always use `-X GET` explicitly (e.g., `gh api -X GET repos/owner/repo`) — this is the only form that's auto-approved. POST/PUT/DELETE will prompt.
 
-Prefer `fd` over `find` — fd is read-only by design (no -delete, no -exec). Use `nix run nixpkgs#fd -- <args>` until fd is added to Nix packages.
+ALWAYS prefer `fd` over `find` — unless it is not powerful enough, e.g. you actually want to delete something — fd is read-only by design (no -delete, no -exec), so I'm not prompted for giving you permission.
+
 </permissions>
+
+<bulk_refactoring>
+For large-scale code changes, use `fastmod` or `ast-grep` (sg) instead of repeated Edit calls:
+
+**fastmod** — regex-based, interactive:
+- Rename across many files: `fastmod 'old_name' 'new_name' --extensions py`
+- With regex groups: `fastmod 'foo\((\w+)\)' 'bar($1)' --extensions ts`
+
+**ast-grep** — syntax-aware, won't match inside strings/comments:
+- Find pattern: `ast-grep --pattern 'console.log($$$ARGS)' --lang js`
+- Replace: `ast-grep --pattern 'OLD($X)' --rewrite 'NEW($X)' --lang py`
+
+When to use:
+- 5+ files with same pattern → fastmod/ast-grep (one command vs many Edit calls)
+- Rename that might appear in strings → ast-grep (won't false-match)
+- Syntax-aware search (e.g., function calls only) → ast-grep
+
+When Edit is better:
+- Single file, precise change
+- Need to inspect context before deciding
+- Non-uniform changes across files
+</bulk_refactoring>
 
