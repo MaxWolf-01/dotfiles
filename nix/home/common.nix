@@ -38,6 +38,7 @@
     fastfetch
     fastmod
     fd
+    ffmpeg
     git
     git-lfs
     gnumake
@@ -54,5 +55,6 @@
     tree
     uv
     vim
+    yt-dlp
   ];
 }

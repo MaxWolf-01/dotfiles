@@ -8,6 +8,7 @@ in
   home.packages = with pkgs; [
     alacritty
     nemo
+    signal-desktop
     vesktop
   ];
 
