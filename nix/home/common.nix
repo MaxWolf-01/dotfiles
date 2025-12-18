@@ -44,8 +44,10 @@
     go
     jq
     neovim
+    nodejs
     nvtopPackages.full
     openssh
+    restic
     ripgrep
     sops
     tmux
