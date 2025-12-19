@@ -9,9 +9,12 @@ in
 
   home.packages = with pkgs; [
     alacritty
+    gedit
+    nautilus
     nemo
     signal-desktop
     vesktop
+    yaru-theme
   ];
 
   xdg.desktopEntries.vesktop = {
