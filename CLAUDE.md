@@ -11,18 +11,42 @@ When writing scripts (especially ones run by systemd timers or cron): include in
 
 Structure:
 - `flake.nix` in root defines hosts (zephyrus, xmg19, minimal)
-- `nix/home/common.nix` - CLI tools for all hosts
+- `nix/home/common.nix` - CLI tools for all hosts (auto-included via mkHome)
 - `nix/home/desktop.nix` - GUI apps (vesktop, nemo, fonts)
 - `nix/home/gnome.nix` - GNOME-specific (tiling-shell, dconf)
 - `nix/home/x11.nix` / `wayland.nix` - display server specific
-- `nix/home/hosts/` - per-machine configs that import modules
+- `nix/home/hosts/` - per-machine configs (stateVersion + imports)
 - `nix/nix.conf` - enables flakes (symlinked by setup script)
-- Existing configs (zsh, nvim, etc.) stay as files, symlinked by setup script
 
 Setup flow:
 - `./setup minimal` installs Nix
 - First run: `nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST`
-- After that: `hmswitch` alias
+- After that: `hmswitch` alias (or `s home-manager` then `hmswitch`)
+
+### Key Nix Concepts
+
+**Pure vs Impure:**
+- Pure: references files within the flake (e.g., `../../zsh/zshrc`) — Nix controls them, builds are reproducible
+- Impure: references runtime paths (e.g., `${config.home.homeDirectory}/.dotfiles/...`) — Nix can't verify they exist
+- Prefer pure paths. Impure is okay for live editing (symlinks that should update without hmswitch)
+
+**stateVersion:**
+- Per-machine, set to HM version first installed on that host
+- NEVER change it — Nix uses it for data migrations
+- On fresh OS install, set to current HM version
+
+**builtins.readFile vs source:**
+- `builtins.readFile ../../file` — bakes content in, changes require hmswitch, but rollback restores old content
+- `source ~/.dotfiles/file` in initContent — runtime, changes apply immediately, rollback doesn't restore
+- If your baked file sources other files, those sourced files are still runtime (hot reload works)
+
+**Credentials:**
+- Never put secrets in Nix-managed files (they go to /nix/store, could leak via binary caches)
+- Use sops-nix/agenix for secrets, or keep them outside Nix entirely
+
+**zshrc is pure now:**
+- Changes to `zsh/zshrc` require `hmswitch` to take effect
+- But files it sources (like `zsh/aliases`) are runtime — changes apply on new shell, no hmswitch needed
 
 ## What stays outside Nix
 
@@ -35,4 +59,5 @@ Setup flow:
 - Move config symlinks to HM for Nix-managed tools (nvim, kitty, ruff → home.file in respective modules)
 - Move ~/.icons to gnome.nix
 - nixGL for GPU acceleration in Electron apps (vesktop currently uses --disable-gpu)
+- Consider programs.vesktop module for declarative Discord config
 

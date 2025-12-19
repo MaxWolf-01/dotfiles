@@ -18,20 +18,11 @@
       };
       mkHome = modules: home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
-        inherit modules;
+        modules = [ ./nix/home/common.nix ] ++ modules;
       };
     in {
-      homeConfigurations."zephyrus" = mkHome [
-        ./nix/home/common.nix
-        ./nix/home/hosts/zephyrus.nix
-      ];
-      homeConfigurations."minimal" = mkHome [
-        ./nix/home/common.nix
-        ./nix/home/hosts/minimal.nix
-      ];
-      homeConfigurations."xmg19" = mkHome [
-        ./nix/home/common.nix
-        ./nix/home/hosts/xmg19.nix
-      ];
+      homeConfigurations."zephyrus" = mkHome [ ./nix/home/hosts/zephyrus.nix ];
+      homeConfigurations."minimal" = mkHome [ ./nix/home/hosts/minimal.nix ];
+      homeConfigurations."xmg19" = mkHome [ ./nix/home/hosts/xmg19.nix ];
     };
 }

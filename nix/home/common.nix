@@ -2,7 +2,6 @@
 {
   home.username = "max";
   home.homeDirectory = "/home/max";
-  home.stateVersion = "24.05";
 
   programs.home-manager.enable = true;
 
@@ -13,9 +12,7 @@
 
   programs.zsh = {
     enable = true;
-    initContent = ''
-      source ~/.dotfiles/zsh/zshrc
-    '';
+    initContent = builtins.readFile ../../zsh/zshrc;
   };
 
   programs.fzf = {
