@@ -1,13 +1,14 @@
 { pkgs, config, ... }:
 {
-  home.packages = with pkgs; [
-    gnomeExtensions.tiling-shell
-  ];
-
-  # GNOME doesn't see ~/.nix-profile in XDG_DATA_DIRS, so symlink extensions here
-  xdg.dataFile."gnome-shell/extensions/tilingshell@ferrarodomenico.com".source =
-    config.lib.file.mkOutOfStoreSymlink
-      "${config.home.homeDirectory}/.nix-profile/share/gnome-shell/extensions/tilingshell@ferrarodomenico.com";
+  # tiling-shell: installed via setup script for now (nixpkgs only has GNOME 45+ build, we're on GNOME 42)
+  # TODO: uncomment when on GNOME 45+ (Ubuntu 25.04+)
+  # home.packages = with pkgs; [
+  #   gnomeExtensions.tiling-shell
+  # ];
+  # # GNOME doesn't see ~/.nix-profile in XDG_DATA_DIRS, so symlink extensions here
+  # xdg.dataFile."gnome-shell/extensions/tilingshell@ferrarodomenico.com".source =
+  #   config.lib.file.mkOutOfStoreSymlink
+  #     "${config.home.homeDirectory}/.nix-profile/share/gnome-shell/extensions/tilingshell@ferrarodomenico.com";
 
   dconf.settings = {
     "org/gnome/shell" = {
