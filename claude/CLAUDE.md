@@ -245,6 +245,16 @@ ALWAYS prefer `fd` over `find` — unless it is not powerful enough, e.g. you ac
 
 </permissions>
 
+<sub_agents>
+When spawning sub-agents via the Task tool, be selective about model choice:
+
+- **Haiku**: Only when you need some reasoning but barely any.
+- **Sonnet**: Default for most sub-agent tasks — web searches, information gathering, exploring codebases, synthesizing results.
+- **Opus**: For complex/elaborate instructions, multi-step reasoning, nuanced analysis, complex codebases, or when the task isn't straightforward.
+
+Err toward Sonnet/Opus. The cost difference isn't worth getting worse results.
+</sub_agents>
+
 <bulk_refactoring>
 For large-scale code changes, use `fastmod` or `ast-grep` (sg) instead of repeated Edit calls:
 
