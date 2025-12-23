@@ -58,7 +58,7 @@ cd ~/.dotfiles && ./setup minimal
 
 **Restart shell**, then set host and run Home Manager:
 
-Hosts: `zephyrus` (X11), `xmg19` (Wayland), `minimal` (CLI only)
+Hosts: `zephyrus` (X11), `xmg19` (Wayland), `minimal` (CLI), `minimal-root` (CLI as root)
 ```bash
 echo 'export NIX_HOST="zephyrus"' >> ~/.local_exports
 source ~/.local_exports
@@ -88,8 +88,7 @@ git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
 <summary>Setup (Server/Container)</summary>
 
 ```bash
-apt-get update && apt-get install -y git gh openssh-client
-gh auth login -w -s admin:public_key
+apt-get update && apt-get install -y git
 git clone --depth 1 https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles && ./setup minimal
 ```
@@ -97,9 +96,10 @@ cd ~/.dotfiles && ./setup minimal
 **Restart shell**, then:
 
 ```bash
-echo 'export NIX_HOST="minimal"' >> ~/.local_exports && source ~/.local_exports
-nix run home-manager/master -- switch --flake ~/.dotfiles#minimal
-./setup cli
+# use minimal-root if running as root, minimal otherwise
+echo 'export NIX_HOST="minimal-root"' >> ~/.local_exports && source ~/.local_exports
+nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST
+gh auth login -w -s admin:public_key
 ```
 </details>
 
