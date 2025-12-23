@@ -87,6 +87,7 @@ User provided detailed feedback on /archive (2024-12-22). Key corrections:
 - **Knowledge placement:** Own node vs. in-note with links? (e.g., "KaTeX SSR issue" - own node? or note in KaTeX linked to SSR?) Context-dependent, user also unsure. Need to explore existing patterns in knowledge base.
 - **Project scaffolding:** How to best initialize agent/{tasks,knowledge} for new projects? Options: alias, Claude Code /init hook, integrated into /task command. Over-engineering risk?
 - **$ARGUMENTS syntax:** Should be `$ARGUMENTS` for all args, `$1`, `$2` for positional (per docs). How to integrate?
+- **`/consult-knowledge` command:** Separate command for explicit "research before acting" mode. Agent searches memex, synthesizes, reports back. No implementation until user greenlights. Worth considering but not implementing yet — see if pre-flight checklist in /task is sufficient first.
 
 ## Notes / Findings
 
@@ -563,3 +564,58 @@ Knowledge extracted to global vault:
   - Wants steering wheel for now (Dec 2025)
 
 Task not marked complete - still pending production testing.
+
+### 2025-12-23 - TodoWrite Integration
+
+User proposed: Always use TodoWrite tool for in-session visibility, complementing task files (cross-session memory).
+
+**Key insight:** TodoWrite makes reasoning visible in TUI, reducing need for interruptions ("why are you doing X?") and building trust for autonomous work. Not just activity tracking—rationale visibility.
+
+Added to global CLAUDE.md (`~/.claude/CLAUDE.md`):
+- Section `<progress_visibility>` (xml-style to match document structure)
+- Emphasizes WHY (supervision, trust, fewer interruptions)
+- Examples show action→reasoning connection without task-workflow-specific references
+
+Files modified:
+- `/home/max/.claude/CLAUDE.md` - added `<progress_visibility>` section
+
+### 2025-12-23 - Workflow Pain Point Analysis
+
+User shared example conversation from another agent session. Analyzed pain points:
+
+**Issues observed:**
+- Agent didn't read /archive before writing knowledge → produced "poetic" content with excessive structure
+- Memex search hit 92k char limit (now fixed with increased MCP token limit)
+- Date hallucination ("2024" instead of "2025") — fixed with "IT'S NOT 2024!" in CLAUDE.md
+- No explicit pre-flight checklist → agents skip research step when eager to act
+
+**Changes made:**
+
+1. Added to `~/.dotfiles/CLAUDE.md` (memex section):
+   - "Before writing to any knowledge vault, read `~/.dotfiles/claude/commands/archive.md`"
+
+2. Added to `/task` command:
+   - Renamed "Search Memex Vaults" → "Pre-Flight Checklist"
+   - Now explicitly requires: search memex, read agent/knowledge/, report findings before proceeding
+
+3. Noted `/consult-knowledge` command idea in Open Questions:
+   - Separate command for explicit research mode
+   - Not implementing yet — see if pre-flight checklist is sufficient first
+
+Files modified:
+- `/home/max/.dotfiles/CLAUDE.md` - added archive guidance to memex section
+- `/home/max/.dotfiles/claude/commands/task.md` - added pre-flight checklist
+
+### 2025-12-23 - Second Pain Point Analysis
+
+User shared another agent conversation. Main workflow issue identified:
+
+Agent added recommendations to Next Steps without discussing tradeoffs first (e.g., "Caddy recommended", specific deployment steps). This biases the plan for future agents before decisions are confirmed.
+
+**Fix applied to /task command:**
+- Added warning to Next Steps section: "Don't add recommendations here without discussing tradeoffs with user first"
+- Updated Open Questions description to include "architectural decisions with tradeoffs"
+- Guidance: if multiple valid approaches exist, put in Open Questions first, discuss, then move to Next Steps
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - added tradeoff discussion requirement

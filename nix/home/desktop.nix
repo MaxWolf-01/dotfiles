@@ -9,12 +9,16 @@ in
 
   home.packages = with pkgs; [
     alacritty
-    gedit
-    nautilus
-    nemo
+    ast-grep
+    fastmod
+    ffmpeg
+    gedit # TODO(ubuntu-26): remove, workaround for GTK conflicts
+    nautilus # TODO(ubuntu-26): remove, workaround for GTK conflicts
+    nemo # TODO(ubuntu-26): remove, workaround for GTK conflicts
     signal-desktop
     vesktop
-    yaru-theme
+    yaru-theme # TODO(ubuntu-26): remove, workaround for GTK conflicts
+    yt-dlp
   ];
 
   xdg.desktopEntries.vesktop = {

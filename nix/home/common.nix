@@ -1,8 +1,5 @@
 { pkgs, ... }:
 {
-  home.username = "max";
-  home.homeDirectory = "/home/max";
-
   programs.home-manager.enable = true;
 
   # Non-NixOS: add ~/.nix-profile/share to XDG_DATA_DIRS so GNOME finds desktop entries
@@ -27,21 +24,20 @@
 
   home.packages = with pkgs; [
     age
-    ast-grep
     # btop - compiled from source in setup script for GPU support
     cargo
     curl
     dysk
     fastfetch
-    fastmod
     fd
-    ffmpeg
+    gh
     git
     git-lfs
     gnumake
     go
     jq
     neovim
+    nnn
     nodejs
     nvtopPackages.full
     openssh
@@ -52,6 +48,5 @@
     tree
     uv
     vim
-    yt-dlp
   ];
 }
