@@ -44,14 +44,8 @@ sudo apt autoremove && sudo apt clean
   ```
 </details>
 
-Pre-requisites:
 ```bash
-sudo apt-get update && sudo apt-get install -y git gh openssh-client
-gh auth login -w -s admin:public_key
-```
-
-Clone and setup (symlinks, installs Nix):
-```bash
+sudo apt-get update && sudo apt-get install -y git
 git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles && ./setup minimal
 ```
@@ -63,6 +57,7 @@ Hosts: `zephyrus` (X11), `xmg19` (Wayland), `minimal` (CLI), `minimal-root` (CLI
 echo 'export NIX_HOST="zephyrus"' >> ~/.local_exports
 source ~/.local_exports
 nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST
+gh auth login -w -s admin:public_key
 ```
 
 After first run, use `hmswitch` to apply changes.
