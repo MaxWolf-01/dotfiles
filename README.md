@@ -69,14 +69,6 @@ Additional setup:
 ./setup secrets
 ```
 
-SSH for pushing (optional, gh auth works for cloning):
-```bash
-./setup sshkeys
-gh ssh-key add ~/.ssh/id_ed25519.pub -t "$(hostname)-dotfiles-$(date +%F)"
-ssh -T git@github.com || true
-git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
-```
-
 `./setup` functions are idempotent. Export your gnome keyboard shortcuts via `./bin/keybindings.pl` before `./setup ubuntu` to avoid overwriting them.
 
 <details>
@@ -95,6 +87,17 @@ cd ~/.dotfiles && ./setup minimal
 echo 'export NIX_HOST="minimal-root"' >> ~/.local_exports && source ~/.local_exports
 nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST
 gh auth login -w -s admin:public_key
+```
+</details>
+
+<details>
+<summary>GitHub SSH key setup (optional)</summary>
+
+```bash
+./setup sshkeys
+gh ssh-key add ~/.ssh/id_ed25519.pub -t "$(hostname)-dotfiles-$(date +%F)"
+ssh -T git@github.com || true
+git -C ~/.dotfiles remote set-url origin git@github.com:MaxWolf-01/dotfiles.git
 ```
 </details>
 
