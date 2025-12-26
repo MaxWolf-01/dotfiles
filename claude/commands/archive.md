@@ -137,7 +137,16 @@ Add wiki links at the TOP of the task file pointing to extracted knowledge:
 
 This creates backlinks from knowledge to task files, making task files discoverable through the knowledge graph.
 
-### 6. Mark Task as Archived
+### 6. Mark Task as Done
+
+Update the YAML frontmatter to `status: done`:
+
+```yaml
+---
+status: done
+type: implementation
+---
+```
 
 Add final work log entry noting:
 - What knowledge was extracted

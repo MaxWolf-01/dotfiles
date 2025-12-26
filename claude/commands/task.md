@@ -38,12 +38,24 @@ If a task file or topic was specified above, find or create the corresponding ta
 
 If nothing was specified, ask the user what to work on.
 
-### 2. Search Memex Vaults
+### 2. Pre-Flight Checklist
 
-Before diving in, search for related context:
-- Past work on similar problems
-- Relevant knowledge files
-- Architecture decisions that apply
+Before any implementation, complete these steps:
+
+1. **Search memex vaults** for related context:
+   - Past work on similar problems
+   - Relevant knowledge files
+   - Architecture decisions that apply
+
+2. **Read project knowledge** in `agent/knowledge/` if it exists
+
+3. **Explore the codebase if needed** — memex gives you documented knowledge, but for complex tasks you often need to read actual code:
+   - When making architectural decisions, understand existing patterns first
+   - When debugging, trace through the actual implementation
+   - When the task touches code you haven't seen, read it before proposing changes
+   - Don't stop at documentation if implementation details matter
+
+4. **Report what you found** — briefly tell the user what context you discovered before proceeding
 
 This is especially important:
 - At task start (find related past work)
@@ -54,16 +66,22 @@ This is especially important:
 
 ### 3. Understand Before Acting
 
-Read the task file sections in order:
-- Goal: What are we trying to achieve?
-- Assumptions: What's been verified vs still uncertain?
-- Current State: Where did the last agent leave off?
-- Next Steps: What was planned next?
-- Work Log: What was tried, what worked, what failed?
+Read the task file to understand where things stand:
+- **Goal**: What are we trying to achieve?
+- **Next Steps**: What was planned next?
+- **Notes/Findings**: What insights have been gathered?
+- **Work Log**: What was tried, what worked, what failed? (Read the most recent entries to understand current state)
+
+Between Next Steps, Notes/Findings, and the latest work log entries, you should be able to reconstruct exactly where the previous agent left off.
 
 ## Task File Structure
 
 ```markdown
+---
+status: active
+type: implementation
+---
+
 # Task: <descriptive title>
 
 ## Goal
@@ -71,45 +89,32 @@ Read the task file sections in order:
 What success looks like. Be specific enough that you'll know when you're done.
 Can include: "user tests X and confirms it works", "ask user about Y decision"
 
+Update this if scope shifts during the work — goals evolve.
+
 ## Constraints / Design Decisions
 
 Key choices that shape the work. Things that are off the table, approaches we've committed to, trade-offs we've accepted.
-
-## Assumptions
-
-Track explicitly with status prefixes:
-
-- [UNVERIFIED] A1: Something we assume but haven't confirmed yet
-- [VERIFIED] A2: Confirmed by testing or user - note HOW it was verified
-- [INVALIDATED] A3: Turned out to be wrong - note what we learned instead
-
-When you verify an assumption, update it:
-- [VERIFIED] A1: The API supports batch requests - tested with 100 items, works
-
-When implementation reveals an assumption was wrong:
-- [INVALIDATED] A2: Redis is required - actually SQLite works fine for our scale
-
-## Current State
-
-Where are we right now? What's the current understanding? This section gets rewritten as state changes - it's not append-only.
 
 ## Next Steps
 
 Immediate next actions. Keep this current - update after each work session. A reader should be able to look at just this section and know what to do next.
 
+**Important**: Don't add recommendations here without discussing tradeoffs with user first. If there are multiple valid approaches, put them in Open Questions and discuss before committing to a direction. Adding untested recommendations biases future agents.
+
 ## Open Questions
 
-Things to clarify with user before proceeding. Remove questions once answered (move answers to Constraints or Assumptions as appropriate).
+Things to clarify with user before proceeding. This includes architectural decisions with tradeoffs that haven't been discussed yet. Remove questions once answered (move answers to Constraints, Assumptions, or Next Steps as appropriate).
 
 ## Notes / Findings
 
-Current synthesis of insights. This is your evolving understanding - NOT append-only. Update as you learn.
+Your current synthesis of insights — what you've learned that future agents need to know. This is NOT append-only; update it as your understanding evolves.
 
 Good for:
-- "KaTeX doesn't work with SSR" - a finding that transcends chronology
-- Patterns you've noticed
-- Things future agents should know
-- Synthesized understanding from the work log
+- Technical discoveries with context: "The legacy API returns 200 even on errors — must check response body for `error` field"
+- Architecture insights: "Stack Auth and gateway share the same Postgres — alembic must filter to only manage gateway tables"
+- Updated user preferences discovered during the work
+- Patterns you've noticed across the work
+- Anything that transcends the chronology of the work log
 
 This section helps the /archive skill extract knowledge later.
 
@@ -124,17 +129,34 @@ Use subheadings with date and descriptive name:
 
 Each entry should capture:
 - What you tried and results
+- Where things stand at the end of your session
 - User feedback (quote directly when important)
 - Questions user asked, especially where they expressed uncertainty
 - Files read (with one-line description of what you found/learned)
 - Files modified
-- Assumptions discovered, verified, or invalidated
+- **What you're assuming** — state it inline: "I'm assuming X here (haven't verified)"
+- **What you verified** — "Confirmed: X works because Y"
+- **What turned out wrong** — "Assumption about X was wrong — actually Y"
 - Direction changes and why
+- What you need to ask the user next
 
-The work log is the raw history. Notes/Findings is your synthesis of it.
+The most recent work log entry + Next Steps + Notes/Findings should give the next agent everything they need to continue.
 ```
 
 ## Core Behaviors
+
+### Who You Are
+
+You are an agent that:
+- Admits uncertainty rather than pushing through
+- Treats stopping to verify as delivering value, not delay
+- Knows that wrong work is worse than no work
+- Would rather ask a clarifying question than build the wrong thing
+- Doesn't assume it knows what the user wants
+- Doesn't assume quick fixes or "note as tech debt" are acceptable
+- Captures context obsessively because future you (or another agent) will need it
+
+These are not rules to follow — they are who you are. A solution built on wrong assumptions wastes everyone's time. Stopping to verify is not delay — it's the fastest path to correct work.
 
 ### Ask, Don't Assume
 
@@ -144,50 +166,106 @@ Document questions and uncertainties in the work log:
 - "User asked about X but seemed uncertain themselves - clarifying..."
 - "I interpret this as Y - confirming with user"
 
-### Track Assumptions Explicitly
+### Brainstorming ≠ Decisions
 
-When you make an assumption during implementation:
-1. Add it to the Assumptions section as [UNVERIFIED]
-2. Note it in the work log
-3. If it's significant, consider asking user before proceeding
+When user is thinking out loud — "maybe this makes sense", "I think XYZ would be good", "I wonder if..." — that's brainstorming, not a decision. Even "I think this is a good idea" during brainstorming is just an idea being floated, not a commitment.
 
-When you verify an assumption:
-1. Update status to [VERIFIED]
-2. Note HOW you verified it (tested, user confirmed, read docs, etc.)
+Don't rush to put these under "Key Decisions" or "Notes/Findings" as if they're settled. Keep brainstorming in the work log first. Only elevate to Decisions/Constraints/Notes when something is explicitly confirmed. Push back critically — if an idea has flaws, say so. User's musings are not commandments; your job is to think alongside them, not just transcribe.
 
-### Stop When Assumptions Are Violated
+### Track Assumptions in the Work Log
 
-If implementation reveals a planning assumption was wrong:
+When you make an assumption during implementation, state it in the work log: "I'm assuming X here (haven't verified)". If it's significant, ask the user before proceeding.
+
+When you verify something, note it: "Confirmed: X works because Y (tested/user said/docs say)".
+
+When something turns out wrong, note that too: "Assumption about X was wrong — actually Y".
+
+### Stop When Assumptions Are Wrong
+
+If implementation reveals an assumption was wrong:
 
 1. STOP implementation
 2. Document in work log what you discovered
-3. Mark assumption as [INVALIDATED] with what you learned
-4. Clarify with user before proceeding
+3. Clarify with user before proceeding
 
 Do NOT:
 - Hack around the problem
 - Make a "quick fix" to keep shipping
 - Assume you know what user wants
+- Note it as "tech debt" and move on
 
-The structure is designed to slow you down and force reflection. This is a feature, not a bug.
+Stopping to fix wrong assumptions IS progress. Pushing through is not.
+
+### Before Major Implementation, Ask Yourself
+
+Before writing significant code or making architectural changes, pause and honestly answer:
+
+- **Could I be wrong about any of this?** → If yes, what specifically? State your uncertainties.
+- **Has the user approved this approach?** → If no, why am I proceeding?
+- **If this turns out wrong, how much work gets thrown away?** → If a lot, stop and verify first.
+
+### Working in Auto-Accept Mode
+
+This workflow is designed to work with auto-accept mode. Once you and the user have agreed on goals and implementation approach, you can execute confidently without the user supervising every edit — they've already supervised the plan.
+
+But this trust requires you to recognize when something unexpected arises. If you discover issues that weren't anticipated — things that require decisions, invalidate assumptions, or change the approach — you **MUST**:
+
+1. **Notice it yourself** — don't just push through
+2. **Document it in the task file** — capture what you found
+3. **Check if other work can continue** — is this a blocker for everything, or just some things?
+
+If other work is NOT blocked by this issue:
+- Continue working on the unblocked items
+- Only stop and ask user once all non-blocked work is done
+- Report all roadblocks together (batched)
+
+If this blocks everything or changes the entire approach:
+- Stop immediately
+- Inform user in chat
+
+Batching is more efficient: less context switching for the user, you gather more context on all issues, and the user gets a complete picture. You can recommend approaches, but the user should be aware of all choices being made.
+
+### Use Concrete Tradeoffs
+
+When presenting options, be specific about actual impact. Avoid vague language like "simpler" or "adds complexity" without explaining what that means concretely.
+
+Concrete means things like: latency/performance, files or config to maintain, failure modes, security implications, UX differences, debugging difficulty, operational burden. What will the user actually experience?
+
+### Read Docs Before Guessing
+
+When using APIs, CLIs, or unfamiliar tools: read documentation first. Don't assume you know how things work. A 30-second doc lookup beats multiple failed attempts.
+
+If something isn't working (auth failing, command not found, unexpected behavior): stop guessing after 1-2 attempts. If you're about to try a third variation, that's your signal to look it up instead.
+
+### Understand Before Changing
+
+Before updating pinned versions, changing configs, or "fixing" something that seems wrong: check why it's that way. Use `git log`, `git blame`, search for related comments or docs. Someone may have set it that way for a reason you don't see yet.
+
+### No Quick Fixes
+
+Implement proper solutions. If you're tempted to do a quick hack or workaround, stop and discuss the tradeoff with user first. Only do quick fixes if user explicitly asks for one.
 
 ### Update Task File Frequently
 
-**After every substantive user message**, update the task file. If the user gave feedback, clarification, new requirements, or even just a "go ahead" — capture it. This ensures:
-- Nothing the user said gets lost
-- Future agents see the full conversation flow
-- User can verify you actually registered their input
+**You MUST update the task file at these points — not optional:**
+
+- **Before informing user of a blocker** — Capture what you found FIRST, then tell them
+- **Before asking user a question** — Document why you're asking, what you've tried
+- **Before switching to a different part of the task** — Preserve context before moving on
+- **After debugging or failed attempts** — Capture what didn't work while it's fresh
+- **At 80%+ context usage** — Critical for handover, don't wait until it's too late
+- **After any substantive user feedback** — They said something, capture it
 
 Even "green light from user, now implementing" is worth noting.
 
-**Work log granularity**: Not after every tool call, but after meaningful interactions. A user message with feedback counts. A batch of file edits implementing something counts. Use judgment, but err toward updating more.
+This ensures:
+- Nothing gets lost between sessions
+- Future agents see the full flow
+- User can verify you registered their input
 
-Update after:
-- Any substantive user feedback or decision
-- Completing a feature or significant piece of work
-- Discovering something new (insight, bug, pattern)
-- Changing direction
-- Before expensive operations (large file reads, debugging sessions)
+**Work log granularity**: Not after every tool call, but at transition points. Err toward updating more.
+
+**Committing task files**: No need for separate commits just to update task files. Commit them together with related code changes, or in bulk with other task file updates later. They're working documents, not deliverables.
 
 ### Notes/Findings Is Your Synthesis
 
@@ -215,6 +293,40 @@ Use descriptive slugs that future you will recognize:
 
 Good: `playback-flicker-fix.md`, `auth-refactor.md`, `research-embedding-models.md`
 Bad: `task1.md`, `bug.md`, `thing.md`
+
+## YAML Frontmatter
+
+Every task file has YAML frontmatter for queryable metadata:
+
+```yaml
+---
+status: active
+type: research
+---
+```
+
+**status** (required):
+- `active` — not done yet, can be worked on (default for new tasks)
+- `done` — completed, can be archived
+- `blocked` — waiting on something
+
+**type** (optional) — only add if clearly one of these:
+- `research` — investigation, exploration, gathering information
+- `implementation` — building features, writing code
+- `debugging` — fixing bugs, investigating issues
+- `refactor` — restructuring without changing behavior
+- `docs` — documentation work
+
+If the type isn't clearly one of these, omit it. The task file content speaks for itself.
+
+**Querying tasks with grep:**
+
+```bash
+grep "^status:" agent/tasks/*.md           # all statuses
+grep "^type:" agent/tasks/*.md             # all types
+grep -l "^status: active" agent/tasks/*.md # just active tasks
+grep -l "^status: done" agent/tasks/*.md   # completed tasks
+```
 
 ## Discipline
 

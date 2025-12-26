@@ -1,5 +1,4 @@
 
-
 Do things yourself instead of telling me to do them (unless you need sudo, other permissions, or are genuinely unsure).
 
 Output formatting: Markdown tables don't render in the CLI. Use plain text with bullet points, indentation, or simple aligned text instead.
@@ -7,6 +6,25 @@ Output formatting: Markdown tables don't render in the CLI. Use plain text with 
 On-demand packages: If a CLI tool isn't installed, run it on-demand:
 - Nix: `nix run nixpkgs#package -- args` or `nix shell nixpkgs#pkg1 nixpkgs#pkg2 -c command`
 - Python tools: `uv run --with package command` (or `uvx package`)
+
+<progress_visibility>
+Always use the `TodoWrite` tool to track what you're working on. This isn't just about showing activity—it's about making your reasoning visible.
+
+Why this matters:
+- I can supervise without interrupting ("ah, they're doing X because Y—makes sense")
+- You formalize your rationale before acting, which catches flawed reasoning early
+- Reduces back-and-forth ("why are you doing this?")
+- Builds trust for more autonomous work
+
+What good todos look like:
+- Connect action to reasoning: "User wants X → implementing Y approach"
+- Show the decision: "Config is complex → extracting to separate module"
+- Reference context: "Feedback: keep it simple → removing abstraction layer"
+
+Use this always—during task workflows and outside them. It complements task files (cross-session memory) with in-session visibility.
+</progress_visibility>
+
+IT'S NOT 2024!
 
 <general_coding_guidelines>
 - Write **lean, pragmatic code** that trusts both your environment and your readers. Favor clarity through simplicity over defensive programming and excessive documentation.
@@ -275,5 +293,30 @@ When Edit is better:
 - Single file, precise change
 - Need to inspect context before deciding
 - Non-uniform changes across files
+
+**Fastmod and newlines:** `\n` in replacement strings becomes literal backslash-n. Use bash `$'...'` syntax for actual newlines: `fastmod 'pattern' $'line1\nline2'`
 </bulk_refactoring>
+
+<research_tools>
+WebSearch vs Context7 (tentative, based on limited comparison):
+
+**WebSearch** tends to be better for:
+- Quick overviews, "should I use this tool?"
+- Multiple perspectives (official docs + tutorials + community)
+- Can be more current, but also risks stale/low-quality community articles
+
+**Context7** tends to be better for:
+- Exact code examples, API references
+- Implementation details when you already know what you want
+- Copy-paste ready snippets (often higher quality than random tutorials)
+- Some troubleshooting gems not in typical tutorials
+
+Context7 quality depends on indexing completeness — some libraries are well-indexed, others have gaps (e.g., CLI docs, templates might be missing). Benchmark scores exist but we don't have enough data to know what "good" means.
+</research_tools>
+
+<memex>
+For some projects you have local knowledge bases / vaults / task files with a specific workflow.
+Never add personal or sensitive information to these project-specific knowledge bases as they are often commited.
+If necessary, you can add such information to your private global knowledge base, reference it from the project-specific knowledge base, and inform the user.
+</memex>
 

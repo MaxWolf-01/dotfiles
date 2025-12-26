@@ -77,3 +77,5 @@ Search tips:
 - For precise "find this exact file/string" needs, use grep/rg instead — memex is for exploration
 
 Workflow: Search to find entry points → Explore to follow connections (outlinks, backlinks, similar notes) → Build context before implementation.
+
+Before writing to any knowledge vault, read `~/.dotfiles/claude/commands/archive.md` — it has guidance on what makes good knowledge vs slop.
