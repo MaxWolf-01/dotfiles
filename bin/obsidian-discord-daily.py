@@ -50,27 +50,44 @@ def format_message(today: date, yesterday: date) -> str:
     return "\n\n".join(parts)
 
 
-def post_to_discord(webhook_url: str, content: str) -> None:
-    """Post message to Discord webhook, splitting if needed."""
-    # Discord limit is 2000 chars
-    if len(content) <= 2000:
-        resp = httpx.post(webhook_url, json={"content": content})
-        resp.raise_for_status()
-        return
+def split_text(text: str, limit: int = 1900) -> list[str]:
+    """Split text into chunks respecting the character limit."""
+    if len(text) <= limit:
+        return [text]
 
-    # Split on double newlines, respecting the limit
     chunks = []
     current = ""
-    for para in content.split("\n\n"):
-        if len(current) + len(para) + 2 > 1900:  # Leave some margin
-            chunks.append(current.strip())
+
+    for para in text.split("\n\n"):
+        # If paragraph itself exceeds limit, split on single newlines
+        if len(para) > limit:
+            for line in para.split("\n"):
+                # If single line exceeds limit, hard split it
+                while len(line) > limit:
+                    chunks.append(line[:limit])
+                    line = line[limit:]
+                if len(current) + len(line) + 1 > limit:
+                    if current:
+                        chunks.append(current.strip())
+                    current = line
+                else:
+                    current = f"{current}\n{line}" if current else line
+        elif len(current) + len(para) + 2 > limit:
+            if current:
+                chunks.append(current.strip())
             current = para
         else:
             current = f"{current}\n\n{para}" if current else para
+
     if current:
         chunks.append(current.strip())
 
-    for chunk in chunks:
+    return [c for c in chunks if c]
+
+
+def post_to_discord(webhook_url: str, content: str) -> None:
+    """Post message to Discord webhook, splitting if needed."""
+    for chunk in split_text(content):
         resp = httpx.post(webhook_url, json={"content": chunk})
         resp.raise_for_status()
 
