@@ -64,7 +64,7 @@ return {
       "lua_ls",
       "nil_ls",
       "nixd",
-      "pyright",
+      "ty",
       "rust_analyzer",
       "tailwindcss",
       "taplo",
