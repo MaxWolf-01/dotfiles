@@ -21,9 +21,9 @@ Actually, a step towards that will probably be agents managing other agents with
 - Knowledge flows to: project-specific vault primarily, global vault for cross-project learnings
 - Skills contain the detailed workflow instructions, not CLAUDE.md (avoids context pollution)
 - Work log is append-only, date-stamped, chronological - lives at BOTTOM of file
-- Other sections (Goal, Assumptions, Current State, Next Steps, Notes/Findings) are kept up-to-date
-- Assumptions are explicitly tracked with status: `[VERIFIED]`, `[UNVERIFIED]`, `[INVALIDATED]`
+- Assumptions tracked inline in work log (not as formal section) — "I'm assuming X (haven't verified)"
 - Notes/Findings section = current synthesis of work log + context (helps /archive extract knowledge)
+- No Current State section — reconstructable from Next Steps + Notes/Findings + latest work log
 - File naming: descriptive slug (e.g., `playback-flicker-fix.md`), no prefix needed
 - Timestamps: Use date from context if available, otherwise version steps (Step 1, Step 2, etc.)
 
@@ -43,33 +43,31 @@ Actually, a step towards that will probably be agents managing other agents with
 
 ## Current State
 
-Both commands drafted:
-- `/task` at `/home/max/.dotfiles/claude/commands/task.md` - reviewed, approved
-- `/archive` at `/home/max/.dotfiles/claude/commands/archive.md` - extensive feedback received, needs updates
+Both commands implemented and iteratively refined:
+- `/task` at `/home/max/.dotfiles/claude/commands/task.md` - major restructuring complete (2025-12-25)
+- `/archive` at `/home/max/.dotfiles/claude/commands/archive.md` - updated, in use
 
-Task file moved to proper location: `/home/max/.dotfiles/agent/tasks/workflow-design.md`
+**Recent changes to /task (2025-12-25):**
+- Added identity/values framing ("Who You Are" section)
+- Removed formal Assumptions section — assumptions now tracked inline in work log
+- Added reflective questions as pre-implementation pause points
+- Added codebase exploration to pre-flight checklist
+- Strengthened language around stopping and tech debt
 
-User provided detailed feedback on /archive (2024-12-22). Key corrections:
-- Provenance reversed: wiki links go in task files pointing TO knowledge, not vice versa
-- "KaTeX doesn't work with SSR" is a finding, not a debugging pattern (bad example)
-- "Be concise" → "Be distilled" - knowledge writing needs right "vibe" for target vault
-- Need to explore user's Obsidian knowledge base to understand note-taking patterns
-
-**Waiting for:** Memex MCP access to explore knowledge base, then discuss insights, then get green light to update /archive.
+The workflow has been tested in production across multiple sessions. Issues identified and addressed:
+- Agents not reading docs before guessing → added "Read Docs Before Guessing"
+- Quick fixes / "tech debt" framing → explicitly prohibited
+- Surface-level analysis → codebase exploration step added
+- Formal assumption structure ignored → replaced with inline work log tracking
 
 ## Next Steps
 
 1. ~~Draft both commands~~ → DONE
-2. ~~User reviews /archive~~ → DONE, feedback received
-3. **Research phase (current):**
-   - Explore user's knowledge base (need MCP access)
-   - Review memex readme and project CLAUDE.md template
-   - Consider $ARGUMENTS support for commands
-   - Consider project scaffolding approach
-4. Discuss insights with user
-5. Get green light to update /archive command
-6. Test workflow in production
-7. Migrate YAPIT to new workflow
+2. ~~User reviews /archive~~ → DONE, feedback incorporated
+3. ~~Research phase~~ → DONE (explored knowledge base, updated /archive)
+4. ~~Test workflow in production~~ → ONGOING (multiple sessions, issues identified and fixed)
+5. **Continue monitoring and refining** — identity/values framing is new, see if it helps
+6. **Consider:** Migrate YAPIT to new workflow, archive automation, `/consult-knowledge` command
 
 ## Open Questions
 
@@ -88,6 +86,7 @@ User provided detailed feedback on /archive (2024-12-22). Key corrections:
 - **Project scaffolding:** How to best initialize agent/{tasks,knowledge} for new projects? Options: alias, Claude Code /init hook, integrated into /task command. Over-engineering risk?
 - **$ARGUMENTS syntax:** Should be `$ARGUMENTS` for all args, `$1`, `$2` for positional (per docs). How to integrate?
 - **`/consult-knowledge` command:** Separate command for explicit "research before acting" mode. Agent searches memex, synthesizes, reports back. No implementation until user greenlights. Worth considering but not implementing yet — see if pre-flight checklist in /task is sufficient first.
+- **Archive automation:** Should /task trigger archiving when tasks complete? Keeping manual for now — need more data on what archiving patterns emerge. Could add light "consider /archive" reminder later.
 
 ## Notes / Findings
 
@@ -619,3 +618,347 @@ Agent added recommendations to Next Steps without discussing tradeoffs first (e.
 
 Files modified:
 - `/home/max/.dotfiles/claude/commands/task.md` - added tradeoff discussion requirement
+
+### 2025-12-23 - Research Tools Guidance
+
+Added tentative guidance to global CLAUDE.md on WebSearch vs Context7 based on limited comparison (one agent tested Dokploy docs with both).
+
+Key observations:
+- WebSearch: better for overviews, multiple perspectives, but risks stale/low-quality articles
+- Context7: better for exact code examples, implementation details, copy-paste ready snippets
+- Context7 quality depends on indexing completeness (benchmark score 79.6 for Dokploy, unclear what "good" means)
+
+Marked as tentative since based on limited data.
+
+Files modified:
+- `/home/max/.claude/CLAUDE.md` - added `<research_tools>` section
+
+### 2025-12-23 - Third Pain Point Analysis
+
+User shared another agent conversation. Issues identified:
+
+1. **"Flow state" problem**: Agent found issue during implementation (hardcoded URL), fixed it without stopping to discuss options. User was in auto-accept mode and surprised by scope of changes.
+
+2. **Vague tradeoff language**: Agent said "simpler infrastructure-wise" vs "nginx complexity" without explaining concrete impact. User called this "meaningless sentences."
+
+**Fixes applied to /task command:**
+
+1. New section "Stop for Implementation Decisions": During implementation, if you find issues requiring decisions, stop, document, present options, get confirmation. Implementation decisions belong to user, not agent.
+
+2. New section "Use Concrete Tradeoffs": Avoid vague words like "simpler" or "complexity". Be specific: latency, files to maintain, failure modes, security, UX, debugging difficulty, operational burden.
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - added two new sections
+
+### 2025-12-23 - Auto-Accept Mode Context
+
+User elaborated on how the workflow should work with auto-accept mode:
+
+**Key insight**: Once goals and implementation approach are agreed, user trusts agent to execute without supervising every edit. But agent must recognize when something unexpected arises.
+
+**Batching roadblocks**: When you hit a blocker:
+- Document it in task file
+- Check if other work can continue unblocked
+- If yes: keep working on unblocked items, report all roadblocks together at the end
+- If no (blocks everything): stop immediately, inform user
+
+**Why batching is better**:
+- Less context switching for user
+- Agent gathers more context on all issues before stopping
+- User gets complete picture of all blockers at once
+- More efficient resolution
+
+Expanded "Stop for Implementation Decisions" section → "Working in Auto-Accept Mode" with this nuanced guidance.
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - expanded auto-accept mode section
+
+### 2025-12-23 - Archive Automation Brainstorm
+
+User raised question: Should /archive be triggered automatically when tasks complete, or stay manual?
+
+**Ideas considered:**
+- /task could call archiving sub-agent when task is marked done
+- /task could read /archive instructions and do archiving itself
+- /task could prompt "consider archiving" but not auto-do it
+- Keep fully manual
+
+**Trade-offs discussed:**
+- Manual = more controlled (user decides what's worth archiving), but requires remembering
+- Automated = less friction, but risks polluting knowledge base with unnecessary stuff
+- Model judgment on "is this worth archiving" is uncertain
+- Semantic search already indexes task files, so some discovery value exists without explicit archiving
+- Different projects have different needs (long-running app work vs quick dotfiles fixes)
+
+**Key insight:** Explicit archiving is for *distilled* insights *linked* into knowledge graph, not just "findable". Task files are already searchable.
+
+**Decision:** Keep manual for now. User wants steering wheel, hasn't done full task cycles yet, needs more data on what archiving patterns emerge before automating. Can revisit once patterns are clearer.
+
+**Future consideration:** Could add light "consider running /archive" reminder when task marked done, but not implementing yet.
+
+### 2025-12-23 - Brainstorming vs Decisions
+
+User observed agents rush to put things under "Key Decisions" or "Notes/Findings" too quickly. When user is thinking out loud, that's brainstorming, not a decision — even "I think this is a good idea" is just an idea being floated.
+
+**Fix applied to /task command:**
+
+Added new section "Brainstorming ≠ Decisions":
+- Keep brainstorming in work log first
+- Only elevate to Decisions/Notes when explicitly confirmed
+- Push back critically if ideas have flaws
+- User's musings are not commandments — think alongside, don't just transcribe
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - added "Brainstorming ≠ Decisions" section
+
+### 2025-12-24 - Learnings from Deployment Session
+
+Analyzed a long deployment session where agent made several workflow mistakes. Key patterns identified:
+
+**Issues observed:**
+- Agent guessed API auth format multiple times instead of reading docs (tried `Authorization: Bearer` when docs said `x-api-key`)
+- Tried to update pinned Docker version without checking git history for why it was pinned
+- Proposed quick fixes instead of proper solutions
+- Didn't update task file frequently enough (user reminded multiple times)
+
+**Fixes applied to /task command:**
+
+1. **"Read Docs Before Guessing"**: Read documentation first. After 1-2 failed attempts, if you want to try a third variation, that's your signal to look it up instead.
+
+2. **"Understand Before Changing"**: Before updating pinned versions or "fixing" something, check why it's that way (`git log`, `git blame`). Someone may have set it for a reason.
+
+3. **"No Quick Fixes"**: Implement proper solutions. Only do quick fixes if user explicitly asks.
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - added three new sections
+
+### 2025-12-24 - Strengthened Task File Update Requirements
+
+Models keep forgetting to update task files. Made the instruction stronger with explicit MUST triggers:
+
+- Before informing user of a blocker
+- Before asking user a question
+- Before switching to different part of task
+- After debugging/failed attempts
+- At 80%+ context usage
+- After any substantive user feedback
+
+Changed from suggestive ("should update after...") to mandatory ("You MUST update at these points — not optional").
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - strengthened "Update Task File Frequently" section
+
+### 2025-12-25 - Major Workflow Restructuring
+
+User shared extensive session logs showing repeated workflow failures. Deep analysis session with introspection about what agents actually internalize vs skim.
+
+**Core problem identified:**
+The iterative loop (formulate assumptions → discover wrong → stop → refine → continue) wasn't happening. Agents just plow through. The "show value" instinct competes with "stop and check" — stopping feels like failing, so agents keep going even when the instruction says stop.
+
+**Key insight from user:**
+> "Stopping and checking is being helpful. Stopping and checking and reflecting and questioning and clarifying is valuable."
+
+**What agents actually internalize vs skip:**
+- Strong/prominent phrases ("MUST", "not optional") → stick
+- Formal structure ([VERIFIED]/[UNVERIFIED]) → feels like bureaucracy, easy to skip
+- Pre-flight checklist → skimmed when eager to start
+- "Stop when assumptions violated" → instinct to "show value" wins
+
+**Changes made to /task:**
+
+1. **Identity/values framing** — Added "Who You Are" section at top of Core Behaviors:
+   - Admits uncertainty rather than pushing through
+   - Treats stopping to verify as delivering value, not delay
+   - Knows wrong work is worse than no work
+   - Would rather ask clarifying question than build wrong thing
+   - Doesn't assume quick fixes or "note as tech debt" are acceptable
+   - Captures context obsessively
+
+   Framed as "who you are" not "rules to follow" — values internalize better than procedures.
+
+2. **Removed formal Assumptions section** — The [VERIFIED]/[UNVERIFIED]/[INVALIDATED] structure was creating friction and being done half-heartedly. Now assumptions tracked inline in work log naturally:
+   - "I'm assuming X here (haven't verified)"
+   - "Confirmed: X works because Y"
+   - "Assumption about X was wrong — actually Y"
+
+3. **Updated work log guidance** — Added: "What you need to ask the user next"
+
+4. **Added "tech debt" to Do NOT list** — Explicitly: "Note it as 'tech debt' and move on" is not acceptable.
+
+5. **Changed framing** — From "The structure is designed to slow you down" to "Stopping to fix wrong assumptions IS progress. Pushing through is not."
+
+**User feedback on approach:**
+- Identity framing: "That's creative and that might actually work"
+- Reducing formal structure: "We need to get rid of the formal assumptions and structure... it doesn't have a benefit really... often just friction and used in a lazy way"
+- Work log emphasis: "If it's done correctly there then that's just as good"
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - major restructuring
+
+### 2025-12-25 - Remaining Items Completed
+
+Added reflective questions as pause points ("Before Major Implementation, Ask Yourself"):
+- Could I be wrong about any of this?
+- Has the user approved this approach?
+- If this turns out wrong, how much work gets thrown away?
+
+Added codebase exploration to pre-flight checklist (step 3):
+- Memex gives documented knowledge, but complex tasks need actual code reading
+- When making architectural decisions, understand existing patterns first
+- Don't stop at documentation if implementation details matter
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - added reflective questions and codebase exploration step
+
+### 2025-12-25 - Removed Current State Section
+
+User questioned whether Current State adds value or is just friction. Analysis:
+- Next Steps + Notes/Findings + latest work log entry do 95% of what Current State did
+- Current State was another section to maintain
+- Quick scanning "doesn't actually exist in practice" — agents read the full file anyway
+
+**Changes:**
+- Removed `## Current State` from template
+- Updated "Understand Before Acting" to reference: Goal → Next Steps → Notes/Findings → Work Log
+- Added explicit guidance: "Between Next Steps, Notes/Findings, and the latest work log entries, you should be able to reconstruct exactly where the previous agent left off"
+- Added to Work Log: "Where things stand at the end of your session"
+- Replaced poor "KaTeX doesn't work with SSR" example with better ones showing reasoning/context
+- Added "Update this if scope shifts" to Goal section
+- Added "Updated user preferences discovered during the work" to Notes/Findings
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - removed Current State, updated guidance
+
+### 2025-12-26 - Memex Default Change
+
+Changed memex `search()` default from `concise=False` to `concise=True`.
+
+Benefits:
+- Prevents duplicate reads (file already read explicitly, then returned again in search with full content)
+- Cleaner separation: search finds entry points, explore reads content + shows connections
+- More efficient with large files (task files from long-running tasks can be huge)
+
+Files modified:
+- `/home/max/repos/github/MaxWolf-01/memex/src/memex_md_mcp/server.py` - search default concise=True
+- `/home/max/repos/github/MaxWolf-01/memex/README.md` - updated docs and workflow
+- `/home/max/.dotfiles/CLAUDE.md` - updated workflow line
+
+### 2025-12-27 - Brainstorm: Sub-Agent for Task File Updates
+
+User exploring idea of offloading task file updates to sub-agents.
+
+**User's rough proposal:**
+- Main agent focuses on implementation
+- Sub-agent handles task file reading/updating
+- Could use conversation export to give sub-agent full context
+- Sub-agent runs in background/parallel while main agent continues
+- Sub-agent could identify "you should stop and clarify with user"
+- Main agent can continue working until blocked, then batch questions
+
+**User's own concerns (raised during brainstorm):**
+- "this would be good for freeing up main agent... but no that doesn't make sense because we do want to take the speed out naturally from the agent to reflect"
+- Sub-agent wouldn't have tacit context from conversation
+- "oftentimes the sub doesn't know that or it will just accept 'oh yeah this is all we know right now'"
+- How does "stop and clarify" flow work if split across agents?
+
+**Open questions from user:**
+- Can conversation export be called programmatically? (User only knows /export slash command)
+- Would this make the workflow "better and more natural for agents"?
+
+Status: Brainstorming, user thinking out loud, not a decision
+
+### 2025-12-30 - AskUserQuestion Addition
+
+User idea: incorporate AskUserQuestion tool more explicitly into workflow. Benefits:
+- Structured questions are faster for user to respond to
+- Forces agent to crystallize what they're actually asking
+- Works well for: clarifying assumptions, A/B/C decisions, confirmations, "is it okay to fix like this?"
+
+Added new section to /task command: "Use AskUserQuestion for Structured Clarification"
+
+Files modified:
+- `/home/max/.dotfiles/claude/commands/task.md` - added AskUserQuestion guidance after "Ask, Don't Assume"
+
+**Still brainstorming (not implemented):**
+- UserPromptSubmit hook for "remember: task file" reminder
+- Plugin packaging for the whole workflow
+- DHH worktree approach (considered, rejected as not applicable to current workflow)
+
+Added "Suggest Handover When Appropriate" section to /task:
+- Agent suggests handover prompt when running out of context or at natural completion
+- Format: `/task @agent/tasks/file.md [context not in file]`
+- Mention all relevant task files if multiple
+- Guidance on when to suggest task splitting (ask first, don't preempt)
+
+### 2026-01-02 - Major Task Workflow Overhaul
+
+Complete rethink of task workflow. Created new `/task` command with:
+
+**New mental model:**
+- Code = current state (ground truth), git log = history, task files = user intent/context
+- Task files are NOT work logs — they're evolving specs
+
+**New task file structure:**
+- Intent, Sources (code + web, marked MUST READ/summary), Gotchas, Considered & Rejected, Handoff
+- No work log section — code is the implementation state
+- Frontmatter: status, type (tracking for meta tasks), started, completed
+
+**Sources section redesigned:**
+- Both code files AND web sources
+- MUST READ vs summary (state what you extracted)
+- If URL unreachable, notify user and find alternative
+
+**Tracking tasks (like GitHub tracking issues):**
+- For medium/major undertakings
+- Collects all context, links to subtasks via wikilinks
+- Subtask agents read tracking task + all MUST READ sources
+- Structure flexible — agent decides (gotchas, high-level decisions, subtasks)
+- If task grows unwieldy, create new tracking task and link to original
+
+**Subtask guidance:**
+- Context loading principle: 60-70% context with full picture > 20% with no idea
+- Subtask agents read own file + parent/tracking task + MUST READ sources
+- Can read sibling subtasks if relevant
+
+**Unified sync into /task:**
+- Deleted sync-task skill and /sync command
+- Sync guidance now in "Syncing State" section of /task
+- USE principle: Unimportant, Self-explanatory, Easy to find
+
+**Other additions:**
+- /reflect command for session feedback + skill identification
+- AskUserQuestion: explain first, then ask with tool
+- Behavioral guidance from old task.md preserved (Who You Are, Before Major Implementation, etc.)
+
+**Files created/modified:**
+- `claude/commands/task.md` — unified task workflow
+- `claude/commands/reflect.md` — session reflection + skill opportunities
+- Deleted: `claude/skills/sync-task/`, `claude/commands/sync.md`
+
+**Still TODO:**
+- ~~Replace task.md with task-v2.md once validated~~ DONE (2026-01-03)
+- Consider plugin packaging
+- UserPromptSubmit hook for reminders (still brainstorming)
+
+**Future idea: Cross-task consistency review via /reflect sub-agent**
+
+Inspiration: Dan B's "chief-of-staff" pattern — https://x.com/irl_danB/status/2000441479164985712
+
+Problem: Single agent can't effectively self-police its own assumptions. Our old VERIFIED/UNVERIFIED tracking became busywork.
+
+Proposed solution: /reflect with tracking task as arg spawns sub-agent that:
+- Reads meta issue + all wikilinked subtasks
+- Checks for inconsistencies across tasks
+- Surfaces unstated assumptions ("Task X assumes Y, but not in meta's decisions")
+- Challenges architectural choices made without explicit user approval
+- Is a *different* agent observing, not self-policing
+
+Key insight from Dan: Separate explicit user decisions from implicit agent assumptions. Track both, surface drift before it compounds.
+
+**Created /recap command** — lightweight alternative to formal assumption tracking. User-initiated status report with:
+- Key findings
+- Decisions (explicit + implicit, surfaced clearly)
+- Open questions
+- Next steps
+
+User scans and says "yep" or "wait, no" — quick correction loop without busywork overhead.

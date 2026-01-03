@@ -100,7 +100,7 @@ Structure your reflection as:
 For each suggestion, indicate where the fix belongs:
 - `CLAUDE.md (global)` — cross-project patterns
 - `CLAUDE.md (project)` — project-specific
-- `task-v2.md` — task workflow
+- `task.md` — task workflow
 - Other (specify)
 
 Be direct. If something was confusing or unhelpful, say so. The goal is continuous improvement.
