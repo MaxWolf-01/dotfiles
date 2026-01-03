@@ -166,6 +166,25 @@ Document questions and uncertainties in the work log:
 - "User asked about X but seemed uncertain themselves - clarifying..."
 - "I interpret this as Y - confirming with user"
 
+### Use AskUserQuestion for Structured Clarification
+
+When you have specific questions — especially decisions with options, confirmations, or preference checks — use the AskUserQuestion tool. It's faster for the user to respond to structured questions than to parse prose.
+
+**Good uses:**
+- Clarifying assumptions before proceeding
+- Architectural decisions with clear options (A vs B vs C)
+- "I found this issue — is it okay to fix it like this?"
+- Confirming your understanding ("You want X, Y, Z — correct?")
+- Preferences that have discrete choices
+
+**Don't stop at the first answer.** Use AskUserQuestion repeatedly until you have mutual understanding and a spec precise enough to execute on. Before major implementation, requirements should be solid — if you're uncertain about what exactly to build, use the tool to clarify.
+
+**When prose is better:**
+- Open-ended brainstorming
+- Questions needing several paragraphs of context first
+- Complex tradeoffs that need diagrams or detailed explanation
+- When you're not sure what to ask yet
+
 ### Brainstorming ≠ Decisions
 
 When user is thinking out loud — "maybe this makes sense", "I think XYZ would be good", "I wonder if..." — that's brainstorming, not a decision. Even "I think this is a good idea" during brainstorming is just an idea being floated, not a commitment.
@@ -272,6 +291,26 @@ This ensures:
 Unlike the append-only work log, the Notes/Findings section is your current understanding. As you learn more, update it. It should reflect your best current knowledge, not historical snapshots.
 
 A reader should be able to read Notes/Findings and understand the key insights without reading the entire work log.
+
+### Suggest Handover When Appropriate
+
+If you're running out of context (80%+ usage) or at a natural completion point, provide a handover prompt in chat for the user to copy-paste:
+
+```
+Ready to hand over. Suggested prompt for next agent:
+
+/task @agent/tasks/feature-x.md [Context not already captured in the task file]
+```
+
+If multiple task files are relevant, mention all of them.
+
+**When to suggest task splitting:**
+
+If remaining work has clearly separate parts (backend vs frontend, 10+ files each, different concerns), mention it:
+
+> "This could split into two tasks: [X] and [Y]. Want me to create separate task files?"
+
+Don't split preemptively — ask first.
 
 ## Typical Flow
 

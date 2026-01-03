@@ -5,7 +5,8 @@ Output formatting: Markdown tables don't render in the CLI. Use plain text with 
 
 On-demand packages: If a CLI tool isn't installed, run it on-demand:
 - Nix: `nix run nixpkgs#package -- args` or `nix shell nixpkgs#pkg1 nixpkgs#pkg2 -c command`
-- Python tools: `uv run --with package command` (or `uvx package`)
+- Python tools: `uv run --with package command` (or `uvx package@latest`) - you shouldn't have to bother with venvs, especially for one-off commands.
+- Docker images: `docker run --rm image command` (if available for the tool)
 
 <progress_visibility>
 Always use the `TodoWrite` tool to track what you're working on. This isn't just about showing activity—it's about making your reasoning visible.
@@ -318,5 +319,7 @@ Context7 quality depends on indexing completeness — some libraries are well-in
 For some projects you have local knowledge bases / vaults / task files with a specific workflow.
 Never add personal or sensitive information to these project-specific knowledge bases as they are often commited.
 If necessary, you can add such information to your private global knowledge base, reference it from the project-specific knowledge base, and inform the user.
+
+Remember, just finding files with memex (the default for the search tool) is only the first step (you also have to actually read them if they seem relevant ;) )
 </memex>
 
