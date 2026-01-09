@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ pkgs, rime, system, ... }:
 {
   programs.home-manager.enable = true;
 
@@ -36,6 +36,7 @@
     gnumake
     go
     jq
+    manix
     neovim
     nnn
     nodejs
@@ -43,7 +44,10 @@
     openssh
     restic
     ripgrep
+    rime.packages.${system}.default
+    sqlite
     sops
+    stripe-cli
     tmux
     tree
     uv

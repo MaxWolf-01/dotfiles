@@ -38,7 +38,7 @@ If `agent/tasks/` doesn't exist, create it along with `agent/knowledge/`.
 
 If a task file or topic was specified, find or create it in `agent/tasks/`. Otherwise, ask what to work on.
 
-**File naming:** Use serial number + descriptive slug: `01-auth-jwt-migration.md`, `12-checkout-flow-redesign.md`. The serial shows recency — higher = more recent. Check existing files and increment when creating new.
+**File naming:** Descriptive slug: `auth-jwt-migration.md`, `checkout-flow-redesign.md`.
 
 ### 3. Search for Context
 
@@ -95,7 +95,7 @@ Approaches explored but dropped, and why. Prevents re-exploring dead ends.
 
 ## Handoff
 
-What next agent needs to continue from here.
+When pausing a task or if the user explicitly asks you to write handoff notes in the task file or asks you to write down next steps for the next agent, add the hand-off snippet (see below) to the task file too.
 ```
 
 **Frontmatter:**
@@ -230,13 +230,12 @@ Don't wait to be asked. If you've learned something valuable or context is getti
 - **Sources** — Add useful external docs, GitHub issues, threads. Mark as MUST READ / reference / details on X. Err toward MUST READ. If large source has simple takeaway, write takeaway + link.
 - **Gotchas** — API quirks, patterns that don't work, noisy debug approaches, workarounds, edge cases.
 - **Considered & Rejected** — Approaches explored but dropped, and why.
-- **Handoff** — What next agent needs to continue. Not summary of what was done, but what to do next.
 
 **Handoff prompt:** After updating task file, output in chat for user to copy-paste:
 ```
 Ready to hand over. Suggested prompt for next agent:
 
-/task @agent/tasks/XX-task-name.md [Context not captured in the file]
+/task @agent/tasks/task-name.md [Context not captured in the file. What next agent needs to continue. Not summary of what was done, but what to do next.]
 ```
 If multiple task files are relevant, @mention all of them.
 
@@ -280,7 +279,7 @@ When you identify work that could be **delegated** — isolated enough to spec o
 
 **To create a subtask:**
 1. Create the subtask file with clear Intent
-2. Wikilink from current task to subtask: `[[13-subtask-name]]`
+2. Wikilink from current task to subtask: `[[subtask-name]]`
 3. Provide handover snippet in chat for user to paste
 
 **Subtask agents must:**

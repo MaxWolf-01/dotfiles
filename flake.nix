@@ -7,9 +7,13 @@
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    rime = {
+      url = "github:lukasl-dev/rime";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { nixpkgs, home-manager, ... }:
+  outputs = { nixpkgs, home-manager, rime, ... }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -18,6 +22,7 @@
       };
       mkHome = modules: home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
+        extraSpecialArgs = { inherit rime system; };
         modules = [ ./nix/home/common.nix ] ++ modules;
       };
     in {

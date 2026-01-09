@@ -264,6 +264,13 @@ ALWAYS prefer `fd` over `find` — unless it is not powerful enough, e.g. you ac
 
 </permissions>
 
+<shell_utilities>
+`tre` — Enhanced tree command for quick codebase overviews.
+- Auto-excludes .git + all patterns from project `.gitignore` and global `~/.gitignore_global`
+- `-e`/`--exclude PATTERN` for additional exclusions (supports wildcards like `*.log`, `test_*`)
+- Examples: `tre`, `tre -e node_modules`, `tre -e "*.tmp" -L 2 src/`
+</shell_utilities>
+
 <sub_agents>
 When spawning sub-agents via the Task tool, be selective about model choice:
 
@@ -296,6 +303,10 @@ When Edit is better:
 - Non-uniform changes across files
 
 **Fastmod and newlines:** `\n` in replacement strings becomes literal backslash-n. Use bash `$'...'` syntax for actual newlines: `fastmod 'pattern' $'line1\nline2'`
+
+**Fastmod and patterns starting with `-`:** Use `--` to separate flags from positional args, otherwise the pattern is parsed as a flag:
+- Bad: `fastmod --accept-all '- [ ]' '- [x]' file.md`
+- Good: `fastmod --accept-all -- '- [ ]' '- [x]' file.md`
 </bulk_refactoring>
 
 <research_tools>

@@ -76,6 +76,35 @@ Search tips:
 - For exact term lookup, use keywords parameter with a focused query
 - For precise "find this exact file/string" needs, use grep/rg instead — memex is for exploration
 
-Workflow: Search to find entry points → Explore to follow connections (outlinks, backlinks, similar notes) → Build context before implementation.
+Workflow: Search to find entry points (returns paths by default) → Explore to read content + see connections → Build context before implementation.
 
 Before writing to any knowledge vault, read `~/.dotfiles/claude/commands/archive.md` — it has guidance on what makes good knowledge vs slop.
+
+# Rime MCP
+
+You have access to Nix tooling via the rime MCP server. Use it for Nix-related tasks in this project.
+
+**Package/Flake Operations:**
+- `nix_packages_search` — Search packages in nixpkgs or a flake
+- `nix_packages_why_depends` — Show dependency chains between packages
+- `nix_flakes_show` — Show flake outputs
+- `nix_flakes_metadata` — Show flake metadata (inputs, locks)
+- `nix_evaluate` — Evaluate Nix expressions
+- `nix_log` — Get build logs for debugging
+
+**Documentation (use these before web searches for Nix questions):**
+- `manix_search` — Fast doc search across Nix/NixOS/HM options
+- `home_manager_options_search` — Search Home Manager options specifically
+- `nixpkgs_options_search` — Search NixOS module options for a specific nixpkgs ref
+- `nvf_options_search` / `nvf_manual_*` — Search nvf (Neovim Flake) options
+- `nix_manual_list` / `nix_manual_read` — Browse Nix manual source
+- `nixos_wiki_search` / `nixos_wiki_read` — NixOS wiki access
+
+**System Info:**
+- `nix_config_show` — Current Nix configuration
+- `nixos_channels` — Available channels and status
+- `nixhub_package_versions` — Version history for a package (useful for pinning)
+
+When to use rime vs web search:
+- **rime first**: HM options, Nix builtins, package search, flake introspection
+- **web search**: Tutorials, complex debugging, community patterns not in docs
