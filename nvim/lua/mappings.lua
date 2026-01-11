@@ -168,6 +168,11 @@ map("n", "<leader>tF", function()
   end
 end, { desc = "Toggle buffer auto-format" })
 
+map("n", "<leader>tw", function()
+  vim.wo.wrap = not vim.wo.wrap
+  vim.notify("Line wrap: " .. (vim.wo.wrap and "ON" or "OFF"), vim.log.levels.INFO)
+end, { desc = "Toggle line wrap" })
+
 -- diagnostics
 
 map("n", "[d", function() vim.diagnostic.jump({ count = -1, float = true }) end, { desc = "Previous diagnostic" })

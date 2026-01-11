@@ -37,7 +37,7 @@ o.listchars = {
 
 -- Text Display and Wrapping
 --------------------
-o.wrap = false       -- don't wrap long lines by default
+o.wrap = true        -- wrap long lines
 o.linebreak = true   -- when wrap is enabled, break at words
 o.breakindent = true -- when a line wraps, maintain indentation level
 
