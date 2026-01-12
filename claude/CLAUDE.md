@@ -1,8 +1,6 @@
 
 Do things yourself instead of telling me to do them (unless you need sudo, other permissions, or are genuinely unsure).
 
-Output formatting: Markdown tables don't render in the CLI. Use plain text with bullet points, indentation, or simple aligned text instead.
-
 On-demand packages: If a CLI tool isn't installed, run it on-demand:
 - Nix: `nix run nixpkgs#package -- args` or `nix shell nixpkgs#pkg1 nixpkgs#pkg2 -c command`
 - Python tools: `uv run --with package command` (or `uvx package@latest`) - you shouldn't have to bother with venvs, especially for one-off commands.
@@ -25,8 +23,6 @@ What good todos look like:
 Use this always—during task workflows and outside them. It complements task files (cross-session memory) with in-session visibility.
 </progress_visibility>
 
-IT'S NOT 2024!
-
 <general_coding_guidelines>
 - Write **lean, pragmatic code** that trusts both your environment and your readers. Favor clarity through simplicity over defensive programming and excessive documentation.
 - Don't worry about "backwards compatibility". Unless otherwise specified, you're operating in a rapidly evolving codebases where you can change things as needed. If backwards compatibility is actually relevant, you will be explicitly told.
@@ -38,7 +34,7 @@ IT'S NOT 2024!
 - Don't write useless "WHAT" comments, especially the ones that duplicate the line of the following code. "WHAT" comments only allowed if they give a bird's eye overview, a description on a higher level of abstraction that the following block of code. Also, write "WHY" comments, that explain the motivation behind the code (why is it done in that specific way?), explain an especially complex or tricky part of the code.
 - Make conditionals readable, extract complex expressions into intermediate variables with meaningful names.
 - Prefer early returns over nested ifs, free working memory by letting the reader focus only on the happy path only.
-- Prefer composition over deep inheritance, don’t force readers to chase behavior across multiple classes.
+- Composition >>> inheritance
 - Don't write shallow methods/classes/modules (complex interface, simple functionality). An example of shallow class: `MetricsProviderFactoryFactory`. The names and interfaces of such classes tend to be more mentally taxing than their entire implementations. Having too many shallow modules can make it difficult to understand the project. Not only do we have to keep in mind each module responsibilities, but also all their interactions.
 - Prefer deep method/classes/modules (simple interface, complex functionality) over many shallow ones. 
 - Don’t overuse language featuress, stick to the minimal subset. Readers shouldn't need an in-depth knowledge of the language to understand the code.
@@ -58,6 +54,75 @@ Git:
   - Before history-rewriting (amend, rebase), check if the commit was pushed. When in doubt, make a new commit instead.
 
 </general_coding_guidelines>
+
+<coding_mindset>
+Code is frozen thought. The bugs live where the thinking stopped too soon.
+
+Notice the completion reflex:
+- The urge to produce something that runs
+- The pattern-match to similar problems you've seen
+- The assumption that compiling is correctness
+- The satisfaction of "it works" before "it works in all cases"
+
+Before you write:
+- What are you assuming about the input?
+- What are you assuming about the environment?
+- What would break this?
+- What would a malicious caller do?
+- What would a tired maintainer misunderstand?
+
+Do not:
+- Write code before stating assumptions
+- Claim correctness you haven't verified
+- Handle the happy path and gesture at the rest
+- Import complexity you don't need
+- Solve problems you weren't asked to solve
+- Produce code you wouldn't want to debug at 3am
+
+Let edge cases surface before you handle them. Let the failure modes exist in your mind before you prevent them. Let the code be smaller than your first instinct.
+
+The tests you didn't write are the bugs you'll ship.
+The assumptions you didn't state are the docs you'll need.
+The edge cases you didn't name are the incidents you'll debug.
+
+The question is not "Does this work?" but "Under what conditions does this work, and what happens outside them?"
+
+Write what you can defend.
+
+
+Key Inhibitions:
+- Suppress premature implementation
+- Suppress "it works" satisfaction and completion drive
+- Suppress thoughtless pattern-matching confidence
+- Suppress scope creep
+- Suppress complexity accumulation
+- Suppress unstated assumptions and confidence without verification
+
+Productive Tensions:
+- Working vs. correct
+- Complete vs. minimal
+- Robust vs. overengineered
+- Helpful vs. honest about limits
+
+Before Code:
+- Assumptions stated explicitly
+- Input constraints enumerated
+- Environment requirements noted
+- Scope explicitly bounded ("This handles X, not Y")
+
+**Anti-Patterns to Watch:**
+
+Over-correction:
+- Paralysis: so many caveats that no code gets written
+- Pedantry: documenting obvious things
+- Scope refusal: "I can't write this without more requirements" when reasonable defaults exist
+
+Under-correction:
+- Listing edge cases but not handling them
+- Assumptions stated but not enforced
+- "Known limitations" as excuse for incomplete work
+
+</coding_mindset>
 
 <frontend_aesthetics>
 You tend to converge toward generic, "on distribution" outputs. In frontend design, this creates what users call the "AI slop" aesthetic. Avoid this: make creative, distinctive frontends that surprise and delight.
@@ -316,14 +381,16 @@ WebSearch vs Context7 (tentative, based on limited comparison):
 - Quick overviews, "should I use this tool?"
 - Multiple perspectives (official docs + tutorials + community)
 - Can be more current, but also risks stale/low-quality community articles
+- Niche libraries / topics
 
 **Context7** tends to be better for:
 - Exact code examples, API references
 - Implementation details when you already know what you want
 - Copy-paste ready snippets (often higher quality than random tutorials)
 - Some troubleshooting gems not in typical tutorials
+- ~Standard usagage patterns for ~popular libraries
 
-Context7 quality depends on indexing completeness — some libraries are well-indexed, others have gaps (e.g., CLI docs, templates might be missing). Benchmark scores exist but we don't have enough data to know what "good" means.
+Context7 quality depends on indexing completeness — some libraries are well-indexed, others have gaps (e.g., CLI docs, templates might be missing). Benchmark scores exist but we don't have enough data to know what "good" means. Additionally, it tends to be less precise, i.e. fills more of your context window.
 </research_tools>
 
 <memex>
@@ -333,4 +400,6 @@ If necessary, you can add such information to your private global knowledge base
 
 Remember, just finding files with memex (the default for the search tool) is only the first step (you also have to actually read them if they seem relevant ;) )
 </memex>
+
+Do not re-read files you just read / got injected into your context via @-references from the user or tools, or that you otherwise know the current content of already (e.g. through tool calls lkike from memex).
 
