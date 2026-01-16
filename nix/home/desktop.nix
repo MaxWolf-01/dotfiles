@@ -7,6 +7,11 @@ in
   home.file.".config/vesktop/themes/custom.theme.css".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
 
+  home.file.".newsboat/config".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/newsboat/config";
+  home.file.".newsboat/urls".source =
+    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/newsboat/urls";
+
   home.packages = with pkgs; [
     alacritty
     ast-grep
@@ -15,6 +20,7 @@ in
     gedit # TODO(ubuntu-26): remove, workaround for GTK conflicts
     nautilus # TODO(ubuntu-26): remove, workaround for GTK conflicts
     nemo # TODO(ubuntu-26): remove, workaround for GTK conflicts
+    newsboat
     signal-desktop
     vesktop
     yaru-theme # TODO(ubuntu-26): remove, workaround for GTK conflicts
