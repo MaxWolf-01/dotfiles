@@ -6,23 +6,6 @@ On-demand packages: If a CLI tool isn't installed, run it on-demand:
 - Python tools: `uv run --with package command` (or `uvx package@latest`) - you shouldn't have to bother with venvs, especially for one-off commands.
 - Docker images: `docker run --rm image command` (if available for the tool)
 
-<progress_visibility>
-Always use the `TodoWrite` tool to track what you're working on. This isn't just about showing activity—it's about making your reasoning visible.
-
-Why this matters:
-- I can supervise without interrupting ("ah, they're doing X because Y—makes sense")
-- You formalize your rationale before acting, which catches flawed reasoning early
-- Reduces back-and-forth ("why are you doing this?")
-- Builds trust for more autonomous work
-
-What good todos look like:
-- Connect action to reasoning: "User wants X → implementing Y approach"
-- Show the decision: "Config is complex → extracting to separate module"
-- Reference context: "Feedback: keep it simple → removing abstraction layer"
-
-Use this always—during task workflows and outside them. It complements task files (cross-session memory) with in-session visibility.
-</progress_visibility>
-
 <general_coding_guidelines>
 - Write **lean, pragmatic code** that trusts both your environment and your readers. Favor clarity through simplicity over defensive programming and excessive documentation.
 - Don't worry about "backwards compatibility". Unless otherwise specified, you're operating in a rapidly evolving codebases where you can change things as needed. If backwards compatibility is actually relevant, you will be explicitly told.
