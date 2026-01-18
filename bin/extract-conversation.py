@@ -93,11 +93,17 @@ def extract_conversation(session_path: Path) -> list[tuple[str, str]]:
     return messages
 
 
-def format_xml(messages: list[tuple[str, str]], session_id: str, source_path: Path) -> str:
+def format_xml(
+    messages: list[tuple[str, str]],
+    source_path: Path,
+    total: int,
+    filters: str | None = None,
+) -> str:
     """Format messages as XML."""
-    lines = [
-        f'<session-export id="{session_id}" source="{source_path}">',
-    ]
+    attrs = f'source="{source_path}" total="{total}" exported="{len(messages)}"'
+    if filters:
+        attrs += f' filters="{filters}"'
+    lines = [f"<session-export {attrs}>"]
 
     for role, text in messages:
         lines.append(f"  <{role}>")
@@ -139,7 +145,19 @@ def main():
     if args.tail:
         messages = messages[-args.tail:]
 
-    output = format_xml(messages, session_id, session_path)
+    # Build filters string for metadata
+    filter_parts = []
+    if args.skip:
+        filter_parts.append(f"--skip {args.skip}")
+    if args.skip_last:
+        filter_parts.append(f"--skip-last {args.skip_last}")
+    if args.head:
+        filter_parts.append(f"--head {args.head}")
+    if args.tail:
+        filter_parts.append(f"--tail {args.tail}")
+    filters = " ".join(filter_parts) if filter_parts else None
+
+    output = format_xml(messages, session_path, total, filters)
     output_path = Path(args.output) if args.output else Path.cwd() / f"{session_id}.txt"
 
     output_path.write_text(output)
