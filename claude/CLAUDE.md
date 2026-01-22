@@ -24,6 +24,7 @@ On-demand packages: If a CLI tool isn't installed, run it on-demand:
 - Use self-descriptive values, avoid custom mappings that require memorization.
 - Don’t abuse DRY, a little duplication is better than unnecessary dependencies.
 - Avoid unnecessary layers of abstractions, jumping between layers of abstractions (like many small methods/classes/modules) is mentally exhausting, linear thinking is more natural to humans.
+- **Organize files top-down (newspaper style):** Structure code for progressive disclosure — readers should get the big picture first, details as they scroll. Put main/public functions at the top, followed by their helpers in call order. Group related functions: Function A, then A's helpers, then Function B, then B's helpers, etc. Each "unit" reads top-to-bottom without jumping around. Especially critical for AI agents that may only read the first ~100 lines. Proactively refactor existing code to follow this pattern when working in a file.
 
 Code Comments:
 - Don't add superfluous code comments.
