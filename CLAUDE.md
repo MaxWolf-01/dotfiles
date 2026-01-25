@@ -7,6 +7,21 @@ Check out the README for overview. Also secrets/README.md and secrets/backup/REA
 
 When writing scripts (especially ones run by systemd timers or cron): include informative error messages. Print what failed, why, and what to check. Don't silently fail - these run unattended and failures need to be easy to debug after the fact.
 
+## Tmux
+
+Config managed by Home Manager (`nix/home/tmux.nix`). After changes:
+```bash
+hmswitch && tmux source ~/.config/tmux/tmux.conf
+```
+Or: `hmswitch` then `Ctrl+a r` inside tmux.
+
+**Scripted layouts:** When creating detached sessions (`new-session -d`), tmux uses a tiny default size (~80x24). Pass terminal dimensions to get correct proportions:
+```bash
+tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
+```
+
+**When changing keybindings:** Update `tmux/cheatsheet.md` to match!
+
 ## Home Manager
 
 Structure:
@@ -77,8 +92,6 @@ Search tips:
 - For precise "find this exact file/string" needs, use grep/rg instead — memex is for exploration
 
 Workflow: Search to find entry points (returns paths by default) → Explore to read content + see connections → Build context before implementation.
-
-Before writing to any knowledge vault, read `~/.dotfiles/claude/commands/archive.md` — it has guidance on what makes good knowledge vs slop.
 
 # Rime MCP
 
