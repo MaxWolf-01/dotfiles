@@ -11,6 +11,8 @@ Prefix: **Ctrl+a** (press, release, then next key)
 | `-` | Split horizontal (stacked) |
 | `h/j/k/l` | Navigate panes |
 | `H/J/K/L` | Resize panes |
+| `Ctrl+o` | Rotate panes forward |
+| `Alt+o` | Rotate panes backward |
 | `z` | Zoom/unzoom (fullscreen toggle) |
 | `x` | Kill pane |
 
@@ -51,12 +53,18 @@ tmux switch-client -t name   # Switch session (from inside tmux)
 | `v` | Enter copy mode |
 | `/` | Enter copy mode + search |
 | *in copy mode:* | |
+| `Ctrl+u/d` | Half-page up/down |
+| `Ctrl+b/f` | Full page up/down |
+| `g/G` | Top/bottom of buffer |
+| `hjkl` | Line-by-line navigation |
+| `/` or `?` | Search forward/backward |
+| `n/N` | Next/prev search match |
 | `v` | Start selection |
 | `y` | Yank to clipboard |
-| `n/N` | Next/prev search match |
-| `q` | Exit copy mode |
+| `q` or `Esc` | Exit copy mode |
 
-**Tip:** Hold `Shift` while selecting to use terminal's native clipboard.
+**Tip:** Shift+select uses terminal clipboard but crosses pane boundaries.
+For single-pane select: `z` (zoom) → Shift+select → `z` (unzoom)
 
 ## Persistence
 

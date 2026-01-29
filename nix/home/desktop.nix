@@ -25,6 +25,7 @@ in
     vesktop
     yaru-theme # TODO(ubuntu-26): remove, workaround for GTK conflicts
     yt-dlp
+    zathura
   ];
 
   xdg.desktopEntries.vesktop = {

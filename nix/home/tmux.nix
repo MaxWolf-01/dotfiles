@@ -62,6 +62,9 @@
       # Ctrl+a Ctrl+a sends Ctrl+a to shell (for beginning-of-line)
       bind C-a send-keys C-a
 
+      # Unbind layout cycling (easy to trigger accidentally)
+      unbind Space
+
       # True color support
       set -g default-terminal "tmux-256color"
       set -ga terminal-overrides ",*256col*:Tc"

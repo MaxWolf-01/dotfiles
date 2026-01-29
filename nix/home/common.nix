@@ -31,6 +31,7 @@
     # btop - compiled from source in setup script for GPU support
     cargo
     curl
+    duckdb
     dysk
     fastfetch
     fd
