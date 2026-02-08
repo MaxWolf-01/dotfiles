@@ -10,6 +10,18 @@ import sys
 from pathlib import Path
 
 
+_SYSTEM_ERROR_MARKERS = (
+    "<tool_use_error>",
+    "Exit code ",
+    "Traceback (most recent call last)",
+    "Sibling tool call errored",
+)
+
+
+def _is_system_error(content: str) -> bool:
+    return any(marker in content for marker in _SYSTEM_ERROR_MARKERS)
+
+
 def format_ask_user_questions(input_data: dict) -> str:
     """Format AskUserQuestion tool_use input as readable text."""
     questions = input_data.get("questions", [])
@@ -56,6 +68,10 @@ def extract_text_content(content, ask_user_tool_ids: set[str] | None = None) -> 
                     for sub in result_content:
                         if isinstance(sub, dict) and sub.get("type") == "text":
                             parts.append(sub.get("text", ""))
+            elif item.get("type") == "tool_result" and item.get("is_error"):
+                result_content = item.get("content", "")
+                if isinstance(result_content, str) and not _is_system_error(result_content):
+                    parts.append(f"[Rejected tool call] {result_content}")
             # Skip: other tool_use, tool_result, thinking, etc.
 
     return "\n".join(parts)
