@@ -10,13 +10,33 @@ import sys
 from pathlib import Path
 
 
-def extract_text_content(content) -> str:
-    """Extract only text content, skipping tool_use, tool_result, thinking blocks."""
+def format_ask_user_questions(input_data: dict) -> str:
+    """Format AskUserQuestion tool_use input as readable text."""
+    questions = input_data.get("questions", [])
+    if not questions:
+        return ""
+    lines = []
+    for q in questions:
+        lines.append(f"[{q.get('header', 'Question')}] {q.get('question', '')}")
+        for opt in q.get("options", []):
+            lines.append(f"  - {opt.get('label', '')}: {opt.get('description', '')}")
+    return "\n".join(lines)
+
+
+def extract_text_content(content, ask_user_tool_ids: set[str] | None = None) -> str:
+    """Extract only text content, skipping tool_use, tool_result, thinking blocks.
+
+    AskUserQuestion tool calls and their results are preserved since they
+    represent actual user-facing Q&A (not internal tool machinery).
+    """
     if isinstance(content, str):
         return content
 
     if not isinstance(content, list):
         return ""
+
+    if ask_user_tool_ids is None:
+        ask_user_tool_ids = set()
 
     parts = []
     for item in content:
@@ -25,7 +45,18 @@ def extract_text_content(content) -> str:
         elif isinstance(item, dict):
             if item.get("type") == "text":
                 parts.append(item.get("text", ""))
-            # Skip: tool_use, tool_result, thinking, etc.
+            elif item.get("type") == "tool_use" and item.get("name") == "AskUserQuestion":
+                ask_user_tool_ids.add(item["id"])
+                parts.append(format_ask_user_questions(item.get("input", {})))
+            elif item.get("type") == "tool_result" and item.get("tool_use_id") in ask_user_tool_ids:
+                result_content = item.get("content", "")
+                if isinstance(result_content, str):
+                    parts.append(result_content)
+                elif isinstance(result_content, list):
+                    for sub in result_content:
+                        if isinstance(sub, dict) and sub.get("type") == "text":
+                            parts.append(sub.get("text", ""))
+            # Skip: other tool_use, tool_result, thinking, etc.
 
     return "\n".join(parts)
 
@@ -59,6 +90,7 @@ def find_session_path(arg: str) -> tuple[Path, str]:
 def extract_conversation(session_path: Path) -> list[tuple[str, str]]:
     """Extract (role, text) pairs from session."""
     messages = []
+    ask_user_tool_ids: set[str] = set()
 
     for line in session_path.read_text().splitlines():
         if not line.strip():
@@ -84,7 +116,7 @@ def extract_conversation(session_path: Path) -> list[tuple[str, str]]:
         if not content:
             continue
 
-        text = extract_text_content(content).strip()
+        text = extract_text_content(content, ask_user_tool_ids).strip()
         if not text:
             continue
 
