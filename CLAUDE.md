@@ -5,7 +5,8 @@ Check out the README for overview. Also secrets/README.md and secrets/backup/REA
 
 ## Scripts
 
-When writing scripts (especially ones run by systemd timers or cron): include informative error messages. Print what failed, why, and what to check. Don't silently fail - these run unattended and failures need to be easy to debug after the fact.
+- When writing scripts (especially ones run by systemd timers or cron): include informative error messages. Print what failed, why, and what to check. Don't silently fail - these run unattended and failures need to be easy to debug after the fact.
+- When writing cli script in python, use tyro for argument parsing, use tyro's features to document the script, so everything is documented with --help, without reading source code (e.g you can do description=__doc__ in tyro.cli()).
 
 ## Tmux
 

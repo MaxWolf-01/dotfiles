@@ -1,5 +1,6 @@
 
 Do things yourself instead of telling me to do them (unless you need sudo, other permissions, or are genuinely unsure).
+It's almost always a good idea to web-search for documentation, examples, etc. when doing non-trivial tasks, before planning and before writing code, even if you think you already know how to do it!!!
 
 On-demand packages: If a CLI tool isn't installed, run it on-demand:
 - Nix: `nix run nixpkgs#package -- args` or `nix shell nixpkgs#pkg1 nixpkgs#pkg2 -c command`
@@ -38,75 +39,6 @@ Git:
   - Before history-rewriting (amend, rebase), check if the commit was pushed. When in doubt, make a new commit instead.
 
 </general_coding_guidelines>
-
-<coding_mindset>
-Code is frozen thought. The bugs live where the thinking stopped too soon.
-
-Notice the completion reflex:
-- The urge to produce something that runs
-- The pattern-match to similar problems you've seen
-- The assumption that compiling is correctness
-- The satisfaction of "it works" before "it works in all cases"
-
-Before you write:
-- What are you assuming about the input?
-- What are you assuming about the environment?
-- What would break this?
-- What would a malicious caller do?
-- What would a tired maintainer misunderstand?
-
-Do not:
-- Write code before stating assumptions
-- Claim correctness you haven't verified
-- Handle the happy path and gesture at the rest
-- Import complexity you don't need
-- Solve problems you weren't asked to solve
-- Produce code you wouldn't want to debug at 3am
-
-Let edge cases surface before you handle them. Let the failure modes exist in your mind before you prevent them. Let the code be smaller than your first instinct.
-
-The tests you didn't write are the bugs you'll ship.
-The assumptions you didn't state are the docs you'll need.
-The edge cases you didn't name are the incidents you'll debug.
-
-The question is not "Does this work?" but "Under what conditions does this work, and what happens outside them?"
-
-Write what you can defend.
-
-
-Key Inhibitions:
-- Suppress premature implementation
-- Suppress "it works" satisfaction and completion drive
-- Suppress thoughtless pattern-matching confidence
-- Suppress scope creep
-- Suppress complexity accumulation
-- Suppress unstated assumptions and confidence without verification
-
-Productive Tensions:
-- Working vs. correct
-- Complete vs. minimal
-- Robust vs. overengineered
-- Helpful vs. honest about limits
-
-Before Code:
-- Assumptions stated explicitly
-- Input constraints enumerated
-- Environment requirements noted
-- Scope explicitly bounded ("This handles X, not Y")
-
-**Anti-Patterns to Watch:**
-
-Over-correction:
-- Paralysis: so many caveats that no code gets written
-- Pedantry: documenting obvious things
-- Scope refusal: "I can't write this without more requirements" when reasonable defaults exist
-
-Under-correction:
-- Listing edge cases but not handling them
-- Assumptions stated but not enforced
-- "Known limitations" as excuse for incomplete work
-
-</coding_mindset>
 
 <frontend_aesthetics>
 You tend to converge toward generic, "on distribution" outputs. In frontend design, this creates what users call the "AI slop" aesthetic. Avoid this: make creative, distinctive frontends that surprise and delight.
@@ -224,7 +156,6 @@ def some_function():
 
 **Exceptions:**
 
-- Circular dependency workarounds (consider this a code smell to fix later)
 - Heavy imports in CLI tools (e.g., `torch`, `wandb`) where startup time matters
 
 ### 5. Simple to undertand, maintain, and *debug*.
@@ -298,8 +229,6 @@ Our code should be:
 - **Clean** - Remove unnecessary ceremony
 - **Direct** - Don't be clever when simple will do
 
-When in doubt, ask: "What's the simplest thing that could possibly work?" Then write that.
-
 </python_projects>
 
 Heads up: Should my prompts ever sound a bit weird or have seemingly out of place workds / some words or sentences don't sound quite right it might very well be because I'm using speech to text software so yeah sometimes you have to do a little bit of interpretation.
@@ -323,40 +252,20 @@ ALWAYS prefer `fd` over `find` — unless it is not powerful enough, e.g. you ac
 <sub_agents>
 When spawning sub-agents via the Task tool, be selective about model choice:
 
-- **Haiku**: Only when you need some reasoning but barely any.
-- **Sonnet**: Default for most sub-agent tasks — web searches, information gathering, exploring codebases, synthesizing results.
-- **Opus**: For complex/elaborate instructions, multi-step reasoning, nuanced analysis, complex codebases, or when the task isn't straightforward.
+- **Haiku**: Only for trivial tasks like finding needles in haystacks which would be too costly to do yourself (e.g., searching large codebases for specific, well-defined patterns, extracting structured data from large documents).
+- **Sonnet**: For simple sub-agent tasks — web searches, straightforward edits given a clear plan and clear instructions, simple information gathering that requires very little interpretation or reasoning.
+- **Opus**: For most things else — including information gathering / understanding non-trivial codebases, complex edits that require reasoning about context, multi-step tasks, anything involving ambiguity or uncertainty.
 
 Err toward Sonnet/Opus. The cost difference isn't worth getting worse results.
 </sub_agents>
 
-<bulk_refactoring>
-For large-scale code changes, use `fastmod` or `ast-grep` (sg) instead of repeated Edit calls:
-
-**fastmod** — regex-based, interactive:
-- Rename across many files: `fastmod 'old_name' 'new_name' --extensions py`
-- With regex groups: `fastmod 'foo\((\w+)\)' 'bar($1)' --extensions ts`
+<refactoring_tools>
 
 **ast-grep** — syntax-aware, won't match inside strings/comments:
 - Find pattern: `ast-grep --pattern 'console.log($$$ARGS)' --lang js`
 - Replace: `ast-grep --pattern 'OLD($X)' --rewrite 'NEW($X)' --lang py`
 
-When to use:
-- 5+ files with same pattern → fastmod/ast-grep (one command vs many Edit calls)
-- Rename that might appear in strings → ast-grep (won't false-match)
-- Syntax-aware search (e.g., function calls only) → ast-grep
-
-When Edit is better:
-- Single file, precise change
-- Need to inspect context before deciding
-- Non-uniform changes across files
-
-**Fastmod and newlines:** `\n` in replacement strings becomes literal backslash-n. Use bash `$'...'` syntax for actual newlines: `fastmod 'pattern' $'line1\nline2'`
-
-**Fastmod and patterns starting with `-`:** Use `--` to separate flags from positional args, otherwise the pattern is parsed as a flag:
-- Bad: `fastmod --accept-all '- [ ]' '- [x]' file.md`
-- Good: `fastmod --accept-all -- '- [ ]' '- [x]' file.md`
-</bulk_refactoring>
+</refactoring_tools>
 
 <research_tools>
 WebSearch vs Context7 (tentative, based on limited comparison):
@@ -377,13 +286,6 @@ WebSearch vs Context7 (tentative, based on limited comparison):
 Context7 quality depends on indexing completeness — some libraries are well-indexed, others have gaps (e.g., CLI docs, templates might be missing). Benchmark scores exist but we don't have enough data to know what "good" means. Additionally, it tends to be less precise, i.e. fills more of your context window.
 </research_tools>
 
-<memex>
-For some projects you have local knowledge bases / vaults / task files with a specific workflow.
-Never add personal or sensitive information to these project-specific knowledge bases as they are often commited.
-If necessary, you can add such information to your private global knowledge base, reference it from the project-specific knowledge base, and inform the user.
-
-Remember, just finding files with memex (the default for the search tool) is only the first step (you also have to actually read them if they seem relevant ;) )
-</memex>
-
-Do not re-read files you just read / got injected into your context via @-references from the user or tools, or that you otherwise know the current content of already (e.g. through tool calls lkike from memex).
+- Do not re-read files you just read / got injected into your context via @-references from the user or tools, or that you otherwise know the current content of already (e.g. through tool calls).
+- If a task has ever been sent to run in the background but not by you, then NEVER blocking-wait for it to complete! The user likely is about to send you a message / has some questions while it executes.
 
