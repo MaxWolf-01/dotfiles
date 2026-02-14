@@ -122,8 +122,8 @@
       # Ctrl+s to save (no prefix needed!)
       bind -n C-s run-shell '#{@resurrect-save-script-path}'
 
-      # Don't detach on session destroy
-      set -g detach-on-destroy off
+      # Detach to terminal when session is destroyed (instead of switching to another)
+      set -g detach-on-destroy on
 
       # Status bar (clean, minimal)
       set -g status-position bottom
