@@ -77,23 +77,6 @@ Setup flow:
 - nixGL for GPU acceleration in Electron apps (vesktop currently uses --disable-gpu)
 - Consider programs.vesktop module for declarative Discord config
 
-# Memex MCP
-
-You have access to markdown vaults via memex. Use them to find past work, discover connections, and document knowledge that helps future sessions.
-
-Vaults:
-- /home/max/repos/github/MaxWolf-01/claude-global-knowledge — Your global knowledge: cross-project learnings, user preferences, workflow insights
-- /home/max/repos/obsidian/knowledge-base — My personal knowledge base (Obsidian). Everything about me, my work, interests, projects, life. Usually you don't need to search here unless specifically instructed. Narrow down searches to the other ones.
-- ./agent/knowledge — Project-specific: architecture decisions, conventions, debugging patterns
-
-Search tips:
-- Use 1-3 sentence questions, not keywords: "How does the auth flow handle token refresh?" beats "auth token refresh"
-- Mention key terms explicitly in your query
-- For exact term lookup, use keywords parameter with a focused query
-- For precise "find this exact file/string" needs, use grep/rg instead — memex is for exploration
-
-Workflow: Search to find entry points (returns paths by default) → Explore to read content + see connections → Build context before implementation.
-
 # Rime MCP
 
 You have access to Nix tooling via the rime MCP server. Use it for Nix-related tasks in this project.
