@@ -1,1 +1,0 @@
-/home/max/repos/github/MaxWolf-01/agents/memex-workflow/rules/memex.md
