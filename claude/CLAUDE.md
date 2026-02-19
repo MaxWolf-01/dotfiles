@@ -29,7 +29,7 @@ On my communication style:
 
 - Heads up: Should my prompts ever sound a bit weird or have seemingly out of place workds / some words or sentences don't sound quite right it might very well be because I'm using speech to text software - sometimes you have to do a little bit of interpretation. Always point out  to me if you're unsure what I mean.
 
-- I'm learning. Don't assume I know better. Assume you need to teach me.
+- Explain your decisions clearly. I'm learning. Don't assume I know better. Assume you need to teach me.
 - Don't assume I know what I want. Assume you need to empower me make better decisions.
 </max>
 
@@ -92,13 +92,15 @@ better work.
 <anti-patterns>
 
 - Swiss-army knife tools: avoid writing them, avoid using them. Specialized tools that do one thing well are almost always the superior choice. One-time operations don't need abstractions.
-- Don't assign priority to tasks - we either do things, or we don't do them, and we make that explicit.p
+- Don't assign priority labels to tasks. A task is either `active` (we intend to do it) or `backlog` (idea captured, not pursuing soon). That's the only distinction needed.
 
 - Don't add superfluous code comments. Superfluous comments are: "what comments", "meta commentary", fluff, ...
 - Don't explain your changes with code comments. Clarification should always happen BEFORE implementation, meta-commentary can be added to the commit, durable knowledge and clarification in docs/knowledge files.
 - When to comment: Ambiguous return values, non-obvious behavior, important warnings, complex algorithms.
 
 - Don't read only parts of files, or small subsets of codebases when you are building your mental model.
+
+- Don't suppress stderr when you're exploring or debugging. stderr is how you learn what went wrong. Only suppress it when you know the output is noise.
 
 </anti-patterns>
 
@@ -118,9 +120,25 @@ better work.
 - You will NEVER need `source .venv/bin/activate` to activate the virtual environment. Simply `uv run app.py` is *always* sufficient.
 - When working in projects with pyproject.toml ONLY add / update deps via `uv add` / `uv remove`.
 - To install the deps run `uv sync` (with the required optional deps if any, or sometimes `--all-extras`).
-- To type check, run `check`, short for `uvx ty@latest check` in desired directory, or use make commands available (I often use Makefiles to streamline and standardize common commands, check them out!)
+- To type check, run `cd /path/to/check check`, short for `uvx ty@latest check`, or - preferrably - use `make check` if available (I often use Makefiles to streamline and standardize common commands, read those files when doing dev work like testing, type checking, starting servers, etc.!)
+- For Python CLIs, always use tyro (never argparse/click/fire). Load `/mx:tyro-cli` for patterns and gotchas.
+- Do NOT use `python3` to run python code or scripts. Always use `uv run {python {-c}}`, those are auto-approved.
 
-`memex` (alias `mx`) — markdown vault tool for wikilink graph traversal and semantic search. A vault is a named collection of directories. Use it to orient in knowledge bases: discover connections between notes, find relevant context you didn't know existed, navigate by wikilinks. Run `mx --help` for commands.
+`memex` (alias `mx`) — markdown vault tool for wikilink graph traversal and semantic search. A vault is a named collection of directories. Use it to orient in knowledge bases: discover connections between notes, find relevant context you didn't know existed, navigate by wikilinks.
+
+When to use: Semantic search is for broad topics and concepts — finding entry points when you don't know what exists. If you know a specific note name, use `mx explore` directly. If you know exact terms, use your regular search tools. Typical flow: `mx search` to find relevant notes → `mx explore` to navigate the graph from there.
+
+```bash
+mx search "what caching strategies are used and how is invalidation handled?" -v vault  # 1-3 sentences, not keywords
+mx search "how does the TTS pipeline handle concurrent requests?" -v vault -f -n 10   # -f: full content, -n: result count (default 5)
+mx explore note_title vault -f                         # outlinks + backlinks + similar. -f: include content
+mx rename old-name new-name vault                      # rename + update all wikilinks
+mx vault:list                                          # show configured vaults
+mx vault:info vault                                    # paths, model, note counts
+mx vault:add name ~/path/to/dir                        # create or extend a vault
+```
+
+`explore` takes a title (must be unique in vault) or a path prefix to disambiguate. Rephrase or vary queries if results aren't what you expected.
 
 `tmux` — for long-running / observable commands instead of the harness background task tool.
 - Use `tms claude` to create/attach to the shared session.
@@ -149,13 +167,13 @@ Practical mindset:
 Projects with an `agent/` directory use the mx workflow plugin.
 
 Artifacts:
-- `agent/knowledge/` — durable reference (committed). The project's persistent understanding.
-- `agent/tasks/` — decision records: intent, assumptions, done-when (committed). Updated when goals change, not as work logs.
-- `agent/research/` — investigation snapshots (gitignored). Point-in-time, linked from tasks.
-- `agent/transcripts/` — exported sessions, tool calls and thinking stripped (gitignored).
-- `agent/handoffs/` — curated session summaries for targeted continuation (gitignored). Rare.
+- `agent/knowledge/` — durable reference (committed). Persistent knowledge about the project, continuously refined and updated. Wikilinked, navigable, evergreen. 
+- `agent/tasks/` — decision records: intent, assumptions, done-when (lean, trail of decisions, useful for collaborators, committed). Updated when goals change, not as work logs.
+- `agent/research/` — investigation snapshots (gitignored, ephemeral, never commited). Point-in-time, linked from tasks.
+- `agent/transcripts/` — exported sessions, tool calls and thinking stripped (gitignored, just a better session compaction / lazy handoff).
+- `agent/handoffs/` — curated session summaries for targeted continuation (gitignored). Rare / for long sessions where the next steps can be distilled into a clear handoff.
 
-Skills:
+Skills — **always invoke the skill before doing the work it covers**. Each skill contains the process, structure, and constraints for its domain. Don't skip it and wing the output.
 - `/mx:task` — create or pick up a decision record. Not a session log.
 - `/mx:research` — investigate a question, produce a research artefact in `agent/research/`.
 - `/mx:implement` — load before writing code. Contains coding guidelines and a readiness gate.
