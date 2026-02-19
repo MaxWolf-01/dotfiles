@@ -20,7 +20,7 @@ Prefix: **Ctrl+a** (press, release, then next key)
 
 | Key | Action |
 |-----|--------|
-| `Alt+1-4` | Switch to window 1-4 (no prefix!) |
+| `Alt+1-6` | Switch to window 1-6 (no prefix!) |
 | `c` | New window |
 | `n/p` | Next/prev window |
 | `,` | Rename window |

@@ -106,6 +106,8 @@
       bind -n M-2 select-window -t 2
       bind -n M-3 select-window -t 3
       bind -n M-4 select-window -t 4
+      bind -n M-5 select-window -t 5
+      bind -n M-6 select-window -t 6
 
       # Alt+qweasdf to switch panes (2x3 block + f for buffer)
       bind -n M-q select-pane -t 1
