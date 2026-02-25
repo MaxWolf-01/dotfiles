@@ -7,6 +7,7 @@
   imports = [
     ../desktop.nix
     ../gnome.nix
+    ../timers.nix
     ../x11.nix
   ];
 }

@@ -3,6 +3,13 @@ Since I'm a beginner to Nix, explain what you do and be proactive in suggesting 
 
 Check out the README for overview. Also secrets/README.md and secrets/backup/README.md for system context.
 
+## Claude Code Config
+
+Two `claude`-related directories exist in this repo — don't confuse them:
+- `.claude/` — repo-local project settings (e.g. `settings.local.json`). Scoped to this project only.
+- `claude/` — source of truth for **global** `~/.claude/` config. Symlinked: `~/.claude/settings.json` → `~/.dotfiles/claude/settings.json`. Edits here apply globally across all projects.
+- `~/repos/github/MaxWolf-01/agents` — agent config: plugins, skills, commands, prompts. The `mx` plugin lives there.
+
 ## Scripts
 
 - When writing scripts (especially ones run by systemd timers or cron): include informative error messages. Print what failed, why, and what to check. Don't silently fail - these run unattended and failures need to be easy to debug after the fact.
@@ -30,6 +37,7 @@ Structure:
 - `nix/home/common.nix` - CLI tools for all hosts (auto-included via mkHome)
 - `nix/home/desktop.nix` - GUI apps (vesktop, nemo, fonts)
 - `nix/home/gnome.nix` - GNOME-specific (tiling-shell, dconf)
+- `nix/home/timers.nix` - systemd user timers, zephyrus only. Secrets via `EnvironmentFile` from `secrets/env/`
 - `nix/home/x11.nix` / `wayland.nix` - display server specific
 - `nix/home/hosts/` - per-machine configs (stateVersion + imports)
 - `nix/nix.conf` - enables flakes (symlinked by setup script)
