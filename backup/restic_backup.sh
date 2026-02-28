@@ -125,27 +125,8 @@ Password command: $password_command" "$config_name" "${ntfy_topic:-}"
     fi
 fi
 
-# Remove stale locks (older than 8 hours) to prevent backup failures from interrupted operations
-stale_lock_threshold=28800  # 8 hours in seconds
-current_time=$(date +%s)
-stale_locks=0
-
-while IFS= read -r lock_json; do
-    [ -z "$lock_json" ] && continue
-    lock_time=$(echo "$lock_json" | jq -r '.time // empty')
-    if [ -n "$lock_time" ]; then
-        lock_epoch=$(date -d "$lock_time" +%s 2>/dev/null || echo "0")
-        lock_age=$((current_time - lock_epoch))
-        if [ "$lock_age" -gt "$stale_lock_threshold" ]; then
-            stale_locks=$((stale_locks + 1))
-        fi
-    fi
-done < <(restic --repo "$repo_path" --password-command "$password_command" list locks --json 2>/dev/null)
-
-if [ "$stale_locks" -gt 0 ]; then
-    echo "Removing $stale_locks stale lock(s) older than 8 hours..."
-    restic --repo "$repo_path" --password-command "$password_command" unlock
-fi
+# Remove stale locks (>30min unrefreshed or dead PID on same host)
+restic --repo "$repo_path" --password-command "$password_command" unlock 2>/dev/null
 
 # Create temporary files for capturing output
 backup_output=$(mktemp)
@@ -244,7 +225,7 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
 
     # Run repository check
     echo "Checking repository integrity..."
-    if restic check --repo "$repo_path" --password-command "$password_command" $check_args >/dev/null 2>&1; then
+    if check_error_msg=$(restic check --repo "$repo_path" --password-command "$password_command" $check_args 2>&1 >/dev/null); then
         check_status="passed"
     else
         check_status="FAILED"
@@ -276,7 +257,8 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
 📊 Files: $total_files_processed processed
 💾 Size: $(format_bytes $data_added) added
 
-⚠️ The $check_description integrity check failed. Please investigate!"
+⚠️ The $check_description integrity check failed:
+${check_error_msg}"
 
             curl -s \
                 -H "Title: ⚠️ $config_name - Integrity Check Failed" \
