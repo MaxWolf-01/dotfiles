@@ -19,6 +19,7 @@ set -uo pipefail
 # check_data - (optional) "true", "false", or percentage like "5%" (default: false)
 # ntfy_topic - (optional) Ntfy topic for notifications
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
+# require_mount - (optional) Path that must be a mountpoint, else skip (for encrypted ZFS datasets)
 
 # Helper to send failure notification and exit
 send_failure_ntfy() {
@@ -59,6 +60,15 @@ for var in $required_vars; do
 done
 if [ -n "$missing_vars" ]; then
     send_failure_ntfy "Missing required config variables:$missing_vars" "$config_name" "${ntfy_topic:-}"
+fi
+
+# Optional: abort if a required mountpoint isn't mounted (e.g., encrypted ZFS datasets)
+# Prevents creating empty snapshots that could push out real data via retention.
+if [ -n "${require_mount:-}" ]; then
+    if ! mountpoint -q "$require_mount"; then
+        echo "Skipping $config_name: $require_mount is not mounted"
+        exit 0
+    fi
 fi
 
 # Helper function to format bytes to human readable
