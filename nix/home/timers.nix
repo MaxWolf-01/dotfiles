@@ -66,7 +66,7 @@ in
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
       EnvironmentFile = "${secrets}/env/yapit-health-report.env";
-      Environment = [ "PATH=${lib.makeBinPath (with pkgs; [ bash coreutils openssh curl jq ])}" ];
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/report.sh";
     };
   };
