@@ -6,6 +6,5 @@
 
   imports = [
     ../pc-timers.nix
-    ../syncthing.nix
   ];
 }

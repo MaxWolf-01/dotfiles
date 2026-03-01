@@ -9,6 +9,10 @@ let
     bash coreutils gnused gnugrep restic openssh sops curl jq age
   ]);
 
+  syncPath = lib.makeBinPath (with pkgs; [
+    bash coreutils rsync openssh curl
+  ]);
+
   ytPath = lib.makeBinPath (with pkgs; [
     bash coreutils gnused gnugrep yt-dlp ffmpeg curl
   ]);
@@ -61,6 +65,32 @@ in
       OnCalendar = "*-*-* 00:30:00";
       Persistent = true;
       RandomizedDelaySec = "5m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Phone sync (rsync over Tailscale SSH) ---
+
+  systemd.user.services.phone-sync = {
+    Unit = {
+      Description = "Sync phone data via rsync over Tailscale";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${syncPath}" ];
+      EnvironmentFile = "${secrets}/env/phone-sync.env";
+      ExecStart = "${dotfiles}/backup/phone_sync.sh";
+    };
+  };
+
+  systemd.user.timers.phone-sync = {
+    Unit.Description = "Daily phone sync";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
