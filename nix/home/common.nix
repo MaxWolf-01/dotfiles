@@ -61,4 +61,24 @@
     vim
     yt-dlp
   ];
+
+  # Weekly GC: delete generations older than 30 days, then remove unreferenced store paths.
+  # Works together with min-free/max-free in /etc/nix/nix.conf (daemon-level safety net).
+  systemd.user.services.nix-gc = {
+    Unit.Description = "Nix garbage collection";
+    Service = {
+      Type = "oneshot";
+      ExecStart = "${pkgs.nix}/bin/nix-collect-garbage --delete-older-than 30d";
+    };
+  };
+
+  systemd.user.timers.nix-gc = {
+    Unit.Description = "Weekly Nix garbage collection";
+    Timer = {
+      OnCalendar = "weekly";
+      Persistent = true;
+      RandomizedDelaySec = "1h";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
 }
