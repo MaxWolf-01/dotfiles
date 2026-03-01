@@ -10,7 +10,7 @@ let
   ]);
 
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh curl
+    bash coreutils util-linux rsync openssh curl
   ]);
 
   ytPath = lib.makeBinPath (with pkgs; [
