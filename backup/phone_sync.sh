@@ -47,7 +47,7 @@ for phone_path in "${!DIRS[@]}"; do
 
     echo "Syncing $phone_path → $local_dir" | tee -a "$log_file"
 
-    output=$(rsync -avz --partial \
+    output=$(rsync -az --partial --itemize-changes \
         --exclude='.thumbnails' \
         --exclude='.nomedia' \
         "$PHONE_HOST:$phone_path/" "$local_dir/" 2>&1)
@@ -59,8 +59,9 @@ for phone_path in "${!DIRS[@]}"; do
         echo "  FAILED (exit $rc)" | tee -a "$log_file"
         failed="${failed}${DIRS[$phone_path]}, "
     else
-        count=$(echo "$output" | grep -c '^[^.]' || true)
-        echo "  OK ($count items)" | tee -a "$log_file"
+        # --itemize-changes: ">f" = received file, ">L" = received symlink
+        count=$(echo "$output" | grep -c '^>f' || true)
+        echo "  OK ($count new files)" | tee -a "$log_file"
         total_transferred=$((total_transferred + count))
     fi
 done
@@ -80,7 +81,7 @@ if [ -n "$NTFY_TOPIC" ]; then
             -d "Failed: ${failed%, }" "https://ntfy.sh/$NTFY_TOPIC"
     elif [ $total_transferred -gt 0 ]; then
         curl -s -H "Title: Phone Sync" -H "Priority: 2" -H "Tags: phone,success" \
-            -d "Synced $total_transferred items" "https://ntfy.sh/$NTFY_TOPIC"
+            -d "Synced $total_transferred new files" "https://ntfy.sh/$NTFY_TOPIC"
     fi
 fi
 
