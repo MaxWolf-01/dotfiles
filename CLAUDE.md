@@ -33,14 +33,21 @@ tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
 ## Home Manager
 
 Structure:
-- `flake.nix` in root defines hosts (zephyrus, xmg19, minimal)
+- `flake.nix` in root defines hosts (zephyrus, xmg19, pc, minimal)
 - `nix/home/common.nix` - CLI tools for all hosts (auto-included via mkHome)
-- `nix/home/desktop.nix` - GUI apps (vesktop, nemo, fonts)
+- `nix/home/desktop.nix` - GUI apps (vesktop, nemo, fonts) — workstation machines only
 - `nix/home/gnome.nix` - GNOME-specific (tiling-shell, dconf)
 - `nix/home/timers.nix` - systemd user timers, zephyrus only. Secrets via `EnvironmentFile` from `secrets/env/`
+- `nix/home/pc-timers.nix` - PC backup timers (youtube, phone, encrypted)
+- `nix/home/syncthing.nix` - Syncthing phone sync (PC only for now)
 - `nix/home/x11.nix` / `wayland.nix` - display server specific
 - `nix/home/hosts/` - per-machine configs (stateVersion + imports)
 - `nix/nix.conf` - enables flakes (symlinked by setup script)
+
+Host tiers:
+- **CLI** (common.nix): every machine — shell, dev tools, restic, etc.
+- **Workstation** (+ desktop.nix, gnome.nix, display server): zephyrus, xmg19, future laptops
+- **Server** (+ pc-timers.nix, syncthing.nix): PC — headless, backup hub, workers
 
 Setup flow:
 - `./setup minimal` installs Nix

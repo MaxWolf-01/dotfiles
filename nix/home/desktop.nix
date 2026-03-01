@@ -14,16 +14,13 @@ in
 
   home.packages = with pkgs; [
     alacritty
-    ast-grep
-    fastmod
-    ffmpeg
+    loupe
     gedit # TODO(ubuntu-26): remove, workaround for GTK conflicts
     nautilus # TODO(ubuntu-26): remove, workaround for GTK conflicts
     nemo # TODO(ubuntu-26): remove, workaround for GTK conflicts
     signal-desktop
     vesktop
     yaru-theme # TODO(ubuntu-26): remove, workaround for GTK conflicts
-    yt-dlp
     zathura
   ];
 

@@ -28,13 +28,16 @@
 
   home.packages = with pkgs; [
     age
+    ast-grep
     # btop - compiled from source in setup script for GPU support
     cargo
     curl
     duckdb
     dysk
     fastfetch
+    fastmod
     fd
+    ffmpeg
     gh
     git
     git-lfs
@@ -56,5 +59,6 @@
     tree
     uv
     vim
+    yt-dlp
   ];
 }

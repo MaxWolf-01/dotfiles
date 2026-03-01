@@ -30,5 +30,6 @@
       homeConfigurations."minimal" = mkHome [ ./nix/home/hosts/minimal.nix ];
       homeConfigurations."minimal-root" = mkHome [ ./nix/home/hosts/minimal-root.nix ];
       homeConfigurations."xmg19" = mkHome [ ./nix/home/hosts/xmg19.nix ];
+      homeConfigurations."pc" = mkHome [ ./nix/home/hosts/pc.nix ];
     };
 }
