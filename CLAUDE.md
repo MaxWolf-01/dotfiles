@@ -1,7 +1,17 @@
-I'm transitioning to Nix (Home Manager standalone on Ubuntu for now, NixOS later).
-Since I'm a beginner to Nix, explain what you do and be proactive in suggesting improvements.
+## Philosophy
 
-Check out the README for overview. Also secrets/README.md and secrets/backup/README.md for system context.
+Everything rebuildable from version control. Dotfiles (public) for all config. `secrets/` is a separate private git repo living as a subdir — committed and pushed independently. It holds anything private or security-relevant; passwords/keys are additionally sops-encrypted on top. If it can't be rebuilt from VC, it's debt.
+
+I'm learning Nix — explain what you do and suggest improvements proactively.
+
+For device inventory, infrastructure, and backup architecture: always read `secrets/README.md` and `secrets/backup/README.md` before working on infra-related tasks.
+
+## Git: Two Repos
+
+`secrets/` is a **separate git repo** nested inside dotfiles. They share no history. When committing or running git commands, always use absolute paths or verify `git rev-parse --show-toplevel` to avoid operating on the wrong repo. Never `cd` into `secrets/` and forget — shell state persists between commands.
+
+- Dotfiles: `git -C ~/.dotfiles ...`
+- Secrets: `git -C ~/.dotfiles/secrets ...`
 
 ## Claude Code Config
 
