@@ -1,0 +1,224 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["zxcvbn-python", "rich"]
+# ///
+"""Analyze password strength against brute-force attacks of varying sophistication.
+
+Password is read via getpass (no echo, no shell history). Also accepts stdin pipe.
+"""
+
+import getpass
+import math
+import sys
+from dataclasses import dataclass
+
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+from zxcvbn import zxcvbn
+
+
+@dataclass
+class AttackScenario:
+    name: str
+    description: str
+    guesses_per_sec: float
+
+
+# Realistic 2024-2025 estimates for common hash/attack combos
+SCENARIOS = [
+    AttackScenario(
+        "Online (throttled)",
+        "Rate-limited login with lockout policy",
+        100,
+    ),
+    AttackScenario(
+        "Online (unthrottled)",
+        "No rate limiting, fast server",
+        1e4,
+    ),
+    AttackScenario(
+        "Offline — bcrypt (cost 12)",
+        "Single RTX 4090 — strong KDF makes this slow",
+        7e4,
+    ),
+    AttackScenario(
+        "Offline — SHA-256",
+        "Single RTX 4090 — fast hash, no KDF",
+        8e9,
+    ),
+    AttackScenario(
+        "Offline — MD5",
+        "Single RTX 4090 — trivially fast hash",
+        65e9,
+    ),
+    AttackScenario(
+        "Offline — MD5 (cluster)",
+        "8× A100 GPU cluster",
+        1e12,
+    ),
+    AttackScenario(
+        "Offline — NTLM (state-level)",
+        "Nation-state scale compute",
+        1e14,
+    ),
+]
+
+
+def format_time(seconds: float) -> str:
+    if seconds < 0.001:
+        return "instant"
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f} min"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f} hours"
+    days = seconds / 86400
+    if days < 365:
+        return f"{days:.0f} days"
+    years = days / 365.25
+    if years < 1000:
+        return f"{years:.1f} years"
+    if years < 1e6:
+        return f"{years / 1000:.0f}k years"
+    if years < 1e9:
+        return f"{years / 1e6:.0f}M years"
+    if years < 1e12:
+        return f"{years / 1e9:.0f}B years"
+    return f"{years / 1e12:.0f}T years"
+
+
+def time_style(seconds: float) -> str:
+    if seconds < 1:
+        return "red bold"
+    if seconds < 3600:
+        return "red"
+    if seconds < 86400 * 30:
+        return "yellow"
+    if seconds < 86400 * 365 * 100:
+        return "green"
+    return "green bold"
+
+
+def naive_entropy(password: str) -> float:
+    charset = 0
+    if any(c.islower() for c in password):
+        charset += 26
+    if any(c.isupper() for c in password):
+        charset += 26
+    if any(c.isdigit() for c in password):
+        charset += 10
+    if any(not c.isalnum() for c in password):
+        charset += 33
+    return len(password) * math.log2(charset) if charset else 0
+
+
+def verdict_label(guesses: float) -> tuple[str, str]:
+    bits = math.log2(guesses) if guesses > 1 else 0
+    if bits < 20:
+        return "TERRIBLE", "red bold"
+    if bits < 30:
+        return "WEAK", "red"
+    if bits < 40:
+        return "FAIR", "yellow"
+    if bits < 50:
+        return "GOOD", "green"
+    if bits < 65:
+        return "STRONG", "green bold"
+    return "EXCELLENT", "green bold"
+
+
+PATTERN_LABELS = {
+    "dictionary": lambda s: (
+        f'L33t: "{s["token"]}" ({s.get("dictionary_name", "?")}, rank #{s.get("rank", "?")})'
+        if s.get("l33t")
+        else f'Reversed: "{s["token"]}" ({s.get("dictionary_name", "?")}, rank #{s.get("rank", "?")})'
+        if s.get("reversed")
+        else f'Dictionary: "{s["token"]}" ({s.get("dictionary_name", "?")}, rank #{s.get("rank", "?")})'
+    ),
+    "spatial": lambda s: f'Keyboard walk: "{s["token"]}"',
+    "repeat": lambda s: f'Repeated: "{s["token"]}"',
+    "sequence": lambda s: f'Sequential: "{s["token"]}"',
+    "date": lambda s: f'Date: "{s["token"]}"',
+    "regex": lambda s: f'Common pattern: "{s["token"]}"',
+}
+
+
+def main() -> None:
+    console = Console()
+
+    if sys.stdin.isatty():
+        password = getpass.getpass("Enter password: ")
+    else:
+        password = sys.stdin.readline().rstrip("\n")
+
+    if not password:
+        console.print("[red]No password entered.[/red]")
+        sys.exit(1)
+
+    result = zxcvbn(password)
+    guesses = result["guesses"]
+    effective_bits = math.log2(guesses) if guesses > 1 else 0
+    n_entropy = naive_entropy(password)
+
+    # Composition
+    classes = []
+    if any(c.islower() for c in password):
+        classes.append("lower")
+    if any(c.isupper() for c in password):
+        classes.append("upper")
+    if any(c.isdigit() for c in password):
+        classes.append("digits")
+    if any(not c.isalnum() for c in password):
+        classes.append("symbols")
+
+    console.print(f"\n[bold]Composition[/bold]")
+    console.print(f"  Length: {len(password)}  |  Classes: {', '.join(classes)}")
+    console.print(f"  Naive entropy: {n_entropy:.1f} bits (if truly random)")
+    console.print(f"  Effective entropy: {effective_bits:.1f} bits (pattern-adjusted)")
+
+    # Detected patterns
+    patterns = [s for s in result["sequence"] if s["pattern"] != "bruteforce"]
+    if patterns:
+        console.print(f"\n[bold]Detected Weaknesses[/bold]")
+        for seq in patterns:
+            label_fn = PATTERN_LABELS.get(seq["pattern"])
+            if label_fn:
+                console.print(f"  [yellow]![/yellow] {label_fn(seq)}")
+
+    # Crack times
+    console.print(f"\n[bold]Crack Time Estimates[/bold]  (~{guesses:.2e} guesses needed)\n")
+
+    table = Table(box=None, padding=(0, 2), show_header=True, header_style="bold")
+    table.add_column("Scenario")
+    table.add_column("Speed", justify="right")
+    table.add_column("Time", justify="right")
+
+    for sc in SCENARIOS:
+        secs = guesses / sc.guesses_per_sec
+        table.add_row(
+            f"{sc.name}\n[dim]{sc.description}[/dim]",
+            f"{sc.guesses_per_sec:.0e}/s",
+            Text(format_time(secs), style=time_style(secs)),
+        )
+
+    console.print(table)
+
+    # Verdict
+    label, color = verdict_label(guesses)
+    console.print(f"\n  [{color}]Verdict: {label}[/{color}]")
+
+    feedback = result.get("feedback", {})
+    if feedback.get("warning"):
+        console.print(f"  [yellow]{feedback['warning']}[/yellow]")
+    for suggestion in feedback.get("suggestions", []):
+        console.print(f"  → {suggestion}")
+    console.print()
+
+
+if __name__ == "__main__":
+    main()
