@@ -1,5 +1,5 @@
 {
-  description = "Home Manager configuration";
+  description = "NixOS and Home Manager configuration";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -26,10 +26,26 @@
         modules = [ ./nix/home/common.nix ] ++ modules;
       };
     in {
+      # NixOS systems
+      nixosConfigurations."pc" = nixpkgs.lib.nixosSystem {
+        inherit system;
+        specialArgs = { inherit rime system; };
+        modules = [
+          ./nix/nixos/pc/configuration.nix
+          home-manager.nixosModules.home-manager
+          {
+            home-manager.useGlobalPkgs = true;
+            home-manager.useUserPackages = true;
+            home-manager.extraSpecialArgs = { inherit rime system; };
+            home-manager.users.max = import ./nix/home/hosts/pc.nix;
+          }
+        ];
+      };
+
+      # Home Manager standalone (non-NixOS machines)
       homeConfigurations."zephyrus" = mkHome [ ./nix/home/hosts/zephyrus.nix ];
       homeConfigurations."minimal" = mkHome [ ./nix/home/hosts/minimal.nix ];
       homeConfigurations."minimal-root" = mkHome [ ./nix/home/hosts/minimal-root.nix ];
       homeConfigurations."xmg19" = mkHome [ ./nix/home/hosts/xmg19.nix ];
-      homeConfigurations."pc" = mkHome [ ./nix/home/hosts/pc.nix ];
     };
 }

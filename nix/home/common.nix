@@ -1,4 +1,4 @@
-{ pkgs, rime, system, ... }:
+{ pkgs, lib, rime, system, ... }:
 {
   imports = [
     ./tmux.nix
@@ -7,7 +7,7 @@
   programs.home-manager.enable = true;
 
   # Non-NixOS: add ~/.nix-profile/share to XDG_DATA_DIRS so GNOME finds desktop entries
-  targets.genericLinux.enable = true;
+  targets.genericLinux.enable = lib.mkDefault true;
 
   xdg.enable = true;
 
