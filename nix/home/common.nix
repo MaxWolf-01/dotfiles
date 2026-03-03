@@ -46,6 +46,7 @@
     jq
     manix
     neovim
+    nerd-fonts.hack
     nnn
     nodejs
     nvtopPackages.full
