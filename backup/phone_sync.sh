@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Sync phone data to PC via rsync over Tailscale SSH.
 # Runs as a systemd timer or manually. Requires:
 #   - Tailscale running on both PC and phone

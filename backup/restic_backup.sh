@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Restic backup wrapper with enhanced notifications
 
 set -uo pipefail
