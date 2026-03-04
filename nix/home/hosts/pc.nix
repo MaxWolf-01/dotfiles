@@ -1,4 +1,4 @@
-{ ... }:
+{ pkgs, ... }:
 {
   home.username = "max";
   home.homeDirectory = "/home/max";
@@ -10,4 +10,8 @@
   ];
 
   targets.genericLinux.enable = false;
+
+  home.packages = [
+    (pkgs.btop.override { cudaSupport = true; })
+  ];
 }
