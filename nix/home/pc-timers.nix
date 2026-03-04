@@ -13,36 +13,11 @@ let
     bash coreutils util-linux rsync openssh curl
   ]);
 
-  ytPath = lib.makeBinPath (with pkgs; [
-    bash coreutils gnused gnugrep yt-dlp ffmpeg curl
-  ]);
+  # Age key on tmpfs (decrypted on first SSH login, see secrets/zshrc)
+  ageKeyFile = "/run/user/1000/age-key.txt";
 in
 {
-  # --- YouTube download ---
-
-  systemd.user.services.youtube-download = {
-    Unit = {
-      Description = "Download YouTube playlists";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      Environment = [ "PATH=${ytPath}" ];
-      EnvironmentFile = "${secrets}/env/youtube-download.env";
-      ExecStart = "${dotfiles}/backup/youtube_archive.sh ${secrets}/backup/playlists.txt ${home}/data/yt";
-    };
-  };
-
-  systemd.user.timers.youtube-download = {
-    Unit.Description = "Daily YouTube playlist download";
-    Timer = {
-      OnCalendar = "*-*-* 00:00:00";
-      Persistent = true;
-      RandomizedDelaySec = "5m";
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
+  # --- YouTube download: moved to nix/nixos/pc/youtube-download.nix (system-level, sandboxed) ---
 
   # --- YouTube → rsync.net ---
 
@@ -54,7 +29,10 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${backupPath}" ];
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+      ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/youtube/rsyncnet.conf";
     };
   };
@@ -105,7 +83,10 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${backupPath}" ];
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+      ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/rsyncnet.conf";
     };
   };
@@ -130,7 +111,10 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${backupPath}" ];
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+      ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/pc.conf";
     };
   };
@@ -155,7 +139,10 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${backupPath}" ];
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+      ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/encrypted/rsyncnet.conf";
     };
   };
@@ -168,5 +155,21 @@ in
       RandomizedDelaySec = "1h20m";
     };
     Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Catch up missed backups after age key is decrypted ---
+
+  systemd.user.paths.age-key-available = {
+    Unit.Description = "Watch for age key availability";
+    Path.PathExists = ageKeyFile;
+    Install.WantedBy = [ "paths.target" ];
+  };
+
+  systemd.user.services.age-key-available = {
+    Unit.Description = "Run missed backups after age key appears";
+    Service = {
+      Type = "oneshot";
+      ExecStart = "${pkgs.bash}/bin/bash -c '${pkgs.systemd}/bin/systemctl --user start youtube-rsyncnet.service phone-rsyncnet.service phone-pc.service encrypted-rsyncnet.service || true'";
+    };
   };
 }

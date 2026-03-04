@@ -71,6 +71,19 @@ if [ -n "${require_mount:-}" ]; then
     fi
 fi
 
+# Abort if age key is not available (encrypted at rest, not yet decrypted)
+age_key="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
+if [ ! -f "$age_key" ]; then
+    echo "Skipping $config_name: age key not available at $age_key (decrypt it first)"
+    if [ -n "${ntfy_topic:-}" ]; then
+        curl -s -H "Title: $config_name - Age key needed" -H "Priority: 3" \
+            -H "Tags: backup,key-needed" \
+            -d "Age key not decrypted. SSH in to unlock backups." \
+            "https://ntfy.sh/$ntfy_topic"
+    fi
+    exit 0
+fi
+
 # Helper function to format bytes to human readable
 format_bytes() {
     local bytes=$1

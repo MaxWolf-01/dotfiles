@@ -1,7 +1,10 @@
 { config, pkgs, lib, ... }:
 
 {
-  imports = [ ./hardware-configuration.nix ];
+  imports = [
+    ./hardware-configuration.nix
+    ./youtube-download.nix
+  ];
 
   # Boot
   boot.loader.systemd-boot.enable = true;
