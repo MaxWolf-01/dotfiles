@@ -86,6 +86,7 @@
     isNormalUser = true;
     extraGroups = [ "wheel" "docker" ];
     shell = pkgs.zsh;
+    linger = true;
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAjII9WXpRDSR9Ac8M2ajf/DsQbBReeI3q7V9FSsXIlO"
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p"
