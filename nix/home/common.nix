@@ -26,7 +26,6 @@
       "agent/transcripts"
       "agent/handoffs"
       "agent/research"
-      ".claude"
       "node_modules"
       "repomix-output.*"
       "**/uv.lock"
