@@ -6,7 +6,7 @@ let
   secrets = "${dotfiles}/secrets";
 
   backupPath = lib.makeBinPath (with pkgs; [
-    bash coreutils gnused gnugrep restic openssh sops curl jq age
+    bash coreutils util-linux gnused gnugrep restic openssh sops curl jq age
   ]);
 
   syncPath = lib.makeBinPath (with pkgs; [
