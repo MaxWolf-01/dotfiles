@@ -16,6 +16,65 @@
     initContent = builtins.readFile ../../zsh/zshrc;
   };
 
+  programs.git = {
+    enable = true;
+    lfs.enable = true;
+    ignores = [
+      "agent/transcripts"
+      "agent/handoffs"
+      "agent/research"
+      ".claude"
+      "node_modules"
+      "repomix-output.*"
+      "**/uv.lock"
+      ".idea"
+      ".vscode"
+      "*.swp"
+      "*.class"
+      "*.dll"
+      "*.exe"
+      "*.o"
+      "*.so"
+      "*.pyc"
+      ".pytest_cache"
+      ".mypy_cache"
+      ".ruff_cache"
+      ".venv"
+      "build"
+      "*.log"
+      "*.sqlite"
+      "*.db"
+      "*.zip"
+      "*.gz"
+      "*.tar"
+      "*.tar.gz"
+      "*.7z"
+      "*.pdf"
+      "**/notes/*"
+      "**/notebooks/*"
+    ];
+    attributes = [
+      "*.lockb binary diff=lockb"
+    ];
+    includes = [
+      { path = "~/.gitconfig_local"; }
+    ];
+    settings = {
+      user.name = "Maximilian Wolf";
+      user.email = "69987866+MaxWolf-01@users.noreply.github.com";
+      init.defaultBranch = "master";
+      push.default = "current";
+      credential."https://github.com".helper = "!/usr/bin/gh auth git-credential";
+      diff.lockb = { textconv = "bun"; binary = true; };
+      help.autocorrect = 2;
+      branch.sort = "-committerdate";
+      transfer.fsckobjects = true;
+      fetch.fsckobjects = true;
+      receive.fsckObjects = true;
+      pull.rebase = false;
+    };
+  };
+
   programs.fzf = {
     enable = true;
     enableZshIntegration = true;
@@ -29,7 +88,6 @@
   home.packages = with pkgs; [
     age
     ast-grep
-    # btop - compiled from source in setup script for GPU support
     cargo
     curl
     duckdb
@@ -39,8 +97,6 @@
     fd
     ffmpeg
     gh
-    git
-    git-lfs
     gnumake
     go
     jq
@@ -51,6 +107,8 @@
     nodejs
     nvtopPackages.full
     openssh
+    python3Packages.ipdb
+    pywal
     restic
     ripgrep
     rime.packages.${system}.default
