@@ -7,7 +7,7 @@ in
   home.file.".config/vesktop/themes/custom.theme.css".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
 
-  imports = [ ./kitty.nix ./newsboat.nix ];
+  imports = [ ./kitty.nix ./newsboat.nix ]; # TODO(ubuntu-26): switch to ./ghostty.nix
 
   home.file.".icons".source = ../../desktop/icons;
 

@@ -17,7 +17,7 @@ For device inventory, infrastructure, and backup architecture: always read `secr
 
 ALWAYS read README.md to get a quick high-level overview of the project structure / setup / usage flow.
 
-Flake check only sees igt tracked files.
+**IMPORTANT: Nix flakes only see git-tracked files.** When creating new `.nix` files, `git add` them BEFORE running `hmswitch`/`nswitch`/any flake command — otherwise the build fails with "path does not exist".
 
 ## Claude Code Config
 
