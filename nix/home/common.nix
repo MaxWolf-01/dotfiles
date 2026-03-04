@@ -88,6 +88,87 @@
     enableZshIntegration = true;
   };
 
+  programs.yazi = {
+    enable = true;
+    enableZshIntegration = true;
+    shellWrapperName = "y";
+    extraPackages = with pkgs; [ trash-cli ];
+    initLua = ''
+      -- Override built-in size linemode to also show mtime
+      function Linemode:size()
+        local time = math.floor(self._file.cha.mtime or 0)
+        local time_str
+        if time == 0 then
+          time_str = ""
+        elseif os.date("%Y", time) == os.date("%Y") then
+          time_str = os.date("%m/%d %H:%M", time)
+        else
+          time_str = os.date("%m/%d  %Y", time)
+        end
+
+        local size = self._file:size()
+        local size_str
+        if size then
+          size_str = ya.readable_size(size)
+        else
+          local folder = cx.active:history(self._file.url)
+          size_str = folder and tostring(#folder.files) or ""
+        end
+
+        return string.format("%s %s", size_str, time_str)
+      end
+    '';
+    settings = {
+      manager = {
+        show_hidden = true;
+        sort_by = "modified";
+        sort_reverse = true;
+        linemode = "size";
+      };
+    };
+    theme = {
+      mgr = {
+        cwd = { fg = "yellow"; };
+        marker_copied = { fg = "green"; bg = "green"; };
+        marker_cut = { fg = "red"; bg = "red"; };
+        marker_marked = { fg = "magenta"; bg = "magenta"; };
+        marker_selected = { fg = "yellow"; bg = "yellow"; };
+        count_copied = { fg = "black"; bg = "green"; };
+        count_cut = { fg = "black"; bg = "red"; };
+        count_selected = { fg = "black"; bg = "yellow"; };
+        border_style = { fg = "darkgray"; };
+      };
+      tabs = {
+        active = { fg = "black"; bg = "yellow"; bold = true; };
+        inactive = { fg = "lightgray"; bg = "darkgray"; };
+      };
+      mode = {
+        normal_main = { fg = "black"; bg = "green"; bold = true; };
+        normal_alt = { fg = "green"; bg = "darkgray"; };
+        select_main = { fg = "black"; bg = "red"; bold = true; };
+        select_alt = { fg = "red"; bg = "darkgray"; };
+        unset_main = { fg = "black"; bg = "magenta"; bold = true; };
+        unset_alt = { fg = "magenta"; bg = "darkgray"; };
+      };
+      status = {
+        perm_type = { fg = "green"; };
+        perm_read = { fg = "yellow"; };
+        perm_write = { fg = "red"; };
+        perm_exec = { fg = "magenta"; };
+        progress_normal = { fg = "green"; bg = "black"; };
+        progress_error = { fg = "yellow"; bg = "red"; };
+      };
+      filetype.rules = [
+        { mime = "image/*"; fg = "yellow"; }
+        { mime = "{audio,video}/*"; fg = "magenta"; }
+        { mime = "application/{zip,rar,7z*,tar,gzip,xz,zstd,bzip*,lzma,compress,archive,cpio,arj,xar,ms-cab*}"; fg = "red"; }
+        { mime = "application/{pdf,doc,rtf}"; fg = "lightcyan"; }
+        { name = "*"; is = "orphan"; fg = "red"; }
+        { name = "*/"; fg = "green"; bold = true; }
+      ];
+    };
+  };
+
   services.ssh-agent.enable = true;
 
   programs.ssh = {
@@ -145,7 +226,6 @@
     ncdu
     neovim
     nerd-fonts.hack
-    nnn
     nodejs
     nvd
     nvtopPackages.full
