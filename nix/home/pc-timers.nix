@@ -15,6 +15,9 @@ let
 
   # Age key on tmpfs (decrypted on first SSH login, see secrets/zshrc)
   ageKeyFile = "/run/user/1000/age-key.txt";
+
+  # ssh-agent socket (managed by services.ssh-agent in common.nix)
+  sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
   # --- YouTube download: moved to nix/nixos/pc/youtube-download.nix (system-level, sandboxed) ---
@@ -32,6 +35,7 @@ in
       Environment = [
         "PATH=${backupPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/youtube/rsyncnet.conf";
     };
@@ -57,7 +61,10 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${syncPath}" ];
+      Environment = [
+        "PATH=${syncPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
       EnvironmentFile = "${secrets}/env/phone-sync.env";
       ExecStart = "${dotfiles}/backup/phone_sync.sh";
     };
@@ -86,6 +93,7 @@ in
       Environment = [
         "PATH=${backupPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/rsyncnet.conf";
     };
@@ -142,6 +150,7 @@ in
       Environment = [
         "PATH=${backupPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/encrypted/rsyncnet.conf";
     };
