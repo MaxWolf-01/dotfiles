@@ -103,5 +103,8 @@
     trusted-users = [ "max" ];
   };
 
+  # Disable deprecated udev-settle (times out waiting for NVIDIA/ZFS events, nothing needs it)
+  systemd.services.systemd-udev-settle.serviceConfig.ExecStart = [ "" "${pkgs.coreutils}/bin/true" ];
+
   system.stateVersion = "26.05";
 }
