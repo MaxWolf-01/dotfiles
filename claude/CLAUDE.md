@@ -152,6 +152,7 @@ mx vault:add name ~/path/to/dir                        # create or extend a vaul
 
 Permissions: Understanding this will allow you to go faster (when it's time to implement, experiment, or gather information).
 - Read-only commands are auto-approved in ~/.claude/settings.json.
+- **Don't chain independent commands** (`&&`, `||`, `;`) — it breaks auto-approval matching. `git diff` is approved; `git diff && git status` is not. Use parallel or sequential tool calls instead. Dependent chains (e.g. `mkdir -p foo && mv bar foo/`) are fine. Instead of `cd dir && git ...`, use `git -C dir ...`.
 - For `gh api`: Always use `-X GET` explicitly (e.g., `gh api -X GET repos/owner/repo`) — this is the only form that's auto-approved. POST/PUT/DELETE will prompt.
 - ALWAYS prefer `fd` over `find` — unless it is not powerful enough, e.g. you actually want to delete something — fd is read-only by design (no -delete, no -exec), so I'm not prompted for giving you permission.
 

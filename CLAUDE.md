@@ -13,6 +13,12 @@ For device inventory, infrastructure, and backup architecture: always read `secr
 - Dotfiles: `git -C ~/.dotfiles ...`
 - Secrets: `git -C ~/.dotfiles/secrets ...`
 
+## Getting Started
+
+ALWAYS read README.md to get a quick high-level overview of the project structure / setup / usage flow.
+
+Flake check only sees igt tracked files.
+
 ## Claude Code Config
 
 Two `claude`-related directories exist in this repo — don't confuse them:
@@ -38,30 +44,33 @@ Or: `hmswitch` then `Ctrl+a r` inside tmux.
 tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
 ```
 
-**When changing keybindings:** Update `tmux/cheatsheet.md` to match!
+**When changing keybindings:** Update `docs/tmux-cheatsheet.md` to match!
 
 ## Home Manager
 
 Structure:
-- `flake.nix` in root defines hosts (zephyrus, xmg19, pc, minimal)
+- `flake.nix` — defines all hosts. PC is a NixOS system (with HM as module); laptops are HM standalone.
 - `nix/home/common.nix` - CLI tools for all hosts (auto-included via mkHome)
 - `nix/home/desktop.nix` - GUI apps (vesktop, nemo, fonts) — workstation machines only
 - `nix/home/gnome.nix` - GNOME-specific (tiling-shell, dconf)
+- `nix/home/kitty.nix` - terminal emulator
+- `nix/home/newsboat.nix` - RSS reader with desktop notifications
+- `nix/home/tmux.nix` - tmux config
 - `nix/home/timers.nix` - systemd user timers, zephyrus only. Secrets via `EnvironmentFile` from `secrets/env/`
 - `nix/home/pc-timers.nix` - PC timers (youtube, phone sync + backup, encrypted)
 - `nix/home/x11.nix` / `wayland.nix` - display server specific
 - `nix/home/hosts/` - per-machine configs (stateVersion + imports)
-- `nix/nix.conf` - enables flakes (symlinked by setup script)
+- `nix/nixos/pc/` - NixOS system config for PC (configuration.nix, hardware-configuration.nix, youtube-download.nix)
 
 Host tiers:
 - **CLI** (common.nix): every machine — shell, dev tools, restic, etc.
-- **Workstation** (+ desktop.nix, gnome.nix, display server): zephyrus, xmg19, future laptops
-- **Server** (+ pc-timers.nix): PC — headless, backup hub, workers
+- **Workstation** (+ desktop.nix, gnome.nix, display server): zephyrus, xmg19
+- **Server / NixOS** (nix/nixos/pc/ + pc-timers.nix): PC — headless, backup hub, GPU workers
 
 Setup flow:
 - `./setup minimal` installs Nix
-- First run: `nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST`
-- After that: `hmswitch` alias (or `s home-manager` then `hmswitch`)
+- Laptops (HM standalone): `nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST`, then `hmswitch`
+- PC (NixOS): `nswitch` (alias for `sudo nixos-rebuild switch --flake ...`) — rebuilds system + HM together
 
 ### Key Nix Concepts
 
@@ -88,18 +97,14 @@ Setup flow:
 - Changes to `zsh/zshrc` require `hmswitch` to take effect
 - But files it sources (like `zsh/aliases`) are runtime — changes apply on new shell, no hmswitch needed
 
+## NixOS on a New Machine
+
+See `agent/knowledge/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).
+
 ## What stays outside Nix
 
 - Ubuntu-specific apt packages (pulseaudio-module-bluetooth) - system-level
-- btop - compiled from source for GPU support
 - GNOME keybindings - keybindings.pl works fine
-
-## TODOs
-
-- Move config symlinks to HM for Nix-managed tools (nvim, kitty, ruff → home.file in respective modules)
-- Move ~/.icons to gnome.nix
-- nixGL for GPU acceleration in Electron apps (vesktop currently uses --disable-gpu)
-- Consider programs.vesktop module for declarative Discord config
 
 # Rime MCP
 
