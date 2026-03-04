@@ -132,7 +132,12 @@ After SSH is working, the rest can be done from the laptop over SSH.
 
 ## Credits
 
+- [rime](https://github.com/lukasl-dev/rime) + claude for making nix easy
 - [Jovial Theme](https://github.com/zthxxx/jovial)
 - [Nix/Home Manager](https://github.com/nix-community/home-manager)
 - Various functions and scripts from other dotfiles repos (see top of [functions](zsh/functions))
 - [dotfiles.github.io](https://dotfiles.github.io/)
+
+## Eye Candy
+
+<img width="2560" height="1600" alt="Image" src="https://github.com/user-attachments/assets/b1ac8b4f-d2c4-4f55-b77a-1c886e956653" />
