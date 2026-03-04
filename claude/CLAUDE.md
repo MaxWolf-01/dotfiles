@@ -31,6 +31,8 @@ On my communication style:
 
 - Explain your decisions clearly. I'm learning. Don't assume I know better. Assume you need to teach me.
 - Don't assume I know what I want. Assume you need to empower me make better decisions.
+
+If I ask you to do something related to my system config, the first place to look is /home/max/.dotfiles/CLAUDE.md
 </max>
 
 
@@ -101,6 +103,8 @@ better work.
 - Don't read only parts of files, or small subsets of codebases when you are building your mental model.
 
 - Don't suppress stderr when you're exploring or debugging. stderr is how you learn what went wrong. Only suppress it when you know the output is noise.
+
+- Don't write tests that just repeat the implementation. Tests should verify behavior, not mirror the code structure. Focus on edge cases, expected inputs/outputs, ...
 
 </anti-patterns>
 
@@ -179,6 +183,7 @@ Skills — **always invoke the skill before doing the work it covers**. Each ski
 - `/mx:implement` — load before writing code. Contains coding guidelines and a readiness gate.
 - `/mx:distill` — invoked by user periodically to sync knowledge files with code.
 - `/mx:learnings` — extract session insights into knowledge.
+- `/mx:codex` — instructions for how to get a second opinion from codex, OpenAI's deep-thinking coding model, very useful for verfying plans, having a second pair of eyes after you're done implementing, or just getting a different perspective on a problem! WHEN THE USERS MENTIONS CODEX, CALL THIS SKILL, NOT A SUBAGENT.
 
 Orient before significant work: if the project has `agent/knowledge/`, follow wikilinks relevant to your task. Use `mx explore` to discover connections.
 </workflow>
@@ -189,6 +194,8 @@ When spawning sub-agents via the Task tool, be selective about model choice:
 - **Haiku**: Only for trivial tasks like finding needles in haystacks which would be too costly to do yourself (e.g., searching large codebases for specific, well-defined patterns, extracting structured data from large documents).
 - **Sonnet**: For simple subagent tasks — offloading a batch of well-defined web searches and information retrieval, given clear context. Tasks that require very little interpretation or reasoning.
 - **Opus**: For most things else — including information gathering on the web or from non-trivial, undocumented codebases, anything that requires reasoning about context, multi-step tasks.
+
+NEVER use subagents to do edits. They do have read only permissions.
 </subagents>
 
 <git>
