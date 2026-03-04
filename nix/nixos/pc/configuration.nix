@@ -11,6 +11,7 @@
   boot.zfs = {
     forceImportRoot = false;
     extraPools = [ "tank" ];
+    requestEncryptionCredentials = false;
   };
 
   # Network
