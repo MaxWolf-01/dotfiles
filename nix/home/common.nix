@@ -66,7 +66,7 @@
       user.email = "69987866+MaxWolf-01@users.noreply.github.com";
       init.defaultBranch = "master";
       push.default = "current";
-      credential."https://github.com".helper = "!/usr/bin/gh auth git-credential";
+      credential."https://github.com".helper = "!gh auth git-credential";
       diff.lockb = { textconv = "bun"; binary = true; };
       help.autocorrect = 2;
       branch.sort = "-committerdate";
