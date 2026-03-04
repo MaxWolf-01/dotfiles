@@ -9,6 +9,8 @@ in
 
   imports = [ ./kitty.nix ./newsboat.nix ];
 
+  home.file.".icons".source = ../../desktop/icons;
+
   home.file.".config/newsboat/urls".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfiles}/newsboat/urls";
 
