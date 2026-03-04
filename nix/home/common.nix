@@ -93,16 +93,19 @@
     cargo
     curl
     duckdb
+    dust
     dysk
     fastfetch
     fastmod
     fd
     ffmpeg
+    gcc
     gh
     gnumake
     go
     jq
     manix
+    ncdu
     neovim
     nerd-fonts.hack
     nnn
