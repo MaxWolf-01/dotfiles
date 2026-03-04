@@ -125,7 +125,7 @@ return {
           "",
           os.date("%H:%M") .. " " .. ({ "🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘" })[tonumber(os.date("%d")) % 8 + 1] .. " " .. os.date("%d %b, %a"),
           "", "󰍛 " .. io.popen("whoami"):read("*l") .. "@" .. io.popen("hostname"):read("*l")
-        .. " 󰌪 " .. io.popen('uptime -p'):read("*l"),
+        .. " 󰌪 " .. (io.popen('uptime -p'):read("*l") or io.popen('uptime'):read("*l") or ""),
         }
       },
       hide = {
