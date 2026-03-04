@@ -88,6 +88,40 @@
     enableZshIntegration = true;
   };
 
+  programs.ssh = {
+    enable = true;
+    enableDefaultConfig = false;
+    matchBlocks = {
+      "github.com" = {
+        hostname = "github.com";
+        user = "git";
+      };
+      "rsyncnet zh5684.rsync.net" = {
+        hostname = "zh5684.rsync.net";
+        user = "zh5684";
+        extraOptions = {
+          BatchMode = "yes";
+          StrictHostKeyChecking = "accept-new";
+        };
+      };
+      "a55 phone" = {
+        hostname = "100.65.181.6";
+        port = 8022;
+      };
+      yapit-prod = {
+        hostname = "100.87.244.58";
+        user = "root";
+      };
+      "*" = {
+        extraOptions = {
+          AddKeysToAgent = "yes";
+          IdentitiesOnly = "yes";
+        };
+        identityFile = [ "~/.ssh/id_ed25519" ];
+      };
+    };
+  };
+
   home.packages = with pkgs; [
     age
     ast-grep
