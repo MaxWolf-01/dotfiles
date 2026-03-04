@@ -166,19 +166,4 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Catch up missed backups after age key is decrypted ---
-
-  systemd.user.paths.age-key-available = {
-    Unit.Description = "Watch for age key availability";
-    Path.PathExists = ageKeyFile;
-    Install.WantedBy = [ "paths.target" ];
-  };
-
-  systemd.user.services.age-key-available = {
-    Unit.Description = "Run missed backups after age key appears";
-    Service = {
-      Type = "oneshot";
-      ExecStart = "${pkgs.bash}/bin/bash -c '${pkgs.systemd}/bin/systemctl --user start youtube-rsyncnet.service phone-rsyncnet.service phone-pc.service encrypted-rsyncnet.service || true'";
-    };
-  };
 }
