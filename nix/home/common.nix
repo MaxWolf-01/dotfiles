@@ -110,6 +110,7 @@
     nerd-fonts.hack
     nnn
     nodejs
+    nvd
     nvtopPackages.full
     openssh
     python3Packages.ipdb
@@ -123,6 +124,7 @@
     tree
     uv
     vim
+    wakatime-cli
     yt-dlp
   ];
 
