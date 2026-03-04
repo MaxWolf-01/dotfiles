@@ -14,6 +14,8 @@
   programs.zsh = {
     enable = true;
     initContent = builtins.readFile ../../zsh/zshrc;
+    syntaxHighlighting.enable = true;
+    autosuggestion.enable = true;
   };
 
   programs.git = {
