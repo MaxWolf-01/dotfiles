@@ -9,6 +9,10 @@ let
   ]);
 in
 {
+  systemd.tmpfiles.rules = [
+    "d /home/max/logs/youtube 0755 max users -"
+  ];
+
   systemd.services.youtube-download = {
     description = "Download YouTube playlists";
     after = [ "network-online.target" ];
