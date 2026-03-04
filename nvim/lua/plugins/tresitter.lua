@@ -6,28 +6,13 @@ return {
     cmd = { "TSInstall", "TSBufEnable", "TSBufDisable", "TSModuleInfo" },
 
     opts = {
-      ensure_installed = { "lua", "luadoc", "printf", "vim", "vimdoc" },
-
-      highlight = {
-        enable = true,
-        use_languagetree = true,
-      },
-
-      indent = {
-        enable = true,
-      },
+      ensure_installed = { "just", "lua", "luadoc", "printf", "vim", "vimdoc" },
     },
 
     config = function(_, opts)
-      require("nvim-treesitter.configs").setup(opts)
+      require("nvim-treesitter").setup(opts)
     end,
   },
 
-  {
-    "IndianBoy42/tree-sitter-just",
-    dependencies = { "nvim-treesitter/nvim-treesitter" },
-
-    opts = {},
-  },
 }
 
