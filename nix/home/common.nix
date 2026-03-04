@@ -1,4 +1,4 @@
-{ pkgs, lib, rime, system, ... }:
+{ config, pkgs, lib, rime, system, ... }:
 {
   imports = [
     ./tmux.nix
@@ -13,6 +13,7 @@
 
   programs.zsh = {
     enable = true;
+    dotDir = "${config.xdg.configHome}/zsh";
     initContent = builtins.readFile ../../zsh/zshrc;
     syntaxHighlighting.enable = true;
     autosuggestion.enable = true;
