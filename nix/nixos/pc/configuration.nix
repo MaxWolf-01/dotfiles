@@ -32,7 +32,7 @@
   hardware.graphics.enable = true;
 
   hardware.nvidia = {
-    open = false; # MPS requires proprietary module (open module can't spawn MPS servers)
+    open = true;
     nvidiaSettings = false;
     nvidiaPersistenced = true;
   };
@@ -43,6 +43,7 @@
     after = [ "nvidia-persistenced.service" ];
     requires = [ "nvidia-persistenced.service" ];
     wantedBy = [ "multi-user.target" ];
+    path = [ config.hardware.nvidia.package.bin ];
     serviceConfig = {
       Type = "forking";
       ExecStart = "${config.hardware.nvidia.package.bin}/bin/nvidia-cuda-mps-control -d";
