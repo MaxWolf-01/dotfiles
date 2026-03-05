@@ -11,6 +11,7 @@ in
 {
   systemd.tmpfiles.rules = [
     "d /home/max/logs/youtube 0755 max users -"
+    "d /home/max/.cache/yt-dlp 0700 max users -"
   ];
 
   systemd.services.youtube-download = {
@@ -36,6 +37,7 @@ in
       BindPaths = [
         "/home/max/data/yt"
         "/home/max/logs/youtube"
+        "/home/max/.cache/yt-dlp"
       ];
       PrivateTmp = true;
       PrivateDevices = true;

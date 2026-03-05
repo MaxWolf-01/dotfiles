@@ -60,9 +60,9 @@ while IFS='|' read -r url format name; do
         cmd=(yt-dlp --format "bv[height<=720]+ba/b[height<=720]")
     fi
 
-    # Common options
+    # Common options (OAuth2 token cached in ~/.cache/yt-dlp/, one-time setup per machine)
     cmd+=(
-        --cookies-from-browser firefox
+        --username oauth --password ''
         --download-archive archive.txt
         --continue
         "$url"
