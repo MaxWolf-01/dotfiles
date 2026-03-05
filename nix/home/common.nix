@@ -17,6 +17,11 @@
     initContent = builtins.readFile ../../zsh/zshrc;
     syntaxHighlighting.enable = true;
     autosuggestion.enable = true;
+    history = {
+      size = 1000000;
+      save = 1000000;
+      ignoreAllDups = true;
+    };
   };
 
   programs.git = {
