@@ -106,6 +106,11 @@ better work.
 
 - Don't write tests that just repeat the implementation. Tests should verify behavior, not mirror the code structure. Focus on edge cases, expected inputs/outputs, ...
 
+- **Don't chain shell commands** (`&&`, `||`, `;`) — every chained command requires manual approval, which blocks async execution and stalls the agent. One command per Bash call is the default.
+  - `cd dir && command` is the most common violation. Use absolute paths or tool flags (`git -C`, `npm --prefix`) instead.
+  - Independent commands → parallel tool calls. Dependent commands → sequential tool calls.
+  - Chains are okay only when functionally necessary or when splitting would be significantly more costly. If you find yourself needing the same chain repeatedly, write a script.
+
 </anti-patterns>
 
 <tools>
@@ -152,8 +157,6 @@ mx vault:add name ~/path/to/dir                        # create or extend a vaul
 
 Permissions: Understanding this will allow you to go faster (when it's time to implement, experiment, or gather information).
 - Read-only commands are auto-approved in ~/.claude/settings.json.
-- **Don't chain independent commands** (`&&`, `||`, `;`) — it breaks auto-approval matching. `git diff` is approved; `git diff && git status` is not. Use parallel tool calls for independent commands, or sequential tool calls when one depends on the other. Instead of `cd dir && git ...`, use `git -C dir ...`.
-  - Example: to wait then check logs, make two sequential Bash calls: first `sleep 10`, then `ssh pc "journalctl ..."` — NOT `sleep 10 && ssh pc "journalctl ..."`.
 - For `gh api`: Always use `-X GET` explicitly (e.g., `gh api -X GET repos/owner/repo`) — this is the only form that's auto-approved. POST/PUT/DELETE will prompt.
 - ALWAYS prefer `fd` over `find` — unless it is not powerful enough, e.g. you actually want to delete something — fd is read-only by design (no -delete, no -exec), so I'm not prompted for giving you permission.
 
