@@ -60,13 +60,18 @@ while IFS='|' read -r url format name; do
         cmd=(yt-dlp --format "bv[height<=720]+ba/b[height<=720]")
     fi
 
-    # Common options (OAuth2 token cached in ~/.cache/yt-dlp/, one-time setup per machine)
+    # Common options
     cmd+=(
-        --username oauth --password ''
         --download-archive archive.txt
         --continue
-        "$url"
+        --sleep-interval 5 --max-sleep-interval 10
     )
+    if [ -n "${YOUTUBE_COOKIES:-}" ] && [ -f "$YOUTUBE_COOKIES" ]; then
+        cmd+=(--cookies "$YOUTUBE_COOKIES")
+    else
+        cmd+=(--cookies-from-browser firefox)
+    fi
+    cmd+=("$url")
 
     log_file="$log_dir/${name}_$(date +%Y%m%d_%H%M%S).log"
 

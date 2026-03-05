@@ -8,6 +8,10 @@ let
   backupPath = lib.makeBinPath (with pkgs; [
     bash coreutils gnused gnugrep restic openssh sops curl jq age
   ]);
+
+  ytCookiePath = lib.makeBinPath (with pkgs; [
+    bash coreutils yt-dlp openssh
+  ]);
 in
 {
   systemd.user.services.working-rsyncnet = {
@@ -52,6 +56,43 @@ in
       OnCalendar = "daily";
       Persistent = true;
       RandomizedDelaySec = "30m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- YouTube cookie export → PC ---
+
+  systemd.user.services.youtube-cookies-export = {
+    Unit = {
+      Description = "Export YouTube cookies from Firefox and push to PC";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${ytCookiePath}" ];
+      ExecStart = pkgs.writeShellScript "youtube-cookies-export" ''
+        set -euo pipefail
+        tmp=$(mktemp)
+        trap "rm -f $tmp" EXIT
+
+        # Export cookies from Firefox (Netscape format)
+        yt-dlp --cookies-from-browser firefox \
+          --cookies "$tmp" \
+          --skip-download "https://www.youtube.com/robots.txt" 2>/dev/null
+
+        # Push to PC
+        scp -q "$tmp" pc:/home/max/.local/secrets/youtube-cookies.txt
+      '';
+    };
+  };
+
+  systemd.user.timers.youtube-cookies-export = {
+    Unit.Description = "Weekly YouTube cookie export to PC";
+    Timer = {
+      OnCalendar = "weekly";
+      Persistent = true;
+      RandomizedDelaySec = "1h";
     };
     Install.WantedBy = [ "timers.target" ];
   };

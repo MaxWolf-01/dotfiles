@@ -3,6 +3,7 @@
 let
   dotfiles = "/home/max/.dotfiles";
   secrets = "${dotfiles}/secrets";
+  cookieFile = "/home/max/.local/secrets/youtube-cookies.txt";
 
   ytPath = lib.makeBinPath (with pkgs; [
     bash coreutils gnused gnugrep yt-dlp ffmpeg curl
@@ -11,7 +12,6 @@ in
 {
   systemd.tmpfiles.rules = [
     "d /home/max/logs/youtube 0755 max users -"
-    "d /home/max/.cache/yt-dlp 0700 max users -"
   ];
 
   systemd.services.youtube-download = {
@@ -22,7 +22,10 @@ in
       Type = "oneshot";
       User = "max";
       Group = "users";
-      Environment = [ "PATH=${ytPath}" ];
+      Environment = [
+        "PATH=${ytPath}"
+        "YOUTUBE_COOKIES=${cookieFile}"
+      ];
       EnvironmentFile = "${secrets}/env/youtube-download.env";
       ExecStart = "${dotfiles}/backup/youtube_archive.sh ${secrets}/backup/playlists.txt /home/max/data/yt";
 
@@ -33,11 +36,11 @@ in
       BindReadOnlyPaths = [
         "${dotfiles}/backup/youtube_archive.sh"
         "${secrets}/backup/playlists.txt"
+        "-${cookieFile}"
       ];
       BindPaths = [
         "/home/max/data/yt"
         "/home/max/logs/youtube"
-        "/home/max/.cache/yt-dlp"
       ];
       PrivateTmp = true;
       PrivateDevices = true;
