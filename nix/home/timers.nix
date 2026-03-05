@@ -70,19 +70,30 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${ytCookiePath}" ];
+      Environment = [
+        "PATH=${ytCookiePath}"
+        "SSH_AUTH_SOCK=/run/user/1000/ssh-agent"
+      ];
       ExecStart = pkgs.writeShellScript "youtube-cookies-export" ''
-        set -euo pipefail
+        set -uo pipefail
         tmp=$(mktemp)
         trap "rm -f $tmp" EXIT
 
-        # Export cookies from Firefox (Netscape format)
+        # Seed with Netscape header (yt-dlp reads before writing)
+        echo "# Netscape HTTP Cookie File" > "$tmp"
+
+        # Export cookies from Firefox — exit code ignored (video processing may fail)
         yt-dlp --cookies-from-browser firefox \
           --cookies "$tmp" \
-          --skip-download "https://www.youtube.com/robots.txt" 2>/dev/null
+          --skip-download "https://www.youtube.com/watch?v=jNQXAC9IVRw" >/dev/null 2>&1 || true
 
-        # Push to PC
-        scp -q "$tmp" pc:/home/max/.local/secrets/youtube-cookies.txt
+        # Verify cookies were written, then push to PC
+        if [ "$(wc -l < "$tmp")" -gt 10 ]; then
+          scp -q "$tmp" pc:/home/max/.local/secrets/youtube-cookies.txt
+        else
+          echo "Cookie export produced no data" >&2
+          exit 1
+        fi
       '';
     };
   };
