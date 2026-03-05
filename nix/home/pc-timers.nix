@@ -10,7 +10,7 @@ let
   ]);
 
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils util-linux rsync openssh curl
+    bash coreutils util-linux rsync openssh curl gnugrep
   ]);
 
   # Age key on tmpfs (decrypted on first SSH login, see secrets/zshrc)
