@@ -102,11 +102,11 @@ while IFS='|' read -r url format name; do
         fi
 
         # Count errors by type
-        if [[ "$line" =~ ERROR:.*unavailable|not\ available ]]; then
+        if [[ "$line" =~ ERROR:.*(unavailable|not\ available) ]]; then
             ((pl_error_unavailable++))
-        elif [[ "$line" =~ ERROR:.*copyright\ claim ]]; then
+        elif [[ "$line" =~ ERROR:.*(copyright\ claim) ]]; then
             ((pl_error_copyright++))
-        elif [[ "$line" =~ ERROR:.*removed|deleted ]]; then
+        elif [[ "$line" =~ ERROR:.*(removed|deleted) ]]; then
             ((pl_error_deleted++))
         elif [[ "$line" =~ ^ERROR: ]]; then
             ((pl_error_other++))
@@ -182,7 +182,7 @@ if [ $error_count -gt 0 ]; then
     [ $total_error_copyright -gt 0 ] && echo "  - Copyright: $total_error_copyright" | tee -a "$run_log"
     [ $total_error_deleted -gt 0 ] && echo "  - Deleted/Removed: $total_error_deleted" | tee -a "$run_log"
     [ $total_error_other -gt 0 ] && echo "  - Other: $total_error_other" | tee -a "$run_log"
-    echo "  Archive status: ${total_errors_archived} archived, ${total_errors_lost} never captured" | tee -a "$run_log"
+    echo "  Never captured: ${total_errors_lost}" | tee -a "$run_log"
 fi
 
 if [ -n "$failed_playlists" ]; then
@@ -204,14 +204,9 @@ if [ -n "$ntfy_topic" ]; then
     fi
 
     if [ $error_count -gt 0 ]; then
-        msg+="\nErrors: "
-        error_parts=()
-        [ $total_error_unavailable -gt 0 ] && error_parts+=("${total_error_unavailable} unavailable")
-        [ $total_error_copyright -gt 0 ] && error_parts+=("${total_error_copyright} copyright")
-        [ $total_error_deleted -gt 0 ] && error_parts+=("${total_error_deleted} deleted")
-        [ $total_error_other -gt 0 ] && error_parts+=("${total_error_other} other")
-        msg+=$(IFS=", "; echo "${error_parts[*]}")
-        msg+=" (${total_errors_archived} archived, ${total_errors_lost} never captured)"
+        gone=$((total_error_unavailable + total_error_copyright + total_error_deleted))
+        msg+="\n${gone} gone"
+        [ $total_error_other -gt 0 ] && msg+=", ${total_error_other} unexpected errors"
     fi
 
     if [ -n "$failed_playlists" ]; then

@@ -43,11 +43,11 @@ in
       BindReadOnlyPaths = [
         "${dotfiles}/backup/youtube_archive.sh"
         "${secrets}/backup/playlists.txt"
-        "-${cookieFile}"
       ];
       BindPaths = [
         "/home/max/data/yt"
         "/home/max/logs/youtube"
+        "-${cookieFile}"
       ];
       PrivateTmp = true;
       PrivateDevices = true;
