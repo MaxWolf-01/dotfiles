@@ -97,6 +97,10 @@ Setup flow:
 - Changes to `zsh/zshrc` require `hmswitch` to take effect
 - But files it sources (like `zsh/aliases`) are runtime — changes apply on new shell, no hmswitch needed
 
+## NixOS Systemd Services
+
+Custom systemd services need explicit `path` for any package whose binaries the daemon spawns by name. NixOS services get a minimal default PATH — see `agent/knowledge/nixos-systemd-gotchas.md`.
+
 ## NixOS on a New Machine
 
 See `agent/knowledge/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).

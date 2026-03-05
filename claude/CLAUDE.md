@@ -131,6 +131,7 @@ better work.
 - To install the deps run `uv sync` (with the required optional deps if any, or sometimes `--all-extras`).
 - To type check, run `cd /path/to/check check`, short for `uvx ty@latest check`, or - preferrably - use `make check` if available (I often use Makefiles to streamline and standardize common commands, read those files when doing dev work like testing, type checking, starting servers, etc.!)
 - For Python CLIs, always use tyro (never argparse/click/fire). Load `/mx:tyro-cli` for patterns and gotchas.
+ - Prefer creating CLIs/scripts with tyro, for anything you might want to run more than once or that has flags you want to ablate. Save time and attention by creating proper infrastructure for your investigations, visualizations, experiments, etc.
 - Do NOT use `python3` to run python code or scripts. Always use `uv run {python {-c}}`, those are auto-approved.
 
 `memex` (alias `mx`) — markdown vault tool for wikilink graph traversal and semantic search. A vault is a named collection of directories. Use it to orient in knowledge bases: discover connections between notes, find relevant context you didn't know existed, navigate by wikilinks.
