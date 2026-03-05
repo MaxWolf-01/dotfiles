@@ -37,10 +37,12 @@ echo "" | tee -a "$run_log"
 # Process each playlist
 all_downloaded_titles=()
 failed_playlists=""
-error_unavailable=0
-error_copyright=0
-error_deleted=0
-error_other=0
+total_error_unavailable=0
+total_error_copyright=0
+total_error_deleted=0
+total_error_other=0
+total_errors_archived=0
+total_errors_lost=0
 
 while IFS='|' read -r url format name; do
     [ -z "$url" ] && continue
@@ -74,6 +76,12 @@ while IFS='|' read -r url format name; do
 
     # Parse log for downloaded videos and errors
     downloaded_titles=()
+    pl_error_unavailable=0
+    pl_error_copyright=0
+    pl_error_deleted=0
+    pl_error_other=0
+    pl_error_ids=()
+
     while IFS= read -r line; do
         # Extract downloaded video titles (look for [download] lines with actual downloads)
         if [[ "$line" =~ \[download\]\ Destination:\ (.+)\.(wav|mp4|webm|mkv)$ ]]; then
@@ -83,23 +91,50 @@ while IFS='|' read -r url format name; do
             downloaded_titles+=("$title")
         fi
 
+        # Extract video ID from error lines (11-char base64url, [youtube] extractor only)
+        if [[ "$line" =~ ERROR:.*\[youtube\]\ ([a-zA-Z0-9_-]{11}): ]]; then
+            pl_error_ids+=("${BASH_REMATCH[1]}")
+        fi
+
         # Count errors by type
         if [[ "$line" =~ ERROR:.*unavailable|not\ available ]]; then
-            ((error_unavailable++))
+            ((pl_error_unavailable++))
         elif [[ "$line" =~ ERROR:.*copyright\ claim ]]; then
-            ((error_copyright++))
+            ((pl_error_copyright++))
         elif [[ "$line" =~ ERROR:.*removed|deleted ]]; then
-            ((error_deleted++))
+            ((pl_error_deleted++))
         elif [[ "$line" =~ ^ERROR: ]]; then
-            ((error_other++))
+            ((pl_error_other++))
         fi
     done < "$log_file"
 
+    # Cross-reference error video IDs with archive.txt
+    pl_errors_archived=0
+    pl_errors_lost=0
+    for vid_id in "${pl_error_ids[@]}"; do
+        if grep -q "youtube $vid_id" "$playlist_dir/archive.txt" 2>/dev/null; then
+            ((pl_errors_archived++))
+        else
+            ((pl_errors_lost++))
+            # Append to persistent lost.txt (first-seen only, deduped by ID)
+            if ! grep -q "$vid_id" "$playlist_dir/lost.txt" 2>/dev/null; then
+                echo "$(date +%Y-%m-%d) $vid_id https://youtube.com/watch?v=$vid_id" >> "$playlist_dir/lost.txt"
+            fi
+        fi
+    done
+
     # Determine if this is a real failure
+    # yt-dlp exits 1 when any video is unavailable — that's expected, not a script failure.
+    # Only flag as failure when there are unexpected errors.
     is_failure=false
-    if [ $exit_code -ne 0 ] && [ ${#downloaded_titles[@]} -eq 0 ]; then
-        # Exit code 1 AND no downloads = real failure
-        is_failure=true
+    if [ $exit_code -ne 0 ]; then
+        pl_expected=$((pl_error_unavailable + pl_error_copyright + pl_error_deleted))
+        if [ $pl_error_other -gt 0 ]; then
+            is_failure=true
+        elif [ $pl_expected -eq 0 ] && [ ${#downloaded_titles[@]} -eq 0 ]; then
+            # Non-zero exit, no recognized errors, no downloads = unknown failure
+            is_failure=true
+        fi
     fi
 
     if [ "$is_failure" = true ]; then
@@ -112,7 +147,18 @@ while IFS='|' read -r url format name; do
         else
             echo "  No new videos" | tee -a "$run_log"
         fi
+        if [ ${#pl_error_ids[@]} -gt 0 ]; then
+            echo "  Errors: ${#pl_error_ids[@]} videos (${pl_errors_archived} archived, ${pl_errors_lost} never captured)" | tee -a "$run_log"
+        fi
     fi
+
+    # Accumulate into global counters
+    total_error_unavailable=$((total_error_unavailable + pl_error_unavailable))
+    total_error_copyright=$((total_error_copyright + pl_error_copyright))
+    total_error_deleted=$((total_error_deleted + pl_error_deleted))
+    total_error_other=$((total_error_other + pl_error_other))
+    total_errors_archived=$((total_errors_archived + pl_errors_archived))
+    total_errors_lost=$((total_errors_lost + pl_errors_lost))
 done < "$playlist_file"
 
 # Write summary to run log
@@ -124,13 +170,14 @@ if [ ${#all_downloaded_titles[@]} -gt 0 ]; then
     printf '  - %s\n' "${all_downloaded_titles[@]}" | tee -a "$run_log"
 fi
 
-error_count=$((error_unavailable + error_copyright + error_deleted + error_other))
+error_count=$((total_error_unavailable + total_error_copyright + total_error_deleted + total_error_other))
 if [ $error_count -gt 0 ]; then
     echo "Errors encountered:" | tee -a "$run_log"
-    [ $error_unavailable -gt 0 ] && echo "  - Unavailable: $error_unavailable" | tee -a "$run_log"
-    [ $error_copyright -gt 0 ] && echo "  - Copyright: $error_copyright" | tee -a "$run_log"
-    [ $error_deleted -gt 0 ] && echo "  - Deleted/Removed: $error_deleted" | tee -a "$run_log"
-    [ $error_other -gt 0 ] && echo "  - Other: $error_other" | tee -a "$run_log"
+    [ $total_error_unavailable -gt 0 ] && echo "  - Unavailable: $total_error_unavailable" | tee -a "$run_log"
+    [ $total_error_copyright -gt 0 ] && echo "  - Copyright: $total_error_copyright" | tee -a "$run_log"
+    [ $total_error_deleted -gt 0 ] && echo "  - Deleted/Removed: $total_error_deleted" | tee -a "$run_log"
+    [ $total_error_other -gt 0 ] && echo "  - Other: $total_error_other" | tee -a "$run_log"
+    echo "  Archive status: ${total_errors_archived} archived, ${total_errors_lost} never captured" | tee -a "$run_log"
 fi
 
 if [ -n "$failed_playlists" ]; then
@@ -154,11 +201,12 @@ if [ -n "$ntfy_topic" ]; then
     if [ $error_count -gt 0 ]; then
         msg+="\nErrors: "
         error_parts=()
-        [ $error_unavailable -gt 0 ] && error_parts+=("${error_unavailable} unavailable")
-        [ $error_copyright -gt 0 ] && error_parts+=("${error_copyright} copyright")
-        [ $error_deleted -gt 0 ] && error_parts+=("${error_deleted} deleted")
-        [ $error_other -gt 0 ] && error_parts+=("${error_other} other")
+        [ $total_error_unavailable -gt 0 ] && error_parts+=("${total_error_unavailable} unavailable")
+        [ $total_error_copyright -gt 0 ] && error_parts+=("${total_error_copyright} copyright")
+        [ $total_error_deleted -gt 0 ] && error_parts+=("${total_error_deleted} deleted")
+        [ $total_error_other -gt 0 ] && error_parts+=("${total_error_other} other")
         msg+=$(IFS=", "; echo "${error_parts[*]}")
+        msg+=" (${total_errors_archived} archived, ${total_errors_lost} never captured)"
     fi
 
     if [ -n "$failed_playlists" ]; then
@@ -167,17 +215,14 @@ if [ -n "$ntfy_topic" ]; then
 
     # Determine priority and title
     if [ -n "$failed_playlists" ]; then
-        # Real failures get warning priority
         title="YouTube Download - Failures"
         priority=3
         tags="youtube,warning"
     elif [ ${#all_downloaded_titles[@]} -gt 0 ]; then
-        # Downloads succeeded
         title="YouTube Download - ${#all_downloaded_titles[@]} New"
         priority=2
         tags="youtube,success"
     else
-        # Nothing new
         title="YouTube Download - Up to Date"
         priority=1
         tags="youtube,info"
