@@ -32,7 +32,7 @@
   hardware.graphics.enable = true;
 
   hardware.nvidia = {
-    open = true;
+    open = false; # MPS requires proprietary module (open module can't spawn MPS servers)
     nvidiaSettings = false;
     nvidiaPersistenced = true;
   };
