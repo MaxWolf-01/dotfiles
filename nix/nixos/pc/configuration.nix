@@ -63,6 +63,13 @@
 
   hardware.nvidia-container-toolkit.enable = true;
 
+  # PO token server for yt-dlp (anti-bot verification for YouTube)
+  virtualisation.oci-containers.containers.bgutil-pot = {
+    image = "brainicism/bgutil-ytdlp-pot-provider:latest";
+    ports = [ "127.0.0.1:4416:4416" ];
+    autoStart = true;
+  };
+
   # ZFS maintenance (pool on HDDs, auto-imported)
   services.zfs = {
     autoScrub.enable = true;

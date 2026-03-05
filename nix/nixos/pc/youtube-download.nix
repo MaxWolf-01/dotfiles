@@ -5,9 +5,16 @@ let
   secrets = "${dotfiles}/secrets";
   cookieFile = "/home/max/.local/secrets/youtube-cookies.txt";
 
-  ytPath = lib.makeBinPath (with pkgs; [
-    bash coreutils gnused gnugrep yt-dlp ffmpeg curl
-  ]);
+  # yt-dlp with bgutil PO token plugin (anti-bot verification)
+  bgutilPlugin = pkgs.python3Packages.bgutil-ytdlp-pot-provider;
+  yt-dlp-wrapped = pkgs.writeShellScriptBin "yt-dlp" ''
+    exec ${pkgs.yt-dlp}/bin/yt-dlp --plugin-dirs ${bgutilPlugin}/${pkgs.python3.sitePackages} "$@"
+  '';
+
+  ytPath = lib.makeBinPath [
+    yt-dlp-wrapped
+    pkgs.bash pkgs.coreutils pkgs.gnused pkgs.gnugrep pkgs.ffmpeg pkgs.curl
+  ];
 in
 {
   systemd.tmpfiles.rules = [
