@@ -119,6 +119,12 @@
   systemd.services.systemd-udev-settle.serviceConfig.ExecStart = [ "" "${pkgs.coreutils}/bin/true" ];
 
   # Temporary boot diagnostics — remove after debugging headless boot hang
+  boot.initrd.postMountCommands = ''
+    echo "INITRD-ROOT-MOUNTED $(date -Iseconds 2>/dev/null || date)" >> /mnt-root/var/log/boot-diag.log
+  '';
+  boot.postBootCommands = ''
+    echo "STAGE2-PRE-SYSTEMD $(date -Iseconds)" >> /var/log/boot-diag.log
+  '';
   systemd.services.boot-diag-pre = {
     description = "Boot diag: before module loading";
     unitConfig.DefaultDependencies = false;
