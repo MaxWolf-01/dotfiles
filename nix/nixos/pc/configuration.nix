@@ -35,6 +35,7 @@
     open = true;
     nvidiaSettings = false;
     nvidiaPersistenced = true;
+    modesetting.enable = false;
   };
 
   # NVIDIA MPS — concurrent GPU sharing across containers
