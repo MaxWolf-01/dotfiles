@@ -159,7 +159,7 @@ mx vault:add name ~/path/to/dir                        # create or extend a vaul
 Permissions: Understanding this will allow you to go faster (when it's time to implement, experiment, or gather information).
 - Read-only commands are auto-approved in ~/.claude/settings.json.
 - For `gh api`: Always use `-X GET` explicitly (e.g., `gh api -X GET repos/owner/repo`) — this is the only form that's auto-approved. POST/PUT/DELETE will prompt.
-- For `ssh` commands: Don't quote the remote command. `ssh host ls /path` matches the allowlist glob `ssh * ls *`; `ssh host "ls /path"` doesn't (quotes collapse it into one argument).
+- For `ssh` commands: **NEVER quote the remote command** unless actually needed (spaces/metacharacters in arguments). Quotes are literal in the command string — `ssh host "cmd arg"` doesn't match the glob `ssh * cmd *` because `"cmd arg"` is one token. Always `ssh host cmd arg`.
 - ALWAYS prefer `fd` over `find` — unless it is not powerful enough, e.g. you actually want to delete something — fd is read-only by design (no -delete, no -exec), so I'm not prompted for giving you permission.
 
 If you find a tool that would help you accomplish your task more efficiently / effectively isn't installed, you have several options:
