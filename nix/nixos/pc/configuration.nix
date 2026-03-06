@@ -118,5 +118,44 @@
   # Disable deprecated udev-settle (times out waiting for NVIDIA/ZFS events, nothing needs it)
   systemd.services.systemd-udev-settle.serviceConfig.ExecStart = [ "" "${pkgs.coreutils}/bin/true" ];
 
+  # Temporary boot diagnostics — remove after debugging headless boot hang
+  systemd.services.boot-diag-pre = {
+    description = "Boot diag: before module loading";
+    unitConfig.DefaultDependencies = false;
+    after = [ "local-fs.target" ];
+    before = [ "systemd-modules-load.service" ];
+    wantedBy = [ "sysinit.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = pkgs.writeShellScript "boot-diag-pre" ''
+        echo "PRE-MODULES $(date -Iseconds)" >> /var/log/boot-diag.log
+      '';
+    };
+  };
+  systemd.services.boot-diag-post = {
+    description = "Boot diag: after module loading";
+    unitConfig.DefaultDependencies = false;
+    after = [ "systemd-modules-load.service" "local-fs.target" ];
+    wantedBy = [ "sysinit.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = pkgs.writeShellScript "boot-diag-post" ''
+        echo "POST-MODULES $(date -Iseconds)" >> /var/log/boot-diag.log
+      '';
+    };
+  };
+  systemd.services.boot-diag-net = {
+    description = "Boot diag: network up";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = pkgs.writeShellScript "boot-diag-net" ''
+        echo "NETWORK-UP $(date -Iseconds)" >> /var/log/boot-diag.log
+      '';
+    };
+  };
+
   system.stateVersion = "26.05";
 }
