@@ -1,16 +1,50 @@
 { pkgs, ... }:
+let
+  tmux = "${pkgs.tmux}/bin/tmux";
+  tms = pkgs.writeShellScriptBin "tms" ''
+    if [ -z "$1" ]; then
+      echo "Usage: tms <session-name>"
+      exit 1
+    fi
+
+    # If no tmux server is running, restore saved sessions first
+    if ! ${tmux} list-sessions &>/dev/null; then
+      last="$HOME/.tmux/resurrect/last"
+      if [ -L "$last" ] && [ -f "$last" ]; then
+        # Start a temporary server, run restore synchronously, then clean up
+        ${tmux} new-session -d -s __restore__ -x "$(${pkgs.ncurses}/bin/tput cols)" -y "$(${pkgs.ncurses}/bin/tput lines)"
+        restore_script=$(${tmux} show-options -gqv @resurrect-restore-script-path 2>/dev/null)
+        if [ -x "$restore_script" ]; then
+          "$restore_script" 2>/dev/null
+          ${tmux} kill-session -t __restore__ 2>/dev/null
+        fi
+      fi
+    fi
+
+    ${tmux} new-session -A -s "$1"
+  '';
+in
 {
   # Systemd timer for tmux session auto-save (more reliable than continuum)
   systemd.user.services.tmux-resurrect-save = {
     Unit.Description = "Save tmux sessions";
     Service = {
       Type = "oneshot";
+      Environment = [ "TMUX_TMPDIR=%t" ];
       ExecStart = toString (pkgs.writeShellScript "tmux-save" ''
-        # Only save if tmux server is running
-        ${pkgs.tmux}/bin/tmux list-sessions &>/dev/null || exit 0
-        # Get the save script path from tmux and run it
-        save_script=$(${pkgs.tmux}/bin/tmux show-options -gqv @resurrect-save-script-path)
-        [ -x "$save_script" ] && ${pkgs.tmux}/bin/tmux run-shell "$save_script"
+        ${tmux} list-sessions &>/dev/null || exit 0
+
+        resurrect_dir="$HOME/.tmux/resurrect"
+
+        # Rotate pane_contents.tar.gz before save
+        pane_archive="$resurrect_dir/pane_contents.tar.gz"
+        if [ -f "$pane_archive" ]; then
+          ${pkgs.coreutils}/bin/cp "$pane_archive" "$resurrect_dir/pane_contents_$(${pkgs.coreutils}/bin/date +%Y%m%dT%H%M%S).tar.gz"
+          ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/pane_contents_*.tar.gz 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +501 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
+        fi
+
+        save_script=$(${tmux} show-options -gqv @resurrect-save-script-path)
+        [ -x "$save_script" ] && "$save_script" quiet 2>/dev/null
       '');
     };
   };
@@ -22,6 +56,8 @@
     };
     Install.WantedBy = [ "timers.target" ];
   };
+
+  home.packages = [ tms ];
 
   programs.tmux = {
     enable = true;
@@ -46,14 +82,6 @@
         extraConfig = ''
           set -g @resurrect-capture-pane-contents 'on'
           set -g @resurrect-strategy-nvim 'session'
-        '';
-      }
-      {
-        plugin = continuum;
-        extraConfig = ''
-          set -g @continuum-restore 'on'
-          set -g @continuum-save-interval '1'
-          set -g @continuum-save-last-timestamp '0'
         '';
       }
     ];
@@ -81,7 +109,7 @@
 
       # Vi copy mode bindings
       bind -T copy-mode-vi v send -X begin-selection
-      bind -T copy-mode-vi y send -X copy-pipe-and-cancel "xclip -selection clipboard -i"
+      bind -T copy-mode-vi y send -X copy-pipe "xclip -selection clipboard -i"
       bind -T copy-mode-vi C-v send -X rectangle-toggle
       bind -T copy-mode-vi Escape send -X cancel
 
