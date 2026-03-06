@@ -2,8 +2,8 @@
 let
   tmux = "${pkgs.tmux}/bin/tmux";
   tms = pkgs.writeShellScriptBin "tms" ''
-    if [ -z "$1" ]; then
-      echo "Usage: tms <session-name>"
+    if [ -z "$1" ] || [ "$1" = "0" ]; then
+      echo "Usage: tms <session-name> (name '0' is reserved)"
       exit 1
     fi
 
@@ -11,17 +11,18 @@ let
     if ! ${tmux} list-sessions &>/dev/null; then
       last="$HOME/.tmux/resurrect/last"
       if [ -L "$last" ] && [ -f "$last" ]; then
-        # Start a temporary server, run restore synchronously, then clean up
-        ${tmux} new-session -d -s __restore__ -x "$(${pkgs.ncurses}/bin/tput cols)" -y "$(${pkgs.ncurses}/bin/tput lines)"
+        # Session "0" required — restore.sh's handle_session_0() kills it after restore
+        ${tmux} new-session -d -s 0 -x "$(${pkgs.ncurses}/bin/tput cols)" -y "$(${pkgs.ncurses}/bin/tput lines)"
         restore_script=$(${tmux} show-options -gqv @resurrect-restore-script-path 2>/dev/null)
-        if [ -x "$restore_script" ]; then
-          "$restore_script" 2>/dev/null
-          ${tmux} kill-session -t __restore__ 2>/dev/null
-        fi
+        [ -x "$restore_script" ] && ${tmux} run-shell -t 0:0.0 "$restore_script"
+        ${tmux} set-environment TMS_READY 1
+        exec ${tmux} new-session -A -s "$1"
       fi
     fi
 
-    ${tmux} new-session -A -s "$1"
+    # Server already running — ensure flag is set (e.g. first tms after manual tmux start)
+    ${tmux} show-environment TMS_READY &>/dev/null || ${tmux} set-environment TMS_READY 1
+    exec ${tmux} new-session -A -s "$1"
   '';
 in
 {
@@ -33,6 +34,9 @@ in
       Environment = [ "TMUX_TMPDIR=%t" ];
       ExecStart = toString (pkgs.writeShellScript "tmux-save" ''
         ${tmux} list-sessions &>/dev/null || exit 0
+
+        # Only save after tms has run restore (env var set by tms, dies with server)
+        ${tmux} show-environment TMS_READY &>/dev/null || exit 0
 
         resurrect_dir="$HOME/.tmux/resurrect"
 
