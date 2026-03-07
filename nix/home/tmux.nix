@@ -125,6 +125,7 @@ in
 
       # New window in current directory
       bind c new-window -c "#{pane_current_path}"
+      bind -n C-S-t new-window -c "#{pane_current_path}"
 
       # Session switching with fzf
       bind f display-popup -E "tmux list-sessions -F '#{session_name}' | fzf --reverse | xargs -r tmux switch-client -t"

@@ -17,6 +17,10 @@
       ];
     };
 
+    "org/gnome/desktop/default-applications/terminal" = {
+      exec = "ghostty";
+    };
+
     "org/gnome/desktop/input-sources" = {
       sources = [ (lib.hm.gvariant.mkTuple [ "xkb" "de+nodeadkeys" ]) ];
     };
