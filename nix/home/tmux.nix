@@ -113,7 +113,7 @@ in
 
       # Vi copy mode bindings
       bind -T copy-mode-vi v send -X begin-selection
-      bind -T copy-mode-vi y send -X copy-pipe "xclip -selection clipboard -i"
+      bind -T copy-mode-vi y send -X copy-pipe "wl-copy"
       bind -T copy-mode-vi C-v send -X rectangle-toggle
       bind -T copy-mode-vi Escape send -X cancel
 
