@@ -56,6 +56,7 @@
       sleep-inactive-ac-timeout = lib.hm.gvariant.mkUint32 0;
       sleep-inactive-battery-timeout = lib.hm.gvariant.mkUint32 3600;
       idle-dim = false;
+      power-button-action = "interactive";
     };
 
     # Window management keybindings
@@ -107,10 +108,6 @@
       name = "Toggle nightlight";
       command = "toggle_nightlight";
       binding = "<Primary><Super>n";
-    };
-
-    "org/gnome/settings-daemon/plugins/power" = {
-      power-button-action = "interactive";
     };
 
     "org/freedesktop/ibus/panel/emoji" = {
