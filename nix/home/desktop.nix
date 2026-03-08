@@ -23,6 +23,8 @@ in
     zathura
   ];
 
+  xdg.configFile."xdg-terminals.list".text = "com.mitchellh.ghostty.desktop\n";
+
   xdg.desktopEntries.vesktop = {
     name = "Vesktop";
     genericName = "Discord Client";
