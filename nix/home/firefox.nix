@@ -1,11 +1,14 @@
-{ ... }:
+{ config, ... }:
+let
+  firefoxBin = "${config.home.homeDirectory}/.nix-profile/bin/firefox";
+in
 {
   home.file.".config/firejail/firefox.local".source = ../../firejail/firefox.local;
 
   xdg.desktopEntries.firefox = {
     name = "Firefox";
     genericName = "Web Browser";
-    exec = "firejail firefox %u";
+    exec = "/usr/bin/firejail ${firefoxBin} %u";
     icon = "firefox";
     type = "Application";
     categories = [ "Network" "WebBrowser" ];
