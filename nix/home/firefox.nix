@@ -1,5 +1,24 @@
 { ... }:
 {
+  home.file.".config/firejail/firefox.local".source = ../../firejail/firefox.local;
+
+  xdg.desktopEntries.firefox = {
+    name = "Firefox";
+    genericName = "Web Browser";
+    exec = "firejail firefox %u";
+    icon = "firefox";
+    type = "Application";
+    categories = [ "Network" "WebBrowser" ];
+    mimeType = [
+      "text/html"
+      "x-scheme-handler/http"
+      "x-scheme-handler/https"
+      "application/xhtml+xml"
+      "application/pdf"
+    ];
+    terminal = false;
+  };
+
   programs.firefox = {
     enable = true;
 
