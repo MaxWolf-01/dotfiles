@@ -39,32 +39,45 @@ dotfiles
 
 ## Setup (Ubuntu)
 
+### Fresh install (LUKS + LVM)
+
+Boot a live USB, then:
+
+```bash
+sudo apt-get install -y debootstrap gdisk
+curl -sLO https://raw.githubusercontent.com/MaxWolf-01/dotfiles/master/bin/ubuntu-install
+chmod +x ubuntu-install && sudo ./ubuntu-install /dev/nvmeXnY --root 200
+```
+
+Reboot, remove USB.
+
+### Post-install
+
 ```bash
 sudo apt-get update && sudo apt-get install -y git
 git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles && ./setup minimal
 ```
 
-Restart shell, then set host (auto-runs first HM switch):
+Restart shell, then:
 
 ```bash
-./setup host zephyrus
-gh auth login -w
-```
-
-After first run, use `hmswitch` to apply changes.
-
-Place your age key at `~/.local/secrets/age-key.txt` (copy from another machine or backup), then:
-```bash
-./setup secrets
-./setup ubuntu
+./setup host zephyrus          # sets NIX_HOST, runs first HM switch
+./setup ubuntu                 # NVIDIA drivers, codecs, cleanup
+sudo reboot
+./setup gpu                    # nix GPU driver symlinks
 ./setup get_claude
+gh auth login -w
+./setup secrets                # clones private secrets repo, decrypts
+restore-working                # restore data from rsync.net backup
 ```
+
+After first run, use `hmswitch` to apply HM changes.
 
 All `./setup` functions are idempotent — safe to re-run.
 
 <details>
-<summary>Other common setup functions for the daily driver</summary>
+<summary>Other setup functions</summary>
 
 ```bash
 ./setup docker
