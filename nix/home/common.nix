@@ -6,6 +6,11 @@
 
   programs.home-manager.enable = true;
 
+  nix.gc = {
+    automatic = true;
+    options = "--delete-older-than 30d";
+  };
+
   # Non-NixOS: add ~/.nix-profile/share to XDG_DATA_DIRS so GNOME finds desktop entries
   targets.genericLinux.enable = lib.mkDefault true;
 

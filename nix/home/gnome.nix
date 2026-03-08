@@ -44,12 +44,18 @@
     };
 
     "org/gnome/desktop/session" = {
-      idle-delay = 3600;
+      idle-delay = lib.hm.gvariant.mkUint32 3600;
     };
 
     "org/gnome/desktop/screensaver" = {
       lock-enabled = true;
-      lock-delay = 7200;
+      lock-delay = lib.hm.gvariant.mkUint32 7200;
+    };
+
+    "org/gnome/settings-daemon/plugins/power" = {
+      sleep-inactive-ac-timeout = lib.hm.gvariant.mkUint32 0;
+      sleep-inactive-battery-timeout = lib.hm.gvariant.mkUint32 3600;
+      idle-dim = false;
     };
 
     # Window management keybindings
@@ -105,6 +111,12 @@
 
     "org/gnome/settings-daemon/plugins/power" = {
       power-button-action = "interactive";
+    };
+
+    "org/freedesktop/ibus/panel/emoji" = {
+      hotkey = [ "" ];
+      unicode-hotkey = [ "" ];
+      load-emoji-at-startup = false;
     };
 
     # Tiling Shell extension
