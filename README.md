@@ -66,10 +66,10 @@ Restart shell, then:
 ./setup ubuntu                 # NVIDIA drivers, codecs, cleanup
 sudo reboot
 ./setup gpu                    # nix GPU driver symlinks
-./setup get_claude
 gh auth login -w
-./setup secrets                # clones private secrets repo, decrypts
+./setup secrets                # clones secrets repo, decrypts SSH key + secrets
 restore-working                # restore data from rsync.net backup
+./setup get_claude             # after restore to avoid .claude/ conflicts
 ```
 
 After first run, use `hmswitch` to apply HM changes.
