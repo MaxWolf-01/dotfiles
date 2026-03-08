@@ -5,7 +5,7 @@
   xdg.desktopEntries.firefox = {
     name = "Firefox";
     genericName = "Web Browser";
-    exec = "firejail firefox %u";
+    exec = "sh -c 'if command -v firejail >/dev/null; then firejail firefox %u; else firefox %u; fi'";
     icon = "firefox";
     type = "Application";
     categories = [ "Network" "WebBrowser" ];
