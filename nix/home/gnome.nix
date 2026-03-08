@@ -10,6 +10,24 @@
       "${config.home.homeDirectory}/.nix-profile/share/gnome-shell/extensions/tilingshell@ferrarodomenico.com";
 
   dconf.settings = {
+    "org/gnome/shell/keybindings" = {
+      screenshot = [ "<Shift><Alt>s" ];
+      screenshot-window = [ "<Shift><Super>s" ];
+      show-screenshot-ui = [ "<Primary><Shift><Alt>s" ];
+      toggle-message-tray = [ "<Super>n" ];
+      toggle-overview = [];
+      # Free Super+N for workspace switching (handled in wm/keybindings)
+      switch-to-application-1 = [];
+      switch-to-application-2 = [];
+      switch-to-application-3 = [];
+      switch-to-application-4 = [];
+      switch-to-application-5 = [];
+      switch-to-application-6 = [];
+      switch-to-application-7 = [];
+      switch-to-application-8 = [];
+      switch-to-application-9 = [];
+    };
+
     "org/gnome/shell" = {
       enabled-extensions = [
         "tilingshell@ferrarodomenico.com"

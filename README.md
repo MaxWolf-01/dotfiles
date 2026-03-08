@@ -12,16 +12,17 @@ Managed via [Nix Home Manager](https://github.com/nix-community/home-manager) �
 dotfiles
 ├── backup        # restic/rsync backup scripts (ntfy notifications)
 ├── bin           # custom scripts
-├── desktop       # desktop shortcuts, icons, discord theme
+├── desktop       # icons, discord theme
 ├── nix
 │   ├── home
 │   │   ├── common.nix     # CLI tools, git, zsh plugins (all hosts)
 │   │   ├── desktop.nix    # GUI apps (workstations)
-│   │   ├── gnome.nix      # GNOME extensions, dconf
+│   │   ├── firefox.nix    # Firefox config, policies, search engines
+│   │   ├── gnome.nix      # GNOME keybindings, extensions, dconf
 │   │   ├── tmux.nix       # tmux config + resurrect
 │   │   ├── timers.nix     # systemd timers (zephyrus)
 │   │   ├── pc-timers.nix  # backup/sync timers (pc)
-│   │   ├── x11.nix / wayland.nix
+│   │   ├── wayland.nix
 │   │   └── hosts/         # per-machine: imports + stateVersion
 │   └── nixos/             # NixOS system configs
 ├── nvim          # neovim config (lazy.nvim)
@@ -44,11 +45,10 @@ git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
 cd ~/.dotfiles && ./setup minimal
 ```
 
-Restart shell, then set host and run Home Manager:
+Restart shell, then set host (auto-runs first HM switch):
 
 ```bash
 ./setup host zephyrus
-nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST
 gh auth login -w
 ```
 
@@ -70,7 +70,6 @@ All `./setup` functions are idempotent — safe to re-run.
 ./setup docker
 ./setup nvidia_container_toolkit
 ./setup get_vibetyper
-./setup tiling_shell
 ```
 </details>
 
