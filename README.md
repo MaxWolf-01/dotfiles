@@ -44,9 +44,9 @@ dotfiles
 Boot a live USB, then:
 
 ```bash
-sudo apt-get install -y debootstrap gdisk
+sudo apt-get install -y debootstrap gdisk curl
 curl -sLO https://raw.githubusercontent.com/MaxWolf-01/dotfiles/master/bin/ubuntu-install
-chmod +x ubuntu-install && sudo ./ubuntu-install /dev/nvmeXnY --root 200
+chmod +x ubuntu-install && sudo ./ubuntu-install
 ```
 
 Reboot, remove USB.
