@@ -11,8 +11,6 @@ in
 
   home.file.".icons".source = ../../desktop/icons;
 
-  home.file.".config/newsboat/urls".source =
-    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/newsboat/urls";
 
   home.packages = with pkgs; [
     alacritty
