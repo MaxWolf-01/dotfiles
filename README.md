@@ -44,10 +44,31 @@ dotfiles
 Boot a live USB, then:
 
 ```bash
-sudo apt-get install -y debootstrap gdisk curl
+sudo apt-get install -y curl debootstrap gdisk
 curl -sLO https://raw.githubusercontent.com/MaxWolf-01/dotfiles/master/bin/ubuntu-install
-chmod +x ubuntu-install && sudo ./ubuntu-install
+sudo bash ubuntu-install
 ```
+
+<details>
+<summary>If apt doesn't work (pre-release ISO)</summary>
+
+```bash
+curl -Lo /tmp/debootstrap.deb http://archive.ubuntu.com/ubuntu/pool/main/d/debootstrap/debootstrap_1.0.142ubuntu1_all.deb
+curl -Lo /tmp/gdisk.deb http://archive.ubuntu.com/ubuntu/pool/main/g/gdisk/gdisk_1.0.10-2build1_amd64.deb
+sudo dpkg -i /tmp/debootstrap.deb /tmp/gdisk.deb
+curl -sLO https://raw.githubusercontent.com/MaxWolf-01/dotfiles/master/bin/ubuntu-install
+sudo bash ubuntu-install
+```
+</details>
+
+<details>
+<summary>CLI pastebin (send text between machines without login/git)</summary>
+
+```bash
+echo "commands here" | curl --data-binary @- https://paste.rs
+cat script.sh | curl --data-binary @- https://paste.rs
+```
+</details>
 
 Reboot, remove USB.
 
