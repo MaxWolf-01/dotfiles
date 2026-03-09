@@ -77,14 +77,13 @@ Reboot, remove USB.
 ```bash
 sudo apt-get update && sudo apt-get install -y git
 git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-cd ~/.dotfiles && ./setup minimal
+cd ~/.dotfiles && ./setup host zephyrus   # dirs, symlinks, nix, HM switch
 ```
 
-Restart shell, then:
+Restart shell (nix needs it on first install), then re-run `./setup host zephyrus`.
 
 ```bash
-./setup host zephyrus          # sets NIX_HOST, runs first HM switch
-./setup ubuntu                 # NVIDIA drivers, codecs, cleanup
+./setup ubuntu                 # NVIDIA drivers, codecs, btop, cleanup
 sudo reboot
 ./setup gpu                    # nix GPU driver symlinks
 gh auth login -w
