@@ -41,6 +41,8 @@ in
         EmailTracking = true;
       };
 
+      PasswordManagerEnabled = false;
+
       GenerativeAI = {
         Chatbot = false;
         LinkPreviews = false;
