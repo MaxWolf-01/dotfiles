@@ -26,10 +26,18 @@ Two `claude`-related directories exist in this repo — don't confuse them:
 - `claude/` — source of truth for **global** `~/.claude/` config. Symlinked: `~/.claude/settings.json` → `~/.dotfiles/claude/settings.json`. Edits here apply globally across all projects.
 - `~/repos/github/MaxWolf-01/agents` — agent config: plugins, skills, commands, prompts. The `mx` plugin lives there.
 
-## Scripts
+## Scripts (`bin/`)
 
-- When writing scripts (especially ones run by systemd timers or cron): include informative error messages. Print what failed, why, and what to check. Don't silently fail - these run unattended and failures need to be easy to debug after the fact.
-- When writing cli script in python, use tyro for argument parsing, use tyro's features to document the script, so everything is documented with --help, without reading source code (e.g you can do description=__doc__ in tyro.cli()).
+`bin/` contains standalone scripts on `$PATH` (`~/bin`). These are available everywhere — interactive shells, Claude Code, cron, systemd timers, ssh. Prefer scripts over shell functions for anything that doesn't need to modify the current shell's state (cd, export, source, etc.).
+
+Existing scripts include `tre` (gitignore-aware tree), `extract` (universal archive extractor), `clip` (clipboard, X11/Wayland-aware), `fext` (disk usage by extension), and `restic-*` helpers (restic-diff, restic-snaps, restic-lsfs, restic-ls-recent, restic-ls-all, restic-current). If a common operation is needed repeatedly, add a new script here.
+
+Shell functions that need to affect the current shell (cd, set, source, disown) stay in `zsh/functions`.
+
+Guidelines:
+- Include a shebang (`#!/usr/bin/env bash` or `#!/usr/bin/env zsh` if zsh features are needed)
+- Include informative error messages — especially for unattended scripts (timers, cron). Print what failed, why, and what to check.
+- Python CLIs: use tyro (load `/mx:tyro-cli` skill first).
 
 ## Tmux
 
