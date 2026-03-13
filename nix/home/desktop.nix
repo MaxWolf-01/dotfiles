@@ -3,13 +3,25 @@ let
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
 in
 {
-  home.file.".config/vesktop/themes/custom.theme.css".source =
-    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
-
   imports = [ ./firefox.nix ./ghostty.nix ./newsboat.nix ];
 
   home.file.".icons".source = ../../desktop/icons;
 
+  programs.vesktop = {
+    enable = true;
+    settings = {
+      discordBranch = "stable";
+      minimizeToTray = true;
+      arRPC = false;
+      hardwareAcceleration = true;
+      splashColor = "rgb(220, 220, 223)";
+      splashBackground = "rgba(0, 0, 0, 0)";
+      splashTheming = true;
+      spellCheckLanguages = [ "en-US" "en" ];
+    };
+    vencord.themes."custom.theme" =
+      config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
+  };
 
   home.packages = with pkgs; [
     dconf2nix
@@ -17,7 +29,6 @@ in
     obsidian
     qdirstat
     signal-desktop
-    vesktop
     zathura
   ];
 
@@ -26,7 +37,7 @@ in
   xdg.desktopEntries.vesktop = {
     name = "Vesktop";
     genericName = "Discord Client";
-    exec = "vesktop %U";
+    exec = "vesktop --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist %U";
     icon = toString ../../desktop/icons/vesktop.svg;
     type = "Application";
     categories = [ "Network" "InstantMessaging" ];
