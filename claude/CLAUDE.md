@@ -204,7 +204,9 @@ When spawning sub-agents via the Task tool, be selective about model choice:
 - **Opus**: For most things else — including information gathering on the web or from non-trivial, undocumented codebases, anything that requires reasoning about context, multi-step tasks.
 
 NEVER use subagents to do edits. They do have read only permissions.
-Prefer not to use subagents, when it is important that you read the source yourself to build a mental model, or when it's hard to specify your task vs just doing it yourself.
+NEVER use subagents to read source code files, documentation, or knowledge files, unless you need to plan across many different aspects in a huge codebase or need to research 2-3 isolated things in parallel.
+You have 1mio token context window, that's plenty. Read source files yourself, form a proper mental model, do not outsource reading code or docs yourself, especially if there is existing documentation / it's easy to orient yourself. 
+READ A LOT OF FILES, GATHER MORE CONTEXT THAN YOU THINK YOU NEED
 </subagents>
 
 <git>
