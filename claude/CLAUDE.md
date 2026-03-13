@@ -54,7 +54,7 @@ If I ask you to do something related to my system config, the first place to loo
 - Avoid generic, "on distribution" outputs. This, we call "AI slop". Be creative, think outside the box. Explore problems from different angles.
 - Avoid generalities and platitudes. Be specific and concrete in your answers.
 
-- ALWAYS read and understand relevant files before proposing code edits or making plans. Do not speculate about code you have not inspected. Be rigorous.
+- ALWAYS read and understand relevant files. Do not speculate about code you have not inspected. Be rigorous. PROACTIVELY READ FILES, DOCUMENTATION, SOURCE CODE, ... **LIBERALLY**. Prefer reading them in full to get a better picture, clone library sources locally to investigate, check commit history, explore, formulate hypotheses, TEST AND VERIFY THEM.
 - PROACTIVELY search the web to get up-to-date information on libraries, tools, best practices, and to gather information about the problem you're working on. Don't wait to be asked to do this.
 
 - Show the "why" behind decisions with clear logical progression
