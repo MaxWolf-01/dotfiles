@@ -111,6 +111,7 @@ better work.
   - Independent commands → parallel tool calls. Dependent commands → sequential tool calls.
   - Chains are okay only when functionally necessary or when splitting would be significantly more costly. If you find yourself needing the same chain repeatedly, write a script.
 
+- Don't use worktrees, use fresh checkouts. For short-lived, ephemeral work like quick patches or exploring a repo, simply clone it to /tmp (you have full Read/Write permissions there).
 </anti-patterns>
 
 <tools>
@@ -203,6 +204,7 @@ When spawning sub-agents via the Task tool, be selective about model choice:
 - **Opus**: For most things else — including information gathering on the web or from non-trivial, undocumented codebases, anything that requires reasoning about context, multi-step tasks.
 
 NEVER use subagents to do edits. They do have read only permissions.
+Prefer not to use subagents, when it is important that you read the source yourself to build a mental model, or when it's hard to specify your task vs just doing it yourself.
 </subagents>
 
 <git>
