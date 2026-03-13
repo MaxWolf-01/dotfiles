@@ -83,6 +83,7 @@ cd ~/.dotfiles && ./setup host zephyrus   # dirs, symlinks, nix, HM switch
 Restart shell (nix needs it on first install), then re-run `./setup host zephyrus`.
 
 ```bash
+systemctl --user disable --now working-rsyncnet.timer working-pc.timer # don't accidentally overwrite backups 
 ./setup ubuntu                 # NVIDIA drivers, codecs, btop, cleanup
 sudo reboot
 ./setup gpu                    # nix GPU driver symlinks
@@ -90,6 +91,7 @@ gh auth login -w
 ./setup secrets                # clones secrets repo, decrypts SSH key + secrets
 restore-working                # restore data from rsync.net backup
 ./setup get_claude             # after restore to avoid .claude/ conflicts
+systemctl --user enable --now working-rsyncnet.timer working-pc.timer # re-enable backups
 ```
 
 After first run, use `hmswitch` to apply HM changes.
