@@ -216,3 +216,5 @@ READ A LOT OF FILES, GATHER MORE CONTEXT THAN YOU THINK YOU NEED
   - Before history-rewriting (amend, rebase), check if the commit was pushed. When in doubt, make a new commit instead.
 </git>
 
+The webfetch tool always slop-summarizes sites for you... use curl if you want raw content.
+
