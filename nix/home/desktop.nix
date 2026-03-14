@@ -3,34 +3,75 @@ let
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
 in
 {
-  # TODO: make pure once theme works on Ubuntu 26
-  home.file.".config/vesktop/themes/custom.theme.css".source =
-    config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
-
-  imports = [ ./kitty.nix ./newsboat.nix ]; # TODO(ubuntu-26): switch to ./ghostty.nix
+  imports = [ ./firefox.nix ./ghostty.nix ./newsboat.nix ];
 
   home.file.".icons".source = ../../desktop/icons;
 
+  programs.vesktop = {
+    enable = true;
+    settings = {
+      discordBranch = "stable";
+      minimizeToTray = true;
+      arRPC = false;
+      hardwareAcceleration = true;
+      splashColor = "rgb(220, 220, 223)";
+      splashBackground = "rgba(0, 0, 0, 0)";
+      splashTheming = true;
+      spellCheckLanguages = [ "en-US" "en" ];
+    };
+    vencord.themes."custom.theme" =
+      config.lib.file.mkOutOfStoreSymlink "${dotfiles}/desktop/discord/themes/custom.theme.css";
+  };
 
   home.packages = with pkgs; [
-    alacritty
+    dconf2nix
     loupe
-    gedit # TODO(ubuntu-26): remove, workaround for GTK conflicts
-    nautilus # TODO(ubuntu-26): remove, workaround for GTK conflicts
-    nemo # TODO(ubuntu-26): remove, workaround for GTK conflicts
+    obsidian
+    qdirstat
     signal-desktop
-    vesktop
-    yaru-theme # TODO(ubuntu-26): remove, workaround for GTK conflicts
     zathura
   ];
+
+  xdg.configFile."xdg-terminals.list".text = "com.mitchellh.ghostty.desktop\n";
 
   xdg.desktopEntries.vesktop = {
     name = "Vesktop";
     genericName = "Discord Client";
-    exec = "vesktop %U";
+    exec = "vesktop --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist %U";
     icon = toString ../../desktop/icons/vesktop.svg;
     type = "Application";
     categories = [ "Network" "InstantMessaging" ];
     terminal = false;
+  };
+
+  xdg.desktopEntries.nvim = {
+    name = "Neovim";
+    comment = "Edit files with Neovim";
+    exec = "nvim %F";
+    icon = toString ../../desktop/icons/nvim.svg;
+    type = "Application";
+    categories = [ "Utility" "Development" "TextEditor" ];
+    mimeType = [ "text/markdown" "text/plain" ];
+    terminal = true;
+    settings.Path = "${config.home.homeDirectory}/Downloads";
+  };
+
+  xdg.mimeApps = {
+    enable = true;
+    defaultApplications = {
+      "text/plain" = "nvim.desktop";
+      "text/markdown" = "nvim.desktop";
+      "text/x-python" = "nvim.desktop";
+      "text/x-shellscript" = "nvim.desktop";
+      "text/x-yaml" = "nvim.desktop";
+      "text/x-toml" = "nvim.desktop";
+      "application/json" = "nvim.desktop";
+      "application/javascript" = "nvim.desktop";
+      "application/x-shellscript" = "nvim.desktop";
+      "x-scheme-handler/obsidian" = "obsidian.desktop";
+      "text/html" = "firefox.desktop";
+      "x-scheme-handler/http" = "firefox.desktop";
+      "x-scheme-handler/https" = "firefox.desktop";
+    };
   };
 }

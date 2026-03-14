@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# Ubuntu debootstrap installer — LUKS + LVM + EFI
+#
+# Two-layer design:
+#   Layer 1 (interactive): disk selection + partitioning + LUKS + LVM
+#   Layer 2 (automated):   debootstrap + chroot config + GRUB
+#
+# Run from a live USB environment (Ubuntu installer or any live Linux).
+# Requires: debootstrap, sgdisk, cryptsetup, lvm2
+#
+# Arguments:
+#   DISK          target disk (e.g. /dev/nvme0n1). Prompted if omitted.
+#   --root GB     root partition size in GB (required)
+#
+# From a live USB:
+#   sudo apt-get install -y debootstrap gdisk
+#   curl -sLO https://raw.githubusercontent.com/MaxWolf-01/dotfiles/master/bin/ubuntu-install
+#   chmod +x ubuntu-install && sudo ./ubuntu-install /dev/nvme0n1 --root 200
+
+set -euo pipefail
+
+CODENAME="resolute"  # Ubuntu 26.04
+LOCALE="en_US.UTF-8"
+TIMEZONE="Europe/Vienna"
+KEYBOARD_LAYOUT="de"
+KEYBOARD_VARIANT="nodeadkeys"
+USERNAME="max"
+HOSTNAME=""
+ROOT_SIZE=""
+
+# Parse arguments
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}>>>${NC} $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC}  $*"; }
+error() { echo -e "${RED}✗${NC}  $*" >&2; }
+die()   { error "$@"; exit 1; }
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --root) ROOT_SIZE="${2}G"; shift 2 ;;
+        *)      POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+if [[ -z "$ROOT_SIZE" ]]; then
+    read -rp "$(echo -e "${BOLD}Root partition size in GB:${NC} ")" root_gb
+    [[ -n "$root_gb" ]] || die "Root size cannot be empty"
+    ROOT_SIZE="${root_gb}G"
+fi
+
+confirm() {
+    local prompt="$1"
+    local response
+    read -rp "$(echo -e "${BOLD}${prompt}${NC} [y/N] ")" response
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+# ============================================================
+# Preflight checks
+# ============================================================
+
+[[ $EUID -eq 0 ]] || die "Must run as root"
+
+for cmd in debootstrap mkfs.vfat mkfs.ext4 cryptsetup lvcreate pvcreate vgcreate; do
+    command -v "$cmd" &>/dev/null || die "Missing: $cmd"
+done
+
+# ============================================================
+# Layer 1: Disk selection + partitioning
+# ============================================================
+
+disk_selection() {
+    if [[ -n "${1:-}" ]]; then
+        DISK="$1"
+    else
+        info "Available disks:"
+        lsblk -d -o NAME,SIZE,MODEL,TRAN | grep -v '^loop\|^sr\|^NAME'
+        echo
+        read -rp "$(echo -e "${BOLD}Target disk (e.g. /dev/nvme0n1):${NC} ")" DISK
+    fi
+
+    [[ -b "$DISK" ]] || die "$DISK is not a block device"
+
+    # Determine partition suffix (nvme uses p1, sda uses 1)
+    if [[ "$DISK" == *nvme* ]] || [[ "$DISK" == *mmcblk* ]]; then
+        PART_PREFIX="${DISK}p"
+    else
+        PART_PREFIX="${DISK}"
+    fi
+
+    echo
+    warn "This will ERASE ALL DATA on $DISK"
+    lsblk "$DISK" 2>/dev/null
+    echo
+    confirm "Continue?" || exit 0
+}
+
+read_hostname() {
+    if [[ -z "$HOSTNAME" ]]; then
+        read -rp "$(echo -e "${BOLD}Hostname:${NC} ")" HOSTNAME
+        [[ -n "$HOSTNAME" ]] || die "Hostname cannot be empty"
+    fi
+}
+
+partition_disk() {
+    info "Partitioning $DISK (GPT: EFI + boot + LUKS)"
+
+    sgdisk --zap-all "$DISK"
+    sgdisk -n 1:0:+1G   -t 1:ef00 -c 1:"EFI"  "$DISK"
+    sgdisk -n 2:0:+2G   -t 2:8300 -c 2:"boot"  "$DISK"
+    sgdisk -n 3:0:0     -t 3:8309 -c 3:"luks"   "$DISK"
+    partprobe "$DISK"
+    sleep 1
+
+    EFI_PART="${PART_PREFIX}1"
+    BOOT_PART="${PART_PREFIX}2"
+    LUKS_PART="${PART_PREFIX}3"
+}
+
+setup_luks_lvm() {
+    info "Setting up LUKS on $LUKS_PART"
+    cryptsetup luksFormat --type luks2 "$LUKS_PART"
+    cryptsetup open "$LUKS_PART" cryptroot
+
+    info "Setting up LVM (root=${ROOT_SIZE}, home=rest)"
+    pvcreate /dev/mapper/cryptroot
+    vgcreate vg0 /dev/mapper/cryptroot
+    lvcreate -L "$ROOT_SIZE" -n root vg0
+    lvcreate -l 100%FREE -n home vg0
+}
+
+format_filesystems() {
+    info "Formatting filesystems"
+    mkfs.vfat -F32 "$EFI_PART"
+    mkfs.ext4 -q "$BOOT_PART"
+    mkfs.ext4 -q /dev/vg0/root
+    mkfs.ext4 -q /dev/vg0/home
+}
+
+mount_filesystems() {
+    info "Mounting filesystems"
+    mount /dev/vg0/root /mnt
+    mkdir -p /mnt/boot /mnt/home
+    mount "$BOOT_PART" /mnt/boot
+    mount /dev/vg0/home /mnt/home
+    mkdir -p /mnt/boot/efi
+    mount "$EFI_PART" /mnt/boot/efi
+}
+
+# ============================================================
+# Layer 2: OS bootstrap (fully automated from here)
+# ============================================================
+
+install_base() {
+    info "Running debootstrap ($CODENAME)"
+    debootstrap "$CODENAME" /mnt http://archive.ubuntu.com/ubuntu
+}
+
+configure_sources() {
+    info "Configuring apt sources (deb822)"
+    cat > /mnt/etc/apt/sources.list.d/ubuntu.sources <<SOURCES
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu
+Suites: ${CODENAME} ${CODENAME}-updates ${CODENAME}-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+    # Clear old-style sources.list if debootstrap created one
+    : > /mnt/etc/apt/sources.list
+}
+
+configure_system() {
+    info "Configuring hostname, locale, timezone, keyboard"
+
+    echo "$HOSTNAME" > /mnt/etc/hostname
+    cat > /mnt/etc/hosts <<HOSTS
+127.0.0.1   localhost
+127.0.1.1   ${HOSTNAME}
+HOSTS
+
+    # Locale
+    chroot /mnt locale-gen "$LOCALE"
+    echo "LANG=$LOCALE" > /mnt/etc/default/locale
+
+    # Timezone
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE" /mnt/etc/localtime
+    chroot /mnt dpkg-reconfigure -f noninteractive tzdata
+
+    # Keyboard
+    cat > /mnt/etc/default/keyboard <<KBD
+XKBMODEL="pc105"
+XKBLAYOUT="$KEYBOARD_LAYOUT"
+XKBVARIANT="$KEYBOARD_VARIANT"
+XKBOPTIONS=""
+BACKSPACE="guess"
+KBD
+}
+
+configure_fstab_crypttab() {
+    info "Generating fstab and crypttab"
+
+    # fstab
+    local root_uuid boot_uuid efi_uuid home_uuid
+    root_uuid=$(blkid -s UUID -o value /dev/vg0/root)
+    home_uuid=$(blkid -s UUID -o value /dev/vg0/home)
+    boot_uuid=$(blkid -s UUID -o value "$BOOT_PART")
+    efi_uuid=$(blkid -s UUID -o value "$EFI_PART")
+
+    cat > /mnt/etc/fstab <<FSTAB
+# <file system>                            <mount point>  <type>  <options>         <dump>  <pass>
+UUID=${root_uuid}  /          ext4    errors=remount-ro 0       1
+UUID=${home_uuid}  /home      ext4    defaults          0       2
+UUID=${boot_uuid}  /boot      ext4    defaults          0       2
+UUID=${efi_uuid}   /boot/efi  vfat    umask=0077        0       1
+FSTAB
+
+    # crypttab
+    local luks_uuid
+    luks_uuid=$(blkid -s UUID -o value "$LUKS_PART")
+    echo "cryptroot UUID=${luks_uuid} none luks,discard" > /mnt/etc/crypttab
+}
+
+install_packages() {
+    info "Installing kernel, desktop, bootloader, crypto"
+
+    # Bind-mount for chroot
+    mount --bind /dev  /mnt/dev
+    mount --bind /dev/pts /mnt/dev/pts
+    mount --bind /proc /mnt/proc
+    mount --bind /sys  /mnt/sys
+    mount --bind /run  /mnt/run
+
+    chroot /mnt apt-get update
+    chroot /mnt apt-get install -y \
+        linux-generic \
+        ubuntu-desktop \
+        grub-efi-amd64 \
+        cryptsetup-initramfs \
+        lvm2 \
+        openssh-server \
+        network-manager
+}
+
+configure_user() {
+    info "Creating user $USERNAME"
+    chroot /mnt useradd -m -s /bin/bash -G sudo "$USERNAME"
+    info "Set password for $USERNAME:"
+    chroot /mnt passwd "$USERNAME"
+
+    # SSH: allow key auth from github
+    local ssh_dir="/mnt/home/${USERNAME}/.ssh"
+    mkdir -p "$ssh_dir"
+    curl -sL "https://github.com/${USERNAME}Wolf-01.keys" > "${ssh_dir}/authorized_keys"
+    chmod 700 "$ssh_dir"
+    chmod 600 "${ssh_dir}/authorized_keys"
+    chroot /mnt chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.ssh"
+}
+
+install_bootloader() {
+    info "Installing GRUB and rebuilding initramfs"
+    chroot /mnt update-initramfs -u -k all
+    chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="ubuntu-$(basename "$DISK")"
+    chroot /mnt update-grub
+}
+
+cleanup() {
+    info "Unmounting"
+    umount -R /mnt 2>/dev/null || true
+    cryptsetup close cryptroot 2>/dev/null || true
+    vgchange -an vg0 2>/dev/null || true
+}
+
+# ============================================================
+# Main
+# ============================================================
+
+trap cleanup EXIT
+
+echo
+echo -e "${BOLD}Ubuntu ${CODENAME} debootstrap installer${NC}"
+echo -e "${BOLD}LUKS + LVM + EFI${NC}"
+echo
+
+disk_selection "${POSITIONAL[0]:-}"
+read_hostname
+
+echo
+info "Configuration:"
+echo "  Disk:      $DISK"
+echo "  Hostname:  $HOSTNAME"
+echo "  Root:      $ROOT_SIZE"
+echo "  Home:      (remaining space)"
+echo "  LUKS:      ${PART_PREFIX}3"
+echo "  Codename:  $CODENAME"
+echo "  Locale:    $LOCALE"
+echo "  Timezone:  $TIMEZONE"
+echo "  Keyboard:  ${KEYBOARD_LAYOUT}+${KEYBOARD_VARIANT}"
+echo
+confirm "Proceed with install?" || exit 0
+
+partition_disk
+setup_luks_lvm
+format_filesystems
+mount_filesystems
+install_base
+configure_sources
+configure_system
+configure_fstab_crypttab
+install_packages
+configure_user
+install_bootloader
+
+trap - EXIT
+info "Unmounting"
+umount -R /mnt
+cryptsetup close cryptroot
+vgchange -an vg0
+
+echo
+info "Done! Reboot and remove the USB drive."
+info "After boot: git clone dotfiles, then ./setup host $HOSTNAME"

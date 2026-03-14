@@ -12,16 +12,17 @@ Managed via [Nix Home Manager](https://github.com/nix-community/home-manager) �
 dotfiles
 ├── backup        # restic/rsync backup scripts (ntfy notifications)
 ├── bin           # custom scripts
-├── desktop       # desktop shortcuts, icons, discord theme
+├── desktop       # icons, discord theme
 ├── nix
 │   ├── home
 │   │   ├── common.nix     # CLI tools, git, zsh plugins (all hosts)
 │   │   ├── desktop.nix    # GUI apps (workstations)
-│   │   ├── gnome.nix      # GNOME extensions, dconf
+│   │   ├── firefox.nix    # Firefox config, policies, search engines
+│   │   ├── gnome.nix      # GNOME keybindings, extensions, dconf
 │   │   ├── tmux.nix       # tmux config + resurrect
 │   │   ├── timers.nix     # systemd timers (zephyrus)
 │   │   ├── pc-timers.nix  # backup/sync timers (pc)
-│   │   ├── x11.nix / wayland.nix
+│   │   ├── wayland.nix
 │   │   └── hosts/         # per-machine: imports + stateVersion
 │   └── nixos/             # NixOS system configs
 ├── nvim          # neovim config (lazy.nvim)
@@ -38,39 +39,72 @@ dotfiles
 
 ## Setup (Ubuntu)
 
+### Fresh install (LUKS + LVM)
+
+Boot a live USB, then:
+
+```bash
+sudo apt-get install -y curl debootstrap gdisk
+curl -sLO https://raw.githubusercontent.com/MaxWolf-01/dotfiles/master/bin/ubuntu-install
+sudo bash ubuntu-install
+```
+
+<details>
+<summary>If apt doesn't work (pre-release ISO)</summary>
+
+```bash
+curl -Lo /tmp/debootstrap.deb http://archive.ubuntu.com/ubuntu/pool/main/d/debootstrap/debootstrap_1.0.142ubuntu1_all.deb
+curl -Lo /tmp/gdisk.deb http://archive.ubuntu.com/ubuntu/pool/main/g/gdisk/gdisk_1.0.10-2build1_amd64.deb
+sudo dpkg -i /tmp/debootstrap.deb /tmp/gdisk.deb
+curl -sLO https://raw.githubusercontent.com/MaxWolf-01/dotfiles/master/bin/ubuntu-install
+sudo bash ubuntu-install
+```
+</details>
+
+<details>
+<summary>CLI pastebin (send text between machines without login/git)</summary>
+
+```bash
+echo "commands here" | curl --data-binary @- https://paste.rs
+cat script.sh | curl --data-binary @- https://paste.rs
+```
+</details>
+
+Reboot, remove USB.
+
+### Post-install
+
 ```bash
 sudo apt-get update && sudo apt-get install -y git
 git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-cd ~/.dotfiles && ./setup minimal
+cd ~/.dotfiles && ./setup host zephyrus   # dirs, symlinks, nix, HM switch
 ```
 
-Restart shell, then set host and run Home Manager:
+Restart shell (nix needs it on first install), then re-run `./setup host zephyrus`.
 
 ```bash
-./setup host zephyrus
-nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST
+systemctl --user disable --now working-rsyncnet.timer working-pc.timer # don't accidentally overwrite backups 
+./setup ubuntu                 # NVIDIA drivers, codecs, btop, cleanup
+sudo reboot
+./setup gpu                    # nix GPU driver symlinks
 gh auth login -w
+./setup secrets                # clones secrets repo, decrypts SSH key + secrets
+restore-working                # restore data from rsync.net backup
+./setup get_claude             # after restore to avoid .claude/ conflicts
+systemctl --user enable --now working-rsyncnet.timer working-pc.timer # re-enable backups
 ```
 
-After first run, use `hmswitch` to apply changes.
-
-Place your age key at `~/.local/secrets/age-key.txt` (copy from another machine or backup), then:
-```bash
-./setup secrets
-./setup ubuntu
-./setup get_claude
-```
+After first run, use `hmswitch` to apply HM changes.
 
 All `./setup` functions are idempotent — safe to re-run.
 
 <details>
-<summary>Other common setup functions for the daily driver</summary>
+<summary>Other setup functions</summary>
 
 ```bash
 ./setup docker
 ./setup nvidia_container_toolkit
 ./setup get_vibetyper
-./setup tiling_shell
 ```
 </details>
 

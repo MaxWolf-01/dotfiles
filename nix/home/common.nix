@@ -6,6 +6,11 @@
 
   programs.home-manager.enable = true;
 
+  nix.gc = {
+    automatic = true;
+    options = "--delete-older-than 30d";
+  };
+
   # Non-NixOS: add ~/.nix-profile/share to XDG_DATA_DIRS so GNOME finds desktop entries
   targets.genericLinux.enable = lib.mkDefault true;
 
@@ -136,8 +141,6 @@
         return { entry = entry }
       '';
     };
-    # TODO: HM generates "manager" but yazi renamed it to "mgr". Switch back to
-    # manager.prepend_keymap / manager.{show_hidden,...} after HM update (post Ubuntu 26 install).
     keymap = {
       mgr.prepend_keymap = [
         { on = [ "<Enter>" ]; run = "plugin smart-enter"; desc = "Enter directory / open file"; }
@@ -146,7 +149,7 @@
     settings = {
       mgr = {
         show_hidden = true;
-        sort_by = "modified";
+        sort_by = "mtime";
         sort_reverse = true;
         linemode = "size";
       };
@@ -270,23 +273,4 @@
     yt-dlp
   ];
 
-  # Weekly GC: delete generations older than 30 days, then remove unreferenced store paths.
-  # Works together with min-free/max-free in /etc/nix/nix.conf (daemon-level safety net).
-  systemd.user.services.nix-gc = {
-    Unit.Description = "Nix garbage collection";
-    Service = {
-      Type = "oneshot";
-      ExecStart = "${pkgs.nix}/bin/nix-collect-garbage --delete-older-than 30d";
-    };
-  };
-
-  systemd.user.timers.nix-gc = {
-    Unit.Description = "Weekly Nix garbage collection";
-    Timer = {
-      OnCalendar = "weekly";
-      Persistent = true;
-      RandomizedDelaySec = "1h";
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
 }

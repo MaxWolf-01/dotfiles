@@ -113,7 +113,7 @@ in
 
       # Vi copy mode bindings
       bind -T copy-mode-vi v send -X begin-selection
-      bind -T copy-mode-vi y send -X copy-pipe "xclip -selection clipboard -i"
+      bind -T copy-mode-vi y send -X copy-pipe "wl-copy"
       bind -T copy-mode-vi C-v send -X rectangle-toggle
       bind -T copy-mode-vi Escape send -X cancel
 
@@ -125,6 +125,7 @@ in
 
       # New window in current directory
       bind c new-window -c "#{pane_current_path}"
+      bind -n C-S-t new-window -c "#{pane_current_path}"
 
       # Session switching with fzf
       bind f display-popup -E "tmux list-sessions -F '#{session_name}' | fzf --reverse | xargs -r tmux switch-client -t"

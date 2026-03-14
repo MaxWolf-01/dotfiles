@@ -59,14 +59,15 @@ tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
 Structure:
 - `flake.nix` — defines all hosts. PC is a NixOS system (with HM as module); laptops are HM standalone.
 - `nix/home/common.nix` - CLI tools for all hosts (auto-included via mkHome)
-- `nix/home/desktop.nix` - GUI apps (vesktop, nemo, fonts) — workstation machines only
-- `nix/home/gnome.nix` - GNOME-specific (tiling-shell, dconf)
-- `nix/home/kitty.nix` - terminal emulator
+- `nix/home/desktop.nix` - GUI apps (vesktop, obsidian, etc.) — workstation machines only
+- `nix/home/firefox.nix` - Firefox: policies, search engines, about:config
+- `nix/home/ghostty.nix` - terminal emulator
+- `nix/home/gnome.nix` - GNOME keybindings, tiling-shell, dconf settings
 - `nix/home/newsboat.nix` - RSS reader with desktop notifications
 - `nix/home/tmux.nix` - tmux config
 - `nix/home/timers.nix` - systemd user timers, zephyrus only. Secrets via `EnvironmentFile` from `secrets/env/`
 - `nix/home/pc-timers.nix` - PC user timers (youtube backup, phone sync + backup, encrypted backup)
-- `nix/home/x11.nix` / `wayland.nix` - display server specific
+- `nix/home/wayland.nix` - Wayland clipboard (wl-clipboard)
 - `nix/home/hosts/` - per-machine configs (stateVersion + imports)
 - `nix/nixos/pc/` - NixOS system config for PC (configuration.nix, hardware-configuration.nix, youtube-download.nix)
 
@@ -77,7 +78,7 @@ Host tiers:
 
 Setup flow:
 - `./setup minimal` installs Nix
-- Laptops (HM standalone): `nix run home-manager/master -- switch --flake ~/.dotfiles#$NIX_HOST`, then `hmswitch`
+- Laptops (HM standalone): `./setup host <name>` (auto-runs first HM switch), then `hmswitch` for subsequent changes
 - PC (NixOS): `nswitch` (alias for `sudo nixos-rebuild switch --flake ...`) — rebuilds system + HM together
 
 ### Key Nix Concepts
@@ -115,8 +116,8 @@ See `agent/knowledge/nixos-new-machine.md` (disko + nixos-facter + nixos-anywher
 
 ## What stays outside Nix
 
-- Ubuntu-specific apt packages (pulseaudio-module-bluetooth) - system-level
-- GNOME keybindings - keybindings.pl works fine
+- Ubuntu-specific apt packages (libfuse2, ubuntu-drivers, ubuntu-restricted-extras) — system-level
+- NVIDIA drivers — `sudo ubuntu-drivers install` via `./setup ubuntu`
 
 # Rime MCP
 
