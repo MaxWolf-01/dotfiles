@@ -127,10 +127,29 @@
         return string.format("%s %s", size_str, time_str)
       end
     '';
+    plugins = {
+      smart-enter = pkgs.writeTextDir "main.lua" ''
+        --- @sync entry
+        local function entry(self)
+          local h = cx.active.current.hovered
+          if h and h.cha.is_dir then
+            ya.emit("enter", {})
+          else
+            ya.emit("open", { hovered = true })
+          end
+        end
+        return { entry = entry }
+      '';
+    };
+    keymap = {
+      mgr.prepend_keymap = [
+        { on = [ "<Enter>" ]; run = "plugin smart-enter"; desc = "Enter directory / open file"; }
+      ];
+    };
     settings = {
-      manager = {
+      mgr = {
         show_hidden = true;
-        sort_by = "modified";
+        sort_by = "mtime";
         sort_reverse = true;
         linemode = "size";
       };
