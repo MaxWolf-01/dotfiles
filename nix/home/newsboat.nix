@@ -72,7 +72,7 @@ in
       notify-format "%d new articles (%n unread articles, %f unread feeds)"
       notify-always no
 
-      browser "xdg-open %u"
+      browser "xdg-open %u >/dev/null 2>&1 &"
 
       bind-key j down
       bind-key k up
