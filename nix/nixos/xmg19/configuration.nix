@@ -100,12 +100,16 @@
     '';
   };
 
+  # Bootstrap packages (available before HM is applied)
+  environment.systemPackages = with pkgs; [ git firefox ];
+
   # User
   users.users.max = {
     isNormalUser = true;
     extraGroups = [ "wheel" "docker" "networkmanager" "input" ];
     shell = pkgs.zsh;
     linger = true;
+    initialPassword = "max"; # change with passwd after first login
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9y4XD7AHJ9PbUTMtUhS3VzTewwbE/zNZkrlywwrdnL max@zephylux"
     ];
