@@ -62,7 +62,8 @@
     # Window management keybindings
     "org/gnome/desktop/wm/keybindings" = {
       minimize = [ "<Super>m" ];
-      maximize = [ "<Shift><Super>m" ];
+      maximize = [ "<Shift><Super>m" "<Super>Up" ];
+      unmaximize = [ "<Super>Down" ];
       switch-to-workspace-1 = [ "<Super>1" ];
       switch-to-workspace-2 = [ "<Super>2" ];
       switch-to-workspace-3 = [ "<Super>3" ];
