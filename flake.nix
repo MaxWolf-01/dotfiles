@@ -11,9 +11,13 @@
       url = "github:lukasl-dev/rime";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { nixpkgs, home-manager, rime, ... }:
+  outputs = { self, nixpkgs, home-manager, rime, disko, ... }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -29,7 +33,7 @@
       # NixOS systems
       nixosConfigurations."pc" = nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = { inherit rime system; };
+        specialArgs = { inherit self rime system; };
         modules = [
           ./nix/nixos/pc/configuration.nix
           home-manager.nixosModules.home-manager
@@ -38,6 +42,23 @@
             home-manager.useUserPackages = true;
             home-manager.extraSpecialArgs = { inherit rime system; };
             home-manager.users.max = import ./nix/home/hosts/pc.nix;
+          }
+        ];
+      };
+
+      nixosConfigurations."xmg19" = nixpkgs.lib.nixosSystem {
+        inherit system;
+        specialArgs = { inherit self rime system; };
+        modules = [
+          disko.nixosModules.disko
+          ./nix/nixos/xmg19/configuration.nix
+          home-manager.nixosModules.home-manager
+          {
+            home-manager.useGlobalPkgs = true;
+            home-manager.useUserPackages = true;
+            home-manager.extraSpecialArgs = { inherit rime system; };
+            home-manager.users.max = import ./nix/home/hosts/xmg19.nix;
+            home-manager.backupFileExtension = "bak";
           }
         ];
       };

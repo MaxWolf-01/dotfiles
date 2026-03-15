@@ -5,8 +5,7 @@
   home.stateVersion = "26.05";
 
   imports = [
-    ../desktop.nix
-    ../gnome.nix
-    ../wayland.nix
+    ../ghostty.nix
+    ../hyprland.nix
   ];
 }

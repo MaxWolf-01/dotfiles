@@ -1,4 +1,4 @@
-{ config, pkgs, lib, ... }:
+{ config, pkgs, lib, self, ... }:
 
 {
   imports = [
@@ -123,6 +123,8 @@
 
   # Disable deprecated udev-settle (times out waiting for NVIDIA/ZFS events, nothing needs it)
   systemd.services.systemd-udev-settle.serviceConfig.ExecStart = [ "" "${pkgs.coreutils}/bin/true" ];
+
+  system.configurationRevision = self.rev or self.dirtyRev or "unknown";
 
   system.stateVersion = "26.05";
 }

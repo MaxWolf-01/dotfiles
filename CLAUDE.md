@@ -145,5 +145,5 @@ You have access to Nix tooling via the rime MCP server. Use it for Nix-related t
 - `nixhub_package_versions` — Version history for a package (useful for pinning)
 
 When to use rime vs web search:
-- **rime first**: HM options, Nix builtins, package search, flake introspection
+- **rime first**: ALWAYS USE IT WHEN ADDING / CHANGING ANYTHING NIX RELATED: HM options, Nix builtins, package search, flake introspection, ...
 - **web search**: Tutorials, complex debugging, community patterns not in docs
