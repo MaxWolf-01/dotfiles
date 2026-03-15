@@ -262,6 +262,7 @@
     pywal
     restic
     ripgrep
+    rsync
     rime.packages.${system}.default
     sqlite
     sops
