@@ -20,6 +20,7 @@
         "alt+eight=unbind"
         "alt+nine=unbind"
         "ctrl+shift+t=unbind"
+        "shift+enter=text:\\n" # https://github.com/anthropics/claude-code/issues/1282
       ];
     };
   };
