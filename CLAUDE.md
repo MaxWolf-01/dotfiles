@@ -77,9 +77,9 @@ Host tiers:
 - **Server / NixOS** (nix/nixos/pc/ + pc-timers.nix): PC — headless, backup hub, GPU workers
 
 Setup flow:
-- `./setup minimal` installs Nix
-- Laptops (HM standalone): `./setup host <name>` (auto-runs first HM switch), then `hmswitch` for subsequent changes
-- PC (NixOS): `nswitch` (alias for `sudo nixos-rebuild switch --flake ...`) — rebuilds system + HM together
+- `./setup host <name>` — sets NIX_HOST, creates dirs. On non-NixOS: also installs Nix + runs first HM switch.
+- Non-NixOS (zephyrus): `hmswitch` for subsequent changes
+- NixOS (pc, xmg19): `nswitch` (alias for `sudo nixos-rebuild switch --flake ...`) — rebuilds system + HM together
 
 ### Key Nix Concepts
 

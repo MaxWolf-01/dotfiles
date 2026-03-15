@@ -110,12 +110,14 @@ All `./setup` functions are idempotent — safe to re-run.
 
 ## Setup (NixOS)
 
+For existing NixOS (pc):
 ```bash
 git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-cd ~/.dotfiles && ./setup minimal
-./setup host pc
+cd ~/.dotfiles && ./setup host <name>
 nswitch
 ```
+
+For new NixOS installs via nixos-anywhere, see `docs/nixos-new-machine.md`.
 
 Place age key at `~/.local/secrets/age-key.txt`, then: `./setup secrets`
 

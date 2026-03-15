@@ -93,6 +93,9 @@ in
         "$mod, C, exec, firefox"
         "CTRL SHIFT, L, exec, hyprlock"
 
+        # Session
+        "$mod SHIFT, Q, exit," # logout (back to SDDM)
+
         # Window management
         "$mod, W, killactive,"
         "$mod, M, fullscreen, 1"
@@ -194,7 +197,13 @@ in
       height = 30;
       modules-left = [ "hyprland/workspaces" ];
       modules-center = [ "clock" ];
-      modules-right = [ "battery" "network" "pulseaudio" "tray" ];
+      modules-right = [ "battery" "power-profiles-daemon" "network" "pulseaudio" "tray" "custom/power" ];
+
+      "custom/power" = {
+        format = "⏻";
+        tooltip = false;
+        on-click = "wlogout";
+      };
 
       clock = {
         format = "{:%H:%M  %a %d %b}";

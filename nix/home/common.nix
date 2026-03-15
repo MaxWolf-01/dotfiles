@@ -16,6 +16,20 @@
 
   xdg.enable = true;
 
+  # Config symlinks (impure — hot-reload without hmswitch)
+  xdg.configFile."nvim".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/nvim";
+  xdg.configFile."ruff".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/ruff";
+  xdg.configFile."oyo/config.toml".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/oyo/config.toml";
+  home.file.".vimrc".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/vim/vimrc";
+  home.file.".pythonrc".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/python/pythonrc";
+  home.file."bin".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/bin";
+
   programs.zsh = {
     enable = true;
     dotDir = "${config.xdg.configHome}/zsh";
