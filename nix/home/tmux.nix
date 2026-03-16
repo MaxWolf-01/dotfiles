@@ -11,17 +11,14 @@ let
     if ! ${tmux} list-sessions &>/dev/null; then
       last="$HOME/.tmux/resurrect/last"
       if [ -L "$last" ] && [ -f "$last" ]; then
-        # Session "0" required — restore.sh's handle_session_0() kills it after restore
+        # Session "0" exists only during restore — save script skips when it's present
         ${tmux} new-session -d -s 0 -x "$(${pkgs.ncurses}/bin/tput cols)" -y "$(${pkgs.ncurses}/bin/tput lines)"
         restore_script=$(${tmux} show-options -gqv @resurrect-restore-script-path 2>/dev/null)
         [ -x "$restore_script" ] && ${tmux} run-shell -t 0:0.0 "$restore_script"
-        ${tmux} set-environment TMS_READY 1
         exec ${tmux} new-session -A -s "$1"
       fi
     fi
 
-    # Server already running — ensure flag is set (e.g. first tms after manual tmux start)
-    ${tmux} show-environment TMS_READY &>/dev/null || ${tmux} set-environment TMS_READY 1
     exec ${tmux} new-session -A -s "$1"
   '';
 in

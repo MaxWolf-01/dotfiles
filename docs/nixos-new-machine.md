@@ -1,129 +1,90 @@
 # NixOS on a New Machine
 
-Last updated 2026-03-15 after xmg19 install. Re-verify before acting — tools evolve fast.
+Last updated 2026-03-16 after xmg19 install. Re-verify before acting — tools evolve fast.
 
-## The Stack
+## Quick Reference
 
-- **disko** (`github:nix-community/disko`) — declarative disk partitioning as Nix code. Replaces manual fdisk/parted. nixos-anywhere calls it automatically.
-- **nixos-facter** (in nixpkgs) — generates JSON hardware report. Replaces `nixos-generate-config`. Dynamic: NixOS modules interpret the report, so it improves as nixpkgs evolves. Use via `hardware.facter.reportPath = ./facter.json;`
-- **nixos-anywhere** (`github:nix-community/nixos-anywhere`) — one-command remote NixOS install over SSH. Orchestrates kexec + disko + facter + install.
+### Ideal flow (with custom installer ISO)
 
-## Key Command
+1. Build ISO: `nix build .#nixosConfigurations.installer.config.system.build.isoImage`
+2. Flash + boot from USB (SSH + keys baked in, no manual setup)
+3. Note IP from console
+4. From any machine: `nix run github:nix-community/nixos-anywhere -- --flake .#hostname --target-host root@<ip>`
+5. Enter LUKS passphrase when prompted
+6. After install finishes: `ssh root@<ip> 'nixos-enter --root /mnt -c "echo max:max | chpasswd"'`
+7. Reboot, select new drive in BIOS
+8. Log in, clone dotfiles, nswitch:
+   ```bash
+   curl -sL https://github.com/MaxWolf-01.keys >> ~/.ssh/authorized_keys
+   git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
+   sudo nixos-rebuild switch --flake ~/.dotfiles#$(hostname)
+   ```
+9. Log out and back in
 
-```bash
-nix run github:nix-community/nixos-anywhere -- \
-  --flake .#hostname \
-  --generate-hardware-config nixos-facter ./path/to/facter.json \
-  --target-host root@<ip>
-```
+### Without custom ISO (from existing Linux)
 
-## Lessons Learned (xmg19 install, 2026-03-15)
+Same as above, but step 1-2 replaced with: boot any Linux, set up root SSH manually, install `cpio` if needed. nixos-anywhere will kexec into a NixOS installer — **IP changes after kexec**. Re-run with `--phases disko,install` at the new IP.
 
-### CRITICAL: disko must use stable disk IDs
+### SSH host key cleanup
 
-**Never use `/dev/nvmeXn1`** in disko configs. NVMe probe order changes across boots and kexec. Use `/dev/disk/by-id/nvme-MODEL_SERIAL` instead. Get the ID from the target before writing the config:
-```bash
-ssh root@<target> 'ls -la /dev/disk/by-id/ | grep nvme | grep -v part'
-```
-We installed to the wrong drive (256GB Patriot instead of 1TB Samsung) because of this.
+Every boot/kexec/reinstall changes the host key. Run `ssh-keygen -R <ip>` before connecting.
 
-### CRITICAL: unique LVM VG names when multiple drives have LVM
+## Prerequisites for a new host config
 
-disko defaults VG name to whatever you set in `disko.devices.lvm_vg.<name>`. If you install NixOS on a second drive while the first drive also has an LVM VG with the same name, **both VGs will be called `vg0` and LVM can't distinguish them**. The initrd activates the wrong one, and root doesn't mount.
+Before running nixos-anywhere, create these files:
 
-Fix: use unique VG names per machine/drive in disko configs (e.g. `vg-xmg19` instead of `vg0`). Or wipe the old drive's LVM before installing.
+1. **Get stable disk ID** from the target:
+   ```bash
+   ssh root@<target> 'ls -la /dev/disk/by-id/ | grep nvme | grep -v part'
+   ```
 
-**Never rename a VG on a running system** — systemd services referencing the old name will break, and the initrd on other drives still expects the original name. If you're stuck with duplicate VGs, boot a live USB to fix.
+2. **`nix/nixos/<hostname>/disk-config.nix`** — disko config using the stable disk ID. Use a **unique VG name** (e.g. `vg-<hostname>`, never `vg0`).
 
-### nixos-anywhere kexec changes IP
+3. **`nix/nixos/<hostname>/configuration.nix`** — must include:
+   - `hardware.facter.reportPath = ./facter.json;`
+   - `environment.systemPackages = [ git firefox ];` (bootstrap)
+   - `users.users.max.initialPassword = "max";`
+   - `openssh.authorizedKeys.keys` with your current SSH pubkey
+   - Import `./disk-config.nix`
 
-kexec replaces the running kernel. The new kernel does its own DHCP and gets a different IP. nixos-anywhere tries to reconnect but often fails. Workaround: check the new IP on the target's console, then re-run with `--phases disko,install` at the new IP:
-```bash
-nix run github:nix-community/nixos-anywhere -- \
-  --flake .#hostname \
-  --generate-hardware-config nixos-facter ./path/to/facter.json \
-  --target-host root@<NEW_IP> \
-  --phases disko,install
-```
+4. **`nix/home/hosts/<hostname>.nix`** — must import `../common.nix` + set `targets.genericLinux.enable = false;`
 
-### Bootstrap essentials in system config
+5. **`flake.nix`** — add to `nixosConfigurations` with `disko.nixosModules.disko` in modules
 
-The NixOS config needs packages available before HM applies:
-- `environment.systemPackages = [ git firefox ]` — clone dotfiles + browse docs
-- `users.users.<name>.initialPassword = "changeme"` — login before passwd is set
-- Without these, you can't clone dotfiles or log into SDDM after first boot
+6. **`git add`** all new files (flakes only see tracked files)
 
-### HM-as-NixOS-module: common.nix must be imported explicitly
+7. **`nix flake lock`** if new inputs were added (e.g. disko)
 
-`mkHome` (for standalone HM) auto-includes `common.nix`. The NixOS path (`home-manager.users.max = import ./hosts/foo.nix`) does NOT. The host's nix file must explicitly `import ../common.nix`. Without it: no zsh, no git, no aliases, no SSH config — nothing from common.
+## Gotchas
 
-Also set `targets.genericLinux.enable = false` on NixOS hosts (it's `mkDefault true` in common.nix for Ubuntu machines).
+### CRITICAL: stable disk IDs in disko
 
-### Set user password before rebooting
+**Never use `/dev/nvmeXn1`**. NVMe probe order changes across boots, kexec, and live USBs. We installed to the wrong drive (256GB instead of 1TB) because of this. Always use `/dev/disk/by-id/nvme-MODEL_SERIAL`.
 
-After nixos-anywhere finishes but before reboot:
-```bash
-ssh root@<installer-ip> 'nixos-enter --root /mnt -c "echo max:<password> | chpasswd"'
-```
-Or set `initialPassword` in the config.
+### CRITICAL: unique LVM VG names
 
-### SSH access to new install
+If the target has multiple drives with LVM, VG name collisions cause boot failure — initrd activates the wrong VG. Use `vg-<hostname>` in disko, never `vg0`. **Never rename a VG on a running system** — boot a live USB instead.
 
-The installed system has new SSH host keys. After reboot:
-1. `ssh-keygen -R <ip>` to clear old host key
-2. SSH pubkeys in `openssh.authorizedKeys.keys` must match your current machine's key
-3. On the target, `curl -sL https://github.com/MaxWolf-01.keys >> ~/.ssh/authorized_keys` as a quick fix
+### kexec changes IP
 
-### Stage facter.json immediately
+nixos-anywhere kexecs the target into a NixOS installer. DHCP assigns a new IP. Check the console, re-run with `--phases disko,install --target-host root@<new-ip>`.
 
-nixos-anywhere generates `facter.json` — stage it with `git add` right away. Flakes only see tracked files. Also add `hardware.facter.reportPath = ./facter.json;` to the configuration.nix for future `nswitch` rebuilds.
+### Ubuntu live USB can't run nixos-install
 
-### The target needs `cpio`
+nixos-anywhere's `--phases disko,install` needs `nixos-install` on the target. Ubuntu doesn't have it. Either: let nixos-anywhere do the full kexec flow (no `--phases`), or boot a NixOS live USB.
 
-nixos-anywhere's kexec needs `cpio` on the target. If missing: `ssh root@<target> 'apt-get install -y cpio'`
+### HM common.nix import
 
-## Gotchas & Non-Obvious Things
-
-- **nixos-facter doesn't handle filesystems** — that's disko's job. They're complementary.
-- **nixos-hardware** has no XMG/Schenker/Tongfang profiles. Use `common-pc-laptop` for generic laptop power mgmt. Zephyrus models ARE covered.
-- **kexec needs ~2GB RAM** on the target for nixos-anywhere to work.
-- **LUKS keys**: pass via `--disk-encryption-keys /tmp/secret.key <(pass ...)` during nixos-anywhere.
-- **Secrets bootstrapping** (sops-nix): use `--extra-files` to inject host SSH keys so sops can decrypt on first boot.
-- **`system.configurationRevision`**: use `self.rev or self.dirtyRev or "unknown"` — pass `self` via `specialArgs` in flake.nix. Shows git commit via `nixos-version --configuration-revision`.
-
-## Post-Install Steps (after first boot)
-
-```bash
-# 1. Set password (if initialPassword wasn't in config)
-passwd
-
-# 2. Get SSH access from other machines
-curl -sL https://github.com/MaxWolf-01.keys >> ~/.ssh/authorized_keys
-
-# 3. Clone dotfiles
-git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-
-# 4. Set NIX_HOST + create dirs (still needed on NixOS for nswitch alias)
-cd ~/.dotfiles && ./setup host <hostname>
-
-# 5. First full rebuild (applies NixOS config + HM with all symlinks, zsh, tools)
-sudo nixos-rebuild switch --flake ~/.dotfiles#<hostname>
-
-# 6. Log out and back in (new shell environment)
-```
-
-After step 5, everything is declarative — `nswitch` for future changes.
+`mkHome` (standalone HM) auto-includes `common.nix`. NixOS HM module path does NOT. The host nix file must explicitly `import ../common.nix` and set `targets.genericLinux.enable = false`.
 
 ## Sources
 
-- nixos-anywhere docs: https://github.com/nix-community/nixos-anywhere
+- nixos-anywhere: https://github.com/nix-community/nixos-anywhere
 - disko examples: https://github.com/nix-community/disko/tree/master/example
-- disko templates: https://github.com/nix-community/disko-templates
 - nixos-facter: https://github.com/nix-community/nixos-facter
-- nixos-hardware profiles: https://github.com/NixOS/nixos-hardware
 
 ## Current Setup
 
-- **pc**: NixOS with manual `hardware-configuration.nix` + ext4. No disko/facter.
-- **xmg19**: NixOS via nixos-anywhere + disko (LUKS+LVM on Samsung 1TB, stable disk ID) + facter. Hyprland desktop.
-- **zephyrus**: Ubuntu with standalone HM. Not NixOS.
+- **pc**: NixOS, manual hardware-configuration.nix, ext4, no disko/facter
+- **xmg19**: NixOS via nixos-anywhere, disko (LUKS+LVM, Samsung 1TB by stable ID, VG `vg-xmg19`), facter, Hyprland
+- **zephyrus**: Ubuntu 26.04 with standalone HM (NixOS planned)

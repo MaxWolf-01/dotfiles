@@ -63,6 +63,24 @@
         ];
       };
 
+      # Installer ISO (SSH + keys baked in, for nixos-anywhere)
+      nixosConfigurations."installer" = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          "${nixpkgs}/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix"
+          {
+            users.users.root.openssh.authorizedKeys.keys = [
+              "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p"
+            ];
+            services.openssh = {
+              enable = true;
+              settings.PermitRootLogin = "yes";
+            };
+            networking.networkmanager.enable = true;
+          }
+        ];
+      };
+
       # Home Manager standalone (non-NixOS machines)
       homeConfigurations."zephyrus" = mkHome [ ./nix/home/hosts/zephyrus.nix ];
       homeConfigurations."minimal" = mkHome [ ./nix/home/hosts/minimal.nix ];
