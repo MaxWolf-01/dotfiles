@@ -121,7 +121,7 @@
     enable = true;
     enableZshIntegration = true;
     shellWrapperName = "y";
-    extraPackages = with pkgs; [ trash-cli ];
+    extraPackages = with pkgs; [ trash-cli dragon-drop ];
     initLua = ''
       -- Override built-in size linemode to also show mtime
       function Linemode:size()
@@ -160,10 +160,37 @@
         end
         return { entry = entry }
       '';
+      dragon-drop = pkgs.writeTextDir "main.lua" ''
+        local selected_files = ya.sync(function()
+          local tab, paths = cx.active, {}
+          for _, u in pairs(tab.selected) do
+            paths[#paths + 1] = tostring(u)
+          end
+          if #paths == 0 and tab.current.hovered then
+            paths[1] = tostring(tab.current.hovered.url)
+          end
+          return paths
+        end)
+
+        return {
+          entry = function()
+            local files = selected_files()
+            if #files == 0 then return end
+
+            local child, err = Command("dragon-drop"):arg("--all"):arg(files):spawn()
+            if not child then
+              ya.notify({ title = "dragon-drop", content = "spawn failed: " .. tostring(err), timeout = 3, level = "error" })
+              return
+            end
+            child:wait()
+          end,
+        }
+      '';
     };
     keymap = {
       mgr.prepend_keymap = [
         { on = [ "<Enter>" ]; run = "plugin smart-enter"; desc = "Enter directory / open file"; }
+        { on = [ "<C-n>" ]; run = "plugin dragon-drop"; desc = "Drag and drop selected files"; }
       ];
     };
     settings = {
