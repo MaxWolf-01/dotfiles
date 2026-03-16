@@ -100,7 +100,7 @@
     # Custom: file manager
     "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0" = {
       name = "Open file manager";
-      command = "nautilus";
+      command = "ghostty -e yazi";
       binding = "<Super>e";
     };
 
