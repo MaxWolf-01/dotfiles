@@ -32,8 +32,8 @@ in
       ExecStart = toString (pkgs.writeShellScript "tmux-save" ''
         ${tmux} list-sessions &>/dev/null || exit 0
 
-        # Only save after tms has run restore (env var set by tms, dies with server)
-        ${tmux} show-environment TMS_READY &>/dev/null || exit 0
+        # Skip save while restore is in progress (session "0" only exists during restore)
+        ${tmux} has-session -t 0 2>/dev/null && exit 0
 
         resurrect_dir="$HOME/.tmux/resurrect"
 

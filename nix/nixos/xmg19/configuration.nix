@@ -92,6 +92,8 @@
   # Power management (laptop)
   services.power-profiles-daemon.enable = true;
   services.thermald.enable = true;
+  services.upower.enable = true;
+  services.udisks2.enable = true; # auto-mount removable drives
 
   # Docker + GPU passthrough
   virtualisation.docker = {

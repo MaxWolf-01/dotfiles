@@ -1,10 +1,15 @@
-{ pkgs, config, lib, ... }:
+{ pkgs, config, lib, inputs, ... }:
 
 let
   screenshotArea = "grim -g \"$(slurp)\" - | wl-copy";
   screenshotFull = "grim - | wl-copy";
+  noctalia = cmd: "noctalia-shell ipc call ${cmd}";
 in
 {
+  imports = [
+    inputs.noctalia.homeModules.default
+  ];
+
   wayland.windowManager.hyprland = {
     enable = true;
     package = null; # use system package from NixOS module
@@ -24,7 +29,7 @@ in
 
       master = {
         new_status = "slave";
-        mfact = 0.65; # master takes 65% of screen
+        mfact = 0.65;
       };
 
       input = {
@@ -78,7 +83,7 @@ in
       # Autostart
       exec-once = [
         "systemctl --user start hyprpolkitagent"
-        "waybar"
+        "noctalia-shell"
         "clipse -listen"
       ];
 
@@ -88,25 +93,25 @@ in
       bind = [
         # Apps
         "$mod, Return, exec, ghostty"
-        "$mod, Space, exec, fuzzel"
+        "$mod, Space, exec, ${noctalia "launcher toggle"}"
         "$mod, E, exec, ghostty -e yazi"
         "$mod, C, exec, firefox"
-        "CTRL SHIFT, L, exec, hyprlock"
 
         # Session
-        "$mod SHIFT, Q, exit," # logout (back to SDDM)
+        "$mod SHIFT, Q, exit,"
+        "CTRL SHIFT, L, exec, ${noctalia "lockScreen lock"}"
+        "$mod, P, exec, ${noctalia "sessionMenu toggle"}"
 
         # Window management
         "$mod, W, killactive,"
         "$mod, M, fullscreen, 1"
         "$mod SHIFT, M, fullscreen, 0"
         "$mod, F, togglefloating,"
-        "$mod, P, pin,"
 
         # Master layout
-        "$mod SHIFT, Return, layoutmsg, swapwithmaster" # swap focused ↔ master
-        "$mod SHIFT, period, layoutmsg, addmaster"       # add a second master window
-        "$mod SHIFT, comma, layoutmsg, removemaster"    # back to single master
+        "$mod SHIFT, Return, layoutmsg, swapwithmaster"
+        "$mod SHIFT, period, layoutmsg, addmaster"
+        "$mod SHIFT, comma, layoutmsg, removemaster"
 
         # Focus (vim keys)
         "$mod, H, movefocus, l"
@@ -142,7 +147,7 @@ in
         "$mod SHIFT, 8, movetoworkspace, 8"
         "$mod SHIFT, 9, movetoworkspace, 9"
 
-        # Screenshots
+        # Screenshots (fallback — also available via Noctalia screenshot plugin)
         "$mod, S, exec, ${screenshotArea}"
         "$mod SHIFT, S, exec, ${screenshotFull}"
 
@@ -150,8 +155,8 @@ in
         "CTRL ALT, H, exec, ghostty --class=clipse -e clipse"
 
         # Notifications
-        "$mod, N, exec, makoctl dismiss"
-        "$mod SHIFT, N, exec, makoctl dismiss --all"
+        "$mod, N, exec, ${noctalia "notifications dismiss"}"
+        "$mod SHIFT, N, exec, ${noctalia "notifications dismissAll"}"
 
         # Cycle windows
         "ALT, Tab, cyclenext,"
@@ -188,183 +193,106 @@ in
     };
   };
 
-  # Status bar
-  programs.waybar = {
+  # Noctalia Shell — bar, notifications, lock screen, idle, OSD, wallpaper
+  programs.noctalia-shell = {
     enable = true;
-    settings = [{
-      layer = "top";
-      position = "top";
-      height = 30;
-      modules-left = [ "hyprland/workspaces" ];
-      modules-center = [ "clock" ];
-      modules-right = [ "battery" "power-profiles-daemon" "network" "pulseaudio" "tray" "custom/power" ];
+    systemd.enable = false; # started via exec-once
 
-      "custom/power" = {
-        format = "⏻";
-        tooltip = false;
-        on-click = "wlogout";
-      };
-
-      clock = {
-        format = "{:%H:%M  %a %d %b}";
-        tooltip-format = "{:%Y-%m-%d %H:%M}";
-      };
-
-      battery = {
-        format = "{icon} {capacity}%";
-        format-icons = [ "" "" "" "" "" ];
-        states = {
-          warning = 20;
-          critical = 10;
-        };
-      };
-
-      network = {
-        format-wifi = " {signalStrength}%";
-        format-ethernet = " {ifname}";
-        format-disconnected = "⚠ disconnected";
-        tooltip-format = "{essid} ({signalStrength}%)";
-      };
-
-      pulseaudio = {
-        format = "{icon} {volume}%";
-        format-muted = " muted";
-        format-icons.default = [ "" "" "" ];
-        on-click = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle";
-      };
-    }];
-
-    style = ''
-      * {
-        font-family: "Hack Nerd Font";
-        font-size: 13px;
-      }
-
-      window#waybar {
-        background-color: rgba(30, 30, 46, 0.9);
-        color: #cdd6f4;
-      }
-
-      #workspaces button {
-        padding: 0 8px;
-        color: #6c7086;
-      }
-
-      #workspaces button.active {
-        color: #cdd6f4;
-        background-color: rgba(137, 180, 250, 0.2);
-        border-bottom: 2px solid #89b4fa;
-      }
-
-      #clock, #battery, #network, #pulseaudio, #tray {
-        padding: 0 10px;
-      }
-
-      #battery.warning {
-        color: #fab387;
-      }
-
-      #battery.critical {
-        color: #f38ba8;
-      }
-    '';
-  };
-
-  # Notifications
-  services.mako = {
-    enable = true;
     settings = {
-      default-timeout = 5000;
-      border-radius = 8;
-      font = "Hack Nerd Font 11";
-      background-color = "#1e1e2e";
-      text-color = "#cdd6f4";
-      border-color = "#89b4fa";
-      border-size = 2;
+      settingsVersion = 43;
+
+      bar.widgets = {
+        left = [
+          {
+            id = "Clock";
+            formatHorizontal = "HH:mm ddd, MMM dd";
+            tooltipFormat = "HH:mm ddd, MMM dd";
+          }
+          {
+            id = "SystemMonitor";
+            compactMode = true;
+            showCpuTemp = true;
+            showCpuUsage = true;
+            showMemoryUsage = true;
+          }
+          { id = "plugin:catwalk"; }
+          { id = "plugin:network-indicator"; }
+        ];
+        center = [
+          {
+            id = "Workspace";
+            characterCount = 2;
+            showApplications = true;
+            showLabelsOnlyWhenOccupied = true;
+            colorizeIcons = true;
+          }
+        ];
+        right = [
+          { id = "plugin:privacy-indicator"; }
+          { id = "plugin:tailscale"; }
+          { id = "plugin:screenshot"; }
+          { id = "plugin:screen-recorder"; }
+          { id = "Tray"; drawerEnabled = true; }
+          { id = "NotificationHistory"; showUnreadBadge = true; }
+          { id = "Battery"; hideIfNotDetected = true; warningThreshold = 20; }
+          { id = "Volume"; middleClickCommand = "pavucontrol"; }
+          { id = "Brightness"; }
+          {
+            id = "ControlCenter";
+            icon = "noctalia";
+          }
+        ];
+      };
+
+      appLauncher = {
+        enableClipboardHistory = false; # using clipse instead
+      };
+
+      wallpaper = {
+        overviewEnabled = true;
+        automationEnabled = true;
+      };
+
+      nightLight.enabled = true;
+
+      dock.enabled = false;
+
+      location = {
+        name = "Vienna";
+        hideWeatherTimezone = true;
+        hideWeatherCityName = true;
+      };
     };
-  };
 
-  # Screen lock
-  programs.hyprlock = {
-    enable = true;
-    settings = {
-      general.hide_cursor = true;
-      background = [{
-        path = "screenshot";
-        blur_passes = 3;
-        blur_size = 8;
-      }];
-      input-field = [{
-        size = "200, 50";
-        position = "0, -20";
-        halign = "center";
-        valign = "center";
-        placeholder_text = "";
-        fade_on_empty = true;
-        outer_color = "rgba(137, 180, 250, 0.5)";
-        inner_color = "rgba(30, 30, 46, 0.9)";
-        font_color = "rgb(205, 214, 244)";
-        check_color = "rgba(166, 227, 161, 0.5)";
-        fail_color = "rgba(243, 139, 168, 0.5)";
-      }];
-      label = [{
-        text = "$TIME";
-        font_size = 64;
-        font_family = "Hack Nerd Font";
-        position = "0, 80";
-        halign = "center";
-        valign = "center";
-        color = "rgba(205, 214, 244, 0.8)";
-      }];
-    };
-  };
-
-  # Idle management
-  services.hypridle = {
-    enable = true;
-    settings = {
-      general = {
-        lock_cmd = "pidof hyprlock || hyprlock";
-        before_sleep_cmd = "loginctl lock-session";
-        after_sleep_cmd = "hyprctl dispatch dpms on";
-      };
-      listener = [
+    plugins = {
+      sources = [
         {
-          timeout = 300; # 5 min
-          on-timeout = "loginctl lock-session";
-        }
-        {
-          timeout = 600; # 10 min
-          on-timeout = "hyprctl dispatch dpms off";
-          on-resume = "hyprctl dispatch dpms on";
-        }
-        {
-          timeout = 1800; # 30 min
-          on-timeout = "systemctl suspend";
+          enabled = true;
+          name = "Official Noctalia Plugins";
+          url = "https://github.com/noctalia-dev/noctalia-plugins";
         }
       ];
+      states = {
+        catwalk = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
+        network-indicator = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
+        privacy-indicator = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
+        tailscale = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
+        screenshot = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
+        screen-recorder = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
+        noctalia-supergfxctl = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
+        rss-feed = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
+      };
+      version = 2;
     };
-  };
 
-  # App launcher
-  programs.fuzzel = {
-    enable = true;
-    settings = {
-      main = {
-        font = "Hack Nerd Font:size=12";
-        terminal = "ghostty -e";
-        width = 40;
-        lines = 12;
+    pluginSettings = {
+      catwalk = {
+        minimumThreshold = 25;
+        hideBackground = true;
       };
-      colors = {
-        background = "1e1e2edd";
-        text = "cdd6f4ff";
-        selection = "89b4fa33";
-        selection-text = "cdd6f4ff";
-        border = "89b4faff";
-      };
-      border.width = 2;
-      border.radius = 8;
+      tailscale.compactMode = true;
+      screenshot.defaultSettings.mode = "region";
+      screen-recorder.defaultSettings.copyToClipboard = false;
     };
   };
 
@@ -408,7 +336,6 @@ in
     showtime
     slurp
     wl-clipboard
-    wlogout
     hyprpolkitagent
     playerctl
     brightnessctl
