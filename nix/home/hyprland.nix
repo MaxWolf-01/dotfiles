@@ -32,6 +32,8 @@ in
         mfact = 0.65;
       };
 
+      monitor = [ ",preferred,auto,1" ]; # force scale 1x (auto-detect picks 1.5x on 1080p 15.6")
+
       input = {
         kb_layout = "de";
         kb_variant = "nodeadkeys";
@@ -147,16 +149,16 @@ in
         "$mod SHIFT, 8, movetoworkspace, 8"
         "$mod SHIFT, 9, movetoworkspace, 9"
 
-        # Screenshots (fallback — also available via Noctalia screenshot plugin)
+        # Screenshots (fallback — also via Noctalia screenshot plugin)
         "$mod, S, exec, ${screenshotArea}"
         "$mod SHIFT, S, exec, ${screenshotFull}"
 
         # Clipboard history
         "CTRL ALT, H, exec, ghostty --class=clipse -e clipse"
 
-        # Notifications
+        # Notifications + night light
         "$mod, N, exec, ${noctalia "notifications dismiss"}"
-        "$mod SHIFT, N, exec, ${noctalia "notifications dismissAll"}"
+        "$mod SHIFT, N, exec, ${noctalia "nightLight toggle"}"
 
         # Cycle windows
         "ALT, Tab, cyclenext,"
@@ -193,74 +195,134 @@ in
     };
   };
 
-  # Noctalia Shell — bar, notifications, lock screen, idle, OSD, wallpaper
+  # Noctalia Shell
   programs.noctalia-shell = {
     enable = true;
     systemd.enable = false; # started via exec-once
 
     settings = {
-      settingsVersion = 43;
+      settingsVersion = 59;
 
-      bar.widgets = {
-        left = [
-          {
-            id = "Clock";
-            formatHorizontal = "HH:mm ddd, MMM dd";
-            tooltipFormat = "HH:mm ddd, MMM dd";
-          }
-          {
-            id = "SystemMonitor";
-            compactMode = true;
-            showCpuTemp = true;
-            showCpuUsage = true;
-            showMemoryUsage = true;
-          }
-          { id = "plugin:catwalk"; }
-          { id = "plugin:network-indicator"; }
-        ];
-        center = [
-          {
-            id = "Workspace";
-            characterCount = 2;
-            showApplications = true;
-            showLabelsOnlyWhenOccupied = true;
-            colorizeIcons = true;
-          }
-        ];
-        right = [
-          { id = "plugin:privacy-indicator"; }
-          { id = "plugin:tailscale"; }
-          { id = "plugin:screenshot"; }
-          { id = "plugin:screen-recorder"; }
-          { id = "Tray"; drawerEnabled = true; }
-          { id = "NotificationHistory"; showUnreadBadge = true; }
-          { id = "Battery"; hideIfNotDetected = true; warningThreshold = 20; }
-          { id = "Volume"; middleClickCommand = "pavucontrol"; }
-          { id = "Brightness"; }
-          {
-            id = "ControlCenter";
-            icon = "noctalia";
-          }
-        ];
+      bar = {
+        position = "bottom";
+        density = "compact";
+        showCapsule = false;
+        widgetSpacing = 0;
+        contentPadding = 0;
+        fontScale = 0.95;
+
+        widgets = {
+          left = [
+            {
+              id = "SystemMonitor";
+              compactMode = true;
+              showCpuTemp = true;
+              showCpuUsage = false;
+              showMemoryUsage = true;
+              showDiskAvailable = true;
+              useMonospaceFont = true;
+              usePadding = false;
+            }
+            { id = "plugin:privacy-indicator"; }
+            {
+              id = "plugin:catwalk";
+              defaultSettings = { minimumThreshold = 10; hideBackground = false; };
+            }
+          ];
+          center = [
+            {
+              id = "Clock";
+              formatHorizontal = "HH:mm ddd, MMM dd";
+              tooltipFormat = "HH:mm ddd, MMM dd";
+            }
+            {
+              id = "Workspace";
+              characterCount = 2;
+              showLabelsOnlyWhenOccupied = true;
+              labelMode = "index";
+              fontWeight = "bold";
+              showBadge = true;
+            }
+          ];
+          right = [
+            { id = "Tray"; drawerEnabled = true; }
+            { id = "Volume"; displayMode = "onhover"; middleClickCommand = "pavucontrol"; }
+            { id = "Brightness"; displayMode = "onhover"; }
+            { id = "plugin:screen-recorder"; }
+            { id = "plugin:screenshot"; }
+            { id = "plugin:tailscale"; }
+            { id = "plugin:network-indicator"; }
+            { id = "plugin:noctalia-supergfxctl"; }
+            {
+              id = "Battery";
+              displayMode = "graphic-clean";
+              hideIfNotDetected = true;
+              showPowerProfiles = false;
+            }
+            { id = "NotificationHistory"; showUnreadBadge = true; }
+            { id = "ControlCenter"; icon = "noctalia"; }
+          ];
+        };
       };
 
-      appLauncher = {
-        enableClipboardHistory = false; # using clipse instead
+      general = {
+        telemetryEnabled = false;
+        lockOnSuspend = true;
       };
+
+      ui = {
+        fontDefaultScale = 0.9;
+        tooltipsEnabled = false;
+      };
+
+      location = {
+        name = "Vienna";
+        weatherEnabled = false;
+        hideWeatherTimezone = true;
+        hideWeatherCityName = true;
+      };
+
+      calendar.cards = [
+        { enabled = true; id = "calendar-header-card"; }
+        { enabled = true; id = "calendar-month-card"; }
+        { enabled = false; id = "weather-card"; }
+      ];
 
       wallpaper = {
         overviewEnabled = true;
         automationEnabled = true;
       };
 
-      nightLight.enabled = true;
+      appLauncher.enableClipboardHistory = false; # using clipse
+
+      controlCenter.cards = [
+        { enabled = true; id = "profile-card"; }
+        { enabled = true; id = "shortcuts-card"; }
+        { enabled = true; id = "audio-card"; }
+        { enabled = false; id = "brightness-card"; }
+        { enabled = false; id = "weather-card"; }
+        { enabled = false; id = "media-sysmon-card"; }
+      ];
+
+      colorSchemes = {
+        predefinedScheme = "Catppuccin";
+        darkMode = true;
+      };
+
+      nightLight = {
+        enabled = true;
+        forced = true;
+        autoSchedule = true;
+        nightTemp = "3553";
+      };
 
       dock.enabled = false;
 
-      location = {
-        name = "Vienna";
-        hideWeatherTimezone = true;
-        hideWeatherCityName = true;
+      idle = {
+        enabled = true;
+        screenOffTimeout = 600;
+        lockTimeout = 660;
+        suspendTimeout = 1800;
       };
     };
 
@@ -280,19 +342,13 @@ in
         screenshot = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
         screen-recorder = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
         noctalia-supergfxctl = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
-        rss-feed = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
       };
       version = 2;
     };
 
     pluginSettings = {
-      catwalk = {
-        minimumThreshold = 25;
-        hideBackground = true;
-      };
+      catwalk = { minimumThreshold = 10; hideBackground = false; };
       tailscale.compactMode = true;
-      screenshot.defaultSettings.mode = "region";
-      screen-recorder.defaultSettings.copyToClipboard = false;
     };
   };
 
@@ -322,17 +378,18 @@ in
     };
   };
 
-  # Qt theming (consistent dark theme)
+  # Qt theming
   qt = {
     enable = true;
     platformTheme.name = "adwaita";
     style.name = "adwaita-dark";
   };
 
-  # Packages for Hyprland ecosystem
+  # Packages
   home.packages = with pkgs; [
     clipse
     grim
+    gpu-screen-recorder
     showtime
     slurp
     wl-clipboard
