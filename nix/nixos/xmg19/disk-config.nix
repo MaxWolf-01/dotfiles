@@ -33,7 +33,7 @@
             settings.allowDiscards = true;
             content = {
               type = "lvm_pv";
-              vg = "vg0";
+              vg = "vg-xmg19";
             };
           };
         };
@@ -41,7 +41,7 @@
     };
   };
 
-  disko.devices.lvm_vg.vg0 = {
+  disko.devices.lvm_vg.vg-xmg19 = {
     type = "lvm_vg";
     lvs = {
       root = {

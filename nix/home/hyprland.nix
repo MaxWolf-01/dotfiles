@@ -89,7 +89,7 @@ in
         # Apps
         "$mod, Return, exec, ghostty"
         "$mod, Space, exec, fuzzel"
-        "$mod, E, exec, nautilus"
+        "$mod, E, exec, ghostty -e yazi"
         "$mod, C, exec, firefox"
         "CTRL SHIFT, L, exec, hyprlock"
 
@@ -368,12 +368,47 @@ in
     };
   };
 
+  # MIME defaults
+  xdg = {
+    enable = true;
+    userDirs = {
+      enable = true;
+      createDirectories = true;
+    };
+    mimeApps = {
+      enable = true;
+      defaultApplications = {
+        "text/html" = "firefox.desktop";
+        "x-scheme-handler/http" = "firefox.desktop";
+        "x-scheme-handler/https" = "firefox.desktop";
+        "application/pdf" = "org.pwmt.zathura.desktop";
+        "image/png" = "org.gnome.Loupe.desktop";
+        "image/jpeg" = "org.gnome.Loupe.desktop";
+        "image/webp" = "org.gnome.Loupe.desktop";
+        "image/gif" = "org.gnome.Loupe.desktop";
+        "video/mp4" = "org.gnome.Showtime.desktop";
+        "video/webm" = "org.gnome.Showtime.desktop";
+        "video/x-matroska" = "org.gnome.Showtime.desktop";
+        "inode/directory" = "yazi.desktop";
+      };
+    };
+  };
+
+  # Qt theming (consistent dark theme)
+  qt = {
+    enable = true;
+    platformTheme.name = "adwaita";
+    style.name = "adwaita-dark";
+  };
+
   # Packages for Hyprland ecosystem
   home.packages = with pkgs; [
     clipse
     grim
+    showtime
     slurp
     wl-clipboard
+    wlogout
     hyprpolkitagent
     playerctl
     brightnessctl

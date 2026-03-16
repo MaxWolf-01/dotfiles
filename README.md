@@ -77,10 +77,11 @@ Reboot, remove USB.
 ```bash
 sudo apt-get update && sudo apt-get install -y git
 git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-cd ~/.dotfiles && ./setup host zephyrus   # dirs, symlinks, nix, HM switch
+cd ~/.dotfiles && ./setup host   # installs nix, runs first HM switch (uses hostname by default)
 ```
 
-Restart shell (nix needs it on first install), then re-run `./setup host zephyrus`.
+Restart shell (nix needs it on first install), then re-run `./setup host`.
+Use `./setup host <name>` if hostname doesn't match the flake config name.
 
 ```bash
 systemctl --user disable --now working-rsyncnet.timer working-pc.timer # don't accidentally overwrite backups 
@@ -110,12 +111,13 @@ All `./setup` functions are idempotent — safe to re-run.
 
 ## Setup (NixOS)
 
-For existing NixOS (pc):
 ```bash
 git clone https://github.com/MaxWolf-01/dotfiles.git ~/.dotfiles
-cd ~/.dotfiles && ./setup host <name>
-nswitch
+cd ~/.dotfiles
+sudo nixos-rebuild switch --flake .#$(hostname)
 ```
+
+`nswitch` / `hmswitch` default to `$(hostname)`. Use `./setup host <name>` to override when hostname differs from flake config name.
 
 For new NixOS installs via nixos-anywhere, see `docs/nixos-new-machine.md`.
 

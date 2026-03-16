@@ -27,6 +27,14 @@ ssh root@<target> 'ls -la /dev/disk/by-id/ | grep nvme | grep -v part'
 ```
 We installed to the wrong drive (256GB Patriot instead of 1TB Samsung) because of this.
 
+### CRITICAL: unique LVM VG names when multiple drives have LVM
+
+disko defaults VG name to whatever you set in `disko.devices.lvm_vg.<name>`. If you install NixOS on a second drive while the first drive also has an LVM VG with the same name, **both VGs will be called `vg0` and LVM can't distinguish them**. The initrd activates the wrong one, and root doesn't mount.
+
+Fix: use unique VG names per machine/drive in disko configs (e.g. `vg-xmg19` instead of `vg0`). Or wipe the old drive's LVM before installing.
+
+**Never rename a VG on a running system** — systemd services referencing the old name will break, and the initrd on other drives still expects the original name. If you're stuck with duplicate VGs, boot a live USB to fix.
+
 ### nixos-anywhere kexec changes IP
 
 kexec replaces the running kernel. The new kernel does its own DHCP and gets a different IP. nixos-anywhere tries to reconnect but often fails. Workaround: check the new IP on the target's console, then re-run with `--phases disko,install` at the new IP:

@@ -30,6 +30,11 @@
   home.file."bin".source =
     config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/bin";
 
+  # Ensure common dirs exist
+  home.activation.createDirs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+    mkdir -p ~/tmp ~/logs
+  '';
+
   programs.zsh = {
     enable = true;
     dotDir = "${config.xdg.configHome}/zsh";
