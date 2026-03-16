@@ -90,9 +90,11 @@ in
         "browser.download.autohideButton" = false;
         "browser.zoom.siteSpecific" = false;
 
-        # Tab unloading
+        # Tab unloading & memory pressure
         "browser.tabs.unloadOnLowMemory" = true;
-        "browser.low_commit_space_threshold_percent" = 5;
+        "browser.low_commit_space_threshold_percent" = 15;
+        "browser.tabs.min_inactive_duration_before_unload" = 300000; # 5min (default 10min)
+        "memory.free_dirty_pages" = true;
 
         # Search
         "browser.search.suggest.enabled" = false;
