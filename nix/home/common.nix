@@ -83,6 +83,7 @@
       "*.pdf"
       "**/notes/*"
       "**/notebooks/*"
+      ".sessions"
     ];
     attributes = [
       "*.lockb binary diff=lockb"

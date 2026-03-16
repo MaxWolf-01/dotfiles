@@ -29,6 +29,7 @@ in
     obsidian
     qdirstat
     signal-desktop
+    sshfs
     zathura
   ];
 
