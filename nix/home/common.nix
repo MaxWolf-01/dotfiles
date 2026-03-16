@@ -120,7 +120,7 @@
   programs.yazi = {
     enable = true;
     enableZshIntegration = true;
-    shellWrapperName = "y";
+    shellWrapperName = "_yazi";
     extraPackages = with pkgs; [ trash-cli dragon-drop ];
     initLua = ''
       -- Override built-in size linemode to also show mtime
