@@ -33,6 +33,17 @@
   services.xserver.videoDrivers = [ "nvidia" ];
   hardware.graphics.enable = true;
 
+  boot = {
+    initrd.kernelModules = [ "nvidia" "nvidia_modeset" "nvidia_uvm" "nvidia_drm" ];
+    kernelParams = [
+      "nvidia_drm.fbdev=1"
+      "nvidia.NVreg_PreserveVideoMemoryAllocations=1"
+      "nvidia.NVreg_TemporaryFilePath=/var/tmp"
+    ];
+    blacklistedKernelModules = [ "nouveau" ];
+    resumeDevice = "/dev/vg-xmg19/swap";
+  };
+
   hardware.nvidia = {
     modesetting.enable = true;
     open = true;
@@ -46,6 +57,12 @@
     powerManagement.enable = true;
     powerManagement.finegrained = true;
   };
+
+  environment.systemPackages = with pkgs; [
+    git firefox
+    nvidia-vaapi-driver
+    nvtopPackages.nvidia
+  ];
 
   # Hyprland
   programs.hyprland = {
@@ -99,9 +116,6 @@
         PasswordAuthentication yes
     '';
   };
-
-  # Bootstrap packages (available before HM is applied)
-  environment.systemPackages = with pkgs; [ git firefox ];
 
   # User
   users.users.max = {

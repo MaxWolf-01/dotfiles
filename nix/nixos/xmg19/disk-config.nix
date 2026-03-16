@@ -52,6 +52,10 @@
           mountpoint = "/";
         };
       };
+      swap = {
+        size = "32G";
+        content.type = "swap";
+      };
       home = {
         size = "100%FREE";
         content = {
