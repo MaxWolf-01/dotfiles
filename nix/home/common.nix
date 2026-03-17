@@ -122,6 +122,7 @@
     enableZshIntegration = true;
     shellWrapperName = "_yazi";
     extraPackages = with pkgs; [ trash-cli dragon-drop ];
+    settings.preview.cache_dir = "${config.xdg.cacheHome}/yazi";
     initLua = ''
       -- Override built-in size linemode to also show mtime
       function Linemode:size()
