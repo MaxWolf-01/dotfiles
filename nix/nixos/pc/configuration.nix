@@ -4,6 +4,7 @@
   imports = [
     ./hardware-configuration.nix
     ./youtube-download.nix
+    ./pihole.nix
   ];
 
   # Boot
