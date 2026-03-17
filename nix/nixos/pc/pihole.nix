@@ -7,6 +7,7 @@
     openFirewallWebserver = true;
     settings = {
       dns.upstreams = [ "1.1.1.1" "1.0.0.1" ];
+      dns.listeningMode = "all";
     };
     lists = [
       {
