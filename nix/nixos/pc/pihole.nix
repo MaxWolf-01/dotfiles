@@ -2,12 +2,12 @@
 
 {
   services.pihole-ftl = {
-    enable = true;
+    enable = false; # disabled until nixpkgs#500852 is fixed (pihole/pihole-ftl version mismatch)
     openFirewallDNS = true;
     openFirewallWebserver = true;
     settings = {
       dns.upstreams = [ "1.1.1.1" "1.0.0.1" ];
-      dns.listeningMode = "all";
+      dns.listeningMode = "all"; # default "local" ignores Tailscale queries; safe because firewall blocks external access
     };
     lists = [
       {
