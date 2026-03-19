@@ -30,6 +30,7 @@ in
     qdirstat
     signal-desktop
     sshfs
+    chromium
     codex
     zathura
   ];
