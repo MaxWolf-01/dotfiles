@@ -299,6 +299,7 @@
     go
     jq
     manix
+    markdown-oxide
     ncdu
     neovim
     nerd-fonts.hack

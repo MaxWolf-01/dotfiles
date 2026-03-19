@@ -2,9 +2,14 @@ return {
   "L3MON4D3/LuaSnip",
 
   config = function()
-    require("luasnip.loaders.from_lua").load()
-    require("luasnip.loaders.from_lua").lazy_load {
-      paths = vim.g.lua_snippets_path or "",
-    }
+    local ls = require("luasnip")
+
+    ls.setup({
+      enable_autosnippets = true,
+    })
+
+    require("luasnip.loaders.from_lua").load({
+      paths = { vim.fn.stdpath("config") .. "/snippets" },
+    })
   end,
 }

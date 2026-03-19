@@ -61,12 +61,23 @@ return {
     -- Cmdline completion (like : commands and / search)
     cmdline = {
       enabled = true,
+      keymap = {
+        preset = 'enter',
+        ['<Tab>'] = { 'select_and_accept', 'fallback' },
+        ['<S-Tab>'] = { 'select_prev', 'fallback' },
+      },
       completion = {
         menu = {
-          auto_show = true,  -- Show menu automatically, just like regular completion
+          auto_show = true,
         },
         ghost_text = {
-          enabled = true,  -- Preview the completion inline
+          enabled = true,
+        },
+        list = {
+          selection = {
+            preselect = true,
+            auto_insert = false,
+          },
         },
       },
     },
