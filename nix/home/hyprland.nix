@@ -1,14 +1,57 @@
-{ pkgs, config, lib, inputs, ... }:
+{ pkgs, config, lib, ... }:
 
 let
-  screenshotArea = "grim -g \"$(slurp)\" - | wl-copy";
-  screenshotFull = "grim - | wl-copy";
-  noctalia = cmd: "noctalia-shell ipc call ${cmd}";
+  screenshotArea = pkgs.writeShellScript "screenshot-area" ''
+    dir="$HOME/Pictures/Screenshots"
+    mkdir -p "$dir"
+    f="$dir/$(date +%Y%m%d_%H%M%S).png"
+    grim -g "$(slurp)" "$f" && wl-copy < "$f" && notify-send -t 2000 "Screenshot" "$f"
+  '';
+  screenshotFull = pkgs.writeShellScript "screenshot-full" ''
+    dir="$HOME/Pictures/Screenshots"
+    mkdir -p "$dir"
+    f="$dir/$(date +%Y%m%d_%H%M%S).png"
+    grim "$f" && wl-copy < "$f" && notify-send -t 2000 "Screenshot" "$f"
+  '';
+  brightnessCycle = pkgs.writeShellScript "brightness-cycle" ''
+    current=$(brightnessctl get)
+    max=$(brightnessctl max)
+    pct=$((current * 100 / max))
+    if [ "$pct" -lt 17 ]; then
+      brightnessctl set 33%
+    elif [ "$pct" -lt 50 ]; then
+      brightnessctl set 66%
+    elif [ "$pct" -lt 83 ]; then
+      brightnessctl set 100%
+    else
+      brightnessctl set 10%
+    fi
+  '';
+  powerProfileCycle = pkgs.writeShellScript "power-profile-cycle" ''
+    current=$(powerprofilesctl get)
+    case "$current" in
+      performance) powerprofilesctl set balanced ;;
+      balanced)    powerprofilesctl set power-saver ;;
+      *)           powerprofilesctl set performance ;;
+    esac
+  '';
+  hyprsunsetToggle = pkgs.writeShellScript "hyprsunset-toggle" ''
+    if pgrep -x hyprsunset > /dev/null; then
+      pkill -x hyprsunset
+    else
+      hyprsunset -t 3500 &
+    fi
+  '';
 in
 {
-  imports = [
-    inputs.noctalia.homeModules.default
-  ];
+  # Catppuccin theming
+  catppuccin = {
+    enable = true;
+    flavor = "mocha";
+    yazi.enable = false; # yazi has its own theme config in common.nix
+  };
+
+  # ── Hyprland ────────────────────────────────────────────────
 
   wayland.windowManager.hyprland = {
     enable = true;
@@ -16,14 +59,13 @@ in
     systemd.enable = false; # MUST be false with UWSM
 
     settings = {
-      # Master layout: one big window left, rest stack right
       general = {
         layout = "master";
         gaps_in = 4;
         gaps_out = 8;
         border_size = 2;
-        "col.active_border" = "rgba(88c0d0ff) rgba(81a1c1ff) 45deg";
-        "col.inactive_border" = "rgba(4c566aaa)";
+        "col.active_border" = "rgba(89b4faff) rgba(cba6f7ff) 45deg";
+        "col.inactive_border" = "rgba(585b70aa)";
         allow_tearing = false;
       };
 
@@ -32,7 +74,7 @@ in
         mfact = 0.65;
       };
 
-      monitor = [ ",preferred,auto,1" ]; # force scale 1x (auto-detect picks 1.5x on 1080p 15.6")
+      monitor = [ ",preferred,auto,1" ];
 
       input = {
         kb_layout = "de";
@@ -70,9 +112,8 @@ in
         disable_hyprland_guiutils_check = true;
       };
 
-      cursor.no_hardware_cursors = 2; # auto, recommended for NVIDIA
+      cursor.no_hardware_cursors = 2;
 
-      # Environment
       env = [
         "NIXOS_OZONE_WL,1"
         "XDG_CURRENT_DESKTOP,Hyprland"
@@ -82,27 +123,27 @@ in
         "ELECTRON_OZONE_PLATFORM_HINT,auto"
       ];
 
-      # Autostart
       exec-once = [
         "systemctl --user start hyprpolkitagent"
-        "noctalia-shell"
+        "hyprpaper"
+        "nm-applet"
+        "blueman-applet"
         "clipse -listen"
       ];
 
-      # Keybindings
       "$mod" = "SUPER";
 
       bind = [
         # Apps
         "$mod, Return, exec, ghostty"
-        "$mod, Space, exec, ${noctalia "launcher toggle"}"
+        "$mod, Space, exec, fuzzel"
         "$mod, E, exec, ghostty -e yazi"
         "$mod, C, exec, firefox"
 
         # Session
         "$mod SHIFT, Q, exit,"
-        "CTRL SHIFT, L, exec, ${noctalia "lockScreen lock"}"
-        "$mod, P, exec, ${noctalia "sessionMenu toggle"}"
+        "CTRL SHIFT, L, exec, pidof hyprlock || hyprlock"
+        "$mod, P, exec, pgrep wlogout && pkill wlogout || wlogout"
 
         # Window management
         "$mod, W, killactive,"
@@ -149,16 +190,20 @@ in
         "$mod SHIFT, 8, movetoworkspace, 8"
         "$mod SHIFT, 9, movetoworkspace, 9"
 
-        # Screenshots (fallback — also via Noctalia screenshot plugin)
-        "$mod, S, exec, ${screenshotArea}"
+        # Screenshots (kill previous slurp if running to prevent stacking)
+        "$mod, S, exec, pkill slurp; ${screenshotArea}"
+        ", Print, exec, ${screenshotFull}"
         "$mod SHIFT, S, exec, ${screenshotFull}"
 
         # Clipboard history
         "CTRL ALT, H, exec, ghostty --class=clipse -e clipse"
 
-        # Notifications + night light
-        "$mod, N, exec, ${noctalia "notifications dismiss"}"
-        "$mod SHIFT, N, exec, ${noctalia "nightLight toggle"}"
+        # Notifications
+        "$mod, N, exec, makoctl dismiss"
+        "$mod SHIFT, N, exec, makoctl dismiss --all"
+
+        # Night light
+        "CTRL $mod, N, exec, ${hyprsunsetToggle}"
 
         # Cycle windows
         "ALT, Tab, cyclenext,"
@@ -169,190 +214,334 @@ in
         "$mod, period, layoutmsg, mfact +0.05"
       ];
 
-      # Mouse bindings
+      # Media/hardware keys (repeatable)
+      bindel = [
+        ", XF86AudioRaiseVolume, exec, wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+"
+        ", XF86AudioLowerVolume, exec, wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"
+        ", XF86MonBrightnessUp, exec, brightnessctl set 5%+"
+        ", XF86MonBrightnessDown, exec, brightnessctl -n set 5%-"
+      ];
+
+      # Media/hardware keys (non-repeating)
+      bindl = [
+        ", XF86AudioMute, exec, wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
+        ", XF86AudioMicMute, exec, wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"
+        ", XF86AudioPlay, exec, playerctl play-pause"
+        ", XF86AudioNext, exec, playerctl next"
+        ", XF86AudioPrev, exec, playerctl previous"
+      ];
+
       bindm = [
         "$mod, mouse:272, movewindow"
         "$mod, mouse:273, resizewindow"
       ];
 
-      # Window rules
       windowrule = [
-        # Clipboard popup
         "float on, match:class clipse"
         "size 700 500, match:class clipse"
         "center on, match:class clipse"
 
-        # Picture-in-picture
         "float on, match:title Picture-in-picture"
         "pin on, match:title Picture-in-picture"
         "float on, match:title Picture-in-Picture"
         "pin on, match:title Picture-in-Picture"
 
-        # File picker
         "float on, match:class Xdg-desktop-portal-gtk"
         "center on, match:class Xdg-desktop-portal-gtk"
       ];
     };
   };
 
-  # Noctalia Shell
-  programs.noctalia-shell = {
+  # ── Waybar ──────────────────────────────────────────────────
+
+  programs.waybar = {
     enable = true;
-    systemd.enable = false; # started via exec-once
+    systemd.enable = true;
+    systemd.target = "graphical-session.target";
 
-    settings = {
-      settingsVersion = 59;
+    settings.mainBar = {
+      layer = "top";
+      position = "top";
+      height = 30;
+      spacing = 4;
 
-      bar = {
-        position = "bottom";
-        density = "compact";
-        showCapsule = false;
-        widgetSpacing = 0;
-        contentPadding = 0;
-        fontScale = 0.95;
+      modules-left = [ "hyprland/workspaces" ];
+      modules-center = [ "clock" ];
+      modules-right = [
+        "tray"
+        "power-profiles-daemon"
+        "bluetooth"
+        "network"
+        "pulseaudio"
+        "backlight"
+        "battery"
+        "custom/power"
+      ];
 
-        widgets = {
-          left = [
-            {
-              id = "SystemMonitor";
-              compactMode = true;
-              showCpuTemp = true;
-              showCpuUsage = false;
-              showMemoryUsage = true;
-              showDiskAvailable = true;
-              useMonospaceFont = true;
-              usePadding = false;
-            }
-            { id = "plugin:privacy-indicator"; }
-            {
-              id = "plugin:catwalk";
-              defaultSettings = { minimumThreshold = 10; hideBackground = false; };
-            }
-          ];
-          center = [
-            {
-              id = "Clock";
-              formatHorizontal = "HH:mm ddd, MMM dd";
-              tooltipFormat = "HH:mm ddd, MMM dd";
-            }
-            {
-              id = "Workspace";
-              characterCount = 2;
-              showLabelsOnlyWhenOccupied = true;
-              labelMode = "index";
-              fontWeight = "bold";
-              showBadge = true;
-            }
-          ];
-          right = [
-            { id = "Tray"; drawerEnabled = true; }
-            { id = "Volume"; displayMode = "onhover"; middleClickCommand = "pavucontrol"; }
-            { id = "Brightness"; displayMode = "onhover"; }
-            { id = "plugin:screen-recorder"; }
-            { id = "plugin:screenshot"; }
-            { id = "plugin:tailscale"; }
-            { id = "plugin:network-indicator"; }
-            { id = "plugin:noctalia-supergfxctl"; }
-            {
-              id = "Battery";
-              displayMode = "graphic-clean";
-              hideIfNotDetected = true;
-              showPowerProfiles = false;
-            }
-            { id = "NotificationHistory"; showUnreadBadge = true; }
-            { id = "ControlCenter"; icon = "noctalia"; }
-          ];
+      "hyprland/workspaces" = {
+        format = "{id}";
+        on-click = "activate";
+        sort-by-number = true;
+      };
+
+      clock = {
+        format = "{:%H:%M  %a, %b %d}";
+        tooltip-format = "<tt>{calendar}</tt>";
+      };
+
+      battery = {
+        format = "{icon} {capacity}%";
+        format-icons = [ "" "" "" "" "" ];
+        format-charging = " {capacity}%";
+        states = {
+          warning = 20;
+          critical = 10;
         };
       };
 
-      general = {
-        telemetryEnabled = false;
-        lockOnSuspend = true;
+      network = {
+        format-wifi = " {essid}";
+        format-ethernet = " {ifname}";
+        format-disconnected = "󰖪 ";
+        tooltip-format = "{ipaddr}/{cidr}";
+        on-click = "nm-connection-editor";
       };
 
-      ui = {
-        fontDefaultScale = 0.9;
-        tooltipsEnabled = false;
+      bluetooth = {
+        format = "";
+        format-connected = " {device_alias}";
+        format-disabled = "󰂲";
+        on-click = "blueman-manager";
+        tooltip-format = "{status}";
       };
 
-      location = {
-        name = "Vienna";
-        weatherEnabled = false;
-        hideWeatherTimezone = true;
-        hideWeatherCityName = true;
+      pulseaudio = {
+        format = "{icon} {volume}%";
+        format-muted = "󰝟 ";
+        format-icons.default = [ "" "" "" ];
+        on-click = "pavucontrol";
+        on-click-right = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle";
       };
 
-      calendar.cards = [
-        { enabled = true; id = "calendar-header-card"; }
-        { enabled = true; id = "calendar-month-card"; }
-        { enabled = false; id = "weather-card"; }
-      ];
-
-      wallpaper = {
-        overviewEnabled = true;
-        automationEnabled = true;
+      backlight = {
+        format = "󰃟 {percent}%";
+        on-scroll-up = "brightnessctl set 5%+";
+        on-scroll-down = "brightnessctl set 5%-";
+        on-click = "${brightnessCycle}";
       };
 
-      appLauncher.enableClipboardHistory = false; # using clipse
-
-      controlCenter.cards = [
-        { enabled = true; id = "profile-card"; }
-        { enabled = true; id = "shortcuts-card"; }
-        { enabled = true; id = "audio-card"; }
-        { enabled = false; id = "brightness-card"; }
-        { enabled = false; id = "weather-card"; }
-        { enabled = false; id = "media-sysmon-card"; }
-      ];
-
-      colorSchemes = {
-        predefinedScheme = "Catppuccin";
-        darkMode = true;
+      "power-profiles-daemon" = {
+        format = "{icon}";
+        format-icons = {
+          default = "";
+          performance = "";
+          balanced = "";
+          power-saver = "";
+        };
+        tooltip-format = "Profile: {profile}";
+        on-click = "${powerProfileCycle}";
       };
 
-      nightLight = {
-        enabled = true;
-        forced = true;
-        autoSchedule = true;
-        nightTemp = "3553";
+      tray = {
+        spacing = 10;
       };
 
-      dock.enabled = false;
-
-      idle = {
-        enabled = true;
-        screenOffTimeout = 600;
-        lockTimeout = 660;
-        suspendTimeout = 1800;
+      "custom/power" = {
+        format = "⏻";
+        on-click = "wlogout";
+        tooltip = false;
       };
+
     };
 
-    plugins = {
-      sources = [
-        {
-          enabled = true;
-          name = "Official Noctalia Plugins";
-          url = "https://github.com/noctalia-dev/noctalia-plugins";
-        }
-      ];
-      states = {
-        catwalk = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
-        network-indicator = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
-        privacy-indicator = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
-        tailscale = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
-        screenshot = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
-        screen-recorder = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
-        noctalia-supergfxctl = { enabled = true; sourceUrl = "https://github.com/noctalia-dev/noctalia-plugins"; };
-      };
-      version = 2;
-    };
+    style = ''
+      * {
+        font-family: "JetBrains Mono", "Symbols Nerd Font";
+        font-size: 13px;
+      }
 
-    pluginSettings = {
-      catwalk = { minimumThreshold = 10; hideBackground = false; };
-      tailscale.compactMode = true;
+      window#waybar {
+        background-color: rgba(30, 30, 46, 0.9);
+        color: @text;
+      }
+
+      #workspaces button {
+        padding: 0 8px;
+        color: @overlay1;
+        border-bottom: 2px solid transparent;
+      }
+
+      #workspaces button.active {
+        color: @blue;
+        border-bottom: 2px solid @blue;
+      }
+
+      #workspaces button.urgent {
+        color: @red;
+      }
+
+      #clock {
+        font-weight: bold;
+      }
+
+      #battery.warning {
+        color: @yellow;
+      }
+
+      #battery.critical {
+        color: @red;
+      }
+
+      #network.disconnected {
+        color: @overlay0;
+      }
+
+      #pulseaudio.muted {
+        color: @overlay0;
+      }
+
+      #tray,
+      #battery,
+      #network,
+      #bluetooth,
+      #pulseaudio,
+      #backlight,
+      #power-profiles-daemon,
+      #custom-power {
+        padding: 0 8px;
+      }
+
+      #custom-power {
+        color: @red;
+      }
+    '';
+  };
+
+  # ── Mako (notifications) ────────────────────────────────────
+
+  services.mako = {
+    enable = true;
+    settings = {
+      default-timeout = 8000;
+      anchor = "top-right";
+      border-radius = 8;
+      border-size = 2;
+      padding = "10";
+      margin = "10";
+      width = 350;
+      max-visible = 3;
     };
   };
 
-  # MIME defaults
+  # ── Hyprlock (lock screen) ──────────────────────────────────
+
+  programs.hyprlock = {
+    enable = true;
+    settings = {
+      general = {
+        hide_cursor = true;
+        grace = 5;
+      };
+
+      background = [{
+        path = "screenshot";
+        blur_passes = 3;
+        blur_size = 8;
+      }];
+
+      input-field = [{
+        size = "250, 50";
+        outline_thickness = 2;
+        dots_center = true;
+        fade_on_empty = true;
+        placeholder_text = "";
+        position = "0, -20";
+        halign = "center";
+        valign = "center";
+      }];
+
+      label = [{
+        text = "$TIME";
+        font_size = 64;
+        position = "0, 100";
+        halign = "center";
+        valign = "center";
+      }];
+    };
+  };
+
+  # ── Hypridle (idle management) ──────────────────────────────
+
+  services.hypridle = {
+    enable = true;
+    settings = {
+      general = {
+        lock_cmd = "pidof hyprlock || hyprlock";
+        before_sleep_cmd = "loginctl lock-session";
+        after_sleep_cmd = "hyprctl dispatch dpms on";
+      };
+
+      listener = [
+        {
+          timeout = 900; # 15 min — screen off
+          on-timeout = "hyprctl dispatch dpms off";
+          on-resume = "hyprctl dispatch dpms on";
+        }
+        {
+          timeout = 3600; # 1 hour — lock
+          on-timeout = "loginctl lock-session";
+        }
+        {
+          timeout = 3900; # 1h05 — suspend (only on battery, but hypridle doesn't know power state — logind handles AC)
+          on-timeout = "systemctl suspend";
+        }
+      ];
+    };
+  };
+
+  # ── Fuzzel (app launcher) ───────────────────────────────────
+
+  programs.fuzzel = {
+    enable = true;
+    settings = {
+      main = {
+        font = "JetBrains Mono:size=12";
+        terminal = "ghostty -e";
+        layer = "overlay";
+        width = 40;
+        lines = 12;
+      };
+    };
+  };
+
+  # ── Wlogout (power menu) ────────────────────────────────────
+
+  programs.wlogout = {
+    enable = true;
+    layout = [
+      { label = "lock";      action = "hyprlock";                  text = "Lock";      keybind = "l"; }
+      { label = "suspend";   action = "systemctl suspend";         text = "Suspend";   keybind = "s"; }
+      { label = "hibernate"; action = "systemctl hibernate";       text = "Hibernate"; keybind = "h"; }
+      { label = "reboot";    action = "systemctl reboot";          text = "Reboot";    keybind = "r"; }
+      { label = "shutdown";  action = "systemctl poweroff";        text = "Shutdown";  keybind = "p"; }
+      { label = "logout";    action = "hyprctl dispatch exit";     text = "Logout";    keybind = "e"; }
+    ];
+  };
+
+  # ── Hyprpaper (wallpaper) ───────────────────────────────────
+
+  services.hyprpaper = {
+    enable = true;
+    settings = {
+      ipc = "off";
+      splash = false;
+      preload = [ "~/Pictures/Wallpapers/wallpaper.jpg" ];
+      wallpaper = [ ",~/Pictures/Wallpapers/wallpaper.jpg" ];
+    };
+  };
+
+  # ── MIME defaults ───────────────────────────────────────────
+
   xdg = {
     enable = true;
     userDirs = {
@@ -378,18 +567,23 @@ in
     };
   };
 
-  # Qt theming
+  # ── Qt theming (catppuccin handles this via kvantum) ─────────
+
   qt = {
     enable = true;
-    platformTheme.name = "adwaita";
-    style.name = "adwaita-dark";
+    style.name = "kvantum";
   };
 
-  # Packages
+  # ── Packages ────────────────────────────────────────────────
+
   home.packages = with pkgs; [
     clipse
     grim
+    libnotify
     gpu-screen-recorder
+    hyprsunset
+    loupe
+    nwg-displays
     showtime
     slurp
     wl-clipboard
