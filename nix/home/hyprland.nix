@@ -48,7 +48,8 @@ in
   catppuccin = {
     enable = true;
     flavor = "mocha";
-    yazi.enable = false; # yazi has its own theme config in common.nix
+    yazi.enable = false;
+    hyprlock.enable = false; # catppuccin adds duplicate background/input-field/label blocks
   };
 
   # ── Hyprland ────────────────────────────────────────────────
@@ -444,29 +445,55 @@ in
       };
 
       background = [{
+        monitor = "";
         path = "screenshot";
         blur_passes = 3;
         blur_size = 8;
       }];
 
       input-field = [{
-        size = "250, 50";
-        outline_thickness = 2;
+        monitor = "";
+        size = "300, 60";
+        outline_thickness = 3;
+        dots_size = 0.2;
+        dots_spacing = 0.2;
         dots_center = true;
-        fade_on_empty = true;
-        placeholder_text = "";
-        position = "0, -20";
+        outer_color = "$blue";
+        inner_color = "$surface0";
+        font_color = "$text";
+        fade_on_empty = false;
+        check_color = "$blue";
+        fail_color = "$red";
+        fail_text = "<i>$FAIL <b>($ATTEMPTS)</b></i>";
+        capslock_color = "$yellow";
+        placeholder_text = "<i>Password...</i>";
+        position = "0, -47";
         halign = "center";
         valign = "center";
       }];
 
-      label = [{
-        text = "$TIME";
-        font_size = 64;
-        position = "0, 100";
-        halign = "center";
-        valign = "center";
-      }];
+      label = [
+        {
+          monitor = "";
+          text = "$TIME";
+          color = "$text";
+          font_size = 90;
+          font_family = "JetBrains Mono";
+          position = "0, 100";
+          halign = "center";
+          valign = "center";
+        }
+        {
+          monitor = "";
+          text = "cmd[update:43200000] date +\"%A, %d %B %Y\"";
+          color = "$subtext1";
+          font_size = 22;
+          font_family = "JetBrains Mono";
+          position = "0, 20";
+          halign = "center";
+          valign = "center";
+        }
+      ];
     };
   };
 
