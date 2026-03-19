@@ -131,6 +131,7 @@
     ];
   };
   programs.zsh.enable = true;
+  programs.nix-ld.enable = true;
 
   # Nix
   nixpkgs.config.allowUnfree = true;

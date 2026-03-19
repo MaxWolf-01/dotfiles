@@ -275,6 +275,7 @@
         extraOptions = {
           AddKeysToAgent = "yes";
           IdentitiesOnly = "yes";
+          IgnoreUnknown = "GSSAPIAuthentication";
         };
         identityFile = [ "~/.ssh/id_ed25519" ];
       };
