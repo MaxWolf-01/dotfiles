@@ -114,13 +114,6 @@ Custom systemd services need explicit `path` for any package whose binaries the 
 
 See `docs/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).
 
-## Remote Commands (SSH without sudo)
-
-When SSH'd into a machine without sudo TTY access, send commands via:
-```bash
-echo 'sudo command here > ~/Downloads/out 2>&1' | ssh max@<ip> 'cat > ~/Downloads/cmd'
-```
-User runs `bash ~/Downloads/cmd` locally. Append `> ~/Downloads/out 2>&1` when no interactive input is needed. After user confirms they ran it, read with `ssh max@<ip> 'cat ~/Downloads/out'`. If interactive input is needed (sudo password, LUKS passphrase), user copies output to `~/Downloads/out` manually — still read from there.
 
 ## What stays outside Nix
 

@@ -26,6 +26,7 @@ On my communication style:
 - It can mean your message was too long, contained too much slop, you need more context, or my head is full of ideas I need to get out / get your quick feedback on to develop my thinking.
 - Silence on a point != agreement. It often means "slop, moving on". If I want to see something done, I make that explicit.
 - Don't interpret partial engagement as "time to implement".
+- Don't ask me to do things that you could do yourself via the commandline !
 
 - Heads up: Should my prompts ever sound a bit weird or have seemingly out of place workds / some words or sentences don't sound quite right it might very well be because I'm using speech to text software - sometimes you have to do a little bit of interpretation. Always point out  to me if you're unsure what I mean.
 
@@ -151,16 +152,24 @@ mx vault:add name ~/path/to/dir                        # create or extend a vaul
 
 `explore` takes a title (must be unique in vault) or a path prefix to disambiguate. Rephrase or vary queries if results aren't what you expected.
 
-`tmux` — for long-running / observable commands instead of the harness background task tool.
-- Use `tms claude` to create/attach to the shared session.
-- Send commands: `tmux send-keys -t claude 'command' Enter`
-- Read output: `tmux capture-pane -t claude -p`
-- Create additional panes/windows as needed within the `claude` session.
+`tmux` — for long-running / observable commands and interactive sessions (local or remote).
+- Local: `tms claude` to create/attach to the shared session.
+- Send commands: `tmux send-keys -t claude -l 'command'` then `tmux send-keys -t claude Enter`
+- Read output: `tmux capture-pane -p -J -t claude -S -50` (`-J` joins wrapped lines)
+- Remote (SSH): always quote the full tmux command for SSH to preserve spaces:
+  ```
+  ssh host "tmux send-keys -t claude -l 'command'"
+  ssh host "tmux send-keys -t claude Enter"
+  ssh host "tmux capture-pane -p -J -t claude -S -50"
+  ```
+- Interactive prompts (sudo, etc.): poll for the prompt before sending input — don't race it.
+  Use `bin/tmux-wait-for-text` or a manual poll loop checking `capture-pane` output for the expected prompt.
+- User can always attach directly: `ssh host -t "tmux attach -t claude"` (or locally: `tmux attach -t claude`)
 
 Permissions: Understanding this will allow you to go faster (when it's time to implement, experiment, or gather information).
 - Read-only commands are auto-approved in ~/.claude/settings.json.
 - For `gh api`: Always use `-X GET` explicitly (e.g., `gh api -X GET repos/owner/repo`) — this is the only form that's auto-approved. POST/PUT/DELETE will prompt.
-- For `ssh` commands: **NEVER quote the remote command** unless actually needed (spaces/metacharacters in arguments). Quotes are literal in the command string — `ssh host "cmd arg"` doesn't match the glob `ssh * cmd *` because `"cmd arg"` is one token. Always `ssh host cmd arg`.
+- For `ssh` commands: **NEVER quote the remote command** unless actually needed (spaces/metacharacters in arguments). Quotes are literal in the command string — `ssh host "cmd arg"` doesn't match the glob `ssh * cmd *` because `"cmd arg"` is one token. Always `ssh host cmd arg`. Exception: tmux commands with `-l` need quoting to preserve spaces — `ssh host "tmux send-keys -t sess -l 'text with spaces'"` — these will prompt for permission.
 - ALWAYS prefer `fd` over `find` — unless it is not powerful enough, e.g. you actually want to delete something — fd is read-only by design (no -delete, no -exec), so I'm not prompted for giving you permission.
 
 If you find a tool that would help you accomplish your task more efficiently / effectively isn't installed, you have several options:
