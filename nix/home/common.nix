@@ -192,6 +192,8 @@
       mgr.prepend_keymap = [
         { on = [ "<Enter>" ]; run = "plugin smart-enter"; desc = "Enter directory / open file"; }
         { on = [ "<C-n>" ]; run = "plugin dragon-drop"; desc = "Drag and drop selected files"; }
+        { on = [ "N" ]; run = "shell 'nautilus . &' --confirm"; desc = "Open nautilus here"; }
+        { on = [ "T" ]; run = "shell 'ghostty &' --confirm"; desc = "Open terminal here"; }
       ];
     };
     settings = {
