@@ -33,6 +33,12 @@
   services.xserver.videoDrivers = [ "nvidia" ];
   hardware.graphics.enable = true;
 
+  # XMG uses Clevo/Tongfang chassis (uniwill_wmi). tuxedo-drivers loads but
+  # Fn+F-key media combos send unmapped scancodes (0xf8 etc.) — no volume/brightness.
+  # Needs udev hwdb rules to map scancodes to keycodes. Ubuntu ships these; NixOS doesn't.
+  # TODO: add hwdb rules or find the right scancode→keycode mappings for this model.
+  hardware.tuxedo-drivers.enable = true;
+
   boot = {
     initrd.kernelModules = [ "nvidia" "nvidia_modeset" "nvidia_uvm" "nvidia_drm" ];
     kernelParams = [
@@ -77,6 +83,9 @@
     wayland.enable = true;
   };
 
+  # PAM (needed for hyprlock)
+  security.pam.services.hyprlock = {};
+
   # Audio
   services.pipewire = {
     enable = true;
@@ -88,12 +97,24 @@
 
   # Bluetooth
   hardware.bluetooth.enable = true;
+  services.blueman.enable = true;
 
   # Power management (laptop)
   services.power-profiles-daemon.enable = true;
   services.thermald.enable = true;
   services.upower.enable = true;
-  services.udisks2.enable = true; # auto-mount removable drives
+  services.udisks2.enable = true;
+
+  # Lid/idle: hypridle controls screen/lock/suspend, not logind
+  services.logind.settings.Login = {
+    HandleLidSwitch = "ignore";
+    HandleLidSwitchExternalPower = "ignore";
+    HandleLidSwitchDocked = "ignore";
+    IdleAction = "ignore";
+  };
+
+  # Keep wifi alive during idle
+  networking.networkmanager.wifi.powersave = false;
 
   # Docker + GPU passthrough
   virtualisation.docker = {

@@ -15,18 +15,10 @@
       url = "github:nix-community/disko";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    noctalia = {
-      url = "github:noctalia-dev/noctalia-shell";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.noctalia-qs.follows = "noctalia-qs";
-    };
-    noctalia-qs = {
-      url = "github:noctalia-dev/noctalia-qs";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    catppuccin.url = "github:catppuccin/nix";
   };
 
-  outputs = { self, nixpkgs, home-manager, rime, disko, noctalia, ... }@inputs:
+  outputs = { self, nixpkgs, home-manager, rime, disko, catppuccin, ... }@inputs:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -60,13 +52,19 @@
         specialArgs = { inherit self rime system; };
         modules = [
           disko.nixosModules.disko
+          catppuccin.nixosModules.catppuccin
           ./nix/nixos/xmg19/configuration.nix
           home-manager.nixosModules.home-manager
           {
             home-manager.useGlobalPkgs = true;
             home-manager.useUserPackages = true;
-            home-manager.extraSpecialArgs = { inherit inputs rime system; };
-            home-manager.users.max = import ./nix/home/hosts/xmg19.nix;
+            home-manager.extraSpecialArgs = { inherit rime system; };
+            home-manager.users.max = {
+              imports = [
+                catppuccin.homeModules.catppuccin
+                ./nix/home/hosts/xmg19.nix
+              ];
+            };
             home-manager.backupFileExtension = "bak";
           }
         ];

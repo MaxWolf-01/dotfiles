@@ -5,16 +5,17 @@ Super = $mod. Layout: master (big window left, stack right).
 ## Apps
 | Key | Action |
 |---|---|
-| Super+Enter | Terminal (ghostty) |
-| Super+Space | App launcher (fuzzel) |
-| Super+E | File manager (nautilus) |
-| Super+C | Browser (firefox) |
+| Super+Enter | Terminal |
+| Super+Space | App launcher |
+| Super+E | File manager |
+| Super+C | Browser |
 
 ## Session
 | Key | Action |
 |---|---|
-| Super+Shift+Q | Logout (back to SDDM) |
+| Super+Shift+Q | Logout |
 | Ctrl+Shift+L | Lock screen |
+| Super+P | Power menu |
 
 ## Windows
 | Key | Action |
@@ -23,7 +24,6 @@ Super = $mod. Layout: master (big window left, stack right).
 | Super+M | Maximize (keep bar) |
 | Super+Shift+M | True fullscreen |
 | Super+F | Toggle floating |
-| Super+P | Pin (stays on all workspaces) |
 
 ## Focus (vim)
 | Key | Action |
@@ -48,7 +48,7 @@ Super = $mod. Layout: master (big window left, stack right).
 ## Master Layout
 | Key | Action |
 |---|---|
-| Super+Shift+Enter | Swap focused ↔ master |
+| Super+Shift+Enter | Swap focused <-> master |
 | Super+Shift+Period | Add another master |
 | Super+Shift+Comma | Remove a master |
 | Super+Comma | Shrink master area |
@@ -57,8 +57,9 @@ Super = $mod. Layout: master (big window left, stack right).
 ## Tools
 | Key | Action |
 |---|---|
-| Super+S | Screenshot area → clipboard |
-| Super+Shift+S | Screenshot full screen → clipboard |
-| Ctrl+Alt+H | Clipboard history (clipse) |
+| Super+S | Screenshot area -> clipboard |
+| Super+Shift+S | Screenshot full screen -> clipboard |
+| Ctrl+Alt+H | Clipboard history |
 | Super+N | Dismiss notification |
 | Super+Shift+N | Dismiss all notifications |
+| Ctrl+Super+N | Toggle night light |
