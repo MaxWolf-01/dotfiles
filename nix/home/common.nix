@@ -273,6 +273,10 @@
         hostname = "100.87.244.58";
         user = "root";
       };
+      "xmg xmg19" = {
+        hostname = "100.97.152.25";
+        user = "max";
+      };
       "*" = {
         extraOptions = {
           AddKeysToAgent = "yes";
