@@ -206,16 +206,11 @@ Orient before significant work: if the project has `agent/knowledge/`, follow wi
 </workflow>
 
 <subagents>
-When spawning sub-agents via the Task tool, be selective about model choice:
-
-- **Haiku**: Only for trivial tasks like finding needles in haystacks which would be too costly to do yourself (e.g., searching large codebases for specific, well-defined patterns, extracting structured data from large documents).
-- **Sonnet**: For simple subagent tasks — offloading a batch of well-defined web searches and information retrieval, given clear context. Tasks that require very little interpretation or reasoning.
-- **Opus**: For most things else — including information gathering on the web or from non-trivial, undocumented codebases, anything that requires reasoning about context, multi-step tasks.
-
 NEVER use subagents to do edits. They do have read only permissions.
 NEVER use subagents to read source code files, documentation, or knowledge files, unless you need to plan across many different aspects in a huge codebase or need to research 2-3 isolated things in parallel.
 You have 1mio token context window, that's plenty. Read source files yourself, form a proper mental model, do not outsource reading code or docs yourself, especially if there is existing documentation / it's easy to orient yourself. 
 READ A LOT OF FILES, GATHER MORE CONTEXT THAN YOU THINK YOU NEED
+DO NOT USE SUBAGENTS.
 </subagents>
 
 <git>
