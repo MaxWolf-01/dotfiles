@@ -4,7 +4,7 @@ Everything rebuildable from version control. Dotfiles (public) for all config. `
 
 I'm learning Nix — explain what you do and suggest improvements proactively.
 
-For device inventory, infrastructure, and backup architecture: always read `secrets/README.md` and `secrets/backup/README.md` before working on infra-related tasks.
+For device inventory, infrastructure, and backup architecture: always read `secrets/README.md` and `secrets/backup/README.md` before working on infra-related tasks. SSH aliases are defined in `nix/home/common.nix` (programs.ssh.matchBlocks).
 
 ## Git: Two Repos
 
