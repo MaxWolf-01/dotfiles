@@ -7,6 +7,7 @@
       font-family = "UbuntuSansMono Nerd Font Mono";
       shell-integration-features = "ssh-terminfo,ssh-env";
       confirm-close-surface = false;
+      clipboard-paste-protection = false;
       copy-on-select = "clipboard";
       # Pass Alt+N through to tmux instead of ghostty tab switching
       keybind = [
