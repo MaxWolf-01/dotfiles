@@ -126,6 +126,7 @@ in
         "media.ffmpeg.vaapi.enabled" = true;
         "widget.use-xdg-desktop-portal.file-picker" = 1;
         "media.eme.enabled" = true;
+        "media.webspeech.synth.enabled" = false;
       };
     };
   };
