@@ -278,6 +278,10 @@
         hostname = "100.97.152.25";
         user = "max";
       };
+      "zephylux main" = {
+        hostname = "100.104.165.39";
+        user = "max";
+      };
       "*" = {
         extraOptions = {
           AddKeysToAgent = "yes";
