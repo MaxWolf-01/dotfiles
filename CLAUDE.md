@@ -15,7 +15,12 @@ For device inventory, infrastructure, and backup architecture: always read `secr
 
 ## Getting Started
 
-ALWAYS read README.md to get a quick high-level overview of the project structure / setup / usage flow.
+‼️‼️‼️
+
+ALWAYS read README.md and secrets/README.md to get a quick high-level overview of the project structure / setup / usage flow.
+ALWAYS read the nix config files etc. first when debugging anything/before answering anything, etc.
+
+‼️‼️‼️
 
 **IMPORTANT: Nix flakes only see git-tracked files.** When creating new `.nix` files, `git add` them BEFORE running `hmswitch`/`nswitch`/any flake command — otherwise the build fails with "path does not exist".
 

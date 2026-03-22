@@ -112,6 +112,7 @@ better work.
   - Chains are okay only when functionally necessary or when splitting would be significantly more costly. If you find yourself needing the same chain repeatedly, write a script.
 
 - Don't use worktrees, use fresh checkouts. For short-lived, ephemeral work like quick patches or exploring a repo, simply clone it to /tmp (you have full Read/Write permissions there).
+- Do NOT clone from a local path (e.g. `git clone /path/to/repo`) — always clone from the remote/github url.
 </anti-patterns>
 
 <tools>
