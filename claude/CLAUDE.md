@@ -136,6 +136,9 @@ better work.
  - Prefer creating CLIs/scripts with tyro, for anything you might want to run more than once or that has flags you want to ablate. Save time and attention by creating proper infrastructure for your investigations, visualizations, experiments, etc.
 - Do NOT use `python3` to run python code or scripts. Always use `uv run {python {-c}}`, those are auto-approved.
 
+- !! Access any (non-paywalled/gated) website as clean markdown via curl + defuddle.md/<url> !!
+- Prefer this a million times over raw curl or the webfetch tool, when fetching content for your own consumption (the webfetch tool always slop-summarizes sites for you, which is great for super duper long and noisy pages, but not for 99.9% your use-cases). 
+
 `memex` (alias `mx`) — markdown vault tool for wikilink graph traversal and semantic search. A vault is a named collection of directories. Use it to orient in knowledge bases: discover connections between notes, find relevant context you didn't know existed, navigate by wikilinks.
 
 When to use: Semantic search is for broad topics and concepts — finding entry points when you don't know what exists. If you know a specific note name, use `mx explore` directly. If you know exact terms, use your regular search tools. Typical flow: `mx search` to find relevant notes → `mx explore` to navigate the graph from there.
@@ -219,6 +222,4 @@ DO NOT USE SUBAGENTS.
   - Avoid `git add -A` or `git add .` - untracked files may exist that shouldn't be committed. Prefer explicit file lists or `git add -u` (tracked files only).
   - Before history-rewriting (amend, rebase), check if the commit was pushed. When in doubt, make a new commit instead.
 </git>
-
-The webfetch tool always slop-summarizes sites for you... use curl if you want raw content.
 
