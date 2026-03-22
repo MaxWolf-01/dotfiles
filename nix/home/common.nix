@@ -96,6 +96,7 @@
       user.email = "69987866+MaxWolf-01@users.noreply.github.com";
       init.defaultBranch = "master";
       push.default = "current";
+      push.autoSetupRemote = true;
       credential."https://github.com".helper = "!gh auth git-credential";
       diff.lockb = { textconv = "bun"; binary = true; };
       help.autocorrect = 2;
