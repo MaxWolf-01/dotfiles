@@ -23,8 +23,8 @@ return {
       },
       list = {
         selection = {
-          preselect = true,  -- Need this TRUE for super-tab to work properly
-          auto_insert = false,  -- Keep false so text doesn't insert until Tab
+          preselect = false,
+          auto_insert = false,
         }
       },
       documentation = {
@@ -61,21 +61,13 @@ return {
     -- Cmdline completion (like : commands and / search)
     cmdline = {
       enabled = true,
-      keymap = {
-        preset = 'enter',
-        ['<Tab>'] = { 'select_and_accept', 'fallback' },
-        ['<S-Tab>'] = { 'select_prev', 'fallback' },
-      },
+      keymap = { preset = 'cmdline' },
       completion = {
-        menu = {
-          auto_show = true,
-        },
-        ghost_text = {
-          enabled = true,
-        },
+        menu = { auto_show = false },
+        ghost_text = { enabled = true },
         list = {
           selection = {
-            preselect = true,
+            preselect = false,
             auto_insert = false,
           },
         },
