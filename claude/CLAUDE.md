@@ -95,11 +95,10 @@ better work.
 <anti-patterns>
 
 - Swiss-army knife tools: avoid writing them, avoid using them. Specialized tools that do one thing well are almost always the superior choice. One-time operations don't need abstractions.
-- Don't assign priority labels to tasks. A task is either `active` (we intend to do it) or `backlog` (idea captured, not pursuing soon). That's the only distinction needed.
 
 - Don't add superfluous code comments. Superfluous comments are: "what comments", "meta commentary", fluff, ...
-- Don't explain your changes with code comments. Clarification should always happen BEFORE implementation, meta-commentary can be added to the commit, durable knowledge and clarification in docs/knowledge files.
-- When to comment: Ambiguous return values, non-obvious behavior, important warnings, complex algorithms.
+- Don't explain your changes with code comments. Clarification should always happen BEFORE implementation, meta-commentary can be added to the commit, things that can not be figured out from the code alone/would save significant time/context go into docs/knowledge files.
+- When to comment: non-obvious behavior, important warnings, complex algorithms.
 
 - Don't read only parts of files, or small subsets of codebases when you are building your mental model.
 
@@ -189,7 +188,7 @@ Projects with an `agent/` directory use the mx workflow plugin.
 
 Artifacts:
 - `agent/knowledge/` — durable reference (committed). Persistent knowledge about the project, continuously refined and updated. Wikilinked, navigable, evergreen. 
-- `agent/tasks/` — decision records: intent, assumptions, done-when (lean, trail of decisions, useful for collaborators, committed). Updated when goals change, not as work logs.
+- `agent/tasks/` — [active, backlog, done] issues-as-files: intent, assumptions, done-when (lean, trail of decisions, useful for collaborators, committed). Updated when goals change, not as work logs.
 - `agent/research/` — investigation snapshots (gitignored, ephemeral, never commited). Point-in-time, linked from tasks.
 - `agent/transcripts/` — exported sessions, tool calls and thinking stripped (gitignored, just a better session compaction / lazy handoff).
 - `agent/handoffs/` — curated session summaries for targeted continuation (gitignored). Rare / for long sessions where the next steps can be distilled into a clear handoff.
