@@ -35,7 +35,7 @@ Two `claude`-related directories exist in this repo — don't confuse them:
 
 `bin/` contains standalone scripts on `$PATH` (`~/bin`). These are available everywhere — interactive shells, Claude Code, cron, systemd timers, ssh. Prefer scripts over shell functions for anything that doesn't need to modify the current shell's state (cd, export, source, etc.).
 
-Existing scripts include `tre` (gitignore-aware tree), `extract` (universal archive extractor), `clip` (clipboard, X11/Wayland-aware), `fext` (disk usage by extension), and `restic-*` helpers (restic-diff, restic-snaps, restic-lsfs, restic-ls-recent, restic-ls-all, restic-current). If a common operation is needed repeatedly, add a new script here.
+Existing scripts include `tre` (gitignore-aware tree), `extract` (universal archive extractor), `clip` (clipboard, X11/Wayland-aware), `fext` (disk usage by extension), `restic-*` helpers (restic-diff, restic-snaps, restic-lsfs, restic-ls-recent, restic-ls-all, restic-current), and `vault-*` (knowledge base publishing tools — see below). If a common operation is needed repeatedly, add a new script here.
 
 Shell functions that need to affect the current shell (cd, set, source, disown) stay in `zsh/functions`.
 
@@ -119,6 +119,17 @@ Custom systemd services need explicit `path` for any package whose binaries the 
 
 See `docs/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).
 
+
+## Knowledge Base Publishing
+
+The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:
+
+- **`vault-triage`** (`~/bin/`) — curses TUI for triaging unpublished notes into whitelist or blacklist
+- **`vault-sync`** (`~/bin/`) — copies whitelisted files + referenced media to the quartz repo's `content/` dir
+- **Pre-push hook** (`git/hooks/quartz-sync-pre-push`) — runs `vault-sync` automatically when pushing the vault, then commits and pushes the quartz repo
+- **`whitelist.json`** and **`blacklist.txt`** live in the vault repo (data, not tooling)
+
+The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to GitHub Pages on push to `v4`.
 
 ## What stays outside Nix
 

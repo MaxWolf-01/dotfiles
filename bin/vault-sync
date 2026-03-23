@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""Sync whitelisted Obsidian vault notes + referenced media to Quartz.
+
+Reads whitelist.json from the vault, copies matching files and any media
+they reference to the Quartz content dir.
+
+Env vars: VAULT_DIR, QUARTZ_DIR (both have sensible defaults).
+"""
+
+import fnmatch
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import TypedDict
+
+HOME = Path.home()
+VAULT_DIR_DEFAULT = HOME / "repos/obsidian/knowledge-base"
+QUARTZ_DIR_DEFAULT = HOME / "repos/obsidian/quartz-knowledge-base"
+
+MEDIA_EXTENSIONS = frozenset({
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+    ".mp4", ".webm", ".mov",
+})
+
+MAX_FILE_SIZE = 100 * 1024 * 1024  # TODO: remove once self-hosting (no GitHub file size limit)
+
+
+class Whitelist(TypedDict):
+    files: list[str]
+    patterns: list[str]
+
+
+def log(msg: str, level: str = "INFO") -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {level}: {msg}")
+
+
+def load_whitelist(path: Path) -> Whitelist:
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        log("No whitelist.json found, creating empty one", "WARNING")
+        wl: Whitelist = {"files": [], "patterns": []}
+        path.write_text(json.dumps(wl, indent=2))
+        return wl
+    except json.JSONDecodeError as e:
+        log(f"Error parsing whitelist.json: {e}", "ERROR")
+        sys.exit(1)
+
+
+def is_media(path: Path) -> bool:
+    return path.suffix.lower() in MEDIA_EXTENSIONS
+
+
+def extract_media_refs(markdown: str, file_path: str) -> set[str]:
+    """Extract local media filenames referenced in markdown.
+
+    Supports both Obsidian (![[img.png]], [[img.png]]) and standard
+    markdown (![alt](img.png)) syntax. Skips URLs and code blocks.
+    """
+    # Strip code blocks and inline code
+    text = re.sub(r"```[^`]*```", "", markdown, flags=re.DOTALL)
+    text = re.sub(r"(?m)^( {4}|\t).*$\n?", "", text)
+    text = re.sub(r"`[^`]+`", "", text)
+
+    ext = r"\.(jpg|jpeg|png|gif|webp|svg|mp4|webm|mov)"
+    patterns = [
+        rf"!\[\[(.*?{ext}[^|\]]*?)(?:\|[^\]]+)?\]\]",  # ![[media|modifier]]
+        rf"\[\[(.*?{ext}[^|\]]*?)(?:\|[^\]]+)?\]\]",    # [[media|modifier]]
+        rf"!\[[^\]]*\]\(([^)]*?{ext})\)",                # ![alt](media.ext)
+    ]
+
+    names: set[str] = set()
+    parent = Path(file_path).parent
+
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            ref = m.group(1).strip()
+            if ref.startswith(("http://", "https://")):
+                continue
+            resolved = (parent / ref).resolve() if not ref.startswith("/") else Path(ref)
+            names.add(resolved.name)
+
+    return names
+
+
+def collect_referenced_media(
+    source_dir: Path, whitelisted_files: list[str]
+) -> set[str]:
+    """Collect media filenames referenced by all whitelisted markdown files."""
+    all_media: set[str] = set()
+
+    for file_path in whitelisted_files:
+        full_path = source_dir / file_path
+        if not full_path.exists():
+            log(f"File does not exist: {full_path}", "WARNING")
+            continue
+        if full_path.suffix.lower() != ".md":
+            continue
+
+        try:
+            content = full_path.read_text(encoding="utf-8")
+            media = extract_media_refs(content, file_path)
+            if media:
+                log(f"Found {len(media)} media refs in {file_path}")
+            all_media.update(media)
+        except Exception as e:
+            log(f"Error processing {file_path}: {e}", "ERROR")
+
+    return all_media
+
+
+def is_whitelisted(
+    file_path: str, whitelist: Whitelist, referenced_media: set[str]
+) -> bool:
+    if file_path in whitelist["files"]:
+        return True
+
+    if Path(file_path).name in referenced_media:
+        return True
+
+    for pattern in whitelist.get("patterns", []):
+        if pattern.startswith("!"):
+            if fnmatch.fnmatch(file_path, pattern[1:]):
+                return False
+        elif fnmatch.fnmatch(file_path, pattern):
+            return True
+    return False
+
+
+def sync(source_dir: Path, content_dir: Path, whitelist: Whitelist) -> tuple[int, int]:
+    # Report missing whitelisted files
+    missing = {f for f in whitelist["files"] if not (source_dir / f).is_file()}
+    if missing:
+        log("Whitelisted files not found:", "WARNING")
+        for f in sorted(missing):
+            log(f"  - {f}", "WARNING")
+
+    referenced_media = collect_referenced_media(source_dir, whitelist["files"])
+
+    # Clean and recreate content dir
+    if content_dir.exists():
+        shutil.rmtree(content_dir)
+    content_dir.mkdir(parents=True)
+    media_dir = content_dir / "media"
+    media_dir.mkdir()
+
+    copied = 0
+    skipped = 0
+
+    # Copy whitelisted files from vault
+    for source_path in source_dir.rglob("*"):
+        if not source_path.is_file():
+            continue
+
+        rel = str(source_path.relative_to(source_dir))
+
+        if not is_whitelisted(rel, whitelist, referenced_media):
+            skipped += 1
+            continue
+
+        if source_path.stat().st_size > MAX_FILE_SIZE:
+            log(f"Skipping (>{MAX_FILE_SIZE // 1024 // 1024}MB): {rel}", "WARNING")
+            skipped += 1
+            continue
+
+        if is_media(source_path):
+            target = media_dir / source_path.name
+        else:
+            target = content_dir / rel
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target)
+        log(f"Copied: {rel}")
+        copied += 1
+
+    # Copy referenced media from external directories (library, archive)
+    external_dirs = [
+        HOME / "Documents" / "archive" / "papers",
+        HOME / "Documents" / "library",
+    ]
+    for ext_dir in external_dirs:
+        if not ext_dir.exists():
+            continue
+        log(f"Checking external directory for media: {ext_dir}")
+        for path in ext_dir.rglob("*"):
+            if path.is_file() and is_media(path) and path.name in referenced_media:
+                target = media_dir / path.name
+                if not target.exists():
+                    if path.stat().st_size > MAX_FILE_SIZE:
+                        log(f"Skipping (>{MAX_FILE_SIZE // 1024 // 1024}MB): {path.name}", "WARNING")
+                        continue
+                    shutil.copy2(path, target)
+                    log(f"Copied external media: {path.name}")
+                    copied += 1
+
+    return copied, skipped
+
+
+def main() -> None:
+    vault_dir = Path(os.getenv("VAULT_DIR", VAULT_DIR_DEFAULT))
+    quartz_dir = Path(os.getenv("QUARTZ_DIR", QUARTZ_DIR_DEFAULT))
+    content_dir = quartz_dir / "content"
+    whitelist_path = vault_dir / "whitelist.json"
+
+    log("Starting whitelisted sync...")
+    log(f"Vault: {vault_dir}")
+    log(f"Quartz: {quartz_dir}")
+
+    whitelist = load_whitelist(whitelist_path)
+    copied, skipped = sync(vault_dir, content_dir, whitelist)
+    log(f"Sync complete. {copied} files copied, {skipped} files skipped.")
+
+
+if __name__ == "__main__":
+    main()

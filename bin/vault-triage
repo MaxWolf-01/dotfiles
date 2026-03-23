@@ -1,0 +1,282 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""TUI for triaging unpublished Obsidian notes into whitelist or blacklist.
+
+    j/k ↑/↓   navigate
+    l/→/Enter  whitelist (accept)
+    h/←       blacklist (reject)
+    u          undo current item
+    /          search (type query, Enter to confirm, n/N for next/prev match)
+    g/G        jump to top/bottom
+    PgUp/PgDn  page scroll
+    q          save & quit
+    Esc        discard & quit (or cancel search)
+"""
+
+import curses
+import json
+import re
+from pathlib import Path
+
+VAULT = Path.home() / "repos/obsidian/knowledge-base"
+WHITELIST = VAULT / "whitelist.json"
+BLACKLIST = VAULT / "blacklist.txt"
+
+
+def get_unpublished_notes() -> list[str]:
+    """Unpublished notes sorted by mtime (newest first), filtered by whitelist+blacklist."""
+    md_files = sorted(
+        VAULT.rglob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    paths = [str(f.relative_to(VAULT)) for f in md_files]
+
+    whitelist = json.loads(WHITELIST.read_text())
+    whitelisted = set(whitelist["files"])
+
+    blacklist_patterns: list[re.Pattern[str]] = []
+    if BLACKLIST.exists():
+        for line in BLACKLIST.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                blacklist_patterns.append(re.compile(line))
+
+    return [
+        p
+        for p in paths
+        if p not in whitelisted
+        and not any(pat.search(p) for pat in blacklist_patterns)
+    ]
+
+
+def load_preview(path: str, max_lines: int) -> list[str]:
+    try:
+        return (VAULT / path).read_text(errors="replace").splitlines()[:max_lines]
+    except Exception:
+        return ["(unable to read)"]
+
+
+def save_decisions(accepted: list[str], rejected: list[str]) -> None:
+    if accepted:
+        whitelist = json.loads(WHITELIST.read_text())
+        for path in accepted:
+            if path not in whitelist["files"]:
+                whitelist["files"].append(path)
+        WHITELIST.write_text(json.dumps(whitelist, indent=2, ensure_ascii=False) + "\n")
+
+    if rejected:
+        content = BLACKLIST.read_text() if BLACKLIST.exists() else ""
+        if content and not content.endswith("\n"):
+            content += "\n"
+        for path in rejected:
+            content += f"^{re.escape(path)}$\n"
+        BLACKLIST.write_text(content)
+
+
+def find_matches(notes: list[str], query: str) -> list[int]:
+    """Return indices of notes matching query (case-insensitive)."""
+    q = query.lower()
+    return [i for i, n in enumerate(notes) if q in n.lower()]
+
+
+def search_prompt(stdscr: curses.window, h: int, w: int) -> str | None:
+    """Show / prompt at bottom, return query or None on Esc."""
+    curses.curs_set(1)
+    query = ""
+    while True:
+        try:
+            stdscr.move(h - 1, 0)
+            stdscr.clrtoeol()
+            stdscr.attron(curses.A_REVERSE)
+            stdscr.addnstr(h - 1, 0, f" /{query}".ljust(w), w - 1)
+            stdscr.attroff(curses.A_REVERSE)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == 27:  # Esc
+            curses.curs_set(0)
+            return None
+        elif key in (10, 13):  # Enter
+            curses.curs_set(0)
+            return query
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            query = query[:-1]
+        elif 32 <= key <= 126:
+            query += chr(key)
+
+
+def main(stdscr: curses.window) -> None:
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_RED, -1)
+    curses.init_pair(4, curses.COLOR_CYAN, -1)
+    curses.init_pair(5, curses.COLOR_YELLOW, -1)
+
+    notes = get_unpublished_notes()
+    if not notes:
+        stdscr.addstr(0, 0, "No unpublished notes to triage. Press any key.")
+        stdscr.getch()
+        return
+
+    decisions: dict[int, str] = {}  # idx -> 'w' | 'b'
+    cursor = 0
+    scroll = 0
+    search_query = ""
+    search_matches: list[int] = []
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        n_acc = sum(1 for v in decisions.values() if v == "w")
+        n_rej = sum(1 for v in decisions.values() if v == "b")
+        remaining = len(notes) - len(decisions)
+
+        # -- header --
+        hdr = f" triage │ {remaining} remaining │ +{n_acc} whitelist │ -{n_rej} blacklist "
+        if search_query:
+            hdr += f"│ /{search_query} [{len(search_matches)} matches] "
+        stdscr.attron(curses.A_REVERSE)
+        stdscr.addnstr(0, 0, hdr.ljust(w), w - 1)
+        stdscr.attroff(curses.A_REVERSE)
+
+        # -- layout --
+        preview_h = max(5, h // 3)
+        list_h = h - preview_h - 3  # header row, separator row, footer row
+
+        if cursor < scroll:
+            scroll = cursor
+        if cursor >= scroll + list_h:
+            scroll = cursor - list_h + 1
+
+        # -- note list --
+        match_set = set(search_matches)
+        for i in range(list_h):
+            idx = scroll + i
+            if idx >= len(notes):
+                break
+            row = 2 + i
+            d = decisions.get(idx)
+            if d == "w":
+                prefix, color = " + ", curses.color_pair(1)
+            elif d == "b":
+                prefix, color = " - ", curses.color_pair(2)
+            else:
+                prefix, color = "   ", 0
+            line = f"{prefix}{notes[idx]}"
+            is_match = search_query and idx in match_set
+            try:
+                if idx == cursor:
+                    attr = curses.A_REVERSE | color
+                    if is_match:
+                        attr |= curses.A_BOLD
+                    stdscr.attron(attr)
+                    stdscr.addnstr(row, 0, line.ljust(w), w - 1)
+                    stdscr.attroff(attr)
+                elif is_match:
+                    stdscr.attron(curses.color_pair(5))
+                    stdscr.addnstr(row, 0, line[: w - 1], w - 1)
+                    stdscr.attroff(curses.color_pair(5))
+                else:
+                    stdscr.attron(color)
+                    stdscr.addnstr(row, 0, line[: w - 1], w - 1)
+                    stdscr.attroff(color)
+            except curses.error:
+                pass
+
+        # -- preview --
+        sep_row = 2 + list_h
+        try:
+            stdscr.attron(curses.color_pair(4))
+            label = f"─ {notes[cursor]} "
+            stdscr.addnstr(sep_row, 0, label.ljust(w, "─"), w - 1)
+            stdscr.attroff(curses.color_pair(4))
+        except curses.error:
+            pass
+
+        for i, pline in enumerate(load_preview(notes[cursor], preview_h - 1)):
+            row = sep_row + 1 + i
+            if row >= h - 1:
+                break
+            try:
+                stdscr.addnstr(row, 1, pline[: w - 2], w - 2)
+            except curses.error:
+                pass
+
+        # -- footer --
+        foot = " j/k:nav  l/→/⏎:accept  h/←:reject  u:undo  /:search  n/N:next/prev  q:save  esc:quit "
+        try:
+            stdscr.attron(curses.A_REVERSE)
+            stdscr.addnstr(h - 1, 0, foot.ljust(w), w - 1)
+            stdscr.attroff(curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if key == 27:  # ESC = discard
+            if search_query:
+                search_query = ""
+                search_matches = []
+            else:
+                break
+        elif key == ord("q"):  # save + quit
+            acc = [notes[i] for i, v in decisions.items() if v == "w"]
+            rej = [notes[i] for i, v in decisions.items() if v == "b"]
+            save_decisions(acc, rej)
+
+            stdscr.erase()
+            stdscr.addstr(0, 0, f"Saved: +{len(acc)} whitelisted, -{len(rej)} blacklisted")
+            stdscr.addstr(1, 0, "Press any key.")
+            stdscr.refresh()
+            stdscr.getch()
+            break
+        elif key == ord("/"):
+            result = search_prompt(stdscr, h, w)
+            if result is not None:
+                search_query = result
+                search_matches = find_matches(notes, search_query)
+                if search_matches:
+                    # Jump to first match at or after cursor
+                    forward = [m for m in search_matches if m >= cursor]
+                    cursor = forward[0] if forward else search_matches[0]
+            else:
+                search_query = ""
+                search_matches = []
+        elif key == ord("n") and search_matches:
+            # Next match
+            forward = [m for m in search_matches if m > cursor]
+            cursor = forward[0] if forward else search_matches[0]
+        elif key == ord("N") and search_matches:
+            # Previous match
+            backward = [m for m in search_matches if m < cursor]
+            cursor = backward[-1] if backward else search_matches[-1]
+        elif key in (ord("j"), curses.KEY_DOWN):
+            cursor = min(cursor + 1, len(notes) - 1)
+        elif key in (ord("k"), curses.KEY_UP):
+            cursor = max(cursor - 1, 0)
+        elif key in (ord("l"), curses.KEY_RIGHT, 10, 13):
+            decisions[cursor] = "w"
+            cursor = min(cursor + 1, len(notes) - 1)
+        elif key in (ord("h"), curses.KEY_LEFT):
+            decisions[cursor] = "b"
+            cursor = min(cursor + 1, len(notes) - 1)
+        elif key == ord("u"):
+            decisions.pop(cursor, None)
+        elif key == ord("g"):
+            cursor = 0
+        elif key == ord("G"):
+            cursor = len(notes) - 1
+        elif key == curses.KEY_PPAGE:
+            cursor = max(cursor - list_h, 0)
+        elif key == curses.KEY_NPAGE:
+            cursor = min(cursor + list_h, len(notes) - 1)
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)
