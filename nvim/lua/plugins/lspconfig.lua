@@ -37,16 +37,16 @@ vim.diagnostic.config({
 return {
   "neovim/nvim-lspconfig",
   config = function()
-    local caps = require("blink.cmp").get_lsp_capabilities()
-    local function on_attach(_, _) end
-    local function on_init(client, _)
-      if client.supports_method("textDocument/semanticTokens") then
-        client.server_capabilities.semanticTokensProvider = nil
-      end
-    end
+    vim.lsp.config('*', {
+      capabilities = require("blink.cmp").get_lsp_capabilities(),
+      on_init = function(client)
+        if client.supports_method("textDocument/semanticTokens") then
+          client.server_capabilities.semanticTokensProvider = nil
+        end
+      end,
+    })
 
-    -- Enable servers via the 0.11 API; upstream configs live under runtime lsp/<name>.lua
-    local servers = {
+    vim.lsp.enable({
       "bashls",
       "biome",
       "cmake",
@@ -71,14 +71,6 @@ return {
       "taplo",
       "ts_ls",
       "zls",
-    }
-
-    for _, s in ipairs(servers) do
-      vim.lsp.enable(s, {
-        capabilities = caps,
-        on_attach = on_attach,
-        on_init = on_init,
-      })
-    end
+    })
   end,
 }
