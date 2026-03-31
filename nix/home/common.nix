@@ -30,6 +30,14 @@
   home.file."bin".source =
     config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/bin";
 
+  # Supply chain protection: quarantine newly published packages
+  home.file.".npmrc".text = ''
+    min-release-age=7
+  '';
+  xdg.configFile."uv/uv.toml".text = ''
+    exclude-newer = "7 days"
+  '';
+
   # Ensure common dirs exist
   home.activation.createDirs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
     mkdir -p ~/tmp ~/logs
@@ -269,6 +277,10 @@
       "a55 phone" = {
         hostname = "100.65.181.6";
         port = 8022;
+      };
+      jarvis = {
+        hostname = "100.124.185.86";
+        user = "root";
       };
       yapit-prod = {
         hostname = "100.87.244.58";
