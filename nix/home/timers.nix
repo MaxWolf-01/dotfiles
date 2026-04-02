@@ -60,6 +60,31 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Jarvis VPS workspace → rsync.net (via SSHFS) ---
+
+  systemd.user.services.jarvis-rsyncnet = {
+    Unit = {
+      Description = "Restic backup to rsync.net (jarvis workspace via SSHFS)";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${backupPath}:${lib.makeBinPath (with pkgs; [ sshfs fuse ])}" ];
+      ExecStart = "${dotfiles}/backup/jarvis_backup.sh ${secrets}/backup/restic/jarvis/rsyncnet.conf";
+    };
+  };
+
+  systemd.user.timers.jarvis-rsyncnet = {
+    Unit.Description = "Daily backup to rsync.net (jarvis workspace)";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "20m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- YouTube cookie export → PC ---
 
   systemd.user.services.youtube-cookies-export = {
