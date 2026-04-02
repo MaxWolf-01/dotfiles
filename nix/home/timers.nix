@@ -155,4 +155,27 @@ in
     };
     Install.WantedBy = [ "timers.target" ];
   };
+
+  systemd.user.services.yapit-dep-scout = {
+    Unit = {
+      Description = "Yapit dependency scout";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/dep-scout.sh";
+    };
+  };
+
+  systemd.user.timers.yapit-dep-scout = {
+    Unit.Description = "Yapit dependency scout (biweekly)";
+    Timer = {
+      OnCalendar = "Mon *-*-1..7,15..21 20:00:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
 }
