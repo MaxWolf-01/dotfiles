@@ -236,6 +236,9 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
         check_description="$check_data of data"
     fi
 
+    # Remove stale locks before check (prune may leave one if interrupted)
+    restic --repo "$repo_path" --password-command "$password_command" unlock 2>/dev/null
+
     # Run repository check
     echo "Checking repository integrity..."
     if check_error_msg=$(restic check --repo "$repo_path" --password-command "$password_command" $check_args 2>&1 >/dev/null); then

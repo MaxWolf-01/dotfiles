@@ -70,7 +70,10 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${backupPath}:${lib.makeBinPath (with pkgs; [ sshfs fuse ])}" ];
+      Environment = [
+        "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
+        "SSH_AUTH_SOCK=/run/user/1000/ssh-agent"
+      ];
       ExecStart = "${dotfiles}/backup/jarvis_backup.sh ${secrets}/backup/restic/jarvis/rsyncnet.conf";
     };
   };
