@@ -40,7 +40,7 @@ return {
     vim.lsp.config('*', {
       capabilities = require("blink.cmp").get_lsp_capabilities(),
       on_init = function(client)
-        if client.supports_method("textDocument/semanticTokens") then
+        if client:supports_method("textDocument/semanticTokens") then
           client.server_capabilities.semanticTokensProvider = nil
         end
       end,
