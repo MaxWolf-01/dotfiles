@@ -230,16 +230,22 @@ map("n", "-", "<CMD>Oil<CR>", opts)
 -- telescope
 -- ====================================================================
 
-map("n", "<leader>ff", ":Telescope git_files hidden=true show_untracked=true<CR>", opts)
+local builtin = require("telescope.builtin")
+
+map("n", "<leader>ff", function()
+  local ok = pcall(builtin.git_files, { show_untracked = true, hidden = true })
+  if not ok then
+    builtin.find_files({ hidden = true })
+  end
+end, opts)
 map("n", "<leader>fg", ":Telescope git_files hidden=true<CR>", opts)
-map("n", "<leader>fa", ":Telescope find_files hidden=false no_ignore=true<CR>", opts)
+map("n", "<leader>fa", ":Telescope find_files hidden=true no_ignore=true<CR>", opts)
 map("n", "<leader>ft", ":Telescope oldfiles<CR>", opts)
 map("n", "<leader>fb", ":Telescope buffers<CR>", opts)
 
 map("n", "<leader>fw", ":Telescope live_grep hidden=true<CR>", opts) -- TODO!! It does not search in hidden files!
 map("n", "<leader>fW", ":Telescope live_grep word_match=-w<CR>", opts)
 map("n", "<leader>fl", ":Telescope grep_string<CR>", opts) -- literal search (no regex)
-local builtin = require("telescope.builtin")
 local function fuzzy_find_current_buffer()
   builtin.current_buffer_fuzzy_find(require("telescope.themes").get_dropdown({
     winblend = 10,
