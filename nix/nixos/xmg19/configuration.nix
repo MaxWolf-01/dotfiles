@@ -153,6 +153,7 @@
   };
   programs.zsh.enable = true;
   programs.nix-ld.enable = true;
+  programs.nix-ld.libraries = [ config.hardware.nvidia.package ];
 
   # Nix
   nixpkgs.config.allowUnfree = true;
