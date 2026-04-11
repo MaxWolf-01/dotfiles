@@ -93,6 +93,7 @@
       "**/notes/*"
       "**/notebooks/*"
       ".sessions"
+      ".codex"
     ];
     attributes = [
       "*.lockb binary diff=lockb"
