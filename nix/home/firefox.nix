@@ -116,6 +116,9 @@ in
         "layout.css.prefers-color-scheme.content-override" = 0;
         "layout.spellcheckDefault" = 0;
 
+        # Reader Mode — disabled so Alt+Shift+R goes to Obsidian Web Clipper
+        "reader.parse-on-load.enabled" = false;
+
         # Translations
         "browser.translations.automaticallyPopup" = false;
         "browser.translations.neverTranslateLanguages" = "de";
