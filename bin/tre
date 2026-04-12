@@ -1,57 +1,221 @@
-#!/usr/bin/env bash
-# Colorized, dirs-first tree excluding .git + .gitignore patterns; paginated via less
-#
-# Options:
-#   -e, --exclude PATTERN   Additional pattern to exclude (supports wildcards)
-#                           Can be used multiple times: tre -e node_modules -e "*.pyc"
-#   All other args are passed through to tree.
-set -euo pipefail
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Colorized, gitignore-aware tree listing.
 
-root=$(git rev-parse --show-toplevel 2>/dev/null) || root="$PWD"
-proj_ign="$root/.gitignore"
-glob_ign=$(git config --get core.excludesfile 2>/dev/null | sed "s|^~|$HOME|") || glob_ign="${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore"
+Wraps tree(1) with automatic .gitignore exclusions and per-directory entry limits.
 
-# Parse -e/--exclude options, pass remaining args to tree
-excludes=()
-tree_args=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -e|--exclude)
-      [[ -n "${2:-}" ]] && excludes+=("$2")
-      shift 2
-      ;;
-    --exclude=*)
-      excludes+=("${1#--exclude=}")
-      shift
-      ;;
-    -e*)
-      excludes+=("${1#-e}")
-      shift
-      ;;
-    *)
-      tree_args+=("$1")
-      shift
-      ;;
-  esac
-done
+Examples::
 
-# Read and clean patterns from gitignore files
-patterns=$(
-  grep -hEv '^\s*(#|$)' "$proj_ign" "$glob_ign" 2>/dev/null \
-    | sed -E 's@^\./@@; s@/$@@; s@^\*\*/@@' \
-    | paste -sd'|' -
-) || true
+    tre                          # tree from current dir
+    tre -L 2                     # max depth 2
+    tre --limit 5                # at most 5 entries per directory
+    tre -e node_modules -L 3     # extra exclusion + depth limit
+    tre src/ -L 2 --limit 10     # specific path with limits
+"""
+from __future__ import annotations
 
-# Build -I argument (always ignore .git)
-if [[ -n "$patterns" ]]; then
-  patterns=".git|$patterns"
-else
-  patterns=".git"
-fi
+import os
+import re
+import signal
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Annotated
 
-# Append manual excludes
-for excl in "${excludes[@]}"; do
-  patterns="$patterns|$excl"
-done
+import tyro
+from tyro.conf import Positional, UseAppendAction, arg
 
-tree -aC -I "$patterns" --dirsfirst "${tree_args[@]}" | less -FRNX
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+CONNECTOR_L = "└── "
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def get_depth(plain: str) -> int:
+    """Count tree indent units before the connector.
+
+    Two indent formats per level:
+    - Continuing parent: │ + NBSP + NBSP + space (4 chars)
+    - Ended parent:      4 ASCII spaces
+    """
+    depth = 0
+    i = 0
+    while i + 3 < len(plain):
+        if plain[i + 1 : i + 3] == "\xa0\xa0" and plain[i + 3] == " ":
+            depth += 1
+            i += 4
+        elif plain[i : i + 4] == "    ":
+            depth += 1
+            i += 4
+        else:
+            break
+    return depth
+
+
+def has_connector(plain: str, depth: int) -> bool:
+    pos = depth * 4
+    rest = plain[pos:]
+    return rest.startswith("├── ") or rest.startswith("└── ")
+
+
+def apply_limit(output: str, limit: int) -> str:
+    """Truncate tree output to at most `limit` entries per directory."""
+    lines = output.split("\n")
+    result: list[str] = []
+
+    sibling_count: dict[int, int] = {}
+    suppressed_count: dict[int, int] = {}
+    saved_prefix: dict[int, str] = {}
+    suppress_at: int | None = None
+
+    def emit_summary(d: int) -> None:
+        n = suppressed_count.get(d, 0)
+        if n > 0:
+            pfx = saved_prefix.get(d, "")
+            result.append(f"{pfx}{CONNECTOR_L}\033[90m… ({n} more)\033[0m")
+
+    def cleanup(d: int) -> None:
+        sibling_count.pop(d, None)
+        suppressed_count.pop(d, None)
+        saved_prefix.pop(d, None)
+
+    for line in lines:
+        plain = strip_ansi(line)
+        depth = get_depth(plain)
+        is_entry = has_connector(plain, depth)
+
+        if not is_entry:
+            # Root ".", blank line, or final summary — flush everything
+            if suppress_at is not None:
+                emit_summary(suppress_at)
+                cleanup(suppress_at)
+                suppress_at = None
+            for d in sorted(suppressed_count, reverse=True):
+                emit_summary(d)
+                cleanup(d)
+            result.append(line)
+            continue
+
+        # Left a suppressed region?
+        if suppress_at is not None and depth < suppress_at:
+            emit_summary(suppress_at)
+            cleanup(suppress_at)
+            suppress_at = None
+
+        # Inside suppressed subtree?
+        if suppress_at is not None and depth >= suppress_at:
+            if depth == suppress_at:
+                suppressed_count[depth] = suppressed_count.get(depth, 0) + 1
+            continue
+
+        # Flush deeper depths we returned from
+        for d in sorted([k for k in sibling_count if k > depth], reverse=True):
+            emit_summary(d)
+            cleanup(d)
+
+        sibling_count[depth] = sibling_count.get(depth, 0) + 1
+
+        if sibling_count[depth] <= limit:
+            result.append(line)
+            saved_prefix[depth] = plain[: depth * 4]
+        else:
+            suppressed_count[depth] = suppressed_count.get(depth, 0) + 1
+            saved_prefix.setdefault(depth, plain[: depth * 4])
+            suppress_at = depth
+
+    # Final flush
+    if suppress_at is not None:
+        emit_summary(suppress_at)
+    for d in sorted(suppressed_count, reverse=True):
+        emit_summary(d)
+
+    return "\n".join(result)
+
+
+def get_gitignore_patterns(excludes: list[str]) -> str:
+    """Build tree -I pattern from .gitignore + global gitignore + user excludes."""
+    r = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    )
+    root = Path(r.stdout.strip()) if r.returncode == 0 else Path.cwd()
+
+    proj_ign = root / ".gitignore"
+    r = subprocess.run(
+        ["git", "config", "--get", "core.excludesfile"], capture_output=True, text=True
+    )
+    if r.returncode == 0:
+        glob_ign = Path(r.stdout.strip().replace("~", str(Path.home())))
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        glob_ign = Path(xdg) / "git" / "ignore"
+
+    raw: list[str] = []
+    for ign_file in [proj_ign, glob_ign]:
+        try:
+            for line in ign_file.read_text().splitlines():
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    s = re.sub(r"^\./", "", s)
+                    s = re.sub(r"/$", "", s)
+                    s = re.sub(r"^\*\*/", "", s)
+                    raw.append(s)
+        except (FileNotFoundError, PermissionError):
+            continue
+
+    return "|".join([".git"] + raw + excludes)
+
+
+@dataclass
+class Args:
+    path: Annotated[list[str], Positional] = field(default_factory=list)
+    """Directories to list."""
+
+    exclude: Annotated[list[str], UseAppendAction, arg(aliases=["-e"])] = field(
+        default_factory=list
+    )
+    """Pattern to exclude (supports wildcards). Repeatable."""
+
+    limit: int | None = None
+    """Max entries per directory (rest shown as '… N more')."""
+
+    depth: Annotated[int | None, arg(aliases=["-L"])] = None
+    """Max directory depth."""
+
+
+def main() -> None:
+    args = tyro.cli(Args, description=__doc__)
+
+    patterns = get_gitignore_patterns(args.exclude)
+    tree_cmd = ["tree", "-aC", "-I", patterns, "--dirsfirst"]
+    if args.depth is not None:
+        tree_cmd += ["-L", str(args.depth)]
+    tree_cmd += args.path
+
+    if args.limit is None:
+        tree = subprocess.Popen(tree_cmd, stdout=subprocess.PIPE)
+        pager = subprocess.Popen(["less", "-FRNX"], stdin=tree.stdout)
+        tree.stdout.close()
+        pager.wait()
+    else:
+        tree = subprocess.run(tree_cmd, stdout=subprocess.PIPE, text=True)
+        output = apply_limit(tree.stdout, args.limit)
+        pager = subprocess.Popen(["less", "-FRNX"], stdin=subprocess.PIPE, text=True)
+        try:
+            pager.communicate(output)
+        except BrokenPipeError:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
