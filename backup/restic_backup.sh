@@ -171,15 +171,20 @@ if [ -n "${exclude_file:-}" ]; then
     done
 fi
 
-if sed "s|^|$base_path/|" "$backup_dirs_file" | \
+sed "s|^|$base_path/|" "$backup_dirs_file" | \
    restic --repo "$repo_path" backup \
     --option compression="$compression" \
     --files-from-verbatim - \
     --password-command "$password_command" \
     $exclude_opts \
     $scan_option \
-    --json 2>"$error_log" | tee "$backup_output"; then
+    --json 2>"$error_log" | tee "$backup_output"
+backup_exit=${PIPESTATUS[1]}
 
+# 0 = clean, 3 = snapshot created but some files unreadable (e.g. race with
+# ephemeral files). Real failures are exit 1/2.
+if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
+    had_warnings=$([ "$backup_exit" -eq 3 ] && echo true || echo false)
     backup_success=true
     backup_end_time=$(date +%s)
     backup_duration=$((backup_end_time - backup_start_time))
@@ -252,15 +257,28 @@ if sed "s|^|$base_path/|" "$backup_dirs_file" | \
     if [ -n "${ntfy_topic:-}" ]; then
         if [ "$backup_success" = true ]; then
             # Format success message
+            warning_line=""
+            if [ "$had_warnings" = true ]; then
+                warn_count=$(grep -c '"message_type":"error"' "$error_log" 2>/dev/null || echo "?")
+                warning_line="
+⚠️ $warn_count file(s) unreadable (see error log)"
+            fi
             message="📦 Snapshot ${snapshot_id} created
 ⏱️ Duration: $(format_duration $backup_duration)
 📊 Files: $total_files_processed processed ($files_new new, $files_changed changed)
 💾 Size: $(format_bytes $data_added) added ($(format_bytes $data_added_packed)$compression_info)
-🔍 Integrity: $check_description check $check_status"
+🔍 Integrity: $check_description check $check_status$warning_line"
 
+            if [ "$had_warnings" = true ]; then
+                title="⚠️ $config_name"
+                priority=3
+            else
+                title="✅ $config_name"
+                priority=2
+            fi
             curl -s \
-                -H "Title: ✅ $config_name" \
-                -H "Priority: 2" \
+                -H "Title: $title" \
+                -H "Priority: $priority" \
                 -H "Tags: backup,restic,$config_name,success" \
                 -d "$message" \
                 "https://ntfy.sh/$ntfy_topic"
@@ -283,6 +301,13 @@ ${check_error_msg}"
                 -d "$message" \
                 "https://ntfy.sh/$ntfy_topic"
         fi
+    fi
+
+    # Save warning log so it's inspectable
+    if [ "$had_warnings" = true ]; then
+        warning_log="$log_dir/restic_warning_${config_name}_$(date +%Y%m%d_%H%M%S).log"
+        cat "$error_log" > "$warning_log"
+        echo "Warning log saved to: $warning_log"
     fi
 
     if [ "$backup_success" = false ]; then
