@@ -71,6 +71,10 @@ in
       "application/json" = "nvim.desktop";
       "application/javascript" = "nvim.desktop";
       "application/x-shellscript" = "nvim.desktop";
+      "audio/mpeg" = "org.gnome.Showtime.desktop";
+      "video/mp4" = "org.gnome.Showtime.desktop";
+      "video/webm" = "org.gnome.Showtime.desktop";
+      "video/x-matroska" = "org.gnome.Showtime.desktop";
       "x-scheme-handler/obsidian" = "obsidian.desktop";
       "text/html" = "firefox.desktop";
       "x-scheme-handler/http" = "firefox.desktop";
