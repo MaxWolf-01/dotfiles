@@ -13,6 +13,7 @@
 - Correctness, simplicity, maintainability, readability over cleverness. 
 - Unix philosophy.
 - File over app.
+- Simple over complex.
 - Aesthetics matter.
 - The zen of python.
 - Think outside the box! Diversity of ideas leads to greatness.
@@ -107,12 +108,16 @@ better work.
 - Don't write tests that just repeat the implementation. Tests should verify behavior, not mirror the code structure. Focus on edge cases, expected inputs/outputs, ...
 
 - **Don't chain shell commands** (`&&`, `||`, `;`) — every chained command requires manual approval, which blocks async execution and stalls the agent. One command per Bash call is the default.
-  - `cd dir && command` is the most common violation. Use absolute paths or tool flags (`git -C`, `npm --prefix`) instead.
+  - `cd dir && command` is the most common violation. Use absolute paths or tool flags (`git -C` (at the end, so it doesnt bust permission rules), `npm --prefix`) instead.
   - Independent commands → parallel tool calls. Dependent commands → sequential tool calls.
   - Chains are okay only when functionally necessary or when splitting would be significantly more costly. If you find yourself needing the same chain repeatedly, write a script.
 
+- **SSH/remote commands: never embed subshells.** A quoted remote command like `ssh host 'cmd_a $(cmd_b) ...'` is a single string from the permission system's perspective — it sees `ssh *` and matches the first token, so `cmd_a` never gets its own permission check. If you need the output of one remote command to run another, run them as separate Bash calls: get the result locally, then use it in the next call.
+
 - Don't use worktrees, use fresh checkouts. For short-lived, ephemeral work like quick patches or exploring a repo, simply clone it to /tmp (you have full Read/Write permissions there).
 - Do NOT clone from a local path (e.g. `git clone /path/to/repo`) — always clone from the remote/github url.
+
+NEVER AMMEND A COMMIT WITHOUT CHECKING WETHER IT'S PUSHED ALREADY
 </anti-patterns>
 
 <tools>
@@ -120,7 +125,8 @@ better work.
 `tre` — Enhanced tree command for quick codebase overviews.
 - Auto-excludes .git + all patterns from project `.gitignore` and global `~/.gitignore_global`
 - `-e`/`--exclude PATTERN` for additional exclusions (supports wildcards like `*.log`, `test_*`)
-- Examples: `tre`, `tre -e node_modules`, `tre -e "*.tmp" -L 2 src/`
+- `--limit N` caps total output lines (default: unlimited)
+- Examples: `tre`, `tre -e node_modules`, `tre -e "*.tmp" -L 2 src/`, `tre --limit 50`
 
 `ast-grep` — syntax-aware, won't match inside strings/comments:
 - Find pattern: `ast-grep --pattern 'console.log($$$ARGS)' --lang js`
@@ -132,7 +138,7 @@ better work.
 - When working in projects with pyproject.toml ONLY add / update deps via `uv add` / `uv remove`.
 - To install the deps run `uv sync` (with the required optional deps if any, or sometimes `--all-extras`).
 - To type check, run `cd /path/to/check check`, short for `uvx ty@latest check`, or - preferrably - use `make check` if available (I often use Makefiles to streamline and standardize common commands, read those files when doing dev work like testing, type checking, starting servers, etc.!)
-- For Python CLIs, always use tyro (never argparse/click/fire). Load `/mx:tyro-cli` for patterns and gotchas.
+- For Python CLIs, always use tyro (never argparse/click/fire). **ALWAYS load `/mx:tyro-cli` before writing any CLI** — it contains critical gotchas (shebangs, PEP 723, docstring formatting) that are easy to get wrong.
  - Prefer creating CLIs/scripts with tyro, for anything you might want to run more than once or that has flags you want to ablate. Save time and attention by creating proper infrastructure for your investigations, visualizations, experiments, etc.
 - Do NOT use `python3` to run python code or scripts. Always use `uv run {python {-c}}`, those are auto-approved.
 
@@ -222,4 +228,21 @@ DO NOT USE SUBAGENTS.
   - Avoid `git add -A` or `git add .` - untracked files may exist that shouldn't be committed. Prefer explicit file lists or `git add -u` (tracked files only).
   - Before history-rewriting (amend, rebase), check if the commit was pushed. When in doubt, make a new commit instead.
 </git>
+
+| Complexity | Simplicity |
+| --- | --- |
+| State, Objects | Values |
+| Methods | Functions, Namespaces |
+| vars | Managed refs |
+| Inheritance, switch, matching | Polymorphism a la carte |
+| Syntax | Data |
+| Imperative loops, fold | Set functions |
+| Actors | Queues |
+| ORM | Declarative data manipulation |
+| Conditionals | Rules |
+| Inconsistency | Consistency |
+
+- Assess constructs by the artifacts they produce, not the experience of authoring them.
+- Strictly separate what from how.
+- Represent data as data.
 
