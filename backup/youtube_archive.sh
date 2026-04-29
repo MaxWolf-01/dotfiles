@@ -106,7 +106,7 @@ while IFS='|' read -r url format name; do
             ((pl_error_unavailable++))
         elif [[ "$line" =~ ERROR:.*(copyright\ claim) ]]; then
             ((pl_error_copyright++))
-        elif [[ "$line" =~ ERROR:.*(removed|deleted) ]]; then
+        elif [[ "$line" =~ ERROR:.*(removed|deleted|Private\ video|members-only|Join\ this\ channel) ]]; then
             ((pl_error_deleted++))
         elif [[ "$line" =~ ^ERROR: ]]; then
             ((pl_error_other++))
