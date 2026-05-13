@@ -17,10 +17,15 @@ in
 {
   systemd.user.services.mdsr = {
     description = "mdsr — spaced repetition server";
-    after = [ "network-online.target" ];
+    after = [ "network-online.target" "ssh-agent.service" ];
     wants = [ "network-online.target" ];
     wantedBy = [ "default.target" ];
     path = [ pkgs.uv pkgs.git pkgs.openssh ];
+    # The vault SSH key has a passphrase; reach github.com via the user's
+    # ssh-agent (which holds the unlocked key). If the agent ever loses the
+    # key (e.g. fresh boot with no auto-unlock), `git pull` will fail until
+    # `ssh-add` is run interactively.
+    environment.SSH_AUTH_SOCK = "/run/user/%U/ssh-agent";
     serviceConfig = {
       Type = "simple";
       ExecStartPre = "${pkgs.uv}/bin/uv tool install --upgrade mdsr";
