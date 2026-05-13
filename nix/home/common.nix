@@ -36,7 +36,6 @@
   '';
   xdg.configFile."uv/uv.toml".text = ''
     exclude-newer = "7 days"
-    exclude-newer-package = { yapit = false, memex-md = false, gitplot = false, clankr = false }
   '';
 
   # Ensure common dirs exist

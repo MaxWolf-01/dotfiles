@@ -12,6 +12,12 @@ let
   ytCookiePath = lib.makeBinPath (with pkgs; [
     bash coreutils yt-dlp openssh
   ]);
+
+  syncPath = lib.makeBinPath (with pkgs; [
+    bash coreutils rsync openssh
+  ]);
+
+  sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
   systemd.user.services.working-rsyncnet = {
@@ -178,6 +184,34 @@ in
     Timer = {
       OnCalendar = "Mon *-*-1..7,15..21 20:00:00";
       Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Documents → jarvis (read-only mirror for the agent) ---
+
+  systemd.user.services.jarvis-sync = {
+    Unit = {
+      Description = "Sync selected dirs to jarvis VPS (read-only mirror)";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${syncPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${secrets}/scripts/jarvis-sync";
+    };
+  };
+
+  systemd.user.timers.jarvis-sync = {
+    Unit.Description = "Daily jarvis sync";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "15m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
