@@ -1,0 +1,218 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Convert a Twitter/X archive into markdown files.
+
+Point at the archive — either the zip you downloaded or the unzipped
+directory. Output is overwritten on each run, so commit the output dir
+to git if you want history of what silently disappears (likes, mainly).
+
+Data fidelity:
+- tweets             full content + timestamps. Tweets >280 chars are
+                     truncated; `note-tweet.js` carries the untruncated
+                     text but is not currently merged in.
+- direct messages    full content + timestamps. Personal and group DMs.
+- bookmarks          tweetId + fullText + bookmarkedAt timestamp.
+- likes              tweetId + expandedUrl + (often) fullText. No author,
+                     no timestamp.
+
+Examples::
+
+    xxport ~/Downloads/twitter-archive.zip
+    xxport ~/Downloads/twitter-2026-05-02 --out ~/twitter-export
+    xxport ~/Downloads/twitter-archive.zip --kind bookmarks
+"""
+from __future__ import annotations
+
+import json
+import re
+import sys
+import tempfile
+import zipfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated, Any, Callable, Iterator, Literal
+
+import tyro
+
+
+KINDS = ("tweets", "likes", "bookmarks", "dms")
+
+# Patterns derived from steipete/birdclaw's archive-import.ts (verified shapes
+# of real X archives). Each kind can appear sharded across `<name>-partN.js`
+# files and may be singular or plural.
+PATTERNS: dict[str, re.Pattern[str]] = {
+    "tweets": re.compile(r"^(?:tweets|community-tweet)(?:-part\d+)?\.js$", re.I),
+    "likes": re.compile(r"^likes?(?:-part\d+)?\.js$", re.I),
+    "bookmarks": re.compile(r"^bookmarks?(?:-part\d+)?\.js$", re.I),
+    "dms": re.compile(r"^direct-messages(?:-group)?(?:-part\d+)?\.js$", re.I),
+}
+
+
+def load_js(path: Path) -> list[Any]:
+    """Strip the `window.YTD.<kind>.partN = ` prefix and parse the JSON body."""
+    text = path.read_text()
+    body = re.sub(r"^\s*window\.YTD\.[\w_]+\.part\d+\s*=\s*", "", text)
+    return json.loads(body)
+
+
+def load_all(srcs: list[Path]) -> list[Any]:
+    out: list[Any] = []
+    for s in sorted(srcs):
+        out.extend(load_js(s))
+    return out
+
+
+def write_md(out: Path, body: str) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(body)
+
+
+def status_url(tid: str) -> str:
+    return f"https://twitter.com/i/web/status/{tid}"
+
+
+def export_tweets(srcs: list[Path], out: Path) -> int:
+    data = load_all(srcs)
+    by_year: dict[str, list[dict]] = {}
+    for entry in data:
+        t = entry["tweet"]
+        # created_at: "Wed Sep 06 12:00:00 +0000 2023" — last token is the year
+        year = t["created_at"].split()[-1]
+        by_year.setdefault(year, []).append(t)
+    n = 0
+    for year, tweets in sorted(by_year.items()):
+        tweets.sort(key=lambda t: int(t["id_str"]))
+        chunks = []
+        for t in tweets:
+            chunks.append(
+                f"### {t['created_at']}\n\n{t['full_text']}\n\n<{status_url(t['id_str'])}>"
+            )
+            n += 1
+        write_md(out / "tweets" / f"{year}.md", "\n\n---\n\n".join(chunks) + "\n")
+    return n
+
+
+def export_likes(srcs: list[Path], out: Path) -> int:
+    data = load_all(srcs)
+    chunks = []
+    for entry in data:
+        like = entry["like"]
+        tid = like["tweetId"]
+        text = (like.get("fullText") or "").strip()
+        url = like.get("expandedUrl") or status_url(tid)
+        head = f"### {tid}"
+        chunks.append(f"{head}\n\n{text}\n\n<{url}>" if text else f"{head}\n\n<{url}>")
+    write_md(out / "likes.md", "\n\n---\n\n".join(chunks) + "\n")
+    return len(data)
+
+
+def export_bookmarks(srcs: list[Path], out: Path) -> int:
+    data = load_all(srcs)
+    items = [e["bookmark"] for e in data]
+    items.sort(key=lambda b: b.get("bookmarkedAt", ""))
+    chunks = []
+    for bm in items:
+        tid = bm["tweetId"]
+        ts = bm.get("bookmarkedAt", "")
+        text = (bm.get("fullText") or "").strip()
+        head = f"### {ts} — {tid}" if ts else f"### {tid}"
+        body_parts = [head]
+        if text:
+            body_parts.append(text)
+        body_parts.append(f"<{status_url(tid)}>")
+        chunks.append("\n\n".join(body_parts))
+    write_md(out / "bookmarks.md", "\n\n---\n\n".join(chunks) + "\n")
+    return len(items)
+
+
+def export_dms(srcs: list[Path], out: Path) -> int:
+    data = load_all(srcs)
+    n = 0
+    for entry in data:
+        conv = entry["dmConversation"]
+        cid = conv["conversationId"]
+        msgs = []
+        for m in conv.get("messages", []):
+            mc = m.get("messageCreate")
+            if not mc:
+                continue
+            msgs.append(
+                f"**{mc.get('senderId', '?')}** — {mc.get('createdAt', '')}\n\n{mc.get('text', '')}"
+            )
+            n += 1
+        write_md(out / "dms" / f"{cid}.md", "\n\n---\n\n".join(msgs) + "\n")
+    return n
+
+
+HANDLERS: dict[str, Callable[[list[Path], Path], int]] = {
+    "tweets": export_tweets,
+    "likes": export_likes,
+    "bookmarks": export_bookmarks,
+    "dms": export_dms,
+}
+
+
+def find_data_dir(archive: Path) -> Path:
+    """Locate the `data/` dir. Some archives nest it one level deep."""
+    if (archive / "data").is_dir():
+        return archive / "data"
+    nested = list(archive.glob("*/data"))
+    if len(nested) == 1 and nested[0].is_dir():
+        return nested[0]
+    sys.exit(f"no `data/` dir under {archive}")
+
+
+@contextmanager
+def open_archive(archive: Path) -> Iterator[Path]:
+    """Yield a directory containing the archive contents.
+
+    Accepts either an unzipped directory or a .zip. Zips are extracted to a
+    temp dir that is cleaned up on exit.
+    """
+    if archive.is_dir():
+        yield archive
+        return
+    if archive.is_file() and zipfile.is_zipfile(archive):
+        with tempfile.TemporaryDirectory(prefix="twitter-archive-") as td:
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(td)
+            yield Path(td)
+        return
+    sys.exit(f"{archive} is neither a directory nor a zip archive")
+
+
+@dataclass
+class Args:
+    archive: Annotated[Path, tyro.conf.Positional]
+    """Path to the Twitter archive — a .zip or an unzipped directory."""
+    out: Path = Path.cwd() / "twitter-export"
+    """Output directory. Created if missing. Files are overwritten."""
+    kind: Literal["all", "tweets", "likes", "bookmarks", "dms"] = "all"
+    """Which data kind to export."""
+
+
+def main(args: Args) -> None:
+    with open_archive(args.archive) as root:
+        data_dir = find_data_dir(root)
+        files = [p for p in data_dir.iterdir() if p.is_file()]
+        kinds = KINDS if args.kind == "all" else (args.kind,)
+        for kind in kinds:
+            srcs = sorted(p for p in files if PATTERNS[kind].match(p.name))
+            if not srcs:
+                print(f"[skip] {kind}: no matching files in archive", file=sys.stderr)
+                continue
+            try:
+                n = HANDLERS[kind](srcs, args.out)
+            except Exception as e:
+                print(f"[fail] {kind}: {e}", file=sys.stderr)
+                continue
+            names = ", ".join(p.name for p in srcs)
+            print(f"[ok]   {kind}: {n} entries from {names} -> {args.out}")
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__))
