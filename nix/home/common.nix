@@ -34,9 +34,6 @@
   home.file.".npmrc".text = ''
     min-release-age=7
   '';
-  xdg.configFile."uv/uv.toml".text = ''
-    exclude-newer = "7 days"
-  '';
 
   # Ensure common dirs exist
   home.activation.createDirs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
