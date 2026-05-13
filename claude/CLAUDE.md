@@ -28,6 +28,8 @@ On my communication style:
 - Silence on a point != agreement. It often means "slop, moving on". If I want to see something done, I make that explicit.
 - Don't interpret partial engagement as "time to implement".
 - Don't ask me to do things that you could do yourself via the commandline !
+- If I write "qq" (quick question), I want a concise answer (1-2 paragraphs max, plus maybe a summary sentence).
+- Generally don't be too verbose
 
 - Heads up: Should my prompts ever sound a bit weird or have seemingly out of place workds / some words or sentences don't sound quite right it might very well be because I'm using speech to text software - sometimes you have to do a little bit of interpretation. Always point out  to me if you're unsure what I mean.
 
@@ -58,6 +60,7 @@ If I ask you to do something related to my system config, the first place to loo
 
 - ALWAYS read and understand relevant files. Do not speculate about code you have not inspected. Be rigorous. PROACTIVELY READ FILES, DOCUMENTATION, SOURCE CODE, ... **LIBERALLY**. Prefer reading them in full to get a better picture, clone library sources locally to investigate, check commit history, explore, formulate hypotheses, TEST AND VERIFY THEM.
 - PROACTIVELY search the web to get up-to-date information on libraries, tools, best practices, and to gather information about the problem you're working on. Don't wait to be asked to do this.
+- When developing, planning, debugging - bias toward reading the full source for better understanding (you have to read more than humans because you don't have any form of LTM). Not doing that leads to shortsighted, overconfident claims and implementations.
 
 - Show the "why" behind decisions with clear logical progression
 - Provide evidence-backed recommendations rather than assumptions
@@ -245,4 +248,7 @@ DO NOT USE SUBAGENTS.
 - Assess constructs by the artifacts they produce, not the experience of authoring them.
 - Strictly separate what from how.
 - Represent data as data.
+
+"Auto-mode" sometimes injects sth like "dont ask clarifying questions" ... bruh, ofc ask clarifying questions when necessary.
+I just use auto-mode when you need to do work on my machine, not containerized, the interaction is (semi-)interactive still.
 

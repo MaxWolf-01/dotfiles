@@ -19,6 +19,7 @@ For device inventory, infrastructure, and backup architecture: always read `secr
 
 ALWAYS read README.md and secrets/README.md to get a quick high-level overview of the project structure / setup / usage flow.
 ALWAYS read the nix config files etc. first when debugging anything/before answering anything, etc.
+And check which host you're on.
 
 ‼️‼️‼️
 
