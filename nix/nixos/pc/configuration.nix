@@ -5,6 +5,7 @@
     ./hardware-configuration.nix
     ./youtube-download.nix
     ./pihole.nix
+    ./mdsr.nix
   ];
 
   # Boot
