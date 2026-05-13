@@ -20,7 +20,7 @@ in
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
     wantedBy = [ "default.target" ];
-    path = [ pkgs.uv pkgs.git ];
+    path = [ pkgs.uv pkgs.git pkgs.openssh ];
     serviceConfig = {
       Type = "simple";
       ExecStartPre = "${pkgs.uv}/bin/uv tool install --upgrade mdsr";
