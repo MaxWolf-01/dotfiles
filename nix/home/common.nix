@@ -56,6 +56,12 @@
   programs.git = {
     enable = true;
     lfs.enable = true;
+    signing = {
+      format = "ssh";
+      signByDefault = true;
+      signer = "${pkgs.openssh}/bin/ssh-keygen";
+      key = "~/.ssh/id_ed25519.pub";
+    };
     ignores = [
       "agent/transcripts"
       "agent/handoffs"
