@@ -35,11 +35,13 @@ in
     };
   };
 
-  # `tailscale serve` persists config in /var/lib/tailscale, so this is effectively
-  # a boot-time reconciler — re-running is idempotent. Additive: doesn't clobber
-  # other serve paths set imperatively.
+  # Forward the whole tailnet hostname to mdsr (no `--set-path`): tailscale's
+  # `--set-path` strips the prefix, which conflicts with mdsr's `--root-path`.
+  # mdsr only answers at /sr/... so other paths just 404 at the app layer.
+  # `ExecStartPre` clears any stale /sr mount from earlier attempts (leading
+  # `-` ignores the exit code if nothing was set).
   systemd.services.mdsr-tailscale-serve = {
-    description = "Tailscale serve mount for mdsr at ${urlPath}";
+    description = "Tailscale serve forward to mdsr";
     after = [ "tailscaled.service" "network-online.target" ];
     requires = [ "tailscaled.service" ];
     wants = [ "network-online.target" ];
@@ -47,7 +49,8 @@ in
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
-      ExecStart = "${pkgs.tailscale}/bin/tailscale serve --bg --http=80 --set-path=${urlPath} http://127.0.0.1:${toString port}";
+      ExecStartPre = "-${pkgs.tailscale}/bin/tailscale serve --set-path=${urlPath} off";
+      ExecStart = "${pkgs.tailscale}/bin/tailscale serve --bg --http=80 http://127.0.0.1:${toString port}";
     };
   };
 }
