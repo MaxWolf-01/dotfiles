@@ -38,8 +38,9 @@ in
   # Forward the whole tailnet hostname to mdsr (no `--set-path`): tailscale's
   # `--set-path` strips the prefix, which conflicts with mdsr's `--root-path`.
   # mdsr only answers at /sr/... so other paths just 404 at the app layer.
-  # `ExecStartPre` clears any stale /sr mount from earlier attempts (leading
-  # `-` ignores the exit code if nothing was set).
+  # `serve reset` wipes any prior mounts so this is deterministic — if you
+  # later add other services on this host, do them via additional units that
+  # run after this one, or merge them into this oneshot.
   systemd.services.mdsr-tailscale-serve = {
     description = "Tailscale serve forward to mdsr";
     after = [ "tailscaled.service" "network-online.target" ];
@@ -49,7 +50,7 @@ in
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
-      ExecStartPre = "-${pkgs.tailscale}/bin/tailscale serve --set-path=${urlPath} off";
+      ExecStartPre = "${pkgs.tailscale}/bin/tailscale serve reset";
       ExecStart = "${pkgs.tailscale}/bin/tailscale serve --bg --http=80 http://127.0.0.1:${toString port}";
     };
   };
