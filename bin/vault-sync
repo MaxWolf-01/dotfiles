@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,7 @@ from typing import TypedDict
 
 HOME = Path.home()
 VAULT_DIR_DEFAULT = HOME / "repos/obsidian/knowledge-base"
-QUARTZ_DIR_DEFAULT = HOME / "repos/obsidian/quartz-knowledge-base"
+QUARTZ_DIR_DEFAULT = HOME / "repos/github/MaxWolf-01/quartz-knowledge-base"
 
 MEDIA_EXTENSIONS = frozenset({
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
@@ -204,6 +205,103 @@ def sync(source_dir: Path, content_dir: Path, whitelist: Whitelist) -> tuple[int
     return copied, skipped
 
 
+def _git(args: list[str], cwd: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True, text=True, capture_output=True,
+    ).stdout
+
+
+def _blame_lines(repo: Path, rel_path: str) -> list[int]:
+    """Return per-line unix epoch (author-time) for `rel_path` in `repo`.
+
+    1-indexed; index 0 is a sentinel 0 so callers can use line numbers directly.
+    """
+    porcelain = _git(["blame", "--line-porcelain", "--", rel_path], repo)
+    # Track current author-time, emit it on each new file_line (tab-prefixed content).
+    out: list[int] = [0]
+    cur_time = 0
+    for line in porcelain.splitlines():
+        if line.startswith("author-time "):
+            cur_time = int(line.split(" ", 1)[1])
+        elif line.startswith("\t"):
+            out.append(cur_time)
+    return out
+
+
+def _head_sha(repo: Path) -> str:
+    return _git(["rev-parse", "HEAD"], repo).strip()
+
+
+def _changed_since(repo: Path, old_sha: str) -> set[str] | None:
+    """Markdown paths changed between old_sha and HEAD. None if old_sha is unknown
+    to the repo (forces a full recompute)."""
+    try:
+        out = _git(["diff", "--name-only", f"{old_sha}..HEAD"], repo)
+    except subprocess.CalledProcessError:
+        return None
+    return {p for p in out.splitlines() if p.endswith(".md")}
+
+
+def compute_blame(
+    vault_dir: Path,
+    whitelist: Whitelist,
+    cache_path: Path,
+) -> dict[str, list[int]]:
+    """Build {vault-relative path: [per-line timestamps]} with HEAD-based caching.
+
+    Cache stores the HEAD it was computed at plus per-file blame. On the next run:
+    if HEAD is unchanged, reuse everything (no git calls). Otherwise re-blame only
+    the markdown files that changed between the cached HEAD and the current one.
+    Skips library/ (symlinked, not under git).
+    """
+    cache: dict = {}
+    if cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text())
+        except Exception as e:
+            log(f"Blame cache unreadable, starting fresh: {e}", "WARNING")
+
+    cached_head = cache.get("head")
+    cached_blame: dict[str, list[int]] = cache.get("blame", {})
+    head = _head_sha(vault_dir)
+
+    candidates = [
+        rel
+        for rel in whitelist["files"]
+        if rel.endswith(".md")
+        and not rel.startswith("library/")
+        and (vault_dir / rel).is_file()
+    ]
+
+    # Decide which files need (re)blaming.
+    if cached_head == head and cached_blame:
+        to_blame: set[str] = {rel for rel in candidates if rel not in cached_blame}
+    else:
+        changed = _changed_since(vault_dir, cached_head) if cached_head else None
+        if changed is None:
+            to_blame = set(candidates)  # full recompute
+        else:
+            to_blame = {rel for rel in candidates if rel in changed or rel not in cached_blame}
+
+    blame_map: dict[str, list[int]] = {}
+    computed = 0
+    for rel in candidates:
+        if rel in to_blame:
+            try:
+                blame_map[rel] = _blame_lines(vault_dir, rel)
+                computed += 1
+            except subprocess.CalledProcessError as e:
+                log(f"blame failed for {rel}: {e.stderr.strip()}", "WARNING")
+        elif rel in cached_blame:
+            blame_map[rel] = cached_blame[rel]
+
+    cache_path.write_text(json.dumps({"head": head, "blame": blame_map}))
+    log(f"Blame: {len(blame_map) - computed} cached, {computed} computed, "
+        f"{len(candidates)} total md files")
+    return blame_map
+
+
 def main() -> None:
     vault_dir = Path(os.getenv("VAULT_DIR", VAULT_DIR_DEFAULT))
     quartz_dir = Path(os.getenv("QUARTZ_DIR", QUARTZ_DIR_DEFAULT))
@@ -217,6 +315,16 @@ def main() -> None:
     whitelist = load_whitelist(whitelist_path)
     copied, skipped = sync(vault_dir, content_dir, whitelist)
     log(f"Sync complete. {copied} files copied, {skipped} files skipped.")
+
+    # Per-line blame for git-blame toggle on the site. Cache lives in
+    # ~/.cache/ (user-local, never committed) because content/ gets rmtree'd
+    # at the start of each sync. CI only needs the output content/blame.json,
+    # not the cache.
+    cache_dir = Path(os.getenv("XDG_CACHE_HOME", HOME / ".cache")) / "vault-sync"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "blame-cache.json"
+    blame_map = compute_blame(vault_dir, whitelist, cache_path)
+    (content_dir / "blame.json").write_text(json.dumps(blame_map))
 
 
 if __name__ == "__main__":
