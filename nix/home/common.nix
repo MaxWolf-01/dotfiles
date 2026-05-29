@@ -329,6 +329,7 @@
     markdown-oxide
     ncdu
     neovim
+    copilot-language-server
     nerd-fonts.hack
     nodejs
     nvd
