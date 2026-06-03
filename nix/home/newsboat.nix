@@ -49,6 +49,9 @@ in
       { url = "https://steipete.me/rss.xml"; }
       { url = "https://lucumr.pocoo.org/feed.xml"; }
       { url = "https://earendil.com/posts/feed.rss"; }
+      { url = "https://lineick.github.io/feed.xml"; }
+      { url = "https://www.benfrederickson.com/atom.xml"; }
+      { url = "https://blog.trueberryless.org/blog/rss.xml"; }
       (codebergFeed "https://codeberg.org/lucidrains/x-evolution.rss")
       (codebergFeed "https://codeberg.org/lucidrains/streaming-deep-rl.rss")
       (codebergFeed "https://codeberg.org/lucidrains/metacontroller.rss")

@@ -92,10 +92,10 @@
       "*.tar.gz"
       "*.7z"
       "*.pdf"
-      "**/notes/*"
       "**/notebooks/*"
       ".sessions"
       ".codex"
+      "**/.ignored/*"
     ];
     attributes = [
       "*.lockb binary diff=lockb"

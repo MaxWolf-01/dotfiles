@@ -30,8 +30,8 @@
 
     "org/gnome/shell" = {
       enabled-extensions = [
-        "tilingshell@ferrarodomenico.com"
-        "GPaste@gnome-shell-extensions.gnome.org"
+        # waiting on GNOME 50 support
+        # "tilingshell@ferrarodomenico.com"
       ];
     };
 
@@ -94,6 +94,7 @@
       custom-keybindings = [
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/"
+        "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom3/"
       ];
     };
 
@@ -104,11 +105,6 @@
       binding = "<Super>e";
     };
 
-    # Custom: clipboard history — blocked on GNOME 50
-    # clipse/cliphist use wl-paste which triggers dock auto-show (wl-clipboard bug: github.com/bugaevc/wl-clipboard/issues/90)
-    # GPaste supports up to GNOME 48, Clipboard Indicator up to 49
-    # Works on Hyprland with cliphist. Revisit when GPaste/Clipboard Indicator update for GNOME 50.
-
     # Custom: nightlight toggle
     "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1" = {
       name = "Toggle nightlight";
@@ -116,11 +112,13 @@
       binding = "<Primary><Super>n";
     };
 
-    # Custom: clipboard history
-    "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2" = {
-      name = "Clipboard history";
-      command = "ghostty --class=clipse -e clipse";
-      binding = "<Primary><Alt>h";
+    # Custom: Handy speech-to-text toggle
+    # Wayland requires the compositor to own the global shortcut; the CLI signals the running instance via IPC.
+    # Absolute path: gnome-shell's exec environment for shortcut commands lacks ~/bin on PATH.
+    "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom3" = {
+      name = "Handy toggle transcription";
+      command = "${config.home.homeDirectory}/bin/handy --toggle-transcription";
+      binding = "<Primary>space";
     };
 
     "org/freedesktop/ibus/panel/emoji" = {
@@ -130,7 +128,6 @@
     };
 
     # Tiling Shell extension
-    # TODO: redo keybindings when tiling-shell supports GNOME 50 (Ctrl+Alt+H conflicts with clipse)
     "org/gnome/shell/extensions/tilingshell" = {
       enable-autotiling = true;
       enable-screen-edges-windows-suggestions = true;
