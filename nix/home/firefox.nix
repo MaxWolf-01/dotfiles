@@ -25,6 +25,12 @@ in
   programs.firefox = {
     enable = true;
 
+    # Pin the legacy native profile dir. HM 26.05+ defaults to XDG
+    # (~/.config/mozilla/firefox) once stateVersion >= 26.05, which we are.
+    # TODO: migrate ~/.mozilla → ~/.config/mozilla eventually (move dir, update
+    # firejail whitelist + backup paths in dirs.txt), then drop this pin.
+    configPath = ".mozilla/firefox";
+
     policies = {
       DisableTelemetry = true;
       DisableFirefoxStudies = true;
