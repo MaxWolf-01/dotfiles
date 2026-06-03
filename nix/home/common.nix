@@ -254,8 +254,8 @@
         { mime = "{audio,video}/*"; fg = "magenta"; }
         { mime = "application/{zip,rar,7z*,tar,gzip,xz,zstd,bzip*,lzma,compress,archive,cpio,arj,xar,ms-cab*}"; fg = "red"; }
         { mime = "application/{pdf,doc,rtf}"; fg = "lightcyan"; }
-        { name = "*"; is = "orphan"; fg = "red"; }
-        { name = "*/"; fg = "green"; bold = true; }
+        { url = "*"; is = "orphan"; fg = "red"; }
+        { url = "*/"; fg = "green"; bold = true; }
       ];
     };
   };
