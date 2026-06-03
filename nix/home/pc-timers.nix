@@ -6,7 +6,7 @@ let
   secrets = "${dotfiles}/secrets";
 
   backupPath = lib.makeBinPath (with pkgs; [
-    bash coreutils util-linux gnused gnugrep restic openssh sops curl jq age
+    bash coreutils util-linux gnused gnugrep restic openssh sops curl jq age sqlite
   ]);
 
   syncPath = lib.makeBinPath (with pkgs; [
@@ -162,6 +162,40 @@ in
       OnCalendar = "weekly";
       Persistent = true;
       RandomizedDelaySec = "1h20m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- pc service state → rsync.net ---
+  # pc-local app state (e.g. mdsr's spaced-repetition DB) that lives on pc's own
+  # disk, not in a tank dataset. ExecStartPre stages consistent snapshots; the
+  # backup then sweeps the staging tree. Add services by editing the snapshot
+  # script + pcstate/dirs.txt — this unit doesn't change.
+
+  systemd.user.services.pcstate-rsyncnet = {
+    Unit = {
+      Description = "Restic backup to rsync.net (pc service state)";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStartPre = "${dotfiles}/backup/pcstate_snapshot.sh";
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/pcstate/rsyncnet.conf";
+    };
+  };
+
+  systemd.user.timers.pcstate-rsyncnet = {
+    Unit.Description = "Weekly backup to rsync.net (pc service state)";
+    Timer = {
+      OnCalendar = "weekly";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
