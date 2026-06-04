@@ -265,45 +265,41 @@
   programs.ssh = {
     enable = true;
     enableDefaultConfig = false;
-    matchBlocks = {
+    settings = {
       "github.com" = {
-        hostname = "github.com";
-        user = "git";
+        HostName = "github.com";
+        User = "git";
       };
       "rsyncnet zh5684.rsync.net" = {
-        hostname = "zh5684.rsync.net";
-        user = "zh5684";
-        extraOptions = {
-          BatchMode = "yes";
-          StrictHostKeyChecking = "accept-new";
-        };
+        HostName = "zh5684.rsync.net";
+        User = "zh5684";
+        BatchMode = "yes";
+        StrictHostKeyChecking = "accept-new";
       };
       "a55 phone" = {
-        hostname = "100.65.181.6";
-        port = 8022;
+        HostName = "100.65.181.6";
+        Port = 8022;
       };
       jarvis = {
-        hostname = "100.124.185.86";
-        user = "root";
+        HostName = "100.124.185.86";
+        User = "root";
       };
       yapit-prod = {
-        hostname = "100.87.244.58";
-        user = "root";
+        HostName = "100.87.244.58";
+        User = "root";
       };
       "xmg xmg19" = {
-        hostname = "100.97.152.25";
-        user = "max";
+        HostName = "100.97.152.25";
+        User = "max";
       };
       "zephylux main" = {
-        hostname = "100.104.165.39";
-        user = "max";
+        HostName = "100.104.165.39";
+        User = "max";
       };
       "*" = {
-        extraOptions = {
-          AddKeysToAgent = "yes";
-          IdentitiesOnly = "yes";
-        };
-        identityFile = [ "~/.ssh/id_ed25519" ];
+        AddKeysToAgent = "yes";
+        IdentitiesOnly = "yes";
+        IdentityFile = "~/.ssh/id_ed25519";
       };
     };
   };
