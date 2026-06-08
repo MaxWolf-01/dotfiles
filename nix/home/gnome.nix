@@ -30,6 +30,7 @@
 
     "org/gnome/shell" = {
       enabled-extensions = [
+        "copyous@boerdereinar.dev"
         # waiting on GNOME 50 support
         # "tilingshell@ferrarodomenico.com"
       ];
@@ -158,6 +159,37 @@
       layouts-json = ''[{"id":"Layout 1","tiles":[{"x":0,"y":0,"width":0.22,"height":0.5,"groups":[1,2]},{"x":0,"y":0.5,"width":0.22,"height":0.5,"groups":[1,2]},{"x":0.22,"y":0,"width":0.56,"height":1,"groups":[2,3]},{"x":0.78,"y":0,"width":0.22,"height":0.5,"groups":[3,4]},{"x":0.78,"y":0.5,"width":0.22,"height":0.5,"groups":[3,4]}]},{"id":"Layout 2","tiles":[{"x":0,"y":0,"width":0.22,"height":1,"groups":[1]},{"x":0.22,"y":0,"width":0.56,"height":1,"groups":[1,2]},{"x":0.78,"y":0,"width":0.22,"height":1,"groups":[2]}]},{"id":"Layout 3","tiles":[{"x":0,"y":0,"width":0.33,"height":1,"groups":[1]},{"x":0.33,"y":0,"width":0.67,"height":1,"groups":[1]}]},{"id":"Layout 4","tiles":[{"x":0,"y":0,"width":0.67,"height":1,"groups":[1]},{"x":0.67,"y":0,"width":0.33,"height":1,"groups":[1]}]},{"id":"13597114","tiles":[{"x":0,"y":0,"width":0.36770833333333336,"height":0.5,"groups":[1,2]},{"x":0.36770833333333336,"y":0,"width":0.6322916666666674,"height":1,"groups":[1]},{"x":0,"y":0.5,"width":0.36770833333333336,"height":0.5,"groups":[2,1]}]},{"id":"13201446","tiles":[{"x":0,"y":0,"width":0.29069767441860467,"height":1,"groups":[1]},{"x":0.29069767441860467,"y":0,"width":0.5087209302325582,"height":1,"groups":[2,1]},{"x":0.7994186046511628,"y":0,"width":0.20058139534883718,"height":1,"groups":[2]}]},{"id":"13300092","tiles":[{"x":0,"y":0,"width":0.5,"height":1,"groups":[1]},{"x":0.5,"y":0,"width":0.4999999999999982,"height":1,"groups":[1]}]}]'';
       # Settings tiling-shell overrides in GNOME
       overridden-settings = ''{"org.gnome.mutter.keybindings":{"toggle-tiled-right":"['<Super>Right']","toggle-tiled-left":"['<Super>Left']"},"org.gnome.desktop.wm.keybindings":{"maximize":"['<Super>Up']","unmaximize":"['<Super>Down', '<Alt>F5']"},"org.gnome.mutter":{"edge-tiling":"true"}}'';
+    };
+
+    # Copyous clipboard manager (installed imperatively via ./setup copyous).
+    # Only non-default settings are tracked here; everything else uses schema defaults.
+    "org/gnome/shell/extensions/copyous" = {
+      # Persist full history across restart/logout (default only keeps pinned/tagged)
+      clipboard-history = "keep-all";
+      database-backend = "sqlite";
+      history-length = 500;
+      # Layout / appearance
+      clipboard-orientation = "vertical";
+      clipboard-position-horizontal = "top";
+      clipboard-position-vertical = "fill";
+      clipboard-size = 600;
+      item-width = 512;
+      item-height = 128;
+      dynamic-item-height = true;
+      auto-hide-search = true;
+      show-header = false;
+      header-controls-visibility = "visible-on-hover";
+      show-at-pointer = true;
+      open-clipboard-dialog-shortcut = [ "<Super>v" ];
+    };
+    "org/gnome/shell/extensions/copyous/file-item" = {
+      file-preview-visibility = "file-info";
+    };
+    "org/gnome/shell/extensions/copyous/image-item" = {
+      show-image-info = true;
+    };
+    "org/gnome/shell/extensions/copyous/link-item" = {
+      link-preview-orientation = "horizontal";
     };
   };
 }
