@@ -95,7 +95,6 @@
       custom-keybindings = [
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/"
-        "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom3/"
       ];
     };
 
@@ -111,15 +110,6 @@
       name = "Toggle nightlight";
       command = "toggle_nightlight";
       binding = "<Primary><Super>n";
-    };
-
-    # Custom: Handy speech-to-text toggle
-    # Wayland requires the compositor to own the global shortcut; the CLI signals the running instance via IPC.
-    # Absolute path: gnome-shell's exec environment for shortcut commands lacks ~/bin on PATH.
-    "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom3" = {
-      name = "Handy toggle transcription";
-      command = "${config.home.homeDirectory}/bin/handy --toggle-transcription";
-      binding = "<Primary>space";
     };
 
     "org/freedesktop/ibus/panel/emoji" = {
