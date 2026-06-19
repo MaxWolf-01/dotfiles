@@ -7,6 +7,11 @@ in
 
   home.file.".icons".source = ../../desktop/icons;
 
+  programs.mpv = {
+    enable = true;
+    scripts = [ pkgs.mpvScripts.autoload ];
+  };
+
   programs.vesktop = {
     enable = true;
     settings = {

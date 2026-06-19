@@ -136,6 +136,12 @@
     shellWrapperName = "_yazi";
     extraPackages = with pkgs; [ trash-cli dragon-drop ];
     settings.preview.cache_dir = "${config.xdg.cacheHome}/yazi";
+    settings.opener.mpv = [
+      { run = ''mpv --force-window "$@"''; orphan = true; for = "unix"; }
+    ];
+    settings.open.prepend_rules = [
+      { mime = "{audio,video}/*"; use = [ "mpv" "reveal" ]; }
+    ];
     initLua = ''
       -- Override built-in size linemode to also show mtime
       function Linemode:size()
