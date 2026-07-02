@@ -11,9 +11,9 @@
 
   dconf.settings = {
     "org/gnome/shell/keybindings" = {
-      screenshot = [ "<Shift><Alt>s" ];
+      screenshot = [ "<Primary><Super>s" ];
       screenshot-window = [ "<Shift><Super>s" ];
-      show-screenshot-ui = [ "<Primary><Shift><Alt>s" ];
+      show-screenshot-ui = [ "<Primary><Shift><Super>s" ];
       toggle-message-tray = [ "<Super>n" ];
       toggle-overview = [];
       # Free Super+N for workspace switching (handled in wm/keybindings)
@@ -157,7 +157,7 @@
       # Persist full history across restart/logout (default only keeps pinned/tagged)
       clipboard-history = "keep-all";
       database-backend = "sqlite";
-      history-length = 500;
+      history-length = 100;
       # Layout / appearance
       clipboard-orientation = "vertical";
       clipboard-position-horizontal = "top";

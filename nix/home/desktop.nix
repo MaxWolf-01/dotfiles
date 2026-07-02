@@ -78,9 +78,12 @@ in
       "application/javascript" = "nvim.desktop";
       "application/x-shellscript" = "nvim.desktop";
       "audio/mpeg" = "org.gnome.Showtime.desktop";
-      "video/mp4" = "org.gnome.Showtime.desktop";
-      "video/webm" = "org.gnome.Showtime.desktop";
-      "video/x-matroska" = "org.gnome.Showtime.desktop";
+      "video/mp4" = "mpv.desktop";
+      "video/webm" = "mpv.desktop";
+      "video/x-matroska" = "mpv.desktop";
+      "video/quicktime" = "mpv.desktop";
+      "video/x-msvideo" = "mpv.desktop";
+      "video/mpeg" = "mpv.desktop";
       "x-scheme-handler/obsidian" = "obsidian.desktop";
       "text/html" = "firefox.desktop";
       "x-scheme-handler/http" = "firefox.desktop";
