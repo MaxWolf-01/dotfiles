@@ -39,6 +39,7 @@ in
     codex
     localsend
     zathura
+    texliveFull
   ];
 
   xdg.configFile."xdg-terminals.list".text = "com.mitchellh.ghostty.desktop\n";
