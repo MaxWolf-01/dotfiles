@@ -75,3 +75,9 @@ o.confirm = true   -- ask for confirmation instead of failing due to unsaved cha
 vim.schedule(function()
   vim.opt.clipboard = 'unnamedplus'
 end)
+
+-- Python 3 provider (for molten-nvim). The nixpkgs neovim wrapper disables all
+-- providers via --cmd; re-enable python3 and point it at a venv holding pynvim +
+-- jupyter_client (~/.virtualenvs/neovim). Remove this block to drop molten.
+vim.g.loaded_python3_provider = nil
+vim.g.python3_host_prog = vim.env.HOME .. "/.virtualenvs/neovim/bin/python"
