@@ -336,6 +336,7 @@
     nvd
     nvtopPackages.full
     openssh
+    poppler-utils
     python3Packages.ipdb
     pywal
     restic
