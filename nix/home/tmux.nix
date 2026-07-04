@@ -9,8 +9,25 @@ let
 
     # If no tmux server is running, restore saved sessions first
     if ! ${tmux} list-sessions &>/dev/null; then
-      last="$HOME/.tmux/resurrect/last"
-      if [ -L "$last" ] && [ -f "$last" ]; then
+      resdir="$HOME/.tmux/resurrect"
+      last="$resdir/last"
+
+      # Power loss can leave 'last' pointing at a 0-byte save (write never
+      # flushed). Fall back to the newest non-empty save, with its matching
+      # pane contents archive.
+      if [ ! -s "$last" ]; then
+        for f in $(ls -t "$resdir"/tmux_resurrect_*.txt 2>/dev/null); do
+          if [ -s "$f" ]; then
+            ln -sfn "$(basename "$f")" "$last"
+            ts="$(basename "$f" .txt)"; ts="''${ts#tmux_resurrect_}"
+            [ -s "$resdir/pane_contents_$ts.tar.gz" ] && cp "$resdir/pane_contents_$ts.tar.gz" "$resdir/pane_contents.tar.gz"
+            echo "tms: 'last' save was empty/missing, restored from $ts" >&2
+            break
+          fi
+        done
+      fi
+
+      if [ -s "$last" ]; then
         # Session "0" exists only during restore — save script skips when it's present
         ${tmux} new-session -d -s 0 -x "$(${pkgs.ncurses}/bin/tput cols)" -y "$(${pkgs.ncurses}/bin/tput lines)"
         restore_script=$(${tmux} show-options -gqv @resurrect-restore-script-path 2>/dev/null)
