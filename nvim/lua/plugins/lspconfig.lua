@@ -46,7 +46,7 @@ return {
       end,
     })
 
-    vim.lsp.enable({
+    local servers = {
       "bashls",
       "biome",
       "cmake",
@@ -71,6 +71,20 @@ return {
       "taplo",
       "ts_ls",
       "zls",
-    })
+    }
+
+    -- register overrides via vim.lsp.config(), which takes precedence over ALL
+    -- lsp/*.lua rtp files -- nvim merges those in rtp order with later (i.e.
+    -- nvim-lspconfig's) files winning, so user lsp/*.lua files can't override
+    for _, name in ipairs(servers) do
+      local ok, cfg = pcall(require, "lsps." .. name)
+      if ok then
+        vim.lsp.config(name, cfg)
+      elseif not tostring(cfg):match("module 'lsps%.") then
+        vim.notify(("lsps.%s failed to load: %s"):format(name, cfg), vim.log.levels.ERROR)
+      end
+    end
+
+    vim.lsp.enable(servers)
   end,
 }
