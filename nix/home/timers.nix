@@ -17,6 +17,10 @@ let
     bash coreutils rsync openssh
   ]);
 
+  mirrorPath = lib.makeBinPath (with pkgs; [
+    bash coreutils gnugrep git gh openssh
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -184,6 +188,34 @@ in
     Timer = {
       OnCalendar = "Mon *-*-1..7,15..21 20:00:00";
       Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- GitHub repo mirror (clone missing, fetch existing) ---
+
+  systemd.user.services.github-mirror = {
+    Unit = {
+      Description = "Mirror GitHub repos (clone missing, fetch existing)";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${mirrorPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/bin/github-mirror";
+    };
+  };
+
+  systemd.user.timers.github-mirror = {
+    Unit.Description = "Daily GitHub repo mirror";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
