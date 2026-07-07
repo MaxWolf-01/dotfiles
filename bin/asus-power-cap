@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Cap the CPU power limits the ASUS EC enforces (asus-armoury firmware attributes).
+# Values are volatile (reset on reboot), so applying also installs a systemd
+# oneshot that re-applies them on boot and resume. Power-profile switches do NOT
+# reset them (verified on GU603ZW), so no watcher is needed.
+#
+# What the two knobs mean:
+#   ppt_pl1_spl  (arg 1) — sustained power limit: what the CPU may draw
+#                          indefinitely. This sets steady-state temperature.
+#   ppt_pl2_sppt (arg 2) — boost power limit: what it may draw for short bursts
+#                          (seconds to ~1 min) before dropping back to spl.
+#                          This sets how hot spikes get and how snappy it feels.
+#
+# Reading `status` output:
+#   current = what the EC enforces right now
+#   min/max = writable range (driver rejects anything outside)
+#   default = firmware stock value (what `reset` restores)
+#
+# Usage:
+#   asus-power-cap <spl-watts> [sppt-watts]   apply caps (sustained, boost) + install unit
+#   asus-power-cap status                     show current/min/max/default values
+#   asus-power-cap reset                      restore firmware defaults, remove unit
+#
+# Scenarios (GU603ZW, i9-12900H — stock is 60/135, which rides 95°C+):
+#   asus-power-cap 35 65    # daily driver: cool on soft surfaces, snappy bursts
+#   asus-power-cap 28 45    # still overheating / heavy bed use
+#   asus-power-cap 45 90    # docked on a hard desk, want more sustained grunt
+#   asus-power-cap reset    # back to stock 60/135 (gaming on a cooling pad etc.)
+
+set -euo pipefail
+
+ATTRS=/sys/class/firmware-attributes/asus-armoury/attributes
+UNIT_NAME=asus-power-cap.service
+UNIT_PATH=/etc/systemd/system/$UNIT_NAME
+
+[ -d "$ATTRS/ppt_pl1_spl" ] || { echo "error: $ATTRS/ppt_pl1_spl not found (asus-armoury driver missing?)" >&2; exit 1; }
+
+show() {
+    for attr in ppt_pl1_spl ppt_pl2_sppt; do
+        d=$ATTRS/$attr
+        echo "$attr: current=$(cat "$d/current_value")W min=$(cat "$d/min_value")W max=$(cat "$d/max_value")W default=$(cat "$d/default_value")W"
+    done
+    systemctl is-enabled --quiet $UNIT_NAME 2>/dev/null \
+        && echo "unit: $UNIT_NAME enabled" \
+        || echo "unit: not installed"
+}
+
+validate() { # attr watts
+    local d=$ATTRS/$1 min max
+    min=$(cat "$d/min_value"); max=$(cat "$d/max_value")
+    echo "$2" | grep -Eq '^[0-9]+$' || { echo "error: $1 value '$2' is not a number" >&2; exit 1; }
+    [ "$2" -ge "$min" ] && [ "$2" -le "$max" ] || { echo "error: $1 must be in [$min, $max], got $2" >&2; exit 1; }
+}
+
+case "${1:-}" in
+    status)
+        show
+        ;;
+    reset)
+        for attr in ppt_pl1_spl ppt_pl2_sppt; do
+            cat "$ATTRS/$attr/default_value" | sudo tee "$ATTRS/$attr/current_value" >/dev/null
+        done
+        if [ -f "$UNIT_PATH" ]; then
+            sudo systemctl disable --quiet $UNIT_NAME
+            sudo rm "$UNIT_PATH"
+            sudo systemctl daemon-reload
+        fi
+        echo "restored firmware defaults, removed $UNIT_NAME"
+        show
+        ;;
+    ''|-h|--help)
+        awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
+        ;;
+    *)
+        spl=$1
+        sppt=${2:-$(cat "$ATTRS/ppt_pl2_sppt/current_value")}
+        validate ppt_pl1_spl "$spl"
+        validate ppt_pl2_sppt "$sppt"
+        [ "$spl" -le "$sppt" ] || { echo "error: spl ($spl) must be <= sppt ($sppt)" >&2; exit 1; }
+
+        echo "$spl"  | sudo tee "$ATTRS/ppt_pl1_spl/current_value"  >/dev/null
+        echo "$sppt" | sudo tee "$ATTRS/ppt_pl2_sppt/current_value" >/dev/null
+
+        sudo tee "$UNIT_PATH" >/dev/null <<EOF
+[Unit]
+Description=Cap ASUS EC CPU power limits (spl=${spl}W sppt=${sppt}W)
+After=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo $spl > $ATTRS/ppt_pl1_spl/current_value; echo $sppt > $ATTRS/ppt_pl2_sppt/current_value'
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable --quiet $UNIT_NAME
+        echo "applied caps and installed $UNIT_NAME"
+        show
+        ;;
+esac
