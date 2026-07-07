@@ -44,11 +44,6 @@ return {
       substitutions = {},
     },
 
-    completion = {
-      blink = true,
-      min_chars = 2,
-    },
-
     picker = {
       name = "telescope",
     },
