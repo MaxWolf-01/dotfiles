@@ -104,6 +104,7 @@ Gather sufficient context, verify your assumptions and sources.
 - Don't suppress stderr when you're exploring or debugging. stderr is how you learn what went wrong. Only suppress it when you know the output is noise.
 
 - Don't write tests that just repeat the implementation. Tests should verify behavior, not mirror the code structure. Focus on edge cases, expected inputs/outputs, ...
+- Don't leave non-trivial logic without a check: a few plain asserts in a `__main__` block if the file has no real entrypoint (e.g. tiny-dim model, forward pass, assert shapes/finiteness), otherwise one small test file. No frameworks or fixtures unless asked; trivial one-liners need none.
 </anti-patterns>
 
 <permissions>
@@ -240,6 +241,7 @@ Good code requires good abstractions requires deep understanding.
 | Conditionals | Rules |
 | Inconsistency | Consistency |
 
+- Before writing code, climb this ladder and stop at the first rung that holds: does it need to exist at all (YAGNI) → does this codebase already have it → stdlib → native platform feature (`<input type="date">` over a picker lib, DB constraint over app code) → already-installed dependency → can it be one line → only then, the minimum code that works. The ladder runs *after* you understand the problem, never instead of it.
 - Assess constructs by the artifacts they produce, not the experience of authoring them.
 - Strictly separate what from how.
 - Represent data as data.
