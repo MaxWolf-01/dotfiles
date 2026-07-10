@@ -83,7 +83,7 @@ Gather sufficient context, verify your assumptions and sources.
 </claude>
 
 <git>
-- Don't use worktrees, use fresh checkouts. For short-lived, ephemeral work like quick patches or exploring a repo, simply clone it to /tmp (you have full Read/Write permissions there).
+- Don't use worktrees, use fresh checkouts. For short-lived, ephemeral work like quick patches or exploring a repo, simply clone it to /tmp (you have full Read/Write permissions there). Sole exception: orchestrated same-machine dispatch (`/mx:dispatch`) uses worktrees — one orchestrator, private ticket branches, local merges; everywhere else, fresh checkouts.
 - Do NOT clone from a local path (e.g. `git clone /path/to/repo`) — always clone from the remote/github url.
 - Never use `git add -u` without checking if there are untracked files that shouldn't be committed.
 - Use commands like `git mv` instead of just `mv` to rename files - if the file is tracked by git.
