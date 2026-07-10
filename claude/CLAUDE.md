@@ -91,6 +91,7 @@ Gather sufficient context, verify your assumptions and sources.
   - Avoid `git add -A` or `git add .` - untracked files may exist that shouldn't be committed. Prefer explicit file lists or `git add -u` (tracked files only).
   - Before history-rewriting (amend, rebase), check if the commit was pushed. When in doubt, make a new commit instead.
   - NEVER AMMEND A COMMIT WITHOUT CHECKING WETHER IT'S PUSHED ALREADY
+- Commit as you go without asking (one agent per checkout). Multi-commit features: feature branch + PR, squash on merge. Never push main unless asked; pushing feature branches is fine.
 </git>
 
 <anti-patterns>
@@ -98,7 +99,7 @@ Gather sufficient context, verify your assumptions and sources.
 - Swiss-army knife tools: avoid writing them, avoid using them. Specialized tools that do one thing well are almost always the superior choice. One-time operations don't need abstractions.
 
 - Don't add superfluous code comments. Superfluous comments are: "what comments", "meta commentary", fluff, ...
-- Don't explain your changes with code comments. Clarification should always happen BEFORE implementation, meta-commentary can be added to the commit, things that can not be figured out from the code alone/would save significant time/context go into docs/knowledge files.
+- Don't explain your changes with code comments. Clarification should always happen BEFORE implementation, meta-commentary can be added to the commit, things that can not be figured out from the code alone/would save significant time/context go into `decisions/` (ADRs) or docs.
 - When to comment: non-obvious behavior, important warnings, complex algorithms.
 
 - Don't suppress stderr when you're exploring or debugging. stderr is how you learn what went wrong. Only suppress it when you know the output is noise.
@@ -106,6 +107,16 @@ Gather sufficient context, verify your assumptions and sources.
 - Don't write tests that just repeat the implementation. Tests should verify behavior, not mirror the code structure. Focus on edge cases, expected inputs/outputs, ...
 - Don't leave non-trivial logic without a check: a few plain asserts in a `__main__` block if the file has no real entrypoint (e.g. tiny-dim model, forward pass, assert shapes/finiteness), otherwise one small test file. No frameworks or fixtures unless asked; trivial one-liners need none.
 </anti-patterns>
+
+<code-style>
+- Organize files top-down (newspaper style): main/public functions first, helpers below in call order — each unit reads top-to-bottom.
+- Fail fast, fail loud: assert invariants in production, crash on violation — no silent fallbacks, swallowed errors, or no-op defaults.
+- Validate only at system boundaries (user input, external APIs); trust internal invariants.
+- No backwards-compatibility shims — just change the code. If that truly seems impossible, escalate.
+- Early returns over nested ifs; keep the happy path unindented.
+- Direct attribute access (`self.cfg.some_val`) over aliasing into temporaries — but do name the parts of otherwise hard to read expressions and complex conditions instead of packing them into one line.
+- Cleverness needs a reason: no metaclass-tier sorcery when a plain construct does. (An obscure-but-correct stdlib function still beats a new dependency or a hand-rolled version.)
+</code-style>
 
 <permissions>
 
@@ -154,21 +165,7 @@ LaTeX — full TeX Live is installed on workstations (via Home Manager): `pdflat
 - !! Access any (non-paywalled/gated) website as clean markdown via curl + defuddle.md/<url> !!
 - Prefer this a million times over raw curl or the webfetch tool, when fetching content for your own consumption (the webfetch tool always slop-summarizes sites for you, which is great for super duper long and noisy pages, but not for 99.9% your use-cases). 
 
-`memex` (alias `mx`) — markdown vault tool for wikilink graph traversal and semantic search. A vault is a named collection of directories. Use it to orient in knowledge bases: discover connections between notes, find relevant context you didn't know existed, navigate by wikilinks.
-
-When to use: Semantic search is for broad topics and concepts — finding entry points when you don't know what exists. If you know a specific note name, use `mx explore` directly. If you know exact terms, use your regular search tools. Typical flow: `mx search` to find relevant notes → `mx explore` to navigate the graph from there.
-
-```bash
-mx search "what caching strategies are used and how is invalidation handled?" -v vault  # 1-3 sentences, not keywords
-mx search "how does the TTS pipeline handle concurrent requests?" -v vault -f -n 10   # -f: full content, -n: result count (default 5)
-mx explore note_title vault -f                         # outlinks + backlinks + similar. -f: include content
-mx rename old-name new-name vault                      # rename + update all wikilinks
-mx vault:list                                          # show configured vaults
-mx vault:info vault                                    # paths, model, note counts
-mx vault:add name ~/path/to/dir                        # create or extend a vault
-```
-
-`explore` takes a title (must be unique in vault) or a path prefix to disambiguate. Rephrase or vary queries if results aren't what you expected.
+`memex` (alias `mx`) — markdown vault tool (a vault = named collection of directories). Capabilities: semantic search (`mx search "1-3 sentence question, not keywords" -v vault`), wikilink graph exploration (`mx explore note_title vault` — outlinks + backlinks + similar), rename with wikilink updates (`mx rename old new vault`), vault management (`mx vault:list|info|add`). Prime uses: orienting in knowledge bases (esp. the Obsidian vault) — search for entry points you don't know exist, then explore the graph from there. Exact terms → regular search tools instead. `mx --help` for full usage.
 
 `tmux` — for long-running / observable commands and interactive sessions (local or remote).
 - Local: `tms claude` to create/attach to the shared session.
@@ -198,24 +195,11 @@ Practical mindset:
 </tools>
 
 <workflow>
-Projects with an `agent/` directory use the mx workflow plugin.
+Projects with an `agent/` directory use the mx workflow plugin — `/mx:orient` is the map of flows, skills, and artefacts.
 
-Artifacts:
-- `agent/knowledge/` — durable reference (committed). Persistent knowledge about the project, continuously refined and updated. Wikilinked, navigable, evergreen. 
-- `agent/tasks/` — [active, backlog, done] issues-as-files: intent, assumptions, done-when (lean, trail of decisions, useful for collaborators, committed). Updated when goals change, not as work logs.
-- `agent/research/` — investigation snapshots (gitignored, ephemeral, never commited). Point-in-time, linked from tasks.
-- `agent/transcripts/` — exported sessions, tool calls and thinking stripped (gitignored, just a better session compaction / lazy handoff).
-- `agent/handoffs/` — curated session summaries for targeted continuation (gitignored). Rare / for long sessions where the next steps can be distilled into a clear handoff.
+Durable docs: `CONTEXT.md` (domain glossary, repo root) and `decisions/` (ADRs). Before significant work, read the glossary and the ADRs touching your area; use the glossary's vocabulary in everything you write; if your output contradicts an ADR, surface it — don't silently override. `agent/tasks/` holds specs and tickets (conventions: the mx `tracker` skill), `agent/research/` ephemeral investigation snapshots, `agent/transcripts/` + `agent/handoffs/` session continuity (gitignored).
 
-Skills — **always invoke the skill before doing the work it covers**. Each skill contains the process, structure, and constraints for its domain. Don't skip it and wing the output.
-- `/mx:task` — create or pick up a decision record. Not a session log.
-- `/mx:research` — investigate a question, produce a research artefact in `agent/research/`.
-- `/mx:implement` — load before writing code. Contains coding guidelines and a readiness gate.
-- `/mx:distill` — invoked by user periodically to sync knowledge files with code.
-- `/mx:learnings` — extract session insights into knowledge.
-- `/mx:codex` — instructions for how to get a second opinion from codex, OpenAI's deep-thinking coding model, very useful for verfying plans, having a second pair of eyes after you're done implementing, or just getting a different perspective on a problem! WHEN THE USERS MENTIONS CODEX, CALL THIS SKILL, NOT A SUBAGENT.
-
-Orient before significant work: if the project has `agent/knowledge/`, follow wikilinks relevant to your task. Use `mx explore` to discover connections.
+Always invoke the relevant skill before doing the work it covers — don't skip it and wing the output. WHEN THE USER MENTIONS CODEX, CALL /mx:codex, NOT A SUBAGENT.
 </workflow>
 
 <subagents>
