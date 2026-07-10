@@ -167,20 +167,6 @@ LaTeX — full TeX Live is installed on workstations (via Home Manager): `pdflat
 
 `memex` (alias `mx`) — markdown vault tool (a vault = named collection of directories). Capabilities: fuzzy note lookup by name/alias/path (`mx find query -v vault` — instant, no embeddings), semantic search (`mx search "1-3 sentence question, not keywords" -v vault`), wikilink graph exploration (`mx explore note_title vault` — outlinks + backlinks + similar), rename with wikilink updates (`mx rename old new vault`), vault management (`mx vault:list|info|add`). Prime uses: orienting in knowledge bases (esp. the Obsidian vault) — `find` when you roughly know the note, `search` for entry points you don't know exist, then explore the graph from there. Exact content terms → regular search tools instead. `mx --help` for full usage.
 
-`tmux` — for long-running / observable commands and interactive sessions (local or remote).
-- Local: `tms claude` to create/attach to the shared session.
-- Send commands: `tmux send-keys -t claude -l 'command'` then `tmux send-keys -t claude Enter`
-- Read output: `tmux capture-pane -p -J -t claude -S -50` (`-J` joins wrapped lines)
-- Remote (SSH): always quote the full tmux command for SSH to preserve spaces:
-  ```
-  ssh host "tmux send-keys -t claude -l 'command'"
-  ssh host "tmux send-keys -t claude Enter"
-  ssh host "tmux capture-pane -p -J -t claude -S -50"
-  ```
-- Interactive prompts (sudo, etc.): poll for the prompt before sending input — don't race it.
-  Use `bin/tmux-wait-for-text` or a manual poll loop checking `capture-pane` output for the expected prompt.
-- User can always attach directly: `ssh host -t "tmux attach -t claude"` (or locally: `tmux attach -t claude`)
-
 If you find a tool that would help you accomplish your task more efficiently / effectively isn't installed, you have several options:
 - Python tools: `uv run --with package command` (or `uvx package@latest`) - you shouldn't have to bother with venvs, especially for one-off commands. This is the preferred way, if the right tool exists on PyPI.
 - Nix: `nix run nixpkgs#package -- args` or `nix shell nixpkgs#pkg1 nixpkgs#pkg2 -c command`
