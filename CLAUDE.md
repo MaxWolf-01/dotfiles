@@ -27,10 +27,7 @@ And check which host you're on.
 
 ## Claude Code Config
 
-Two `claude`-related directories exist in this repo — don't confuse them:
-- `.claude/` — repo-local project settings (e.g. `settings.local.json`). Scoped to this project only.
-- `claude/` — source of truth for **global** `~/.claude/` config. Symlinked: `~/.claude/settings.json` → `~/.dotfiles/claude/settings.json`. Edits here apply globally across all projects.
-- `~/repos/github/MaxWolf-01/agents` — agent config: plugins, skills, commands, prompts. The `mx` plugin lives there.
+Global `~/.claude` config lives in `~/repos/github/MaxWolf-01/agents` (`claude/`), not here. `.claude/` in this repo is dotfiles-local.
 
 ## Scripts (`bin/`)
 
