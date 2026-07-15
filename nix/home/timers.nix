@@ -220,6 +220,26 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Browsing archive: append new Firefox visits ---
+
+  systemd.user.services.browsing-archive = {
+    Unit.Description = "Append new Firefox visits to the browsing archive";
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/bin:/bin" ];
+      ExecStart = "${secrets}/scripts/browsing-archive";
+    };
+  };
+
+  systemd.user.timers.browsing-archive = {
+    Unit.Description = "Browsing archive collection (every 30 min)";
+    Timer = {
+      OnCalendar = "*:00/30";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Documents → jarvis (read-only mirror for the agent) ---
 
   systemd.user.services.jarvis-sync = {
@@ -239,11 +259,10 @@ in
   };
 
   systemd.user.timers.jarvis-sync = {
-    Unit.Description = "Daily jarvis sync";
+    Unit.Description = "jarvis sync (every 30 min, offset 5 min behind browsing-archive)";
     Timer = {
-      OnCalendar = "daily";
+      OnCalendar = "*:05/30";
       Persistent = true;
-      RandomizedDelaySec = "15m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
