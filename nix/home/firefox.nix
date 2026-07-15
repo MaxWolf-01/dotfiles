@@ -1,6 +1,15 @@
-{ config, ... }:
+{ config, pkgs, ... }:
 let
-  firefoxBin = "${config.home.homeDirectory}/.nix-profile/bin/firefox";
+  home = config.home.homeDirectory;
+  firefoxBin = "${home}/.nix-profile/bin/firefox";
+  # Pre-launch history maintenance; no-ops when Firefox is already running.
+  firefoxLaunch = pkgs.writeShellScript "firefox-launch" ''
+    export PATH="${home}/.nix-profile/bin:$PATH"
+    secrets=${home}/.dotfiles/secrets
+    $secrets/scripts/browsing-archive || true
+    $secrets/scripts/browsing-cleanup --quiet || true
+    exec /usr/bin/firejail ${firefoxBin} "$@"
+  '';
 in
 {
   home.file.".config/firejail/firefox.local".source = ../../firejail/firefox.local;
@@ -8,7 +17,7 @@ in
   xdg.desktopEntries.firefox = {
     name = "Firefox";
     genericName = "Web Browser";
-    exec = "/usr/bin/firejail ${firefoxBin} %u";
+    exec = "${firefoxLaunch} %u";
     icon = "firefox";
     type = "Application";
     categories = [ "Network" "WebBrowser" ];
