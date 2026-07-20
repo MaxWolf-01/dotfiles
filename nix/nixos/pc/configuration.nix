@@ -4,6 +4,7 @@
   imports = [
     ./hardware-configuration.nix
     ./youtube-download.nix
+    ./copyparty.nix
     ./pihole.nix
     ./mdsr.nix
   ];
