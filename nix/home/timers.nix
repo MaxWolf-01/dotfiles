@@ -240,6 +240,31 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- YouTube watch history → browsing archive ---
+
+  systemd.user.services.yt-watch = {
+    Unit = {
+      Description = "Append YouTube watch history to the browsing archive";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/bin:/bin" ];
+      ExecStart = "${secrets}/scripts/yt-watch-collect";
+    };
+  };
+
+  systemd.user.timers.yt-watch = {
+    Unit.Description = "Daily YouTube watch history collection";
+    Timer = {
+      OnCalendar = "*-*-* 12:30:00";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Documents → jarvis (read-only mirror for the agent) ---
 
   systemd.user.services.jarvis-sync = {

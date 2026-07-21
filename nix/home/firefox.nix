@@ -2,12 +2,16 @@
 let
   home = config.home.homeDirectory;
   firefoxBin = "${home}/.nix-profile/bin/firefox";
-  # Pre-launch history maintenance; no-ops when Firefox is already running.
+  # Pre-launch history maintenance — fresh starts only. When Firefox is already
+  # running (link clicks from other apps), exec immediately: any delay here sits
+  # between click and page.
   firefoxLaunch = pkgs.writeShellScript "firefox-launch" ''
     export PATH="${home}/.nix-profile/bin:$PATH"
-    secrets=${home}/.dotfiles/secrets
-    $secrets/scripts/browsing-archive || true
-    $secrets/scripts/browsing-cleanup --quiet || true
+    if ! pgrep firefox >/dev/null; then
+      secrets=${home}/.dotfiles/secrets
+      $secrets/scripts/browsing-archive || true
+      $secrets/scripts/browsing-cleanup --quiet || true
+    fi
     exec /usr/bin/firejail ${firefoxBin} "$@"
   '';
 in
