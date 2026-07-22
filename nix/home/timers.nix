@@ -240,6 +240,24 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Browsing-time dashboard (localhost + tailnet, port 8930) ---
+
+  systemd.user.services.browsing-dash = {
+    Unit = {
+      Description = "Live browsing-time dashboard";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      # uv via nix-profile; tailscale is the Ubuntu system package in /usr/bin
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/bin:/bin" ];
+      ExecStart = "${secrets}/scripts/browsing-dash";
+      Restart = "on-failure";
+      RestartSec = "30s";
+    };
+    Install.WantedBy = [ "default.target" ];
+  };
+
   # --- YouTube watch history → browsing archive ---
 
   systemd.user.services.yt-watch = {
