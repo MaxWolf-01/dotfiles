@@ -16,9 +16,13 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     catppuccin.url = "github:catppuccin/nix";
+    greyline = {
+      url = "github:cothinking-dev/greyline";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, home-manager, rime, disko, catppuccin, ... }@inputs:
+  outputs = { self, nixpkgs, home-manager, rime, disko, catppuccin, greyline, ... }@inputs:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -89,7 +93,10 @@
       };
 
       # Home Manager standalone (non-NixOS machines)
-      homeConfigurations."zephyrus" = mkHome [ ./nix/home/hosts/zephyrus.nix ];
+      homeConfigurations."zephyrus" = mkHome [
+        greyline.homeManagerModules.default
+        ./nix/home/hosts/zephyrus.nix
+      ];
       homeConfigurations."minimal" = mkHome [ ./nix/home/hosts/minimal.nix ];
       homeConfigurations."minimal-root" = mkHome [ ./nix/home/hosts/minimal-root.nix ];
     };

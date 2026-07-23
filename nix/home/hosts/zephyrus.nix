@@ -9,6 +9,7 @@
   imports = [
     ../desktop.nix
     ../gnome.nix
+    ../greyline.nix
     ../timers.nix
     ../wayland.nix
   ];
