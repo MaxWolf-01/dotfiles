@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Measure what the CPU package really draws under load, and how hot it gets.
+#
+# Reading a power cap back from sysfs proves nothing — the EC can report a limit
+# it is not enforcing. This measures the physical quantity instead. Run it after
+# changing anything with asus-power-cap.
+#
+# Boost runs for roughly the first minute, so under 120s measures the burst
+# rather than the sustained limit.
+#
+# Needs root: energy_uj is root-only (PLATYPUS side-channel mitigation).
+#
+# Usage:
+#   sudo cpu-power-bench [seconds]   default 180
+
+set -uo pipefail
+
+case "${1:-}" in
+    -h|--help) awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
+esac
+
+SECS=${1:-180}
+echo "$SECS" | grep -Eq '^[0-9]+$' || { echo "error: seconds '$SECS' is not a number" >&2; exit 1; }
+
+RAPL=/sys/class/powercap/intel-rapl:0/energy_uj
+[ -r "$RAPL" ] || { echo "error: cannot read $RAPL — run with sudo" >&2; exit 1; }
+
+PKG=""
+for z in /sys/class/thermal/thermal_zone*/; do
+    if [ "$(cat "$z/type" 2>/dev/null)" = x86_pkg_temp ]; then PKG=$z/temp; fi
+done
+[ -n "$PKG" ] || { echo "error: no x86_pkg_temp thermal zone found" >&2; exit 1; }
+
+pids=()
+cleanup() {
+    if [ ${#pids[@]} -gt 0 ]; then kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null; pids=(); fi
+    return 0
+}
+trap cleanup EXIT INT TERM
+
+# Each sample integrates energy over a 3s window; instantaneous readings are
+# too noisy to tell a 35W cap from a 48W one.
+sample() { # label
+    local e1 t1 e2 t2 mhz
+    e1=$(cat "$RAPL"); t1=$(date +%s.%N)
+    sleep 3
+    e2=$(cat "$RAPL"); t2=$(date +%s.%N)
+    mhz=$(awk '/cpu MHz/{s+=$4; n++} END{printf "%d", s/n}' /proc/cpuinfo)
+    awk -v e1="$e1" -v e2="$e2" -v t1="$t1" -v t2="$t2" -v temp="$(cat "$PKG")" -v mhz="$mhz" -v tag="$1" \
+        'BEGIN{ printf "%-11s %6.1f W   %3d C   %5d MHz\n", tag, (e2-e1)/1e6/(t2-t1), temp/1000, mhz }'
+}
+
+A=/sys/class/firmware-attributes/asus-armoury/attributes
+if [ -d "$A/ppt_pl1_spl" ]; then
+    echo "configured: spl=$(cat $A/ppt_pl1_spl/current_value)W sppt=$(cat $A/ppt_pl2_sppt/current_value)W (as reported, not as enforced)"
+fi
+if [ -r /sys/firmware/acpi/platform_profile ]; then
+    echo "profile: $(cat /sys/firmware/acpi/platform_profile)"
+fi
+echo
+printf '%-11s %8s %7s %9s\n' phase power temp clock
+sample idle
+
+# AES-NI is the densest load available, so this is close to a worst case.
+for _ in $(seq "$(nproc)"); do
+    openssl speed -seconds $((SECS + 60)) -evp aes-256-cbc >/dev/null 2>&1 &
+    pids+=($!)
+done
+
+elapsed=0
+while [ "$elapsed" -lt "$SECS" ]; do
+    sample "load-${elapsed}s"
+    elapsed=$((elapsed + 3))
+    if [ "$elapsed" -lt "$SECS" ]; then sleep 12; elapsed=$((elapsed + 12)); fi
+done
+
+cleanup
+sleep 8
+sample cooldown
