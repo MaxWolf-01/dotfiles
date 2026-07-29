@@ -30,10 +30,14 @@
   home.file."bin".source =
     config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/bin";
 
-  # Supply chain protection: quarantine newly published packages
-  home.file.".npmrc".text = ''
-    min-release-age=7
-  '';
+  # npm writes its auth token to the user config, so that file must stay writable —
+  # never a home.file (read-only nix store symlink), or `npm login` fails with EACCES.
+  # Supply chain protection (quarantine newly published packages) goes in the env
+  # layer instead, which outranks the user config anyway.
+  home.sessionVariables = {
+    NPM_CONFIG_USERCONFIG = "${config.xdg.configHome}/npm/npmrc";
+    NPM_CONFIG_MIN_RELEASE_AGE = "7";
+  };
 
   # Ensure common dirs exist
   home.activation.createDirs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
