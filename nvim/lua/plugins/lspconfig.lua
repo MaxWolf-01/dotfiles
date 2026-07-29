@@ -46,31 +46,28 @@ return {
       end,
     })
 
+    -- every server here needs its binary in nix/home/common.nix (home.packages);
+    -- vim.lsp.enable() does not check, it fails when the filetype is opened
     local servers = {
       "bashls",
       "biome",
+      "clangd",
       "cmake",
-      "copilot",
+      "cssls",
       "docker_compose_language_service",
       "dockerls",
-      "elixirls",
-      "gleam",
-      "golangci_lint_ls",
+      "eslint",
       "gopls",
-      "hls",
       "html",
-      "jdtls",
       "jsonls",
       "lua_ls",
       "markdown_oxide",
-      "nil_ls",
       "nixd",
-      "ty",
       "rust_analyzer",
       "tailwindcss",
       "taplo",
       "ts_ls",
-      "zls",
+      "ty",
     }
 
     -- register overrides via vim.lsp.config(), which takes precedence over ALL

@@ -328,7 +328,6 @@
     go
     jq
     manix
-    markdown-oxide
     ncdu
     neovim
     nerd-fonts.hack
@@ -351,6 +350,33 @@
     vim
     wakatime-cli
     yt-dlp
+
+    # neovim toolchain: language servers enabled in nvim/lua/plugins/lspconfig.lua
+    # and formatters referenced by nvim/lua/fmts/*.lua. Keep both in sync with
+    # this list -- a server enabled without its binary here fails at spawn time.
+    bash-language-server
+    biome
+    clang-tools # clangd + clang-format
+    cmake-language-server
+    docker-compose-language-service
+    dockerfile-language-server-nodejs
+    gofumpt
+    gopls
+    gotools # goimports
+    just
+    lua-language-server
+    markdown-oxide
+    nixd
+    nixfmt-rfc-style # binary is `nixfmt`
+    prettier
+    rust-analyzer
+    rustfmt
+    shfmt
+    stylua
+    tailwindcss-language-server
+    taplo
+    typescript-language-server
+    vscode-langservers-extracted # html, cssls, jsonls, eslint
   ];
 
 }
