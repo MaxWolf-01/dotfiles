@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Cap how far the ASUS EC charges the battery (charge_control_end_threshold).
+# The threshold resets to 100 on reboot, so applying also installs a systemd
+# oneshot that re-applies it on boot and resume.
+#
+# Why cap at all:
+#   Lithium-ion wear is driven by the voltage the cell rests at, and the damage
+#   rate climbs steeply near a full charge. Most of the harm comes from the top
+#   15-20% of the range, so cutting just that buys most of the available life.
+#
+#     cap    cell voltage   typical cycle life   runtime kept
+#     100%      4.20 V         300-500 cycles        100%
+#      85%      4.10 V        600-1000 cycles         86%
+#      80%      4.05 V        850-1500 cycles         80%
+#      65%      4.00 V       1200-2000 cycles         70%
+#      50%      3.90 V       2400-4000 cycles         58%
+#
+#   Below 80% the extra life per lost hour of runtime drops off sharply. 80-85
+#   is the sweet spot for a laptop you carry. 60 only pays off on a machine that
+#   lives on AC. Heat multiplies voltage stress, so `asus-power-cap` helps here
+#   too — a cooler chassis is a slower-aging pack.
+#
+# Two things that surprise people:
+#   - The EC stops charging above the cap but never discharges down to it. After
+#     lowering the cap, run the machine unplugged below it once, or the pack sits
+#     at its old charge until your next unplugged session.
+#   - Raise the cap to 100 the day before you travel, then put it back. A few
+#     days a year at full charge cost little. Every day costs a lot.
+#
+# Reading `status` output:
+#   cap     = what the EC enforces right now
+#   charge  = where the pack sits at this moment
+#   health  = capacity left versus what it shipped with (this is the wear)
+#
+# Usage:
+#   asus-battery-cap <percent>   apply cap (1-100) + install unit
+#   asus-battery-cap status      show cap, charge, pack health, unit state
+#   asus-battery-cap reset       restore 100%, remove unit
+
+set -euo pipefail
+
+UNIT_NAME=asus-battery-cap.service
+UNIT_PATH=/etc/systemd/system/$UNIT_NAME
+
+shopt -s nullglob
+batteries=(/sys/class/power_supply/BAT*)
+shopt -u nullglob
+[ ${#batteries[@]} -eq 1 ] || { echo "error: expected exactly one battery under /sys/class/power_supply, found ${#batteries[@]}" >&2; exit 1; }
+BAT=${batteries[0]}
+ATTR=$BAT/charge_control_end_threshold
+[ -f "$ATTR" ] || { echo "error: $ATTR not found (firmware does not expose a charge threshold?)" >&2; exit 1; }
+
+show() {
+    echo "cap: $(cat "$ATTR")%"
+    echo "charge: $(cat "$BAT/capacity")% ($(cat "$BAT/status"))"
+    if [ -f "$BAT/energy_full" ] && [ -f "$BAT/energy_full_design" ]; then
+        awk -v now="$(cat "$BAT/energy_full")" -v design="$(cat "$BAT/energy_full_design")" \
+            'BEGIN { printf "health: %.1f%% (%.1f Wh of %.1f Wh design)\n", 100 * now / design, now / 1e6, design / 1e6 }'
+    fi
+    if [ -f "$BAT/cycle_count" ]; then
+        echo "cycles: $(cat "$BAT/cycle_count")"
+    fi
+    if systemctl is-enabled --quiet $UNIT_NAME 2>/dev/null; then
+        echo "unit: $UNIT_NAME enabled"
+    else
+        echo "unit: not installed"
+    fi
+}
+
+# The EC silently clamps values it dislikes (some models accept only 60/80/100),
+# so never trust the write — read it back.
+apply() { # percent
+    echo "$1" | sudo tee "$ATTR" >/dev/null
+    local applied
+    applied=$(cat "$ATTR")
+    [ "$applied" = "$1" ] || { echo "error: EC clamped the cap to ${applied}%, asked for ${1}%" >&2; exit 1; }
+}
+
+remove_unit() {
+    [ -f "$UNIT_PATH" ] || return 0
+    sudo systemctl disable --quiet $UNIT_NAME
+    sudo rm "$UNIT_PATH"
+    sudo systemctl daemon-reload
+}
+
+case "${1:-}" in
+    status)
+        show
+        ;;
+    reset)
+        apply 100
+        remove_unit
+        echo "restored 100% charging, removed $UNIT_NAME"
+        show
+        ;;
+    ''|-h|--help)
+        awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
+        ;;
+    *)
+        percent=$1
+        echo "$percent" | grep -Eq '^[0-9]+$' || { echo "error: cap '$percent' is not a number" >&2; exit 1; }
+        [ "$percent" -ge 1 ] && [ "$percent" -le 100 ] || { echo "error: cap must be in [1, 100], got $percent" >&2; exit 1; }
+
+        apply "$percent"
+
+        sudo tee "$UNIT_PATH" >/dev/null <<EOF
+[Unit]
+Description=Cap ASUS battery charge threshold (${percent}%)
+After=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo $percent > $ATTR'
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable --quiet $UNIT_NAME
+        echo "applied cap and installed $UNIT_NAME"
+        show
+        ;;
+esac
