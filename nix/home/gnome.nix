@@ -57,11 +57,14 @@
       lock-delay = lib.hm.gvariant.mkUint32 1800;
     };
 
+    # These timeouts are int32 (plain ints), unlike the uint32 delays above.
+    # mkUint32 here writes a variant GSettings rejects on read, falling back to
+    # the schema default with no error anywhere. Check `gsettings range` first.
     "org/gnome/settings-daemon/plugins/power" = {
       sleep-inactive-ac-type = "suspend";
-      sleep-inactive-ac-timeout = lib.hm.gvariant.mkUint32 3600;
+      sleep-inactive-ac-timeout = 3600;
       sleep-inactive-battery-type = "suspend";
-      sleep-inactive-battery-timeout = lib.hm.gvariant.mkUint32 1800;
+      sleep-inactive-battery-timeout = 1800;
       idle-dim = false;
       power-button-action = "interactive";
     };
