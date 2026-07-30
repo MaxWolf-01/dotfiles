@@ -44,18 +44,24 @@
       sources = [ (lib.hm.gvariant.mkTuple [ "xkb" "de+nodeadkeys" ]) ];
     };
 
+    # GNOME has a single blank delay; there is no AC/battery split for it.
     "org/gnome/desktop/session" = {
-      idle-delay = lib.hm.gvariant.mkUint32 3600;
+      idle-delay = lib.hm.gvariant.mkUint32 1800;
     };
 
+    # lock-delay counts from blanking, so this locks at 1h -- same moment as
+    # the AC suspend below. Suspend locks on its own, but a `nosleep` job
+    # inhibits it, and then this is what still locks the session.
     "org/gnome/desktop/screensaver" = {
       lock-enabled = true;
-      lock-delay = lib.hm.gvariant.mkUint32 7200;
+      lock-delay = lib.hm.gvariant.mkUint32 1800;
     };
 
     "org/gnome/settings-daemon/plugins/power" = {
-      sleep-inactive-ac-timeout = lib.hm.gvariant.mkUint32 0;
-      sleep-inactive-battery-timeout = lib.hm.gvariant.mkUint32 3600;
+      sleep-inactive-ac-type = "suspend";
+      sleep-inactive-ac-timeout = lib.hm.gvariant.mkUint32 3600;
+      sleep-inactive-battery-type = "suspend";
+      sleep-inactive-battery-timeout = lib.hm.gvariant.mkUint32 1800;
       idle-dim = false;
       power-button-action = "interactive";
     };
