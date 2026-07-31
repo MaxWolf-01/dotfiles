@@ -36,7 +36,10 @@
       ];
     };
 
-    "org/gnome/desktop/default-applications/terminal" = {
+    # Path is .../applications/, not .../default-applications/ as the schema id
+    # suggests. dconf.settings keys are raw paths and are never validated against
+    # a schema, so a wrong path is written and silently read by nobody.
+    "org/gnome/desktop/applications/terminal" = {
       exec = "ghostty";
     };
 
@@ -121,7 +124,8 @@
       binding = "<Primary><Super>n";
     };
 
-    "org/freedesktop/ibus/panel/emoji" = {
+    # ibus lives under /desktop/ibus/, not /org/freedesktop/ibus/.
+    "desktop/ibus/panel/emoji" = {
       hotkey = [ "" ];
       unicode-hotkey = [ "" ];
       load-emoji-at-startup = false;
