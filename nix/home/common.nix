@@ -295,7 +295,7 @@
         User = "root";
       };
       yapit-prod = {
-        HostName = "100.87.244.58";
+        HostName = "100.124.59.34";
         User = "root";
       };
       "xmg xmg19" = {
