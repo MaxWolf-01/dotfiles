@@ -134,10 +134,6 @@
       PasswordAuthentication = false;
       PermitRootLogin = "prohibit-password";
     };
-    extraConfig = ''
-      Match Address 100.64.0.0/10
-        PasswordAuthentication yes
-    '';
   };
 
   # User
