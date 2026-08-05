@@ -21,6 +21,10 @@ let
     bash coreutils gnugrep git gh openssh
   ]);
 
+  thermalPath = lib.makeBinPath (with pkgs; [
+    bash coreutils findutils gawk
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -308,5 +312,21 @@ in
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Thermal history ---
+  # Runs continuously rather than on a timer: the point is the seconds before a
+  # hard power cut, which a timer's granularity would miss.
+
+  systemd.user.services.thermal-log = {
+    Unit.Description = "Sample temperatures, fans and CPU power caps to CSV";
+    Service = {
+      Environment = [ "PATH=${thermalPath}" ];
+      ExecStart = "${dotfiles}/bin/thermal-log";
+      Restart = "always";
+      RestartSec = 10;
+      Nice = 19;
+    };
+    Install.WantedBy = [ "default.target" ];
   };
 }
