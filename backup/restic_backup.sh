@@ -259,9 +259,17 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
             # Format success message
             warning_line=""
             if [ "$had_warnings" = true ]; then
-                warn_count=$(grep -c '"message_type":"error"' "$error_log" 2>/dev/null || echo "?")
-                warning_line="
+                # Unreadable files are reported as JSON error lines, but other
+                # exit-3 causes (a missing source dir) only show up as plain
+                # stderr — surface those verbatim instead of a count of zero.
+                warn_count=$(grep -c '"message_type":"error"' "$error_log" || true)
+                if [ "$warn_count" -gt 0 ]; then
+                    warning_line="
 ⚠️ $warn_count file(s) unreadable (see error log)"
+                else
+                    warning_line="
+⚠️ $(grep -v '^{' "$error_log" | head -3)"
+                fi
             fi
             message="📦 Snapshot ${snapshot_id} created
 ⏱️ Duration: $(format_duration $backup_duration)
