@@ -33,7 +33,7 @@ Global `~/.claude` config lives in `~/repos/github/MaxWolf-01/agents` (`claude/`
 
 `bin/` contains standalone scripts on `$PATH` (`~/bin`). These are available everywhere — interactive shells, Claude Code, cron, systemd timers, ssh. Prefer scripts over shell functions for anything that doesn't need to modify the current shell's state (cd, export, source, etc.).
 
-Existing scripts include `tre` (gitignore-aware tree), `extract` (universal archive extractor), `clip` (clipboard, X11/Wayland-aware), `fext` (disk usage by extension), `restic-*` helpers (restic-diff, restic-snaps, restic-lsfs, restic-ls-recent, restic-ls-all, restic-current), and `vault-*` (knowledge base publishing tools — see below). If a common operation is needed repeatedly, add a new script here.
+Existing scripts include `tre` (gitignore-aware tree), `extract` (universal archive extractor), `clip` (clipboard, X11/Wayland-aware), `fext` (disk usage by extension), `restic-*` helpers (restic-diff, restic-snaps, restic-lsfs, restic-ls-recent, restic-ls-all, restic-current), `backup-staleness-check` (alarms on repos that stopped receiving snapshots), and `vault-*` (knowledge base publishing tools — see below). If a common operation is needed repeatedly, add a new script here.
 
 Shell functions that need to affect the current shell (cd, set, source, disown) stay in `zsh/functions`.
 
