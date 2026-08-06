@@ -314,6 +314,37 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Backup staleness alarm ---
+  # pc runs the same check without the offset, so it normally alerts first and
+  # this stays quiet. The offset exists so that a dead pc — which would take its
+  # alarm down with it — still surfaces here a week later.
+
+  systemd.user.services.backup-staleness-check = {
+    Unit = {
+      Description = "Alert on restic repos that stopped receiving snapshots";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${backupPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/bin/backup-staleness-check --extra-days 7";
+    };
+  };
+
+  systemd.user.timers.backup-staleness-check = {
+    Unit.Description = "Daily backup staleness check (7d behind pc's)";
+    Timer = {
+      OnCalendar = "*-*-* 09:30:00";
+      Persistent = true;
+      RandomizedDelaySec = "15m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Thermal history ---
   # Runs continuously rather than on a timer: the point is the seconds before a
   # hard power cut, which a timer's granularity would miss.

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Report restic repos whose newest snapshot is older than the repo's max_age_days.
+#
+# Backup runs that skip (locked ZFS dataset, unreachable phone) exit 0 and send
+# no notification, so a repo can quietly stop receiving snapshots for months.
+# This checks the outcome instead of the run: per repo, how old is the newest
+# snapshot? Configs are the same ones restic_backup.sh consumes.
+
+set -uo pipefail
+
+DEFAULT_MAX_AGE_DAYS=14
+CONFIG_GLOB="$HOME/.dotfiles/secrets/backup/restic/*/*.conf"
+
+usage() {
+    echo "Usage: $(basename "$0") [--extra-days N] [CONFIG...]"
+    echo
+    echo "Checks each restic config's newest snapshot against its max_age_days"
+    echo "(default $DEFAULT_MAX_AGE_DAYS). With no arguments, checks every config under"
+    echo "  $CONFIG_GLOB"
+    echo "Repos on a filesystem path that doesn't exist here are skipped: they"
+    echo "belong to another host. Exits 1 if anything is stale or unreadable."
+    echo
+    echo "  --extra-days N  add N days to every repo's limit. Two hosts running"
+    echo "                  this both cover every repo, but the one with the"
+    echo "                  offset stays quiet unless the other stopped alerting"
+    echo "                  (i.e. died), so a healthy setup alerts only once."
+}
+
+extra_days=0
+configs=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --extra-days) extra_days="${2:?--extra-days needs a value}"; shift 2 ;;
+        --extra-days=*) extra_days="${1#*=}"; shift ;;
+        -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *) configs+=("$1"); shift ;;
+    esac
+done
+
+if ! [[ "$extra_days" =~ ^[0-9]+$ ]]; then
+    echo "--extra-days must be a non-negative integer, got: $extra_days" >&2
+    exit 2
+fi
+
+age_key="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
+if [ ! -f "$age_key" ]; then
+    echo "Cannot check: age key not available at $age_key (decrypt it first)" >&2
+    exit 1
+fi
+
+if [ ${#configs[@]} -eq 0 ]; then
+    configs=($CONFIG_GLOB)
+fi
+
+now=$(date +%s)
+stale=""
+unreadable=""
+ok_count=0
+ntfy_topic=""
+
+for config in "${configs[@]}"; do
+    [ -f "$config" ] || continue
+    name="$(basename "$(dirname "$config")")-$(basename "$config" .conf)"
+
+    # Source in a subshell and print the fields, so one config's values can't
+    # leak into the next. Unit separator, not tab: tab is IFS whitespace, so
+    # consecutive tabs around an empty field would collapse and shift the rest.
+    IFS=$'\x1f' read -r repo repo_local password_command max_age topic < <(
+        source "$config" 2>/dev/null
+        printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+            "${repo_path:-}" \
+            "${repo_path_local:-}" \
+            "${password_command:-}" \
+            "${max_age_days:-$DEFAULT_MAX_AGE_DAYS}" \
+            "${ntfy_topic:-}"
+    )
+    [ -n "$topic" ] && ntfy_topic="$topic"
+    max_age=$((max_age + extra_days))
+
+    # A config may name the same repo twice: once as other hosts reach it, once
+    # as the host storing it does (pc has no ssh alias for itself). Take the
+    # local path only when it's actually here, so both hosts resolve correctly.
+    if [ -n "$repo_local" ] && [ -d "$repo_local" ]; then
+        repo="$repo_local"
+    fi
+
+    if [ -z "$repo" ] || [ -z "$password_command" ]; then
+        unreadable="${unreadable}  ${name}: config missing repo_path or password_command"$'\n'
+        continue
+    fi
+
+    # A bare filesystem path that isn't here means the repo lives on another
+    # host (phone/pc.conf seen from the laptop) — not this host's to monitor.
+    if [[ "$repo" != *:* ]] && [ ! -d "$repo" ]; then
+        continue
+    fi
+
+    latest=$(restic --repo "$repo" --password-command "$password_command" \
+        snapshots --json 2>/dev/null | jq -r 'max_by(.time).time // empty')
+
+    if [ -z "$latest" ]; then
+        unreadable="${unreadable}  ${name}: no snapshots, or repo unreadable"$'\n'
+        continue
+    fi
+
+    age_days=$(( (now - $(date -d "$latest" +%s)) / 86400 ))
+    if [ "$age_days" -gt "$max_age" ]; then
+        stale="${stale}  ${name}: ${age_days}d old (limit ${max_age}d), newest ${latest:0:10}"$'\n'
+    else
+        ok_count=$((ok_count + 1))
+        echo "ok: $name — ${age_days}d old (limit ${max_age}d)"
+    fi
+done
+
+if [ -z "$stale" ] && [ -z "$unreadable" ]; then
+    echo "All $ok_count repo(s) have recent snapshots."
+    exit 0
+fi
+
+message=""
+[ -n "$stale" ] && message="Not receiving snapshots:"$'\n'"$stale"
+[ -n "$unreadable" ] && message="${message}Could not check:"$'\n'"$unreadable"
+message="${message}"$'\n'"$ok_count repo(s) fine."
+
+echo "$message" >&2
+
+if [ -n "$ntfy_topic" ]; then
+    curl -s \
+        -H "Title: 🕸️ Backups going stale" \
+        -H "Priority: 4" \
+        -H "Tags: backup,restic,stale" \
+        -d "$message" \
+        "https://ntfy.sh/$ntfy_topic" >/dev/null
+fi
+
+exit 1

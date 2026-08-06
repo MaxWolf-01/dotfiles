@@ -85,8 +85,11 @@ in
   systemd.user.services.phone-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (phone data)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      # Ordered after the sync so we never snapshot a half-copied tree. Wants,
+      # not Requires: a failed or skipped sync should still leave us backing up
+      # whatever already landed on disk.
+      After = [ "network-online.target" "phone-sync.service" ];
+      Wants = [ "network-online.target" "phone-sync.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -114,8 +117,8 @@ in
   systemd.user.services.phone-pc = {
     Unit = {
       Description = "Restic backup local (phone data)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "phone-sync.service" ];
+      Wants = [ "network-online.target" "phone-sync.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -196,6 +199,39 @@ in
       OnCalendar = "weekly";
       Persistent = true;
       RandomizedDelaySec = "30m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Backup staleness alarm ---
+  # A backup that skips (locked dataset, unreachable phone) exits 0 and notifies
+  # nothing, so a repo can stop receiving snapshots unnoticed. This watches the
+  # snapshots themselves. The laptop runs the same check with --extra-days, so
+  # either machine dying still leaves an alarm standing. See bin/.
+
+  systemd.user.services.backup-staleness-check = {
+    Unit = {
+      Description = "Alert on restic repos that stopped receiving snapshots";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/bin/backup-staleness-check";
+    };
+  };
+
+  systemd.user.timers.backup-staleness-check = {
+    Unit.Description = "Daily backup staleness check";
+    Timer = {
+      OnCalendar = "*-*-* 09:00:00";
+      Persistent = true;
+      RandomizedDelaySec = "15m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
