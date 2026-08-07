@@ -11,6 +11,13 @@ PHONE_HOST="phone"
 DEST="/home/max/data/phone"
 NTFY_TOPIC="${NTFY_TOPIC:-}"
 
+# The phone drops the connection on long transfers (screen off, Android
+# suspending Termux, mobile link). Each attempt resumes from the partial dir,
+# so a big catch-up gets there across several tries instead of failing outright.
+MAX_ATTEMPTS=4
+RETRY_WAIT=30
+IO_TIMEOUT=180
+
 # Directories to sync: phone_path → local_subdir
 declare -A DIRS=(
     ["~/storage/dcim"]="DCIM"
@@ -41,27 +48,53 @@ echo "=== Phone Sync - $(date) ===" | tee "$log_file"
 failed=""
 total_transferred=0
 
+# Socket I/O (10), protocol stream (12), I/O timeout (30) and ssh dying (255)
+# are the ways a dropped link surfaces. Any other code is a real error that
+# another attempt won't fix.
+is_retryable() {
+    case "$1" in
+        10 | 12 | 30 | 255) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 for phone_path in "${!DIRS[@]}"; do
     local_dir="$DEST/${DIRS[$phone_path]}"
     mkdir -p "$local_dir"
 
     echo "Syncing $phone_path → $local_dir" | tee -a "$log_file"
 
-    output=$(rsync -az --partial --itemize-changes \
-        --exclude='.thumbnails' \
-        --exclude='.nomedia' \
-        "$PHONE_HOST:$phone_path/" "$local_dir/" 2>&1)
-    rc=$?
+    attempt=1
+    count=0
+    while true; do
+        # --partial-dir, not --partial: an interrupted file stays in
+        # .rsync-partial instead of sitting at its real path truncated, where
+        # the restic run that follows would snapshot it as if it were complete.
+        output=$(rsync -az --partial-dir=.rsync-partial --timeout="$IO_TIMEOUT" \
+            --itemize-changes \
+            --exclude='.thumbnails' \
+            --exclude='.nomedia' \
+            "$PHONE_HOST:$phone_path/" "$local_dir/" 2>&1)
+        rc=$?
 
-    echo "$output" >> "$log_file"
+        echo "$output" >> "$log_file"
+        # --itemize-changes: ">f" = received file, ">L" = received symlink
+        count=$((count + $(echo "$output" | grep -c '^>f' || true)))
+
+        [ $rc -eq 0 ] && break
+        is_retryable "$rc" || break
+        [ "$attempt" -ge "$MAX_ATTEMPTS" ] && break
+
+        echo "  attempt $attempt failed (exit $rc), retrying in ${RETRY_WAIT}s" | tee -a "$log_file"
+        attempt=$((attempt + 1))
+        sleep "$RETRY_WAIT"
+    done
 
     if [ $rc -ne 0 ]; then
-        echo "  FAILED (exit $rc)" | tee -a "$log_file"
+        echo "  FAILED (exit $rc after $attempt attempt(s))" | tee -a "$log_file"
         failed="${failed}${DIRS[$phone_path]}, "
     else
-        # --itemize-changes: ">f" = received file, ">L" = received symlink
-        count=$(echo "$output" | grep -c '^>f' || true)
-        echo "  OK ($count new files)" | tee -a "$log_file"
+        echo "  OK ($count new files, $attempt attempt(s))" | tee -a "$log_file"
         total_transferred=$((total_transferred + count))
     fi
 done
