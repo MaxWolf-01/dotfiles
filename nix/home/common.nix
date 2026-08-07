@@ -67,6 +67,7 @@
       key = "~/.ssh/id_ed25519.pub";
     };
     ignores = [
+      ".env"
       "agent/transcripts"
       "agent/handoffs"
       "agent/research"
