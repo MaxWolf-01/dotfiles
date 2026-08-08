@@ -345,6 +345,39 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Claude usage-window anchor ---
+  # The 5-hour window starts with your first message, so these pings pin it to a
+  # fixed grid: 08:30 → 13:30 → 18:30 → 23:30. Deliberately no 04:30 ping: it
+  # would open a window running to 09:30 that swallows the 08:30 anchor, and
+  # that anchor is the one that matters — it leaves ~2.5h of window in hand when
+  # the workday starts around 11:00, then a fresh 5h block at 13:30.
+  # 04:30–08:30 is the only gap, and it sits inside sleep.
+
+  systemd.user.services.claude-ping = {
+    Unit = {
+      Description = "Anchor the Claude 5-hour usage window";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      WorkingDirectory = "/tmp";
+      Environment = [ "PATH=${home}/.local/bin:${home}/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin" ];
+      ExecStart = "${dotfiles}/bin/claude-ping";
+    };
+  };
+
+  systemd.user.timers.claude-ping = {
+    Unit.Description = "Claude window anchor (08:30, then every 5h to 23:30)";
+    Timer = {
+      OnCalendar = "*-*-* 08,13,18,23:30:00";
+      # Laptop: a missed anchor replays once on resume, which is no worse than
+      # the window you would have opened with your first message anyway.
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Thermal history ---
   # Runs continuously rather than on a timer: the point is the seconds before a
   # hard power cut, which a timer's granularity would miss.
