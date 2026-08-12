@@ -2,7 +2,11 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""Extract user/assistant text conversation from Claude Code session, excluding tool calls and diffs."""
+"""Extract user/assistant text conversation from Claude Code session, excluding tool calls and diffs.
+
+Output is token-minimal XML for model consumption: no indentation, roles as
+<u>/<a> (legend in the session-export header attributes).
+"""
 
 import argparse
 import json
@@ -141,24 +145,26 @@ def extract_conversation(session_path: Path) -> list[tuple[str, str]]:
     return messages
 
 
+ROLE_TAGS = {"user": "u", "assistant": "a"}
+
+
 def format_xml(
     messages: list[tuple[str, str]],
     source_path: Path,
     total: int,
     filters: str | None = None,
 ) -> str:
-    """Format messages as XML."""
-    attrs = f'source="{source_path}" total="{total}" exported="{len(messages)}"'
+    """Format messages as token-minimal XML (no indentation, short role tags)."""
+    attrs = f'source="{source_path}" total="{total}" exported="{len(messages)}" roles="u=user a=assistant"'
     if filters:
         attrs += f' filters="{filters}"'
     lines = [f"<session-export {attrs}>"]
 
     for role, text in messages:
-        lines.append(f"  <{role}>")
-        # Indent content
-        for content_line in text.split("\n"):
-            lines.append(f"    {content_line}" if content_line else "")
-        lines.append(f"  </{role}>")
+        tag = ROLE_TAGS.get(role, role)
+        lines.append(f"<{tag}>")
+        lines.append(text)
+        lines.append(f"</{tag}>")
 
     lines.append("</session-export>")
     return "\n".join(lines)

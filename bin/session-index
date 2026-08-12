@@ -3,28 +3,39 @@
 # requires-python = ">=3.11"
 # dependencies = ["tyro"]
 # ///
-"""Index and search Claude Code sessions by AI-generated descriptive names.
+"""Index and search Claude Code sessions by AI-generated names and tags.
 
-Scans session directories, generates descriptive names via Claude, and maintains
-a searchable TSV index at ~/.claude/session-index.tsv.
+Scans ~/.claude/projects, and for every session with at least one user message
+and one assistant reply, generates a descriptive dash-keyword name plus tags
+from a fixed vocabulary (dev, debug, infra, research, writing, meta, qa, junk,
+other) via `claude -p`. Maintains a TSV index at ~/.claude/session-index.tsv
+with columns: session_id, project, date, indexed_at, n_msgs, n_subst, chars,
+duration_min, slug, tags, name.
 
-Examples::
+Sessions touched after indexing (file mtime > indexed_at) are re-indexed on the
+next run. Sessions modified within --settle-hours are deferred so active
+sessions aren't named mid-flight.
+
+Examples:
 
     session-index --days 7
-    session-index --days 3 --project yapit
-    session-index --grep "evergreen distill"
-    session-index --grep "benchmark kokoro"
-    session-index --grep "defuddle"
+    session-index --workers 4
+    session-index --dry-run --days 3
     session-index --reindex cf75dab2-4df0-446b-9ea1-fe6702d9434d
-    session-index --dry-run --days 1
+    session-index --grep "evergreen distill"
+    session-index --grep backup --tag infra
+    session-index --tag junk
 """
 
+import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
-import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -33,206 +44,69 @@ import tyro
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 INDEX_PATH = Path.home() / ".claude" / "session-index.tsv"
-HEADER = "session_id\tproject\tdate\tslug\tname"
+COLUMNS = (
+    "session_id", "project", "date", "indexed_at", "n_msgs", "n_subst",
+    "chars", "duration_min", "slug", "tags", "name",
+)
+HEADER = "\t".join(COLUMNS)
+CAP_CHARS = 100_000  # transcript cap: first half + last half around a truncation marker
+SUBSTANTIVE_MIN_CHARS = 15  # user messages longer than this count as substantive
 
-NAMING_PROMPT = """\
-Generate a descriptive name for this Claude Code session based on what was discussed/accomplished.
+TAG_DESCRIPTIONS = {
+    "dev": "building features or code",
+    "debug": "diagnosing or fixing something broken",
+    "infra": "system config, nix, dotfiles, backups, machine setup",
+    "research": "investigating, learning, exploring a topic or codebase",
+    "writing": "docs, notes, prose",
+    "meta": "working on agent tooling itself — skills, prompts, CLAUDE.md, workflows",
+    "qa": "one-shot or short question-and-answer",
+    "junk": "aborted, noise, no real work done",
+    "other": "none of the above fit",
+}
 
-Guidelines:
-- Use keywords separated by dashes, lowercase
-- Include all major topics — more detail is better for differentiating similar sessions
-- If working on a task file, lead with the task name
-- Add what was specifically worked on, especially if task wasn't fully completed
-- Output ONLY the name, nothing else
-- Examples:
-  - workflow-design-verify-subagent-session-rename-cmd
-  - memex-search-pagination-bug-fix-tests
-  - auth-migration-research-jwt-vs-sessions-decision
-  - deploy-script-docker-compose-env-vars-debugging
-  - nixos-pc-migration-zfs-gpu-timers-full-install
-  - stripe-billing-past-due-webhook-db-state-check
-  - cf-cache-traefik-observability-ws-latency-filtering
+NAMING_PROMPT = f"""\
+Name and tag this Claude Code session based on what was discussed and accomplished.
 
-Here is the session transcript:
+Output exactly two lines:
+1. The name: lowercase keywords separated by dashes. Cover every major topic — detail differentiates similar sessions in a searchable index. If the session works a ticket/task file, lead with its name. If work was left unfinished, name what was actually done.
+2. The tags: one or more of the following, comma-separated, most fitting first:
+{chr(10).join(f"   {tag}: {desc}" for tag, desc in TAG_DESCRIPTIONS.items())}
+
+Example outputs:
+
+auth-migration-research-jwt-vs-sessions-decision
+research,dev
+
+nixos-pc-migration-zfs-gpu-timers-full-install
+infra
+
+garbled-keyboard-mash-no-actual-task
+junk
+
+Session transcript:
 
 """
 
-MIN_SUBSTANTIVE_MSGS = 3
+
+def _load_extractor():
+    """Import extract-conversation.py (sibling script) as a module."""
+    path = Path(__file__).resolve().parent / "extract-conversation.py"
+    spec = importlib.util.spec_from_file_location("extract_conversation", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def load_index() -> dict[str, str]:
-    """Load existing index as {session_id: name}."""
-    if not INDEX_PATH.exists():
-        return {}
-    entries = {}
-    for line in INDEX_PATH.read_text().splitlines()[1:]:  # skip header
-        parts = line.split("\t")
-        if len(parts) >= 5:
-            entries[parts[0]] = parts[4]
-    return entries
-
-
-def save_entry(session_id: str, project: str, date: str, slug: str, name: str) -> None:
-    """Append a single entry to the index."""
-    if not INDEX_PATH.exists():
-        INDEX_PATH.write_text(HEADER + "\n")
-    with INDEX_PATH.open("a") as f:
-        f.write(f"{session_id}\t{project}\t{date}\t{slug}\t{name}\n")
-
-
-def remove_entry(session_id: str) -> None:
-    """Remove an entry from the index."""
-    if not INDEX_PATH.exists():
-        return
-    lines = INDEX_PATH.read_text().splitlines()
-    filtered = [l for l in lines if not l.startswith(session_id)]
-    INDEX_PATH.write_text("\n".join(filtered) + "\n")
-
-
-def get_slug(jsonl_path: Path) -> str:
-    """Extract slug from JSONL if session was manually renamed."""
-    try:
-        for line in jsonl_path.open():
-            entry = json.loads(line)
-            if slug := entry.get("slug"):
-                return slug
-            break  # only check first few lines
-    except (json.JSONDecodeError, OSError):
-        pass
-    return ""
-
-
-def count_substantive_msgs(jsonl_path: Path) -> int:
-    """Count substantive user messages (skip meta, empty, short)."""
-    count = 0
-    try:
-        for line in jsonl_path.open():
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if entry.get("type") != "user" or entry.get("isMeta"):
-                continue
-            msg = entry.get("message", {})
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    b.get("text", "") for b in content if isinstance(b, dict)
-                )
-            if isinstance(content, str) and len(content.strip()) > 15:
-                count += 1
-    except OSError:
-        pass
-    return count
-
-
-
-def discover_sessions(
-    days: int | None, project_filter: str | None
-) -> list[tuple[str, str, Path]]:
-    """Discover session files. Returns [(session_id, project_name, path)]."""
-    if not PROJECTS_DIR.exists():
-        return []
-
-    cutoff = (datetime.now() - timedelta(days=days)).timestamp() if days else 0
-    sessions = []
-
-    for project_dir in sorted(PROJECTS_DIR.iterdir()):
-        if not project_dir.is_dir():
-            continue
-        project_name = project_dir.name
-        if project_filter and project_filter not in project_name:
-            continue
-
-        for jsonl in project_dir.glob("*.jsonl"):
-            if len(jsonl.stem) < 30:  # skip non-UUID filenames
-                continue
-            if jsonl.stem.startswith("agent-"):
-                continue
-            if days and jsonl.stat().st_mtime < cutoff:
-                continue
-            sessions.append((jsonl.stem, project_name, jsonl))
-
-    return sessions
-
-
-def extract_transcript(session_id: str, tmp_dir: str) -> Path | None:
-    """Run ccx to extract transcript to a temp file."""
-    out_path = Path(tmp_dir) / f"{session_id}.txt"
-    result = subprocess.run(
-        ["ccx", session_id, str(out_path)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"  ccx failed: {result.stderr.strip()}", file=sys.stderr)
-        return None
-    if not out_path.exists() or out_path.stat().st_size < 100:
-        return None
-    return out_path
-
-
-def generate_name(transcript_path: Path, model: str) -> str | None:
-    """Call claude -p to generate a session name."""
-    transcript = transcript_path.read_text()
-    # Truncate very long transcripts to ~50k chars (~12k tokens)
-    if len(transcript) > 50_000:
-        transcript = transcript[:25_000] + "\n\n[... middle truncated ...]\n\n" + transcript[-25_000:]
-
-    prompt = NAMING_PROMPT + transcript
-    result = subprocess.run(
-        ["claude", "-p", "--model", model, prompt],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "CLAUDECODE": ""},  # unset to allow nested invocation
-    )
-    if result.returncode != 0:
-        print(f"  claude -p failed: {result.stderr.strip()}", file=sys.stderr)
-        return None
-
-    name = result.stdout.strip().lower().strip("`\"' ")
-    # Clean up: remove any explanation, keep only the name line
-    if "\n" in name:
-        name = name.split("\n")[0].strip()
-    return name or None
-
-
-def do_grep(query: str, project_filter: str | None) -> None:
-    """Search the index for a query string."""
-    if not INDEX_PATH.exists():
-        print("No index found. Run without --grep first to build it.", file=sys.stderr)
-        sys.exit(1)
-
-    query_lower = query.lower()
-    terms = query_lower.split()
-
-    print(f"{'SESSION ID':<40} {'PROJECT':<35} {'DATE':<12} {'NAME'}")
-    print("-" * 130)
-
-    for line in INDEX_PATH.read_text().splitlines()[1:]:
-        parts = line.split("\t")
-        if len(parts) < 5:
-            continue
-
-        session_id, project, date, slug, name = parts[0], parts[1], parts[2], parts[3], parts[4]
-
-        if project_filter and project_filter not in project:
-            continue
-
-        searchable = f"{name} {slug}".lower()
-        if all(term in searchable for term in terms):
-            display_name = name
-            if slug:
-                display_name = f"{name} (slug: {slug})"
-            print(f"{session_id:<40} {project:<35} {date:<12} {display_name}")
+XC = _load_extractor()
 
 
 @dataclass
 class Args:
-    """Index and search Claude Code sessions by descriptive names."""
-
     grep: str | None = None
-    """Search the index for sessions matching this query (all terms must match)."""
+    """Search the index: all terms must match against name+slug+tags."""
+
+    tag: str | None = None
+    """Search the index for sessions carrying this tag (combines with --grep)."""
 
     days: int | None = None
     """Only process sessions modified within the last N days."""
@@ -241,86 +115,282 @@ class Args:
     """Filter to projects whose directory name contains this string."""
 
     reindex: str | None = None
-    """Re-generate the name for a specific session ID."""
+    """Force re-indexing of a specific session ID (ignores --settle-hours)."""
 
-    model: str = "haiku"
-    """Model to use for naming."""
+    model: str = "sonnet"
+    """Model for naming/tagging (passed to claude -p --model)."""
+
+    workers: int = 2
+    """Concurrent claude -p calls."""
+
+    settle_hours: float = 24.0
+    """Skip sessions modified more recently than this, so active sessions aren't named mid-flight."""
 
     dry_run: bool = False
     """Show what would be indexed without calling the model."""
 
 
 def main(args: Args) -> None:
-    if args.grep:
-        do_grep(args.grep, args.project)
+    if args.grep or args.tag:
+        do_search(args.grep, args.tag, args.project)
         return
 
-    existing = load_index()
+    index = load_index()
 
     if args.reindex:
-        sessions = discover_sessions(days=None, project_filter=None)
-        sessions = [(sid, proj, path) for sid, proj, path in sessions if sid == args.reindex]
+        sessions = [s for s in discover_sessions(None, None) if s[0] == args.reindex]
         if not sessions:
             print(f"Session not found: {args.reindex}", file=sys.stderr)
             sys.exit(1)
-        remove_entry(args.reindex)
-        existing.pop(args.reindex, None)
     else:
-        sessions = discover_sessions(days=args.days, project_filter=args.project)
+        sessions = discover_sessions(args.days, args.project)
 
-    to_index = [
-        (sid, proj, path)
-        for sid, proj, path in sessions
-        if sid not in existing
-    ]
+    now = time.time()
+    settle_cutoff = now - args.settle_hours * 3600
+    candidates: list[tuple[str, str, Path]] = []
+    deferred = up_to_date = 0
+    for sid, proj, path in sessions:
+        mtime = path.stat().st_mtime
+        if args.reindex is None:
+            if mtime > settle_cutoff:
+                deferred += 1
+                continue
+            row = index.get(sid)
+            if row and mtime <= iso_to_epoch(row["indexed_at"]) + 60:
+                up_to_date += 1
+                continue
+        candidates.append((sid, proj, path))
 
-    if not to_index:
-        print("Nothing to index.")
+    print(f"{len(candidates)} to index ({up_to_date} up to date, {deferred} deferred by --settle-hours)")
+    if not candidates:
         return
 
-    # Filter out junk sessions
-    filtered = []
-    for sid, proj, path in to_index:
-        msg_count = count_substantive_msgs(path)
-        if msg_count < MIN_SUBSTANTIVE_MSGS:
-            continue
-        filtered.append((sid, proj, path, msg_count))
-
-    if not filtered:
-        print(f"Found {len(to_index)} unindexed sessions, but all have <{MIN_SUBSTANTIVE_MSGS} substantive messages.")
-        return
-
-    print(f"Indexing {len(filtered)} sessions...")
     if args.dry_run:
-        for sid, proj, path, msg_count in filtered:
-            date = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
-            slug = get_slug(path)
-            print(f"  {sid}  {proj:<35} {date}  {msg_count}msgs  slug={slug or '(none)'}")
+        do_dry_run(candidates, index)
         return
 
-    with tempfile.TemporaryDirectory(prefix="session-index-") as tmp_dir:
-        for i, (sid, proj, path, msg_count) in enumerate(filtered, 1):
-            date = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
-            slug = get_slug(path)
-            print(f"[{i}/{len(filtered)}] {sid} ({proj}, {msg_count}msgs)", end="", flush=True)
-            t0 = time.monotonic()
+    lock = threading.Lock()
+    counters = {"done": 0, "ineligible": 0, "failed": 0, "reindexed": 0}
+    total = len(candidates)
 
-            transcript_path = extract_transcript(sid, tmp_dir)
-            if not transcript_path:
-                print(" — skipped (ccx failed)")
+    def worker(sid: str, proj: str, path: Path) -> None:
+        row, status = index_one(sid, proj, path, args.model)
+        with lock:
+            n = counters["done"] = counters["done"] + 1
+            prefix = f"[{n}/{total}] {sid} ({proj})"
+            if status != "ok":
+                counters["failed" if status == "failed" else "ineligible"] += 1
+                print(f"{prefix} — skipped ({status})")
+                return
+            if sid in index:
+                remove_entry(sid)
+                counters["reindexed"] += 1
+            save_entry(row)
+            print(f"{prefix} — {row['name']} [{row['tags']}]")
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = [pool.submit(worker, *c) for c in candidates]
+        for f in as_completed(futures):
+            f.result()  # propagate exceptions
+
+    print(
+        f"\nIndexed {counters['done'] - counters['ineligible'] - counters['failed']} "
+        f"({counters['reindexed']} re-indexed), "
+        f"{counters['ineligible']} ineligible, {counters['failed']} failed."
+    )
+
+
+def index_one(sid: str, proj: str, path: Path, model: str) -> tuple[dict | None, str]:
+    """Analyze one session and generate its index row. Returns (row, status)."""
+    try:
+        messages = XC.extract_conversation(path)
+    except OSError as e:
+        print(f"  read failed for {sid}: {e}", file=sys.stderr)
+        return None, "failed"
+    if not any(r == "user" for r, _ in messages) or not any(r == "assistant" for r, _ in messages):
+        return None, "no user+assistant exchange"
+
+    transcript = XC.format_xml(messages, path, len(messages))
+    chars = len(transcript)
+    if chars > CAP_CHARS:
+        half = CAP_CHARS // 2
+        transcript = transcript[:half] + "\n\n[... middle truncated ...]\n\n" + transcript[-half:]
+
+    first_ts, last_ts, slug = scan_meta(path)
+    duration_min = 0
+    if first_ts and last_ts:
+        duration_min = max(0, round((last_ts - first_ts).total_seconds() / 60))
+
+    generated = generate_name_and_tags(transcript, model)
+    if generated is None:
+        return None, "failed"
+    name, tags = generated
+
+    return {
+        "session_id": sid,
+        "project": proj,
+        "date": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d"),
+        "indexed_at": datetime.now().isoformat(timespec="seconds"),
+        "n_msgs": str(len(messages)),
+        "n_subst": str(sum(1 for r, t in messages if r == "user" and len(t) > SUBSTANTIVE_MIN_CHARS)),
+        "chars": str(chars),
+        "duration_min": str(duration_min),
+        "slug": slug,
+        "tags": tags,
+        "name": name,
+    }, "ok"
+
+
+def generate_name_and_tags(transcript: str, model: str) -> tuple[str, str] | None:
+    """Call claude -p; parse name (line 1) and validated tags (line 2)."""
+    result = subprocess.run(
+        ["claude", "-p", "--model", model, NAMING_PROMPT + transcript],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CLAUDECODE": ""},  # unset to allow nested invocation
+    )
+    if result.returncode != 0:
+        print(f"  claude -p failed: {result.stderr.strip()}", file=sys.stderr)
+        return None
+
+    lines = [ln.strip().strip("`\"' ") for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    name = re.sub(r"\s+", "-", lines[0].lower())
+    raw = lines[1] if len(lines) > 1 else ""
+    tags = [t for t in (s.strip().lower() for s in raw.split(",")) if t in TAG_DESCRIPTIONS]
+    return name, ",".join(tags or ["other"])
+
+
+def scan_meta(path: Path) -> tuple[datetime | None, datetime | None, str]:
+    """One pass over the JSONL for first/last timestamp and slug."""
+    slug = ""
+    first_line = last_line = None
+    try:
+        for line in path.open():
+            if not slug and '"slug"' in line:
+                try:
+                    slug = json.loads(line).get("slug") or ""
+                except json.JSONDecodeError:
+                    pass
+            if '"timestamp"' in line:
+                if first_line is None:
+                    first_line = line
+                last_line = line
+    except OSError:
+        return None, None, slug
+
+    def parse_ts(line: str | None) -> datetime | None:
+        if line is None:
+            return None
+        try:
+            ts = json.loads(line).get("timestamp")
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            return None
+
+    return parse_ts(first_line), parse_ts(last_line), slug
+
+
+def discover_sessions(days: int | None, project_filter: str | None) -> list[tuple[str, str, Path]]:
+    """Discover session files. Returns [(session_id, project_name, path)]."""
+    if not PROJECTS_DIR.exists():
+        return []
+
+    cutoff = (datetime.now() - timedelta(days=days)).timestamp() if days else 0
+    sessions = []
+    for project_dir in sorted(PROJECTS_DIR.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        if project_filter and project_filter not in project_dir.name:
+            continue
+        for jsonl in project_dir.glob("*.jsonl"):
+            if len(jsonl.stem) < 30:  # skip non-UUID filenames
                 continue
-
-            name = generate_name(transcript_path, args.model)
-            elapsed = time.monotonic() - t0
-            if not name:
-                print(f" — skipped (naming failed, {elapsed:.1f}s)")
+            if jsonl.stem.startswith("agent-"):  # skip subagent transcripts
                 continue
+            if days and jsonl.stat().st_mtime < cutoff:
+                continue
+            sessions.append((jsonl.stem, project_dir.name, jsonl))
+    return sessions
 
-            save_entry(sid, proj, date, slug, name)
-            print(f" — {name} ({elapsed:.1f}s)")
 
-            # Clean up transcript
-            transcript_path.unlink(missing_ok=True)
+def do_dry_run(candidates: list[tuple[str, str, Path]], index: dict[str, dict]) -> None:
+    ineligible = 0
+    for sid, proj, path in candidates:
+        messages = XC.extract_conversation(path)
+        if not any(r == "user" for r, _ in messages) or not any(r == "assistant" for r, _ in messages):
+            ineligible += 1
+            continue
+        chars = len(XC.format_xml(messages, path, len(messages)))
+        date = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+        marker = "re-index" if sid in index else "new"
+        print(f"  {sid}  {proj:<45} {date}  {len(messages):3d}msgs {chars:7,}ch  {marker}")
+    print(f"\n{len(candidates) - ineligible} would be indexed, {ineligible} ineligible (no user+assistant exchange).")
+
+
+def do_search(query: str | None, tag: str | None, project_filter: str | None) -> None:
+    rows = load_index()
+    if not rows:
+        print("No index found. Run session-index first to build it.", file=sys.stderr)
+        sys.exit(1)
+
+    terms = query.lower().split() if query else []
+    print(f"{'SESSION ID':<38} {'PROJECT':<38} {'DATE':<11} {'TAGS':<15} NAME")
+    matches = 0
+    for row in rows.values():
+        if project_filter and project_filter not in row["project"]:
+            continue
+        if tag and tag not in row["tags"].split(","):
+            continue
+        searchable = f"{row['name']} {row['slug']} {row['tags']}".lower()
+        if not all(t in searchable for t in terms):
+            continue
+        matches += 1
+        display = row["name"] + (f" (slug: {row['slug']})" if row["slug"] else "")
+        print(f"{row['session_id']:<38} {row['project']:<38} {row['date']:<11} {row['tags']:<15} {display}")
+    if not matches:
+        print("(no matches)", file=sys.stderr)
+
+
+def load_index() -> dict[str, dict]:
+    """Load the index as {session_id: row dict}. Backs up and discards pre-tags-format files."""
+    if not INDEX_PATH.exists():
+        return {}
+    lines = INDEX_PATH.read_text().splitlines()
+    if not lines or lines[0] != HEADER:
+        backup = INDEX_PATH.with_suffix(".tsv.bak")
+        INDEX_PATH.rename(backup)
+        print(f"Old-format index moved to {backup}; starting fresh.", file=sys.stderr)
+        return {}
+    entries = {}
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) == len(COLUMNS):
+            entries[parts[0]] = dict(zip(COLUMNS, parts))
+    return entries
+
+
+def save_entry(row: dict) -> None:
+    if not INDEX_PATH.exists():
+        INDEX_PATH.write_text(HEADER + "\n")
+    with INDEX_PATH.open("a") as f:
+        f.write("\t".join(row[c] for c in COLUMNS) + "\n")
+
+
+def remove_entry(session_id: str) -> None:
+    if not INDEX_PATH.exists():
+        return
+    lines = INDEX_PATH.read_text().splitlines()
+    filtered = [ln for ln in lines if ln.split("\t", 1)[0] != session_id]
+    INDEX_PATH.write_text("\n".join(filtered) + "\n")
+
+
+def iso_to_epoch(iso: str) -> float:
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        return 0.0
 
 
 if __name__ == "__main__":
