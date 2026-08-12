@@ -140,6 +140,10 @@ def extract_conversation(session_path: Path) -> list[tuple[str, str]]:
         if not text:
             continue
 
+        # Skip slash-command machinery (invocation wrappers and local stdout)
+        if text.startswith(("<command-", "<local-command-")):
+            continue
+
         messages.append((role, text))
 
     return messages
