@@ -102,6 +102,7 @@
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAjII9WXpRDSR9Ac8M2ajf/DsQbBReeI3q7V9FSsXIlO"
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p"
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9y4XD7AHJ9PbUTMtUhS3VzTewwbE/zNZkrlywwrdnL max@zephylux"
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKwAGkyVkoOglSel/XaqaVMqm6FBatAq9LJxsoPq1BFa max@a55-phone"
     ];
   };
   programs.zsh.enable = true;
