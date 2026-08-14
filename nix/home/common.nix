@@ -367,7 +367,7 @@
     clang-tools # clangd + clang-format
     cmake-language-server
     docker-compose-language-service
-    dockerfile-language-server-nodejs
+    dockerfile-language-server
     gofumpt
     gopls
     gotools # goimports
@@ -375,7 +375,7 @@
     lua-language-server
     markdown-oxide
     nixd
-    nixfmt-rfc-style # binary is `nixfmt`
+    nixfmt
     prettier
     rust-analyzer
     rustfmt
