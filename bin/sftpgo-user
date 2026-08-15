@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Manage SFTPGo accounts on pc via the REST API.
+#
+# The API lives on the tailnet-only admin binding, so this needs tailnet access.
+# Auth: sops-encrypted admin API key in ~/.dotfiles/secrets/api_keys/sftpgo.
+#   Mint at http://pc:8081/web/admin/profile -> API keys (scope: admin).
+#   Override with SFTPGO_API_KEY, and the host with SFTPGO_URL.
+#
+# Usage:
+#   sftpgo-user list                    # username, status, quota used/limit
+#   sftpgo-user show <name>             # full account JSON
+#   sftpgo-user add <name> [opts]       # create, print the generated password
+#   sftpgo-user delete <name>           # really delete — see the note below
+#   sftpgo-user dump                    # provider dump (accounts, shares, rules)
+#
+# add options:
+#   --quota GB      storage limit, default 10
+#   --sftp          also allow SFTP/SSH (default: web only)
+#   --no-shares     forbid creating public share links
+#
+# Deleting is the only complete revocation: a disabled account (status 0) blocks
+# the owner's own login, but every public share link they created keeps working.
+set -euo pipefail
+
+API="${SFTPGO_URL:-http://pc:8081}/api/v2"
+KEY_FILE="$HOME/.dotfiles/secrets/api_keys/sftpgo"
+
+api() {
+  local key="${SFTPGO_API_KEY:-$(sops -d "$KEY_FILE")}"
+  curl -sS --fail-with-body -H "X-SFTPGO-API-KEY: $key" "$@"
+}
+
+gen_password() {
+  tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  list)
+    api "$API/users?limit=500" \
+      | jq -r '.[] | [.username, (if .status == 1 then "enabled" else "DISABLED" end),
+                      "\(((.used_quota_size // 0) / 1073741824) | . * 100 | round / 100)G",
+                      (if .quota_size > 0 then "\(.quota_size / 1073741824)G" else "unlimited" end)] | @tsv'
+    ;;
+
+  show)
+    name="${2:?usage: sftpgo-user show <name>}"
+    api "$API/users/$name" | jq .
+    ;;
+
+  add)
+    name="${2:?usage: sftpgo-user add <name> [--quota GB] [--sftp] [--no-shares]}"
+    shift 2
+    quota_gb=10
+    denied_protocols='["SSH","FTP","DAV"]'
+    web_client='[]'
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --quota)     quota_gb="${2:?--quota needs a value in GB}"; shift 2 ;;
+        --sftp)      denied_protocols='["FTP","DAV"]'; shift ;;
+        --no-shares) web_client='["shares-disabled"]'; shift ;;
+        *) echo "sftpgo-user: unknown option $1" >&2; exit 1 ;;
+      esac
+    done
+
+    password=$(gen_password)
+    # home_dir is left unset: users_base_dir gives it /srv/sftpgo/<name>.
+    body=$(jq -n \
+      --arg username "$name" \
+      --arg password "$password" \
+      --argjson quota "$((quota_gb * 1073741824))" \
+      --argjson denied "$denied_protocols" \
+      --argjson web "$web_client" \
+      '{status: 1, username: $username, password: $password, quota_size: $quota,
+        permissions: {"/": ["*"]},
+        filters: {denied_protocols: $denied, web_client: $web}}')
+    api -X POST -H "Content-Type: application/json" --data "$body" "$API/users" >/dev/null
+
+    echo "created $name (${quota_gb}G quota)"
+    echo "  url:      https://pc.tail710178.ts.net/"
+    echo "  username: $name"
+    echo "  password: $password"
+    ;;
+
+  delete)
+    name="${2:?usage: sftpgo-user delete <name>}"
+    api -X DELETE "$API/users/$name" >/dev/null
+    echo "deleted $name — their share links are gone too; files under /srv/sftpgo/$name remain on disk"
+    ;;
+
+  dump)
+    api "$API/dumpdata?output-data=1&indent=1"
+    ;;
+
+  *)
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

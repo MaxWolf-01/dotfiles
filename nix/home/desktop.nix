@@ -37,7 +37,6 @@ in
     sshfs
     chromium
     codex
-    localsend
     zathura
     texliveFull
   ];

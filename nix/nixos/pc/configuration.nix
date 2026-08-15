@@ -6,7 +6,7 @@
     ./youtube-download.nix
     ./copyparty.nix
     ./pihole.nix
-    ./mdsr.nix
+    ./sftpgo.nix
   ];
 
   # Boot
@@ -82,6 +82,8 @@
 
   # Tailscale
   services.tailscale.enable = true;
+  # Lets max (and agents acting as max) drive tailscaled without sudo.
+  services.tailscale.extraSetFlags = [ "--operator=max" ];
 
   # SSH
   services.openssh = {
