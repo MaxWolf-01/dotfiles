@@ -25,6 +25,10 @@ And check which host you're on.
 
 **IMPORTANT: Nix flakes only see git-tracked files.** When creating new `.nix` files, `git add` them BEFORE running `hmswitch`/`nswitch`/any flake command — otherwise the build fails with "path does not exist".
 
+## Issue Tracker
+
+`agent/tasks/` is a symlink into `secrets/agent/tasks/` — tickets are versioned in the private secrets repo, never in this public one (commit them there). Standard mx markdown-tracker conventions apply; `archive/` holds retired pre-mx-workflow task files.
+
 ## Claude Code Config
 
 Global `~/.claude` config lives in `~/repos/github/MaxWolf-01/agents` (`claude/`), not here. `.claude/` in this repo is dotfiles-local.
