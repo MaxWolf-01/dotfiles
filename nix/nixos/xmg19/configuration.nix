@@ -119,6 +119,15 @@
   # Per-network stable random MAC (privacy on public wifi)
   networking.networkmanager.wifi.macAddress = "stable";
 
+  # Encrypted DNS to Quad9 (mirrors `setup net_harden` on non-NixOS hosts);
+  # opportunistic so captive portals still work pre-auth
+  services.resolved = {
+    enable = true;
+    dnsovertls = "opportunistic";
+    domains = [ "~." ];
+  };
+  networking.nameservers = [ "9.9.9.9#dns.quad9.net" "149.112.112.112#dns.quad9.net" ];
+
   # Docker + GPU passthrough
   virtualisation.docker = {
     enable = true;
