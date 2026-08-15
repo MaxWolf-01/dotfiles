@@ -116,6 +116,9 @@
   # Keep wifi alive during idle
   networking.networkmanager.wifi.powersave = false;
 
+  # Per-network stable random MAC (privacy on public wifi)
+  networking.networkmanager.wifi.macAddress = "stable";
+
   # Docker + GPU passthrough
   virtualisation.docker = {
     enable = true;
@@ -132,6 +135,7 @@
     enable = true;
     settings = {
       PasswordAuthentication = false;
+      KbdInteractiveAuthentication = false;
       PermitRootLogin = "prohibit-password";
     };
   };
