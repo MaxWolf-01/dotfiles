@@ -73,12 +73,37 @@ SFTPGo re-applies it at every start:
   account including max's
 - `127.0.0.1` on the defender and rate-limiter safe lists
 
+Retention measures a file's modification time. `common.setstat_mode = 1` therefore
+ignores client-requested timestamp changes, so mtime records when a file arrived.
+Without that, uploading with `sftp -p` or `rsync -t` would carry the original
+timestamp across, and anything older than nine months would be deleted the same
+night it was uploaded.
+
 That safe list is a backstop, not a convenience. Every ban, rate limit and
 per-host connection cap keys on the client IP that SFTPGo resolves from
 `X-Forwarded-For`. If that resolution ever breaks, every Funnel request collapses
 to `127.0.0.1` and one person's failed logins would ban everybody at once. Safe
 listing that address trades brute-force protection for availability in exactly
 that failure.
+
+## When the public URL stops working
+
+`tailscale funnel status` reporting "Funnel on", and the public DNS records
+resolving, both say nothing about whether traffic reaches the daemon — they are
+set by code that never consults the ingress path. A Funnel that is dead end to
+end still looks healthy in both.
+
+The signal is on pc:
+
+```
+journalctl -u tailscaled | grep -i ingress
+```
+
+`peerapi: ingress: denied; no ingress cap` means Tailscale's ingress relays are
+reaching pc and being refused, so no certificate is presented and every external
+client dies at the TLS handshake with `unexpected eof while reading`. `Drop: TCP
+... no rules matched` alongside it means the tailnet policy is refusing the
+relays' packets outright.
 
 ## Backup
 

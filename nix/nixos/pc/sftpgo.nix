@@ -106,6 +106,14 @@ in
 
     settings = {
       common = {
+        # Ignore client-requested timestamp and permission changes. Retention
+        # expires files on their modification time, so a client that preserves
+        # timestamps (sftp -p, rsync -t, WinSCP) would upload a file already
+        # older than the retention window and lose it at the next nightly run.
+        # Ignoring setstat makes mtime mean "when it arrived", which is what
+        # expiry should measure.
+        setstat_mode = 1;
+
         # Web asset bursts blow through the default 20 concurrent requests per
         # host; the rate limiter and defender are the layers that tell load
         # apart from attack.
