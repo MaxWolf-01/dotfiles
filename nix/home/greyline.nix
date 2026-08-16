@@ -8,9 +8,13 @@
 #   - target graphical-session.target: the generic GNOME session target.
 #   - /usr/bin/gsettings (absolute): Ubuntu's binary knows the GNOME schemas;
 #     a nix-store gsettings would not find org.gnome.desktop.background.
-#   - empty-then-set: greyline re-renders to the same path each tick, so we
-#     clear picture-uri first to defeat GNOME's same-URI cache; both light and
-#     dark keys are set so it shows in either colour scheme.
+#   - both light and dark keys are set so it shows in either colour scheme.
+#
+# Every picture-uri change leaks memory in gnome-shell (GNOME/gnome-shell#5729,
+# #9188): it builds a fresh Background actor and decoded texture — 37 MB at this
+# resolution — and does not reliably release the old one. The interval is the
+# leak rate. At 5 min the daylight terminator lags by at most 1.25° of
+# longitude, which is not visible.
 #   - extraPackages = []: the default pulls in sway, which we don't need.
 #
 # `command` goes in settings (config.toml), NOT services.greyline.command: the
@@ -24,11 +28,11 @@
     backend = "command";
     target = "graphical-session.target";
     extraPackages = [ ];
+    interval = "*:0/5:00";
 
     settings = {
       command =
-        ''/usr/bin/gsettings set org.gnome.desktop.background picture-uri "" ''
-        + ''&& /usr/bin/gsettings set org.gnome.desktop.background picture-uri "file://{path}" ''
+        ''/usr/bin/gsettings set org.gnome.desktop.background picture-uri "file://{path}" ''
         + ''&& /usr/bin/gsettings set org.gnome.desktop.background picture-uri-dark "file://{path}"'';
       map_style = "vector";
       theme = "dark";
