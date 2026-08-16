@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Install the dual-path DNS failover as system services. Idempotent.
+#
+# Two dnsproxy instances, both forwarding to the same Mullvad filtered resolver
+# (base.dns.mullvad.net over DoT), differing only in network path:
+#
+#   dnsproxy-front   127.0.0.1:5300  what resolved talks to. Primary upstream
+#                    egresses as an ordinary process — through the exit node
+#                    whenever the tunnel is up, so queries stay anonymized.
+#                    On failure (~1s), falls back per-query to the direct
+#                    instance. MagicDNS names are split-routed to quad-100.
+#   dnsproxy-direct  127.0.0.1:5301  runs as its own user; an ip rule keyed to
+#                    that uid sends its traffic past tailscale's routing tables
+#                    (table main always holds the physical default route), so it
+#                    works exactly when the tunnel is broken. Its journal is the
+#                    tunnel-outage record: it only ever sees fallback traffic.
+#
+# Filtering cannot fail open: both upstreams apply the same blocklists, and no
+# unfiltered resolver exists anywhere in the chain. Real-IP exposure to Mullvad
+# happens only for queries the tunnel path already failed. See docs/dns.md.
+#
+# This script does NOT flip tailscale's accept-dns; it prints the cutover step.
+# The intermediate state (tailscaled and the front both claiming ~.) is safe:
+# resolved races them, both answer filtered.
+set -euo pipefail
+
+DIRECT_USER=dnsproxy-direct
+BIN=/usr/local/bin/dnsproxy
+MULLVAD_DOT=tls://base.dns.mullvad.net
+# Plain DNS to Mullvad, used only to resolve base.dns.mullvad.net itself —
+# user queries never touch port 53 (Mullvad's plain listener skips blocklists).
+BOOTSTRAP=194.242.2.4:53
+
+echo "building dnsproxy from nixpkgs..."
+store_path=$(nix build --no-link --print-out-paths nixpkgs#dnsproxy)
+sudo install -m 0755 "$store_path/bin/dnsproxy" "$BIN"
+
+if ! id "$DIRECT_USER" &> /dev/null; then
+  sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$DIRECT_USER"
+fi
+direct_uid=$(id -u "$DIRECT_USER")
+
+# The bypass rules live with the service: added before start, removed after
+# stop, so `systemctl status dnsproxy-direct` is the whole truth about whether
+# the bypass exists. pref 5000 sits before tailscale's rules (52xx); the
+# del-then-add pair keeps restarts from stacking duplicates.
+sudo tee /etc/systemd/system/dnsproxy-direct.service > /dev/null << EOF
+[Unit]
+Description=Mullvad DoT forwarder that bypasses the tailscale tunnel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=$DIRECT_USER
+ExecStartPre=-+/usr/sbin/ip rule del pref 5000
+ExecStartPre=-+/usr/sbin/ip -6 rule del pref 5000
+ExecStartPre=+/usr/sbin/ip rule add uidrange $direct_uid-$direct_uid lookup main pref 5000
+ExecStartPre=+/usr/sbin/ip -6 rule add uidrange $direct_uid-$direct_uid lookup main pref 5000
+ExecStopPost=-+/usr/sbin/ip rule del pref 5000
+ExecStopPost=-+/usr/sbin/ip -6 rule del pref 5000
+# -v: one log line per query. This instance receives traffic only while the
+# tunnel path is failing, so its journal doubles as the tunnel-outage record
+# (and stays small). Count outage minutes straight from journalctl.
+ExecStart=$BIN -l 127.0.0.1 -p 5301 -u $MULLVAD_DOT -b $BOOTSTRAP --timeout=2s -v
+Restart=always
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo tee /etc/systemd/system/dnsproxy-front.service > /dev/null << EOF
+[Unit]
+Description=DNS front: Mullvad DoT via tunnel, per-query fallback to direct path
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+DynamicUser=yes
+# ts.net split-route keeps MagicDNS alive: tailscaled's internal resolver keeps
+# serving tailnet names even with accept-dns=false (verified on pc via
+# `tailscale dns query`; sftpgo-user/-share depend on it).
+ExecStart=$BIN -l 127.0.0.1 -p 5300 \\
+  -u $MULLVAD_DOT \\
+  -u [/ts.net/]100.100.100.100:53 \\
+  -b $BOOTSTRAP \\
+  -f 127.0.0.1:5301 \\
+  --cache --timeout=1s
+Restart=always
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Global ~. hands all names to the front. 10-dot.conf (Quad9) must go: a second
+# global server would be a same-scope alternative resolved switches to on
+# timeout — an unfiltered bypass of exactly the failover this install provides.
+sudo rm -f /etc/systemd/resolved.conf.d/10-dot.conf
+sudo mkdir -p /etc/systemd/resolved.conf.d
+sudo tee /etc/systemd/resolved.conf.d/20-dns-failover.conf > /dev/null << 'EOF'
+[Resolve]
+DNS=127.0.0.1:5300
+Domains=~.
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now dnsproxy-direct dnsproxy-front
+sudo systemctl restart systemd-resolved
+
+echo
+echo "verify:  dig @127.0.0.1 -p 5300 doubleclick.net   # NXDOMAIN = filtered"
+echo "         dig @127.0.0.1 -p 5300 pc.tail710178.ts.net"
+echo "         resolvectl query github.com"
+echo
+echo "cutover (removes tailscaled from the DNS path; safe to defer):"
+echo "         tailscale set --accept-dns=false"
+echo "rollback: sudo rm /etc/systemd/resolved.conf.d/20-dns-failover.conf;"
+echo "          sudo systemctl restart systemd-resolved; tailscale set --accept-dns=true"
