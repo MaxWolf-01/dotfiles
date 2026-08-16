@@ -34,6 +34,10 @@ let
     bash coreutils uv
   ]);
 
+  vpnPath = lib.makeBinPath (with pkgs; [
+    bash coreutils gawk curl jq libnotify
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -427,6 +431,36 @@ in
     Timer = {
       OnBootSec = "2m";
       OnUnitActiveSec = "15m";
+      RandomizedDelaySec = "1m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Exit-node watchdog ---
+  # Cloudflare blocks some Mullvad IPs for Chrome-family clients (Vesktop, any
+  # Electron app), invisibly to Tailscale's own failover. vpn-pick --watchdog
+  # re-probes the active exit node and rotates it when blocked or dead; it is
+  # a no-op when no exit node is set. Rationale and probe: bin/vpn-pick.
+
+  systemd.user.services.vpn-watchdog = {
+    Unit = {
+      Description = "Rotate the Mullvad exit node when Cloudflare blocks it";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # tailscale is the Ubuntu system package in /usr/bin
+      Environment = [ "PATH=${vpnPath}:/usr/bin:/bin" ];
+      ExecStart = "${dotfiles}/bin/vpn-pick --watchdog";
+    };
+  };
+
+  systemd.user.timers.vpn-watchdog = {
+    Unit.Description = "Exit-node Cloudflare check (every 10 min)";
+    Timer = {
+      OnBootSec = "3m";
+      OnUnitActiveSec = "10m";
       RandomizedDelaySec = "1m";
     };
     Install.WantedBy = [ "timers.target" ];

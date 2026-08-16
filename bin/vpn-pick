@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Pick a Mullvad exit node that Cloudflare does not block.
+#
+# `tailscale set --exit-node=auto:any` ranks nodes by latency only. Cloudflare
+# scores each egress IP separately and hard-blocks some Mullvad IPs for
+# Chrome-family clients (every Electron app: Vesktop, ...), while Firefox from
+# the same IP passes. So the browser works, the app shows "Temporary Network
+# Error", and Tailscale's own health checks see nothing wrong. The block is
+# per-node, not per-country, and reputations drift — a static pin or blacklist
+# rots. This adds the missing application-level health check: enable auto:any
+# (keeps auto-failover), probe the case that actually fails (discord.com with a
+# Chrome UA), and only when the picked node is blocked, walk nearby nodes and
+# pin the first clean one.
+#
+#   vpn-pick             turn on + verify (what the vpn-on alias runs)
+#   vpn-pick --check     report the current node's verdict, change nothing
+#   vpn-pick --watchdog  re-verify quietly; rotate + notify only when broken.
+#                        No-op when no exit node is set (respects vpn-off).
+#                        Run by the vpn-watchdog timer (nix/home/timers.nix).
+#
+# Needs curl + jq, and the tailscale operator grant (no sudo).
+set -uo pipefail
+
+CHROME_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+CANARY=https://discord.com/app
+COUNTRIES=(Germany Austria Switzerland Netherlands)
+MAX_PINS=8  # nodes to try after auto's pick before giving up
+
+pick() {  # $1 = fresh (vpn-on: also restore accept-dns) | rotate (leave DNS prefs alone)
+  local extra=()
+  [[ $1 == fresh ]] && extra=(--accept-dns=true)
+  tailscale set --exit-node=auto:any --exit-node-allow-lan-access=true "${extra[@]}"
+  if ! settle any; then
+    echo "vpn-pick: egress never reached Mullvad — tailscale down? captive portal? (docs/dns.md)" >&2
+    return 1
+  fi
+  local current verdict
+  current=$(egress)
+  probe && verdict=0 || verdict=$?
+  if [[ $verdict -eq 0 ]]; then
+    echo "exit node: $current (auto-failover on, canary clean)"
+    return 0
+  fi
+  if [[ $verdict -eq 2 ]]; then
+    echo "vpn-pick: canary unreachable through $current — network trouble, not walking nodes" >&2
+    return 1
+  fi
+
+  echo "auto picked $current, Cloudflare blocks it — walking alternatives"
+  local attempts=0 node short
+  for node in $(candidates); do
+    short=${node%%.*}
+    [[ $short == "$current" ]] && continue
+    (( ++attempts > MAX_PINS )) && break
+    tailscale set --exit-node="$node" --exit-node-allow-lan-access=true
+    settle "$short" || { echo "  $short: unreachable, skipping"; continue; }
+    if probe; then
+      echo "pinned: $node (auto-failover off — the vpn-watchdog timer re-checks every 10 min)"
+      notify "Exit node $current is Cloudflare-blocked; pinned $short instead."
+      return 0
+    fi
+    echo "  $short: blocked too"
+  done
+
+  tailscale set --exit-node=auto:any --exit-node-allow-lan-access=true
+  echo "vpn-pick: no clean node among $attempts candidates — left on auto:any; Discord will be broken" >&2
+  notify "No Cloudflare-clean exit node found; Discord likely broken."
+  return 1
+}
+
+watchdog() {
+  local st
+  st=$(tailscale status --json 2>/dev/null) || exit 0            # tailscale down: nothing to guard
+  [[ -n $(jq -r '.ExitNodeStatus // empty' <<<"$st") ]] || exit 0  # vpn-off: respect it
+  probe && exit 0
+  if [[ $? -eq 1 ]]; then
+    echo "vpn-watchdog: current exit node is Cloudflare-blocked — rotating"
+    pick rotate
+    exit $?
+  fi
+  # Canary unreachable. Egress still answering means Discord itself is unwell —
+  # rotating won't help. No egress at all means the pinned node died (or the
+  # network is down, in which case pick fails loud and the next tick retries).
+  if [[ -n $(egress) ]]; then
+    echo "vpn-watchdog: egress fine, canary unreachable — not a node problem, not rotating"
+    exit 0
+  fi
+  echo "vpn-watchdog: no egress through the exit node — re-picking"
+  pick rotate
+}
+
+check() {
+  local node
+  node=$(egress)
+  [[ -n $node ]] || { echo "not egressing through Mullvad (vpn-off, or no connectivity)"; exit 1; }
+  probe && { echo "$node: clean"; exit 0; }
+  case $? in
+    1) echo "$node: Cloudflare-blocked (Chrome-UA canary gets 403)"; exit 1 ;;
+    2) echo "$node: canary unreachable"; exit 2 ;;
+  esac
+}
+
+probe() {  # 0 clean, 1 blocked (Cloudflare 403), 2 unreachable
+  local code blocked=0 ok=0
+  for _ in 1 2 3; do
+    code=$(curl -4 -s -m 10 -o /dev/null -w '%{http_code}' -A "$CHROME_UA" "$CANARY")
+    case $code in
+      403) blocked=1 ;;
+      2*|3*) ok=1 ;;
+    esac
+  done
+  (( blocked )) && return 1
+  (( ok )) && return 0
+  return 2
+}
+
+egress() {  # Mullvad node short name we currently egress through, or empty
+  curl -4 -s -m 8 https://am.i.mullvad.net/json | jq -r '.mullvad_exit_ip_hostname // empty'
+}
+
+settle() {  # settle <short-name|any> — wait until egress goes through it
+  local want=$1 got
+  for _ in $(seq 1 20); do
+    got=$(egress)
+    [[ -n $got && ( $want == any || $got == "$want" ) ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+candidates() {  # exit nodes in COUNTRIES order, deduped ("Any"-city rows repeat nodes)
+  local list country
+  list=$(tailscale exit-node list)
+  for country in "${COUNTRIES[@]}"; do
+    awk -v c="$country" '$2 ~ /\.mullvad\.ts\.net$/ && $3 == c {print $2}' <<<"$list"
+  done | awk '!seen[$0]++'
+}
+
+notify() {
+  command -v notify-send >/dev/null && notify-send "vpn-pick" "$1" || true
+}
+
+case "${1:-}" in
+  "") pick fresh ;;
+  --check) check ;;
+  --watchdog) watchdog ;;
+  *) echo "usage: vpn-pick [--check|--watchdog]" >&2; exit 2 ;;
+esac
