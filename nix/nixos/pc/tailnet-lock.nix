@@ -1,9 +1,9 @@
 { pkgs, ... }:
 
 {
-  # pc's tailscaled has no operator, so signing runs as root. That is the point:
-  # the tailnet-lock key admits nodes to the tailnet, and granting the operator
-  # role would hand that to every process running as max.
+  # Runs as root rather than as max. Not a trust boundary — max is in wheel and
+  # docker here — just one less thing to depend on: a user unit would break if
+  # the tailscale operator grant ever went away.
   systemd.services.tailnet-lock-sign = {
     description = "Sign Mullvad exit nodes locked out by Tailnet Lock";
     after = [ "tailscaled.service" "network-online.target" ];
