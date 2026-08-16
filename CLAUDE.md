@@ -33,6 +33,8 @@ And check which host you're on.
 
 Everything the mx workflow produces lives in the secrets repo and is symlinked into place here, gitignored on this side: `agent/`, `decisions/` → `secrets/decisions/`, and `CONTEXT.md` when there is one. Commit them in `secrets`.
 
+`agent/research/` is gitignored everywhere (global `~/.config/git/ignore`) and stays that way — research is ephemeral, and `~` is backed up, so nothing is lost. Condense findings into the ticket, decision, or doc that needs them; never promote a research note to a doc.
+
 ## Claude Code Config
 
 Global `~/.claude` config lives in `~/repos/github/MaxWolf-01/agents` (`claude/`), not here. `.claude/` in this repo is dotfiles-local.
