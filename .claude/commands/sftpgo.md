@@ -14,6 +14,10 @@ account's.
 Admins and users are separate namespaces, so `max` exists as both, with different
 passwords. `sftpgo-user` acts as the admin; `sftpgo-share` acts as the account.
 
+Sharing a directory hands out two links at once, and `create` prints both: the
+`/browse` one opens a file browser, the same link without it streams the whole
+tree as one zip.
+
 ## Which tool
 
 | Goal | Command |
@@ -33,8 +37,9 @@ uploaded what.
 Deleting an account is what revokes it. Disabling leaves every link it created
 serving, and deletion leaves the files on disk — `delete` prints the path.
 
-A share password is printed once, at creation, and cannot be recovered — pass it
-back to whoever asked, along with the link and expiry.
+A generated share password is printed once, at creation, and cannot be recovered
+— pass it back to whoever asked, along with the link and expiry. `--password`
+takes one of your choosing, for when it has to be said out loud.
 
 ## Web admin and these tools disagree
 

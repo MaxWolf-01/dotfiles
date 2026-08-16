@@ -22,7 +22,8 @@ Examples:
 
     sftpgo-share create /trip.zip
     sftpgo-share create /photos --expires 30d --max-downloads 5
-    sftpgo-share create /invoice.pdf --no-password --expires 24h
+    sftpgo-share create /photos --password soup
+    sftpgo-share create /invoice.pdf --open --expires 24h
     sftpgo-share list
     sftpgo-share list --json | jq '.[] | select(.downloads > 0)'
     sftpgo-share revoke aBcD1234
@@ -32,11 +33,11 @@ import json as jsonlib
 import os
 import re
 import secrets
-import stat
 import string
 import subprocess
 import sys
 import time
+from functools import cache
 from pathlib import Path, PurePosixPath
 
 import httpx
@@ -75,6 +76,7 @@ def client() -> httpx.Client:
     )
 
 
+@cache
 def public_base() -> str:
     """The Funnel URL, read from tailscaled rather than hardcoded."""
     try:
@@ -99,6 +101,12 @@ def parse_duration(spec: str) -> int | None:
     return int((time.time() + hours * 3600) * 1000)
 
 
+# SFTPGo serialises Go's fs.FileMode, which flags a directory with bit 31 rather
+# than the POSIX S_IFDIR bits stat.S_ISDIR looks at. A directory arrives as
+# 2147484096 (ModeDir | 0o700), whose low bits are indistinguishable from a file's.
+GO_MODE_DIR = 1 << 31
+
+
 def looks_like_dir(c: httpx.Client, path: str) -> bool:
     """Whether path is a directory, read from its parent's listing.
 
@@ -112,7 +120,7 @@ def looks_like_dir(c: httpx.Client, path: str) -> bool:
     r = c.get("/api/v2/user/dirs", params={"path": str(p.parent)})
     if r.status_code != 200:
         return False
-    return any(stat.S_ISDIR(e.get("mode", 0)) for e in r.json() if e.get("name") == p.name)
+    return any(e.get("mode", 0) & GO_MODE_DIR for e in r.json() if e.get("name") == p.name)
 
 
 def share_url(share_id: str, is_dir: bool) -> str:
@@ -120,11 +128,16 @@ def share_url(share_id: str, is_dir: bool) -> str:
     return f"{public_base()}/web/client/pubshares/{share_id}{suffix}"
 
 
+def gen_password() -> str:
+    return "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+
+
 @app.command(name="create")
 def create(
     path: tyro.conf.Positional[str],
     expires: str = "7d",
-    password: bool = True,
+    password: str = "",
+    open: bool = False,
     max_downloads: int = 0,
     name: str = "",
 ) -> None:
@@ -134,15 +147,19 @@ def create(
         path: Path inside the account, e.g. /trip.zip or /photos.
         expires: Lifetime as 24h, 7d, 6w, or never. Links get forwarded; an
             expiry is what stops that mattering later.
-        password: Protect the link with a generated password, printed once.
-            Send it through a different channel than the link.
+        password: Password for the link. Left empty, one is generated. Either
+            way it is printed once; send it through a different channel than
+            the link.
+        open: Hand out no password at all — whoever holds the link downloads.
         max_downloads: Stop the link working after this many downloads. 0 means
             no limit.
         name: Label shown in the web UI. Defaults to the path.
     """
     if not path.startswith("/"):
         path = "/" + path
-    secret = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16)) if password else ""
+    if open and password:
+        die("--open and --password contradict each other; pick one")
+    secret = "" if open else (password or gen_password())
 
     with client() as c:
         is_dir = looks_like_dir(c, path)
@@ -164,6 +181,10 @@ def create(
 
     print(f"shared {path}")
     print(f"  link:      {share_url(share_id, is_dir)}")
+    # A directory share answers on both URLs at once — the same link without
+    # /browse streams the whole tree as one zip. Neither is a mode you set.
+    if is_dir:
+        print(f"  zip:       {share_url(share_id, is_dir=False)}")
     if secret:
         print(f"  password:  {secret}")
     print(f"  expires:   {expires}")
@@ -186,6 +207,11 @@ def list_shares(json: bool = False) -> None:
     """
     with client() as c:
         shares = c.get("/api/v2/user/shares", params={"limit": 500}).json()
+        # Only a share of one directory browses; several paths always zip.
+        browsable = {
+            s["id"]: len(s.get("paths", [])) == 1 and looks_like_dir(c, s["paths"][0])
+            for s in shares
+        }
 
     rows = []
     for s in shares:
@@ -201,7 +227,7 @@ def list_shares(json: bool = False) -> None:
                 "downloads": s.get("used_tokens", 0),
                 "max_downloads": s.get("max_tokens", 0),
                 "password": bool(s.get("password")),
-                "url": share_url(s["id"], is_dir=False),
+                "url": share_url(s["id"], browsable[s["id"]]),
             }
         )
 
