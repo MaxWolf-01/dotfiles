@@ -11,4 +11,8 @@
   ];
 
   targets.genericLinux.enable = false;
+
+  # Long unattended jobs (dispatch workers, training runs) go here instead of
+  # dying when this laptop suspends.
+  home.sessionVariables.MX_WORKER_HOST = "pc";
 }

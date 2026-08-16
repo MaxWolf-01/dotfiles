@@ -6,6 +6,10 @@
 
   home.packages = [ pkgs.brave ];
 
+  # Long unattended jobs (dispatch workers, training runs) go here instead of
+  # dying when this laptop suspends.
+  home.sessionVariables.MX_WORKER_HOST = "pc";
+
   imports = [
     ../desktop.nix
     ../gnome.nix
