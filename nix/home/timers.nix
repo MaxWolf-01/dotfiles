@@ -432,7 +432,7 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- DNS audit (secrets/dns-archive.md) ---
+  # --- DNS audit ---
 
   systemd.user.services.dns-audit = {
     Unit = {
