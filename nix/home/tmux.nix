@@ -61,16 +61,23 @@ in
           ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/pane_contents_*.tar.gz 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +501 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
         fi
 
+        # Resurrect never prunes its state files (it only dedupes identical
+        # consecutive saves), so bound them like the pane archives above.
+        ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/tmux_resurrect_*.txt 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +2001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
+
         save_script=$(${tmux} show-options -gqv @resurrect-save-script-path)
         [ -x "$save_script" ] && "$save_script" quiet 2>/dev/null
       '');
     };
   };
   systemd.user.timers.tmux-resurrect-save = {
-    Unit.Description = "Auto-save tmux sessions every minute";
+    Unit.Description = "Auto-save tmux sessions every 5 minutes";
     Timer = {
       OnBootSec = "1min";
-      OnUnitActiveSec = "1min";
+      # Each save rewrites the pane-contents archive plus ~1.8 MB of capture
+      # staging; at 1min that measured ~3 GB/day of SSD writes for a
+      # crash-recovery freshness nobody needs at minute granularity.
+      OnUnitActiveSec = "5min";
     };
     Install.WantedBy = [ "timers.target" ];
   };
