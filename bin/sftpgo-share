@@ -1,0 +1,235 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "httpx"]
+# ///
+"""Public share links for files in the SFTPGo drop on pc.
+
+A share is a link to one path inside your account. Whoever holds it downloads
+without an account — for people you don't want to mint an account for. Scope is
+always read: a visitor can never write, which sidesteps the anonymous-overwrite
+behaviour of write shares (drakkan/sftpgo#2232).
+
+Shares carry no storage of their own; the quota belongs to the account.
+
+Needs tailnet access — the API is on the tailnet-only binding. Auth is the
+account password, sops-encrypted at ~/.dotfiles/secrets/passwords/sftpgo-max,
+overridable with SFTPGO_PASSWORD. Account name from SFTPGO_ACCOUNT (default max),
+host from SFTPGO_URL. The account password, not the admin one: shares belong to
+an account, and sftpgo-user's admin API key cannot create them.
+
+Examples:
+
+    sftpgo-share create /trip.zip
+    sftpgo-share create /photos --expires 30d --max-downloads 5
+    sftpgo-share create /invoice.pdf --no-password --expires 24h
+    sftpgo-share list
+    sftpgo-share list --json | jq '.[] | select(.downloads > 0)'
+    sftpgo-share revoke aBcD1234
+"""
+
+import json as jsonlib
+import os
+import re
+import secrets
+import stat
+import string
+import subprocess
+import sys
+import time
+from pathlib import Path, PurePosixPath
+
+import httpx
+import tyro
+from tyro.extras import SubcommandApp
+
+app = SubcommandApp()
+
+BASE = os.environ.get("SFTPGO_URL", "http://pc:8081")
+ACCOUNT = os.environ.get("SFTPGO_ACCOUNT", "max")
+PASSWORD_FILE = Path.home() / ".dotfiles/secrets/passwords/sftpgo-max"
+
+
+def die(msg: str) -> None:
+    print(f"sftpgo-share: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def token() -> str:
+    password = os.environ.get("SFTPGO_PASSWORD")
+    if not password:
+        if not PASSWORD_FILE.exists():
+            die(f"no account password at {PASSWORD_FILE} (see docs/sftpgo.md)")
+        password = subprocess.run(
+            ["sops", "-d", str(PASSWORD_FILE)], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    r = httpx.get(f"{BASE}/api/v2/user/token", auth=(ACCOUNT, password), timeout=20)
+    if r.status_code != 200:
+        die(f"login failed for account {ACCOUNT!r}: {r.status_code} {r.text.strip()}")
+    return r.json()["access_token"]
+
+
+def client() -> httpx.Client:
+    return httpx.Client(
+        base_url=BASE, headers={"Authorization": f"Bearer {token()}"}, timeout=60
+    )
+
+
+def public_base() -> str:
+    """The Funnel URL, read from tailscaled rather than hardcoded."""
+    try:
+        status = jsonlib.loads(
+            subprocess.run(
+                ["tailscale", "status", "--json"], capture_output=True, text=True, check=True
+            ).stdout
+        )
+        return f"https://pc.{status['MagicDNSSuffix']}"
+    except Exception:
+        return "https://pc.<tailnet>.ts.net"
+
+
+def parse_duration(spec: str) -> int | None:
+    """Duration like 24h, 7d, 6w to a unix-ms deadline. 'never' means no expiry."""
+    if spec == "never":
+        return None
+    m = re.fullmatch(r"(\d+)([hdw])", spec)
+    if not m:
+        die(f"bad --expires {spec!r}: use 24h, 7d, 6w, or never")
+    hours = int(m.group(1)) * {"h": 1, "d": 24, "w": 168}[m.group(2)]
+    return int((time.time() + hours * 3600) * 1000)
+
+
+def looks_like_dir(c: httpx.Client, path: str) -> bool:
+    """Whether path is a directory, read from its parent's listing.
+
+    Asking /api/v2/user/dirs about the path itself would be the obvious way, but
+    SFTPGo drops the connection with no response when that path is an existing
+    file (2.7.5) — a nonexistent path 404s correctly, only a real file kills it.
+    """
+    p = PurePosixPath(path)
+    if str(p) == "/":
+        return True
+    r = c.get("/api/v2/user/dirs", params={"path": str(p.parent)})
+    if r.status_code != 200:
+        return False
+    return any(stat.S_ISDIR(e.get("mode", 0)) for e in r.json() if e.get("name") == p.name)
+
+
+def share_url(share_id: str, is_dir: bool) -> str:
+    suffix = "/browse" if is_dir else ""
+    return f"{public_base()}/web/client/pubshares/{share_id}{suffix}"
+
+
+@app.command(name="create")
+def create(
+    path: tyro.conf.Positional[str],
+    expires: str = "7d",
+    password: bool = True,
+    max_downloads: int = 0,
+    name: str = "",
+) -> None:
+    """Share one path as a public read-only link.
+
+    Args:
+        path: Path inside the account, e.g. /trip.zip or /photos.
+        expires: Lifetime as 24h, 7d, 6w, or never. Links get forwarded; an
+            expiry is what stops that mattering later.
+        password: Protect the link with a generated password, printed once.
+            Send it through a different channel than the link.
+        max_downloads: Stop the link working after this many downloads. 0 means
+            no limit.
+        name: Label shown in the web UI. Defaults to the path.
+    """
+    if not path.startswith("/"):
+        path = "/" + path
+    secret = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16)) if password else ""
+
+    with client() as c:
+        is_dir = looks_like_dir(c, path)
+        # SFTPGo rejects slashes in share names, so the label is the basename.
+        body = {
+            "name": name or PurePosixPath(path).name or path.strip("/") or "root",
+            "scope": 1,  # read
+            "paths": [path],
+            "password": secret,
+            "max_tokens": max_downloads,
+        }
+        deadline = parse_duration(expires)
+        if deadline is not None:
+            body["expires_at"] = deadline
+        r = c.post("/api/v2/user/shares", json=body)
+        if r.status_code != 201:
+            die(f"could not create share: {r.status_code} {r.text.strip()}")
+        share_id = r.headers.get("X-Object-ID", "")
+
+    print(f"shared {path}")
+    print(f"  link:      {share_url(share_id, is_dir)}")
+    if secret:
+        print(f"  password:  {secret}")
+    print(f"  expires:   {expires}")
+    if max_downloads:
+        print(f"  downloads: capped at {max_downloads}")
+    print(f"  revoke:    sftpgo-share revoke {share_id}")
+
+
+@app.command(name="list")
+def list_shares(json: bool = False) -> None:
+    """List live share links.
+
+    JSON schema (--json):
+
+        [{"id": "str", "name": "str", "paths": ["str"], "expires": "str",
+          "downloads": int, "max_downloads": int, "password": bool, "url": "str"}]
+
+    Args:
+        json: Emit JSON to stdout. Pipe to jq for filtering.
+    """
+    with client() as c:
+        shares = c.get("/api/v2/user/shares", params={"limit": 500}).json()
+
+    rows = []
+    for s in shares:
+        expires_at = s.get("expires_at", 0)
+        rows.append(
+            {
+                "id": s["id"],
+                "name": s.get("name", ""),
+                "paths": s.get("paths", []),
+                "expires": time.strftime("%Y-%m-%d", time.localtime(expires_at / 1000))
+                if expires_at
+                else "never",
+                "downloads": s.get("used_tokens", 0),
+                "max_downloads": s.get("max_tokens", 0),
+                "password": bool(s.get("password")),
+                "url": share_url(s["id"], is_dir=False),
+            }
+        )
+
+    if json:
+        print(jsonlib.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no shares")
+        return
+    for r in rows:
+        cap = f"/{r['max_downloads']}" if r["max_downloads"] else ""
+        lock = "password" if r["password"] else "OPEN"
+        print(f"{r['id']}\t{','.join(r['paths'])}\texpires {r['expires']}\t{r['downloads']}{cap} downloads\t{lock}")
+
+
+@app.command(name="revoke")
+def revoke(share_id: tyro.conf.Positional[str]) -> None:
+    """Delete a share link. It stops working immediately.
+
+    Args:
+        share_id: The id printed by create, or shown by list.
+    """
+    with client() as c:
+        r = c.delete(f"/api/v2/user/shares/{share_id}")
+        if r.status_code != 200:
+            die(f"could not revoke {share_id}: {r.status_code} {r.text.strip()}")
+    print(f"revoked {share_id}")
+
+
+if __name__ == "__main__":
+    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))

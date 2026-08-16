@@ -138,6 +138,12 @@
     enableZshIntegration = true;
   };
 
+  programs.direnv = {
+    enable = true;
+    enableZshIntegration = true;
+    nix-direnv.enable = true;
+  };
+
   programs.yazi = {
     enable = true;
     enableZshIntegration = true;
@@ -308,6 +314,13 @@
       };
       "zephylux main" = {
         HostName = "100.104.165.39";
+        User = "max";
+      };
+      # SFTPGo's own SSH server, not pc's sshd: `sftp drop` reaches the file
+      # drop, `ssh pc` still reaches the machine.
+      drop = {
+        HostName = "pc";
+        Port = 2022;
         User = "max";
       };
       "*" = {
