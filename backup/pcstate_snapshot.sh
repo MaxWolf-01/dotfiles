@@ -13,6 +13,16 @@ set -euo pipefail
 # Must match base_path in secrets/backup/restic/pcstate/_common.
 stage="${1:-$HOME/.local/state/pcstate}"
 
+# The sftpgo dump needs an API key that sops decrypts, so this needs the age key
+# just like restic_backup.sh does. Skip rather than fail: on pc the key lives on
+# tmpfs and is absent until the first interactive login after a reboot, and a
+# failed ExecStartPre would mark the unit failed on every such boot.
+age_key="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
+if [ ! -f "$age_key" ]; then
+    echo "pcstate_snapshot: age key not available at $age_key — skipping (decrypt it first)"
+    exit 0
+fi
+
 # --- sftpgo (file drop) ----------------------------------------------------
 # Accounts, quotas, shares and event rules — none of it reproducible from the
 # Nix config. SFTPGo's own dump is the right unit: it is exactly what `loaddata`
