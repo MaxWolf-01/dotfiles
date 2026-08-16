@@ -24,6 +24,7 @@ tree as one zip.
 | --- | --- |
 | Send a file to someone without an account | `sftpgo-share create <path>` |
 | See or revoke live links | `sftpgo-share list`, `sftpgo-share revoke <id>` |
+| Give a link more downloads or more time | `sftpgo-share update <id>` |
 | Give someone ongoing access | `sftpgo-user add <name> --quota 10` |
 | Collect files from someone without an account | `sftpgo-user add`, then `delete` when done |
 | Take access away | `sftpgo-user delete <name>` |
@@ -36,6 +37,11 @@ uploaded what.
 
 Deleting an account is what revokes it. Disabling leaves every link it created
 serving, and deletion leaves the files on disk — `delete` prints the path.
+
+A link's cap and expiry stay editable for its whole life, so neither is a
+decision to agonise over at creation. Raising the cap on a used-up link revives
+it, keeping the count: 3/3 raised to 5 leaves two downloads, not five. Expiry is
+recounted from now, and `--expires never` drops it.
 
 A generated share password is printed once, at creation, and cannot be recovered
 — pass it back to whoever asked, along with the link and expiry. `--password`
