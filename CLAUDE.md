@@ -127,9 +127,9 @@ See `docs/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).
 
 ## SFTPGo File Drop
 
-The only service on pc with a public (non-tailnet) surface. Exposure model,
-first-run bootstrap, and the two share gotchas: `docs/sftpgo.md`. Accounts are
-managed with `bin/sftpgo-user`, never by hand in the web admin.
+The only service on pc with a public (non-tailnet) surface. Manage accounts with
+`bin/sftpgo-user`. Bootstrap, operational traps and how to debug a dead public
+URL: `docs/sftpgo.md`. Why each setting is what it is: `nix/nixos/pc/sftpgo.nix`.
 
 
 ## DNS

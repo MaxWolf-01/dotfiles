@@ -1,29 +1,19 @@
 # SFTPGo file drop
 
-A file drop on pc for max and friends. Config: `nix/nixos/pc/sftpgo.nix`.
-
-| Surface | Address | Who can reach it |
-| --- | --- | --- |
-| Web client | `https://pc.tail710178.ts.net/` | anyone on the internet, via Tailscale Funnel |
-| Web admin + REST API | `http://pc:8081/` | tailnet only |
-| SFTP | `pc:2022` | tailnet only |
-
-Files live under `/srv/sftpgo/<username>`, not under `/home`: the NixOS module runs
-the daemon with `ProtectHome = true`, so `/home` is invisible to it.
+Operating notes for the file drop on pc. What it is and how it is configured:
+`nix/nixos/pc/sftpgo.nix`, which carries the rationale for each setting.
 
 ## Why only the web client is public
 
 Funnel has a weaker trust story than tailnet-internal traffic. Tailscale controls
 the `*.ts.net` DNS records and the ACME certificate, so a compelled or compromised
 Tailscale can machine-in-the-middle Funnel ingress. Tailnet WireGuard traffic it
-cannot. So the public binding serves the hardened login and nothing else — the
-admin UI, the REST API and the OpenAPI renderer are off there, which makes the
-admin login, the first-run setup page, the token endpoints and password reset all
-return 404 from the internet.
+cannot. So the public binding serves the hardened login and nothing else, and
+everything else stays on a binding the firewall keeps tailnet-only.
 
 ## First run
 
-Accounts are credentials, not config, so they are not in any repo. Bootstrap once:
+Accounts are credentials, not config, so they are in no repo. Bootstrap once:
 
 1. Open `http://pc:8081/` from a tailnet device. With no admin in the database,
    SFTPGo shows its setup page. Create the admin there.
@@ -36,23 +26,16 @@ Accounts are credentials, not config, so they are not in any repo. Bootstrap onc
    repo. pc needs that commit too — `bin/sftpgo-user dump` runs there for the
    weekly backup and fails without the key.
 
-Sessions do not survive a restart. `httpd.signing_passphrase` is deliberately
-empty, so SFTPGo derives a fresh JWT signing key at every start and you log in
-again after each `nswitch`. The alternative — putting the passphrase in
-`services.sftpgo.settings` — renders it into the world-readable `/nix/store`, and
-anyone holding it can forge a full-admin token offline without logging in, TOTP
-included. Public share links are unaffected: they are identified by URL, not by a
-signed token.
+Admins and users are separate namespaces, so the same name can exist as both with
+different passwords. The admin login rejects a user's password and vice versa.
+
+You are logged out by every restart: the JWT signing key is derived fresh at each
+start, so a `nswitch` ends open sessions. Public share links are unaffected —
+they are identified by URL, not by a signed token.
 
 ## Day to day
 
-`sftpgo-user` with no arguments prints its usage. Two things it cannot tell you:
-
-**Deleting is the only complete revocation.** A disabled account (status 0) blocks
-that person's own login, but every public share link they created keeps working,
-for both read and write. Deleting the account revokes the links with it. Setting
-the `shares-disabled` flag on the account has the same effect on their links
-without removing the account.
+`sftpgo-user` prints its own usage. One thing it does not cover:
 
 **A write share allows anonymous overwrite.** Public shares expose download,
 browse and upload; there is no delete or rename endpoint for them. But a share
@@ -66,28 +49,6 @@ neither applied here: drop `overwrite` from the owner's permissions on that
 directory (uploads to an existing name then fail and the upload is lost), or add a
 pre-upload event rule that renames the existing file aside on collision. Read-only
 shares cannot write at all and need neither.
-
-## Declared state
-
-`services.sftpgo.loadDataFile` carries provider state that holds no secrets, and
-SFTPGo re-applies it at every start:
-
-- the nightly retention rule — files untouched for 9 months are deleted, on every
-  account including max's
-- `127.0.0.1` on the defender and rate-limiter safe lists
-
-Retention measures a file's modification time. `common.setstat_mode = 1` therefore
-ignores client-requested timestamp changes, so mtime records when a file arrived.
-Without that, uploading with `sftp -p` or `rsync -t` would carry the original
-timestamp across, and anything older than nine months would be deleted the same
-night it was uploaded.
-
-That safe list is a backstop, not a convenience. Every ban, rate limit and
-per-host connection cap keys on the client IP that SFTPGo resolves from
-`X-Forwarded-For`. If that resolution ever breaks, every Funnel request collapses
-to `127.0.0.1` and one person's failed logins would ban everybody at once. Safe
-listing that address trades brute-force protection for availability in exactly
-that failure.
 
 ## When the public URL stops working
 
@@ -110,6 +71,10 @@ relays' packets outright.
 
 ## Backup
 
-`backup/pcstate_snapshot.sh` stages an SFTPGo provider dump (accounts, quotas,
-shares, event rules) into the weekly `pcstate` restic repo. Dropped files are not
-backed up — they expire after 9 months by design.
+`backup/pcstate_snapshot.sh` stages a provider dump (accounts, quotas, shares,
+event rules) into the weekly `pcstate` restic repo. Dropped files are not backed
+up — they expire on their own.
+
+Deleting an account leaves its files on disk, and retention only visits accounts
+that exist, so nothing ever expires them. `sftpgo-user delete` prints the path to
+remove.
