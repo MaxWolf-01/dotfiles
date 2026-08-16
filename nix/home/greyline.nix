@@ -11,10 +11,10 @@
 #   - both light and dark keys are set so it shows in either colour scheme.
 #   - extraPackages = []: the default pulls in sway, which we don't need.
 #
-# interval: every tick renders a 3840x2400 PNG — a few hundred MB and about a
-# second of CPU — and then makes gnome-shell decode a 37 MB texture into RAM the
-# iGPU shares. At 5 minutes the daylight terminator lags by at most 1.25° of
-# longitude, which is not visible on a world map.
+# interval: every tick renders a 3840x2400 PNG — ~0.5 s and ~75 MB peak with the
+# fork's base-map cache warm — and then makes gnome-shell decode a 37 MB texture
+# into RAM the iGPU shares. At 5 minutes the daylight terminator lags by at most
+# 1.25° of longitude, which is not visible on a world map.
 #
 # `command` goes in settings (config.toml), NOT services.greyline.command: the
 # module fuses `--font-family "<value>"` with `--command` (a stripped leading
