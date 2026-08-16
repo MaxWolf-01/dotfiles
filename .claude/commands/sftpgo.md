@@ -1,5 +1,5 @@
 ---
-description: Share a file publicly, or mint/revoke a file-drop account, on the SFTPGo server on pc.
+description: The file drop on pc (SFTPGo). Use when asked to send or share a file with someone, hand out or revoke access to the drop, collect files from someone, or put files onto pc's drop — and before touching accounts or shares in its web admin.
 ---
 
 Reach the file drop on pc. Both tools print their own usage; run them with `--help`
@@ -32,6 +32,16 @@ uploaded what.
 
 Deleting an account is what revokes it. Disabling leaves every link it created
 serving, and deletion leaves the files on disk — `delete` prints the path.
+
+A share password is printed once, at creation, and cannot be recovered — pass it
+back to whoever asked, along with the link and expiry.
+
+## Web admin and these tools disagree
+
+Saving a user form in the web admin writes every field on that page, so a form
+opened before a CLI change reverts it on save. Quota bumps and key additions have
+been lost this way. Change an account through one of them per sitting, and reload
+the page after any CLI change.
 
 ## Reference
 
