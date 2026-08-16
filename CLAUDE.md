@@ -141,6 +141,10 @@ with tailscaled's own catch-all and silently defeats filtering. `dns-blocked`
 answers "is this domain blocked, and by which list". Chain, gotchas, and the
 captive-portal escape (`vpn-dns-off`): `docs/dns.md`.
 
+Mullvad exit node: Cloudflare blocks some node IPs for Chrome-family clients
+(Electron apps break, browsers work) — `vpn-on` (= `bin/vpn-pick`) verifies and
+rotates, a watcher service re-checks; rationale in the script header.
+
 ## Knowledge Base Publishing
 
 The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:
