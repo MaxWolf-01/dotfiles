@@ -128,6 +128,14 @@ first-run bootstrap, and the two share gotchas: `docs/sftpgo.md`. Accounts are
 managed with `bin/sftpgo-user`, never by hand in the web admin.
 
 
+## DNS
+
+Tailnet-wide: every device resolves through Mullvad's filtering resolver, pushed
+with `bin/tailscale-dns` from `secrets/tailscale/dns.json`. Never add
+`Domains=~.` to a resolved config — it ties with tailscaled's own catch-all and
+silently defeats filtering. Chain, gotchas, and the captive-portal escape
+(`vpn-dns-off`): `docs/dns.md`.
+
 ## Knowledge Base Publishing
 
 The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:

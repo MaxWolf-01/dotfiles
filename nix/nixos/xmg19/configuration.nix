@@ -120,11 +120,12 @@
   networking.networkmanager.wifi.macAddress = "stable";
 
   # Encrypted DNS to Quad9 (mirrors `setup net_harden` on non-NixOS hosts);
-  # opportunistic so captive portals still work pre-auth
+  # opportunistic so captive portals still work pre-auth. No domains = [ "~." ]
+  # — it would tie with tailscaled's ~. and let Quad9 answer blocked domains
+  # (docs/dns.md).
   services.resolved = {
     enable = true;
     dnsovertls = "opportunistic";
-    domains = [ "~." ];
   };
   networking.nameservers = [ "9.9.9.9#dns.quad9.net" "149.112.112.112#dns.quad9.net" ];
 
