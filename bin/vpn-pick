@@ -14,9 +14,16 @@
 #
 #   vpn-pick             turn on + verify (what the vpn-on alias runs)
 #   vpn-pick --check     report the current node's verdict, change nothing
-#   vpn-pick --watchdog  re-verify quietly; rotate + notify only when broken.
-#                        No-op when no exit node is set (respects vpn-off).
-#                        Run by the vpn-watchdog timer (nix/home/timers.nix).
+#   vpn-pick --watch     persistent watcher (the vpn-watchdog user service).
+#                        Polls local tailscale state every POLL_SECS — free, no
+#                        network traffic — and probes Discord only on events:
+#                        exit node changed (auto failover may have landed on a
+#                        blocked node) or went offline (a pinned node has no
+#                        native failover; this supplies it). A slow PROBE_SECS
+#                        re-probe catches in-place reputation flips without
+#                        hammering Discord from a VPN IP, which is itself the
+#                        traffic pattern that earns an IP a bad score. Idles
+#                        while no exit node is set (respects vpn-off).
 #
 # Needs curl + jq, and the tailscale operator grant (no sudo).
 set -uo pipefail
@@ -24,9 +31,20 @@ set -uo pipefail
 CHROME_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 CANARY=https://discord.com/app
 COUNTRIES=(Germany Austria Switzerland Netherlands)
-MAX_PINS=8  # nodes to try after auto's pick before giving up
+MAX_PINS=8      # nodes to try after auto's pick before giving up
+POLL_SECS=15    # local tailscale state poll (watch mode)
+PROBE_SECS=600  # unconditional re-probe of an unchanged node (watch mode)
+BACKOFF_SECS=300  # pause after a failed recovery before the loop resumes
+LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/vpn-pick.lock"
 
-pick() {  # $1 = fresh (vpn-on: also restore accept-dns) | rotate (leave DNS prefs alone)
+pick() {  # serialized: the watcher and a manual run must not fight over the node
+  (
+    flock -w 90 9 || { echo "vpn-pick: another instance holds the lock" >&2; exit 1; }
+    do_pick "$@"
+  ) 9>>"$LOCKFILE"
+}
+
+do_pick() {  # $1 = fresh (vpn-on: also restore accept-dns) | rotate (leave DNS prefs alone)
   local extra=()
   [[ $1 == fresh ]] && extra=(--accept-dns=true)
   tailscale set --exit-node=auto:any --exit-node-allow-lan-access=true "${extra[@]}"
@@ -55,7 +73,7 @@ pick() {  # $1 = fresh (vpn-on: also restore accept-dns) | rotate (leave DNS pre
     tailscale set --exit-node="$node" --exit-node-allow-lan-access=true
     settle "$short" || { echo "  $short: unreachable, skipping"; continue; }
     if probe; then
-      echo "pinned: $node (auto-failover off — the vpn-watchdog timer re-checks every 10 min)"
+      echo "pinned: $node (native failover off — the vpn-watchdog watcher covers it)"
       notify "Exit node $current is Cloudflare-blocked; pinned $short instead."
       return 0
     fi
@@ -68,25 +86,57 @@ pick() {  # $1 = fresh (vpn-on: also restore accept-dns) | rotate (leave DNS pre
   return 1
 }
 
-watchdog() {
-  local st
-  st=$(tailscale status --json 2>/dev/null) || exit 0            # tailscale down: nothing to guard
-  [[ -n $(jq -r '.ExitNodeStatus // empty' <<<"$st") ]] || exit 0  # vpn-off: respect it
-  probe && exit 0
+watch() {
+  local st id online last_id="" last_probe=0 now
+  while true; do
+    sleep "$POLL_SECS"
+    st=$(tailscale status --json 2>/dev/null) || { last_id=""; continue; }  # tailscale down
+    id=$(jq -r '.ExitNodeStatus.ID // empty' <<<"$st")
+    [[ -n $id ]] || { last_id=""; continue; }  # vpn-off: respect it
+    online=$(jq -r '.ExitNodeStatus.Online' <<<"$st")
+    now=$(date +%s)
+
+    if [[ $online == false ]]; then
+      echo "exit node offline — re-picking"
+      recover; last_id=""; last_probe=$now
+      continue
+    fi
+    if [[ $id != "$last_id" ]]; then
+      [[ -n $last_id ]] && echo "exit node changed — probing the new one"
+      last_id=$id; last_probe=$now
+      settle any >/dev/null || continue  # give a fresh failover a moment to route
+      probe_and_recover
+      continue
+    fi
+    if (( now - last_probe >= PROBE_SECS )); then
+      last_probe=$now
+      probe_and_recover
+    fi
+  done
+}
+
+probe_and_recover() {
+  probe && return 0
   if [[ $? -eq 1 ]]; then
-    echo "vpn-watchdog: current exit node is Cloudflare-blocked — rotating"
-    pick rotate
-    exit $?
+    echo "current exit node is Cloudflare-blocked — rotating"
+    recover
+    return
   fi
   # Canary unreachable. Egress still answering means Discord itself is unwell —
-  # rotating won't help. No egress at all means the pinned node died (or the
-  # network is down, in which case pick fails loud and the next tick retries).
+  # rotating won't help. No egress at all means the node is dead or the network
+  # is down; recovery handles the first and fails loud on the second.
   if [[ -n $(egress) ]]; then
-    echo "vpn-watchdog: egress fine, canary unreachable — not a node problem, not rotating"
-    exit 0
+    echo "egress fine, canary unreachable — not a node problem, not rotating"
+    return 0
   fi
-  echo "vpn-watchdog: no egress through the exit node — re-picking"
-  pick rotate
+  echo "no egress through the exit node — re-picking"
+  recover
+}
+
+recover() {
+  pick rotate && return 0
+  echo "recovery failed — backing off ${BACKOFF_SECS}s"
+  sleep "$BACKOFF_SECS"
 }
 
 check() {
@@ -143,6 +193,6 @@ notify() {
 case "${1:-}" in
   "") pick fresh ;;
   --check) check ;;
-  --watchdog) watchdog ;;
-  *) echo "usage: vpn-pick [--check|--watchdog]" >&2; exit 2 ;;
+  --watch) watch ;;
+  *) echo "usage: vpn-pick [--check|--watch]" >&2; exit 2 ;;
 esac

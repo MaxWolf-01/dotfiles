@@ -34,8 +34,9 @@ let
     bash coreutils uv
   ]);
 
+  # util-linux for flock (vpn-pick serializes watcher vs. manual runs)
   vpnPath = lib.makeBinPath (with pkgs; [
-    bash coreutils gawk curl jq libnotify
+    bash coreutils util-linux gawk curl jq libnotify
   ]);
 
   sshAuthSock = "/run/user/1000/ssh-agent";
@@ -438,32 +439,26 @@ in
 
   # --- Exit-node watchdog ---
   # Cloudflare blocks some Mullvad IPs for Chrome-family clients (Vesktop, any
-  # Electron app), invisibly to Tailscale's own failover. vpn-pick --watchdog
-  # re-probes the active exit node and rotates it when blocked or dead; it is
-  # a no-op when no exit node is set. Rationale and probe: bin/vpn-pick.
+  # Electron app), invisibly to Tailscale's own failover; and a pinned exit
+  # node has no native failover at all. Runs continuously rather than on a
+  # timer: the watcher reacts to exit-node changes and deaths within seconds
+  # by polling local tailscale state, and probing Discord only on those
+  # events. Rationale and probe: bin/vpn-pick.
 
   systemd.user.services.vpn-watchdog = {
     Unit = {
-      Description = "Rotate the Mullvad exit node when Cloudflare blocks it";
+      Description = "Rotate the Mullvad exit node when Cloudflare blocks it or it dies";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
     Service = {
-      Type = "oneshot";
       # tailscale is the Ubuntu system package in /usr/bin
       Environment = [ "PATH=${vpnPath}:/usr/bin:/bin" ];
-      ExecStart = "${dotfiles}/bin/vpn-pick --watchdog";
+      ExecStart = "${dotfiles}/bin/vpn-pick --watch";
+      Restart = "on-failure";
+      RestartSec = "30s";
     };
-  };
-
-  systemd.user.timers.vpn-watchdog = {
-    Unit.Description = "Exit-node Cloudflare check (every 10 min)";
-    Timer = {
-      OnBootSec = "3m";
-      OnUnitActiveSec = "10m";
-      RandomizedDelaySec = "1m";
-    };
-    Install.WantedBy = [ "timers.target" ];
+    Install.WantedBy = [ "default.target" ];
   };
 
   # --- DNS audit ---
