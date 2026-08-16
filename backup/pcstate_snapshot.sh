@@ -21,9 +21,29 @@ stage="${1:-$HOME/.local/state/pcstate}"
 # restic repo it lands in is encrypted.
 #
 # Dropped files themselves are not staged: they expire after 9 months by design.
+#
+# Written via a temp file: the API answers auth failures with a JSON error body
+# and a non-zero exit, so a direct redirect would leave that error staged as if
+# it were the dump.
 sftpgo_stage="$stage/sftpgo"
-rm -rf "$sftpgo_stage"
 mkdir -p "$sftpgo_stage"
 chmod 700 "$sftpgo_stage"
-umask 077
-"$HOME/.dotfiles/bin/sftpgo-user" dump > "$sftpgo_stage/sftpgo-backup.json"
+(umask 077; "$HOME/.dotfiles/bin/sftpgo-user" dump > "$sftpgo_stage/.sftpgo-backup.json.tmp")
+mv "$sftpgo_stage/.sftpgo-backup.json.tmp" "$sftpgo_stage/sftpgo-backup.json"
+
+# --- mdsr (spaced repetition) ---------------------------------------------
+# The service is retired but its review history is not: keep copying the DB
+# until skilltree has taken the data over. Absent is fine — that is the state
+# after the handover — so this block does not fail the run.
+#
+# Live SQLite in WAL mode: a raw cp of the .db would miss reviews still in the
+# -wal file (and could capture a torn state). The online backup API writes a
+# single consistent file even under concurrent writes.
+mdsr_stage="$stage/mdsr"
+shopt -s nullglob
+mdsr_dbs=("$HOME/.local/share/mdsr"/*.db)
+rm -rf "$mdsr_stage"
+mkdir -p "$mdsr_stage"
+for db in "${mdsr_dbs[@]}"; do
+    sqlite3 "$db" ".backup '$mdsr_stage/$(basename "$db")'"
+done

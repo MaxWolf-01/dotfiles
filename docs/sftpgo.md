@@ -28,10 +28,13 @@ Accounts are credentials, not config, so they are not in any repo. Bootstrap onc
 1. Open `http://pc:8081/` from a tailnet device. With no admin in the database,
    SFTPGo shows its setup page. Create the admin there.
 2. Enable TOTP on that admin (`Profile` → `Two-factor auth`).
-3. Mint an API key with admin scope (`Profile` → `API keys`). `sftpgo-user` needs
+3. Tick `Allow API key authentication` on that admin. Without it every API-key
+   request answers 401, whatever the key's scope.
+4. Mint an API key with admin scope (`Profile` → `API keys`). `sftpgo-user` needs
    it, and an API key bypasses TOTP, which is what makes unattended scripting work.
-4. Store it: `sops ~/.dotfiles/secrets/api_keys/sftpgo`, then commit in the secrets
-   repo.
+5. Store it: `sops ~/.dotfiles/secrets/api_keys/sftpgo`, then commit in the secrets
+   repo. pc needs that commit too — `bin/sftpgo-user dump` runs there for the
+   weekly backup and fails without the key.
 
 Sessions do not survive a restart. `httpd.signing_passphrase` is deliberately
 empty, so SFTPGo derives a fresh JWT signing key at every start and you log in

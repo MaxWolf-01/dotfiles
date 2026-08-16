@@ -119,12 +119,19 @@ in
         # apart from attack.
         max_per_host_connections = 50;
 
+        # Bans after 10 failed logins (default 15). The increment compounds on
+        # every attempt made while already banned, so a browser that retries
+        # turns a short ban into a day-long one — measured: 13 attempts at a
+        # 100% increment produced a 7-hour ban. Generated passwords are 24
+        # random alphanumerics, so brute force is hopeless regardless; this
+        # exists to stop noise, not as the primary defence. Hence the stock
+        # increment and a lockout a locked-out friend can wait out.
         defender = {
           enabled = true;
           driver = "memory";
           threshold = 10;
-          ban_time = 60;
-          ban_time_increment = 100;
+          ban_time = 30;
+          ban_time_increment = 50;
           observation_time = 60;
           login_delay.password_failed = 1000;
         };
