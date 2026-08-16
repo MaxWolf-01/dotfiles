@@ -48,11 +48,29 @@ Two consequences follow, and neither is optional:
   does not restrict a resolver to exit-node use, despite the name — it only
   stops the exit node's own resolver from displacing it. Setting tailnet
   resolvers at all means `tailscaled` owns DNS on every network.
-- **It applies to every device that accepts tailnet DNS**, including pc and the
-  VPSes, not just laptops and phones. On a server the blocklists are a
-  liability rather than a feature: a blocked domain is a silent `NXDOMAIN`. Opt
-  a host out with `tailscale set --accept-dns=false`, at the cost of MagicDNS
-  names on that host.
+- **It reaches every device that accepts tailnet DNS**, servers included. On a
+  server the blocklists are a liability rather than a feature: no browser to
+  protect, and a blocked domain is a silent `NXDOMAIN`.
+
+## Which hosts are filtered
+
+| Host | Filtered | Resolver in use |
+| --- | --- | --- |
+| zephylux, xmg19, phone | yes | Mullvad `base` over DoH, via tailscaled |
+| pc | no | the LAN router, via dhcpcd + resolvconf |
+| jarvis, yapit-prod | no | each VPS's own resolver |
+
+The servers are opted out with `--accept-dns=false`. That costs MagicDNS on
+those hosts and nothing else: every tailnet host in `programs.ssh.matchBlocks`
+is addressed by IP, so nothing there resolves tailnet names.
+
+`--accept-dns` is a stored preference, not config, so it needs a home. pc has
+one — `services.tailscale.extraSetFlags`. The VPSes do not run NixOS, so on
+those it is imperative state that a rebuild will not restore. Re-apply with
+`ssh <host> tailscale set --accept-dns=false` if either is ever reinstalled.
+
+Opting a host out leaves it on whatever its network hands out, in clear text.
+pc talks plain DNS to the LAN router today.
 
 ## No global `Domains=~.`
 
