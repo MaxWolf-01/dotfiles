@@ -1,6 +1,6 @@
 # greyline — live world-time desktop wallpaper (github:cothinking-dev/greyline).
-# Renders a PNG once a minute (systemd user timer) and sets it as the GNOME
-# wallpaper. No daemon; the renderer runs and exits each tick.
+# Renders a PNG on a systemd user timer and sets it as the GNOME wallpaper.
+# No daemon; the renderer runs and exits each tick.
 #
 # zephyrus is Ubuntu GNOME (Wayland) with Home Manager standalone, so this
 # overrides the module's sway-oriented defaults:
@@ -9,13 +9,12 @@
 #   - /usr/bin/gsettings (absolute): Ubuntu's binary knows the GNOME schemas;
 #     a nix-store gsettings would not find org.gnome.desktop.background.
 #   - both light and dark keys are set so it shows in either colour scheme.
-#
-# Every picture-uri change leaks memory in gnome-shell (GNOME/gnome-shell#5729,
-# #9188): it builds a fresh Background actor and decoded texture — 37 MB at this
-# resolution — and does not reliably release the old one. The interval is the
-# leak rate. At 5 min the daylight terminator lags by at most 1.25° of
-# longitude, which is not visible.
 #   - extraPackages = []: the default pulls in sway, which we don't need.
+#
+# interval: every tick renders a 3840x2400 PNG — a few hundred MB and about a
+# second of CPU — and then makes gnome-shell decode a 37 MB texture into RAM the
+# iGPU shares. At 5 minutes the daylight terminator lags by at most 1.25° of
+# longitude, which is not visible on a world map.
 #
 # `command` goes in settings (config.toml), NOT services.greyline.command: the
 # module fuses `--font-family "<value>"` with `--command` (a stripped leading
