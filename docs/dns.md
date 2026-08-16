@@ -7,12 +7,10 @@ mechanisms deliver it:
 | Host | Path |
 | --- | --- |
 | zephylux | local failover chain, `bin/dns-failover-install` |
-| xmg19, phone | tailnet DNS: tailscaled forwards to Mullvad over DoH |
+| phone | tailnet DNS: tailscaled forwards to Mullvad over DoH |
+| xmg19 | tailnet DNS; offline, and planned to opt out as a server (`agent/tasks/xmg19-offsite-server-planning.md`) |
 | pc | unfiltered: the LAN router, via dhcpcd + resolvconf |
 | jarvis, yapit-prod | unfiltered: each VPS's own resolver |
-
-xmg19 is slated for the failover chain too; until the installer runs there it
-carries tailnet DNS and its failure modes.
 
 Mullvad publishes several list flavours, one IP each:
 <https://mullvad.net/en/help/dns-over-https-and-dns-over-tls>. The tailnet
@@ -41,7 +39,7 @@ What follows from the shape:
   reboots). MagicDNS still works: the front routes `ts.net` to tailscaled's
   internal resolver, which answers regardless of that preference.
 
-## Tailnet DNS (xmg19, phone)
+## Tailnet DNS (phone, xmg19 until repurposed)
 
 tailscaled claims all DNS on a device that accepts tailnet DNS: applications
 talk to the local stub, the stub hands everything to `100.100.100.100`, and
