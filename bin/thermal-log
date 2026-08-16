@@ -10,10 +10,14 @@
 # Logs the two ASUS EC power rails as well (see asus-power-cap): a profile
 # switch can silently drop the cap, and that shows up here as the rails moving.
 #
+# The sampling loop is bash-builtin only — no command substitutions, no awk,
+# no date. This runs 17k times a day forever; forks made it cost ~1% of a core
+# (measured 49 ms CPU per sample), builtins take it below 1/20th of that. The
+# only children per sample are sleep and the fsync.
+#
 # Usage:   thermal-log [interval-seconds]     default 5
 # Output:  ~/.local/state/thermal-log/YYYY-MM-DD.csv, pruned after 14 days
 # Read it: column -s, -t ~/.local/state/thermal-log/$(date +%F).csv | less -S
-
 set -uo pipefail
 
 INTERVAL=${1:-5}
@@ -27,35 +31,44 @@ main() {
     mkdir -p "$LOGDIR" || { echo "thermal-log: cannot create $LOGDIR" >&2; exit 1; }
     find "$LOGDIR" -name '*.csv' -mtime "+$KEEP_DAYS" -delete
     resolve_sensors
+    # A pipe nothing ever writes to: read -t on it is a builtin sleep, saving a
+    # fork+exec (~4 ms) per sample.
+    exec {idle}<> <(:)
     while :; do
         write_sample
-        sleep "$INTERVAL"
+        read -rt "$INTERVAL" -u "$idle" || :
     done
 }
 
 write_sample() {
-    local file="$LOGDIR/$(date +%F).csv"
+    local today file
+    printf -v today '%(%F)T' -1
+    file="$LOGDIR/$today.csv"
     [ -f "$file" ] || echo "$HEADER" > "$file"
-    row >> "$file"
+    row
+    printf '%s\n' "$ROW" >> "$file"
     sync --data "$file"
 }
 
+# Sets ROW. Every field lands in a global set by a builtin — a $(…) here would
+# fork, which is what this loop exists to avoid.
 row() {
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-        "$(date +'%F %T')" \
-        "$(millideg "$ZONE_PKG")" \
-        "$(millideg "$ZONE_CPU")" \
-        "$(millideg "$ZONE_BOARD")" \
-        "$(rd "$FAN_CPU")" \
-        "$(rd "$FAN_GPU")" \
-        "$(cpu_mhz_max)" \
-        "$(load1)" \
-        "$(rd /sys/firmware/acpi/platform_profile)" \
-        "$(rd $ATTRS/ppt_pl1_spl/current_value)" \
-        "$(rd $ATTRS/ppt_pl2_sppt/current_value)" \
-        "$(rd "$AC_ONLINE")" \
-        "$(rd /sys/class/power_supply/BAT0/capacity)" \
-        "$(microwatts /sys/class/power_supply/BAT0/power_now)"
+    local stamp
+    printf -v stamp '%(%F %T)T' -1
+    millideg "$ZONE_PKG"    PKG_C
+    millideg "$ZONE_CPU"    CPU_C
+    millideg "$ZONE_BOARD"  BOARD_C
+    rd "$FAN_CPU"           CPU_RPM
+    rd "$FAN_GPU"           GPU_RPM
+    cpu_mhz_max
+    load1
+    rd /sys/firmware/acpi/platform_profile          PROFILE
+    rd $ATTRS/ppt_pl1_spl/current_value             SPL_W
+    rd $ATTRS/ppt_pl2_sppt/current_value            SPPT_W
+    rd "$AC_ONLINE"                                 AC
+    rd /sys/class/power_supply/BAT0/capacity        BAT_PCT
+    microwatts /sys/class/power_supply/BAT0/power_now BAT_W
+    ROW="$stamp,$PKG_C,$CPU_C,$BOARD_C,$CPU_RPM,$GPU_RPM,$MHZ_MAX,$LOAD1,$PROFILE,$SPL_W,$SPPT_W,$AC,$BAT_PCT,$BAT_W"
 }
 
 # Zone and hwmon numbering is not stable across boots, so match on the names.
@@ -72,54 +85,63 @@ resolve_sensors() {
 }
 
 zone_by_type() {
-    local zone
+    local zone t
     for zone in /sys/class/thermal/thermal_zone*; do
-        [ "$(rd "$zone/type")" = "$1" ] && { printf '%s' "$zone/temp"; return; }
+        rd "$zone/type" t
+        [ "$t" = "$1" ] && { printf '%s' "$zone/temp"; return; }
     done
 }
 
 hwmon_by_name() {
-    local mon
+    local mon n
     for mon in /sys/class/hwmon/hwmon*; do
-        [ "$(rd "$mon/name")" = "$1" ] && { printf '%s' "$mon"; return; }
+        rd "$mon/name" n
+        [ "$n" = "$1" ] && { printf '%s' "$mon"; return; }
     done
 }
 
 mains_online() {
-    local supply
+    local supply t
     for supply in /sys/class/power_supply/*; do
-        [ "$(rd "$supply/type")" = Mains ] && { printf '%s' "$supply/online"; return; }
+        rd "$supply/type" t
+        [ "$t" = Mains ] && { printf '%s' "$supply/online"; return; }
     done
 }
 
-millideg() {
+millideg() {  # millideg <path> <var>: °C, or empty if the sensor vanished
     local raw
-    raw=$(rd "${1:-}")
-    [ -n "$raw" ] && printf '%d' "$((raw / 1000))"
+    rd "$1" raw
+    printf -v "$2" '%s' "${raw:+$((raw / 1000))}"
 }
 
-microwatts() {
+microwatts() {  # microwatts <path> <var>: watts with one decimal
     local raw
-    raw=$(rd "${1:-}")
-    [ -n "$raw" ] && awk -v uw="$raw" 'BEGIN { printf "%.1f", uw / 1000000 }'
+    rd "$1" raw
+    printf -v "$2" '%s' "${raw:+$((raw / 1000000)).$(((raw / 100000) % 10))}"
 }
 
+# Peak of the per-policy current frequencies, kHz → MHz. Cheaper than parsing
+# /proc/cpuinfo, which the kernel regenerates (35 KB) on every read.
 cpu_mhz_max() {
-    awk '/^cpu MHz/ { if ($4 > peak) peak = $4 } END { printf "%d", peak }' /proc/cpuinfo
+    local f khz peak=0
+    for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq; do
+        read -r khz < "$f" 2>/dev/null || continue
+        ((khz > peak)) && peak=$khz
+    done
+    MHZ_MAX=$((peak / 1000))
 }
 
 load1() {
-    local one rest
-    read -r one rest < /proc/loadavg
-    printf '%s' "$one"
+    local rest
+    read -r LOAD1 rest < /proc/loadavg
 }
 
-# Never fail on a sensor that vanished — a missing reading is an empty field,
-# not a dead logger.
+# rd <path> <var>: never fail on a sensor that vanished — a missing reading is
+# an empty field, not a dead logger.
 rd() {
-    local value=""
-    [ -n "${1:-}" ] && [ -r "$1" ] && read -r value < "$1"
-    printf '%s' "$value"
+    printf -v "$2" ''
+    [ -n "${1:-}" ] && [ -r "$1" ] && read -r "$2" < "$1"
+    return 0
 }
 
 main "$@"
