@@ -17,7 +17,11 @@
     };
     catppuccin.url = "github:catppuccin/nix";
     greyline = {
-      url = "github:cothinking-dev/greyline";
+      # Fork: upstream renders the lit hemisphere dark whenever the sun is south of
+      # the equator (~23 Sep - 20 Mar), writes the PNG non-atomically onto the path
+      # the desktop watches, and peaks at 577 MB for a 4K render. Reported upstream;
+      # track it again once fixed there.
+      url = "github:MaxWolf-01/greyline/review/all";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

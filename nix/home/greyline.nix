@@ -35,7 +35,7 @@
         + ''&& /usr/bin/gsettings set org.gnome.desktop.background picture-uri-dark "file://{path}"'';
       map_style = "vector";
       theme = "dark";
-      format = "24h";
+      format = "hour";
       logo = false;
       resolution = "3840x2400"; # native panel; the service can't rely on xrandr
       twilight = {
