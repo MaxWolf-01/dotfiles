@@ -15,8 +15,10 @@ everything else stays on a binding the firewall keeps tailnet-only.
 
 Accounts are credentials, not config, so they are in no repo. Bootstrap once:
 
-1. Open `http://pc:8081/` from a tailnet device. With no admin in the database,
-   SFTPGo shows its setup page. Create the admin there.
+1. Open `http://pc:8081/web/admin/login` from a tailnet device. With no admin in
+   the database, SFTPGo shows its setup page. Create the admin there. Use that
+   full path: `http://pc:8081/` redirects to the *client* login, which rejects
+   admin credentials as invalid rather than saying you are in the wrong place.
 2. Enable TOTP on that admin (`Profile` → `Two-factor auth`).
 3. Tick `Allow API key authentication` on that admin. Without it every API-key
    request answers 401, whatever the key's scope.
