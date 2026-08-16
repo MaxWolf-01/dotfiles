@@ -25,6 +25,10 @@ let
     bash coreutils findutils gawk
   ]);
 
+  lockSignPath = lib.makeBinPath (with pkgs; [
+    bash coreutils jq
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -392,5 +396,34 @@ in
       Nice = 19;
     };
     Install.WantedBy = [ "default.target" ];
+  };
+
+  # --- Tailnet Lock: keep Mullvad exit nodes signed ---
+  # A user timer suffices here: zephylux grants max the tailscale operator role,
+  # which carries the write access `lock sign` needs. pc has no operator, so its
+  # equivalent is a root service in nix/nixos/pc/tailnet-lock.nix.
+
+  systemd.user.services.tailnet-lock-sign = {
+    Unit = {
+      Description = "Sign Mullvad exit nodes locked out by Tailnet Lock";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # tailscale is the Ubuntu system package in /usr/bin
+      Environment = [ "PATH=${lockSignPath}:/usr/bin:/bin" ];
+      ExecStart = "${dotfiles}/bin/tailnet-lock-sign";
+    };
+  };
+
+  systemd.user.timers.tailnet-lock-sign = {
+    Unit.Description = "Periodic Tailnet Lock signing of Mullvad exit nodes";
+    Timer = {
+      OnBootSec = "2m";
+      OnUnitActiveSec = "15m";
+      RandomizedDelaySec = "1m";
+    };
+    Install.WantedBy = [ "timers.target" ];
   };
 }

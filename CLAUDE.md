@@ -29,6 +29,10 @@ And check which host you're on.
 
 `agent/tasks/` is a symlink into `secrets/agent/tasks/` — tickets are versioned in the private secrets repo, never in this public one (commit them there). Standard mx markdown-tracker conventions apply; `archive/` holds retired pre-mx-workflow task files.
 
+## Workflow Artefacts
+
+Everything the mx workflow produces lives in the secrets repo and is symlinked into place here, gitignored on this side: `agent/`, `decisions/` → `secrets/decisions/`, and `CONTEXT.md` when there is one. Commit them in `secrets`.
+
 ## Claude Code Config
 
 Global `~/.claude` config lives in `~/repos/github/MaxWolf-01/agents` (`claude/`), not here. `.claude/` in this repo is dotfiles-local.

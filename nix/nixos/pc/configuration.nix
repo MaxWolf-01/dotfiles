@@ -7,6 +7,7 @@
     ./copyparty.nix
     ./pihole.nix
     ./sftpgo.nix
+    ./tailnet-lock.nix
   ];
 
   # Boot
