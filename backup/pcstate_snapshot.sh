@@ -6,7 +6,9 @@
 # into a staging tree which the `pcstate` restic config backs up to rsync.net.
 #
 # Adding a service = add a block below that writes into "$stage/<service>/" and
-# a matching line in secrets/backup/restic/pcstate/dirs.txt.
+# a matching line in secrets/backup/restic/pcstate/dirs.txt. Order the blocks so
+# irreplaceable state is staged first: a later block that fails must not be able
+# to hold an earlier one out of the backup.
 
 set -euo pipefail
 
@@ -23,28 +25,10 @@ if [ ! -f "$age_key" ]; then
     exit 0
 fi
 
-# --- sftpgo (file drop) ----------------------------------------------------
-# Accounts, quotas, shares and event rules — none of it reproducible from the
-# Nix config. SFTPGo's own dump is the right unit: it is exactly what `loaddata`
-# restores, and taking it over the API avoids reading the service's SQLite (root
-# owned, and live). The dump carries password hashes, so keep it 0600; the
-# restic repo it lands in is encrypted.
-#
-# Dropped files themselves are not staged: they expire after 9 months by design.
-#
-# Written via a temp file: the API answers auth failures with a JSON error body
-# and a non-zero exit, so a direct redirect would leave that error staged as if
-# it were the dump.
-sftpgo_stage="$stage/sftpgo"
-mkdir -p "$sftpgo_stage"
-chmod 700 "$sftpgo_stage"
-(umask 077; "$HOME/.dotfiles/bin/sftpgo-user" dump > "$sftpgo_stage/.sftpgo-backup.json.tmp")
-mv "$sftpgo_stage/.sftpgo-backup.json.tmp" "$sftpgo_stage/sftpgo-backup.json"
-
 # --- mdsr (spaced repetition) ---------------------------------------------
-# The service is retired but its review history is not: keep copying the DB
-# until skilltree has taken the data over. Absent is fine — that is the state
-# after the handover — so this block does not fail the run.
+# The service is retired; this DB is the only copy of the review history until
+# skilltree takes the data over. Staged first, and before anything that depends
+# on the network.
 #
 # Live SQLite in WAL mode: a raw cp of the .db would miss reviews still in the
 # -wal file (and could capture a torn state). The online backup API writes a
@@ -57,3 +41,26 @@ mkdir -p "$mdsr_stage"
 for db in "${mdsr_dbs[@]}"; do
     sqlite3 "$db" ".backup '$mdsr_stage/$(basename "$db")'"
 done
+
+# --- sftpgo (file drop) ----------------------------------------------------
+# Accounts, quotas, shares and event rules — none of it reproducible from the
+# Nix config. SFTPGo's own dump is the right unit: it is exactly what `loaddata`
+# restores, and taking it over the API avoids reading the service's SQLite (root
+# owned, and live). The dump carries password hashes, so keep it 0600; the
+# restic repo it lands in is encrypted.
+#
+# Dropped files themselves are not staged: they expire after 9 months by design.
+#
+# A rotated key or an unreachable API must not cost the run: the dump is written
+# to a temp file and only replaces the previous one on success, and a failure
+# removes the stale copy so the backup records the gap rather than a dump that
+# quietly stopped tracking reality.
+sftpgo_stage="$stage/sftpgo"
+mkdir -p "$sftpgo_stage"
+chmod 700 "$sftpgo_stage"
+if (umask 077; "$HOME/.dotfiles/bin/sftpgo-user" dump > "$sftpgo_stage/.sftpgo-backup.json.tmp"); then
+    mv "$sftpgo_stage/.sftpgo-backup.json.tmp" "$sftpgo_stage/sftpgo-backup.json"
+else
+    rm -f "$sftpgo_stage/.sftpgo-backup.json.tmp" "$sftpgo_stage/sftpgo-backup.json"
+    echo "pcstate_snapshot: sftpgo dump failed — accounts are NOT in this backup" >&2
+fi

@@ -20,6 +20,8 @@
 #
 # Deleting is the only complete revocation: a disabled account (status 0) blocks
 # the owner's own login, but every public share link they created keeps working.
+# It leaves the account's files on pc, and nothing expires them — delete prints
+# the path.
 set -euo pipefail
 
 API="${SFTPGO_URL:-http://pc:8081}/api/v2"
@@ -27,7 +29,10 @@ KEY_FILE="$HOME/.dotfiles/secrets/api_keys/sftpgo"
 
 api() {
   local key="${SFTPGO_API_KEY:-$(sops -d "$KEY_FILE")}"
-  curl -sS --fail-with-body -H "X-SFTPGO-API-KEY: $key" "$@"
+  # Via --config, not -H: an argument would put the key in /proc/<pid>/cmdline,
+  # which is world-readable on pc. The key is admin-scoped and bypasses TOTP.
+  printf 'header = "X-SFTPGO-API-KEY: %s"\n' "$key" \
+    | curl -sS --fail-with-body --config - "$@"
 }
 
 gen_password() {
@@ -35,6 +40,10 @@ gen_password() {
   # /dev/urandom; pipefail would turn that into a script abort. Contained in a
   # subshell so the rest of the script keeps pipefail.
   ( set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24 )
+}
+
+gen_suffix() {
+  ( set +o pipefail; LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 8 )
 }
 
 # Don't hardcode the tailnet name. MagicDNSSuffix reads the same from any node,
@@ -75,14 +84,20 @@ case "$cmd" in
     done
 
     password=$(gen_password)
-    # home_dir is left unset: users_base_dir gives it /srv/sftpgo/<name>.
+    # An explicit, unguessable home rather than the users_base_dir default of
+    # /srv/sftpgo/<name>. Deleting an account leaves its files behind, so with
+    # the derived path a re-used username would inherit the previous holder's
+    # files. The suffix makes every account a fresh directory.
+    home_dir="/srv/sftpgo/$name-$(gen_suffix)"
     body=$(jq -n \
       --arg username "$name" \
       --arg password "$password" \
+      --arg home "$home_dir" \
       --argjson quota "$((quota_gb * 1073741824))" \
       --argjson denied "$denied_protocols" \
       --argjson web "$web_client" \
-      '{status: 1, username: $username, password: $password, quota_size: $quota,
+      '{status: 1, username: $username, password: $password, home_dir: $home,
+        quota_size: $quota,
         permissions: {"/": ["*"]},
         filters: {denied_protocols: $denied, web_client: $web}}')
     api -X POST -H "Content-Type: application/json" --data "$body" "$API/users" >/dev/null
@@ -91,12 +106,18 @@ case "$cmd" in
     echo "  url:      $(public_url)"
     echo "  username: $name"
     echo "  password: $password"
+    echo "  files:    $home_dir"
     ;;
 
   delete)
     name="${2:?usage: sftpgo-user delete <name>}"
+    # Read the home before the account goes: nothing else records it afterwards,
+    # and retention only visits accounts that exist, so these files never expire.
+    home_dir=$(api "$API/users/$name" | jq -r '.home_dir')
     api -X DELETE "$API/users/$name" >/dev/null
-    echo "deleted $name — their share links are gone too; files under /srv/sftpgo/$name remain on disk"
+    echo "deleted $name — their share links stop working too"
+    echo "  files left on pc: $home_dir"
+    echo "  nothing expires them; remove with: ssh pc sudo rm -rf $home_dir"
     ;;
 
   dump)
@@ -104,7 +125,9 @@ case "$cmd" in
     ;;
 
   *)
-    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    # The header comment is the usage text; print it through to the first line
+    # of code so editing one cannot silently truncate the other.
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
     exit 1
     ;;
 esac

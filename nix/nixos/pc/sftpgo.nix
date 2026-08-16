@@ -50,7 +50,8 @@ let
   };
 
   # Provider state that carries no secrets and so is safe in the world-readable
-  # /nix/store. Restored on every start with mode 0 (add new, update existing).
+  # /nix/store. Applied at every start; see SFTPGO_LOADDATA_MODE below for why
+  # editing any of it actually takes effect.
   initialData = (pkgs.formats.json { }).generate "sftpgo-initial-data.json" {
     version = 17;
 
@@ -98,6 +99,14 @@ in
   systemd.tmpfiles.rules = [
     "d ${storage} 0750 sftpgo sftpgo -"
   ];
+
+  # loaddata defaults to mode 1, which skips objects that already exist
+  # (internal/cmd/root.go defaultLoadDataMode, honoured in RestoreEventRules and
+  # RestoreIPListEntries). That makes loadDataFile write-once: editing the
+  # retention window would apply on a fresh database and nowhere else. Mode 0
+  # updates in place. It also adds and updates users, which is safe here only
+  # because loadDataFile declares none — keep it that way.
+  systemd.services.sftpgo.environment.SFTPGO_LOADDATA_MODE = "0";
 
   services.sftpgo = {
     enable = true;
