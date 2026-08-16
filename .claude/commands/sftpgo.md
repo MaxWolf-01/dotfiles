@@ -14,9 +14,34 @@ account's.
 Admins and users are separate namespaces, so `max` exists as both, with different
 passwords. `sftpgo-user` acts as the admin; `sftpgo-share` acts as the account.
 
-Sharing a directory hands out two links at once, and `create` prints both: the
-`/browse` one opens a file browser, the same link without it streams the whole
-tree as one zip.
+Dropped files expire on their own: a nightly job deletes anything whose
+modification time is older than the retention window, in every account, max's
+included. The window is `retentionMonths` in `nix/nixos/pc/sftpgo.nix`. A share
+outlives its file and starts answering 404 once the file is swept.
+
+## Which link to hand out
+
+`create` prints the one to send as `link:`. It is already the right shape — the
+choice below is only about which *path* you share, and about the second link a
+directory also gets.
+
+| Shared path | `link:` | What the recipient gets |
+| --- | --- | --- |
+| One file | `?compress=false` | the file itself, streamed |
+| A directory | `/browse` | a file browser |
+| A directory | `zip:`, printed second | the whole tree as one archive |
+
+`?compress=false` is not decoration: the plain URL answers with
+`share-<name>.zip` whatever the path is, so without it a lone video reaches its
+recipient as an archive to unpack. Range requests work on it, so the file
+streams and seeks, and Discord embeds it inline.
+
+The browse page plays media in the page — `mp4 mov webm ogv ogg mp3 wav` in a
+player, `jpg png gif webp bmp svg` in a lightbox, `pdf` in a viewer. So share the
+*directory* when the ask is "look at this, take what you want", and reach for the
+`zip:` link only when it is "here, keep all of this". A directory of one video is
+a fine thing to make on purpose: a file share can never play in the browser,
+because SFTPGo sends every share download as an attachment.
 
 ## Which tool
 

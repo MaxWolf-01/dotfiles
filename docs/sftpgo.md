@@ -15,10 +15,13 @@ everything else stays on a binding the firewall keeps tailnet-only.
 
 Accounts are credentials, not config, so they are in no repo. Bootstrap once:
 
-1. Open `http://pc:8081/web/admin/login` from a tailnet device. With no admin in
-   the database, SFTPGo shows its setup page. Create the admin there. Use that
-   full path: `http://pc:8081/` redirects to the *client* login, which rejects
-   admin credentials as invalid rather than saying you are in the wrong place.
+1. Open `http://pc.tail710178.ts.net:8081/web/admin/login` from a tailnet device.
+   With no admin in the database, SFTPGo shows its setup page. Create the admin
+   there. Use that full path: the bare host redirects to the *client* login,
+   which rejects admin credentials as invalid rather than saying you are in the
+   wrong place. Use the MagicDNS name, not `pc`: a router that answers for `pc`
+   hands back its LAN address, and the admin port is firewalled off every
+   interface but tailscale0, so the short name hangs.
 2. Enable TOTP on that admin (`Profile` → `Two-factor auth`).
 3. Tick `Allow API key authentication` on that admin. Without it every API-key
    request answers 401, whatever the key's scope.

@@ -317,9 +317,11 @@
         User = "max";
       };
       # SFTPGo's own SSH server, not pc's sshd: `sftp drop` reaches the file
-      # drop, `ssh pc` still reaches the machine.
+      # drop, `ssh pc` still reaches the machine. pc's tailnet address, not the
+      # name: on a LAN whose router answers for `pc` the name resolves to its
+      # LAN address, where port 2022 is firewalled — only tailscale0 is let in.
       drop = {
-        HostName = "pc";
+        HostName = "100.122.146.47";
         Port = 2022;
         User = "max";
       };

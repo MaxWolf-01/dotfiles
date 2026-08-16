@@ -2,9 +2,13 @@
 
 # SFTPGo file drop — max and friends upload/download through a web UI.
 #
-#   https://pc.tail710178.ts.net/   web client, public via Tailscale Funnel
-#   http://pc:8081/                 web admin + REST API, tailnet only
-#   sftp://pc:2022/                 SFTP, tailnet only
+#   https://pc.tail710178.ts.net/        web client, public via Tailscale Funnel
+#   http://pc.tail710178.ts.net:8081/    web admin + REST API, tailnet only
+#   sftp://pc.tail710178.ts.net:2022/    SFTP, tailnet only
+#
+# The MagicDNS name, not `pc`: a router that answers for the short name hands
+# back pc's LAN address, and both these ports are firewalled off every interface
+# but tailscale0, so the short name hangs rather than failing.
 #
 # The public surface is deliberately only the web *client*: the admin UI, the
 # REST API and the OpenAPI renderer are off on that binding, so the admin login,
