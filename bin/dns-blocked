@@ -1,0 +1,165 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "dnspython"]
+# ///
+"""Ask Mullvad whether a domain is on a blocklist, and which one.
+
+Answers the question you have when something breaks and you suspect DNS. A plain
+NXDOMAIN cannot tell you: most of them are typos, not blocks. Mullvad names the
+list in an SOA record alongside the refusal, so this reports the category too.
+
+Queries Mullvad directly over DNS-over-TLS rather than going through the system
+resolver, so the answer is the resolver's verdict and not a cached one. The
+resolver is read from secrets/tailscale/dns.json, the source of truth for which
+flavour the tailnet uses.
+
+JSON schema (--json):
+
+    [{"domain": "str", "verdict": "blocked|resolves|nxdomain|error",
+      "category": "str|null", "detail": "str|null"}]
+
+Examples:
+
+    dns-blocked doubleclick.net
+    dns-blocked github.com doubleclick.net ads.pubmatic.com
+    dns-blocked --json some.domain | jq -r '.[0].category'
+    dns-blocked --resolver 194.242.2.9 some.domain
+"""
+
+import json as jsonlib
+import pathlib
+import sys
+from dataclasses import dataclass
+from typing import Annotated
+
+import dns.message
+import dns.query
+import dns.rcode
+import dns.rdatatype
+import tyro
+
+# Mullvad's published resolvers. The hostname is needed for TLS verification, so
+# an address alone is not enough to dial one. https://mullvad.net/en/help/dns-over-https-and-dns-over-tls
+MULLVAD_RESOLVERS = {
+    "194.242.2.2": "dns.mullvad.net",
+    "194.242.2.3": "adblock.dns.mullvad.net",
+    "194.242.2.4": "base.dns.mullvad.net",
+    "194.242.2.5": "extended.dns.mullvad.net",
+    "194.242.2.6": "family.dns.mullvad.net",
+    "194.242.2.9": "all.dns.mullvad.net",
+    "2a07:e340::2": "dns.mullvad.net",
+    "2a07:e340::3": "adblock.dns.mullvad.net",
+    "2a07:e340::4": "base.dns.mullvad.net",
+    "2a07:e340::5": "extended.dns.mullvad.net",
+    "2a07:e340::6": "family.dns.mullvad.net",
+    "2a07:e340::9": "all.dns.mullvad.net",
+}
+BLOCKLIST_MARKER = "mullvad-blocklist-"
+TAILNET_DNS = pathlib.Path.home() / ".dotfiles/secrets/tailscale/dns.json"
+FALLBACK_RESOLVER = "194.242.2.4"
+
+
+@dataclass
+class Args:
+    domains: Annotated[list[str], tyro.conf.Positional]
+    """Domains to check."""
+    resolver: str = ""
+    """Mullvad resolver IP. Defaults to the one in secrets/tailscale/dns.json."""
+    timeout: float = 5.0
+    """Seconds to wait for each query."""
+    json: bool = False
+    """Emit JSON to stdout. Pipe to jq for filtering."""
+
+
+def main(args: Args) -> int:
+    resolver = args.resolver or tailnet_resolver()
+    hostname = MULLVAD_RESOLVERS.get(resolver)
+    if hostname is None:
+        print(f"dns-blocked: {resolver} is not a known Mullvad resolver", file=sys.stderr)
+        return 2
+
+    results = [check(d, resolver, hostname, args.timeout) for d in args.domains]
+
+    if args.json:
+        print(jsonlib.dumps(results))
+    else:
+        width = max(len(r["domain"]) for r in results)
+        for r in results:
+            print(f"{r['domain']:<{width}}  {describe(r)}")
+
+    if any(r["verdict"] == "error" for r in results):
+        return 2
+    return 1 if any(r["verdict"] == "blocked" for r in results) else 0
+
+
+def check(domain: str, resolver: str, hostname: str, timeout: float) -> dict:
+    """Resolve one domain against Mullvad and classify the answer."""
+    query = dns.message.make_query(domain, dns.rdatatype.A)
+    try:
+        response = dns.query.tls(query, resolver, timeout=timeout, server_hostname=hostname)
+    except Exception as e:  # noqa: BLE001 — any transport failure is the same to the caller
+        return {"domain": domain, "verdict": "error", "category": None, "detail": str(e)}
+
+    category = blocklist_category(response)
+    if category is not None:
+        return {"domain": domain, "verdict": "blocked", "category": category, "detail": None}
+
+    rcode = dns.rcode.to_text(response.rcode())
+    if rcode == "NXDOMAIN":
+        return {"domain": domain, "verdict": "nxdomain", "category": None, "detail": None}
+    if rcode != "NOERROR":
+        return {"domain": domain, "verdict": "error", "category": None, "detail": rcode}
+    return {"domain": domain, "verdict": "resolves", "category": None, "detail": None}
+
+
+def blocklist_category(response: dns.message.Message) -> str | None:
+    """The blocklist that refused this name, if Mullvad said so.
+
+    Mullvad answers a blocked name with NXDOMAIN plus an SOA named for the list,
+    e.g. `mullvad-blocklist-ads.` It has appeared in both the authority and the
+    additional section, so check both.
+    """
+    for section in (response.authority, response.additional):
+        for rrset in section:
+            if rrset.rdtype != dns.rdatatype.SOA:
+                continue
+            name = rrset.name.to_text().rstrip(".")
+            if name.startswith(BLOCKLIST_MARKER):
+                return name[len(BLOCKLIST_MARKER) :]
+    return None
+
+
+def tailnet_resolver() -> str:
+    """The resolver the tailnet is configured to use, per the versioned config."""
+    try:
+        config = jsonlib.loads(TAILNET_DNS.read_text())
+    except (OSError, ValueError):
+        return FALLBACK_RESOLVER
+    for entry in config.get("resolvers") or []:
+        addr = entry.get("addr", "")
+        if addr in MULLVAD_RESOLVERS:
+            return addr
+    # Say so: the tailnet is on a resolver this cannot ask, so the verdicts below
+    # are about base, not about what the tailnet actually uses.
+    print(
+        f"dns-blocked: no Mullvad resolver in {TAILNET_DNS}, asking {FALLBACK_RESOLVER}",
+        file=sys.stderr,
+    )
+    return FALLBACK_RESOLVER
+
+
+def describe(result: dict) -> str:
+    match result["verdict"]:
+        case "blocked":
+            return f"BLOCKED ({result['category']})"
+        case "nxdomain":
+            return "does not exist (not a block)"
+        case "error":
+            return f"error: {result['detail']}"
+        case _:
+            return "resolves"
+
+
+if __name__ == "__main__":
+    sys.exit(main(tyro.cli(Args, description=__doc__, config=(tyro.conf.OmitArgPrefixes,))))

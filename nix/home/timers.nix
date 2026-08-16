@@ -29,6 +29,11 @@ let
     bash coreutils jq
   ]);
 
+  # The dns-* scripts are PEP 723 uv scripts, so uv resolves their deps at run.
+  dnsPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -423,6 +428,36 @@ in
       OnBootSec = "2m";
       OnUnitActiveSec = "15m";
       RandomizedDelaySec = "1m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- DNS audit (secrets/dns-archive.md) ---
+
+  systemd.user.services.dns-audit = {
+    Unit = {
+      Description = "Classify refused DNS lookups, alert on newly blocked domains";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # ${home}/bin for dns-blocked, which dns-audit shells out to
+      Environment = [ "PATH=${dnsPath}:${home}/bin:/usr/bin:/bin" ];
+      EnvironmentFile = "${secrets}/env/dns-audit.env";
+      ExecStart = "${secrets}/scripts/dns-audit";
+      # oneshot defaults to no timeout; without this a wedged run leaves the
+      # unit activating forever and every later firing is a silent no-op.
+      TimeoutStartSec = "30min";
+    };
+  };
+
+  systemd.user.timers.dns-audit = {
+    Unit.Description = "Daily DNS blocklist audit";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
     };
     Install.WantedBy = [ "timers.target" ];
   };

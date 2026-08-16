@@ -135,10 +135,11 @@ URL: `docs/sftpgo.md`. Why each setting is what it is: `nix/nixos/pc/sftpgo.nix`
 ## DNS
 
 Tailnet-wide: every device resolves through Mullvad's filtering resolver, pushed
-with `bin/tailscale-dns` from `secrets/tailscale/dns.json`. Never add
-`Domains=~.` to a resolved config — it ties with tailscaled's own catch-all and
-silently defeats filtering. Chain, gotchas, and the captive-portal escape
-(`vpn-dns-off`): `docs/dns.md`.
+with `bin/tailscale-dns` from `secrets/tailscale/dns.json`. Servers (pc, jarvis,
+yapit-prod) are opted out. Never add `Domains=~.` to a resolved config — it ties
+with tailscaled's own catch-all and silently defeats filtering. `dns-blocked`
+answers "is this domain blocked, and by which list". Chain, gotchas, and the
+captive-portal escape (`vpn-dns-off`): `docs/dns.md`.
 
 ## Knowledge Base Publishing
 

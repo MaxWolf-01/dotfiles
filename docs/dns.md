@@ -118,6 +118,23 @@ That same race is why filtering fails open rather than closed. Mullvad's port 53
 listener answers ordinary queries *without* applying the blocklists, so if DoH
 is ever unreachable you silently keep working and silently stop blocking.
 
+## Is this domain blocked?
+
+A block is invisible by design. The resolver says the name does not exist, which
+is what a typo says too, so a broken application looks like a broken application
+and nothing points at DNS. `dns-blocked` settles it — it asks Mullvad directly
+over DoT and reads back which list refused the name:
+
+```
+$ dns-blocked doubleclick.net nonexistent-zzz.invalid github.com
+doubleclick.net         BLOCKED (ads)
+nonexistent-zzz.invalid does not exist (not a block)
+github.com              resolves
+```
+
+The resolver it asks comes from `secrets/tailscale/dns.json`, so it always
+matches the flavour the tailnet is on.
+
 ## Verify
 
 ```
