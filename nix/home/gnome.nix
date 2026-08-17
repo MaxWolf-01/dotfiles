@@ -31,8 +31,7 @@
     "org/gnome/shell" = {
       enabled-extensions = [
         "copyous@boerdereinar.dev"
-        # waiting on GNOME 50 support
-        # "tilingshell@ferrarodomenico.com"
+        "tilingshell@ferrarodomenico.com"
       ];
     };
 
