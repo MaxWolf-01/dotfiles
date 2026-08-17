@@ -137,7 +137,9 @@
       enable-snap-assistant-windows-suggestions = true;
       enable-tiling-system-windows-suggestions = true;
       enable-window-border = true;
-      window-border-width = lib.hm.gvariant.mkUint32 10;
+      # Drawn outside the window and multiplied by the monitor scale (1.33 here),
+      # so the effective line is noticeably thicker than this number.
+      window-border-width = lib.hm.gvariant.mkUint32 2;
       top-edge-maximize = false;
       inner-gaps = lib.hm.gvariant.mkUint32 0;
       outer-gaps = lib.hm.gvariant.mkUint32 0;
