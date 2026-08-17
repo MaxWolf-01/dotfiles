@@ -340,29 +340,32 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Backup staleness alarm ---
-  # pc runs the same check without the offset, so it normally alerts first and
-  # this stays quiet. The offset exists so that a dead pc — which would take its
-  # alarm down with it — still surfaces here a week later.
+  # --- Overdue watchdog ---
+  # The only scheduled alerter: restic repos that stopped receiving snapshots,
+  # and units that stopped succeeding. pc runs the same check without the offset,
+  # so it normally alerts first and this stays quiet. The offset exists so that a
+  # dead pc — which would take its alarm down with it — still surfaces here a
+  # week later. /usr/bin for journalctl: this host's own, not a nix build, so it
+  # reads a journal written by the same systemd.
 
-  systemd.user.services.backup-staleness-check = {
+  systemd.user.services.overdue-check = {
     Unit = {
-      Description = "Alert on restic repos that stopped receiving snapshots";
+      Description = "Alert on units and repos that stopped succeeding";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
     Service = {
       Type = "oneshot";
       Environment = [
-        "PATH=${backupPath}"
+        "PATH=${backupPath}:/usr/bin:/bin"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${dotfiles}/bin/backup-staleness-check --extra-days 7";
+      ExecStart = "${dotfiles}/bin/overdue-check --extra-days 7";
     };
   };
 
-  systemd.user.timers.backup-staleness-check = {
-    Unit.Description = "Daily backup staleness check (7d behind pc's)";
+  systemd.user.timers.overdue-check = {
+    Unit.Description = "Daily overdue check (7d behind pc's)";
     Timer = {
       OnCalendar = "*-*-* 09:30:00";
       Persistent = true;

@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Drive bin/overdue-check against fixtures and check what it reports. Run it
+# directly; no framework.
+#
+# The cases here are the promises the watchdog makes: that a bound is the only
+# thing standing between a dead unit and silence, that a run log outranks
+# systemd's opinion of the same unit, that a host being off is not an alarm, and
+# that a breach produces exactly one notification naming what broke.
+#
+# HOME is redirected at a scratch dir, which is what isolates the run: it moves
+# the run logs, and it empties the restic config glob so no repo is contacted.
+
+set -uo pipefail
+
+bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+failures=0
+
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+# Stubs stand in for the two things a check reaches outside this machine for.
+# curl writes the notification to a file so a test can count and read it; ssh
+# refuses to connect, the way a host that is off does.
+mkdir -p "$work/stub"
+cat >"$work/stub/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >> "$work/ntfy.log"
+echo "---" >> "$work/ntfy.log"
+EOF
+cat >"$work/stub/ssh" <<'EOF'
+#!/usr/bin/env bash
+echo "ssh: connect to host: Connection timed out" >&2
+exit 255
+EOF
+chmod +x "$work/stub/curl" "$work/stub/ssh"
+export PATH="$work/stub:$PATH"
+
+export HOME="$work/home"
+mkdir -p "$HOME/logs/runs"
+
+days_ago() { date -Iseconds -d "$1 days ago"; }
+
+log_line() {  # unit outcome days_ago
+    jq -c -n --arg ts "$(days_ago "$3")" --arg unit "$1" --arg outcome "$2" \
+        '{ts: $ts, unit: $unit, outcome: $outcome, reason: null, stats: {}}' \
+        >> "$HOME/logs/runs/$1.jsonl"
+}
+
+run() {  # config-body-on-stdin, args... -> stdout+stderr, sets $rc
+    local config="$work/overdue.conf"
+    cat > "$config"
+    : > "$work/ntfy.log"
+    out=$("$bin_dir/overdue-check" --config "$config" "$@" 2>&1)
+    rc=$?
+}
+
+# grep -c prints its 0 and then exits 1; the || keeps that from ending the run.
+ntfy_count() { grep -c -- '^---$' "$work/ntfy.log" 2>/dev/null || true; }
+
+this_host="$(uname -n)"
+
+# --- a unit inside its bound is silent; outside it, it is named once
+
+log_line fresh-unit ok 1
+log_line stale-unit ok 9
+
+run <<EOF
+ntfy_topic: a-topic
+fresh-unit $this_host 3
+EOF
+check "a unit inside its bound exits 0" 0 "$rc"
+check "...and sends nothing" 0 "$(ntfy_count)"
+
+run <<EOF
+ntfy_topic: a-topic
+stale-unit $this_host 3
+EOF
+check "a unit past its bound exits 1" 1 "$rc"
+check "...sends exactly one notification" 1 "$(ntfy_count)"
+check "...naming the unit and both ages" \
+    "yes" \
+    "$(grep -q 'stale-unit' "$work/ntfy.log" && grep -q '9d since last success (limit 3d)' "$work/ntfy.log" && echo yes || echo no)"
+
+# The acceptance case: tighten a bound to 0 and the unit must surface.
+run <<EOF
+ntfy_topic: a-topic
+fresh-unit $this_host 0
+EOF
+check "bound 0 makes a unit that ran yesterday overdue" 1 "$rc"
+check "...in exactly one notification" 1 "$(ntfy_count)"
+
+# --- --extra-days lifts every bound, which is how the second host stays quiet
+
+run --extra-days 7 <<EOF
+ntfy_topic: a-topic
+stale-unit $this_host 3
+EOF
+check "--extra-days lifts the bound past the breach" 0 "$rc"
+check "...so the offset host stays silent" 0 "$(ntfy_count)"
+
+# --- a unit that only ever fails has no last success
+
+log_line failing-unit fail 5
+log_line failing-unit fail 1
+
+run <<EOF
+ntfy_topic: a-topic
+failing-unit $this_host 30
+EOF
+check "a unit that only ever fails is overdue however loose the bound" 1 "$rc"
+check "...reported as having no successful run" \
+    "yes" \
+    "$(grep -q 'no successful run on record' "$work/ntfy.log" && echo yes || echo no)"
+
+# --- deliberate skips are not successes
+
+log_line skipping-unit ok 40
+log_line skipping-unit skip 2
+log_line skipping-unit skip 1
+
+run <<EOF
+ntfy_topic: a-topic
+skipping-unit $this_host 30
+EOF
+check "a skip streak does not refresh the clock" 1 "$rc"
+check "...the age is measured from the last real success" \
+    "yes" \
+    "$(grep -q '40d since last success' "$work/ntfy.log" && echo yes || echo no)"
+
+# --- a unit nothing has ever heard of
+
+run <<EOF
+ntfy_topic: a-topic
+never-ran-unit $this_host 90
+EOF
+check "a unit with no run log and no journal entry is reported" 1 "$rc"
+check "...rather than skipped" \
+    "yes" \
+    "$(grep -q 'never-ran-unit' "$work/ntfy.log" && echo yes || echo no)"
+
+# --- the run log outranks systemd for units that keep one
+#
+# systemd only knows the unit exited 0. A run-logged job exits 0 when it
+# deliberately did nothing, so trusting systemd here would read a skip streak as
+# health. This host's journal has a real unit to check that against.
+
+journal_unit=""
+for candidate in github-mirror browsing-archive jarvis-sync dns-audit; do
+    if [ -n "$(journalctl --user -u "$candidate.service" \
+        MESSAGE_ID=39f53479d3a045ac8e11786248231fbf JOB_RESULT=done \
+        -n 1 -o cat --no-pager 2>/dev/null)" ]; then
+        journal_unit="$candidate"
+        break
+    fi
+done
+
+if [ -z "$journal_unit" ]; then
+    echo "skip journald cases — no unit with a clean finish in this journal"
+else
+    run <<EOF
+ntfy_topic: a-topic
+$journal_unit $this_host 30
+EOF
+    check "a unit with no run log falls back to systemd ($journal_unit)" 0 "$rc"
+
+    log_line "$journal_unit" ok 60
+    run <<EOF
+ntfy_topic: a-topic
+$journal_unit $this_host 30
+EOF
+    check "...but once it keeps a run log, the run log decides" 1 "$rc"
+    rm -f "$HOME/logs/runs/$journal_unit.jsonl"
+fi
+
+# --- a host that is off is not an alarm
+
+run <<EOF
+ntfy_topic: a-topic
+some-unit a-host-that-is-off 1
+EOF
+check "an unreachable host exits 0" 0 "$rc"
+check "...sends nothing" 0 "$(ntfy_count)"
+check "...and says so on stdout" \
+    "yes" \
+    "$(grep -q 'a-host-that-is-off not reachable' <<<"$out" && echo yes || echo no)"
+
+# --- the check records its own run, so the other host can see it is alive
+
+check "a completed check appends one ok line for itself" \
+    "ok" \
+    "$(jq -r '.outcome' "$HOME/logs/runs/overdue-check.jsonl" | tail -1)"
+check "...carrying what it found" \
+    "number number number number" \
+    "$(jq -r '[.stats.overdue, .stats.unchecked, .stats.unreachable, .stats.ok | type] | join(" ")' \
+        "$HOME/logs/runs/overdue-check.jsonl" | tail -1)"
+
+# --- a config it cannot make sense of stops the check instead of guessing
+
+reject() {
+    local what="$1" body="$2" out rc
+    out=$(printf '%s\n' "$body" > "$work/bad.conf"; \
+        "$bin_dir/overdue-check" --config "$work/bad.conf" 2>&1); rc=$?
+    if [ "$rc" -ne 2 ]; then
+        echo "FAIL $what — exited $rc, should have refused with 2"
+        failures=$((failures + 1))
+    elif [ -z "$out" ]; then
+        echo "FAIL $what — refused silently, should have said why"
+        failures=$((failures + 1))
+    else
+        echo "ok   $what → rc=$rc, ${out%%$'\n'*}"
+    fi
+}
+
+reject "a unit line missing its bound" "some-unit $this_host"
+reject "a bound that is not a number" "some-unit $this_host soon"
+reject "an unknown setting" "colour: green"
+
+out=$("$bin_dir/overdue-check" --config "$work/does-not-exist.conf" 2>&1); rc=$?
+check "a missing config refuses to run" 2 "$rc"
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+    exit 0
+fi
+echo "$failures check(s) failed"
+exit 1

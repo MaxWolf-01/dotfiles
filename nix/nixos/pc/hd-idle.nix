@@ -1,7 +1,7 @@
 # Spin down the tank HDDs after 30 min of no I/O.
 #
 # Everything that touches tank is nocturnal (backups, phone sync, youtube
-# download, all between 00:00 and 01:00, staleness check at 09:06), so the
+# download, all between 00:00 and 01:00, overdue check at 09:06), so the
 # disks can stand still ~22 h a day: ~8 W less draw, less heat and rattle.
 # First access after standby pays ~10 s of spin-up latency.
 #

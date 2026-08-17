@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# Report monitored units that have gone too long without succeeding.
+#
+# A scheduled job that skips — locked ZFS dataset, phone away, nothing new to
+# fetch — exits 0 and notifies nobody, so "healthy" and "dead for months" look
+# identical from the outside. This is the one scheduled alerter in the setup: it
+# ignores runs and asks, per unit, how long it has been since the last real
+# success. Anything over its bound goes into one ntfy message; otherwise silence.
+#
+# Two kinds of unit, two kinds of evidence:
+#
+#   restic repos     the age of the newest snapshot, against max_age_days in the
+#                    repo's own conf — the same files restic_backup.sh consumes.
+#   everything else  the last `ok` line in the unit's run log (bin/run-log), or,
+#                    for units that keep no run log, the last time systemd
+#                    finished the unit's start job cleanly. Bounds come from the
+#                    config file, which is also the written answer to "unit X
+#                    hasn't run in N days — is that a problem?".
+#
+# Units on another host are read over ssh. A host that is simply off is expected
+# unavailability, not an alert: its units are skipped and reported on stdout. A
+# dead pc still surfaces here, because its restic repos stop receiving snapshots.
+
+set -uo pipefail
+
+DEFAULT_MAX_AGE_DAYS=14
+RESTIC_CONFIG_GLOB="$HOME/.dotfiles/secrets/backup/restic/*/*.conf"
+DEFAULT_UNIT_CONFIG="$HOME/.dotfiles/secrets/monitoring/overdue.conf"
+
+# systemd logs this message id when a unit's job finishes; JOB_RESULT says how it
+# went, so "done" is the last clean finish and failures never match.
+SYSTEMD_UNIT_STARTED=39f53479d3a045ac8e11786248231fbf
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--extra-days N] [--config FILE] [RESTIC_CONFIG...]
+
+Checks every restic config's newest snapshot against its max_age_days (default
+$DEFAULT_MAX_AGE_DAYS), and every unit in the config file against its bound there.
+With no positional arguments, checks every restic config under
+  $RESTIC_CONFIG_GLOB
+Repos on a filesystem path that doesn't exist here are skipped: they belong to
+another host. Exits 1 if anything is overdue or unreadable.
+
+  --extra-days N  add N days to every bound, restic and unit alike. Two hosts
+                  running this both cover everything, but the one with the
+                  offset stays quiet unless the other stopped alerting (i.e.
+                  died), so a healthy setup alerts only once.
+  --config FILE   unit bounds and the ntfy topic (default: the path above).
+
+Environment:
+  RUN_LOG_DIR     where this host's run logs live (default ~/logs/runs).
+  NTFY_BASE_URL   where to send the alert (default https://ntfy.sh).
+
+A unit that keeps a run log is judged by that log alone. Such jobs exit 0 when
+they deliberately do nothing, so systemd's "finished cleanly" would read a
+months-long skip streak as health — the failure this watchdog exists to catch.
+EOF
+}
+
+extra_days=0
+unit_config="$DEFAULT_UNIT_CONFIG"
+restic_configs=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --extra-days) extra_days="${2:?--extra-days needs a value}"; shift 2 ;;
+        --extra-days=*) extra_days="${1#*=}"; shift ;;
+        --config) unit_config="${2:?--config needs a value}"; shift 2 ;;
+        --config=*) unit_config="${1#*=}"; shift ;;
+        -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *) restic_configs+=("$1"); shift ;;
+    esac
+done
+
+if ! [[ "$extra_days" =~ ^[0-9]+$ ]]; then
+    echo "--extra-days must be a non-negative integer, got: $extra_days" >&2
+    exit 2
+fi
+
+if [ ! -f "$unit_config" ]; then
+    echo "No unit config at $unit_config — nothing knows what 'overdue' means." >&2
+    exit 2
+fi
+
+# Reached relative to this script, not through PATH: the systemd units pin their
+# own PATH and none of them carries ~/bin.
+run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-log"
+
+this_host="$(uname -n)"
+run_log_dir="${RUN_LOG_DIR:-$HOME/logs/runs}"
+ntfy_base="${NTFY_BASE_URL:-https://ntfy.sh}"
+now=$(date +%s)
+
+# Run a read-only probe here or on another host. Every argument is a plain token
+# — no globs, pipes or quotes — so the remote shell cannot mangle it. -n because
+# ssh would otherwise drain the config file the caller is reading.
+run_on() {
+    local host="$1"; shift
+    if [ "$host" = "$this_host" ]; then
+        "$@"
+    else
+        ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$host" "$@"
+    fi
+}
+
+# Remote paths resolve against the remote $HOME. RUN_LOG_DIR redirects the local
+# log only, which is what a test driving this script needs.
+run_log_path() {
+    local host="$1" unit="$2"
+    if [ "$host" = "$this_host" ]; then
+        echo "$run_log_dir/$unit.jsonl"
+    else
+        echo "logs/runs/$unit.jsonl"
+    fi
+}
+
+# When did this unit last succeed? Prints epoch seconds on stdout.
+#   0  found     1  nothing on record     2  host unreachable
+last_success() {
+    local host="$1" unit="$2" body rc ts epoch scope
+
+    body=$(run_on "$host" cat "$(run_log_path "$host" "$unit")" 2>/dev/null)
+    rc=$?
+    [ "$rc" -eq 255 ] && [ "$host" != "$this_host" ] && return 2
+    if [ "$rc" -eq 0 ]; then
+        ts=$(jq -r 'select(.outcome == "ok") | .ts' <<<"$body" 2>/dev/null | tail -1)
+        [ -n "$ts" ] || return 1
+        epoch=$(date -d "$ts" +%s 2>/dev/null) || return 1
+        echo "$epoch"
+        return 0
+    fi
+
+    # No run log: ask systemd instead. The user manager first — that is where
+    # nearly everything lives — then the system one, for the few root units.
+    for scope in --user --system; do
+        body=$(run_on "$host" journalctl "$scope" -u "$unit.service" \
+            "MESSAGE_ID=$SYSTEMD_UNIT_STARTED" JOB_RESULT=done \
+            -n 1 -o json --no-pager 2>/dev/null)
+        rc=$?
+        [ "$rc" -eq 255 ] && [ "$host" != "$this_host" ] && return 2
+        ts=$(jq -r '.__REALTIME_TIMESTAMP // empty' <<<"$body" 2>/dev/null)
+        if [ -n "$ts" ]; then
+            echo $((ts / 1000000))
+            return 0
+        fi
+    done
+    return 1
+}
+
+overdue=""
+unchecked=""
+unreachable=""
+overdue_count=0
+unchecked_count=0
+unreachable_count=0
+ok_count=0
+ntfy_topic=""
+
+# --- restic repos: the age of the newest snapshot
+
+if [ ${#restic_configs[@]} -eq 0 ]; then
+    # nullglob, so a glob that matches nothing yields no configs rather than the
+    # pattern itself — a run with no repos to check must not demand the age key.
+    shopt -s nullglob
+    restic_configs=($RESTIC_CONFIG_GLOB)
+    shopt -u nullglob
+fi
+
+age_key="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
+if [ ${#restic_configs[@]} -gt 0 ] && [ ! -f "$age_key" ]; then
+    echo "Cannot check: age key not available at $age_key (decrypt it first)" >&2
+    exit 1
+fi
+
+for config in "${restic_configs[@]}"; do
+    [ -f "$config" ] || continue
+    name="$(basename "$(dirname "$config")")-$(basename "$config" .conf)"
+
+    # Source in a subshell and print the fields, so one config's values can't
+    # leak into the next. Unit separator, not tab: tab is IFS whitespace, so
+    # consecutive tabs around an empty field would collapse and shift the rest.
+    #
+    # SOPS_AGE_KEY_FILE comes along because the config exports it for the
+    # password command's benefit, and that export dies with the subshell — so it
+    # has to be put back on the restic call by hand, or sops finds no key and
+    # every repo reads as unreadable.
+    IFS=$'\x1f' read -r repo repo_local password_command max_age age_key_file < <(
+        source "$config" 2>/dev/null
+        printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+            "${repo_path:-}" \
+            "${repo_path_local:-}" \
+            "${password_command:-}" \
+            "${max_age_days:-$DEFAULT_MAX_AGE_DAYS}" \
+            "${SOPS_AGE_KEY_FILE:-$age_key}"
+    )
+    max_age=$((max_age + extra_days))
+
+    # A config may name the same repo twice: once as other hosts reach it, once
+    # as the host storing it does (pc has no ssh alias for itself). Take the
+    # local path only when it's actually here, so both hosts resolve correctly.
+    if [ -n "$repo_local" ] && [ -d "$repo_local" ]; then
+        repo="$repo_local"
+    fi
+
+    if [ -z "$repo" ] || [ -z "$password_command" ]; then
+        unchecked="${unchecked}  ${name}: config missing repo_path or password_command"$'\n'
+        unchecked_count=$((unchecked_count + 1))
+        continue
+    fi
+
+    # A bare filesystem path that isn't here means the repo lives on another
+    # host (phone/pc.conf seen from the laptop) — not this host's to monitor.
+    if [[ "$repo" != *:* ]] && [ ! -d "$repo" ]; then
+        continue
+    fi
+
+    latest=$(SOPS_AGE_KEY_FILE="$age_key_file" \
+        restic --repo "$repo" --password-command "$password_command" \
+        snapshots --json 2>/dev/null | jq -r 'max_by(.time).time // empty')
+
+    if [ -z "$latest" ]; then
+        unchecked="${unchecked}  ${name}: no snapshots, or repo unreadable"$'\n'
+        unchecked_count=$((unchecked_count + 1))
+        continue
+    fi
+
+    age_days=$(( (now - $(date -d "$latest" +%s)) / 86400 ))
+    if [ "$age_days" -gt "$max_age" ]; then
+        overdue="${overdue}  ${name}: newest snapshot ${age_days}d old (limit ${max_age}d), ${latest:0:10}"$'\n'
+        overdue_count=$((overdue_count + 1))
+    else
+        ok_count=$((ok_count + 1))
+        echo "ok: $name — newest snapshot ${age_days}d old (limit ${max_age}d)"
+    fi
+done
+
+# --- everything else: time since the last successful run
+
+while read -r -u 3 line; do
+    line="${line%%#*}"
+    read -r unit host days <<<"$line"
+    [ -n "$unit" ] || continue
+
+    # "key: value" cannot collide with a unit name, which has no colon in it.
+    if [[ "$unit" == *: ]]; then
+        case "${unit%:}" in
+            ntfy_topic) ntfy_topic="$host" ;;
+            *) echo "$unit_config: unknown setting '$unit'" >&2; exit 2 ;;
+        esac
+        continue
+    fi
+
+    if [ -z "$host" ] || ! [[ "$days" =~ ^[0-9]+$ ]]; then
+        echo "$unit_config: expected '<unit> <host> <max_age_days>', got: $line" >&2
+        exit 2
+    fi
+
+    limit=$((days + extra_days))
+    label="$unit ($host)"
+
+    last=$(last_success "$host" "$unit")
+    case $? in
+        2)
+            unreachable="${unreachable}  ${label}: $host not reachable"$'\n'
+            unreachable_count=$((unreachable_count + 1))
+            continue ;;
+        1)
+            overdue="${overdue}  ${label}: no successful run on record (limit ${limit}d)"$'\n'
+            overdue_count=$((overdue_count + 1))
+            continue ;;
+    esac
+
+    age_days=$(( (now - last) / 86400 ))
+    if [ "$age_days" -gt "$limit" ]; then
+        overdue="${overdue}  ${label}: ${age_days}d since last success (limit ${limit}d), $(date -d "@$last" +%F)"$'\n'
+        overdue_count=$((overdue_count + 1))
+    else
+        ok_count=$((ok_count + 1))
+        echo "ok: $label — ${age_days}d since last success (limit ${limit}d)"
+    fi
+done 3< "$unit_config"
+
+[ -n "$unreachable" ] && printf 'Not checked, host away:\n%s' "$unreachable"
+
+# Recording this run must never decide whether the check succeeded. `ok` means
+# the check completed, not that it found nothing: the findings go to ntfy, while
+# the other host reads this log to see that the watchdog itself is still alive.
+"$run_log_bin" overdue-check ok --stats "$(jq -n \
+    --argjson overdue "$overdue_count" \
+    --argjson unchecked "$unchecked_count" \
+    --argjson unreachable "$unreachable_count" \
+    --argjson ok "$ok_count" \
+    '{overdue: $overdue, unchecked: $unchecked, unreachable: $unreachable, ok: $ok}')" || true
+
+if [ -z "$overdue" ] && [ -z "$unchecked" ]; then
+    echo "All $ok_count monitored unit(s) are within their bounds."
+    exit 0
+fi
+
+message=""
+[ -n "$overdue" ] && message="Overdue:"$'\n'"$overdue"
+[ -n "$unchecked" ] && message="${message}Could not check:"$'\n'"$unchecked"
+message="${message}"$'\n'"$ok_count unit(s) fine."
+
+echo "$message" >&2
+
+if [ -n "$ntfy_topic" ]; then
+    # --max-time: this runs as a oneshot with no start timeout, so a server that
+    # accepts the connection and then says nothing would wedge the unit forever.
+    curl -s --max-time 20 \
+        -H "Title: 🕸️ Overdue units" \
+        -H "Priority: 4" \
+        -H "Tags: watchdog,stale" \
+        -d "$message" \
+        "$ntfy_base/$ntfy_topic" >/dev/null
+else
+    echo "No ntfy_topic in $unit_config — the report above went nowhere else." >&2
+fi
+
+exit 1

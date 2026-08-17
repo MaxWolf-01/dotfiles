@@ -14,6 +14,10 @@ let
     bash coreutils util-linux rsync openssh gnugrep jq
   ]);
 
+  # systemd for journalctl: the watchdog asks it when units without a run log
+  # last finished cleanly, here and (over ssh) on the laptop.
+  watchdogPath = "${backupPath}:${lib.makeBinPath [ pkgs.systemd ]}";
+
   # Age key on tmpfs (decrypted on first SSH login, see secrets/zshrc)
   ageKeyFile = "/run/user/1000/age-key.txt";
 
@@ -203,31 +207,32 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Backup staleness alarm ---
-  # A backup that skips (locked dataset, unreachable phone) exits 0 and notifies
-  # nothing, so a repo can stop receiving snapshots unnoticed. This watches the
-  # snapshots themselves. The laptop runs the same check with --extra-days, so
-  # either machine dying still leaves an alarm standing. See bin/.
+  # --- Overdue watchdog ---
+  # A job that skips (locked dataset, unreachable phone) exits 0 and notifies
+  # nothing, so work can stop happening unnoticed. This watches the outcomes
+  # instead: snapshot ages for restic repos, time since the last successful run
+  # for everything else. The laptop runs the same check with --extra-days, so
+  # either machine dying still leaves an alarm standing. See bin/overdue-check.
 
-  systemd.user.services.backup-staleness-check = {
+  systemd.user.services.overdue-check = {
     Unit = {
-      Description = "Alert on restic repos that stopped receiving snapshots";
+      Description = "Alert on units and repos that stopped succeeding";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
     Service = {
       Type = "oneshot";
       Environment = [
-        "PATH=${backupPath}"
+        "PATH=${watchdogPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${dotfiles}/bin/backup-staleness-check";
+      ExecStart = "${dotfiles}/bin/overdue-check";
     };
   };
 
-  systemd.user.timers.backup-staleness-check = {
-    Unit.Description = "Daily backup staleness check";
+  systemd.user.timers.overdue-check = {
+    Unit.Description = "Daily overdue check";
     Timer = {
       OnCalendar = "*-*-* 09:00:00";
       Persistent = true;
