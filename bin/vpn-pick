@@ -8,9 +8,15 @@
 # Error", and Tailscale's own health checks see nothing wrong. The block is
 # per-node, not per-country, and reputations drift — a static pin or blacklist
 # rots. This adds the missing application-level health check: enable auto:any
-# (keeps auto-failover), probe the case that actually fails (discord.com with a
-# Chrome UA), and only when the picked node is blocked, walk nearby nodes and
-# pin the first clean one.
+# (keeps auto-failover), probe the request class that actually fails (the
+# Discord API with a Chrome UA), and only when the picked node is blocked,
+# walk nearby nodes and pin the first clean one.
+#
+# The probe counts only a Cloudflare-signed 403 as blocked (Discord's own
+# errors are JSON; Cloudflare's block page is HTML), and confirms it after
+# CONFIRM_SECS before anyone rotates: a real IP block persists, a transient
+# challenge clears — and every rotation is an IP change Discord's session
+# heuristics get to see (rapid IP hopping is what triggers re-login prompts).
 #
 #   vpn-pick             turn on + verify (what the vpn-on alias runs)
 #   vpn-pick --check     report the current node's verdict, change nothing
@@ -20,20 +26,24 @@
 #                        exit node changed (auto failover may have landed on a
 #                        blocked node) or went offline (a pinned node has no
 #                        native failover; this supplies it). A slow PROBE_SECS
-#                        re-probe catches in-place reputation flips without
-#                        hammering Discord from a VPN IP, which is itself the
-#                        traffic pattern that earns an IP a bad score. Idles
-#                        while no exit node is set (respects vpn-off).
+#                        re-probe catches in-place reputation flips. All
+#                        probing is gated on Vesktop actually running — the
+#                        only Chrome-family client here; nothing to guard
+#                        otherwise. Idles while no exit node is set (respects
+#                        vpn-off); the offline/re-pick path stays active
+#                        regardless of Vesktop (a dead node kills all egress,
+#                        not just Discord).
 #
 # Needs curl + jq, and the tailscale operator grant (no sudo).
 set -uo pipefail
 
 CHROME_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-CANARY=https://discord.com/app
+CANARY=https://discord.com/api/v9/gateway  # unauthenticated, tiny JSON; the API is what Cloudflare blocks for the app
 COUNTRIES=(Germany Austria Switzerland Netherlands)
-MAX_PINS=8      # nodes to try after auto's pick before giving up
-POLL_SECS=15    # local tailscale state poll (watch mode)
-PROBE_SECS=600  # unconditional re-probe of an unchanged node (watch mode)
+MAX_PINS=8       # nodes to try after auto's pick before giving up
+POLL_SECS=15     # local tailscale state poll (watch mode)
+PROBE_SECS=600   # unconditional re-probe of an unchanged node (watch mode)
+CONFIRM_SECS=45  # spacing before confirming a 403 — transients clear, real blocks persist
 BACKOFF_SECS=300  # pause after a failed recovery before the loop resumes
 LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/vpn-pick.lock"
 
@@ -70,7 +80,7 @@ do_pick() {
     (( ++attempts > MAX_PINS )) && break
     tailscale set --exit-node="$node" --exit-node-allow-lan-access=true
     settle "$short" || { echo "  $short: unreachable, skipping"; continue; }
-    if probe; then
+    if probe_once; then  # unconfirmed is fine here: a false "blocked" just skips one candidate
       echo "pinned: $node (native failover off — the vpn-watchdog watcher covers it)"
       notify "Exit node $current is Cloudflare-blocked; pinned $short instead."
       return 0
@@ -97,6 +107,10 @@ watch() {
     if [[ $online == false ]]; then
       echo "exit node offline — re-picking"
       recover; last_id=""; last_probe=$now
+      continue
+    fi
+    if ! vesktop_running; then
+      last_id=""  # forces a probe when Vesktop reopens on an unverified node
       continue
     fi
     if [[ $id != "$last_id" ]]; then
@@ -148,18 +162,29 @@ check() {
   esac
 }
 
-probe() {  # 0 clean, 1 blocked (Cloudflare 403), 2 unreachable
-  local code blocked=0 ok=0
-  for _ in 1 2 3; do
-    code=$(curl -4 -s -m 10 -o /dev/null -w '%{http_code}' -A "$CHROME_UA" "$CANARY")
-    case $code in
-      403) blocked=1 ;;
-      2*|3*) ok=1 ;;
-    esac
-  done
-  (( blocked )) && return 1
-  (( ok )) && return 0
-  return 2
+probe() {  # 0 clean, 1 blocked (Cloudflare 403, confirmed), 2 unreachable
+  probe_once
+  local first=$?
+  (( first != 1 )) && return $first
+  sleep "$CONFIRM_SECS"
+  probe_once
+}
+
+probe_once() {  # single request: 0 clean, 1 blocked, 2 unreachable
+  local body code first_char
+  body=$(mktemp)
+  code=$(curl -4 -s -m 10 -o "$body" -w '%{http_code}' -A "$CHROME_UA" "$CANARY")
+  first_char=$(head -c1 "$body")
+  rm -f "$body"
+  case $code in
+    403) [[ $first_char == "{" ]] && return 0 || return 1 ;;  # JSON = Discord's own answer, node fine; HTML = Cloudflare's block page
+    000|5*) return 2 ;;
+    *) return 0 ;;
+  esac
+}
+
+vesktop_running() {  # no process is named "vesktop" — it's a bare electron binary; match the app path
+  pgrep -f "Vesktop/resources/app.asar" >/dev/null
 }
 
 egress() {  # Mullvad node short name we currently egress through, or empty

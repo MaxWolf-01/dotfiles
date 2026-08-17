@@ -34,9 +34,10 @@ let
     bash coreutils uv
   ]);
 
-  # util-linux for flock (vpn-pick serializes watcher vs. manual runs)
+  # util-linux for flock (vpn-pick serializes watcher vs. manual runs),
+  # procps for pgrep (the Vesktop gate)
   vpnPath = lib.makeBinPath (with pkgs; [
-    bash coreutils util-linux gawk curl jq libnotify
+    bash coreutils util-linux gawk curl jq libnotify procps
   ]);
 
   sshAuthSock = "/run/user/1000/ssh-agent";
@@ -454,7 +455,8 @@ in
   # node has no native failover at all. Runs continuously rather than on a
   # timer: the watcher reacts to exit-node changes and deaths within seconds
   # by polling local tailscale state, and probing Discord only on those
-  # events. Rationale and probe: bin/vpn-pick.
+  # events — and only while Vesktop is running. Rationale and probe:
+  # bin/vpn-pick.
 
   systemd.user.services.vpn-watchdog = {
     Unit = {
