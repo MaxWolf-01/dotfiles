@@ -17,10 +17,13 @@ if [ -z "$config_file" ] || [ ! -f "$config_file" ]; then
     exit 1
 fi
 
+# Lazy unmount, and no mountpoint test first: both stat the mount, and a stat on
+# a mount whose sshfs is gone blocks in the kernel with no timeout. -z detaches
+# the mount from the tree without waiting, so this always returns and the next
+# run always finds a clear path. It does not free a process already stuck reading
+# the mount; only the sshfs process exiting does that.
 cleanup() {
-    if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
-        fusermount -u "$MOUNTPOINT" 2>/dev/null || fusermount3 -u "$MOUNTPOINT" 2>/dev/null || true
-    fi
+    fusermount -uz "$MOUNTPOINT" 2>/dev/null || fusermount3 -uz "$MOUNTPOINT" 2>/dev/null || true
 }
 trap cleanup EXIT
 

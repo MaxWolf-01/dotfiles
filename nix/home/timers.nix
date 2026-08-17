@@ -42,6 +42,14 @@ let
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
+  # TimeoutStartSec on the three restic services: Type=oneshot disables the start
+  # timeout by default, so a restic blocked on a dead sftp socket or a hung sshfs
+  # read never dies. It holds the repo lock — restic only breaks a lock whose
+  # owner has exited, and a task in uninterruptible sleep still exists — and the
+  # kernel cannot freeze it, so the laptop stops suspending. The timeout signals
+  # the unit's whole cgroup: sshfs sleeps interruptibly and dies, its FUSE
+  # connection aborts, and the blocked restic finally wakes and exits. Healthy
+  # runs take 35 min or less.
   systemd.user.services.working-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (working data)";
@@ -50,6 +58,7 @@ in
     };
     Service = {
       Type = "oneshot";
+      TimeoutStartSec = "2h";
       Environment = [ "PATH=${backupPath}" ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/working/rsyncnet.conf";
     };
@@ -73,6 +82,7 @@ in
     };
     Service = {
       Type = "oneshot";
+      TimeoutStartSec = "2h";
       Environment = [ "PATH=${backupPath}" ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/working/pc.conf";
     };
@@ -98,6 +108,7 @@ in
     };
     Service = {
       Type = "oneshot";
+      TimeoutStartSec = "2h";
       Environment = [
         "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
         "SSH_AUTH_SOCK=/run/user/1000/ssh-agent"

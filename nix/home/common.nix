@@ -329,6 +329,11 @@
         AddKeysToAgent = "yes";
         IdentitiesOnly = "yes";
         IdentityFile = "~/.ssh/id_ed25519";
+        # ssh has no timeout on a link that goes away mid-transfer; it waits
+        # forever. Three missed probes 15s apart tear the connection down after
+        # 45s, so a reader gets an error instead of blocking. restic's sftp
+        # backend and sshfs both inherit this — neither has a timeout of its own.
+        ServerAliveInterval = 15;
       };
     };
   };
