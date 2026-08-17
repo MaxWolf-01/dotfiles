@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Restic backup wrapper with enhanced notifications
+# Restic backup wrapper. Every run appends its outcome and stats to the run log
+# (bin/run-log); ntfy is reserved for the failures a human has to act on —
+# a repo that will not initialise, a backup that died, a failed integrity check.
+# A green run and a deliberate skip are silent.
 
 set -uo pipefail
 
@@ -21,21 +24,33 @@ set -uo pipefail
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
 # require_mount - (optional) Path that must be a mountpoint, else skip (for encrypted ZFS datasets)
 
-# Helper to send failure notification and exit
-send_failure_ntfy() {
-    local error_message="$1"
-    local config_name="$2"
-    local ntfy_topic="${3:-}"
+# Reached relative to this script, not through PATH: the systemd units pin
+# their own PATH and none of them carries ~/bin.
+run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../bin/run-log"
 
-    if [ -n "$ntfy_topic" ]; then
+# The run log is a record, not a control flow: if writing it fails, run-log says
+# so on stderr and the backup carries on. A missing line is what the overdue
+# watchdog exists to catch.
+log_run() {
+    "$run_log_bin" "$config_name" "$@" || true
+}
+
+# A failure that needs a human: notify, record, stop. $1 is the one-line reason
+# for the run log, $2 the full text for the notification.
+fail_out() {
+    local reason="$1"
+    local detail="$2"
+
+    log_run fail --reason "$reason"
+    if [ -n "${ntfy_topic:-}" ]; then
         curl -s \
             -H "Title: ❌ $config_name - Backup Failed" \
             -H "Priority: 5" \
             -H "Tags: backup,restic,$config_name,error" \
-            -d "$error_message" \
+            -d "$detail" \
             "https://ntfy.sh/$ntfy_topic"
     fi
-    echo "$error_message"
+    echo "$detail" >&2
     exit 1
 }
 
@@ -59,7 +74,8 @@ for var in $required_vars; do
     fi
 done
 if [ -n "$missing_vars" ]; then
-    send_failure_ntfy "Missing required config variables:$missing_vars" "$config_name" "${ntfy_topic:-}"
+    fail_out "missing config variables:$missing_vars" \
+        "Missing required config variables:$missing_vars"
 fi
 
 # Optional: abort if a required mountpoint isn't mounted (e.g., encrypted ZFS datasets)
@@ -67,6 +83,7 @@ fi
 if [ -n "${require_mount:-}" ]; then
     if ! mountpoint -q "$require_mount"; then
         echo "Skipping $config_name: $require_mount is not mounted"
+        log_run skip --reason "$require_mount is not mounted"
         exit 0
     fi
 fi
@@ -75,12 +92,7 @@ fi
 age_key="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
 if [ ! -f "$age_key" ]; then
     echo "Skipping $config_name: age key not available at $age_key (decrypt it first)"
-    if [ -n "${ntfy_topic:-}" ]; then
-        curl -s -H "Title: $config_name - Age key needed" -H "Priority: 3" \
-            -H "Tags: backup,key-needed" \
-            -d "Age key not decrypted. SSH in to unlock backups." \
-            "https://ntfy.sh/$ntfy_topic"
-    fi
+    log_run skip --reason "age key not decrypted at $age_key"
     exit 0
 fi
 
@@ -126,7 +138,8 @@ if ! restic --repo "$repo_path" --password-command "$password_command" cat confi
     init_log="$log_dir/repo_init_${config_name}_${timestamp}.log"
     if ! restic init --repo "$repo_path" --password-command "$password_command" >"$init_log" 2>&1; then
         error_details=$(cat "$init_log" "$repo_check_log" 2>/dev/null)
-        send_failure_ntfy "Failed to initialize restic repository at $repo_path
+        fail_out "could not initialise repository at $repo_path" \
+            "Failed to initialize restic repository at $repo_path
 
 ERROR OUTPUT:
 $error_details
@@ -134,7 +147,7 @@ $error_details
 Logs: $repo_check_log, $init_log
 Config: $config_file
 Repo: $repo_path
-Password command: $password_command" "$config_name" "${ntfy_topic:-}"
+Password command: $password_command"
     fi
 fi
 
@@ -214,13 +227,6 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         fi
     fi
 
-    # Calculate compression savings if we have the data
-    compression_info=""
-    if [ "$data_added" -gt 0 ] && [ "$data_added_packed" -gt 0 ]; then
-        saved_percentage=$(( (data_added - data_added_packed) * 100 / data_added ))
-        compression_info=" (saved ${saved_percentage}%)"
-    fi
-
     # Run forget and prune
     echo "Pruning old snapshots..."
     restic --repo "$repo_path" forget --prune \
@@ -253,45 +259,38 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         backup_success=false
     fi
 
-    # Send notification
-    if [ -n "${ntfy_topic:-}" ]; then
-        if [ "$backup_success" = true ]; then
-            # Format success message
-            warning_line=""
-            if [ "$had_warnings" = true ]; then
-                # Unreadable files are reported as JSON error lines, but other
-                # exit-3 causes (a missing source dir) only show up as plain
-                # stderr — surface those verbatim instead of a count of zero.
-                warn_count=$(grep -c '"message_type":"error"' "$error_log" || true)
-                if [ "$warn_count" -gt 0 ]; then
-                    warning_line="
-⚠️ $warn_count file(s) unreadable (see error log)"
-                else
-                    warning_line="
-⚠️ $(grep -v '^{' "$error_log" | head -3)"
-                fi
-            fi
-            message="📦 Snapshot ${snapshot_id} created
-⏱️ Duration: $(format_duration $backup_duration)
-📊 Files: $total_files_processed processed ($files_new new, $files_changed changed)
-💾 Size: $(format_bytes $data_added) added ($(format_bytes $data_added_packed)$compression_info)
-🔍 Integrity: $check_description check $check_status$warning_line"
+    # Unreadable files are reported as JSON error lines, but other exit-3 causes
+    # (a missing source dir) only show up as plain stderr — so this count can be
+    # zero while the run still had warnings. The warning log saved below is
+    # where that text survives.
+    warn_count=0
+    if [ "$had_warnings" = true ]; then
+        warn_count=$(grep -c '"message_type":"error"' "$error_log" || true)
+    fi
 
-            if [ "$had_warnings" = true ]; then
-                title="⚠️ $config_name"
-                priority=3
-            else
-                title="✅ $config_name"
-                priority=2
-            fi
-            curl -s \
-                -H "Title: $title" \
-                -H "Priority: $priority" \
-                -H "Tags: backup,restic,$config_name,success" \
-                -d "$message" \
-                "https://ntfy.sh/$ntfy_topic"
-        else
-            # Repository check failed
+    # $ARGS.named collects every --arg/--argjson above into one object, so each
+    # field is named once instead of twice.
+    stats=$(jq -n \
+        --arg snapshot_id "$snapshot_id" \
+        --arg check "${check_status,,}" \
+        --arg check_scope "$check_description" \
+        --argjson duration_s "$backup_duration" \
+        --argjson total_files_processed "$total_files_processed" \
+        --argjson files_new "$files_new" \
+        --argjson files_changed "$files_changed" \
+        --argjson files_unmodified "$files_unmodified" \
+        --argjson total_bytes_processed "$total_bytes_processed" \
+        --argjson data_added "$data_added" \
+        --argjson data_added_packed "$data_added_packed" \
+        --argjson warnings "$warn_count" \
+        '$ARGS.named')
+
+    if [ "$backup_success" = true ]; then
+        log_run ok --stats "$stats"
+    else
+        log_run fail --reason "$check_description integrity check failed" --stats "$stats"
+
+        if [ -n "${ntfy_topic:-}" ]; then
             message="❌ Repository integrity check failed!
 
 📦 Snapshot ${snapshot_id} was created successfully
@@ -321,6 +320,7 @@ ${check_error_msg}"
     if [ "$backup_success" = false ]; then
         exit 1
     fi
+    exit 0
 
 else
     # Backup failed
@@ -349,6 +349,12 @@ else
         cat "$backup_output" 2>/dev/null || echo "No backup output captured"
     } > "$local_log_file"
     echo "Error log saved to: $local_log_file"
+
+    log_run fail \
+        --reason "restic backup exited $backup_exit: $(head -1 <<<"$error_message")" \
+        --stats "$(jq -n --argjson duration_s "$backup_duration" \
+                        --argjson exit_code "$backup_exit" \
+                        --arg error_log "$local_log_file" '$ARGS.named')"
 
     if [ -n "${ntfy_topic:-}" ]; then
         # Send error notification with log file attached

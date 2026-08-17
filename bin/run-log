@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Append one run outcome to ~/logs/runs/<unit>.jsonl.
+#
+# Scheduled jobs used to report by notification, which meant either a ping on
+# every green day or no record at all. The run log is the record: one line per
+# run, machine-readable, so dashboards and the overdue watchdog read outcomes
+# instead of inferring them from silence. Notifications are left for the
+# failures a human has to act on.
+
+set -uo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: run-log <unit> <ok|skip|fail> [--reason TEXT] [--stats JSON]
+
+Appends one line to $RUN_LOG_DIR/<unit>.jsonl (default ~/logs/runs):
+
+  {"ts":"2026-08-17T22:00:01+02:00","unit":"working-rsyncnet",
+   "outcome":"ok","reason":null,"stats":{}}
+
+  <unit>    the scheduled job, matching its systemd unit name where there is
+            one (working-rsyncnet, phone-sync, youtube-download)
+  ok        the job did its work
+  skip      the job deliberately did nothing, because a precondition it does
+            not control was absent (dataset unmounted, phone away, key locked)
+  fail      the job tried and did not finish
+  --reason  why, in one line; required for skip and fail
+  --stats   JSON object of per-job numbers, e.g. built with `jq -n`. Types are
+            the caller's to get right: a hex snapshot id is a string, a byte
+            count is a number.
+
+Every argument is validated; anything unexpected exits non-zero and writes
+nothing, so a broken call site shows up as a missing line the watchdog catches
+rather than as a malformed line a dashboard has to guess about.
+EOF
+}
+
+unit=""
+outcome=""
+reason=""
+stats="{}"
+positional=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --reason) reason="${2?--reason needs a value}"; shift 2 ;;
+        --reason=*) reason="${1#*=}"; shift ;;
+        --stats) stats="${2?--stats needs a value}"; shift 2 ;;
+        --stats=*) stats="${1#*=}"; shift ;;
+        -*) echo "run-log: unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+
+if [ ${#positional[@]} -ne 2 ]; then
+    echo "run-log: expected <unit> and <outcome>, got ${#positional[@]} argument(s)" >&2
+    usage >&2
+    exit 2
+fi
+unit="${positional[0]}"
+outcome="${positional[1]}"
+
+# The unit name becomes a filename; keep it to something that cannot escape the
+# log directory or collide across case-insensitive tooling.
+if ! [[ "$unit" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+    echo "run-log: bad unit name '$unit' (lowercase letters, digits, . _ - ; must not start with . _ -)" >&2
+    exit 2
+fi
+
+case "$outcome" in
+    ok|skip|fail) ;;
+    *) echo "run-log: bad outcome '$outcome' (expected ok, skip or fail)" >&2; exit 2 ;;
+esac
+
+if [ "$outcome" != "ok" ] && [ -z "$reason" ]; then
+    echo "run-log: outcome '$outcome' needs --reason" >&2
+    exit 2
+fi
+
+if ! echo "$stats" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    echo "run-log: --stats must be a JSON object, got: $stats" >&2
+    exit 2
+fi
+
+# Build the line before opening the file: a jq that dies mid-way then appends
+# nothing instead of half a record.
+line=$(jq -c -n \
+    --arg ts "$(date -Iseconds)" \
+    --arg unit "$unit" \
+    --arg outcome "$outcome" \
+    --arg reason "$reason" \
+    --argjson stats "$stats" \
+    '{ts: $ts, unit: $unit, outcome: $outcome,
+      reason: (if $reason == "" then null else $reason end), stats: $stats}')
+if [ $? -ne 0 ] || [ -z "$line" ]; then
+    echo "run-log: failed to build the log line for $unit" >&2
+    exit 1
+fi
+
+log_dir="${RUN_LOG_DIR:-$HOME/logs/runs}"
+if ! mkdir -p "$log_dir"; then
+    echo "run-log: cannot create $log_dir" >&2
+    exit 1
+fi
+
+# O_APPEND, and the line is far below PIPE_BUF, so concurrent runs of different
+# units — or the same unit on two hosts sharing a synced home — interleave
+# whole lines rather than tearing one.
+printf '%s\n' "$line" >> "$log_dir/$unit.jsonl"
