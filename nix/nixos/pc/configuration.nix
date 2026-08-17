@@ -8,6 +8,7 @@
     ./pihole.nix
     ./sftpgo.nix
     ./tailnet-lock.nix
+    ./hd-idle.nix
   ];
 
   # Boot
