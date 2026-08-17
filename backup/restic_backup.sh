@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Restic backup wrapper. Every run appends its outcome and stats to the run log
-# (bin/run-log); ntfy is reserved for the failures a human has to act on —
-# a repo that will not initialise, a backup that died, a failed integrity check.
-# A green run and a deliberate skip are silent.
+# (bin/run-log); ntfy is reserved for the failures a person has to act on, which
+# is every failure this script can name. A green run and a deliberate skip —
+# dataset unmounted, age key still encrypted — are silent.
 
 set -uo pipefail
 
@@ -28,9 +28,8 @@ set -uo pipefail
 # their own PATH and none of them carries ~/bin.
 run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../bin/run-log"
 
-# The run log is a record, not a control flow: if writing it fails, run-log says
-# so on stderr and the backup carries on. A missing line is what the overdue
-# watchdog exists to catch.
+# Recording the run must never decide whether the backup succeeded: run-log
+# explains itself on stderr and the backup carries on.
 log_run() {
     "$run_log_bin" "$config_name" "$@" || true
 }
@@ -261,11 +260,15 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
 
     # Unreadable files are reported as JSON error lines, but other exit-3 causes
     # (a missing source dir) only show up as plain stderr — so this count can be
-    # zero while the run still had warnings. The warning log saved below is
-    # where that text survives.
+    # zero while the run still had warnings. Whoever reads `warnings` has to be
+    # able to reach the text, hence the path alongside it.
     warn_count=0
+    warning_log=""
     if [ "$had_warnings" = true ]; then
         warn_count=$(grep -c '"message_type":"error"' "$error_log" || true)
+        warning_log="$log_dir/restic_warning_${config_name}_$(date +%Y%m%d_%H%M%S).log"
+        cat "$error_log" > "$warning_log"
+        echo "Warning log saved to: $warning_log"
     fi
 
     # $ARGS.named collects every --arg/--argjson above into one object, so each
@@ -283,7 +286,8 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         --argjson data_added "$data_added" \
         --argjson data_added_packed "$data_added_packed" \
         --argjson warnings "$warn_count" \
-        '$ARGS.named')
+        --arg warning_log "$warning_log" \
+        '$ARGS.named | if .warning_log == "" then del(.warning_log) else . end')
 
     if [ "$backup_success" = true ]; then
         log_run ok --stats "$stats"
@@ -308,13 +312,6 @@ ${check_error_msg}"
                 -d "$message" \
                 "https://ntfy.sh/$ntfy_topic"
         fi
-    fi
-
-    # Save warning log so it's inspectable
-    if [ "$had_warnings" = true ]; then
-        warning_log="$log_dir/restic_warning_${config_name}_$(date +%Y%m%d_%H%M%S).log"
-        cat "$error_log" > "$warning_log"
-        echo "Warning log saved to: $warning_log"
     fi
 
     if [ "$backup_success" = false ]; then

@@ -10,7 +10,7 @@ Managed via [Nix Home Manager](https://github.com/nix-community/home-manager) �
 
 ```
 dotfiles
-├── backup        # restic/rsync backup scripts (ntfy notifications)
+├── backup        # restic/rsync backup scripts (run logs; ntfy on failure)
 ├── bin           # custom scripts
 ├── desktop       # icons, discord theme
 ├── nix

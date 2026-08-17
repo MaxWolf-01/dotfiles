@@ -6,8 +6,7 @@
 #   - ZFS dataset tank/max/phone mounted at /home/max/data/phone
 #
 # Sends no notifications: an away phone or an unsynced photo is nothing to act
-# on right now. Each run appends its outcome to the run log instead, and the
-# overdue watchdog is what speaks up when the runs stop landing.
+# on right now. Each run appends its outcome to the run log instead.
 
 set -uo pipefail
 
@@ -18,9 +17,8 @@ DEST="/home/max/data/phone"
 # own PATH and it does not carry ~/bin.
 run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../bin/run-log"
 
-# The run log is a record, not a control flow: if writing it fails, run-log says
-# so on stderr and the sync carries on. A missing line is what the overdue
-# watchdog exists to catch.
+# Recording the run must never decide whether the sync succeeded: run-log
+# explains itself on stderr and the sync carries on.
 log_run() {
     "$run_log_bin" phone-sync "$@" || true
 }

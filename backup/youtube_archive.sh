@@ -3,8 +3,8 @@
 #
 # Sends no notifications: a new video, a video gone from YouTube, and a quiet
 # day are all things to read later, not to be told about. Each run appends its
-# counts to the run log instead, and the overdue watchdog is what speaks up
-# when the runs stop landing.
+# counts to the run log instead, and a run with a failed playlist exits 1 so
+# the systemd unit shows it.
 
 set -uo pipefail
 
@@ -13,9 +13,8 @@ set -uo pipefail
 # nix/nixos/pc/youtube-download.nix has to bind this path in.
 run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../bin/run-log"
 
-# The run log is a record, not a control flow: if writing it fails, run-log says
-# so on stderr and the download carries on. A missing line is what the overdue
-# watchdog exists to catch.
+# Recording the run must never decide whether the download succeeded: run-log
+# explains itself on stderr and the download carries on.
 log_run() {
     "$run_log_bin" youtube-download "$@" || true
 }
@@ -222,6 +221,8 @@ stats=$(jq -n \
 
 if [ ${#failed_playlists[@]} -eq 0 ]; then
     log_run ok --stats "$stats"
-else
-    log_run fail --reason "playlists failed: $(IFS=,; echo "${failed_playlists[*]}")" --stats "$stats"
+    exit 0
 fi
+
+log_run fail --reason "playlists failed: $(IFS=,; echo "${failed_playlists[*]}")" --stats "$stats"
+exit 1

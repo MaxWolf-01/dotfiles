@@ -11,10 +11,12 @@ let
     exec ${pkgs.yt-dlp}/bin/yt-dlp --plugin-dirs ${bgutilPlugin}/${pkgs.python3.sitePackages} "$@"
   '';
 
-  # jq: bin/run-log builds its JSON line with it
+  # jq: bin/run-log builds its JSON line with it. No curl — the script's only
+  # use for one was the notification it no longer sends, and this unit is
+  # sandboxed precisely because yt-dlp handles hostile content.
   ytPath = lib.makeBinPath [
     yt-dlp-wrapped
-    pkgs.bash pkgs.coreutils pkgs.gnused pkgs.gnugrep pkgs.ffmpeg pkgs.curl pkgs.jq
+    pkgs.bash pkgs.coreutils pkgs.gnused pkgs.gnugrep pkgs.ffmpeg pkgs.jq
   ];
 in
 {
