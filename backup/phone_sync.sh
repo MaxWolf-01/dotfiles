@@ -4,12 +4,26 @@
 #   - Tailscale running on both PC and phone
 #   - rsync installed on phone (pkg install rsync in Termux)
 #   - ZFS dataset tank/max/phone mounted at /home/max/data/phone
+#
+# Sends no notifications: an away phone or an unsynced photo is nothing to act
+# on right now. Each run appends its outcome to the run log instead, and the
+# overdue watchdog is what speaks up when the runs stop landing.
 
 set -uo pipefail
 
 PHONE_HOST="phone"
 DEST="/home/max/data/phone"
-NTFY_TOPIC="${NTFY_TOPIC:-}"
+
+# Reached relative to this script, not through PATH: the systemd unit pins its
+# own PATH and it does not carry ~/bin.
+run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../bin/run-log"
+
+# The run log is a record, not a control flow: if writing it fails, run-log says
+# so on stderr and the sync carries on. A missing line is what the overdue
+# watchdog exists to catch.
+log_run() {
+    "$run_log_bin" phone-sync "$@" || true
+}
 
 # The phone drops the connection on long transfers (screen off, Android
 # suspending Termux, mobile link). Each attempt resumes from the partial dir,
@@ -30,12 +44,14 @@ declare -A DIRS=(
 # Pre-flight: ZFS dataset must be mounted
 if ! mountpoint -q "$DEST"; then
     echo "Skipping phone sync: $DEST is not mounted"
+    log_run skip --reason "$DEST is not mounted"
     exit 0
 fi
 
 # Pre-flight: phone must be reachable
 if ! ssh -o ConnectTimeout=10 "$PHONE_HOST" true 2>/dev/null; then
     echo "Skipping phone sync: $PHONE_HOST is not reachable"
+    log_run skip --reason "$PHONE_HOST is not reachable"
     exit 0
 fi
 
@@ -45,7 +61,7 @@ log_file="$log_dir/sync_$(date +%Y%m%d_%H%M%S).log"
 
 echo "=== Phone Sync - $(date) ===" | tee "$log_file"
 
-failed=""
+failed_dirs=()
 total_transferred=0
 
 # Socket I/O (10), protocol stream (12), I/O timeout (30) and ssh dying (255)
@@ -92,7 +108,7 @@ for phone_path in "${!DIRS[@]}"; do
 
     if [ $rc -ne 0 ]; then
         echo "  FAILED (exit $rc after $attempt attempt(s))" | tee -a "$log_file"
-        failed="${failed}${DIRS[$phone_path]}, "
+        failed_dirs+=("${DIRS[$phone_path]}")
     else
         echo "  OK ($count new files, $attempt attempt(s))" | tee -a "$log_file"
         total_transferred=$((total_transferred + count))
@@ -103,19 +119,17 @@ echo "" | tee -a "$log_file"
 echo "=== Summary ===" | tee -a "$log_file"
 echo "Log: $log_file" | tee -a "$log_file"
 
-if [ -n "$failed" ]; then
-    echo "Failed: ${failed%, }" | tee -a "$log_file"
+stats=$(jq -n --argjson files_synced "$total_transferred" \
+              --arg log "$log_file" \
+              --args '$ARGS.named + {dirs_failed: $ARGS.positional}' \
+              -- "${failed_dirs[@]}")
+
+if [ ${#failed_dirs[@]} -eq 0 ]; then
+    log_run ok --stats "$stats"
+    exit 0
 fi
 
-# Notification
-if [ -n "$NTFY_TOPIC" ]; then
-    if [ -n "$failed" ]; then
-        curl -s -H "Title: Phone Sync - Failures" -H "Priority: 4" -H "Tags: phone,warning" \
-            -d "Failed: ${failed%, }" "https://ntfy.sh/$NTFY_TOPIC"
-    elif [ $total_transferred -gt 0 ]; then
-        curl -s -H "Title: Phone Sync" -H "Priority: 2" -H "Tags: phone,success" \
-            -d "Synced $total_transferred new files" "https://ntfy.sh/$NTFY_TOPIC"
-    fi
-fi
-
-[ -z "$failed" ] || exit 1
+failed_list=$(IFS=,; echo "${failed_dirs[*]}")
+echo "Failed: $failed_list" | tee -a "$log_file"
+log_run fail --reason "rsync failed for: $failed_list" --stats "$stats"
+exit 1

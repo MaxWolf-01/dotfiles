@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
+# Download the configured YouTube playlists.
+#
+# Sends no notifications: a new video, a video gone from YouTube, and a quiet
+# day are all things to read later, not to be told about. Each run appends its
+# counts to the run log instead, and the overdue watchdog is what speaks up
+# when the runs stop landing.
 
 set -uo pipefail
+
+# Reached relative to this script, not through PATH: the systemd unit pins its
+# own PATH and it does not carry ~/bin. The unit also runs sandboxed, so
+# nix/nixos/pc/youtube-download.nix has to bind this path in.
+run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../bin/run-log"
+
+# The run log is a record, not a control flow: if writing it fails, run-log says
+# so on stderr and the download carries on. A missing line is what the overdue
+# watchdog exists to catch.
+log_run() {
+    "$run_log_bin" youtube-download "$@" || true
+}
 
 playlist_file="${1:-}"
 output_dir="${2:-}"
@@ -14,29 +32,29 @@ fi
 
 if [ ! -f "$playlist_file" ]; then
     echo "Playlist file not found: $playlist_file"
+    log_run fail --reason "playlist file not found: $playlist_file"
     exit 1
 fi
-
-ntfy_topic="${NTFY_TOPIC:-}"
 
 # Check yt-dlp is available
 if ! command -v yt-dlp &> /dev/null; then
     echo "yt-dlp not found. Run: ./setup ytdlp"
+    log_run fail --reason "yt-dlp not on PATH"
     exit 1
 fi
 
-# Create log directory and run log
+# Create log directory and per-run summary log
 log_dir="$HOME/logs/youtube"
 mkdir -p "$log_dir"
-run_log="$log_dir/run_$(date +%Y%m%d_%H%M%S).log"
+summary_log="$log_dir/run_$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== YouTube Download - $(date) ===" | tee -a "$run_log"
-echo "Output dir: $output_dir" | tee -a "$run_log"
-echo "" | tee -a "$run_log"
+echo "=== YouTube Download - $(date) ===" | tee -a "$summary_log"
+echo "Output dir: $output_dir" | tee -a "$summary_log"
+echo "" | tee -a "$summary_log"
 
 # Process each playlist
 all_downloaded_titles=()
-failed_playlists=""
+failed_playlists=()
 total_error_unavailable=0
 total_error_copyright=0
 total_error_deleted=0
@@ -75,7 +93,7 @@ while IFS='|' read -r url format name; do
 
     log_file="$log_dir/${name}_$(date +%Y%m%d_%H%M%S).log"
 
-    echo "Downloading $name..." | tee -a "$run_log"
+    echo "Downloading $name..." | tee -a "$summary_log"
     "${cmd[@]}" > "$log_file" 2>&1
     exit_code=$?
 
@@ -143,17 +161,17 @@ while IFS='|' read -r url format name; do
     fi
 
     if [ "$is_failure" = true ]; then
-        failed_playlists="${failed_playlists}${name}, "
-        echo "  Failed (exit code: $exit_code)" | tee -a "$run_log"
+        failed_playlists+=("$name")
+        echo "  Failed (exit code: $exit_code)" | tee -a "$summary_log"
     else
         if [ ${#downloaded_titles[@]} -gt 0 ]; then
-            echo "  Downloaded ${#downloaded_titles[@]} video(s)" | tee -a "$run_log"
+            echo "  Downloaded ${#downloaded_titles[@]} video(s)" | tee -a "$summary_log"
             all_downloaded_titles+=("${downloaded_titles[@]}")
         else
-            echo "  No new videos" | tee -a "$run_log"
+            echo "  No new videos" | tee -a "$summary_log"
         fi
         if [ ${#pl_error_ids[@]} -gt 0 ]; then
-            echo "  Errors: ${#pl_error_ids[@]} videos (${pl_errors_archived} archived, ${pl_errors_lost} never captured)" | tee -a "$run_log"
+            echo "  Errors: ${#pl_error_ids[@]} videos (${pl_errors_archived} archived, ${pl_errors_lost} never captured)" | tee -a "$summary_log"
         fi
     fi
 
@@ -166,68 +184,44 @@ while IFS='|' read -r url format name; do
     total_errors_lost=$((total_errors_lost + pl_errors_lost))
 done < "$playlist_file"
 
-# Write summary to run log
-echo "" | tee -a "$run_log"
-echo "=== Summary ===" | tee -a "$run_log"
-echo "Total downloaded: ${#all_downloaded_titles[@]}" | tee -a "$run_log"
+# Write the run summary
+echo "" | tee -a "$summary_log"
+echo "=== Summary ===" | tee -a "$summary_log"
+echo "Total downloaded: ${#all_downloaded_titles[@]}" | tee -a "$summary_log"
 if [ ${#all_downloaded_titles[@]} -gt 0 ]; then
-    echo "Downloaded videos:" | tee -a "$run_log"
-    printf '  - %s\n' "${all_downloaded_titles[@]}" | tee -a "$run_log"
+    echo "Downloaded videos:" | tee -a "$summary_log"
+    printf '  - %s\n' "${all_downloaded_titles[@]}" | tee -a "$summary_log"
 fi
 
 error_count=$((total_error_unavailable + total_error_copyright + total_error_deleted + total_error_other))
 if [ $error_count -gt 0 ]; then
-    echo "Errors encountered:" | tee -a "$run_log"
-    [ $total_error_unavailable -gt 0 ] && echo "  - Unavailable: $total_error_unavailable" | tee -a "$run_log"
-    [ $total_error_copyright -gt 0 ] && echo "  - Copyright: $total_error_copyright" | tee -a "$run_log"
-    [ $total_error_deleted -gt 0 ] && echo "  - Deleted/Removed: $total_error_deleted" | tee -a "$run_log"
-    [ $total_error_other -gt 0 ] && echo "  - Other: $total_error_other" | tee -a "$run_log"
-    echo "  Never captured: ${total_errors_lost}" | tee -a "$run_log"
+    echo "Errors encountered:" | tee -a "$summary_log"
+    [ $total_error_unavailable -gt 0 ] && echo "  - Unavailable: $total_error_unavailable" | tee -a "$summary_log"
+    [ $total_error_copyright -gt 0 ] && echo "  - Copyright: $total_error_copyright" | tee -a "$summary_log"
+    [ $total_error_deleted -gt 0 ] && echo "  - Deleted/Removed: $total_error_deleted" | tee -a "$summary_log"
+    [ $total_error_other -gt 0 ] && echo "  - Other: $total_error_other" | tee -a "$summary_log"
+    echo "  Never captured: ${total_errors_lost}" | tee -a "$summary_log"
 fi
 
-if [ -n "$failed_playlists" ]; then
-    echo "Failed playlists: ${failed_playlists%, }" | tee -a "$run_log"
+if [ ${#failed_playlists[@]} -gt 0 ]; then
+    echo "Failed playlists: ${failed_playlists[*]}" | tee -a "$summary_log"
 fi
-echo "Run log: $run_log" | tee -a "$run_log"
+echo "Log: $summary_log" | tee -a "$summary_log"
 
-# Send notification
-if [ -n "$ntfy_topic" ]; then
-    # Build notification message
-    msg=""
-    if [ ${#all_downloaded_titles[@]} -gt 0 ]; then
-        msg="Downloaded ${#all_downloaded_titles[@]} video(s):\n"
-        for title in "${all_downloaded_titles[@]}"; do
-            msg+="• $title\n"
-        done
-    else
-        msg="No new videos downloaded.\n"
-    fi
+# "gone" is the expected attrition — videos YouTube no longer serves. Whether
+# that cost us anything is `never_captured`: the ones we never had a copy of.
+stats=$(jq -n \
+    --argjson downloaded "${#all_downloaded_titles[@]}" \
+    --argjson gone "$((total_error_unavailable + total_error_copyright + total_error_deleted))" \
+    --argjson errors_other "$total_error_other" \
+    --argjson already_archived "$total_errors_archived" \
+    --argjson never_captured "$total_errors_lost" \
+    --arg log "$summary_log" \
+    --args '$ARGS.named + {playlists_failed: $ARGS.positional}' \
+    -- "${failed_playlists[@]}")
 
-    if [ $error_count -gt 0 ]; then
-        gone=$((total_error_unavailable + total_error_copyright + total_error_deleted))
-        msg+="\n${gone} gone"
-        [ $total_error_other -gt 0 ] && msg+=", ${total_error_other} unexpected errors"
-    fi
-
-    if [ -n "$failed_playlists" ]; then
-        msg+="\n\nFailed: ${failed_playlists%, }"
-    fi
-
-    # Determine priority and title
-    if [ -n "$failed_playlists" ]; then
-        title="YouTube Download - Failures"
-        priority=3
-        tags="youtube,warning"
-    elif [ ${#all_downloaded_titles[@]} -gt 0 ]; then
-        title="YouTube Download - ${#all_downloaded_titles[@]} New"
-        priority=2
-        tags="youtube,success"
-    else
-        title="YouTube Download - Up to Date"
-        priority=1
-        tags="youtube,info"
-    fi
-
-    curl -s -H "Title: $title" -H "Priority: $priority" -H "Tags: $tags" \
-         -d "$msg" "https://ntfy.sh/$ntfy_topic" || true
+if [ ${#failed_playlists[@]} -eq 0 ]; then
+    log_run ok --stats "$stats"
+else
+    log_run fail --reason "playlists failed: $(IFS=,; echo "${failed_playlists[*]}")" --stats "$stats"
 fi

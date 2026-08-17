@@ -11,14 +11,18 @@ let
     exec ${pkgs.yt-dlp}/bin/yt-dlp --plugin-dirs ${bgutilPlugin}/${pkgs.python3.sitePackages} "$@"
   '';
 
+  # jq: bin/run-log builds its JSON line with it
   ytPath = lib.makeBinPath [
     yt-dlp-wrapped
-    pkgs.bash pkgs.coreutils pkgs.gnused pkgs.gnugrep pkgs.ffmpeg pkgs.curl
+    pkgs.bash pkgs.coreutils pkgs.gnused pkgs.gnugrep pkgs.ffmpeg pkgs.curl pkgs.jq
   ];
 in
 {
+  # The run log directory has to exist outside the sandbox before BindPaths can
+  # map it in; run-log's own mkdir would land on the unit's tmpfs home instead.
   systemd.tmpfiles.rules = [
     "d /home/max/logs/youtube 0755 max users -"
+    "d /home/max/logs/runs 0755 max users -"
   ];
 
   systemd.services.youtube-download = {
@@ -33,7 +37,6 @@ in
         "PATH=${ytPath}"
         "YOUTUBE_COOKIES=${cookieFile}"
       ];
-      EnvironmentFile = "${secrets}/env/youtube-download.env";
       ExecStart = "${dotfiles}/backup/youtube_archive.sh ${secrets}/backup/playlists.txt /home/max/data/yt";
 
       # Sandboxing: yt-dlp parses arbitrary web content, isolate it from secrets
@@ -42,11 +45,13 @@ in
       ProtectHome = "tmpfs";
       BindReadOnlyPaths = [
         "${dotfiles}/backup/youtube_archive.sh"
+        "${dotfiles}/bin/run-log"
         "${secrets}/backup/playlists.txt"
       ];
       BindPaths = [
         "/home/max/data/yt"
         "/home/max/logs/youtube"
+        "/home/max/logs/runs"
         "-${cookieFile}"
       ];
       PrivateTmp = true;

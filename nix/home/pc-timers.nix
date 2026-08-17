@@ -9,8 +9,9 @@ let
     bash coreutils util-linux gnused gnugrep restic openssh sops curl jq age sqlite
   ]);
 
+  # jq: bin/run-log builds its JSON line with it
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils util-linux rsync openssh curl gnugrep
+    bash coreutils util-linux rsync openssh gnugrep jq
   ]);
 
   # Age key on tmpfs (decrypted on first SSH login, see secrets/zshrc)
@@ -65,7 +66,6 @@ in
         "PATH=${syncPath}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      EnvironmentFile = "${secrets}/env/phone-sync.env";
       ExecStart = "${dotfiles}/backup/phone_sync.sh";
     };
   };
