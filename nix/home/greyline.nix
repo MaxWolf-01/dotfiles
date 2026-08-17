@@ -11,10 +11,12 @@
 #   - both light and dark keys are set so it shows in either colour scheme.
 #   - extraPackages = []: the default pulls in sway, which we don't need.
 #
-# interval: every tick renders a 3840x2400 PNG — ~0.5 s and ~75 MB peak with the
-# fork's base-map cache warm — and then makes gnome-shell decode a 37 MB texture
-# into RAM the iGPU shares. At 5 minutes the daylight terminator lags by at most
-# 1.25° of longitude, which is not visible on a world map.
+# interval and resolution together set the CPU cost: every tick renders a PNG and
+# then makes gnome-shell decode it into RAM the iGPU shares. Resolution is the
+# lever. The daylight terminator moves 0.25° of longitude per minute, so the
+# interval sets how far behind the drawn sun is: at 5 minutes it lags by at most
+# 1.25°, which is not visible on a world map. Cutting resolution costs no
+# freshness at all — the render and the decode both scale with the pixel count.
 #
 # `command` goes in settings (config.toml), NOT services.greyline.command: the
 # module fuses `--font-family "<value>"` with `--command` (a stripped leading
@@ -37,7 +39,7 @@
       theme = "dark";
       format = "hour";
       logo = false;
-      resolution = "3840x2400"; # native panel; the service can't rely on xrandr
+      resolution = "2560x1600"; # two thirds of the panel per axis; GNOME scales up
       twilight = {
         bands = true;
         darkness = "subtle";
