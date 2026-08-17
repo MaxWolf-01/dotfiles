@@ -61,11 +61,13 @@ in
           ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/pane_contents_*.tar.gz 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +501 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
         fi
 
-        # Resurrect never prunes its state files (it only dedupes identical
-        # consecutive saves). Keep 7 days — but never the file `last` points
-        # at, so a layout idle longer than that stays restorable.
-        keep=$(${pkgs.coreutils}/bin/readlink -f "$resurrect_dir/last" 2>/dev/null)
-        ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -mtime +7 ! -path "$keep" -delete
+        # Resurrect dedupes identical consecutive state files but never deletes
+        # old distinct ones. Keep min(7 days, newest 5k) — but always the
+        # newest: dedupe means it can itself age past 7 days (unchanged layout
+        # for a week), and deleting it would leave `last` dangling.
+        newest=$(${pkgs.coreutils}/bin/readlink -f "$resurrect_dir/last" 2>/dev/null)
+        ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -mtime +7 ! -path "$newest" -delete
+        ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/tmux_resurrect_*.txt 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +5001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
 
         save_script=$(${tmux} show-options -gqv @resurrect-save-script-path)
         [ -x "$save_script" ] && "$save_script" quiet 2>/dev/null
