@@ -54,22 +54,25 @@ in
 
         resurrect_dir="$HOME/.tmux/resurrect"
 
-        # Rotate pane_contents.tar.gz before save
+        # Rotate pane_contents.tar.gz before save. Retention for both the
+        # rotated archives and the state files below: 14 days, with a 100k
+        # count cap that cannot bind under real usage (14d of every-minute
+        # saves is ~20k) and only guards runaway growth. Worst-case size:
+        # tars ~20k x ~180 KB = ~3.6 GB, state files ~100 MB.
         pane_archive="$resurrect_dir/pane_contents.tar.gz"
         if [ -f "$pane_archive" ]; then
           ${pkgs.coreutils}/bin/cp "$pane_archive" "$resurrect_dir/pane_contents_$(${pkgs.coreutils}/bin/date +%Y%m%dT%H%M%S).tar.gz"
-          ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/pane_contents_*.tar.gz 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +501 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
+          ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'pane_contents_*.tar.gz' -mtime +14 -delete
+          ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/pane_contents_*.tar.gz 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +100001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
         fi
 
         # Resurrect dedupes identical consecutive state files but never deletes
-        # old distinct ones. Retention is 7 days; the 20k count cap (~100 MB)
-        # cannot bind under real usage (7d of every-minute distinct saves is
-        # 10k) and only guards a broken dedupe flooding the dir. The newest
-        # file is always kept: dedupe means it can itself age past 7 days
-        # (unchanged layout for a week), and deleting it would dangle `last`.
+        # old distinct ones. The newest is always kept: dedupe means it can
+        # itself age past 14 days (unchanged layout), and deleting it would
+        # dangle `last`.
         newest=$(${pkgs.coreutils}/bin/readlink -f "$resurrect_dir/last" 2>/dev/null)
-        ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -mtime +7 ! -path "$newest" -delete
-        ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/tmux_resurrect_*.txt 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +20001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
+        ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -mtime +14 ! -path "$newest" -delete
+        ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/tmux_resurrect_*.txt 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +100001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
 
         save_script=$(${tmux} show-options -gqv @resurrect-save-script-path)
         [ -x "$save_script" ] && "$save_script" quiet 2>/dev/null
