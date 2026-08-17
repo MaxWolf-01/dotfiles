@@ -312,9 +312,16 @@
         HostName = "100.97.152.25";
         User = "max";
       };
+      # accept-new so an unattended job can reach here on a machine that has
+      # never had an interactive ssh to it — pc's overdue-check reads this
+      # host's run logs, and BatchMode turns an unknown host key into a silent
+      # skip that looks exactly like a closed laptop. Trust-on-first-use is no
+      # weaker than it looks: the address is a tailnet one, so the first
+      # connection is already inside WireGuard.
       "zephylux main" = {
         HostName = "100.104.165.39";
         User = "max";
+        StrictHostKeyChecking = "accept-new";
       };
       # SFTPGo's own SSH server, not pc's sshd: `sftp drop` reaches the file
       # drop, `ssh pc` still reaches the machine. pc's tailnet address, not the

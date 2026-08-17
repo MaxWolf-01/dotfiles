@@ -208,11 +208,9 @@ in
   };
 
   # --- Overdue watchdog ---
-  # A job that skips (locked dataset, unreachable phone) exits 0 and notifies
-  # nothing, so work can stop happening unnoticed. This watches the outcomes
-  # instead: snapshot ages for restic repos, time since the last successful run
-  # for everything else. The laptop runs the same check with --extra-days, so
-  # either machine dying still leaves an alarm standing. See bin/overdue-check.
+  # The only scheduled alerter; what it watches and why is in bin/overdue-check.
+  # No offset here: this host reaches its bounds first, and the laptop runs the
+  # same check with --extra-days so either machine dying leaves an alarm standing.
 
   systemd.user.services.overdue-check = {
     Unit = {

@@ -3,16 +3,23 @@
 # directly; no framework.
 #
 # The cases here are the promises the watchdog makes: that a bound is the only
-# thing standing between a dead unit and silence, that a run log outranks
-# systemd's opinion of the same unit, that a host being off is not an alarm, and
-# that a breach produces exactly one notification naming what broke.
+# thing standing between a dead unit and silence, that a unit judged by its run
+# log is never quietly judged by systemd instead, that a host being off is not
+# an alarm, and that a breach produces exactly one notification naming what
+# broke.
 #
-# HOME is redirected at a scratch dir, which is what isolates the run: it moves
-# the run logs, and it empties the restic config glob so no repo is contacted.
+# HOME is redirected at a scratch dir, which moves the run logs and empties the
+# restic config glob so no repo is contacted. The systemd cases are the one
+# thing not isolated: they read this machine's real journal, because a fake one
+# would only prove the fake right.
 
 set -uo pipefail
 
 bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Read from the script rather than repeated here: a test that carries its own
+# copy of the id would keep passing against an id the script no longer uses.
+unit_started=$(sed -n 's/^SYSTEMD_UNIT_STARTED=//p' "$bin_dir/overdue-check")
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -78,14 +85,14 @@ log_line stale-unit ok 9
 
 run <<EOF
 ntfy_topic: a-topic
-fresh-unit $this_host 3
+fresh-unit $this_host 3 run-log
 EOF
 check "a unit inside its bound exits 0" 0 "$rc"
 check "...and sends nothing" 0 "$(ntfy_count)"
 
 run <<EOF
 ntfy_topic: a-topic
-stale-unit $this_host 3
+stale-unit $this_host 3 run-log
 EOF
 check "a unit past its bound exits 1" 1 "$rc"
 check "...sends exactly one notification" 1 "$(ntfy_count)"
@@ -96,7 +103,7 @@ check "...naming the unit and both ages" \
 # The acceptance case: tighten a bound to 0 and the unit must surface.
 run <<EOF
 ntfy_topic: a-topic
-fresh-unit $this_host 0
+fresh-unit $this_host 0 run-log
 EOF
 check "bound 0 makes a unit that ran yesterday overdue" 1 "$rc"
 check "...in exactly one notification" 1 "$(ntfy_count)"
@@ -105,7 +112,7 @@ check "...in exactly one notification" 1 "$(ntfy_count)"
 
 run --extra-days 7 <<EOF
 ntfy_topic: a-topic
-stale-unit $this_host 3
+stale-unit $this_host 3 run-log
 EOF
 check "--extra-days lifts the bound past the breach" 0 "$rc"
 check "...so the offset host stays silent" 0 "$(ntfy_count)"
@@ -117,7 +124,7 @@ log_line failing-unit fail 1
 
 run <<EOF
 ntfy_topic: a-topic
-failing-unit $this_host 30
+failing-unit $this_host 30 run-log
 EOF
 check "a unit that only ever fails is overdue however loose the bound" 1 "$rc"
 check "...reported as having no successful run" \
@@ -132,7 +139,7 @@ log_line skipping-unit skip 1
 
 run <<EOF
 ntfy_topic: a-topic
-skipping-unit $this_host 30
+skipping-unit $this_host 30 run-log
 EOF
 check "a skip streak does not refresh the clock" 1 "$rc"
 check "...the age is measured from the last real success" \
@@ -143,23 +150,24 @@ check "...the age is measured from the last real success" \
 
 run <<EOF
 ntfy_topic: a-topic
-never-ran-unit $this_host 90
+never-ran-unit $this_host 90 run-log
 EOF
-check "a unit with no run log and no journal entry is reported" 1 "$rc"
+check "a unit with nothing on record is reported" 1 "$rc"
 check "...rather than skipped" \
     "yes" \
     "$(grep -q 'never-ran-unit' "$work/ntfy.log" && echo yes || echo no)"
 
-# --- the run log outranks systemd for units that keep one
+# --- a unit judged by its run log is never judged by systemd instead
 #
-# systemd only knows the unit exited 0. A run-logged job exits 0 when it
-# deliberately did nothing, so trusting systemd here would read a skip streak as
-# health. This host's journal has a real unit to check that against.
+# systemd only knows the unit exited 0, and a run-logged job exits 0 when it
+# deliberately did nothing — so silently reading the journal when the run log is
+# missing would turn a broken recorder into a clean bill of health. This host's
+# journal holds a real unit that succeeded minutes ago to prove the point on.
 
 journal_unit=""
 for candidate in github-mirror browsing-archive jarvis-sync dns-audit; do
     if [ -n "$(journalctl --user -u "$candidate.service" \
-        MESSAGE_ID=39f53479d3a045ac8e11786248231fbf JOB_RESULT=done \
+        "MESSAGE_ID=$unit_started" JOB_RESULT=done \
         -n 1 -o cat --no-pager 2>/dev/null)" ]; then
         journal_unit="$candidate"
         break
@@ -171,16 +179,22 @@ if [ -z "$journal_unit" ]; then
 else
     run <<EOF
 ntfy_topic: a-topic
-$journal_unit $this_host 30
+$journal_unit $this_host 30 systemd
 EOF
-    check "a unit with no run log falls back to systemd ($journal_unit)" 0 "$rc"
+    check "the systemd witness reads a real clean finish ($journal_unit)" 0 "$rc"
 
-    log_line "$journal_unit" ok 60
     run <<EOF
 ntfy_topic: a-topic
-$journal_unit $this_host 30
+$journal_unit $this_host 30 run-log
 EOF
-    check "...but once it keeps a run log, the run log decides" 1 "$rc"
+    check "...and the same unit with no run log is overdue, not healthy" 1 "$rc"
+
+    log_line "$journal_unit" skip 1
+    run <<EOF
+ntfy_topic: a-topic
+$journal_unit $this_host 30 run-log
+EOF
+    check "...still overdue when its only record is a fresh skip" 1 "$rc"
     rm -f "$HOME/logs/runs/$journal_unit.jsonl"
 fi
 
@@ -188,13 +202,32 @@ fi
 
 run <<EOF
 ntfy_topic: a-topic
-some-unit a-host-that-is-off 1
+some-unit a-host-that-is-off 1 run-log
 EOF
 check "an unreachable host exits 0" 0 "$rc"
 check "...sends nothing" 0 "$(ntfy_count)"
 check "...and says so on stdout" \
     "yes" \
     "$(grep -q 'a-host-that-is-off not reachable' <<<"$out" && echo yes || echo no)"
+
+# --- a locked age key costs the repos, not the whole run
+#
+# pc keeps its key on tmpfs and decrypts it at the first interactive login, so
+# every run between a reboot and that login lands here. Giving up would make a
+# reboot silence the units too, and send nothing to say so.
+
+log_line locked-key-unit ok 9
+printf 'ntfy_topic: a-topic\nlocked-key-unit %s 3 run-log\n' "$this_host" > "$work/locked.conf"
+out=$(SOPS_AGE_KEY_FILE="$work/no-such-key" "$bin_dir/overdue-check" \
+    --config "$work/locked.conf" "$work/some-repo.conf" 2>&1)
+rc=$?
+check "a missing age key does not abort the run" 1 "$rc"
+check "...it is reported as something that could not be checked" \
+    "yes" \
+    "$(grep -q 'age key not available' <<<"$out" && echo yes || echo no)"
+check "...and the units are still checked" \
+    "yes" \
+    "$(grep -q 'locked-key-unit' <<<"$out" && echo yes || echo no)"
 
 # --- the check records its own run, so the other host can see it is alive
 
@@ -224,7 +257,11 @@ reject() {
 }
 
 reject "a unit line missing its bound" "some-unit $this_host"
-reject "a bound that is not a number" "some-unit $this_host soon"
+reject "a unit line missing its witness" "some-unit $this_host 7"
+reject "a bound that is not a number" "some-unit $this_host soon run-log"
+reject "a witness nothing can read" "some-unit $this_host 7 vibes"
+reject "a unit name that would escape into a path or a command" \
+    "../evil $this_host 7 run-log"
 reject "an unknown setting" "colour: green"
 
 out=$("$bin_dir/overdue-check" --config "$work/does-not-exist.conf" 2>&1); rc=$?

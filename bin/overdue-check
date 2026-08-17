@@ -11,11 +11,18 @@
 #
 #   restic repos     the age of the newest snapshot, against max_age_days in the
 #                    repo's own conf — the same files restic_backup.sh consumes.
-#   everything else  the last `ok` line in the unit's run log (bin/run-log), or,
-#                    for units that keep no run log, the last time systemd
-#                    finished the unit's start job cleanly. Bounds come from the
-#                    config file, which is also the written answer to "unit X
-#                    hasn't run in N days — is that a problem?".
+#   everything else  the last success recorded by whichever witness the config
+#                    names, against the bound it gives. The config is also the
+#                    written answer to "unit X hasn't run in N days — is that a
+#                    problem?".
+#
+# The witness is named per unit and never guessed. `run-log` means the last `ok`
+# line in ~/logs/runs/<unit>.jsonl (bin/run-log); a job that keeps one exits 0
+# when it deliberately does nothing, so only its own record can tell a real run
+# from a skip. `systemd` means the last time the unit's start job finished
+# cleanly, which is all there is to go on for a job that records nothing — and
+# is why falling back to it when a run log goes missing would be a downgrade
+# with no announcement.
 #
 # Units on another host are read over ssh. A host that is simply off is expected
 # unavailability, not an alert: its units are skipped and reported on stdout. A
@@ -52,9 +59,8 @@ Environment:
   RUN_LOG_DIR     where this host's run logs live (default ~/logs/runs).
   NTFY_BASE_URL   where to send the alert (default https://ntfy.sh).
 
-A unit that keeps a run log is judged by that log alone. Such jobs exit 0 when
-they deliberately do nothing, so systemd's "finished cleanly" would read a
-months-long skip streak as health — the failure this watchdog exists to catch.
+Config lines are '<unit> <host> <max_age_days> <run-log|systemd>', plus
+'ntfy_topic: <topic>'. See the comments in the config file itself.
 EOF
 }
 
@@ -115,15 +121,20 @@ run_log_path() {
     fi
 }
 
-# When did this unit last succeed? Prints epoch seconds on stdout.
+# When did this unit last succeed, according to the witness the config named?
+# Prints epoch seconds on stdout.
 #   0  found     1  nothing on record     2  host unreachable
 last_success() {
-    local host="$1" unit="$2" body rc ts epoch scope
+    local host="$1" unit="$2" witness="$3" body rc ts epoch scope
 
-    body=$(run_on "$host" cat "$(run_log_path "$host" "$unit")" 2>/dev/null)
-    rc=$?
-    [ "$rc" -eq 255 ] && [ "$host" != "$this_host" ] && return 2
-    if [ "$rc" -eq 0 ]; then
+    if [ "$witness" = "run-log" ]; then
+        body=$(run_on "$host" cat "$(run_log_path "$host" "$unit")" 2>/dev/null)
+        rc=$?
+        [ "$rc" -eq 255 ] && [ "$host" != "$this_host" ] && return 2
+        # A missing file is "no record", not a cue to go asking systemd: a unit
+        # declared to keep a run log and then not keeping one is a breakage, and
+        # it should read as one rather than quietly fall back to weaker evidence.
+        [ "$rc" -eq 0 ] || return 1
         ts=$(jq -r 'select(.outcome == "ok") | .ts' <<<"$body" 2>/dev/null | tail -1)
         [ -n "$ts" ] || return 1
         epoch=$(date -d "$ts" +%s 2>/dev/null) || return 1
@@ -131,8 +142,8 @@ last_success() {
         return 0
     fi
 
-    # No run log: ask systemd instead. The user manager first — that is where
-    # nearly everything lives — then the system one, for the few root units.
+    # The user manager first — that is where nearly everything lives — then the
+    # system one, for the few units that run as root.
     for scope in --user --system; do
         body=$(run_on "$host" journalctl "$scope" -u "$unit.service" \
             "MESSAGE_ID=$SYSTEMD_UNIT_STARTED" JOB_RESULT=done \
@@ -167,10 +178,16 @@ if [ ${#restic_configs[@]} -eq 0 ]; then
     shopt -u nullglob
 fi
 
+# Without the key every repo would read as unreadable, which is seven confusing
+# lines in place of one true one. Report it once and drop the repos — but carry
+# on: the unit checks need no key, and on pc the key lives on tmpfs and is only
+# decrypted at the first interactive login, so every run after a reboot lands
+# here. Giving up would leave that reboot silent in both directions.
 age_key="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
 if [ ${#restic_configs[@]} -gt 0 ] && [ ! -f "$age_key" ]; then
-    echo "Cannot check: age key not available at $age_key (decrypt it first)" >&2
-    exit 1
+    unchecked="  restic repos: age key not available at $age_key (decrypt it first)"$'\n'
+    unchecked_count=1
+    restic_configs=()
 fi
 
 for config in "${restic_configs[@]}"; do
@@ -239,27 +256,38 @@ done
 
 while read -r -u 3 line; do
     line="${line%%#*}"
-    read -r unit host days <<<"$line"
+    read -r unit host days witness <<<"$line"
     [ -n "$unit" ] || continue
 
     # "key: value" cannot collide with a unit name, which has no colon in it.
     if [[ "$unit" == *: ]]; then
-        case "${unit%:}" in
-            ntfy_topic) ntfy_topic="$host" ;;
-            *) echo "$unit_config: unknown setting '$unit'" >&2; exit 2 ;;
+        setting="${unit%:}"
+        value="$host"
+        case "$setting" in
+            ntfy_topic) ntfy_topic="$value" ;;
+            *) echo "$unit_config: unknown setting '$setting'" >&2; exit 2 ;;
         esac
         continue
     fi
 
-    if [ -z "$host" ] || ! [[ "$days" =~ ^[0-9]+$ ]]; then
-        echo "$unit_config: expected '<unit> <host> <max_age_days>', got: $line" >&2
+    # The unit name reaches a filename and an ssh command line, and a typo in it
+    # would otherwise surface as a permanent, mystifying "never ran". Same shape
+    # bin/run-log accepts, so a name that works in one works in the other.
+    if ! [[ "$unit" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+        echo "$unit_config: bad unit name '$unit' (lowercase letters, digits, . _ -)" >&2
+        exit 2
+    fi
+
+    if [ -z "$host" ] || ! [[ "$days" =~ ^[0-9]+$ ]] \
+        || { [ "$witness" != "run-log" ] && [ "$witness" != "systemd" ]; }; then
+        echo "$unit_config: expected '<unit> <host> <max_age_days> <run-log|systemd>', got: $line" >&2
         exit 2
     fi
 
     limit=$((days + extra_days))
     label="$unit ($host)"
 
-    last=$(last_success "$host" "$unit")
+    last=$(last_success "$host" "$unit" "$witness")
     case $? in
         2)
             unreachable="${unreachable}  ${label}: $host not reachable"$'\n'

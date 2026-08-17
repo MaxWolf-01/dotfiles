@@ -341,12 +341,10 @@ in
   };
 
   # --- Overdue watchdog ---
-  # The only scheduled alerter: restic repos that stopped receiving snapshots,
-  # and units that stopped succeeding. pc runs the same check without the offset,
-  # so it normally alerts first and this stays quiet. The offset exists so that a
-  # dead pc — which would take its alarm down with it — still surfaces here a
-  # week later. /usr/bin for journalctl: this host's own, not a nix build, so it
-  # reads a journal written by the same systemd.
+  # The only scheduled alerter; what it watches and why is in bin/overdue-check.
+  # The offset makes pc alert first and this host stay quiet, so a healthy setup
+  # notifies once. /usr/bin for journalctl: this host's own, not a nix build, so
+  # it reads a journal written by the same systemd that wrote it.
 
   systemd.user.services.overdue-check = {
     Unit = {
