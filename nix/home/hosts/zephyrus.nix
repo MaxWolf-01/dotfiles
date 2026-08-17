@@ -15,6 +15,7 @@
     ../gnome.nix
     ../greyline.nix
     ../timers.nix
+    ../vibe-typer.nix
     ../wayland.nix
   ];
 }
