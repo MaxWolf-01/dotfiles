@@ -34,6 +34,10 @@ let
     bash coreutils uv
   ]);
 
+  dashboardPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv openssh jq
+  ]);
+
   # util-linux for flock (vpn-pick serializes watcher vs. manual runs),
   # procps for pgrep (the Vesktop gate)
   vpnPath = lib.makeBinPath (with pkgs; [
@@ -368,6 +372,41 @@ in
       OnCalendar = "*-*-* 09:30:00";
       Persistent = true;
       RandomizedDelaySec = "15m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Dashboards ---
+  # One collector per topic dashboard, each writing a real file into ~/Documents
+  # (firejailed Firefox sees that directory and nothing under ~/.dotfiles).
+  # openssh to read pc's run logs, /usr/bin for this host's own journalctl, jq
+  # because bin/run-log builds its line with it.
+
+  systemd.user.services.dashboard-backups = {
+    Unit = {
+      Description = "Rebuild the backups dashboard from the run logs";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${dashboardPath}:/usr/bin:/bin"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${secrets}/scripts/dashboard-backups";
+      # oneshot has no start timeout of its own; a wedged ssh would otherwise
+      # leave the unit activating forever and every later firing a silent no-op.
+      TimeoutStartSec = "10min";
+    };
+  };
+
+  systemd.user.timers.dashboard-backups = {
+    Unit.Description = "Hourly backups dashboard refresh";
+    Timer = {
+      OnCalendar = "hourly";
+      Persistent = true;
+      RandomizedDelaySec = "5m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
