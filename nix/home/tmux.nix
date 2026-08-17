@@ -62,12 +62,14 @@ in
         fi
 
         # Resurrect dedupes identical consecutive state files but never deletes
-        # old distinct ones. Keep min(7 days, newest 5k) — but always the
-        # newest: dedupe means it can itself age past 7 days (unchanged layout
-        # for a week), and deleting it would leave `last` dangling.
+        # old distinct ones. Retention is 7 days; the 20k count cap (~100 MB)
+        # cannot bind under real usage (7d of every-minute distinct saves is
+        # 10k) and only guards a broken dedupe flooding the dir. The newest
+        # file is always kept: dedupe means it can itself age past 7 days
+        # (unchanged layout for a week), and deleting it would dangle `last`.
         newest=$(${pkgs.coreutils}/bin/readlink -f "$resurrect_dir/last" 2>/dev/null)
         ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -mtime +7 ! -path "$newest" -delete
-        ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/tmux_resurrect_*.txt 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +5001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
+        ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/tmux_resurrect_*.txt 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +20001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
 
         save_script=$(${tmux} show-options -gqv @resurrect-save-script-path)
         [ -x "$save_script" ] && "$save_script" quiet 2>/dev/null
