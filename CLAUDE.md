@@ -78,7 +78,7 @@ Structure:
 - `nix/home/gnome.nix` - GNOME keybindings, tiling-shell, dconf settings
 - `nix/home/newsboat.nix` - RSS reader with desktop notifications
 - `nix/home/tmux.nix` - tmux config
-- `nix/home/timers.nix` - systemd user timers, zephyrus only. A unit needing a secret gets it via `EnvironmentFile` from a file in the secrets repo, never from the Nix expression
+- `nix/home/timers.nix` - systemd user timers, zephyrus only
 - `nix/home/pc-timers.nix` - PC user timers (youtube backup, phone sync + backup, encrypted backup)
 - `nix/home/wayland.nix` - Wayland clipboard (wl-clipboard)
 - `nix/home/hosts/` - per-machine configs (stateVersion + imports)

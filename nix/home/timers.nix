@@ -29,10 +29,10 @@ let
     bash coreutils jq
   ]);
 
-  # The dns-* scripts are PEP 723 uv scripts, so uv resolves their deps at run.
-  # jq because bin/run-log, which dns-audit calls to record its outcome, builds
-  # its line with it.
-  dnsPath = lib.makeBinPath (with pkgs; [
+  # The dns-* scripts and the dashboard collectors are PEP 723 uv scripts, so uv
+  # resolves their deps at run. jq because bin/run-log, which each of them calls
+  # to record its outcome, builds its line with it.
+  uvScriptPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv jq
   ]);
 
@@ -45,13 +45,6 @@ let
   # and the run-log lines vpn-pick writes
   vpnPath = lib.makeBinPath (with pkgs; [
     bash coreutils util-linux gawk curl jq procps
-  ]);
-
-  # The dns/vpn dashboard shells out to dns-audit (another uv script) for the
-  # blocklist reading, and to tailscale — the Ubuntu system package in /usr/bin
-  # — for the exit node it is currently on.
-  dnsVpnDashPath = lib.makeBinPath (with pkgs; [
-    bash coreutils uv jq
   ]);
 
   sshAuthSock = "/run/user/1000/ssh-agent";
@@ -423,8 +416,10 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # zephylux only, and there is no host to add: it is the one machine that
-  # filters DNS and the one that holds a Mullvad exit node.
+  # This one collects from no other host, unlike the backups dashboard: zephylux
+  # is the only machine that filters DNS or holds a Mullvad exit node, so there
+  # is nothing to reach over ssh. /usr/bin for tailscale, the Ubuntu system
+  # package, which it asks for the node egress currently goes through.
 
   systemd.user.services.dashboard-dns-vpn = {
     Unit = {
@@ -434,7 +429,7 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${dnsVpnDashPath}:/usr/bin:/bin" ];
+      Environment = [ "PATH=${uvScriptPath}:/usr/bin:/bin" ];
       ExecStart = "${secrets}/scripts/dashboard-dns-vpn --record";
       TimeoutStartSec = "10min";
     };
@@ -566,7 +561,7 @@ in
     Service = {
       Type = "oneshot";
       # ${home}/bin for dns-blocked, which dns-audit shells out to
-      Environment = [ "PATH=${dnsPath}:${home}/bin:/usr/bin:/bin" ];
+      Environment = [ "PATH=${uvScriptPath}:${home}/bin:/usr/bin:/bin" ];
       ExecStart = "${secrets}/scripts/dns-audit";
       # oneshot defaults to no timeout; without this a wedged run leaves the
       # unit activating forever and every later firing is a silent no-op.
