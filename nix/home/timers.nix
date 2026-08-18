@@ -192,7 +192,9 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      # ${home}/bin for run-log: both scripts record what the run did there
+      # instead of notifying, and the watchdog reads it.
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/report.sh";
     };
   };
@@ -215,7 +217,9 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      # ${home}/bin for run-log: both scripts record what the run did there
+      # instead of notifying, and the watchdog reads it.
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/dep-scout.sh";
     };
   };
@@ -441,6 +445,30 @@ in
       # Ten past, not on the hour: the backups dashboard already runs then, and
       # both resolve a uv environment on a laptop that has just woken up.
       OnCalendar = "*:10:00";
+      Persistent = true;
+      RandomizedDelaySec = "5m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # Reads only files under ~/logs — the reports the yapit units save and the run
+  # logs they keep — so it needs neither the network nor anything from /usr/bin.
+
+  systemd.user.services.dashboard-yapit = {
+    Unit.Description = "Rebuild the yapit dashboard from the saved reports and the run logs";
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${uvScriptPath}" ];
+      ExecStart = "${secrets}/scripts/dashboard-yapit --record";
+      TimeoutStartSec = "10min";
+    };
+  };
+
+  systemd.user.timers.dashboard-yapit = {
+    Unit.Description = "Hourly yapit dashboard refresh";
+    Timer = {
+      # Twenty past: the other two collectors have the hour and ten past it.
+      OnCalendar = "*:20:00";
       Persistent = true;
       RandomizedDelaySec = "5m";
     };
