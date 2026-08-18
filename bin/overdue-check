@@ -24,9 +24,10 @@
 # is why falling back to it when a run log goes missing would be a downgrade
 # with no announcement.
 #
-# Units on another host are read over ssh. A host that is simply off is expected
-# unavailability, not an alert: its units are skipped and reported on stdout. A
-# dead pc still surfaces here, because its restic repos stop receiving snapshots.
+# Units on another host are read over ssh. A target that is merely away — a host
+# that is off, a repository whose server is down — is expected unavailability,
+# not an alert: it is skipped and reported on stdout. A dead pc still surfaces
+# here, because its restic repos stop receiving snapshots.
 
 set -uo pipefail
 
@@ -40,7 +41,7 @@ SYSTEMD_UNIT_STARTED=39f53479d3a045ac8e11786248231fbf
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--extra-days N] [--config FILE] [RESTIC_CONFIG...]
+Usage: $(basename "$0") [--extra-days N] [--config FILE] [--dry-run] [RESTIC_CONFIG...]
 
 Checks every restic config's newest snapshot against its max_age_days (default
 $DEFAULT_MAX_AGE_DAYS), and every unit in the config file against its bound there.
@@ -54,6 +55,9 @@ another host. Exits 1 if anything is overdue or unreadable.
                   offset stays quiet unless the other stopped alerting (i.e.
                   died), so a healthy setup alerts only once.
   --config FILE   unit bounds and the ntfy topic (default: the path above).
+  --dry-run       check everything and print what would have been sent, without
+                  sending it or recording this run. For trying out a config
+                  change without it reaching a phone.
 
 Environment:
   RUN_LOG_DIR     where this host's run logs live (default ~/logs/runs).
@@ -66,10 +70,12 @@ EOF
 
 extra_days=0
 unit_config="$DEFAULT_UNIT_CONFIG"
+dry_run=false
 restic_configs=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
+        --dry-run) dry_run=true; shift ;;
         --extra-days) extra_days="${2:?--extra-days needs a value}"; shift 2 ;;
         --extra-days=*) extra_days="${1#*=}"; shift ;;
         --config) unit_config="${2:?--config needs a value}"; shift 2 ;;
@@ -91,7 +97,9 @@ fi
 
 # Reached relative to this script, not through PATH: the systemd units pin their
 # own PATH and none of them carries ~/bin.
-run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-log"
+bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+run_log_bin="$bin_dir/run-log"
+unreachable_reason="$bin_dir/unreachable-reason"
 
 this_host="$(uname -n)"
 run_log_dir="${RUN_LOG_DIR:-$HOME/logs/runs}"
@@ -190,6 +198,9 @@ if [ ${#restic_configs[@]} -gt 0 ] && [ ! -f "$age_key" ]; then
     restic_configs=()
 fi
 
+probe_err=$(mktemp)
+trap 'rm -f "$probe_err"' EXIT
+
 for config in "${restic_configs[@]}"; do
     [ -f "$config" ] || continue
     name="$(basename "$(dirname "$config")")-$(basename "$config" .conf)"
@@ -232,13 +243,24 @@ for config in "${restic_configs[@]}"; do
         continue
     fi
 
+    # --no-lock: listing snapshots only reads, and a lock an interrupted run
+    # left behind must not be read as a repository nobody can open.
     latest=$(SOPS_AGE_KEY_FILE="$age_key_file" \
         restic --repo "$repo" --password-command "$password_command" \
-        snapshots --json 2>/dev/null | jq -r 'max_by(.time).time // empty')
+        snapshots --no-lock --json 2>"$probe_err" | jq -r 'max_by(.time).time // empty')
 
     if [ -z "$latest" ]; then
-        unchecked="${unchecked}  ${name}: no snapshots, or repo unreadable"$'\n'
-        unchecked_count=$((unchecked_count + 1))
+        # A repo whose target is down — rsync.net out, pc off — is the expected
+        # unavailability the backup itself records as a skip, and turning it
+        # into a notification the next morning would only move the noise. An
+        # outage that lasts still surfaces: the snapshots stop being fresh.
+        if reason=$("$unreachable_reason" "$probe_err"); then
+            unreachable="${unreachable}  ${name}: $reason"$'\n'
+            unreachable_count=$((unreachable_count + 1))
+        else
+            unchecked="${unchecked}  ${name}: no snapshots, or repo unreadable"$'\n'
+            unchecked_count=$((unchecked_count + 1))
+        fi
         continue
     fi
 
@@ -309,17 +331,21 @@ while read -r -u 3 line; do
     fi
 done 3< "$unit_config"
 
-[ -n "$unreachable" ] && printf 'Not checked, host away:\n%s' "$unreachable"
+[ -n "$unreachable" ] && printf 'Not checked, target away:\n%s' "$unreachable"
 
 # Recording this run must never decide whether the check succeeded. `ok` means
 # the check completed, not that it found nothing: the findings go to ntfy, while
 # the other host reads this log to see that the watchdog itself is still alive.
-"$run_log_bin" overdue-check ok --stats "$(jq -n \
-    --argjson overdue "$overdue_count" \
-    --argjson unchecked "$unchecked_count" \
-    --argjson unreachable "$unreachable_count" \
-    --argjson ok "$ok_count" \
-    '{overdue: $overdue, unchecked: $unchecked, unreachable: $unreachable, ok: $ok}')" || true
+# A dry run writes no line — it is a rehearsal, and the other host should not
+# read it as the watchdog's own timer still firing.
+if [ "$dry_run" = false ]; then
+    "$run_log_bin" overdue-check ok --stats "$(jq -n \
+        --argjson overdue "$overdue_count" \
+        --argjson unchecked "$unchecked_count" \
+        --argjson unreachable "$unreachable_count" \
+        --argjson ok "$ok_count" \
+        '{overdue: $overdue, unchecked: $unchecked, unreachable: $unreachable, ok: $ok}')" || true
+fi
 
 if [ -z "$overdue" ] && [ -z "$unchecked" ]; then
     echo "All $ok_count monitored unit(s) are within their bounds."
@@ -330,6 +356,12 @@ message=""
 [ -n "$overdue" ] && message="Overdue:"$'\n'"$overdue"
 [ -n "$unchecked" ] && message="${message}Could not check:"$'\n'"$unchecked"
 message="${message}"$'\n'"$ok_count unit(s) fine."
+
+if [ "$dry_run" = true ]; then
+    echo "$message"
+    echo "--dry-run: nothing sent${ntfy_topic:+ (topic $ntfy_topic)}"
+    exit 1
+fi
 
 echo "$message" >&2
 
