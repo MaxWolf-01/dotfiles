@@ -53,6 +53,18 @@ in
       OverrideFirstRunPage = "";
       OverridePostUpdatePage = "";
 
+      # The monitoring dashboards (docs/monitoring.md). Real files under
+      # ~/Documents because that is what the firejail profile lets Firefox see.
+      # In the menu, not the toolbar, which is hidden below.
+      # Firefox only removes a policy bookmark while the policy is still there,
+      # so dropping one means setting it to [ ] and starting Firefox once —
+      # deleting the entry outright leaves the bookmark behind as a normal one.
+      Bookmarks = [
+        { Title = "backups"; URL = "file://${home}/Documents/dashboards/backups.html"; Folder = "Dashboards"; Placement = "menu"; }
+        { Title = "dns + vpn"; URL = "file://${home}/Documents/dashboards/dns-vpn.html"; Folder = "Dashboards"; Placement = "menu"; }
+        { Title = "yapit"; URL = "file://${home}/Documents/dashboards/yapit.html"; Folder = "Dashboards"; Placement = "menu"; }
+      ];
+
       EnableTrackingProtection = {
         Value = true;
         Cryptomining = true;

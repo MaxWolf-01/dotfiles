@@ -13,6 +13,7 @@ dotfiles
 ├── backup        # restic/rsync backup scripts (run logs; ntfy on failure)
 ├── bin           # custom scripts
 ├── desktop       # icons, discord theme
+├── docs          # dns, monitoring, sftpgo, new NixOS machines, cheatsheets
 ├── nix
 │   ├── home
 │   │   ├── common.nix     # CLI tools, git, zsh plugins (all hosts)
