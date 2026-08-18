@@ -25,6 +25,7 @@ Examples:
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -64,15 +65,15 @@ class Args:
 
 def main(args: Args) -> None:
     out = Path(args.output).expanduser()
-    summary = build(args, out, args.summary)
+    summary, generated = build(args, out, args.summary)
     if args.open and not args.watch:
         subprocess.Popen(["xdg-open", str(out.resolve())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if args.watch:
-        watch(args, out, summary)
+        watch(args, out, summary, generated)
 
 
-def build(args: Args, out: Path, summary: str) -> str:
-    """Collect, render, write. Returns the summary actually used so watch regenerations can reuse it."""
+def build(args: Args, out: Path, summary: str) -> tuple[str, str]:
+    """Collect, render, write. Returns (summary used, generation timestamp) so watch mode can reuse both."""
     sources = [collect_source(spec, args.context) for spec in args.sources]
     if not any(s["files"] for s in sources):
         sys.exit("diffview: no changes found in any source")
@@ -99,24 +100,27 @@ def build(args: Args, out: Path, summary: str) -> str:
         .replace("__HLJS__", fetch_hljs(langs))
         .replace('"__DATA__"', payload)
     )
-    out.write_text(html)
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_text(html)
+    os.replace(tmp, out)  # atomic, so a watch-mode request never sees a half-written page
     n_files = sum(len(s["files"]) for s in sources)
     adds = sum(f["adds"] for s in sources for f in s["files"])
     dels = sum(f["dels"] for s in sources for f in s["files"])
     print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
     print(f"file://{out.resolve()}", flush=True)
-    return summary
+    return summary, data["generated"]
 
 
 # ---------------------------------------------------------------- watch mode
 
 
-def watch(args: Args, out: Path, summary: str) -> None:
+def watch(args: Args, out: Path, summary: str, generated: str) -> None:
     """Serve the page on localhost, regenerate when the sources change, let the page live-reload."""
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    version = {"n": 0}
+    args.auto_summary = False  # the summary was computed (or attempted) once; never re-pay per rebuild
+    version = {"g": generated}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -147,13 +151,16 @@ def watch(args: Args, out: Path, summary: str) -> None:
     try:
         while True:
             time.sleep(2)
-            sig = sources_sig(args)
-            if sig == last:
-                continue
-            last = sig
-            build(args, out, summary)
-            version["n"] += 1
-            print(f"diffview: sources changed, regenerated ({datetime.now():%H:%M:%S})", flush=True)
+            try:
+                sig = sources_sig(args)
+                if sig == last:
+                    continue
+                last = sig
+                _, version["g"] = build(args, out, summary)
+                print(f"diffview: sources changed, regenerated ({datetime.now():%H:%M:%S})", flush=True)
+            except SystemExit as e:
+                # transient states are normal mid-review: a rebase in flight, a branch reset to base
+                print(f"diffview: sources unreadable right now, still serving the last page ({e})", flush=True)
     except KeyboardInterrupt:
         print("\ndiffview: watch stopped; the written file stays valid")
 
@@ -163,11 +170,11 @@ def sources_sig(args: Args) -> str:
     for spec in args.sources:
         if "=" in spec and ".." not in spec.split("=")[0]:
             old, new = (str(Path(p).expanduser()) for p in spec.split("=", 1))
-            patch = run_git(["diff", "--no-color", "--no-index", "--", old, new], ok_codes=(0, 1))
+            patch = run_git(["diff", "--no-color", "--no-ext-diff", "--no-index", "--", old, new], ok_codes=(0, 1))
         else:
             repo, range_ = spec.rsplit("@", 1) if "@" in spec else (".", spec)
             repo = str(Path(repo).expanduser().resolve())
-            patch = run_git(["-C", repo, "diff", "--no-color", range_])
+            patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", range_])
         h.update(patch.encode())
     return h.hexdigest()
 
