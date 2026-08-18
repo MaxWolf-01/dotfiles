@@ -30,8 +30,10 @@ let
   ]);
 
   # The dns-* scripts are PEP 723 uv scripts, so uv resolves their deps at run.
+  # jq because bin/run-log, which dns-audit calls to record its outcome, builds
+  # its line with it.
   dnsPath = lib.makeBinPath (with pkgs; [
-    bash coreutils uv
+    bash coreutils uv jq
   ]);
 
   dashboardPath = lib.makeBinPath (with pkgs; [
@@ -39,9 +41,17 @@ let
   ]);
 
   # util-linux for flock (vpn-pick serializes watcher vs. manual runs),
-  # procps for pgrep (the Vesktop gate)
+  # procps for pgrep (the Vesktop gate), jq for both the tailscale state reads
+  # and the run-log lines vpn-pick writes
   vpnPath = lib.makeBinPath (with pkgs; [
-    bash coreutils util-linux gawk curl jq libnotify procps
+    bash coreutils util-linux gawk curl jq procps
+  ]);
+
+  # The dns/vpn dashboard shells out to dns-audit (another uv script) for the
+  # blocklist reading, and to tailscale — the Ubuntu system package in /usr/bin
+  # — for the exit node it is currently on.
+  dnsVpnDashPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv jq
   ]);
 
   sshAuthSock = "/run/user/1000/ssh-agent";
@@ -413,6 +423,35 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # zephylux only, and there is no host to add: it is the one machine that
+  # filters DNS and the one that holds a Mullvad exit node.
+
+  systemd.user.services.dashboard-dns-vpn = {
+    Unit = {
+      Description = "Rebuild the dns/vpn dashboard from the archive and the run logs";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${dnsVpnDashPath}:/usr/bin:/bin" ];
+      ExecStart = "${secrets}/scripts/dashboard-dns-vpn --record";
+      TimeoutStartSec = "10min";
+    };
+  };
+
+  systemd.user.timers.dashboard-dns-vpn = {
+    Unit.Description = "Hourly dns/vpn dashboard refresh";
+    Timer = {
+      # Ten past, not on the hour: the backups dashboard already runs then, and
+      # both resolve a uv environment on a laptop that has just woken up.
+      OnCalendar = "*:10:00";
+      Persistent = true;
+      RandomizedDelaySec = "5m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Claude usage-window anchor ---
   # The 5-hour window starts with your first message, so these pings pin it to a
   # fixed grid: 08:30 → 13:30 → 18:30 → 23:30. Deliberately no 04:30 ping: it
@@ -520,7 +559,7 @@ in
 
   systemd.user.services.dns-audit = {
     Unit = {
-      Description = "Classify refused DNS lookups, alert on newly blocked domains";
+      Description = "Classify refused DNS lookups and record what is blocked";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
@@ -528,7 +567,6 @@ in
       Type = "oneshot";
       # ${home}/bin for dns-blocked, which dns-audit shells out to
       Environment = [ "PATH=${dnsPath}:${home}/bin:/usr/bin:/bin" ];
-      EnvironmentFile = "${secrets}/env/dns-audit.env";
       ExecStart = "${secrets}/scripts/dns-audit";
       # oneshot defaults to no timeout; without this a wedged run leaves the
       # unit activating forever and every later firing is a silent no-op.

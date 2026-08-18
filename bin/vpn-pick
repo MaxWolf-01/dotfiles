@@ -18,6 +18,14 @@
 # challenge clears — and every rotation is an IP change Discord's session
 # heuristics get to see (rapid IP hopping is what triggers re-login prompts).
 #
+# Nothing here pops up a notification. A rotation is the design working, not a
+# thing to act on, so every pick appends a line to ~/logs/runs/vpn-pick.jsonl
+# instead (bin/run-log) and the dns/vpn dashboard reads the history out of it.
+# The watcher writes its own hourly heartbeat to ~/logs/runs/vpn-watchdog.jsonl:
+# systemd only ever saw this loop *start*, so without the heartbeat a watcher
+# that died months ago and one running fine are the same fact, and a pinned exit
+# node with no watcher has no failover at all.
+#
 #   vpn-pick             turn on + verify (what the vpn-on alias runs)
 #   vpn-pick --check     report the current node's verdict, change nothing
 #   vpn-pick --watch     persistent watcher (the vpn-watchdog user service).
@@ -45,7 +53,26 @@ POLL_SECS=15     # local tailscale state poll (watch mode)
 PROBE_SECS=600   # unconditional re-probe of an unchanged node (watch mode)
 CONFIRM_SECS=45  # spacing before confirming a 403 — transients clear, real blocks persist
 BACKOFF_SECS=300  # pause after a failed recovery before the loop resumes
+HEARTBEAT_SECS=3600  # watch mode: how often the loop records that it is alive
 LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/vpn-pick.lock"
+
+# Two run logs, because they answer two questions. Picks are events — a rotation
+# should be rare, and bounding how long it has been since one would be nonsense.
+# The heartbeat is a schedule, and it is the one the watchdog holds to a bound.
+PICK_UNIT=vpn-pick
+WATCH_UNIT=vpn-watchdog
+
+# Reached relative to this script, not through PATH: the systemd unit pins its
+# own PATH and it does not carry ~/bin.
+RUN_LOG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-log"
+
+# Recording a run must never decide whether it succeeded.
+log_run() {  # log_run <unit> <ok|skip|fail> [reason] [stats-json]
+  local args=("$1" "$2")
+  [ -n "${3:-}" ] && args+=(--reason "$3")
+  [ -n "${4:-}" ] && args+=(--stats "$4")
+  "$RUN_LOG" "${args[@]}" || echo "vpn-pick: could not write the run log for $1" >&2
+}
 
 pick() {  # serialized: the watcher and a manual run must not fight over the node
   (
@@ -58,6 +85,8 @@ do_pick() {
   tailscale set --exit-node=auto:any --exit-node-allow-lan-access=true
   if ! settle any; then
     echo "vpn-pick: egress never reached Mullvad — tailscale down? captive portal? (docs/dns.md)" >&2
+    log_run "$PICK_UNIT" fail "egress never reached Mullvad — tailscale down, or a captive portal" \
+      "$(pick_stats unreachable)"
     return 1
   fi
   local current verdict
@@ -65,10 +94,15 @@ do_pick() {
   probe && verdict=0 || verdict=$?
   if [[ $verdict -eq 0 ]]; then
     echo "exit node: $current (auto-failover on, canary clean)"
+    log_run "$PICK_UNIT" ok "" "$(pick_stats clean "$current")"
     return 0
   fi
+  # Not a verdict about the node: the canary itself could not be reached, so
+  # there is nothing to rotate away from. A skip, not a failure of this job.
   if [[ $verdict -eq 2 ]]; then
     echo "vpn-pick: canary unreachable through $current — network trouble, not walking nodes" >&2
+    log_run "$PICK_UNIT" skip "the Discord canary was unreachable through $current — network trouble, not a blocked node" \
+      "$(pick_stats canary-unreachable "$current")"
     return 1
   fi
 
@@ -82,7 +116,7 @@ do_pick() {
     settle "$short" || { echo "  $short: unreachable, skipping"; continue; }
     if probe_once; then  # unconfirmed is fine here: a false "blocked" just skips one candidate
       echo "pinned: $node (native failover off — the vpn-watchdog watcher covers it)"
-      notify "Exit node $current is Cloudflare-blocked; pinned $short instead."
+      log_run "$PICK_UNIT" ok "" "$(pick_stats rotated "$current" "$short" "$attempts")"
       return 0
     fi
     echo "  $short: blocked too"
@@ -90,19 +124,41 @@ do_pick() {
 
   tailscale set --exit-node=auto:any --exit-node-allow-lan-access=true
   echo "vpn-pick: no clean node among $attempts candidates — left on auto:any; Discord will be broken" >&2
-  notify "No Cloudflare-clean exit node found; Discord likely broken."
+  log_run "$PICK_UNIT" fail "Cloudflare blocks $current and every one of $attempts alternatives tried; left on auto:any, so Discord and other Electron apps stay broken" \
+    "$(pick_stats exhausted "$current" "" "$attempts")"
   return 1
 }
 
+# What a pick did, in the shape the dashboard reads. `node` is the node the run
+# was about; `rotated_to` is set only when it actually moved, and `tried` counts
+# the alternatives walked to get there.
+pick_stats() {  # pick_stats <event> [node] [rotated_to] [tried]
+  jq -c -n --arg event "$1" --arg node "${2:-}" --arg to "${3:-}" \
+    --argjson tried "${4:-0}" \
+    '{event: $event,
+      node: (if $node == "" then null else $node end),
+      rotated_to: (if $to == "" then null else $to end),
+      tried: $tried}'
+}
+
 watch() {
-  local st id online last_id="" last_probe=0 now
+  local st id online last_id="" last_probe=0 last_beat=0 now
   while true; do
     sleep "$POLL_SECS"
-    st=$(tailscale status --json 2>/dev/null) || { last_id=""; continue; }  # tailscale down
-    id=$(jq -r '.ExitNodeStatus.ID // empty' <<<"$st")
+    now=$(date +%s)
+    st=$(tailscale status --json 2>/dev/null) || st=""
+    id=$(jq -r '.ExitNodeStatus.ID // empty' <<<"$st" 2>/dev/null)
+    # Before any of the guards below, so the heartbeat keeps arriving while
+    # tailscale is down or the VPN is off — the loop being alive is what it
+    # reports, and both of those are states it is alive to observe.
+    if (( now - last_beat >= HEARTBEAT_SECS )); then
+      last_beat=$now
+      heartbeat "$st" "$id"
+    fi
+
+    [[ -n $st ]] || { last_id=""; continue; }  # tailscale down
     [[ -n $id ]] || { last_id=""; continue; }  # vpn-off: respect it
     online=$(jq -r '.ExitNodeStatus.Online' <<<"$st")
-    now=$(date +%s)
 
     if [[ $online == false ]]; then
       echo "exit node offline — re-picking"
@@ -209,8 +265,22 @@ candidates() {  # exit nodes in COUNTRIES order, deduped ("Any"-city rows repeat
   done | awk '!seen[$0]++'
 }
 
-notify() {
-  command -v notify-send >/dev/null && notify-send "vpn-pick" "$1" || true
+# One line an hour saying the loop is still turning, and what it sees. Always
+# `ok`: neither a machine with the VPN off nor one with tailscale down is a
+# watcher that stopped watching, and this log answers only that question.
+heartbeat() {  # heartbeat <tailscale-status-json> <exit-node-id>
+  local state node=""
+  if [[ -z $1 ]]; then
+    state=tailscale-down
+  elif [[ -z $2 ]]; then
+    state=no-exit-node
+  else
+    state=guarding
+    node=$(jq -r 'first(.Peer[] | select(.ExitNode == true) | .HostName) // empty' <<<"$1" 2>/dev/null)
+  fi
+  log_run "$WATCH_UNIT" ok "" "$(jq -c -n --arg state "$state" --arg node "$node" \
+    --argjson vesktop "$(vesktop_running && echo true || echo false)" \
+    '{state: $state, exit_node: (if $node == "" then null else $node end), vesktop: $vesktop}')"
 }
 
 case "${1:-}" in
