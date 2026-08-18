@@ -29,9 +29,11 @@
 # not an alert: it is skipped and reported on stdout. A dead pc still surfaces
 # here, through the rsync.net repos it stops writing to.
 #
-# Nothing bounds how long a target may stay away. A repository is judged by the
-# age of its newest snapshot, which can only be read from the repository, so a
-# server that stays down is invisible to this check for as long as it is down.
+# An away streak is bounded, because it would otherwise be indistinguishable
+# from health: a repository can only be dated from inside itself, and six of the
+# eight sit on one provider. When the probe cannot reach a repository, the run
+# log of the host that makes that backup (bin/backup-hosts) is read instead, and
+# the same max_age_days applies to the age of its last success.
 
 set -uo pipefail
 
@@ -97,12 +99,20 @@ bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 run_log_bin="$bin_dir/run-log"
 unreachable_reason="$bin_dir/unreachable-reason"
 config_name_bin="$bin_dir/config-name"
+backup_hosts_bin="$bin_dir/backup-hosts"
 
 # Read before any repo is probed, so a config nobody can parse costs a message
 # rather than two minutes of ssh timeouts first.
 conf_arg=()
 [ -n "$unit_config" ] && conf_arg=("$unit_config")
 if ! unit_records=$("$bin_dir/overdue-conf" "${conf_arg[@]}"); then
+    exit 2
+fi
+
+# Read here for the same reason: it is only needed for a repository that turns
+# out to be away, and a run that discovers then that it cannot say which host
+# logs that backup would report the outage as health.
+if ! backup_hosts=$("$backup_hosts_bin"); then
     exit 2
 fi
 
@@ -170,6 +180,44 @@ last_success() {
         fi
     done
     return 1
+}
+
+# How long has a repository nobody could reach been away? Its own snapshots are
+# the only thing that can date it, so the fallback is the run log of the host
+# that makes the backup: while that host keeps recording successes the outage is
+# recent, and once its last success is older than the repo's bound the silence
+# has lasted longer than the backup is allowed to.
+#
+# Prints the line to report. Exit 0 to leave it alone, 1 to alert about it.
+away_verdict() {
+    local name="$1" reason="$2" limit="$3" host="" last age unit on_host
+
+    while IFS=$'\t' read -r unit on_host; do
+        [ "$unit" = "$name" ] && { host="$on_host"; break; }
+    done <<<"$backup_hosts"
+    # A repository no timer runs has no other host to ask, and whatever this one
+    # recorded is the whole story — usually nothing, which reads as overdue.
+    [ -n "$host" ] || host="$this_host"
+
+    last=$(last_success "$host" "$name" run-log)
+    case $? in
+        2)  # Both the repository and the host that writes it are away, so
+            # nothing can date this backup. Alerting would fire every time the
+            # laptop slept through pc's watchdog; the host's own copy of this
+            # check judges it from its own log the moment it is back.
+            echo "$reason; $host is away too, so nothing here can date this backup"
+            return 0 ;;
+        1)  echo "$reason; no successful backup on record on $host (limit ${limit}d)"
+            return 1 ;;
+    esac
+
+    age=$(( (now - last) / 86400 ))
+    if [ "$age" -gt "$limit" ]; then
+        echo "$reason; no backup for ${age}d (limit ${limit}d), $(date -d "@$last" +%F)"
+        return 1
+    fi
+    echo "$reason; last backup ${age}d ago (limit ${limit}d)"
+    return 0
 }
 
 overdue=""
@@ -257,10 +305,16 @@ for config in "${restic_configs[@]}"; do
 
     if [ -z "$latest" ]; then
         # A target that is down is the skip the backup itself recorded; only a
-        # repository that answers and still cannot be read needs a person.
+        # repository that answers and still cannot be read needs a person. How
+        # long it may stay down is what away_verdict decides.
         if reason=$("$unreachable_reason" "$probe_err"); then
-            unreachable="${unreachable}  ${name}: $reason"$'\n'
-            unreachable_count=$((unreachable_count + 1))
+            if verdict=$(away_verdict "$name" "$reason" "$max_age"); then
+                unreachable="${unreachable}  ${name}: $verdict"$'\n'
+                unreachable_count=$((unreachable_count + 1))
+            else
+                overdue="${overdue}  ${name}: target away — $verdict"$'\n'
+                overdue_count=$((overdue_count + 1))
+            fi
         else
             unchecked="${unchecked}  ${name}: no snapshots, or repo unreadable"$'\n'
             unchecked_count=$((unchecked_count + 1))
