@@ -235,6 +235,25 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         --keep-monthly "$keep_monthly" \
         --password-command "$password_command" >/dev/null 2>&1
 
+    # The repository's own size, after this run's prune: what the backup costs at
+    # rest, deduplicated and compressed. Nothing in the backup summary implies it
+    # — that measures the source tree — and reading it walks the whole index,
+    # which is ~15s on a 140 GB repo over sftp. Paid once per run here so that
+    # every reader afterwards, the dashboard included, gets it for free.
+    repo_size=null
+    repo_snapshots=null
+    if repo_stats=$(restic --repo "$repo_path" --password-command "$password_command" \
+            stats --mode raw-data --no-lock --json 2>/dev/null); then
+        repo_size=$(jq -r '.total_size // empty' <<<"$repo_stats")
+        repo_snapshots=$(jq -r '.snapshots_count // empty' <<<"$repo_stats")
+    fi
+    # A size that could not be read must leave the field out, never guess at it.
+    [[ "$repo_size" =~ ^[0-9]+$ ]] || repo_size=null
+    [[ "$repo_snapshots" =~ ^[0-9]+$ ]] || repo_snapshots=null
+    if [ "$repo_size" = null ]; then
+        echo "Could not read repository size (the backup itself is unaffected)" >&2
+    fi
+
     # Determine check arguments based on config
     check_args=""
     check_description="basic"
@@ -285,9 +304,13 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         --argjson total_bytes_processed "$total_bytes_processed" \
         --argjson data_added "$data_added" \
         --argjson data_added_packed "$data_added_packed" \
+        --argjson repo_size "$repo_size" \
+        --argjson repo_snapshots "$repo_snapshots" \
         --argjson warnings "$warn_count" \
         --arg warning_log "$warning_log" \
-        '$ARGS.named | if .warning_log == "" then del(.warning_log) else . end')
+        '$ARGS.named
+         | if .warning_log == "" then del(.warning_log) else . end
+         | if .repo_size == null then del(.repo_size, .repo_snapshots) else . end')
 
     if [ "$backup_success" = true ]; then
         log_run ok --stats "$stats"
