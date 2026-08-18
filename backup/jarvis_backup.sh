@@ -41,7 +41,7 @@ else
     # child's stderr to /dev/null, so a dead host, a rejected key and a changed
     # host key all read "read: Connection reset by peer" and nothing else.
     if ! mount_error=$(sshfs -o ro "$REMOTE" "$MOUNTPOINT" 2>&1); then
-        config_name="$(basename "$(dirname "$config_file")")-$(basename "$config_file" .conf)"
+        config_name="$("$SCRIPT_DIR/../bin/config-name" "$config_file")"
         echo "[jarvis-backup] Could not mount $REMOTE: $mount_error" >&2
         reason=$(head -1 <<<"$mount_error")
         "$SCRIPT_DIR/../bin/run-log" "$config_name" skip \

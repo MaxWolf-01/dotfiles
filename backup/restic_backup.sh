@@ -64,7 +64,7 @@ fi
 source "$config_file"
 
 # Extract config name early for error notifications
-config_name="$(basename "$(dirname "$config_file")")-$(basename "$config_file" .conf)"
+config_name="$("$bin_dir/config-name" "$config_file")" || exit 1
 
 # Validate required variables before using them (set -u would exit silently otherwise)
 required_vars="repo_path password_command backup_dirs_file base_path compression keep_last keep_daily keep_weekly keep_monthly"

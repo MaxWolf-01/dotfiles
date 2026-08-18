@@ -37,7 +37,6 @@ set -uo pipefail
 
 DEFAULT_MAX_AGE_DAYS=14
 RESTIC_CONFIG_GLOB="$HOME/.dotfiles/secrets/backup/restic/*/*.conf"
-DEFAULT_UNIT_CONFIG="$HOME/.dotfiles/secrets/monitoring/overdue.conf"
 
 # systemd logs this message id when a unit's job finishes; JOB_RESULT says how it
 # went, so "done" is the last clean finish and failures never match.
@@ -58,7 +57,8 @@ another host. Exits 1 if anything is overdue or unreadable.
                   running this both cover everything, but the one with the
                   offset stays quiet unless the other stopped alerting (i.e.
                   died), so a healthy setup alerts only once.
-  --config FILE   unit bounds and the ntfy topic (default: the path above).
+  --config FILE   unit bounds and the ntfy topic (default: the file bin/overdue-conf
+                  reads, which is also where the syntax is described).
   --dry-run       check everything and print what would have been sent, without
                   sending it or recording this run. For trying out a config
                   change without it reaching a phone.
@@ -66,14 +66,11 @@ another host. Exits 1 if anything is overdue or unreadable.
 Environment:
   RUN_LOG_DIR     where this host's run logs live (default ~/logs/runs).
   NTFY_BASE_URL   where to send the alert (default https://ntfy.sh).
-
-Config lines are '<unit> <host> <max_age_days> <run-log|systemd>', plus
-'ntfy_topic: <topic>'. See the comments in the config file itself.
 EOF
 }
 
 extra_days=0
-unit_config="$DEFAULT_UNIT_CONFIG"
+unit_config=""
 dry_run=false
 restic_configs=()
 while [ $# -gt 0 ]; do
@@ -94,16 +91,20 @@ if ! [[ "$extra_days" =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
-if [ ! -f "$unit_config" ]; then
-    echo "No unit config at $unit_config — nothing knows what 'overdue' means." >&2
-    exit 2
-fi
-
 # Reached relative to this script, not through PATH: the systemd units pin their
 # own PATH and none of them carries ~/bin.
 bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 run_log_bin="$bin_dir/run-log"
 unreachable_reason="$bin_dir/unreachable-reason"
+config_name_bin="$bin_dir/config-name"
+
+# Read before any repo is probed, so a config nobody can parse costs a message
+# rather than two minutes of ssh timeouts first.
+conf_arg=()
+[ -n "$unit_config" ] && conf_arg=("$unit_config")
+if ! unit_records=$("$bin_dir/overdue-conf" "${conf_arg[@]}"); then
+    exit 2
+fi
 
 this_host="$(uname -n)"
 run_log_dir="${RUN_LOG_DIR:-$HOME/logs/runs}"
@@ -179,6 +180,7 @@ unchecked_count=0
 unreachable_count=0
 ok_count=0
 ntfy_topic=""
+config_file=""
 
 # --- restic repos: the age of the newest snapshot
 
@@ -207,7 +209,7 @@ trap 'rm -f "$probe_err"' EXIT
 
 for config in "${restic_configs[@]}"; do
     [ -f "$config" ] || continue
-    name="$(basename "$(dirname "$config")")-$(basename "$config" .conf)"
+    name="$("$config_name_bin" "$config")" || exit 2
 
     # Source in a subshell and print the fields, so one config's values can't
     # leak into the next. Unit separator, not tab: tab is IFS whitespace, so
@@ -278,34 +280,19 @@ done
 
 # --- everything else: time since the last successful run
 
-while read -r -u 3 line; do
-    line="${line%%#*}"
-    read -r unit host days witness <<<"$line"
-    [ -n "$unit" ] || continue
-
-    # "key: value" cannot collide with a unit name, which has no colon in it.
-    if [[ "$unit" == *: ]]; then
-        setting="${unit%:}"
-        value="$host"
-        case "$setting" in
-            ntfy_topic) ntfy_topic="$value" ;;
-            *) echo "$unit_config: unknown setting '$setting'" >&2; exit 2 ;;
-        esac
+# fd 3, not stdin: an ssh in here would otherwise drain the records still to read.
+while IFS=$'\t' read -r -u 3 kind unit host days witness; do
+    [ -n "$kind" ] || continue
+    if [ "$kind" = file ]; then
+        config_file="$unit"
         continue
     fi
-
-    # The unit name reaches a filename and an ssh command line, and a typo in it
-    # would otherwise surface as a permanent, mystifying "never ran". Same shape
-    # bin/run-log accepts, so a name that works in one works in the other.
-    if ! [[ "$unit" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
-        echo "$unit_config: bad unit name '$unit' (lowercase letters, digits, . _ -)" >&2
-        exit 2
-    fi
-
-    if [ -z "$host" ] || ! [[ "$days" =~ ^[0-9]+$ ]] \
-        || { [ "$witness" != "run-log" ] && [ "$witness" != "systemd" ]; }; then
-        echo "$unit_config: expected '<unit> <host> <max_age_days> <run-log|systemd>', got: $line" >&2
-        exit 2
+    if [ "$kind" = set ]; then
+        case "$unit" in
+            ntfy_topic) ntfy_topic="$host" ;;
+            *) echo "overdue-conf gave a setting this check does not use: $unit" >&2; exit 2 ;;
+        esac
+        continue
     fi
 
     limit=$((days + extra_days))
@@ -331,7 +318,7 @@ while read -r -u 3 line; do
         ok_count=$((ok_count + 1))
         echo "ok: $label — ${age_days}d since last success (limit ${limit}d)"
     fi
-done 3< "$unit_config"
+done 3<<<"$unit_records"
 
 [ -n "$unreachable" ] && printf 'Not checked, target away:\n%s' "$unreachable"
 
@@ -377,7 +364,7 @@ if [ -n "$ntfy_topic" ]; then
         -d "$message" \
         "$ntfy_base/$ntfy_topic" >/dev/null
 else
-    echo "No ntfy_topic in $unit_config — the report above went nowhere else." >&2
+    echo "No ntfy_topic in $config_file — the report above went nowhere else." >&2
 fi
 
 exit 1
