@@ -130,33 +130,36 @@ log_dir="$HOME/logs/backup"
 mkdir -p "$log_dir"
 
 # Restic 0.19.1's own words for "the target could not be reached at all". Over
-# sftp restic reports the same generic "unable to start the sftp session ...
-# unexpected EOF" whatever went wrong underneath, so the cause is only in the
-# line it passes through from its ssh subprocess. Deliberately narrow: a
-# rejected key or a changed host key is a person's problem and stays a failure.
-unreachable_patterns='could not resolve hostname|name or service not known|temporary failure in name resolution|no such host|connection refused|connection timed out|i/o timeout|no route to host|network is unreachable|connection reset by peer|connection closed by remote host'
+# sftp the cause is only in the line restic passes through from its ssh
+# subprocess; restic's own message is the same generic "unable to start the sftp
+# session ... unexpected EOF" whatever went wrong underneath. The last pattern
+# is what ssh says when ServerAliveInterval tears down a link that stopped
+# answering. Deliberately narrow — a rejected key, a changed host key, or a
+# server that hung up on us is a person's problem and stays a failure.
+unreachable_patterns='could not resolve hostname|name or service not known|temporary failure in name resolution|no such host|connection refused|connection timed out|i/o timeout|no route to host|network is unreachable|timeout, server .* not responding'
 
-# Echoes the line restic said it on; fails when the error is of another kind.
+# Echoes the last line restic said it on, and fails when there is none. Last,
+# not first: a hiccup restic retried past must not outvote the error it finally
+# stopped on.
 unreachable_reason() {
     local line
-    line=$(grep -Eim1 "$unreachable_patterns" "$1") || return 1
-    echo "${line#subprocess ssh: }"
+    line=$(grep -Ei "$unreachable_patterns" "$1" | tail -1)
+    [ -n "$line" ] || return 1
+    printf '%s\n' "${line#subprocess ssh: }"
 }
 
-# Check if repository exists. --no-lock because this only reads the config: a
-# lock left behind by an interrupted run (a suspend kills the sftp connection
-# mid-check) would otherwise fail the probe, and this block would read that as
-# "no repository here" and answer a healthy repo with an init failure. The
-# unlock that clears such a lock is a few lines below.
+# Does the repository exist? --no-lock, because the probe only reads the config:
+# a lock an interrupted run left behind would otherwise fail it, and a failed
+# probe here means "no repository, initialise one".
 timestamp=$(date +%Y%m%d_%H%M%S)
 repo_check_log="$log_dir/repo_check_${config_name}_${timestamp}.log"
 if ! restic --repo "$repo_path" --password-command "$password_command" --no-lock cat config >"$repo_check_log" 2>&1; then
-    # An unreachable target is expected: rsync.net down, pc off, no network. It
-    # resolves itself, so it is a skip and nobody is woken; a streak that does
-    # not resolve is what the repo's max_age_days bound is there to catch.
-    if unreachable_detail=$(unreachable_reason "$repo_check_log"); then
-        echo "Skipping $config_name: cannot reach $repo_path ($unreachable_detail)"
-        log_run skip --reason "target unreachable: $unreachable_detail"
+    # An unreachable target is expected: rsync.net down, pc off, no network.
+    # Nobody is woken for it here; a repository the watchdog cannot read is its
+    # own line in the watchdog's report.
+    if reason=$(unreachable_reason "$repo_check_log"); then
+        echo "Skipping $config_name: cannot reach $repo_path ($reason)"
+        log_run skip --reason "target unreachable: $reason"
         exit 0
     fi
 

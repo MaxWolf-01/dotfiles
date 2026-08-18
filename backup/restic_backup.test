@@ -2,11 +2,10 @@
 # Drive backup/restic_backup.sh against throwaway repos and check what it does
 # with a repository probe that fails. Run it directly; no framework.
 #
-# The four cases are the four meanings a failed `restic cat config` can have,
-# which the script used to collapse into one ("no repository here, initialise
-# it"): the target is unreachable, the repository is genuinely absent, the
-# repository is fine but locked, or something else is wrong. Only the second
-# may init, only the fourth may wake anybody.
+# A failed `restic cat config` has four meanings: the target is unreachable, the
+# repository is genuinely absent, the repository is fine but locked, or
+# something else is wrong. Only the second may initialise a repository, only the
+# fourth may wake anybody.
 
 set -uo pipefail
 
@@ -109,10 +108,12 @@ check "a green run sends nothing" "" "$(cat "$NTFY_SENT")"
 # prune wrote and putting it back afterwards.
 
 repo="$work/fresh-repo"
+write_config locked "$repo"
 restic --repo "$repo" --password-command "cat $work/pw" prune >/dev/null 2>&1 &
 pruner=$!
 lock=""
-for _ in $(seq 1 20000); do
+deadline=$(( $(date +%s) + 30 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
     lock=$(ls "$repo/locks/" 2>/dev/null | head -1)
     [ -n "$lock" ] && { cp "$repo/locks/$lock" "$work/stale.lock"; break; }
 done
@@ -120,11 +121,11 @@ wait $pruner
 check "a lock file was captured to replay" "yes" "$([ -s "$work/stale.lock" ] && echo yes || echo no)"
 cp "$work/stale.lock" "$repo/locks/$lock"
 
-check "a locked repository backs up anyway" 0 "$(run_case missing)"
+check "a locked repository backs up anyway" 0 "$(run_case locked)"
 check "and is never reported as an init failure" \
     "" \
     "$(grep -o 'Failed to initialize restic repository' "$work/out.txt")"
-check "the run is logged ok" ok "$(jq -r .outcome <<<"$(last_line missing)")"
+check "the locked run is logged ok" ok "$(jq -r .outcome <<<"$(last_line locked)")"
 check "a locked repository sends nothing" "" "$(cat "$NTFY_SENT")"
 
 # --- 5. an error of any other kind keeps its rich failure
@@ -135,6 +136,36 @@ check "it is logged fail" fail "$(jq -r .outcome <<<"$(last_line badinit)")"
 check "and it notifies" \
     "yes" \
     "$(grep -q 'ntfy.sh/test-topic' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+
+# --- 6. the boundary: an ssh that fails for a reason of its own
+#
+# A reachable host that rejects the key is a person's problem, so it must come
+# out the other end as a failure with its notification, not as a skip. Driven
+# against this host's own sshd with a user that does not exist. The ssh config
+# is the test's, because the script runs with HOME pointing here; nixpkgs' restic
+# is a wrapper that puts its own openssh first on PATH, so a stub ssh cannot be
+# reached and ssh has to be steered by configuration instead.
+
+if ss -ltn 2>/dev/null | grep -q ':22 '; then
+    mkdir -p "$HOME/.ssh"
+    cat >"$HOME/.ssh/config" <<'SSHCONF'
+Host *
+    BatchMode yes
+    PreferredAuthentications publickey
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+SSHCONF
+    chmod 600 "$HOME/.ssh/config"
+    : >"$NTFY_SENT"
+    write_config denied "sftp://nosuchuser@127.0.0.1//tmp/does-not-matter"
+    check "a rejected key exits 1" 1 "$(run_case denied)"
+    check "a rejected key is a failure, not a skip" fail "$(jq -r .outcome <<<"$(last_line denied)")"
+    check "a rejected key notifies" \
+        "yes" \
+        "$(grep -q 'denied-case' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+else
+    echo "skip the rejected-key case: nothing is listening on port 22 here"
+fi
 
 echo
 if [ "$failures" -eq 0 ]; then
