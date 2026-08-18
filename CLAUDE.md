@@ -149,14 +149,11 @@ rotates, a watcher service re-checks; rationale in the script header.
 
 ## Monitoring
 
-Scheduled jobs — backups, syncs, the DNS audit, yapit's reports — append one
-JSON line per run to `~/logs/runs/<unit>.jsonl` (`bin/run-log`) and notify
-nobody for it. `bin/overdue-check` is the only scheduled alerter: a unit past
-the bound in `secrets/monitoring/overdue.conf` (syntax: `bin/overdue-conf`) or
-a repo past its `max_age_days`. Everything else is read on the three dashboards
-in `~/Documents/dashboards/`, rebuilt hourly by `secrets/scripts/dashboard-*`.
-Before making anything here notify, or adding a job that should be watched:
-`docs/monitoring.md`.
+Scheduled jobs record every run in `~/logs/runs/<unit>.jsonl` (`bin/run-log`)
+and notify only what needs a person: restic failures, and `bin/overdue-check`
+for anything that stopped succeeding. Never add a notification to a job without
+reading why it is silent first. Layers, bounds, the dashboards, and what to do
+when one of them goes red: `docs/monitoring.md`.
 
 ## Knowledge Base Publishing
 

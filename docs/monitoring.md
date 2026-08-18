@@ -9,7 +9,7 @@ Three layers carry the rest:
 | Layer | What it holds | Where |
 | --- | --- | --- |
 | Run log | one JSON line per run: outcome, why, the run's own numbers | `~/logs/runs/<unit>.jsonl`, appended by `bin/run-log` |
-| Overdue watchdog | the only scheduled alerter: one ntfy naming every unit that stopped succeeding | `bin/overdue-check`, daily on both hosts |
+| Overdue watchdog | the one job whose purpose is to alert: one ntfy naming every unit that stopped succeeding | `bin/overdue-check`, daily on both hosts |
 | Dashboards | one static HTML page per topic, rebuilt hourly, read when there is time | `~/Documents/dashboards/` |
 
 The split answers two ways this setup failed before. A message on every green
@@ -29,15 +29,14 @@ Everything that can send one, and where it points:
 | --- | --- | --- | --- |
 | `❌ <unit> - Backup Failed` | `backup/restic_backup.sh` | that run left no snapshot; the message carries restic's own error | the same run is a `fail` line in `~/logs/runs/<unit>.jsonl`, with the path to the error log |
 | `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository | `/backup-audit <unit>` — it opens the repo and reports what is broken |
-| `🕸️ Overdue units` | `bin/overdue-check` | every unit and repo listed has had no successful run inside its bound | the unit's run log, then its bound (below) |
+| `🕸️ Overdue units` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Could not check:`, one whose evidence could not be read at all — a repository that answers but cannot be opened, or an age key still locked after a reboot | overdue: the unit's run log, then its bound (below). Could not check: `/backup-audit`, which opens the repositories |
 | `⚠️ Yapit health` / `⚠️ Yapit deps` | `scripts/report.sh` / `scripts/dep-scout.sh` in `~/repos/code/yapit-tts/yapit`, on yapit's own topic | last night's agent found issues, or a dependency needs acting on | the report itself, on the yapit dashboard |
 
 Nothing else on these two machines sends on its own. A green backup, a skipped
 one, a newly blocked domain, an exit node rotation, a routine dependency
-report: run log and dashboard only. `🔍` in a yapit title means the report had no readable
-status line, so the setup could not tell whether the agent found anything and
-says so rather than staying quiet. (yapit's deploy script and its Cloudflare
-firewall sync notify too, from the yapit VPS, and are no part of this.)
+report: run log and dashboard only. `🔍` in a yapit title means the report had
+no readable status line, so the setup could not tell whether the agent found
+anything and says so rather than staying quiet.
 
 ## Run logs
 
@@ -58,17 +57,12 @@ streak that never ends becomes visible through the watchdog bound below.
 
 ## "unit X hasn't run in N days — is that a problem?"
 
-`secrets/monitoring/overdue.conf` is the written answer, one line per unit:
-which host holds its evidence, how many days it may go without a successful
-run, and which witness to read (its run log, or systemd's record of the last
-clean finish). The file's own header explains the columns; `bin/overdue-conf`
-is the parser that defines the syntax, and both the watchdog and the three
-dashboard collectors read the file through it. Restic repos are not in there —
-each carries its own bound as `max_age_days` in
-`secrets/backup/restic/<repo>/_common` (default 14).
-
-Adding a job to the watch is that one line and nothing else. Silent jobs belong
-there most of all: nothing else would ever notice them stopping.
+`secrets/monitoring/overdue.conf` is the written answer, one line per unit and
+host; its header says what each column is for. `bin/overdue-conf` defines and
+validates that syntax, and every reader goes through it — the watchdog and the
+three dashboard collectors — so a line cannot mean two things. Restic repos are
+not in that file: each carries its own bound as `max_age_days` in
+`secrets/backup/restic/<repo>/_common`.
 
 ```bash
 overdue-check --dry-run          # the full check, printed, sends nothing
@@ -78,9 +72,9 @@ systemctl --user start overdue-check.service
 
 Both hosts run the check daily and each judges the other's units over ssh
 (`nix/home/timers.nix`, `nix/home/pc-timers.nix`). pc runs the bounds as
-written; the laptop adds `--extra-days 7`, so pc alerts first and the laptop
-only speaks up about what pc stopped saying — one message out of a healthy
-setup, and a dead pc still surfaces a week later.
+written; zephylux adds `--extra-days 7`, so pc alerts first and zephylux only
+speaks up about what pc stopped saying — one message out of a healthy setup,
+and a dead pc still surfaces a week later.
 
 A host or backup target that cannot be reached is skipped rather than alerted,
 and printed on stdout only. That silence is bounded: a repository the probe
@@ -104,11 +98,11 @@ from where; `--json` prints the same data unrendered. They live in `~/Documents`
 because Firefox runs firejailed and can see that directory, and a symlink into
 `~/.dotfiles` dangles inside the jail.
 
-What the pages will not do: open a restic repository, or run anything. Every
-figure on them, repository sizes included, was measured by the job that wrote
-it down, and the buttons copy prompts and commands to the clipboard rather than
-launching them. A source that cannot be read keeps its last reading and the
-header says how old it is, so pc being asleep is a label rather than an error.
+Every figure on a page, repository sizes included, was measured by the job that
+wrote it down: a collector reads records, never a restic repository, and the
+buttons copy prompts and commands to the clipboard for you to run. A source
+that cannot be read keeps its last reading and the header says how old it is,
+which is how the backups page survives pc being asleep.
 
 ```bash
 systemctl --user start dashboard-backups.service   # rebuild now
@@ -126,7 +120,9 @@ From there:
 1. `jq . ~/logs/runs/<unit>.jsonl` — the failing run in full, including the
    path to whatever log it left behind.
 2. `journalctl --user -u <unit>.service` — what the process printed, when the
-   run log line is missing or says nothing useful.
+   run log line is missing or says nothing useful. On pc, prefix with
+   `ssh pc`, and drop `--user` for the YouTube download, which is the one
+   watched unit that runs as a system service.
 3. `/backup-audit [unit|host]` — the deep pass for backups, and the only thing
    here that opens the repositories: are the snapshots the run logs claim
    really there, is anything damaged, what changed. It costs minutes, so it
@@ -139,9 +135,9 @@ From there:
    ones where it deliberately does nothing. Reach it by a path relative to the
    script — systemd units pin their own PATH and none of them carries `~/bin`.
 2. Add its line to `secrets/monitoring/overdue.conf`.
-3. Run it once. A unit with no successful run on record is overdue from the
-   moment its line exists, which is intended, and seeding it stops the first
-   alert being about the line you just added.
+3. Run it once. A unit with no successful run on record reads as overdue from
+   the moment its line exists, so seeding it stops the next morning's alert
+   being about the line you just added.
 4. If it belongs on a page, add its row to that topic's collector. Bounds,
    cadence and which host runs what are read from the config, the run log and
    the timer files — a collector states none of them itself.
