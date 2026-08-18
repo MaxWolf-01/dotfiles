@@ -13,6 +13,8 @@ For device inventory, infrastructure, and backup architecture: always read `secr
 - Dotfiles: `git -C ~/.dotfiles ...`
 - Secrets: `git -C ~/.dotfiles/secrets ...`
 
+Dotfiles are not exempt from branch discipline: the mechanical-vs-review seam applies here like everywhere — infra-shaped work (timers, backups, notifications, anything with failure modes) is never "just config".
+
 ## Getting Started
 
 ‼️‼️‼️
