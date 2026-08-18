@@ -138,9 +138,8 @@ timestamp=$(date +%Y%m%d_%H%M%S)
 repo_check_log="$log_dir/repo_check_${config_name}_${timestamp}.log"
 if ! restic --repo "$repo_path" --password-command "$password_command" --no-lock cat config >"$repo_check_log" 2>&1; then
     # An unreachable target is expected: rsync.net down, pc off, no network.
-    # Nobody is woken for it here, and the watchdog reaches the same verdict
-    # through the same helper — what surfaces an outage that outlasts a repo's
-    # max_age_days is the snapshot age, not the failure to connect.
+    # Nobody is woken for it; the skip lands in the run log, which is where a
+    # streak of them shows up.
     if reason=$("$unreachable_reason" "$repo_check_log"); then
         echo "Skipping $config_name: cannot reach $repo_path ($reason)"
         log_run skip --reason "target unreachable: $reason"
