@@ -63,7 +63,6 @@ fi
 
 source "$config_file"
 
-# Extract config name early for error notifications
 config_name="$("$bin_dir/config-name" "$config_file")" || exit 1
 
 # Validate required variables before using them (set -u would exit silently otherwise)
@@ -97,7 +96,6 @@ if [ ! -f "$age_key" ]; then
     exit 0
 fi
 
-# Helper function to format bytes to human readable
 format_bytes() {
     local bytes=$1
     if (( bytes < 1024 )); then
@@ -111,7 +109,6 @@ format_bytes() {
     fi
 }
 
-# Helper function to format duration
 format_duration() {
     local seconds=$1
     local hours=$((seconds / 3600))
@@ -127,7 +124,6 @@ format_duration() {
     fi
 }
 
-# Create local log directory
 log_dir="$HOME/logs/backup"
 mkdir -p "$log_dir"
 
@@ -166,13 +162,11 @@ fi
 # Remove stale locks (>30min unrefreshed or dead PID on same host)
 restic --repo "$repo_path" --password-command "$password_command" unlock 2>/dev/null
 
-# Create temporary files for capturing output
 backup_output=$(mktemp)
 error_log=$(mktemp)
 repo_stats_out=$(mktemp)
 trap "rm -f $backup_output $error_log $repo_stats_out" EXIT
 
-# Run backup with JSON output
 echo "Starting backup for $config_name..."
 backup_start_time=$(date +%s)
 
@@ -215,7 +209,6 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
     backup_end_time=$(date +%s)
     backup_duration=$((backup_end_time - backup_start_time))
 
-    # Parse JSON output to extract metrics
     snapshot_id=""
     files_new=0
     files_changed=0
@@ -225,7 +218,6 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
     data_added_packed=0
     total_bytes_processed=0
 
-    # Read the last summary line which contains the backup summary
     if [ -s "$backup_output" ]; then
         summary_json=$(grep '"message_type":"summary"' "$backup_output" | tail -1)
         if [ -n "$summary_json" ]; then
@@ -240,7 +232,6 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         fi
     fi
 
-    # Run forget and prune
     echo "Pruning old snapshots..."
     restic --repo "$repo_path" forget --prune \
         --keep-last "$keep_last" \
