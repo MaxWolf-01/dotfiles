@@ -377,8 +377,10 @@ in
   };
 
   # --- Dashboards ---
-  # One collector per topic dashboard, each writing a real file into ~/Documents
-  # (firejailed Firefox sees that directory and nothing under ~/.dotfiles).
+  # A topic dashboard is one collector script writing one real file into
+  # ~/Documents — real, because firejailed Firefox sees that directory and a
+  # symlink into ~/.dotfiles dangles inside the jail. --record is what tells the
+  # collector to log the run, so only these timed runs reach the watchdog.
   # openssh to read pc's run logs, /usr/bin for this host's own journalctl, jq
   # because bin/run-log builds its line with it.
 
@@ -394,7 +396,7 @@ in
         "PATH=${dashboardPath}:/usr/bin:/bin"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${secrets}/scripts/dashboard-backups";
+      ExecStart = "${secrets}/scripts/dashboard-backups --record";
       # oneshot has no start timeout of its own; a wedged ssh would otherwise
       # leave the unit activating forever and every later firing a silent no-op.
       TimeoutStartSec = "10min";

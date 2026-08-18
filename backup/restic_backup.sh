@@ -156,7 +156,8 @@ restic --repo "$repo_path" --password-command "$password_command" unlock 2>/dev/
 # Create temporary files for capturing output
 backup_output=$(mktemp)
 error_log=$(mktemp)
-trap "rm -f $backup_output $error_log" EXIT
+repo_stats_out=$(mktemp)
+trap "rm -f $backup_output $error_log $repo_stats_out" EXIT
 
 # Run backup with JSON output
 echo "Starting backup for $config_name..."
@@ -242,16 +243,21 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
     # every reader afterwards, the dashboard included, gets it for free.
     repo_size=null
     repo_snapshots=null
-    if repo_stats=$(restic --repo "$repo_path" --password-command "$password_command" \
-            stats --mode raw-data --no-lock --json 2>/dev/null); then
-        repo_size=$(jq -r '.total_size // empty' <<<"$repo_stats")
-        repo_snapshots=$(jq -r '.snapshots_count // empty' <<<"$repo_stats")
+    # 2>&1 >file, in that order: stderr into the substitution, stdout into the file.
+    if stats_error=$(restic --repo "$repo_path" --password-command "$password_command" \
+            stats --mode raw-data --no-lock --json 2>&1 >"$repo_stats_out"); then
+        repo_size=$(jq -r '.total_size // empty' <"$repo_stats_out")
+        repo_snapshots=$(jq -r '.snapshots_count // empty' <"$repo_stats_out")
     fi
-    # A size that could not be read must leave the field out, never guess at it.
+    # A size that could not be read leaves the field out; a guess would be worse
+    # than the gap, because every later reader would believe it.
     [[ "$repo_size" =~ ^[0-9]+$ ]] || repo_size=null
     [[ "$repo_snapshots" =~ ^[0-9]+$ ]] || repo_snapshots=null
     if [ "$repo_size" = null ]; then
-        echo "Could not read repository size (the backup itself is unaffected)" >&2
+        echo "Could not read the repository size of $repo_path — the backup itself is
+unaffected, but the dashboard will show no size for this repo until a later run
+reads one. restic said:
+${stats_error:-nothing}" >&2
     fi
 
     # Determine check arguments based on config
@@ -310,7 +316,8 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         --arg warning_log "$warning_log" \
         '$ARGS.named
          | if .warning_log == "" then del(.warning_log) else . end
-         | if .repo_size == null then del(.repo_size, .repo_snapshots) else . end')
+         | if .repo_size == null then del(.repo_size, .repo_snapshots) else . end
+         | if .snapshot_id == "" then del(.snapshot_id) else . end')
 
     if [ "$backup_success" = true ]; then
         log_run ok --stats "$stats"
