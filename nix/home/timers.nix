@@ -192,8 +192,7 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
-      # ${home}/bin for run-log: both scripts record what the run did there
-      # instead of notifying, and the watchdog reads it.
+      # ${home}/bin for run-log, which the script records each run with
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/report.sh";
     };
@@ -217,8 +216,7 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
-      # ${home}/bin for run-log: both scripts record what the run did there
-      # instead of notifying, and the watchdog reads it.
+      # ${home}/bin for run-log, which the script records each run with
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/dep-scout.sh";
     };
