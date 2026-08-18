@@ -156,8 +156,8 @@
       focus-window-left = [ "<Control><Alt>h" ];
       focus-window-right = [ "<Control><Alt>l" ];
       focus-window-up = [ "<Control><Alt>k" ];
-      focus-window-next = [];
-      focus-window-prev = [];
+      focus-window-next = [ "<Super>j" ];
+      focus-window-prev = [ "<Super>k" ];
       # Layouts
       selected-layouts = [ [ "Layout 3" "Layout 3" ] [ "Layout 3" "Layout 3" ] ];
       layouts-json = ''[{"id":"Layout 1","tiles":[{"x":0,"y":0,"width":0.22,"height":0.5,"groups":[1,2]},{"x":0,"y":0.5,"width":0.22,"height":0.5,"groups":[1,2]},{"x":0.22,"y":0,"width":0.56,"height":1,"groups":[2,3]},{"x":0.78,"y":0,"width":0.22,"height":0.5,"groups":[3,4]},{"x":0.78,"y":0.5,"width":0.22,"height":0.5,"groups":[3,4]}]},{"id":"Layout 2","tiles":[{"x":0,"y":0,"width":0.22,"height":1,"groups":[1]},{"x":0.22,"y":0,"width":0.56,"height":1,"groups":[1,2]},{"x":0.78,"y":0,"width":0.22,"height":1,"groups":[2]}]},{"id":"Layout 3","tiles":[{"x":0,"y":0,"width":0.33,"height":1,"groups":[1]},{"x":0.33,"y":0,"width":0.67,"height":1,"groups":[1]}]},{"id":"Layout 4","tiles":[{"x":0,"y":0,"width":0.67,"height":1,"groups":[1]},{"x":0.67,"y":0,"width":0.33,"height":1,"groups":[1]}]},{"id":"13597114","tiles":[{"x":0,"y":0,"width":0.36770833333333336,"height":0.5,"groups":[1,2]},{"x":0.36770833333333336,"y":0,"width":0.6322916666666674,"height":1,"groups":[1]},{"x":0,"y":0.5,"width":0.36770833333333336,"height":0.5,"groups":[2,1]}]},{"id":"13201446","tiles":[{"x":0,"y":0,"width":0.29069767441860467,"height":1,"groups":[1]},{"x":0.29069767441860467,"y":0,"width":0.5087209302325582,"height":1,"groups":[2,1]},{"x":0.7994186046511628,"y":0,"width":0.20058139534883718,"height":1,"groups":[2]}]},{"id":"13300092","tiles":[{"x":0,"y":0,"width":0.5,"height":1,"groups":[1]},{"x":0.5,"y":0,"width":0.4999999999999982,"height":1,"groups":[1]}]}]'';
