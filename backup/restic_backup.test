@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Drive backup/restic_backup.sh against throwaway repos and check what it does
+# with a repository probe that fails. Run it directly; no framework.
+#
+# The four cases are the four meanings a failed `restic cat config` can have,
+# which the script used to collapse into one ("no repository here, initialise
+# it"): the target is unreachable, the repository is genuinely absent, the
+# repository is fine but locked, or something else is wrong. Only the second
+# may init, only the fourth may wake anybody.
+
+set -uo pipefail
+
+script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/restic_backup.sh"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+export HOME="$work/home"          # keeps ~/logs/backup out of the real home
+export RUN_LOG_DIR="$work/runs"
+export SOPS_AGE_KEY_FILE="$work/age-key.txt"
+export PATH="$work/stub:$PATH"    # curl stub, so a test never sends an ntfy
+mkdir -p "$HOME" "$work/stub" "$work/src"
+touch "$SOPS_AGE_KEY_FILE"
+printf 'testpw\n' >"$work/pw"
+head -c 100000 /dev/urandom >"$work/src/a.bin"
+echo "src" >"$work/dirs.txt"
+
+cat >"$work/stub/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$NTFY_SENT"
+STUB
+chmod +x "$work/stub/curl"
+export NTFY_SENT="$work/ntfy.log"
+: >"$NTFY_SENT"
+
+failures=0
+
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+# Every case is a config file under its own directory, because the script names
+# the run log's unit after "<directory>-<file>".
+write_config() {  # $1 unit dir, $2 repo path
+    mkdir -p "$work/$1"
+    cat >"$work/$1/case.conf" <<CONF
+repo_path="$2"
+password_command="cat $work/pw"
+backup_dirs_file="$work/dirs.txt"
+base_path="$work"
+compression="auto"
+keep_last="1"
+keep_daily="1"
+keep_weekly="1"
+keep_monthly="1"
+ntfy_topic="test-topic"
+CONF
+}
+
+# Echoes the exit code; the run's own output lands in a file, because the call
+# below happens inside a command substitution and a variable would not survive it.
+run_case() {  # $1 unit dir
+    "$script" "$work/$1/case.conf" >"$work/out.txt" 2>&1
+    echo $?
+}
+
+last_line() {  # $1 unit
+    tail -1 "$RUN_LOG_DIR/$1-case.jsonl" 2>/dev/null
+}
+
+# --- 1. unreachable: nothing listening on the port
+
+write_config unreachable "sftp://max@127.0.0.1:2222//tmp/does-not-matter"
+check "refused connection exits 0" 0 "$(run_case unreachable)"
+line=$(last_line unreachable)
+check "refused connection is a skip" skip "$(jq -r .outcome <<<"$line")"
+check "its reason names unreachability and the cause" \
+    "yes" \
+    "$(jq -r 'if .reason | test("^target unreachable:.*[Cc]onnection refused") then "yes" else .reason end' <<<"$line")"
+check "nothing was sent" "" "$(cat "$NTFY_SENT")"
+
+# --- 2. unreachable: the name does not resolve
+
+write_config dns "sftp:nosuchhost.invalid:restic-test"
+check "unresolvable host exits 0" 0 "$(run_case dns)"
+check "unresolvable host is a skip" skip "$(jq -r .outcome <<<"$(last_line dns)")"
+check "still nothing sent" "" "$(cat "$NTFY_SENT")"
+
+# --- 3. reachable target, no repository yet: the init path is untouched
+
+write_config missing "$work/fresh-repo"
+check "a missing repository still runs to a green backup" 0 "$(run_case missing)"
+check "it was initialised" "yes" "$([ -f "$work/fresh-repo/config" ] && echo yes || cat "$work/out.txt")"
+check "the run is logged ok" ok "$(jq -r .outcome <<<"$(last_line missing)")"
+check "a green run sends nothing" "" "$(cat "$NTFY_SENT")"
+
+# --- 4. an existing repository under an exclusive lock left by a dead run
+#
+# The real shape: the laptop suspends mid-check, the sftp connection dies, and
+# the abandoned run's lock stays. Reproduced by keeping the lock file a real
+# prune wrote and putting it back afterwards.
+
+repo="$work/fresh-repo"
+restic --repo "$repo" --password-command "cat $work/pw" prune >/dev/null 2>&1 &
+pruner=$!
+lock=""
+for _ in $(seq 1 20000); do
+    lock=$(ls "$repo/locks/" 2>/dev/null | head -1)
+    [ -n "$lock" ] && { cp "$repo/locks/$lock" "$work/stale.lock"; break; }
+done
+wait $pruner
+check "a lock file was captured to replay" "yes" "$([ -s "$work/stale.lock" ] && echo yes || echo no)"
+cp "$work/stale.lock" "$repo/locks/$lock"
+
+check "a locked repository backs up anyway" 0 "$(run_case missing)"
+check "and is never reported as an init failure" \
+    "" \
+    "$(grep -o 'Failed to initialize restic repository' "$work/out.txt")"
+check "the run is logged ok" ok "$(jq -r .outcome <<<"$(last_line missing)")"
+check "a locked repository sends nothing" "" "$(cat "$NTFY_SENT")"
+
+# --- 5. an error of any other kind keeps its rich failure
+
+write_config badinit "/proc/no/such/place/repo"
+check "an uncreatable repository exits 1" 1 "$(run_case badinit)"
+check "it is logged fail" fail "$(jq -r .outcome <<<"$(last_line badinit)")"
+check "and it notifies" \
+    "yes" \
+    "$(grep -q 'ntfy.sh/test-topic' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+else
+    echo "$failures check(s) failed"
+    exit 1
+fi
