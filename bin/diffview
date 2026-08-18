@@ -1,0 +1,333 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Render diffs from several sources as ONE self-contained HTML review page.
+
+The page is the human-in-the-loop review surface: file tree + side-by-side diff,
+keyboard-driven (press ? in the page), line/hunk comments that persist in the
+browser and export as markdown via the copy button — paste that back to the
+authoring agent. Output goes to ~/Downloads by default so the sandboxed browser
+can read it.
+
+Source specs (positional, several allowed — one page with a section per source):
+- REPO@A..B      git range in REPO (A...B also works)
+- A..B           git range in the current directory
+- OLD=NEW        two directories or two files, no git metadata needed
+
+Examples:
+
+    diffview 'v1.2..v1.3'
+    diffview '~/.dotfiles@b60041c..master' '~/.dotfiles/secrets@e18667c..master' --auto-summary
+    diffview 'old-config/=new-config/' --title "config migration"
+"""
+
+import json
+import re
+import subprocess
+import sys
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Annotated
+
+import tyro
+
+# ---------------------------------------------------------------- CLI
+
+
+@dataclass
+class Args:
+    sources: Annotated[list[str], tyro.conf.Positional]
+    """Source specs: REPO@RANGE, RANGE (cwd), or OLD=NEW paths."""
+    output: Annotated[str, tyro.conf.arg(aliases=["-o"])] = "~/Downloads/review.html"
+    """Path of the generated HTML file (default lands in Downloads, readable by the sandboxed browser)."""
+    summary: str = ""
+    """One plain-English paragraph on what this change is about (shown at the top; inline markdown ok)."""
+    auto_summary: bool = False
+    """Generate the summary with a fresh model instance (`claude -p`) that sees only the diff — deliberately blind to whatever conversation produced the change. Ignored when --summary is given."""
+    summary_model: str = "sonnet"
+    """Model for the auto-summary (passed to `claude --model`): sonnet, opus, haiku, or a full model id."""
+    title: str = ""
+    """Page title; derived from the sources when empty."""
+    context: int = 3
+    """Context lines around each hunk (git diff -U)."""
+
+
+def main(args: Args) -> None:
+    sources = [collect_source(spec, args.context) for spec in args.sources]
+    if not any(s["files"] for s in sources):
+        sys.exit("diffview: no changes found in any source")
+
+    title = args.title or " + ".join(f"{s['label']} {s['detail']}" for s in sources)
+    summary = args.summary
+    if not summary and args.auto_summary:
+        summary = generate_summary(sources, args.summary_model)
+    for s in sources:
+        s.pop("_patch", None)
+
+    langs = {f["lang"] for s in sources for f in s["files"] if f["lang"]}
+
+    data = {
+        "title": title,
+        "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "sources": sources,
+        "summary": summary,
+    }
+
+    template = (Path(__file__).resolve().parent / "diffview.html").read_text()
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    html = (
+        template.replace("__TITLE__", title.replace("<", "&lt;"))
+        .replace("__HLJS__", fetch_hljs(langs))
+        .replace('"__DATA__"', payload)
+    )
+    out = Path(args.output).expanduser()
+    out.write_text(html)
+    n_files = sum(len(s["files"]) for s in sources)
+    adds = sum(f["adds"] for s in sources for f in s["files"])
+    dels = sum(f["dels"] for s in sources for f in s["files"])
+    print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
+    print(f"file://{out.resolve()}")
+
+
+# ---------------------------------------------------------------- source collection
+
+
+def collect_source(spec: str, context: int) -> dict:
+    if "=" in spec and ".." not in spec.split("=")[0]:
+        old, new = (str(Path(p).expanduser()) for p in spec.split("=", 1))
+        patch = run_git(["diff", "--no-color", "--no-ext-diff", f"-U{context}", "--no-index", "--", old, new], ok_codes=(0, 1))
+        files = parse_patch(patch, strip_roots=(old, new))
+        return {"label": Path(new).name, "kind": "paths", "detail": f"{old} → {new}", "files": files, "commits": None, "_patch": patch}
+
+    if "@" in spec:
+        repo, range_ = spec.rsplit("@", 1)
+    else:
+        repo, range_ = ".", spec
+    repo = str(Path(repo).expanduser().resolve())
+    if ".." not in range_:
+        sys.exit(f"diffview: bad spec {spec!r} — need REPO@A..B, A..B, or OLD=NEW (see --help)")
+
+    patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", range_])
+    files = parse_patch(patch)
+    commits = collect_commits(repo, range_)
+    return {"label": Path(repo).name, "kind": "git", "detail": range_, "files": files, "commits": commits, "_patch": patch}
+
+
+def collect_commits(repo: str, range_: str) -> list[dict]:
+    """Commit metadata + per-file numstat only — the page shows the range diff; commits are context."""
+    fmt = "%x1e%h%x1f%an%x1f%aI%x1f%s%x1f%b%x1f"
+    raw = run_git(["-C", repo, "log", "--no-merges", "--reverse", "--numstat", f"--format={fmt}", range_])
+    commits = []
+    for rec in raw.split("\x1e"):
+        if not rec.strip():
+            continue
+        short, author, date, subject, body, numstat = rec.split("\x1f")
+        body = re.sub(r"^(Co-Authored-By|Signed-off-by|Reviewed-by):.*$", "", body, flags=re.M | re.I).strip()
+        files = []
+        for line in numstat.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            adds, dels, path = parts
+            path = re.sub(r"\{([^}]*) => ([^}]*)\}", r"\2", path).replace("//", "/")
+            if " => " in path:
+                path = path.split(" => ")[-1]
+            files.append({"path": path, "adds": 0 if adds == "-" else int(adds), "dels": 0 if dels == "-" else int(dels)})
+        commits.append(
+            {
+                "short": short,
+                "author": author,
+                "date": date,
+                "subject": subject,
+                "body": body,
+                "adds": sum(f["adds"] for f in files),
+                "dels": sum(f["dels"] for f in files),
+                "files": files,
+            }
+        )
+    return commits
+
+
+def run_git(git_args: list[str], ok_codes: tuple[int, ...] = (0,)) -> str:
+    proc = subprocess.run(["git", *git_args], capture_output=True, text=True)
+    if proc.returncode not in ok_codes:
+        sys.exit(f"diffview: git {' '.join(git_args[:4])}… failed:\n{proc.stderr.strip()}")
+    return proc.stdout
+
+
+# ---------------------------------------------------------------- patch parsing
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)")
+
+
+def parse_patch(text: str, strip_roots: tuple[str, ...] = ()) -> list[dict]:
+    """Parse `git diff` output into file dicts with hunks and numbered lines."""
+    files: list[dict] = []
+    lines = text.splitlines()
+    i = 0
+    cur: dict | None = None
+
+    def clean(p: str) -> str:
+        p = p.strip('"')
+        p = re.sub(r"^[ab]/", "", p)
+        orig = p
+        for root in strip_roots:
+            p = p.removeprefix(root.lstrip("/")).lstrip("/")
+        return p or Path(orig).name  # file=file compare strips the whole path — keep the basename
+
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("diff --git "):
+            cur = {"path": "", "oldPath": None, "status": "modified", "adds": 0, "dels": 0, "binary": False, "lang": None, "hunks": []}
+            files.append(cur)
+        elif cur is not None and line.startswith("new file mode"):
+            cur["status"] = "added"
+        elif cur is not None and line.startswith("deleted file mode"):
+            cur["status"] = "deleted"
+        elif cur is not None and line.startswith("rename from "):
+            cur["oldPath"] = clean(line[12:])
+            cur["status"] = "renamed"
+        elif cur is not None and line.startswith("rename to "):
+            cur["path"] = clean(line[10:])
+        elif cur is not None and (line.startswith("Binary files ") or line.startswith("GIT binary patch")):
+            cur["binary"] = True
+        elif cur is not None and line.startswith("--- ") and not cur["path"]:
+            if line[4:] != "/dev/null" and cur["status"] != "renamed":
+                cur["oldPath"] = None  # same-path modify; only renames keep oldPath
+                cur["path"] = clean(line[4:])
+        elif cur is not None and line.startswith("+++ "):
+            if line[4:] != "/dev/null":
+                cur["path"] = clean(line[4:])
+            elif not cur["path"] and cur["oldPath"]:
+                cur["path"] = cur["oldPath"]
+        elif cur is not None and (m := HUNK_RE.match(line)):
+            old_no, old_count = int(m[1]), int(m[2] or "1")
+            new_no, new_count = int(m[3]), int(m[4] or "1")
+            hunk = {"os": old_no, "ns": new_no, "header": m[5], "lines": []}
+            cur["hunks"].append(hunk)
+            i += 1
+            while i < len(lines) and (old_count > 0 or new_count > 0):
+                body = lines[i]
+                tag = body[:1]
+                content = body[1:]
+                if tag == " ":
+                    hunk["lines"].append([0, old_no, new_no, content])
+                    old_no += 1
+                    new_no += 1
+                    old_count -= 1
+                    new_count -= 1
+                elif tag == "+":
+                    hunk["lines"].append([1, None, new_no, content])
+                    new_no += 1
+                    new_count -= 1
+                    cur["adds"] += 1
+                elif tag == "-":
+                    hunk["lines"].append([2, old_no, None, content])
+                    old_no += 1
+                    old_count -= 1
+                    cur["dels"] += 1
+                elif tag == "\\":
+                    pass  # "no newline at end of file"
+                else:
+                    break
+                i += 1
+            continue
+        i += 1
+
+    for f in files:
+        if not f["path"] and f["oldPath"]:
+            f["path"] = f["oldPath"]
+        f["lang"] = guess_lang(f)
+    return [f for f in files if f["path"]]
+
+
+EXT_LANG = {
+    ".py": "python", ".nix": "nix", ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".md": "markdown", ".json": "json", ".js": "javascript", ".ts": "typescript",
+    ".yml": "yaml", ".yaml": "yaml", ".toml": "ini", ".ini": "ini", ".conf": "ini",
+    ".env": "bash", ".test": "bash", ".css": "css", ".html": "xml", ".xml": "xml",
+    ".rs": "rust", ".go": "go", ".c": "c", ".h": "c", ".cpp": "cpp", ".lua": "lua",
+    ".sql": "sql", ".service": "ini", ".timer": "ini", ".txt": None, ".lock": None,
+}
+
+
+def guess_lang(f: dict) -> str | None:
+    ext = Path(f["path"]).suffix.lower()
+    if ext in EXT_LANG:
+        return EXT_LANG[ext]
+    if ext:
+        return None
+    first = next((ln[3] for h in f["hunks"] for ln in h["lines"] if (h["ns"] == 1 or h["os"] == 1)), "")
+    if first.startswith("#!"):
+        if "python" in first:
+            return "python"
+        if re.search(r"\b(ba|z)?sh\b", first):
+            return "bash"
+    parts = Path(f["path"]).parts
+    if "bin" in parts or "scripts" in parts:
+        return "bash"
+    return None
+
+
+# ---------------------------------------------------------------- auto summary
+
+SUMMARY_PROMPT = (
+    "Summarize this unified diff for a colleague who has not seen the codebase. "
+    "Hard constraints: at most 3 sentences, at most 70 words, one plain-English paragraph. "
+    "Describe what changed in behavior and why — never which files changed. Do not mention file "
+    "paths, directory names, or code identifiers; name a component only when there is no plainer "
+    "way to refer to it. No lists, no headings, no preamble — output only the paragraph."
+)
+
+
+def generate_summary(sources: list[dict], model: str) -> str:
+    budget = 400_000 // max(len(sources), 1)
+    body = "\n\n".join(f"### {s['label']} ({s['detail']})\n{s['_patch'][:budget]}" for s in sources)
+    try:
+        proc = subprocess.run(["claude", "-p", "--model", model, SUMMARY_PROMPT], input=body, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"diffview: warning: auto-summary failed ({e}); continuing without one", file=sys.stderr)
+        return ""
+    if proc.returncode != 0:
+        print(f"diffview: warning: auto-summary failed:\n{proc.stderr.strip()[:500]}", file=sys.stderr)
+        return ""
+    return proc.stdout.strip()
+
+
+# ---------------------------------------------------------------- highlight.js (fetched once, cached, inlined)
+
+HLJS_VERSION = "11.11.1"
+HLJS_COMMON = {
+    "bash", "c", "cpp", "csharp", "css", "diff", "go", "ini", "java", "javascript",
+    "json", "kotlin", "less", "lua", "makefile", "markdown", "objectivec", "perl",
+    "php", "plaintext", "python", "r", "ruby", "rust", "scss", "shell", "sql",
+    "swift", "typescript", "xml", "yaml",
+}
+
+
+def fetch_hljs(langs: set[str]) -> str:
+    cache = Path.home() / ".cache" / "diffview"
+    cache.mkdir(parents=True, exist_ok=True)
+    base = f"https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@{HLJS_VERSION}/build"
+    wanted = [("highlight.min.js", f"{base}/highlight.min.js")]
+    wanted += [(f"{lang}.min.js", f"{base}/languages/{lang}.min.js") for lang in sorted(langs - HLJS_COMMON)]
+    chunks = []
+    for name, url in wanted:
+        path = cache / name
+        if not path.exists():
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    path.write_bytes(resp.read())
+            except OSError as e:
+                print(f"diffview: warning: could not fetch {url} ({e}); page will lack some syntax highlighting", file=sys.stderr)
+                continue
+        chunks.append(path.read_text())
+    return "\n".join(chunks)
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__))
