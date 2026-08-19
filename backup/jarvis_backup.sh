@@ -40,7 +40,15 @@ else
     # Why the cause is not in the reason: without -f, sshfs sends its ssh
     # child's stderr to /dev/null, so a dead host, a rejected key and a changed
     # host key all read "read: Connection reset by peer" and nothing else.
-    if ! mount_error=$(sshfs -o ro "$REMOTE" "$MOUNTPOINT" 2>&1); then
+    #
+    # no_contain_symlinks: sshfs otherwise fails readlink with EPERM for any
+    # target that is absolute or contains "..", and restic stores such a symlink
+    # with an empty target. Every symlink in this tree is one of those, and all
+    # of them are correct — knowledge-base/library resolves on the laptop the
+    # vault is checked out on, .xdg/bin/* inside the container. Containment
+    # protects a client that follows a hostile server's link into local files;
+    # restic records the target string and never follows it.
+    if ! mount_error=$(sshfs -o ro,no_contain_symlinks "$REMOTE" "$MOUNTPOINT" 2>&1); then
         config_name="$("$SCRIPT_DIR/../bin/restic-config-name" "$config_file")"
         echo "[jarvis-backup] Could not mount $REMOTE: $mount_error" >&2
         reason=$(head -1 <<<"$mount_error")
