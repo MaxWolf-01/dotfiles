@@ -74,6 +74,7 @@
       "agent/transcripts"
       "agent/handoffs"
       "agent/research"
+      "agent/diffviews"
       "node_modules"
       "repomix-output.*"
       "**/uv.lock"
