@@ -87,8 +87,9 @@
   # --operator lets max (and agents acting as max) drive tailscaled without sudo.
   # --accept-dns=false keeps pc off the tailnet's ad-blocking resolver: pc runs no
   # browser, so the blocklists are pure downside here — a blocked domain is a
-  # silent NXDOMAIN. Costs nothing: every tailnet host in programs.ssh.matchBlocks
-  # is addressed by IP, so pc never needs MagicDNS. See docs/dns.md.
+  # silent NXDOMAIN. It costs tailnet names in the system resolver: nothing
+  # resolving through glibc on pc, containers included, can look up a tailnet
+  # host. tailscaled's own resolver still answers them. See docs/dns.md.
   services.tailscale.extraSetFlags = [ "--operator=max" "--accept-dns=false" ];
 
   # SSH

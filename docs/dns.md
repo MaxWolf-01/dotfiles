@@ -77,6 +77,30 @@ The servers are therefore opted out with `--accept-dns=false`. pc stores it in
 imperative state — re-apply with `ssh <host> tailscale set --accept-dns=false`
 after any reinstall.
 
+### What the opt-out costs
+
+Tailnet names, in the system resolver only. On an opted-out host `getent hosts
+yapit-prod` fails, and so does the FQDN — MagicDNS names are not in public DNS,
+so the LAN router has no answer either. Every consumer that resolves through
+glibc is affected, Docker containers included, and a container inherits none of
+the host's workarounds: it gets the host's `/etc/resolv.conf` copied in, nothing
+else.
+
+tailscaled's resolver itself is untouched. `--accept-dns=false` only stops
+tailscaled from pointing the OS at it; it keeps listening on `100.100.100.100`
+and keeps answering:
+
+```
+ssh pc host yapit-prod.tail710178.ts.net 100.100.100.100  # -> 100.124.59.34
+ssh pc host github.com 100.100.100.100                    # -> SERVFAIL
+```
+
+The SERVFAIL is the opt-out showing through: with no tailnet resolvers accepted
+there is no upstream to forward to. That makes it a tailnet-only resolver with
+no blocklists behind it — usable as the first entry in a resolver list, because
+SERVFAIL (unlike NXDOMAIN) makes glibc, musl and Go all fall through to the next
+nameserver.
+
 When DoH is unreachable, tailscaled falls back to plain port 53
 (`net/dns/resolver/forwarder.go`), and Mullvad's port 53 listener answers
 *without* the blocklists — so on these hosts filtering fails open silently
