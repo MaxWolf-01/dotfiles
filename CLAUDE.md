@@ -53,6 +53,8 @@ Guidelines:
 - Include a shebang (`#!/usr/bin/env bash` or `#!/usr/bin/env zsh` if zsh features are needed)
 - Include informative error messages — especially for unattended scripts (timers, cron). Print what failed, why, and what to check.
 - Python CLIs: use tyro (load `/mx:tyro-cli` skill first).
+- Name a helper for the subsystem it serves, not for its verb: `restic-config-name`, not `config-name`. Everything here shares one flat namespace and one tab-completion list.
+- Tests for `bin/` scripts live in `tests/<script>.test`, not beside them — `bin/` is on `$PATH`, so a test file there is autocomplete noise. Elsewhere (`backup/`, `secrets/scripts/`) tests stay beside what they test.
 
 ## Tmux
 

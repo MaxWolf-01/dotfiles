@@ -28,7 +28,7 @@ set -uo pipefail
 # their own PATH and none of them carries ~/bin.
 bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
 run_log_bin="$bin_dir/run-log"
-unreachable_reason="$bin_dir/unreachable-reason"
+unreachable_reason="$bin_dir/restic-unreachable-reason"
 
 # Recording the run must never decide whether the backup succeeded: run-log
 # explains itself on stderr and the backup carries on.
@@ -63,7 +63,7 @@ fi
 
 source "$config_file"
 
-config_name="$("$bin_dir/config-name" "$config_file")" || exit 1
+config_name="$("$bin_dir/restic-config-name" "$config_file")" || exit 1
 
 # Validate required variables before using them (set -u would exit silently otherwise)
 required_vars="repo_path password_command backup_dirs_file base_path compression keep_last keep_daily keep_weekly keep_monthly"

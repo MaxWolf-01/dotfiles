@@ -87,9 +87,10 @@ named. A repository nothing can date — no run log on the host that backs it up
 ## Dashboards
 
 Three pages, all in `~/Documents/dashboards/`: `backups.html`, `dns-vpn.html`,
-`yapit.html`. They are bookmarked in Firefox under `Dashboards` in the
-bookmarks menu (`nix/home/firefox.nix`; the bookmarks toolbar is off). That
-folder is the index — the pages do not link each other.
+`yapit.html`. Bookmark them by hand — where they sit and in what order is a
+matter of taste, and a policy-managed bookmark cannot be moved or renamed
+without the policy fighting back. The bookmarks are the index; the pages do
+not link each other.
 
 Each page is one self-contained file written by its own collector,
 `secrets/scripts/dashboard-<topic>`, on an hourly timer in
