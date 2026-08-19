@@ -23,6 +23,7 @@ set -uo pipefail
 # ntfy_topic - (optional) Ntfy topic for notifications
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
 # require_mount - (optional) Path that must be a mountpoint, else skip (for encrypted ZFS datasets)
+# backup_opts - (optional) Extra flags for `restic backup`, word-split (e.g. "--ignore-inode")
 
 # Reached relative to this script, not through PATH: the systemd units pin
 # their own PATH and none of them carries ~/bin.
@@ -198,6 +199,7 @@ sed "s|^|$base_path/|" "$backup_dirs_file" | \
     --password-command "$password_command" \
     $exclude_opts \
     $scan_option \
+    ${backup_opts:-} \
     --json 2>"$error_log" | tee "$backup_output"
 backup_exit=${PIPESTATUS[1]}
 
