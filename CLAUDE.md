@@ -54,7 +54,7 @@ Guidelines:
 - Include informative error messages — especially for unattended scripts (timers, cron). Print what failed, why, and what to check.
 - Python CLIs: use tyro (load `/mx:tyro-cli` skill first).
 - Name a helper for the subsystem it serves, not for its verb: `restic-config-name`, not `config-name`. Everything here shares one flat namespace and one tab-completion list.
-- Tests for `bin/` scripts live in `tests/<script>.test`, not beside them — `bin/` is on `$PATH`, so a test file there is autocomplete noise. Elsewhere (`backup/`, `secrets/scripts/`) tests stay beside what they test.
+- A test for a script in a `$PATH` directory (`bin/`, `secrets/scripts/`, `secrets/bin/`) lives in that repo's `tests/`, not beside it — a `.test` file on `$PATH` is autocomplete noise. Everywhere else (`backup/`, for one) a test sits beside what it tests.
 
 ## Tmux
 
