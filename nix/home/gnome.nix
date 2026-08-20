@@ -140,6 +140,10 @@
       # Drawn outside the window and multiplied by the monitor scale (1.33 here),
       # so the effective line is noticeably thicker than this number.
       window-border-width = lib.hm.gvariant.mkUint32 2;
+      # Upstream measures the real corner by screenshotting a strip of the window's
+      # left edge; on GNOME 50 it samples the wrong strip and reports ~90px instead
+      # of ~17px. Off means the fixed 11px + border width, which matches libadwaita.
+      enable-smart-window-border-radius = false;
       top-edge-maximize = false;
       inner-gaps = lib.hm.gvariant.mkUint32 0;
       outer-gaps = lib.hm.gvariant.mkUint32 0;
