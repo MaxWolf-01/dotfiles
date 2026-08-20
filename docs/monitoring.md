@@ -70,6 +70,10 @@ overdue-check --help             # bounds, hosts, what counts as a success
 systemctl --user start overdue-check.service
 ```
 
+A red `overdue-check.service` means the watchdog itself could not run. Finding
+something overdue is exit 1, which the units count as success — the ntfy is how
+that gets reported, not the unit's state.
+
 Both hosts run the check daily and each judges the other's units over ssh
 (`nix/home/timers.nix`, `nix/home/pc-timers.nix`). pc runs the bounds as
 written; zephylux adds `--extra-days 7`, so pc alerts first and zephylux only

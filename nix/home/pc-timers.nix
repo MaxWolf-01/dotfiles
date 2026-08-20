@@ -220,6 +220,11 @@ in
     };
     Service = {
       Type = "oneshot";
+      # Exit 1 means it found something overdue and said so by ntfy; only exit 2
+      # means the check itself broke. Without this the unit sits red in
+      # systemctl --failed for as long as anything is overdue, which reads as
+      # "the watchdog is broken" to everyone who looks later.
+      SuccessExitStatus = "1";
       Environment = [
         "PATH=${watchdogPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
