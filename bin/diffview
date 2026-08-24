@@ -8,8 +8,12 @@
 The page is the human-in-the-loop review surface: file tree + side-by-side diff,
 keyboard-driven (press ? in the page), line/hunk comments that persist in the
 browser and export as markdown via the copy button, ready to paste back to the
-authoring agent. Output goes to ~/Downloads by default so the sandboxed browser
-can read it.
+authoring agent.
+
+The page's own path is the review's identity: rendering to the same path again --
+after review fixes, with the new range appended -- finds the comments already
+there. Unnamed output lands in ~/Downloads/diffview under a name derived from the
+sources, so two renders share a page only when they are the same review.
 
 Source specs (positional, several allowed; one page with a section per source):
 - REPO@A..B      git range in REPO (A...B also works)
@@ -46,8 +50,8 @@ import tyro
 class Args:
     sources: Annotated[list[str], tyro.conf.Positional]
     """Source specs: REPO@RANGE, RANGE (cwd), or OLD=NEW paths."""
-    output: Annotated[str, tyro.conf.arg(aliases=["-o"])] = "~/Downloads/review.html"
-    """Path of the generated HTML file (default lands in Downloads, readable by the sandboxed browser)."""
+    output: Annotated[str, tyro.conf.arg(aliases=["-o"])] = ""
+    """Path of the generated HTML file. Empty derives one per source list under ~/Downloads/diffview, so unrelated renders never overwrite each other; the path is the review's identity, so passing the same one again keeps its comments."""
     summary: str = ""
     """One plain-English paragraph on what this change is about (shown at the top; inline markdown ok)."""
     auto_summary: bool = True
@@ -67,7 +71,8 @@ class Args:
 
 
 def main(args: Args) -> None:
-    out = Path(args.output).expanduser()
+    out = Path(args.output).expanduser() if args.output else default_output(args.sources)
+    out.parent.mkdir(parents=True, exist_ok=True)
     summary, generated, key = build(args, out, args.summary)
     if args.open and not args.watch:
         subprocess.Popen(["xdg-open", str(out.resolve())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -90,7 +95,7 @@ def build(args: Args, out: Path, summary: str) -> tuple[str, str, str]:
     langs = {f["lang"] for s in sources for f in s["files"] if f["lang"]}
 
     notes, agent_resolved = load_notes(args.notes)
-    saved = load_saved_state(out, sources)
+    saved = load_saved_state(out)
     changed_paths = {f["path"] for s in sources for f in s["files"]}
     for n in notes:
         if n["path"] not in changed_paths and not any(p.endswith("/" + n["path"]) for p in changed_paths):
@@ -104,6 +109,7 @@ def build(args: Args, out: Path, summary: str) -> tuple[str, str, str]:
         "notes": notes,
         "agentResolved": agent_resolved,
         "saved": saved,
+        "key": str(out.resolve()),
     }
 
     template = (Path(__file__).resolve().parent / "diffview.html").read_text()
@@ -121,19 +127,36 @@ def build(args: Args, out: Path, summary: str) -> tuple[str, str, str]:
     dels = sum(f["dels"] for s in sources for f in s["files"])
     print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
     print(f"file://{out.resolve()}", flush=True)
-    return summary, data["generated"], page_key(sources)
+    return summary, data["generated"], data["key"]
 
 
 def state_path(out: Path) -> Path:
     return Path(str(out) + ".state.json")
 
 
-def page_key(sources: list[dict]) -> str:
-    """Mirrors the page's STORE_KEY so review state can be matched to its review."""
-    return "diffview:" + "+".join(f"{s['label']}@{s['detail']}" for s in sources)
+def default_output(specs: list[str]) -> Path:
+    """One page per source list: a readable stem plus a digest of the canonical specs.
+
+    Two renders collide only when their specs are identical, which means they are
+    the same review — so parallel agents never overwrite each other's page.
+    """
+    canon = [canonical_spec(s) for s in specs]
+    digest = hashlib.sha256("\n".join(canon).encode()).hexdigest()[:8]
+    stem = re.sub(r"[^A-Za-z0-9._@~-]+", "-", canon[0].split("=")[-1].rsplit("/", 1)[-1])[:60]
+    extra = f"+{len(specs) - 1}" if len(specs) > 1 else ""
+    return Path.home() / "Downloads" / "diffview" / f"{stem}{extra}-{digest}.html"
 
 
-def load_saved_state(out: Path, sources: list[dict]) -> dict | None:
+def canonical_spec(spec: str) -> str:
+    """A spec with its paths made absolute, so the same review names the same page from any cwd."""
+    if "=" in spec and ".." not in spec.split("=")[0]:
+        old, new = (str(Path(p).expanduser().resolve()) for p in spec.split("=", 1))
+        return f"{old}={new}"
+    repo, range_ = spec.rsplit("@", 1) if "@" in spec else (".", spec)
+    return f"{Path(repo).expanduser().resolve()}@{range_}"
+
+
+def load_saved_state(out: Path) -> dict | None:
     """Review state (comments, viewed) saved beside the page by a --watch session; baked back in on rebuild."""
     sp = state_path(out)
     if not sp.is_file():
@@ -146,8 +169,6 @@ def load_saved_state(out: Path, sources: list[dict]) -> dict | None:
     if not isinstance(saved, dict):
         print(f"diffview: warning: ignoring malformed state file {sp}", file=sys.stderr)
         return None
-    if saved.get("key") != page_key(sources):
-        return None  # state from a different review that happened to use the same output path
     return saved
 
 
