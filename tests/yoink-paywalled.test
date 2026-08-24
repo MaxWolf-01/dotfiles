@@ -1,0 +1,124 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Check what bin/yoink-paywalled does with cookies, links, audio and frontmatter.
+
+Run it directly; no framework. Nothing here touches the network or the real
+Firefox profile — the cases build their own cookie rows and markup.
+
+The case that matters most is the first one: the script reads a whole browser
+session out of Firefox, so a cookie reaching a host it does not belong to would
+hand that host the login. The rest guard the patching yapit cannot do itself,
+which is silent when it goes wrong — a dead link or a missing audio file looks
+like a page that simply had none.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_loader(
+    "yoink_paywalled",
+    importlib.machinery.SourceFileLoader("yoink_paywalled", str(REPO / "bin" / "yoink-paywalled")),
+)
+yp = importlib.util.module_from_spec(spec)
+sys.modules["yoink_paywalled"] = yp  # @dataclass resolves its class through sys.modules
+spec.loader.exec_module(yp)
+
+failures = 0
+
+
+def check(what: str, expected: object, actual: object) -> None:
+    global failures
+    if expected != actual:
+        failures += 1
+        print(f"FAIL {what}\n  expected: {expected!r}\n  actual:   {actual!r}")
+    else:
+        print(f"ok   {what}")
+
+
+def cookie_header(host_rows: list[tuple], url: str) -> str | None:
+    """The Cookie header the jar would attach to a request for url."""
+    jar = yp.jar_for(host_rows, urllib.parse.urlparse(url).hostname)
+    request = urllib.request.Request(url)
+    jar.add_cookie_header(request)
+    return request.get_header("Cookie")
+
+
+# host, name, value, path, expiry, isSecure
+SESSION = [
+    (".economist.com", "session", "secret", "/", 0, 1),
+    ("www.economist.com", "exact", "host-only", "/", 0, 1),
+    (".economist.com", "stale", "expired", "/", 1, 1),
+]
+
+check("domain cookie reaches a subdomain", "session=secret; exact=host-only",
+      cookie_header(SESSION, "https://www.economist.com/article"))
+check("domain cookie reaches the bare domain", "session=secret",
+      cookie_header(SESSION, "https://economist.com/article"))
+check("session never reaches a lookalike domain", None,
+      cookie_header(SESSION, "https://evileconomist.com/article"))
+check("session never reaches an unrelated host", None,
+      cookie_header(SESSION, "https://cdn.example.com/audio.mp3"))
+check("secure cookies stay off plain http", None,
+      cookie_header(SESSION, "http://www.economist.com/article"))
+check("expired cookies are dropped", "session=secret",
+      cookie_header([SESSION[0], SESSION[2]], "https://www.economist.com/article"))
+
+PAGE = "https://www.economist.com/by-invitation/2026/08/20/piece"
+check("audio element wins over any other URL",
+      "https://cdn.economist.com/real.mp3",
+      yp.find_audio(b'<a href="https://ads.example.com/beacon.ogg">x</a>'
+                    b'<audio src="https://cdn.economist.com/real.mp3"></audio>', PAGE))
+check("audio element resolved against the page",
+      "https://www.economist.com/assets/x.m4a",
+      yp.find_audio(b'<audio><source src="/assets/x.m4a" type="audio/mp4"></audio>', PAGE))
+check("bare URL found when there is no audio element",
+      "https://www.economist.com/content-assets/a%20b.mp3",
+      yp.find_audio(b'{"url":"https://www.economist.com/content-assets/a%20b.mp3"}', PAGE))
+check("signed URL keeps its query string",
+      "https://cdn.example.com/a.mp3?token=abc&e=1",
+      yp.find_audio(b'<div data-src="https://cdn.example.com/a.mp3?token=abc&amp;e=1">', PAGE))
+check("JSON-escaped URL is found",
+      "https://cdn.example.com/a.mp3",
+      yp.find_audio(rb'{"audio":"https:\/\/cdn.example.com\/a.mp3"}', PAGE))
+check("a page without audio reports none", None, yp.find_audio(b"<p>no audio here</p>", PAGE))
+
+with tempfile.TemporaryDirectory() as tmp:
+    doc = Path(tmp) / "piece"
+    doc.mkdir()
+    (doc / "piece.md").write_text(
+        '---\ntitle: "Piece"\naccessed: 2026-08-24\n---\n\n'
+        "[Section](/section) and [essay](https://www.economist.com/essay)\n\n"
+        "![](./piece-1.jpg)\n",
+        encoding="utf-8",
+    )
+    words = yp.patch_markdown(doc, PAGE, "piece.mp3")
+    written = (doc / "piece.md").read_text(encoding="utf-8")
+
+check("source URL recorded under the title", True, f'title: "Piece"\nsource: {PAGE}\n' in written)
+check("root-relative link made absolute", True, "[Section](https://www.economist.com/section)" in written)
+check("absolute link untouched", True, "[essay](https://www.economist.com/essay)" in written)
+check("local image path untouched", True, "![](./piece-1.jpg)" in written)
+check("audio embedded above the article", True, written.split("---\n\n")[1].startswith("![[piece.mp3]]\n"))
+check("word count is the article, not the frontmatter or the audio embed", 4, words)
+
+with tempfile.TemporaryDirectory() as tmp:
+    doc = Path(tmp) / "untitled"
+    doc.mkdir()
+    (doc / "untitled.md").write_text("Just a body.\n", encoding="utf-8")
+    yp.patch_markdown(doc, PAGE, None)
+    check("frontmatter created when yapit wrote none", True,
+          (doc / "untitled.md").read_text(encoding="utf-8").startswith(f"---\nsource: {PAGE}\n---\n\n"))
+
+print(f"\n{failures} failure(s)")
+sys.exit(1 if failures else 0)

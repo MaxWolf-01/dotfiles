@@ -24,6 +24,7 @@ Examples:
 from __future__ import annotations
 
 import gzip
+import http.cookiejar
 import os
 import re
 import shutil
@@ -31,10 +32,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Annotated, NoReturn
 from urllib.parse import urljoin, urlparse
@@ -50,7 +52,8 @@ FIREFOX_ROOTS = [
     Path.home() / ".var" / "app" / "org.mozilla.firefox" / ".mozilla" / "firefox",
 ]
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
-AUDIO_URL = re.compile(rb"""https?://[^\s"'<>\\]+?\.(?:mp3|m4a|aac|ogg|opus)""", re.IGNORECASE)
+AUDIO_SUFFIXES = (".mp3", ".m4a", ".aac", ".ogg", ".opus")
+AUDIO_URL = re.compile(rb"""https?://[^\s"'<>\\]+?\.(?:mp3|m4a|aac|ogg|opus)(?:\?[^\s"'<>\\]*)?""", re.IGNORECASE)
 ROOT_RELATIVE_LINK = re.compile(r"(!?\[[^\]]*\]\()(/[^)\s]*)(\))")
 SHORT_EXTRACTION = 250  # words; below this, suspect the login didn't take
 
@@ -70,7 +73,7 @@ class Args:
     """Save the page's audio file and embed it in the markdown."""
 
     ai: bool = True
-    """Pass --ai to yapit. Only affects PDFs; costs quota."""
+    """AI extraction. Applies to PDFs only, and spends yapit quota."""
 
     profile: str | None = None
     """Firefox profile, by name or path. Default: whichever has the newest cookies."""
@@ -100,11 +103,11 @@ def find_profile(explicit: str | None) -> Path:
     return max(profiles, key=lambda p: (p / "cookies.sqlite").stat().st_mtime)
 
 
-def read_cookies(profile: Path, host: str) -> dict[str, str]:
-    """Cookies Firefox would send to host.
+def read_cookie_rows(profile: Path) -> list[tuple]:
+    """Every cookie Firefox has stored, read from a copy of its database.
 
-    Reads a copy of the database, write-ahead log included: Firefox keeps the
-    original open, and a copy cannot be damaged by reading it.
+    The copy exists because Firefox keeps the original open, and the most recent
+    writes sit in the write-ahead log rather than the database file.
     """
     with tempfile.TemporaryDirectory() as tmp:
         copy = Path(tmp) / "cookies.sqlite"
@@ -113,25 +116,51 @@ def read_cookies(profile: Path, host: str) -> dict[str, str]:
             if src.exists():
                 shutil.copy2(src, f"{copy}{suffix}")
         db = sqlite3.connect(copy)
-        rows = db.execute("SELECT host, name, value, expiry FROM moz_cookies").fetchall()
+        rows = db.execute("SELECT host, name, value, path, expiry, isSecure FROM moz_cookies").fetchall()
         db.close()
+    return rows
 
-    now = time.time()
-    matching = [
-        (cookie_host, name, value)
-        for cookie_host, name, value, expiry in rows
-        if (host == cookie_host or (cookie_host.startswith(".") and host.endswith(cookie_host[1:])))
-        and not (expiry and expiry < now)
-    ]
-    # Sort by host specificity so a cookie set on the exact host wins over a domain-wide one.
-    return {name: value for _, name, value in sorted(matching, key=lambda c: len(c[0]))}
+
+def jar_for(rows: list[tuple], host: str) -> http.cookiejar.CookieJar:
+    """The cookies for host, in a jar that decides for itself where they may go.
+
+    The filter here only keeps the jar small. What actually governs which cookie
+    reaches which host is the jar's own policy, applied per request — redirect
+    hops included — so a session cookie cannot follow a link off its own domain.
+    """
+    jar = http.cookiejar.CookieJar()
+    for cookie_host, name, value, path, expiry, secure in rows:
+        domain_wide = cookie_host.startswith(".")
+        if not (host == cookie_host or (domain_wide and (host == cookie_host[1:] or host.endswith(cookie_host)))):
+            continue
+        jar.set_cookie(
+            http.cookiejar.Cookie(
+                version=0,
+                name=name,
+                value=value,
+                port=None,
+                port_specified=False,
+                domain=cookie_host,
+                domain_specified=domain_wide,
+                domain_initial_dot=domain_wide,
+                path=path,
+                path_specified=True,
+                secure=bool(secure),
+                expires=expiry or None,
+                discard=not expiry,
+                comment=None,
+                comment_url=None,
+                rest={},
+            )
+        )
+    return jar
 
 
 class FetchError(Exception):
     """A request that failed for a reason worth showing the user verbatim."""
 
 
-def fetch(url: str, cookies: dict[str, str]) -> tuple[bytes, str]:
+def fetch(url: str, jar: http.cookiejar.CookieJar) -> tuple[bytes, str]:
     """Fetch url as the logged-in browser would. Returns (body, content type)."""
     request = urllib.request.Request(
         url,
@@ -139,11 +168,10 @@ def fetch(url: str, cookies: dict[str, str]) -> tuple[bytes, str]:
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
-            "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
             "Upgrade-Insecure-Requests": "1",
         },
     )
-    opener = urllib.request.build_opener(ScopedCookieRedirects)
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     try:
         with opener.open(request, timeout=60) as response:
             body = response.read()
@@ -163,16 +191,6 @@ def fetch(url: str, cookies: dict[str, str]) -> tuple[bytes, str]:
     if b"geo.captcha-delivery.com" in body or b"/_Incapsula_Resource" in body:
         raise FetchError("the site served a bot check instead of the page — open it in Firefox once, then retry")
     return body, content_type
-
-
-class ScopedCookieRedirects(urllib.request.HTTPRedirectHandler):
-    """Follow redirects without handing the session cookies to another host."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and urlparse(newurl).hostname != urlparse(req.full_url).hostname:
-            new.remove_header("Cookie")
-        return new
 
 
 def suffix_for(content_type: str, url: str) -> str:
@@ -213,15 +231,41 @@ def run_yapit(path: Path, args: Args) -> Path:
     return Path(result.stdout.strip().splitlines()[-1])
 
 
-def find_audio(html: bytes, page_url: str) -> str | None:
-    match = AUDIO_URL.search(html)
-    return urljoin(page_url, match.group().decode()) if match else None
+class AudioSources(HTMLParser):
+    """Collects the src of every audio element in a page, in document order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in ("audio", "source"):
+            return
+        attributes = dict(attrs)
+        src, kind = attributes.get("src"), attributes.get("type") or ""
+        if src and (Path(urlparse(src).path).suffix.lower() in AUDIO_SUFFIXES or kind.startswith("audio/")):
+            self.sources.append(src)
 
 
-def download_audio(audio_url: str, cookies: dict[str, str], doc_dir: Path) -> str | None:
+def find_audio(page: bytes, page_url: str) -> str | None:
+    """The page's audio file: its audio element if it has one, else any audio URL in the markup.
+
+    Sites that build their own player leave no audio element to find, so the
+    fallback reads the raw markup, where the URL may also be JSON-escaped.
+    """
+    parser = AudioSources()
+    parser.feed(page.decode("utf-8", "replace"))
+    if parser.sources:
+        return urljoin(page_url, parser.sources[0])
+
+    match = AUDIO_URL.search(page.replace(rb"\/", b"/"))
+    return urljoin(page_url, unescape(match.group().decode())) if match else None
+
+
+def download_audio(audio_url: str, jar: http.cookiejar.CookieJar, doc_dir: Path) -> str | None:
     """Save the audio beside the markdown, named after it. Returns the file name."""
     try:
-        body, _ = fetch(audio_url, cookies)
+        body, _ = fetch(audio_url, jar)
     except FetchError as e:
         err(f"warning: audio not saved: {e}")
         return None
@@ -232,9 +276,9 @@ def download_audio(audio_url: str, cookies: dict[str, str], doc_dir: Path) -> st
 
 
 def patch_markdown(doc_dir: Path, page_url: str, audio_name: str | None) -> int:
-    """Record the source, absolutize links, embed the audio. Returns the word count."""
+    """Record the source, absolutize links, embed the audio. Returns the article's word count."""
     path = doc_dir / f"{doc_dir.name}.md"
-    frontmatter, body = split_frontmatter(path.read_text())
+    frontmatter, body = split_frontmatter(path.read_text(encoding="utf-8"))
 
     if not any(line.startswith("source:") for line in frontmatter):
         # yapit only knows a source URL when it did the fetching itself.
@@ -242,12 +286,13 @@ def patch_markdown(doc_dir: Path, page_url: str, audio_name: str | None) -> int:
         frontmatter.insert(insert_at, f"source: {page_url}")
 
     body = ROOT_RELATIVE_LINK.sub(lambda m: m[1] + urljoin(page_url, m[2]) + m[3], body)
+    words = len(body.split())
     if audio_name:
         body = f"![[{audio_name}]]\n\n{body}"
 
     text = "---\n" + "\n".join(frontmatter) + "\n---\n\n" + body if frontmatter else body
-    path.write_text(text)
-    return len(body.split())
+    path.write_text(text, encoding="utf-8")
+    return words
 
 
 def split_frontmatter(text: str) -> tuple[list[str], str]:
@@ -265,12 +310,13 @@ def main() -> None:
         die(f"not a URL: {args.url}")
 
     profile = find_profile(args.profile)
-    cookies = read_cookies(profile, host)
-    if not cookies:
+    rows = read_cookie_rows(profile)
+    jar = jar_for(rows, host)
+    if not len(jar):
         err(f"warning: no cookies for {host} in {profile.name} — fetching logged out")
-    err(f"Fetching {args.url} with {len(cookies)} cookies from {profile.name}...")
+    err(f"Fetching {args.url} with {len(jar)} cookies from {profile.name}...")
     try:
-        body, content_type = fetch(args.url, cookies)
+        body, content_type = fetch(args.url, jar)
     except FetchError as e:
         die(str(e))
 
@@ -280,8 +326,11 @@ def main() -> None:
         doc_dir = run_yapit(page, args)
 
     audio_url = find_audio(body, args.url) if args.audio else None
-    audio_name = download_audio(audio_url, cookies, doc_dir) if audio_url else None
-    if args.audio and not audio_url:
+    audio_name = None
+    if audio_url:
+        # The audio often lives on a CDN, which gets its own cookies — or none.
+        audio_name = download_audio(audio_url, jar_for(rows, urlparse(audio_url).hostname or host), doc_dir)
+    elif args.audio:
         err("No audio found on the page.")
 
     words = patch_markdown(doc_dir, args.url, audio_name)
