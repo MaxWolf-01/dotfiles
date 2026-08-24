@@ -57,7 +57,7 @@ class Args:
     sources: Annotated[list[str], tyro.conf.Positional]
     """Source specs: REPO@RANGE, RANGE (cwd), or OLD=NEW paths."""
     output: Annotated[str, tyro.conf.arg(aliases=["-o"])] = ""
-    """Path of the generated HTML file. The path is the review's identity: render to it again and the comments already on it are still there. Leave this empty and the name is derived from the sources instead, under ~/Downloads/diffview — which pins the page to those exact diffs, so a review that will gain ranges over later rounds needs a path you choose."""
+    """Path of the generated HTML file. The path is the review's identity: render to it again and the comments already on it are still there. Leave this empty and the name is derived from the sources instead, under ~/Downloads/diffview, and that page is served so it can take comments. A derived name is pinned to those exact diffs, so a review that will gain ranges over later rounds needs a path you choose."""
     summary: str = ""
     """One plain-English paragraph on what this change is about (shown at the top; inline markdown ok)."""
     auto_summary: bool = True
@@ -82,15 +82,31 @@ def main(args: Args) -> None:
     if args.serve:
         serve_root(args.serve)
         return
+    derived = not args.output
     out = Path(args.output).expanduser() if args.output else default_output(args.sources)
     out.parent.mkdir(parents=True, exist_ok=True)
+    if derived:
+        warn_displaced(out)
     summary, generated = build(args, out, args.summary)
     if args.watch:
         watch(args, out, summary, generated)
-    elif args.open:
-        open_page(out)
-    else:
-        print(f"file://{out.resolve()}", flush=True)
+        return
+    # a derived page is the throwaway case, so serve it: the url this prints should be
+    # one you can comment on, not a read-only file
+    url = page_url(out) if args.open or derived else f"file://{out.resolve()}"
+    print(url, flush=True)
+    if args.open:
+        launch(url)
+
+
+def warn_displaced(out: Path) -> None:
+    """An earlier page for these sources whose comments this render will not inherit."""
+    stem = out.name.rsplit("-", 1)[0]
+    for other in sorted(out.parent.glob(f"{stem}-*.html")):
+        if other != out and state_path(other).is_file():
+            print(f"diffview: {other.name} is an earlier page for {stem} and holds comments this one "
+                  f"will not; -o keeps a review on one page across rounds", file=sys.stderr)
+            return
 
 
 def build(args: Args, out: Path, summary: str) -> tuple[str, str]:
@@ -149,15 +165,15 @@ def state_path(out: Path) -> Path:
 def default_output(specs: list[str]) -> Path:
     """One page per source list: a readable stem plus a digest of the canonical specs.
 
-    The digest follows the specs, so a page reached this way is pinned to the diffs
-    it was rendered from. A review that will gain ranges over later rounds needs an
-    explicit -o, which is what makes the growing page one review.
+    The stem is only there to be recognised; the digest does the distinguishing, and
+    it follows the specs, so a page reached this way is pinned to the diffs it was
+    rendered from. A review that will gain ranges over later rounds needs an explicit
+    -o, which is what makes the growing page one review.
     """
     parts = [canonical_spec(s) for s in specs]
     digest = hashlib.sha256("\n".join(c for _, c in parts).encode()).hexdigest()[:8]
-    stem = re.sub(r"[^A-Za-z0-9._@~-]+", "-", parts[0][0])[:60]
-    extra = f"+{len(specs) - 1}" if len(specs) > 1 else ""
-    return Path.home() / "Downloads" / "diffview" / f"{stem}{extra}-{digest}.html"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", parts[0][0])[:40]
+    return Path.home() / "Downloads" / "diffview" / f"{stem}-{digest}.html"
 
 
 def canonical_spec(spec: str) -> tuple[str, str]:
@@ -172,7 +188,7 @@ def canonical_spec(spec: str) -> tuple[str, str]:
         return Path(new).name, f"{old}={new}"
     repo, range_ = spec.rsplit("@", 1) if "@" in spec else (".", spec)
     root = git_root(repo)
-    return f"{Path(root).name}@{range_}", f"{root}@{range_}@{resolved_revs(root, range_)}"
+    return Path(root).name, f"{root}@{range_}@{resolved_revs(root, range_)}"
 
 
 def git_root(repo: str) -> str:
@@ -261,16 +277,13 @@ CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".json": "application/json
                  ".svg": "image/svg+xml", ".css": "text/css", ".js": "text/javascript"}
 
 
-def open_page(out: Path) -> None:
-    """Open the page in a browser, served, so it can take comments rather than only show them."""
+def page_url(out: Path) -> str:
+    """The url to hand someone: served, so the page can take comments; the file when it cannot be."""
     port = ensure_server(out.parent)
     if port is None:
-        print(f"diffview: {out.parent.resolve()} is too broad to serve; opening read-only", file=sys.stderr)
-        launch(f"file://{out.resolve()}")
-        return
-    url = f"http://127.0.0.1:{port}/{out.name}"
-    print(url, flush=True)
-    launch(url)
+        print(f"diffview: {out.parent.resolve()} is too broad to serve; read-only", file=sys.stderr)
+        return f"file://{out.resolve()}"
+    return f"http://127.0.0.1:{port}/{out.name}"
 
 
 def launch(url: str) -> None:
@@ -323,7 +336,7 @@ def ensure_server(root: Path) -> int | None:
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    threading.Thread(target=idle_watchdog, args=(server, stop), daemon=True).start()
+    threading.Thread(target=idle_watchdog, args=(server, stop, root), daemon=True).start()
     try:
         stop.wait()
     finally:
@@ -372,10 +385,10 @@ def already_serving(root: Path) -> int | None:
     return None
 
 
-def idle_watchdog(server, stop: threading.Event) -> None:
-    """Nobody asked for a page in a long while, so the tree is not under review any more."""
+def idle_watchdog(server, stop: threading.Event, root: Path) -> None:
+    """Nobody asked for a page in a long while, or the tree went away — either way it is not under review."""
     while not stop.wait(60):
-        if time.monotonic() - server.last_request > IDLE_EXIT_SECONDS:
+        if not root.is_dir() or time.monotonic() - server.last_request > IDLE_EXIT_SECONDS:
             stop.set()
 
 
