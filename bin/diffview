@@ -6,9 +6,10 @@
 """Render diffs from several sources as ONE self-contained HTML review page.
 
 The page is the human-in-the-loop review surface: file tree + side-by-side diff,
-keyboard-driven (press ? in the page), line/hunk comments that persist in the
-browser and export as markdown via the copy button, ready to paste back to the
-authoring agent.
+keyboard-driven (press ? in the page), line/hunk comments that export as markdown
+via the copy button, ready to paste back to the authoring agent. Comments are
+saved to a file beside the page, which only a served page can write -- see
+--serve; opened as a plain file the page is read-only and says so.
 
 The page's own path is the review's identity: rendering to the same path again --
 after review fixes, with the new range appended -- finds the comments already
@@ -30,14 +31,15 @@ Examples:
 """
 
 import hashlib
+import html
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
-import time
-import signal
 import threading
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -123,13 +125,13 @@ def build(args: Args, out: Path, summary: str) -> tuple[str, str]:
 
     template = (Path(__file__).resolve().parent / "diffview.html").read_text()
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
-    html = (
+    page = (
         template.replace("__TITLE__", title.replace("<", "&lt;"))
         .replace("__HLJS__", fetch_hljs(langs))
         .replace('"__DATA__"', payload)
     )
     tmp = out.with_name(out.name + ".tmp")
-    tmp.write_text(html)
+    tmp.write_text(page)
     os.replace(tmp, out)  # atomic, so a watch-mode request never sees a half-written page
     n_files = sum(len(s["files"]) for s in sources)
     adds = sum(f["adds"] for s in sources for f in s["files"])
@@ -187,7 +189,7 @@ def resolved_revs(root: str, range_: str) -> str:
 
 
 def load_saved_state(out: Path) -> dict | None:
-    """Review state (comments, viewed) saved beside the page by a --watch session; baked back in on rebuild."""
+    """Review state (comments, viewed) saved beside the page while it was served; baked back in on rebuild."""
     sp = state_path(out)
     if not sp.is_file():
         return None
@@ -261,9 +263,7 @@ CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".json": "application/json
 def serve_root(root_spec: str) -> None:
     """Serve a tree of already-rendered pages, in the background, and return.
 
-    Comments live in a file beside their page, which only a served page can write:
-    a file:// page has no way to reach the disk. One server per tree, reported
-    rather than replaced when it is already up.
+    One server per tree: an already-running one is reported rather than replaced.
     """
     root = Path(root_spec).expanduser().resolve()
     if not root.is_dir():
@@ -279,7 +279,7 @@ def serve_root(root_spec: str) -> None:
     print(f"diffview: serving {root} at http://127.0.0.1:{port}/  (exits after {IDLE_EXIT_SECONDS // 60} idle minutes)")
     pid = os.fork()
     if pid:
-        # the marker is written here, so it exists the moment this command returns
+        # written here, so the marker exists the moment this command returns
         marker.write_text(json.dumps({"port": port, "pid": pid, "root": str(root)}))
         return
 
@@ -296,8 +296,35 @@ def serve_root(root_spec: str) -> None:
     try:
         stop.wait()
     finally:
-        marker.unlink(missing_ok=True)
+        release_marker(marker, os.getpid())
     os._exit(0)
+
+
+def release_marker(marker: Path, pid: int) -> None:
+    """Clear the marker only while it still names this server.
+
+    Two --serve racing on one root both bind and both write; the loser exiting must
+    not strand the winner behind a missing marker, which reads as nothing serving.
+    """
+    try:
+        if json.loads(marker.read_text())["pid"] != pid:
+            return
+    except (OSError, ValueError, KeyError):
+        return
+    marker.unlink(missing_ok=True)
+
+
+def index_page(root: Path, directory: Path) -> bytes:
+    """Every review page under this directory, so the served URL is somewhere to start."""
+    pages = sorted(p for p in directory.rglob("*.html"))
+    links = "".join(
+        f'<li><a href="/{html.escape(str(p.relative_to(root)))}">{html.escape(str(p.relative_to(directory)))}</a></li>'
+        for p in pages
+    ) or "<li>no pages rendered here yet</li>"
+    return (f'<!doctype html><meta charset="utf-8"><title>diffview · {html.escape(directory.name)}</title>'
+            '<style>body{background:#141519;color:#d6dae2;font:15px/1.7 ui-monospace,monospace;padding:2rem}'
+            'a{color:#7aa2f7}h1{font-size:15px;color:#9aa1af;font-weight:600}ul{padding-left:1.2rem}</style>'
+            f"<h1>{html.escape(str(directory))}</h1><ul>{links}</ul>").encode()
 
 
 def already_serving(root: Path) -> int | None:
@@ -314,7 +341,7 @@ def already_serving(root: Path) -> int | None:
     return None
 
 
-def idle_watchdog(server, stop) -> None:
+def idle_watchdog(server, stop: threading.Event) -> None:
     """Nobody asked for a page in a long while, so the tree is not under review any more."""
     while not stop.wait(60):
         if time.monotonic() - server.last_request > IDLE_EXIT_SECONDS:
@@ -322,8 +349,8 @@ def idle_watchdog(server, stop) -> None:
 
 
 def bind_server(root: Path):
-    """A port derived from the root keeps the origin stable across restarts."""
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    """The server for one review tree, bound but not yet serving."""
+    from http.server import BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -332,7 +359,13 @@ def bind_server(root: Path):
                 self.respond(200, json.dumps({"root": str(root)}).encode(), "application/json")
                 return
             target = self.resolve(self.path)
-            if target is None or not target.is_file():
+            if target is None:
+                self.respond(404, b"not found", "text/plain")
+                return
+            if target.is_dir():
+                self.respond(200, index_page(root, target), CONTENT_TYPES[".html"])
+                return
+            if not target.is_file():
                 self.respond(404, b"not found", "text/plain")
                 return
             self.respond(200, target.read_bytes(), CONTENT_TYPES.get(target.suffix, "application/octet-stream"))
@@ -341,20 +374,13 @@ def bind_server(root: Path):
             self.server.last_request = time.monotonic()
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
             target = self.resolve(self.path)
-            if target is None or target.suffix != ".json" or not target.name.endswith(".html.state.json"):
+            if target is None or not target.name.endswith(".html.state.json"):
                 self.respond(404, b"not found", "text/plain")
                 return
             if self.headers.get("Origin") not in (None, own_origin):
                 self.respond(403, b"forbidden", "text/plain")
                 return
-            try:
-                blob = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                if not isinstance(blob, dict):
-                    raise ValueError("state must be a JSON object")
-                tmp = target.with_name(target.name + ".tmp")
-                tmp.write_text(json.dumps(blob))
-                os.replace(tmp, target)
-            except (ValueError, OSError, TypeError):
+            if not write_state(target, self.rfile.read(int(self.headers["Content-Length"]))):
                 self.respond(400, b"bad state", "text/plain")
                 return
             self.respond(204, b"", "text/plain")
@@ -377,13 +403,34 @@ def bind_server(root: Path):
         def log_message(self, *_):
             pass
 
-    port = 41000 + int(hashlib.sha256(str(root).encode()).hexdigest(), 16) % 4000
-    try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    except OSError:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = bind_local(Handler, str(root))
     server.last_request = time.monotonic()
     return server
+
+
+def bind_local(handler_cls, seed: str):
+    """Loopback on a port derived from seed, so the origin stays stable across relaunches."""
+    from http.server import ThreadingHTTPServer
+
+    port = 41000 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 4000
+    try:
+        return ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+    except OSError:
+        return ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+
+
+def write_state(target: Path, raw: bytes) -> bool:
+    """Persist a page's review state atomically. False when the payload is unusable."""
+    try:
+        blob = json.loads(raw)
+        if not isinstance(blob, dict):
+            raise ValueError("state must be a JSON object")
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(blob))
+        os.replace(tmp, target)
+        return True
+    except (ValueError, OSError, TypeError):
+        return False
 
 
 # ---------------------------------------------------------------- watch mode
@@ -391,7 +438,7 @@ def bind_server(root: Path):
 
 def watch(args: Args, out: Path, summary: str, generated: str) -> None:
     """Serve the page on localhost, regenerate when the sources change, let the page live-reload."""
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from http.server import BaseHTTPRequestHandler
 
     args.auto_summary = False  # the summary was computed (or attempted) once; never re-pay per rebuild
     version = {"g": generated, "k": str(out.resolve())}
@@ -417,14 +464,7 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
                 self.send_response(403 if self.path.endswith(".state.json") else 404)
                 self.end_headers()
                 return
-            try:
-                blob = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                if not isinstance(blob, dict):
-                    raise ValueError("state must be a JSON object")
-                tmp = state_path(out).with_name(state_path(out).name + ".tmp")
-                tmp.write_text(json.dumps(blob))
-                os.replace(tmp, state_path(out))
-            except (ValueError, OSError, TypeError):
+            if not write_state(state_path(out), self.rfile.read(int(self.headers["Content-Length"]))):
                 self.send_response(400)
                 self.end_headers()
                 return
@@ -434,12 +474,7 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
         def log_message(self, *_):
             pass
 
-    # a port derived from the sources keeps the origin (and its localStorage) stable across relaunches
-    port = 41000 + int(hashlib.sha256(" ".join(args.sources).encode()).hexdigest(), 16) % 4000
-    try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    except OSError:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = bind_local(Handler, " ".join(args.sources))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     print(f"diffview: watching {len(args.sources)} source(s); live page at {url}  (Ctrl-C stops)", flush=True)
