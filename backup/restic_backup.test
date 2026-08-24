@@ -6,13 +6,24 @@
 # repository is genuinely absent, the repository is fine but locked, or
 # something else is wrong. Only the second may initialise a repository, only the
 # fourth may wake anybody.
+#
+# It also checks the credential the sftp repos need before any of that: an agent
+# holding no key is a precondition that has not arrived yet, not a failure.
 
 set -uo pipefail
 
 script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/restic_backup.sh"
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+
+# Its own agent and its own key: the sftp cases below reach ssh, and the script
+# skips before it gets there when the agent is empty, so a test that borrowed
+# whatever the caller's session happens to hold would pass or skip by accident.
+eval "$(ssh-agent -a "$work/agent.sock" -s)" >/dev/null
+agent_pid=$SSH_AGENT_PID
+trap 'rm -rf "$work"; kill "$agent_pid" 2>/dev/null' EXIT
+ssh-keygen -q -t ed25519 -N "" -C restic-backup-test -f "$work/key"
+ssh-add "$work/key" 2>/dev/null
 
 export HOME="$work/home"          # keeps ~/logs/backup out of the real home
 export RUN_LOG_DIR="$work/runs"
@@ -163,9 +174,84 @@ SSHCONF
     check "a rejected key notifies" \
         "yes" \
         "$(grep -q 'denied-case' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+    check "a rejected key is reported as what it is, not as a failed init" \
+        "yes" \
+        "$(jq -r 'if .reason | test("^could not open repository") then "yes" else .reason end' \
+           <<<"$(last_line denied)")"
 else
     echo "skip the rejected-key case: nothing is listening on port 22 here"
 fi
+
+
+# --- 7. an sftp repository while the agent holds no key
+#
+# The state of every fresh boot until the passphrase is typed. It must cost
+# nothing: no ssh attempt, no init, no notification — just a skip that says which
+# credential is missing, so backup-catchup.target can run it again later.
+
+: >"$NTFY_SENT"
+write_config keyless "sftp://max@127.0.0.1:2222//tmp/does-not-matter"
+saved_sock="$SSH_AUTH_SOCK"
+empty_agent="$work/empty-agent.sock"
+eval "$(ssh-agent -a "$empty_agent" -s)" >/dev/null
+empty_agent_pid=$SSH_AGENT_PID
+
+SSH_AUTH_SOCK="$empty_agent"
+check "an empty agent exits 0" 0 "$(run_case keyless)"
+line=$(last_line keyless)
+check "an empty agent is a skip" skip "$(jq -r .outcome <<<"$line")"
+check "and the skip names the key, not the network" \
+    "ssh agent holds no key" "$(jq -r .reason <<<"$line")"
+check "an empty agent sends nothing" "" "$(cat "$NTFY_SENT")"
+kill "$empty_agent_pid" 2>/dev/null
+
+# --- 8. no agent at all
+#
+# Never expected: ssh-agent.service is unconditional on every host, and the units
+# name its socket. So it is a broken session rather than a credential in transit,
+# and it is the one credential case that wakes somebody.
+
+: >"$NTFY_SENT"
+write_config noagent "sftp://max@127.0.0.1:2222//tmp/does-not-matter"
+SSH_AUTH_SOCK="$work/there-is-no-agent-here"
+check "a missing agent exits 1" 1 "$(run_case noagent)"
+check "a missing agent is a failure" fail "$(jq -r .outcome <<<"$(last_line noagent)")"
+check "a missing agent notifies" \
+    "yes" \
+    "$(grep -q 'ntfy.sh/test-topic' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+
+# --- 9. a local repository does not need an agent at all
+#
+# The gate keys on the repo being sftp:. Still no agent here, and the backup runs.
+
+: >"$NTFY_SENT"
+write_config localrepo "$work/fresh-repo"
+check "a local repository backs up with no agent" 0 "$(run_case localrepo)"
+check "and is logged ok" ok "$(jq -r .outcome <<<"$(last_line localrepo)")"
+check "and sends nothing" "" "$(cat "$NTFY_SENT")"
+SSH_AUTH_SOCK="$saved_sock"
+
+# --- 10. a probe that fails for a reason restic cannot call "missing"
+#
+# An unreadable config is a repository that plainly exists. Initialising over it
+# would fail and blame a cause that was never true, which is what an empty agent
+# used to be reported as. It must fail on its own terms and never reach init.
+
+: >"$NTFY_SENT"
+write_config unreadable "$work/unreadable-repo"
+restic init --repo "$work/unreadable-repo" --password-command "cat $work/pw" >/dev/null 2>&1
+chmod 000 "$work/unreadable-repo/config"
+check "an unreadable config exits 1" 1 "$(run_case unreadable)"
+check "it is logged fail" fail "$(jq -r .outcome <<<"$(last_line unreadable)")"
+check "the reason names opening the repository, not initialising it" \
+    "yes" \
+    "$(jq -r 'if .reason | test("^could not open repository") then "yes" else .reason end' \
+       <<<"$(last_line unreadable)")"
+check "no init was attempted" "" "$(grep -o 'Initializing restic repository' "$work/out.txt")"
+check "it notifies" \
+    "yes" \
+    "$(grep -q 'ntfy.sh/test-topic' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+chmod 644 "$work/unreadable-repo/config"
 
 echo
 if [ "$failures" -eq 0 ]; then

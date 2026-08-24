@@ -17,6 +17,31 @@ if [ -z "$config_file" ] || [ ! -f "$config_file" ]; then
     exit 1
 fi
 
+config_name="$("$SCRIPT_DIR/../bin/restic-config-name" "$config_file")"
+
+log_run() {
+    "$SCRIPT_DIR/../bin/run-log" "$config_name" "$@" || true
+}
+
+# Asked before the mount, because the mount cannot answer it: an empty agent is
+# one of the causes that reach us as an indistinguishable "Connection reset by
+# peer" (see the mount below). An empty agent is the ordinary state after a boot
+# and skips like any other missing precondition. No agent at all is a broken
+# session; the ntfy for that comes from this host's sftp repos, which meet the
+# same condition in restic_backup.sh, so it is not raised twice here.
+agent_state=0
+ssh-add -l >/dev/null 2>&1 || agent_state=$?
+if [ "$agent_state" -eq 1 ]; then
+    echo "[jarvis-backup] Skipping: the ssh agent holds no key"
+    log_run skip --reason "ssh agent holds no key"
+    exit 0
+fi
+if [ "$agent_state" -eq 2 ]; then
+    echo "[jarvis-backup] No ssh agent answered at ${SSH_AUTH_SOCK:-<unset>}" >&2
+    log_run fail --reason "no ssh agent at ${SSH_AUTH_SOCK:-<unset>}"
+    exit 1
+fi
+
 # Lazy unmount, and no mountpoint test first: both stat the mount, and a stat on
 # a mount whose sshfs is gone blocks in the kernel with no timeout. -z detaches
 # the mount from the tree without waiting, so this always returns and the next
@@ -49,11 +74,9 @@ else
     # protects a client that follows a hostile server's link into local files;
     # restic records the target string and never follows it.
     if ! mount_error=$(sshfs -o ro,no_contain_symlinks "$REMOTE" "$MOUNTPOINT" 2>&1); then
-        config_name="$("$SCRIPT_DIR/../bin/restic-config-name" "$config_file")"
         echo "[jarvis-backup] Could not mount $REMOTE: $mount_error" >&2
         reason=$(head -1 <<<"$mount_error")
-        "$SCRIPT_DIR/../bin/run-log" "$config_name" skip \
-            --reason "sshfs mount failed: ${reason:-no output from sshfs}" || true
+        log_run skip --reason "sshfs mount failed: ${reason:-no output from sshfs}"
         exit 0
     fi
 fi

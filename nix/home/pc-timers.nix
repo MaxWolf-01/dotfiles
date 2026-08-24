@@ -32,8 +32,8 @@ in
   systemd.user.services.youtube-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (YouTube archive)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -92,8 +92,8 @@ in
       # Ordered after the sync so we never snapshot a half-copied tree. Wants,
       # not Requires: a failed or skipped sync should still leave us backing up
       # whatever already landed on disk.
-      After = [ "network-online.target" "phone-sync.service" ];
-      Wants = [ "network-online.target" "phone-sync.service" ];
+      After = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -149,8 +149,8 @@ in
   systemd.user.services.encrypted-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (encrypted data)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -182,8 +182,8 @@ in
   systemd.user.services.pcstate-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (pc service state)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -205,6 +205,34 @@ in
       RandomizedDelaySec = "30m";
     };
     Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Catch-up handle ---
+  # "The backups can run now." secrets/zshrc starts it on login, when the age key
+  # is decrypted or the ssh key enters the agent, and zfs-unlock starts it when a
+  # dataset appears. It carries no Install section, so systemd itself never
+  # starts it: the timers cover the scheduled runs, this covers what skipped for
+  # want of a precondition.
+  #
+  # It lists every unit rather than the ones a caller's event feeds, so a caller
+  # needs to know nothing about preconditions. The two with no source to gate on
+  # — youtube and pcstate — therefore run every time it fires, which for youtube
+  # means its 1% integrity check reads ~2 GB back from rsync.net. That is the
+  # price of the caller not having to know, and it is only paid on a login or an
+  # unlock.
+
+  systemd.user.targets.backup-catchup = {
+    Unit = {
+      Description = "Run every backup whose preconditions are now met";
+      Wants = [
+        "youtube-rsyncnet.service"
+        "phone-sync.service"
+        "phone-rsyncnet.service"
+        "phone-pc.service"
+        "encrypted-rsyncnet.service"
+        "pcstate-rsyncnet.service"
+      ];
+    };
   };
 
   # --- Overdue watchdog ---

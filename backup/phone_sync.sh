@@ -46,6 +46,17 @@ if ! mountpoint -q "$DEST"; then
     exit 0
 fi
 
+# Pre-flight: the key the phone is reached with. Without this the check below
+# fails on publickey and records an away phone, which is a cause that was never
+# true and one a reader of the run log cannot tell from the real thing.
+agent_state=0
+ssh-add -l >/dev/null 2>&1 || agent_state=$?
+if [ "$agent_state" -ne 0 ]; then
+    echo "Skipping phone sync: the ssh agent holds no key"
+    log_run skip --reason "ssh agent holds no key"
+    exit 0
+fi
+
 # Pre-flight: phone must be reachable
 if ! ssh -o ConnectTimeout=10 "$PHONE_HOST" true 2>/dev/null; then
     echo "Skipping phone sync: $PHONE_HOST is not reachable"
