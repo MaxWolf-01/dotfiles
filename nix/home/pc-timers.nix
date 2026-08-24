@@ -208,12 +208,18 @@ in
   };
 
   # --- Catch-up handle ---
-  # Wanted by no target, so nothing starts it at boot, where the timers already
-  # cover the work. It is started by hand when a credential arrives and the
-  # units that were skipping for want of it can run; secrets/backup/README.md
-  # says by whom and when. Listing every unit is safe because each one tests its
-  # own preconditions and skips when one is missing, so a caller never has to
-  # know which credential changed.
+  # "The backups can run now." secrets/zshrc starts it on login, when the age key
+  # is decrypted or the ssh key enters the agent, and zfs-unlock starts it when a
+  # dataset appears. It carries no Install section, so systemd itself never
+  # starts it: the timers cover the scheduled runs, this covers what skipped for
+  # want of a precondition.
+  #
+  # It lists every unit rather than the ones a caller's event feeds, so a caller
+  # needs to know nothing about preconditions. The two with no source to gate on
+  # — youtube and pcstate — therefore run every time it fires, which for youtube
+  # means its 1% integrity check reads ~2 GB back from rsync.net. That is the
+  # price of the caller not having to know, and it is only paid on a login or an
+  # unlock.
 
   systemd.user.targets.backup-catchup = {
     Unit = {

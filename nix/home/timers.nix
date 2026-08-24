@@ -136,12 +136,10 @@ in
   };
 
   # --- Catch-up handle ---
-  # Wanted by no target, so nothing starts it at boot, where the timers already
-  # cover the work. It is started by hand when a credential arrives and the
-  # units that were skipping for want of it can run; secrets/backup/README.md
-  # says by whom and when. Listing every unit is safe because each one tests its
-  # own preconditions and skips when one is missing, so a caller never has to
-  # know which credential changed.
+  # "The backups can run now." secrets/zshrc starts it on login, when the ssh key
+  # enters the agent and the units that skipped for want of it can run. It
+  # carries no Install section, so systemd itself never starts it: the timers
+  # cover the scheduled runs, this covers what a missing credential skipped.
 
   systemd.user.targets.backup-catchup = {
     Unit = {
