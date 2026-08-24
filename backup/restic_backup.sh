@@ -104,8 +104,18 @@ fi
 # and stays a failure below. Nothing restic prints tells the two apart — only
 # local state does, which is why the question is asked here and not of the error.
 if [[ "$repo_path" == sftp:* ]]; then
-    agent_state=0
-    ssh-add -l >/dev/null 2>&1 || agent_state=$?
+    # ssh-agent.service is Type=simple, so systemd calls it started the moment it
+    # forks — before `ssh-agent -D -a` has bound its socket. A unit ordered after
+    # it can arrive in that gap, and finding no agent wakes someone, so let the
+    # socket have a few seconds to appear before believing it is not coming.
+    agent_deadline=$(( $(date +%s) + 5 ))
+    while :; do
+        agent_state=0
+        ssh-add -l >/dev/null 2>&1 || agent_state=$?
+        [ "$agent_state" -eq 2 ] || break
+        [ "$(date +%s)" -lt "$agent_deadline" ] || break
+        sleep 0.5
+    done
     if [ "$agent_state" -eq 1 ]; then
         echo "Skipping $config_name: the ssh agent holds no key"
         log_run skip --reason "ssh agent holds no key"
