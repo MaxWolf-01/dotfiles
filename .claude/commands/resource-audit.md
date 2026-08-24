@@ -1,11 +1,12 @@
 ---
-description: Measure what this setup costs to run — unattended units against battery, RAM, writes and watts; the interactive side against bytes written — and land the picked fixes in their IaC homes
+description: Measure what this setup costs to run — unattended units against battery, RAM, writes and watts; the interactive side against bytes written
 argument-hint: "[host | unit | interactive]  e.g. pc, thermal-log, or nothing for the full pass"
 ---
 
-An audit, not a cleanup: the deliverable is measurements with options attached,
-and max picks. Worked example with full reasoning, including the rejected
-options and the numbers that killed them: `secrets/dns-archive.md`.
+The deliverable is measurements with options attached; max picks everything
+that changes behavior (step 4 draws the line). Worked example with full
+reasoning, including the rejected options and the numbers that killed them:
+`secrets/dns-archive.md`, its "What it costs" section.
 
 Scope: `$ARGUMENTS` — a host, one unit, `interactive`, or empty for everything.
 
@@ -41,24 +42,24 @@ measured value, its floor, and its behavior-preserving flag.
 
 ## Standing data sources — read before measuring anew
 
-- Run logs and dashboards: `docs/monitoring.md`. Per-run outcomes and stats
-  are already in `~/logs/runs/<unit>.jsonl` on each host.
-- Battery, temperature, power caps: `~/.local/state/thermal-log/*.csv`, one
-  row per 5 s, 14 days back.
+- Per-run outcomes, stats, dashboards: `docs/monitoring.md`.
+- Battery, temperature, power caps: the thermal-log CSVs — path, cadence and
+  retention in `bin/thermal-log`'s header.
 - HDD spin behaviour on pc: `journalctl -u hd-idle` logs every spindown and
   spinup — match each wake against the known timers.
 
 ## Measurement reference (the non-obvious parts)
 
-- Percent of a core: `CPUUsageNSec / seconds since ActiveEnterTimestamp`
-  (`systemctl show`). Counters reset when the unit restarts.
+- Percent of a core: `CPUUsageNSec / (seconds since ActiveEnterTimestamp
+  × 1e7)` (`systemctl show`). Counters reset when the unit restarts.
 - Write attribution: cgroup `io.stat` per system service. The io controller
   is not delegated inside `user@1000`, so user units need `/proc/PID/io` —
-  which misses dead children and can count tty output as write_bytes.
+  which misses dead children. There, `write_bytes` is storage-layer and
+  trustworthy; `wchar` also counts tty and pipe output.
 - Device truth is `/proc/diskstats` (sectors written × 512). Churn vs growth:
   a file rewritten in place shows in the counters and never in `df`.
-- Swap: `pswpout` × 4 KB is the logical volume; zswap absorbs most of it, so
-  only the device delta is real.
+- Swap (`/proc/vmstat`, × 4 KB each): `zswpout` is what zswap absorbed in
+  RAM; `pswpout` is what actually reached the swap device.
 - Root-only probes (RAPL watts, `hdparm -C`, HDD spin state) get a one-shot
   read-only script for max to run — RAPL zones sampled in one shared window,
   counter wrap handled via `max_energy_range_uj`.
@@ -78,8 +79,8 @@ measured value, its floor, and its behavior-preserving flag.
 - Scripts that run rarely or are network-bound are skipped outright:
   frequency × per-run cost rounds to zero, and auditing them costs more than
   it saves.
-- History outranks disk: retention windows (tmux-resurrect and kin) stay at
-  14 days+, and freshness cadences (1-min saves) are deliberate. Cheaper
-  never justifies staler.
+- History outranks disk: retention windows and save cadences (tmux-resurrect
+  and kin) are deliberate choices — current values live in the nix modules.
+  Cheaper never justifies staler.
 - tailscaled's CPU is exit-node WireGuard crypto, by design; the
-  vpn-watchdog 15 s poll is a chosen detection latency.
+  vpn-watchdog poll interval is a chosen detection latency.
