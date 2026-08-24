@@ -42,6 +42,19 @@
       exec = "ghostty";
     };
 
+    # localsearch (GNOME's file indexer) ships indexing $HOME recursively. It
+    # read 22.7 GB of files a day here to serve a search nobody opens -- yazi
+    # and fd are how files get found on this machine. An empty root list leaves
+    # the daemon running with nothing to crawl.
+    #
+    # The path is /tracker/, not /tracker3/, and lowercase, even though the
+    # schema id is org.freedesktop.Tracker3.Miner.Files. Read it back with
+    # `gsettings get org.freedesktop.Tracker3.Miner.Files index-recursive-directories`
+    # after a switch -- a wrong path here writes a key nobody reads.
+    "org/freedesktop/tracker/miner/files" = {
+      index-recursive-directories = [];
+    };
+
     "org/gnome/desktop/input-sources" = {
       sources = [ (lib.hm.gvariant.mkTuple [ "xkb" "de+nodeadkeys" ]) ];
     };
