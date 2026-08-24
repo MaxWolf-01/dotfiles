@@ -85,10 +85,12 @@ def main(args: Args) -> None:
     out = Path(args.output).expanduser() if args.output else default_output(args.sources)
     out.parent.mkdir(parents=True, exist_ok=True)
     summary, generated = build(args, out, args.summary)
-    if args.open and not args.watch:
-        open_page(out)
     if args.watch:
         watch(args, out, summary, generated)
+    elif args.open:
+        open_page(out)
+    else:
+        print(f"file://{out.resolve()}", flush=True)
 
 
 def build(args: Args, out: Path, summary: str) -> tuple[str, str]:
@@ -137,7 +139,6 @@ def build(args: Args, out: Path, summary: str) -> tuple[str, str]:
     adds = sum(f["adds"] for s in sources for f in s["files"])
     dels = sum(f["dels"] for s in sources for f in s["files"])
     print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
-    print(f"file://{out.resolve()}", flush=True)
     return summary, data["generated"]
 
 
@@ -263,11 +264,16 @@ CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".json": "application/json
 def open_page(out: Path) -> None:
     """Open the page in a browser, served, so it can take comments rather than only show them."""
     port = ensure_server(out.parent)
-    url = f"http://127.0.0.1:{port}/{out.name}" if port else f"file://{out.resolve()}"
-    if not port:
-        print(f"diffview: {out.parent} is too broad to serve; opening read-only", file=sys.stderr)
-    else:
-        print(f"diffview: {url}", flush=True)
+    if port is None:
+        print(f"diffview: {out.parent.resolve()} is too broad to serve; opening read-only", file=sys.stderr)
+        launch(f"file://{out.resolve()}")
+        return
+    url = f"http://127.0.0.1:{port}/{out.name}"
+    print(url, flush=True)
+    launch(url)
+
+
+def launch(url: str) -> None:
     subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -279,16 +285,21 @@ def serve_root(root_spec: str) -> None:
     root = Path(root_spec).expanduser().resolve()
     if not root.is_dir():
         sys.exit(f"diffview: --serve {root} is not a directory")
-    port = ensure_server(root)
+    running = already_serving(root)
+    port = running or ensure_server(root)
     if port is None:
         sys.exit(f"diffview: refusing to serve {root} — it holds your whole home or more")
+    if running:
+        print(f"diffview: already serving {root} at http://127.0.0.1:{port}/")
+        return
     print(f"diffview: serving {root} at http://127.0.0.1:{port}/  (exits after {IDLE_EXIT_SECONDS // 60} idle minutes)")
 
 
 def ensure_server(root: Path) -> int | None:
     """The port serving this directory, starting one if needed. None when it is too broad to serve."""
     root = root.resolve()
-    if root == Path.home() or root in Path.home().parents or root.parent == root:
+    home = Path.home().resolve()  # resolved on both sides, or a symlinked home walks straight past this
+    if root == home or root in home.parents:
         return None
     port = already_serving(root)
     if port:
@@ -375,6 +386,9 @@ def bind_server(root: Path):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.server.last_request = time.monotonic()
+            if not local_request(self):
+                self.respond(403, b"forbidden", "text/plain")
+                return
             if self.path.split("?")[0] == "/.health":
                 self.respond(200, json.dumps({"root": str(root)}).encode(), "application/json")
                 return
@@ -393,6 +407,9 @@ def bind_server(root: Path):
         def do_POST(self):
             self.server.last_request = time.monotonic()
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+            if not local_request(self):
+                self.respond(403, b"forbidden", "text/plain")
+                return
             target = self.resolve(self.path)
             if target is None or not target.name.endswith(".html.state.json"):
                 self.respond(404, b"not found", "text/plain")
@@ -439,6 +456,12 @@ def bind_local(handler_cls, seed: str):
         return ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
 
 
+def local_request(handler) -> bool:
+    """Binding to loopback stops remote sockets, not a web page that points a name at 127.0.0.1."""
+    host = (handler.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+    return host in ("127.0.0.1", "localhost", "::1", "")
+
+
 def write_state(target: Path, raw: bytes) -> bool:
     """Persist a page's review state atomically. False when the payload is unusable."""
     try:
@@ -465,6 +488,10 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if not local_request(self):
+                self.send_response(403)
+                self.end_headers()
+                return
             if self.path == "/version":
                 body = json.dumps(version).encode()
                 self.send_response(200)
@@ -480,7 +507,7 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
 
         def do_POST(self):
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if not self.path.endswith(".state.json") or self.headers.get("Origin") not in (None, own_origin):
+            if not local_request(self) or not self.path.endswith(".state.json") or self.headers.get("Origin") not in (None, own_origin):
                 self.send_response(403 if self.path.endswith(".state.json") else 404)
                 self.end_headers()
                 return
