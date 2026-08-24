@@ -61,13 +61,13 @@ in
   systemd.user.services.working-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (working data)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
       TimeoutStartSec = "2h";
-      Environment = [ "PATH=${backupPath}" ];
+      Environment = [ "PATH=${backupPath}" "SSH_AUTH_SOCK=${sshAuthSock}" ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/working/rsyncnet.conf";
     };
   };
@@ -85,13 +85,13 @@ in
   systemd.user.services.working-pc = {
     Unit = {
       Description = "Restic backup to PC (working data)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
       TimeoutStartSec = "2h";
-      Environment = [ "PATH=${backupPath}" ];
+      Environment = [ "PATH=${backupPath}" "SSH_AUTH_SOCK=${sshAuthSock}" ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/working/pc.conf";
     };
   };
@@ -111,15 +111,15 @@ in
   systemd.user.services.jarvis-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (jarvis workspace via SSHFS)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
       TimeoutStartSec = "2h";
       Environment = [
         "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
-        "SSH_AUTH_SOCK=/run/user/1000/ssh-agent"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/jarvis_backup.sh ${secrets}/backup/restic/jarvis/rsyncnet.conf";
     };
@@ -135,6 +135,25 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Catch-up handle ---
+  # Started by hand when a credential arrives mid-session — on this host that is
+  # the ssh key entering the agent (secrets/zshrc). Every unit here gates on its
+  # own preconditions and skips silently when one is missing, so starting all of
+  # them is always safe and the caller never has to know which credential
+  # changed. Wanted by no target: nothing pulls this in at boot, where the
+  # timers already cover the work.
+
+  systemd.user.targets.backup-catchup = {
+    Unit = {
+      Description = "Run every backup whose preconditions are now met";
+      Wants = [
+        "working-rsyncnet.service"
+        "working-pc.service"
+        "jarvis-rsyncnet.service"
+      ];
+    };
+  };
+
   # --- YouTube cookie export → PC ---
 
   systemd.user.services.youtube-cookies-export = {
@@ -147,7 +166,7 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${ytCookiePath}"
-        "SSH_AUTH_SOCK=/run/user/1000/ssh-agent"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = pkgs.writeShellScript "youtube-cookies-export" ''
         set -uo pipefail

@@ -32,8 +32,8 @@ in
   systemd.user.services.youtube-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (YouTube archive)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -92,8 +92,8 @@ in
       # Ordered after the sync so we never snapshot a half-copied tree. Wants,
       # not Requires: a failed or skipped sync should still leave us backing up
       # whatever already landed on disk.
-      After = [ "network-online.target" "phone-sync.service" ];
-      Wants = [ "network-online.target" "phone-sync.service" ];
+      After = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -149,8 +149,8 @@ in
   systemd.user.services.encrypted-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (encrypted data)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -182,8 +182,8 @@ in
   systemd.user.services.pcstate-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (pc service state)";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -205,6 +205,28 @@ in
       RandomizedDelaySec = "30m";
     };
     Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Catch-up handle ---
+  # Started by hand when a credential arrives mid-session — the age key
+  # decrypts, a dataset unlocks, the ssh key enters the agent (secrets/zshrc
+  # does all three). Every unit here gates on its own preconditions and skips
+  # silently when one is missing, so starting all of them is always safe and the
+  # caller never has to know which credential changed. Wanted by no target:
+  # nothing pulls this in at boot, where the timers already cover the work.
+
+  systemd.user.targets.backup-catchup = {
+    Unit = {
+      Description = "Run every backup whose preconditions are now met";
+      Wants = [
+        "youtube-rsyncnet.service"
+        "phone-sync.service"
+        "phone-rsyncnet.service"
+        "phone-pc.service"
+        "encrypted-rsyncnet.service"
+        "pcstate-rsyncnet.service"
+      ];
+    };
   };
 
   # --- Overdue watchdog ---

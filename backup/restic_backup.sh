@@ -97,6 +97,31 @@ if [ ! -f "$age_key" ]; then
     exit 0
 fi
 
+# An sftp repository is reached with the key the ssh agent holds, and the agent
+# is empty from every boot until someone types the passphrase. That is expected
+# unavailability, like a locked age key: skip, and let backup-catchup.target run
+# this again when the key lands. A key the server rejects is a different event
+# and stays a failure below. Nothing restic prints tells the two apart — only
+# local state does, which is why the question is asked here and not of the error.
+if [[ "$repo_path" == sftp:* ]]; then
+    agent_state=0
+    ssh-add -l >/dev/null 2>&1 || agent_state=$?
+    if [ "$agent_state" -eq 1 ]; then
+        echo "Skipping $config_name: the ssh agent holds no key"
+        log_run skip --reason "ssh agent holds no key"
+        exit 0
+    fi
+    if [ "$agent_state" -eq 2 ]; then
+        fail_out "no ssh agent at ${SSH_AUTH_SOCK:-<unset>}" \
+            "No ssh agent answered, so $repo_path cannot be reached.
+
+SSH_AUTH_SOCK: ${SSH_AUTH_SOCK:-<unset>}
+
+ssh-agent.service should be running and its socket should be the path above.
+Check: systemctl --user status ssh-agent.service"
+    fi
+fi
+
 format_bytes() {
     local bytes=$1
     if (( bytes < 1024 )); then
@@ -129,8 +154,7 @@ log_dir="$HOME/logs/backup"
 mkdir -p "$log_dir"
 
 # Does the repository exist? --no-lock, because the probe only reads the config:
-# a lock an interrupted run left behind would otherwise fail it, and a failed
-# probe here means "no repository, initialise one".
+# a lock an interrupted run left behind must not read as a missing repository.
 timestamp=$(date +%Y%m%d_%H%M%S)
 repo_check_log="$log_dir/repo_check_${config_name}_${timestamp}.log"
 if ! restic --repo "$repo_path" --password-command "$password_command" --no-lock cat config >"$repo_check_log" 2>&1; then
@@ -141,6 +165,24 @@ if ! restic --repo "$repo_path" --password-command "$password_command" --no-lock
         echo "Skipping $config_name: cannot reach $repo_path ($reason)"
         log_run skip --reason "target unreachable: $reason"
         exit 0
+    fi
+
+    # Only restic's own words for "there is nothing here" may lead to an init.
+    # Every other failure is a repository that may well exist, and initialising
+    # over it fails while naming a cause that was never true. restic 0.19.1:
+    #   Fatal: repository does not exist: unable to open config file: ...
+    if ! grep -q 'repository does not exist' "$repo_check_log"; then
+        fail_out "could not open repository at $repo_path" \
+            "Could not open the restic repository at $repo_path. restic did not say
+the repository was missing, so nothing was initialised.
+
+ERROR OUTPUT:
+$(cat "$repo_check_log" 2>/dev/null)
+
+Log: $repo_check_log
+Config: $config_file
+Repo: $repo_path
+Password command: $password_command"
     fi
 
     echo "Initializing restic repository at $repo_path"
