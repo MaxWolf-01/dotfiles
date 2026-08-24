@@ -8,6 +8,7 @@ let
   # The one list: installed as packages and named in HOST.md below, so the
   # record dispatch reads cannot drift from what is actually here.
   toolchain = with pkgs; [
+    ast-grep
     chromium
     curl
     fd
