@@ -13,7 +13,8 @@ authoring agent.
 The page's own path is the review's identity: rendering to the same path again --
 after review fixes, with the new range appended -- finds the comments already
 there. Unnamed output lands in ~/Downloads/diffview under a name derived from the
-sources, so two renders share a page only when they are the same review.
+sources, so unrelated renders never collide; Downloads because the sandboxed
+browser is confined to a home whitelist and cannot read anywhere else.
 
 Source specs (positional, several allowed; one page with a section per source):
 - REPO@A..B      git range in REPO (A...B also works)
@@ -51,7 +52,7 @@ class Args:
     sources: Annotated[list[str], tyro.conf.Positional]
     """Source specs: REPO@RANGE, RANGE (cwd), or OLD=NEW paths."""
     output: Annotated[str, tyro.conf.arg(aliases=["-o"])] = ""
-    """Path of the generated HTML file. Empty derives one per source list under ~/Downloads/diffview, so unrelated renders never overwrite each other; the path is the review's identity, so passing the same one again keeps its comments."""
+    """Path of the generated HTML file. The path is the review's identity: render to it again and the comments already on it are still there. Leave this empty and the name is derived from the sources instead, under ~/Downloads/diffview — which pins the page to those exact diffs, so a review that will gain ranges over later rounds needs a path you choose."""
     summary: str = ""
     """One plain-English paragraph on what this change is about (shown at the top; inline markdown ok)."""
     auto_summary: bool = True
@@ -73,15 +74,15 @@ class Args:
 def main(args: Args) -> None:
     out = Path(args.output).expanduser() if args.output else default_output(args.sources)
     out.parent.mkdir(parents=True, exist_ok=True)
-    summary, generated, key = build(args, out, args.summary)
+    summary, generated = build(args, out, args.summary)
     if args.open and not args.watch:
         subprocess.Popen(["xdg-open", str(out.resolve())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if args.watch:
-        watch(args, out, summary, generated, key)
+        watch(args, out, summary, generated)
 
 
-def build(args: Args, out: Path, summary: str) -> tuple[str, str, str]:
-    """Collect, render, write. Returns (summary used, generation timestamp, page key) so watch mode can reuse them."""
+def build(args: Args, out: Path, summary: str) -> tuple[str, str]:
+    """Collect, render, write. Returns (summary used, generation timestamp) so watch mode can reuse them."""
     sources = [collect_source(spec, args.context) for spec in args.sources]
     if not any(s["files"] for s in sources):
         sys.exit("diffview: no changes found in any source")
@@ -127,7 +128,7 @@ def build(args: Args, out: Path, summary: str) -> tuple[str, str, str]:
     dels = sum(f["dels"] for s in sources for f in s["files"])
     print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
     print(f"file://{out.resolve()}", flush=True)
-    return summary, data["generated"], data["key"]
+    return summary, data["generated"]
 
 
 def state_path(out: Path) -> Path:
@@ -137,23 +138,44 @@ def state_path(out: Path) -> Path:
 def default_output(specs: list[str]) -> Path:
     """One page per source list: a readable stem plus a digest of the canonical specs.
 
-    Two renders collide only when their specs are identical, which means they are
-    the same review — so parallel agents never overwrite each other's page.
+    The digest follows the specs, so a page reached this way is pinned to the diffs
+    it was rendered from. A review that will gain ranges over later rounds needs an
+    explicit -o, which is what makes the growing page one review.
     """
-    canon = [canonical_spec(s) for s in specs]
-    digest = hashlib.sha256("\n".join(canon).encode()).hexdigest()[:8]
-    stem = re.sub(r"[^A-Za-z0-9._@~-]+", "-", canon[0].split("=")[-1].rsplit("/", 1)[-1])[:60]
+    parts = [canonical_spec(s) for s in specs]
+    digest = hashlib.sha256("\n".join(c for _, c in parts).encode()).hexdigest()[:8]
+    stem = re.sub(r"[^A-Za-z0-9._@~-]+", "-", parts[0][0])[:60]
     extra = f"+{len(specs) - 1}" if len(specs) > 1 else ""
     return Path.home() / "Downloads" / "diffview" / f"{stem}{extra}-{digest}.html"
 
 
-def canonical_spec(spec: str) -> str:
-    """A spec with its paths made absolute, so the same review names the same page from any cwd."""
+def canonical_spec(spec: str) -> tuple[str, str]:
+    """(label, identity) — what a spec denotes rather than how it was typed.
+
+    Both sides are canonical, so the same review names the same page from any
+    directory, and a HEAD-relative range names a different one once another commit
+    lands under it.
+    """
     if "=" in spec and ".." not in spec.split("=")[0]:
         old, new = (str(Path(p).expanduser().resolve()) for p in spec.split("=", 1))
-        return f"{old}={new}"
+        return Path(new).name, f"{old}={new}"
     repo, range_ = spec.rsplit("@", 1) if "@" in spec else (".", spec)
-    return f"{Path(repo).expanduser().resolve()}@{range_}"
+    root = git_root(repo)
+    return f"{Path(root).name}@{range_}", f"{root}@{range_}@{resolved_revs(root, range_)}"
+
+
+def git_root(repo: str) -> str:
+    """The repo's toplevel, so a spec written from a subdirectory still names the repo."""
+    path = str(Path(repo).expanduser().resolve())
+    proc = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return proc.stdout.strip() or path
+
+
+def resolved_revs(root: str, range_: str) -> str:
+    """The range's endpoints as shas; empty when they don't resolve, which build reports properly."""
+    revs = [r for r in re.split(r"\.{2,3}", range_) if r]
+    proc = subprocess.run(["git", "-C", root, "rev-parse", *revs], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def load_saved_state(out: Path) -> dict | None:
@@ -223,13 +245,13 @@ def parse_resolved(raw: object, path: str) -> list[int]:
 # ---------------------------------------------------------------- watch mode
 
 
-def watch(args: Args, out: Path, summary: str, generated: str, key: str) -> None:
+def watch(args: Args, out: Path, summary: str, generated: str) -> None:
     """Serve the page on localhost, regenerate when the sources change, let the page live-reload."""
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     args.auto_summary = False  # the summary was computed (or attempted) once; never re-pay per rebuild
-    version = {"g": generated, "k": key}
+    version = {"g": generated, "k": str(out.resolve())}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -290,7 +312,7 @@ def watch(args: Args, out: Path, summary: str, generated: str, key: str) -> None
                 if sig == last:
                     continue
                 last = sig
-                _, version["g"], _ = build(args, out, summary)
+                _, version["g"] = build(args, out, summary)
                 print(f"diffview: sources changed, regenerated ({datetime.now():%H:%M:%S})", flush=True)
             except (SystemExit, OSError) as e:
                 # transient states are normal mid-review: a rebase in flight, a branch reset to base
