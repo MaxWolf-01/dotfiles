@@ -170,7 +170,11 @@ watch() {
   while true; do
     sleep "$POLL_SECS"
     now=$EPOCHSECONDS
-    st=$(tailscale status --json 2>/dev/null) || st=""
+    # tailscaled fills ExitNodeStatus whether or not peers are asked for, and
+    # the loop needs nothing else. The peer list is ~99.6% of the blob, and
+    # both the fetch and the parse scale with it. heartbeat() below still
+    # wants the peers, and fetches its own.
+    st=$(tailscale status --json --peers=false 2>/dev/null) || st=""
     read_exit_node "$st"
     # Before any of the guards below, so the heartbeat keeps arriving while
     # tailscale is down or the VPN is off — the loop being alive is what it
@@ -288,15 +292,43 @@ candidates() {  # exit nodes in COUNTRIES order, deduped ("Any"-city rows repeat
 # One line an hour saying the loop is still turning, and what it sees. Always
 # `ok`: neither a machine with the VPN off nor one with tailscale down is a
 # watcher that stopped watching, and this log answers only that question.
-heartbeat() {  # heartbeat <tailscale-status-json> <exit-node-id>
-  local state node=""
+# The exit node's readable name, dug out of a full `tailscale status --json`.
+# Empty when no peer is acting as exit node, or when the blob is unusable.
+exit_node_name() {  # exit_node_name <full-status-json>
+  jq -r 'first(.Peer[]? | select(.ExitNode == true) | .HostName) // empty' <<<"$1" 2>/dev/null
+}
+
+# One line an hour saying the loop is still turning, and what it sees. Always
+# `ok`: neither a machine with the VPN off nor one with tailscale down is a
+# watcher that stopped watching, and this log answers only that question.
+#
+# The one exception is below, and it is the failure this design can otherwise
+# not see. The poll reads ExitNodeStatus from a blob fetched with
+# --peers=false. Were a tailscale release to stop filling that field there,
+# every tick would read a live exit node as "vpn off", the loop would idle,
+# a pinned node would sit with no failover, and the heartbeat would go on
+# saying ok. The peer list is the independent witness: if it names an exit
+# node while ExitNodeStatus was empty, the two disagree and the poll is blind.
+# `fail` puts that in front of bin/overdue-check, which bounds this unit.
+heartbeat() {  # heartbeat <poll-blob> <exit-node-id>
+  local state node="" full=""
   if [[ -z $1 ]]; then
     state=tailscale-down
-  elif [[ -z $2 ]]; then
-    state=no-exit-node
   else
-    state=guarding
-    node=$(jq -r 'first(.Peer[] | select(.ExitNode == true) | .HostName) // empty' <<<"$1" 2>/dev/null)
+    # The poll's blob carries no peers and the name only lives there, so this
+    # is the one place that pays for a full status.
+    full=$(tailscale status --json 2>/dev/null)
+    if [[ -z $2 ]]; then
+      state=no-exit-node
+      if [[ -n $(exit_node_name "$full") ]]; then
+        log_run "$WATCH_UNIT" fail \
+          "a peer is acting as exit node but ExitNodeStatus was empty — the poll is blind to it"
+        return
+      fi
+    else
+      state=guarding
+      node=$(exit_node_name "$full")
+    fi
   fi
   log_run "$WATCH_UNIT" ok "" "$(jq -c -n --arg state "$state" --arg node "$node" \
     --argjson vesktop "$(vesktop_running && echo true || echo false)" \
