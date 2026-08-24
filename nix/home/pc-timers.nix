@@ -208,12 +208,12 @@ in
   };
 
   # --- Catch-up handle ---
-  # Started by hand when a credential arrives mid-session — the age key
-  # decrypts, a dataset unlocks, the ssh key enters the agent (secrets/zshrc
-  # does all three). Every unit here gates on its own preconditions and skips
-  # silently when one is missing, so starting all of them is always safe and the
-  # caller never has to know which credential changed. Wanted by no target:
-  # nothing pulls this in at boot, where the timers already cover the work.
+  # Wanted by no target, so nothing starts it at boot, where the timers already
+  # cover the work. It is started by hand when a credential arrives and the
+  # units that were skipping for want of it can run; secrets/backup/README.md
+  # says by whom and when. Listing every unit is safe because each one tests its
+  # own preconditions and skips when one is missing, so a caller never has to
+  # know which credential changed.
 
   systemd.user.targets.backup-catchup = {
     Unit = {
