@@ -1,0 +1,344 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Yoink a page that requires a login, using Firefox's session cookies.
+
+yoink fetches the page on yapit's server, which carries none of your sessions, so
+anything behind a login arrives as a paywall stub. This fetches the page here with
+the cookies Firefox holds for its domain, then hands the result to yapit, which
+extracts it exactly as yoink does.
+
+The page's audio, if it has any, is saved beside the markdown and embedded.
+Root-relative links become absolute, since they no longer resolve once the article
+leaves the site.
+
+Examples:
+
+    yoink-paywalled https://www.economist.com/by-invitation/2026/08/20/humanity-has
+    yoink-paywalled https://example.com/piece --no-audio
+    yoink-paywalled https://example.com/piece --name my-slug --output-dir .
+"""
+
+from __future__ import annotations
+
+import gzip
+import http.cookiejar
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from html import unescape
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Annotated, NoReturn
+from urllib.parse import urljoin, urlparse
+
+import tyro
+
+LIBRARY = Path.home() / "Documents" / "library"
+SOPS_FILE = Path.home() / ".dotfiles" / "secrets" / "passwords" / "yapit"
+
+FIREFOX_ROOTS = [
+    Path.home() / ".mozilla" / "firefox",
+    Path.home() / "snap" / "firefox" / "common" / ".mozilla" / "firefox",
+    Path.home() / ".var" / "app" / "org.mozilla.firefox" / ".mozilla" / "firefox",
+]
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+AUDIO_SUFFIXES = (".mp3", ".m4a", ".aac", ".ogg", ".opus")
+AUDIO_URL = re.compile(rb"""https?://[^\s"'<>\\]+?\.(?:mp3|m4a|aac|ogg|opus)(?:\?[^\s"'<>\\]*)?""", re.IGNORECASE)
+ROOT_RELATIVE_LINK = re.compile(r"(!?\[[^\]]*\]\()(/[^)\s]*)(\))")
+SHORT_EXTRACTION = 250  # words; below this, suspect the login didn't take
+
+
+@dataclass
+class Args:
+    url: Annotated[str, tyro.conf.Positional]
+    """Page to fetch. Firefox must be logged in to it."""
+
+    output_dir: str = str(LIBRARY)
+    """Parent directory. The article lands in <output-dir>/<slug>/."""
+
+    name: str | None = None
+    """Directory and file name to use instead of the slugified title."""
+
+    audio: bool = True
+    """Save the page's audio file and embed it in the markdown."""
+
+    ai: bool = True
+    """AI extraction. Applies to PDFs only, and spends yapit quota."""
+
+    profile: str | None = None
+    """Firefox profile, by name or path. Default: whichever has the newest cookies."""
+
+
+def err(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def die(msg: str) -> NoReturn:
+    err(f"error: {msg}")
+    sys.exit(1)
+
+
+def find_profile(explicit: str | None) -> Path:
+    """Locate a Firefox profile directory holding a cookie database."""
+    if explicit:
+        candidates = [Path(explicit).expanduser()] if "/" in explicit else [r / explicit for r in FIREFOX_ROOTS]
+        for path in candidates:
+            if (path / "cookies.sqlite").exists():
+                return path
+        die(f"no cookies.sqlite in Firefox profile {explicit!r}")
+
+    profiles = [p.parent for root in FIREFOX_ROOTS for p in root.glob("*/cookies.sqlite")]
+    if not profiles:
+        die(f"no Firefox profile with cookies found under {', '.join(str(r) for r in FIREFOX_ROOTS)}")
+    return max(profiles, key=lambda p: (p / "cookies.sqlite").stat().st_mtime)
+
+
+def read_cookie_rows(profile: Path) -> list[tuple]:
+    """Every cookie Firefox has stored, read from a copy of its database.
+
+    The copy exists because Firefox keeps the original open, and the most recent
+    writes sit in the write-ahead log rather than the database file.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "cookies.sqlite"
+        for suffix in ("", "-wal", "-shm"):
+            src = profile / f"cookies.sqlite{suffix}"
+            if src.exists():
+                shutil.copy2(src, f"{copy}{suffix}")
+        db = sqlite3.connect(copy)
+        rows = db.execute("SELECT host, name, value, path, expiry, isSecure FROM moz_cookies").fetchall()
+        db.close()
+    return rows
+
+
+def jar_for(rows: list[tuple], host: str) -> http.cookiejar.CookieJar:
+    """The cookies for host, in a jar that decides for itself where they may go.
+
+    The filter here only keeps the jar small. What actually governs which cookie
+    reaches which host is the jar's own policy, applied per request — redirect
+    hops included — so a session cookie cannot follow a link off its own domain.
+    """
+    jar = http.cookiejar.CookieJar()
+    for cookie_host, name, value, path, expiry, secure in rows:
+        domain_wide = cookie_host.startswith(".")
+        if not (host == cookie_host or (domain_wide and (host == cookie_host[1:] or host.endswith(cookie_host)))):
+            continue
+        jar.set_cookie(
+            http.cookiejar.Cookie(
+                version=0,
+                name=name,
+                value=value,
+                port=None,
+                port_specified=False,
+                domain=cookie_host,
+                domain_specified=domain_wide,
+                domain_initial_dot=domain_wide,
+                path=path,
+                path_specified=True,
+                secure=bool(secure),
+                expires=expiry or None,
+                discard=not expiry,
+                comment=None,
+                comment_url=None,
+                rest={},
+            )
+        )
+    return jar
+
+
+class FetchError(Exception):
+    """A request that failed for a reason worth showing the user verbatim."""
+
+
+def fetch(url: str, jar: http.cookiejar.CookieJar) -> tuple[bytes, str]:
+    """Fetch url as the logged-in browser would. Returns (body, content type)."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    try:
+        with opener.open(request, timeout=60) as response:
+            body = response.read()
+            content_type = response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        hint = (
+            " — bot protection. Fetching a site repeatedly trips it; open the page in Firefox, then wait a minute."
+            if e.code in (403, 429)
+            else ""
+        )
+        raise FetchError(f"{url} returned HTTP {e.code} {e.reason}{hint}") from e
+    except urllib.error.URLError as e:
+        raise FetchError(f"could not reach {url}: {e.reason}") from e
+
+    if body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+    if b"geo.captcha-delivery.com" in body or b"/_Incapsula_Resource" in body:
+        raise FetchError("the site served a bot check instead of the page — open it in Firefox once, then retry")
+    return body, content_type
+
+
+def suffix_for(content_type: str, url: str) -> str:
+    """File extension yapit needs to route the upload to the right extractor."""
+    if "pdf" in content_type:
+        return ".pdf"
+    if "html" in content_type or "xml" in content_type:
+        return ".html"
+    url_suffix = Path(urlparse(url).path).suffix.lower()
+    if url_suffix in (".pdf", ".html", ".htm"):
+        return url_suffix
+    die(f"don't know what to do with content type {content_type!r}")
+
+
+def yapit_env() -> dict[str, str]:
+    """Environment with the yapit credentials, decrypted from the secrets repo."""
+    result = subprocess.run(["sops", "-d", str(SOPS_FILE)], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        die(f"could not decrypt {SOPS_FILE}: {result.stderr.strip()}")
+    env = dict(os.environ)
+    for line in result.stdout.strip().splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            env[key.strip()] = value.strip()
+    return env
+
+
+def run_yapit(path: Path, args: Args) -> Path:
+    """Upload the saved page to yapit. Returns the directory it wrote."""
+    command = ["yapit", "fetch", str(path), "-o", args.output_dir]
+    if args.name:
+        command += ["--name", args.name]
+    if args.ai:
+        command.append("--ai")
+    result = subprocess.run(command, env=yapit_env(), stdout=subprocess.PIPE, text=True, check=False)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+    return Path(result.stdout.strip().splitlines()[-1])
+
+
+class AudioSources(HTMLParser):
+    """Collects the src of every audio element in a page, in document order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in ("audio", "source"):
+            return
+        attributes = dict(attrs)
+        src, kind = attributes.get("src"), attributes.get("type") or ""
+        if src and (Path(urlparse(src).path).suffix.lower() in AUDIO_SUFFIXES or kind.startswith("audio/")):
+            self.sources.append(src)
+
+
+def find_audio(page: bytes, page_url: str) -> str | None:
+    """The page's audio file: its audio element if it has one, else any audio URL in the markup.
+
+    Sites that build their own player leave no audio element to find, so the
+    fallback reads the raw markup, where the URL may also be JSON-escaped.
+    """
+    parser = AudioSources()
+    parser.feed(page.decode("utf-8", "replace"))
+    if parser.sources:
+        return urljoin(page_url, parser.sources[0])
+
+    match = AUDIO_URL.search(page.replace(rb"\/", b"/"))
+    return urljoin(page_url, unescape(match.group().decode())) if match else None
+
+
+def download_audio(audio_url: str, jar: http.cookiejar.CookieJar, doc_dir: Path) -> str | None:
+    """Save the audio beside the markdown, named after it. Returns the file name."""
+    try:
+        body, _ = fetch(audio_url, jar)
+    except FetchError as e:
+        err(f"warning: audio not saved: {e}")
+        return None
+    name = doc_dir.name + (Path(urlparse(audio_url).path).suffix or ".mp3")
+    (doc_dir / name).write_bytes(body)
+    err(f"Audio: {name} ({len(body) / 1e6:.1f} MB) <- {audio_url}")
+    return name
+
+
+def patch_markdown(doc_dir: Path, page_url: str, audio_name: str | None) -> int:
+    """Record the source, absolutize links, embed the audio. Returns the article's word count."""
+    path = doc_dir / f"{doc_dir.name}.md"
+    frontmatter, body = split_frontmatter(path.read_text(encoding="utf-8"))
+
+    if not any(line.startswith("source:") for line in frontmatter):
+        # yapit only knows a source URL when it did the fetching itself.
+        insert_at = 1 if frontmatter and frontmatter[0].startswith("title:") else 0
+        frontmatter.insert(insert_at, f"source: {page_url}")
+
+    body = ROOT_RELATIVE_LINK.sub(lambda m: m[1] + urljoin(page_url, m[2]) + m[3], body)
+    words = len(body.split())
+    if audio_name:
+        body = f"![[{audio_name}]]\n\n{body}"
+
+    text = "---\n" + "\n".join(frontmatter) + "\n---\n\n" + body if frontmatter else body
+    path.write_text(text, encoding="utf-8")
+    return words
+
+
+def split_frontmatter(text: str) -> tuple[list[str], str]:
+    lines = text.splitlines()
+    if not lines or lines[0] != "---" or "---" not in lines[1:]:
+        return [], text.lstrip("\n")
+    close = lines.index("---", 1)
+    return lines[1:close], "\n".join(lines[close + 1 :]).lstrip("\n")
+
+
+def main() -> None:
+    args = tyro.cli(Args, description=__doc__)
+    host = urlparse(args.url).hostname
+    if not host:
+        die(f"not a URL: {args.url}")
+
+    profile = find_profile(args.profile)
+    rows = read_cookie_rows(profile)
+    jar = jar_for(rows, host)
+    if not len(jar):
+        err(f"warning: no cookies for {host} in {profile.name} — fetching logged out")
+    err(f"Fetching {args.url} with {len(jar)} cookies from {profile.name}...")
+    try:
+        body, content_type = fetch(args.url, jar)
+    except FetchError as e:
+        die(str(e))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        page = Path(tmp) / ((Path(urlparse(args.url).path).name or "page") + suffix_for(content_type, args.url))
+        page.write_bytes(body)
+        doc_dir = run_yapit(page, args)
+
+    audio_url = find_audio(body, args.url) if args.audio else None
+    audio_name = None
+    if audio_url:
+        # The audio often lives on a CDN, which gets its own cookies — or none.
+        audio_name = download_audio(audio_url, jar_for(rows, urlparse(audio_url).hostname or host), doc_dir)
+    elif args.audio:
+        err("No audio found on the page.")
+
+    words = patch_markdown(doc_dir, args.url, audio_name)
+    err(f"{words} words extracted.")
+    if words < SHORT_EXTRACTION:
+        err("warning: that is short for an article — check whether you are still logged in")
+    print(doc_dir)
+
+
+if __name__ == "__main__":
+    main()
