@@ -36,6 +36,9 @@ import re
 import subprocess
 import sys
 import time
+import signal
+import threading
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -67,11 +70,16 @@ class Args:
     """Regenerate whenever the sources change and serve the page on localhost with live reload (the summary is computed once and reused). The written file stays a plain snapshot you can share."""
     notes: str = ""
     """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3 and the agent names in chat: pick it once, leave a gap when a note is dropped, never renumber. line/end/side are optional, a line-less note attaches to the whole file. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is display-only and never part of the comment export. In --watch mode the page refreshes when this file changes."""
+    serve: str = ""
+    """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own once nobody has asked for a page in a while."""
     context: int = 3
     """Context lines around each hunk (git diff -U)."""
 
 
 def main(args: Args) -> None:
+    if args.serve:
+        serve_root(args.serve)
+        return
     out = Path(args.output).expanduser() if args.output else default_output(args.sources)
     out.parent.mkdir(parents=True, exist_ok=True)
     summary, generated = build(args, out, args.summary)
@@ -242,12 +250,147 @@ def parse_resolved(raw: object, path: str) -> list[int]:
     return out
 
 
+# ---------------------------------------------------------------- serve mode
+
+IDLE_EXIT_SECONDS = 30 * 60
+SERVE_MARKER = ".serve.json"
+CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".json": "application/json", ".png": "image/png",
+                 ".svg": "image/svg+xml", ".css": "text/css", ".js": "text/javascript"}
+
+
+def serve_root(root_spec: str) -> None:
+    """Serve a tree of already-rendered pages, in the background, and return.
+
+    Comments live in a file beside their page, which only a served page can write:
+    a file:// page has no way to reach the disk. One server per tree, reported
+    rather than replaced when it is already up.
+    """
+    root = Path(root_spec).expanduser().resolve()
+    if not root.is_dir():
+        sys.exit(f"diffview: --serve {root} is not a directory")
+    port = already_serving(root)
+    if port:
+        print(f"diffview: already serving {root} at http://127.0.0.1:{port}/")
+        return
+
+    server = bind_server(root)
+    port = server.server_address[1]
+    marker = root / SERVE_MARKER
+    print(f"diffview: serving {root} at http://127.0.0.1:{port}/  (exits after {IDLE_EXIT_SECONDS // 60} idle minutes)")
+    pid = os.fork()
+    if pid:
+        # the marker is written here, so it exists the moment this command returns
+        marker.write_text(json.dumps({"port": port, "pid": pid, "root": str(root)}))
+        return
+
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    # serve on its own thread: shutdown() from a signal handler inside the serving
+    # thread would wait for a loop that cannot run until the handler returns
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=idle_watchdog, args=(server, stop), daemon=True).start()
+    try:
+        stop.wait()
+    finally:
+        marker.unlink(missing_ok=True)
+    os._exit(0)
+
+
+def already_serving(root: Path) -> int | None:
+    """The port of a live server for this root, clearing the marker when it names a dead one."""
+    marker = root / SERVE_MARKER
+    try:
+        port = json.loads(marker.read_text())["port"]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/.health", timeout=1) as r:
+            if json.loads(r.read())["root"] == str(root):
+                return int(port)
+    except (OSError, ValueError, KeyError):
+        pass
+    marker.unlink(missing_ok=True)
+    return None
+
+
+def idle_watchdog(server, stop) -> None:
+    """Nobody asked for a page in a long while, so the tree is not under review any more."""
+    while not stop.wait(60):
+        if time.monotonic() - server.last_request > IDLE_EXIT_SECONDS:
+            stop.set()
+
+
+def bind_server(root: Path):
+    """A port derived from the root keeps the origin stable across restarts."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.server.last_request = time.monotonic()
+            if self.path.split("?")[0] == "/.health":
+                self.respond(200, json.dumps({"root": str(root)}).encode(), "application/json")
+                return
+            target = self.resolve(self.path)
+            if target is None or not target.is_file():
+                self.respond(404, b"not found", "text/plain")
+                return
+            self.respond(200, target.read_bytes(), CONTENT_TYPES.get(target.suffix, "application/octet-stream"))
+
+        def do_POST(self):
+            self.server.last_request = time.monotonic()
+            own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+            target = self.resolve(self.path)
+            if target is None or target.suffix != ".json" or not target.name.endswith(".html.state.json"):
+                self.respond(404, b"not found", "text/plain")
+                return
+            if self.headers.get("Origin") not in (None, own_origin):
+                self.respond(403, b"forbidden", "text/plain")
+                return
+            try:
+                blob = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if not isinstance(blob, dict):
+                    raise ValueError("state must be a JSON object")
+                tmp = target.with_name(target.name + ".tmp")
+                tmp.write_text(json.dumps(blob))
+                os.replace(tmp, target)
+            except (ValueError, OSError, TypeError):
+                self.respond(400, b"bad state", "text/plain")
+                return
+            self.respond(204, b"", "text/plain")
+
+        def resolve(self, path: str) -> Path | None:
+            """The file a request names, or None when it points outside the served tree."""
+            rel = urllib.parse.unquote(path.split("?")[0]).lstrip("/")
+            target = (root / rel).resolve()
+            return target if target == root or target.is_relative_to(root) else None
+
+        def respond(self, code: int, body: bytes, ctype: str):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    port = 41000 + int(hashlib.sha256(str(root).encode()).hexdigest(), 16) % 4000
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.last_request = time.monotonic()
+    return server
+
+
 # ---------------------------------------------------------------- watch mode
 
 
 def watch(args: Args, out: Path, summary: str, generated: str) -> None:
     """Serve the page on localhost, regenerate when the sources change, let the page live-reload."""
-    import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     args.auto_summary = False  # the summary was computed (or attempted) once; never re-pay per rebuild
@@ -270,8 +413,8 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
 
         def do_POST(self):
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if self.path != "/state" or self.headers.get("Origin") not in (None, own_origin):
-                self.send_response(403 if self.path == "/state" else 404)
+            if not self.path.endswith(".state.json") or self.headers.get("Origin") not in (None, own_origin):
+                self.send_response(403 if self.path.endswith(".state.json") else 404)
                 self.end_headers()
                 return
             try:
