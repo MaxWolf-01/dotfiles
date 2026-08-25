@@ -6,7 +6,11 @@
 
 let
   # The one list: installed as packages and named in HOST.md below, so the
-  # record dispatch reads cannot drift from what is actually here.
+  # record dispatch reads cannot drift from what is actually here. It is
+  # rendered there by mainProgram, because a worker looks for `make` and `rg`,
+  # not for `gnumake` and `ripgrep`. A package that declares no mainProgram
+  # fails evaluation rather than falling back to its package name -- the record
+  # naming a command that does not exist is the failure worth being loud about.
   toolchain = with pkgs; [
     ast-grep
     chromium
@@ -98,7 +102,7 @@ in
 
     ## Toolchain
 
-    ${lib.concatMapStringsSep "\n" (p: "- `${lib.getName p}`") toolchain}
+    ${lib.concatMapStringsSep "\n" (c: "- `${c}`") (lib.sort lib.lessThan (map (p: p.meta.mainProgram) toolchain))}
 
     Plus `nix` (flakes enabled, untrusted user), rootless `docker`, and
     `claude` with the `mx` plugin. Anything a project needs beyond this comes
