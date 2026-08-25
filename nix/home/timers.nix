@@ -40,11 +40,10 @@ let
     bash coreutils uv openssh jq
   ]);
 
-  # util-linux for flock (vpn-pick serializes watcher vs. manual runs),
-  # procps for pgrep (the Vesktop gate), jq for both the tailscale state reads
-  # and the run-log lines vpn-pick writes
+  # util-linux for flock (vpn-pick serializes watcher vs. manual runs), jq for
+  # both the tailscale state reads and the run-log lines vpn-pick writes
   vpnPath = lib.makeBinPath (with pkgs; [
-    bash coreutils util-linux gawk curl jq procps
+    bash coreutils util-linux gawk curl jq
   ]);
 
   sshAuthSock = "/run/user/1000/ssh-agent";
