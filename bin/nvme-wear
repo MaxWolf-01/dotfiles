@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Read the SSD's wear counters and append a timestamped row to
+# secrets/monitoring/nvme-wear.md, which explains what the columns mean.
+#
+# Run it whenever you or an agent thinks of it — there is no schedule. Two rows
+# answer both questions the drive can be asked: Percentage Used is the wear, and
+# Data Units Written is cumulative, so its difference over the days between two
+# rows is the write rate for that stretch. A short sample of /proc/diskstats
+# cannot give that; on zephylux it swung between 6 and 146 GB/day in one evening.
+#
+# smartctl needs root, and is not installed on either host. The store path is
+# resolved as you and only the binary runs under sudo, so nix never runs as root.
+#
+#   nvme-wear                 read, append a row, print the reading and the rate
+#   nvme-wear --dry-run       print it, append nothing
+#   nvme-wear --device sdX    a disk other than the one holding /
+set -uo pipefail
+
+TABLE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/secrets/monitoring/nvme-wear.md"
+UNIT_BYTES=$(( 1000 * 512 ))  # one NVMe data unit, for the rate between two rows
+
+usage() { sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//;$d'; }
+die() { echo "nvme-wear: $1" >&2; exit 2; }
+
+root_disk() {
+  local src
+  src=$(findmnt -no SOURCE /) || return 1
+  lsblk -nsro NAME,TYPE "$src" | awk '$2=="disk"{print $1; exit}'
+}
+
+find_smartctl() {
+  command -v smartctl && return 0
+  echo "nvme-wear: smartctl not installed, fetching it from nixpkgs" >&2
+  # One line per derivation output, and smartmontools has several — the man
+  # pages come back too. Take whichever one actually carries the binary.
+  local out
+  while read -r out; do
+    [ -x "$out/bin/smartctl" ] && { echo "$out/bin/smartctl"; return 0; }
+  done < <(nix build --no-link --print-out-paths nixpkgs#smartmontools)
+  return 1
+}
+
+dry_run=false
+device=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry_run=true ;;
+    --device) shift; device="${1:-}"; [ -n "$device" ] || die "--device needs a name" ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+[ -n "$device" ] || device=$(root_disk) || die "could not tell which disk holds /"
+[ -e "/dev/$device" ] || die "no such device: /dev/$device"
+
+smartctl=$(find_smartctl) || die "could not get smartctl from nixpkgs"
+echo "nvme-wear: reading /dev/$device (sudo)" >&2
+report=$(sudo "$smartctl" -a "/dev/$device") || die "smartctl could not read /dev/$device"
+
+field() { sed -n "s/^$1: *//p" <<<"$report" | head -1 | sed 's/ *$//'; }
+
+raw=$(field 'Data Units Written')            # "80,550,429 [41.2 TB]"
+written=$(sed 's/ \[.*//;s/,//g' <<<"$raw")
+tb=$(sed -n 's/.*\[\(.*\) TB\]/\1/p' <<<"$raw")   # smartctl's own rounding, not a second one
+used=$(field 'Percentage Used')
+spare=$(field 'Available Spare')
+hours=$(field 'Power On Hours' | sed 's/,//g')
+[ -n "$written" ] || die "no 'Data Units Written' in smartctl's output — not an NVMe drive?"
+
+today=$(date +%F)
+printf 'nvme-wear: %s  %s TB written, %s used, %s spare, %s power-on hours\n' \
+  "$today" "$tb" "$used" "$spare" "$hours"
+
+# The previous row, if the table has one, turns this reading into a rate.
+prev=$(grep -E '^\| 20[0-9]{2}-[0-9]{2}-[0-9]{2} \|' "$TABLE" 2>/dev/null | tail -1)
+if [ -n "$prev" ]; then
+  IFS='|' read -r _ pdate punits _ <<<"$prev"
+  pdate=$(tr -d ' ' <<<"$pdate"); punits=$(tr -d ' ,' <<<"$punits")
+  days=$(( ( $(date -d "$today" +%s) - $(date -d "$pdate" +%s) ) / 86400 ))
+  if [ "$days" -gt 0 ] && [ "$written" -gt "$punits" ]; then
+    awk -v w="$written" -v p="$punits" -v d="$days" -v f="$UNIT_BYTES" \
+      'BEGIN{printf "nvme-wear: %.1f GB/day since %s (%d days)\n", (w-p)*f/1e9/d, ARGV[1], d}' "$pdate"
+  else
+    echo "nvme-wear: no rate yet — the last row is from $pdate" >&2
+  fi
+fi
+
+$dry_run && exit 0
+[ -f "$TABLE" ] || die "no table at $TABLE"
+row=$(printf '| %s | %s | %s | %s | %s | %s |' \
+  "$today" "$(printf "%'d" "$written")" "$tb" "$used" "$spare" "$(printf "%'d" "$hours")")
+printf '%s\n' "$row" >> "$TABLE"
+echo "nvme-wear: appended to $TABLE" >&2
