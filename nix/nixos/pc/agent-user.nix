@@ -2,8 +2,8 @@
 #
 # Workers here run with permission prompts bypassed, so this user's boundary is
 # the only thing between a worker and the rest of the machine: no read access to
-# max's home or the HDD pool (mode 0700 on /home/max covers both), no wheel, no
-# sudo, no docker group, no outgoing tailnet.
+# max's home or the HDD pool mounted inside it, no wheel, no sudo, no docker
+# group, no outgoing tailnet.
 { pkgs, lib, ... }:
 
 let
@@ -42,6 +42,12 @@ in
     ];
   };
   users.groups.agent.gid = agentUid;
+
+  # The agent is kept out of max's data by this mode and nothing else -- the
+  # pool's datasets mount inside that directory, so it covers them too. It is
+  # the default, but the boundary above should not rest on a default staying
+  # put.
+  users.users.max.homeMode = "700";
 
   # Rootless docker, for the agent alone. Two things about the upstream module
   # make "just enable it" wrong here: its user service is wantedBy every

@@ -14,8 +14,7 @@
 
   # Long unattended jobs (dispatch workers, training runs) go here instead of
   # dying when this laptop suspends. As `agent`, not as max: workers get an
-  # unprivileged user of their own there (nix/nixos/pc/agent-user.nix). That
-  # user authorizes zephyrus's key only, so dispatch from here fails until
-  # this host's key is added there too.
+  # unprivileged user of their own there (nix/nixos/pc/agent-user.nix). Dispatch
+  # from here needs this host's key in that user's authorizedKeys.
   home.sessionVariables.MX_WORKER_HOST = "agent@pc";
 }

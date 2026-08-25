@@ -80,8 +80,9 @@ in
     '';
   };
 
-  # What dispatch reads before planning a wave. Generated here, beside the
-  # config that grants the capabilities, so the two cannot disagree.
+  # What dispatch reads before planning a wave. The toolchain list is generated
+  # from the packages above, so that half cannot drift; the limits below are
+  # claims about this host, and every one of them has been exercised.
   home.file."HOST.md".text = ''
     ---
     host: pc
@@ -114,11 +115,15 @@ in
       arrives by push from the orchestrator and leaves the same way.
     - No access to max's home or the storage pool on this machine.
     - No tailnet. Other tailnet nodes are unreachable from this user; the
-      public internet is not affected.
-    - No GPU. Training runs and CUDA work belong on another host.
+      public internet is not affected. Containers inherit the block, which is
+      drawn by uid rather than by interface.
+    - The GPU is visible here, but it is not yours: dispatch work runs no
+      training and no CUDA jobs on this machine, which has its own GPU workers.
+      A ticket that needs the GPU is a blocker.
     - Headless browsing only — `chromium --headless`, or under `xvfb-run`. No
       interactive browser driving.
-    - Rootless docker: no host networking, no privileged containers, no GPU
-      passthrough.
+    - Rootless docker: containers run inside this user's namespace, so
+      `--privileged` and `--network host` are accepted but grant nothing beyond
+      what this user already has. No GPU passthrough.
   '';
 }
