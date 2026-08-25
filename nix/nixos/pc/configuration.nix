@@ -9,6 +9,7 @@
     ./sftpgo.nix
     ./tailnet-lock.nix
     ./hd-idle.nix
+    ./agent-user.nix
   ];
 
   # Boot
