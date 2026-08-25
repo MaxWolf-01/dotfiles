@@ -59,6 +59,20 @@ in
   virtualisation.docker.rootless.enable = true;
   systemd.user.services.docker.unitConfig.ConditionUser = lib.mkForce "agent";
 
+  # The uid rule above only sees packets the agent's own processes send.
+  # tailscaled originates its own as root, and its control socket is world
+  # readable -- which hands any local user the full tailnet inventory and
+  # `tailscale ping` to any node. Mutations are already gated in-process by
+  # --operator=max, so what leaks is disclosure and a probe, not control.
+  # Closing the directory rather than the socket keeps that operator access
+  # working: max is in wheel, the agent is in no group but its own. systemd
+  # recreates this directory on every start, so the mode belongs on the unit
+  # rather than in tmpfiles.
+  systemd.services.tailscaled.serviceConfig = {
+    RuntimeDirectoryMode = lib.mkForce "0750";
+    ExecStartPost = [ "${pkgs.coreutils}/bin/chgrp wheel /run/tailscale" ];
+  };
+
   networking.firewall = {
     extraCommands = lib.concatMapStringsSep "\n" (rule: "ip46tables -A ${rule}") agentTailnetRules;
     extraStopCommands = lib.concatMapStringsSep "\n" (rule: "ip46tables -D ${rule} || true") agentTailnetRules;

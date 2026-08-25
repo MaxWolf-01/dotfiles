@@ -118,9 +118,10 @@ in
       not resolve, and nothing here can push to GitHub or open a PR — history
       arrives by push from the orchestrator and leaves the same way.
     - No access to max's home or the storage pool on this machine.
-    - No tailnet. Other tailnet nodes are unreachable from this user; the
-      public internet is not affected. Containers inherit the block, which is
-      drawn by uid rather than by interface.
+    - No tailnet. Other tailnet nodes are unreachable from this user, and
+      tailscaled's control socket is closed to it, so the node list is not
+      readable either. The public internet is not affected. Containers inherit
+      the block, which is drawn by uid rather than by interface.
     - The GPU is visible here, but it is not yours: dispatch work runs no
       training and no CUDA jobs on this machine, which has its own GPU workers.
       A ticket that needs the GPU is a blocker.
