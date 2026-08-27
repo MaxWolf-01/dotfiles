@@ -223,11 +223,21 @@
       '';
     };
     keymap = {
-      mgr.prepend_keymap = [
+      mgr.prepend_keymap = let
+        imageExt = "jpe?g|png|gif|webp|svg|avif|bmp|tiff?|heic";
+        videoExt = "mp4|mkv|webm|mov|avi|m4v";
+        audioExt = "mp3|flac|ogg|opus|wav|m4a|aac";
+        # filter_do skips the interactive input `filter` always opens; <Esc> clears
+        extFilter = exts: ''filter_do "\.(${exts})$" --insensitive --done'';
+      in [
         { on = [ "<Enter>" ]; run = "plugin smart-enter"; desc = "Enter directory / open file"; }
         { on = [ "<C-n>" ]; run = "plugin dragon-drop"; desc = "Drag and drop selected files"; }
         { on = [ "N" ]; run = "shell 'nautilus . &' --confirm"; desc = "Open nautilus here"; }
         { on = [ "T" ]; run = "shell 'ghostty &' --confirm"; desc = "Open terminal here"; }
+        { on = [ "F" "i" ]; run = extFilter imageExt; desc = "Filter images"; }
+        { on = [ "F" "v" ]; run = extFilter videoExt; desc = "Filter video"; }
+        { on = [ "F" "a" ]; run = extFilter audioExt; desc = "Filter audio"; }
+        { on = [ "F" "m" ]; run = extFilter "${imageExt}|${videoExt}|${audioExt}"; desc = "Filter all media"; }
       ];
     };
     settings = {
