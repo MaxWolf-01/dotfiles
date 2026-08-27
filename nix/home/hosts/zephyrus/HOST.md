@@ -21,6 +21,12 @@ Unlike a worker host, this one also has GitHub credentials, a browser you can
 drive and watch, and the rest of the network. Work needing any of those belongs
 here.
 
+Reaching them is not permission to use them. They are max's, and everything
+they touch is done in his name — a push, a pull request, a comment, a message,
+a request to another machine. Use them only for the concrete actions you were
+told to take. Anything past those is a blocker to report, never a call to
+make.
+
 ## Weigh before a long run here
 
 Finishing is not the question — `nosleep` holds a job through a closed lid and
