@@ -12,10 +12,14 @@ the permission prompts — this host is not a boundary, it is somebody's desk.
 
 ## Available
 
-Everything `~/.dotfiles` installs, and the things an isolated host deliberately
-lacks: GitHub credentials, a browser you can drive and watch, the desktop
-session, and the rest of the network. Work that needs any of those belongs here
-rather than on a worker host.
+A full general-purpose environment — assume the ordinary tools are here.
+Anything a project needs beyond them comes from that project's own setup target
+(`make install`, a dev flake, whatever it documents), inside the worktree, never
+from installing it on this machine.
+
+Unlike a worker host, this one also has GitHub credentials, a browser you can
+drive and watch, and the rest of the network. Work needing any of those belongs
+here.
 
 ## Weigh before a long run here
 
