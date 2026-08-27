@@ -7,12 +7,13 @@ isolated: true
 # Worker host: agent@pc
 
 The almost-always-on machine: a headless NixOS box that also holds the personal
-backups. It goes down on purpose now and again, but a machine that is off
-usually means something is wrong. Work belongs here when it is long, not
+backups. It goes down on purpose now and again, but if it is off for extended
+periods, something is usually wrong. Work belongs here when it is long, not
 time-critical, or simply better off a laptop — dispatch waves, overnight jobs,
-anything that has to outlive a lid closing or wants more compute than a laptop
-has. Its cores and memory are shared with whatever else the machine is doing at
-the time.
+anything that has to outlive a lid closing. It is not the fastest machine in the
+fleet: work that wants the strongest CPU there is belongs on the laptop, and
+everything that does not is at home here. Its cores and memory are shared with
+whatever else the machine is doing at the time.
 
 ## Available
 
