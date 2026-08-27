@@ -18,7 +18,10 @@ set -uo pipefail
 
 repo="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
 hosts_dir="$repo/nix/home/hosts"
-connect_timeout=5
+# Trust on first use, as common.nix grants it per host: these are tailnet
+# addresses, so a first connection is already inside WireGuard. Without it a
+# machine that has never reached the host reports it down rather than new.
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
 
 usage() { sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//;$d'; }
 die() { echo "worker-hosts: $1" >&2; exit 2; }
@@ -48,23 +51,23 @@ awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print "memtotal_kb=" t; print
 # The ZFS ARC is evictable but counts as used, so MemAvailable understates a
 # host with a pool by the size of it -- gigabytes, on this one.
 if [ -r /proc/spl/kstat/zfs/arcstats ]; then
-    awk '$1 == "size" {print "arc_kb=" int($3 / 1024)}' /proc/spl/kstat/zfs/arcstats
+  awk '$1 == "size" {print "arc_kb=" int($3 / 1024)}' /proc/spl/kstat/zfs/arcstats
 fi
 # The filesystems a worker writes to, rather than the machine's disks: a pool
 # this user cannot reach never appears, and nothing here has to know that.
 df -P -h "$HOME" /tmp | awk 'NR > 1 && !seen[$1]++ {print "df=" $6 "|" $4 "|" $2}'
 if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits |
-        awk -F', *' '{print "gpu=" $1 "|" $2 "|" $3 "|" $4}'
+  nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits |
+    awk -F', *' '{print "gpu=" $1 "|" $2 "|" $3 "|" $4}'
 fi
-tmux list-panes -a -F 'worker=#{session_name}' 2>/dev/null | grep '^worker=dispatch-' | sort -u
+tmux list-panes -a -F 'worker=#{session_name}|#{pane_current_path}' 2>/dev/null | grep '^worker=dispatch-' | sort -u
 exit 0
 REMOTE
 
-probe() {
-  ssh -o BatchMode=yes -o ConnectTimeout=$connect_timeout -o StrictHostKeyChecking=accept-new \
-    "$1" bash -s <<<"$remote_probe" 2>/dev/null
-}
+# stderr is kept, not discarded: an unauthorized key and a machine that is off
+# both produce no output, and only the error tells you which one you are
+# looking at -- one of them you can fix in a minute.
+probe() { ssh "${ssh_opts[@]}" "$1" bash -s <<<"$remote_probe" > "$2" 2> "$2.err"; }
 
 gib() { awk -v k="${1:-0}" 'BEGIN { g = k / 1048576; printf (g < 10 ? "%.1fG" : "%.0fG"), g }'; }
 
@@ -76,7 +79,7 @@ render() {
     uptime=$(sed -n 's/^uptime=//p' "$result")
     printf '%s — up %s\n' "$name" "${uptime:-?}"
   else
-    printf '%s — unreachable\n' "$name"
+    printf '%s — unreachable: %s\n' "$name" "$(head -1 "$result.err" 2>/dev/null || echo "no answer")"
   fi
 
   lead "$record" | fmt -w 76 | sed 's/^/  /'
@@ -105,40 +108,50 @@ render() {
   done
   echo
 
-  workers=$(sed -n 's/^worker=//p' "$result" | paste -sd', ' -)
+  # The worktree directory names the repo, feature and ticket a session is on,
+  # which its name alone does not on a host shared by several dispatchers.
+  workers=$(sed -n 's/^worker=//p' "$result" |
+    while IFS='|' read -r session path; do printf '%s (%s), ' "$session" "${path##*/}"; done)
+  workers=${workers%, }
   printf '  workers: %s\n\n' "${workers:-none}"
 }
 
-if [ $# -gt 0 ]; then
+host=""
+while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     -*) die "unknown argument: $1" ;;
+    *) [ -z "$host" ] || die "one host at a time: $host, $1"; host=$1 ;;
   esac
-fi
+  shift
+done
 
 records=("$hosts_dir"/*-agent/HOST.md)
 [ -e "${records[0]}" ] || die "no worker hosts: nothing matches $hosts_dir/*-agent/HOST.md"
 
-if [ $# -gt 0 ]; then
+if [ -n "$host" ]; then
   for record in "${records[@]}"; do
-    [ "$(field "$record" host)" = "$1" ] || continue
+    [ "$(field "$record" host)" = "$host" ] || continue
     # The host's copy carries the generated toolchain and this one still has the
-    # token in its place, so ask the host first and fall back to here.
-    ssh -o BatchMode=yes -o ConnectTimeout=$connect_timeout "$(field "$record" user)@$1" cat HOST.md 2>/dev/null ||
-      cat "$record"
+    # token in its place, so ask the host first and say when you got the other.
+    if ! ssh "${ssh_opts[@]}" "$(field "$record" user)@$host" cat HOST.md 2>/dev/null; then
+      echo "worker-hosts: $host is unreachable — the checked-in record follows" >&2
+      sed 's/@TOOLCHAIN@/(unknown: the tool list is spliced in on the host)/' "$record"
+    fi
     exit 0
   done
-  die "no such worker host: $1 (have: $(for r in "${records[@]}"; do field "$r" host; done | paste -sd' ' -))"
+  die "no such worker host: $host (have: $(for r in "${records[@]}"; do field "$r" host; done | paste -sd' ' -))"
 fi
 
 results=$(mktemp -d)
 trap 'rm -rf "$results"' EXIT
+# Keyed by the record's own directory, not by the host it names: two records
+# claiming one machine would otherwise be handed each other's answers.
 for record in "${records[@]}"; do
-  probe "$(field "$record" user)@$(field "$record" host)" > "$results/$(field "$record" host)" &
+  probe "$(field "$record" user)@$(field "$record" host)" "$results/$(basename "$(dirname "$record")")" &
 done
 wait
 
 for record in "${records[@]}"; do
-  name=$(field "$record" host)
-  render "$name" "$record" "$results/$name"
+  render "$(field "$record" host)" "$record" "$results/$(basename "$(dirname "$record")")"
 done

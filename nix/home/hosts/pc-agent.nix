@@ -5,8 +5,7 @@
 { config, osConfig, pkgs, lib, ... }:
 
 let
-  # The one list: installed as packages and named in HOST.md below, so the
-  # record dispatch reads cannot drift from what is actually here. It is
+  # The one list: installed as packages, and spliced into HOST.md below. It is
   # rendered there by mainProgram, because a worker looks for `make` and `rg`,
   # not for `gnumake` and `ripgrep`. A package that declares no mainProgram
   # fails evaluation rather than falling back to its package name -- the record

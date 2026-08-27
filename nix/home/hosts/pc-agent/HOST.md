@@ -8,9 +8,8 @@ isolated: true
 
 The always-on machine: a headless NixOS box that also holds the backups, so it
 stays up unless something is wrong. Long unattended work belongs here — dispatch
-waves, overnight jobs, anything that has to outlive a laptop lid. Twelve cores
-and 31 GB of RAM, shared with whatever else the machine is doing; its GTX 1650
-is small and usually spoken for.
+waves, overnight jobs, anything that has to outlive a laptop lid. Its cores and
+memory are shared with whatever else the machine is doing at the time.
 
 ## Available
 
