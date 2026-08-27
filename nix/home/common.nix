@@ -228,6 +228,11 @@
         { on = [ "<C-n>" ]; run = "plugin dragon-drop"; desc = "Drag and drop selected files"; }
         { on = [ "N" ]; run = "shell 'nautilus . &' --confirm"; desc = "Open nautilus here"; }
         { on = [ "T" ]; run = "shell 'ghostty &' --confirm"; desc = "Open terminal here"; }
+        # filter_do skips the interactive input `filter` always opens; <Esc> clears
+        { on = [ "F" "i" ]; run = ''filter_do "\.(jpe?g|png|gif|webp|svg|avif|bmp|tiff?|heic)$" --insensitive --done''; desc = "Filter: images"; }
+        { on = [ "F" "v" ]; run = ''filter_do "\.(mp4|mkv|webm|mov|avi|m4v)$" --insensitive --done''; desc = "Filter: video"; }
+        { on = [ "F" "a" ]; run = ''filter_do "\.(mp3|flac|ogg|opus|wav|m4a|aac)$" --insensitive --done''; desc = "Filter: audio"; }
+        { on = [ "F" "m" ]; run = ''filter_do "\.(jpe?g|png|gif|webp|svg|avif|bmp|tiff?|heic|mp4|mkv|webm|mov|avi|m4v|mp3|flac|ogg|opus|wav|m4a|aac)$" --insensitive --done''; desc = "Filter: all media"; }
       ];
     };
     settings = {
