@@ -6,10 +6,13 @@ isolated: true
 
 # Worker host: agent@pc
 
-The always-on machine: a headless NixOS box that also holds the backups, so it
-stays up unless something is wrong. Long unattended work belongs here — dispatch
-waves, overnight jobs, anything that has to outlive a laptop lid. Its cores and
-memory are shared with whatever else the machine is doing at the time.
+The almost-always-on machine: a headless NixOS box that also holds the personal
+backups. It goes down on purpose now and again, but a machine that is off
+usually means something is wrong. Work belongs here when it is long, not
+time-critical, or simply better off a laptop — dispatch waves, overnight jobs,
+anything that has to outlive a lid closing or wants more compute than a laptop
+has. Its cores and memory are shared with whatever else the machine is doing at
+the time.
 
 ## Available
 
@@ -23,9 +26,9 @@ inside the worktree.
 - **Work needing GitHub.** No credentials here: `gh` is unauthenticated and
   nothing can push or open a PR. History arrives by push from the orchestrator
   and leaves the same way.
-- **Work needing the GPU.** Nothing stops you using it, and that is the point:
-  it is spoken for by this machine's own workers, so a ticket that wants it goes
-  back rather than running here.
+- **Work needing the GPU.** Never a default pick. The card is here and nothing
+  stops you, but a ticket runs on it only where it says to use pc's GPU in so
+  many words; otherwise the work goes back.
 - **Work needing another machine on the network.** Only the orchestrator's side
   can reach one.
 - **Driving a real browser.** Headless renders work; a session you can click
