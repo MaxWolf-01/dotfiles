@@ -37,6 +37,9 @@ in
     # Without lingering, the user's tmux server dies with its last session and
     # takes every worker in it along.
     linger = true;
+    # One line per machine that dispatches here. A machine whose key is missing
+    # sees this host as unreachable, which `worker-hosts` reports as the
+    # permission denial it is.
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
     ];

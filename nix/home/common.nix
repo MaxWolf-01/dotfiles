@@ -324,10 +324,15 @@
         User = "max";
         StrictHostKeyChecking = "accept-new";
       };
+      # The tailnet address, not the name: on the home LAN the router answers
+      # for `pc` with a LAN address that resolves nowhere else, so dispatch or a
+      # backup running from another network would have no host at all.
+      pc = {
+        HostName = "100.122.146.47";
+        User = "max";
+      };
       # SFTPGo's own SSH server, not pc's sshd: `sftp drop` reaches the file
-      # drop, `ssh pc` still reaches the machine. pc's tailnet address, not the
-      # name: on a LAN whose router answers for `pc` the name resolves to its
-      # LAN address, where port 2022 is firewalled — only tailscale0 is let in.
+      # drop, `ssh pc` the machine. Port 2022 is let through on tailscale0 only.
       drop = {
         HostName = "100.122.146.47";
         Port = 2022;
