@@ -1,0 +1,1016 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "pillow"]
+# ///
+"""Pick photos and video out of large archives through a contact sheet in the browser.
+
+`index` thumbnails a source where it lives -- over ssh for another machine --
+and brings only the thumbnails back, so a 25 GB archive costs a few hundred MB
+to browse. `serve` opens the contact sheet: a grid to mark in, filters by
+source and year, and a selection that survives reloads. `fetch` copies the
+originals of what is marked.
+
+Marking is a first pass -- the grid shows small thumbnails, enough to tell one
+file from another, not to judge it. Mark generously, fetch, then look properly.
+
+A source is named once and remembered. `index` with no arguments re-indexes
+every source the directory already holds; naming them indexes just those.
+`sources` lists them, `scan` finds new ones worth adding.
+
+Source spec, needed only the first time a label is used:
+
+    LABEL=PATH          a directory tree on this machine
+    LABEL=HOST:PATH     a directory tree on another machine, over ssh
+    LABEL=-             paths read from stdin, naming files on this machine
+    LABEL=HOST:-        paths read from stdin, naming files on HOST
+    LABEL=@FILE         paths read from FILE, alongside the files it names
+
+HOST is anything ssh resolves, so ~/.ssh/config aliases work.
+
+Examples:
+
+    media-picker scan pc:~/data/phone
+    media-picker index camera=pc:~/data/phone/DCIM/Camera irl=~/Pictures/irl_pictures
+    media-picker index camera            # just that one, by name
+    media-picker index                   # everything, by name
+    fd -e mp4 --changed-within 90d ~/Videos | media-picker index recent=-
+    media-picker serve --open
+    media-picker fetch ~/Pictures/candidates
+"""
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Annotated
+
+import tyro
+from tyro.extras import SubcommandApp
+
+app = SubcommandApp()
+
+
+class SourceUnreachable(Exception):
+    """A source could not be read this run. The others still can be."""
+
+DEFAULT_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "media-picker"
+TEMPLATE = Path(__file__).resolve().parent / "media-picker.html"
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif", ".bmp"}
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".3gp", ".mpg", ".mpeg"}
+SUFFIXES = IMAGE_SUFFIXES | VIDEO_SUFFIXES
+IDLE_EXIT_SECONDS = 30 * 60
+SERVE_MARKER = ".serve.json"
+SOURCES_FILE = "sources.json"
+SSH_CONTROL = "/tmp/mp-ssh-%r@%h-%p"   # short: a unix socket path caps out around 100 bytes
+
+
+# ---------------------------------------------------------------- index
+
+@dataclass
+class IndexArgs:
+    sources: Annotated[list[str], tyro.conf.Positional] = field(default_factory=list)
+    """Sources to index. A bare LABEL re-indexes a source already in this directory; LABEL=TARGET defines or redefines one (see the forms above). Nothing at all re-indexes every source there is."""
+    dir: str = str(DEFAULT_DIR)
+    """Where thumbnails, the manifest and the page are written. Indexing the same directory again keeps thumbnails that are already there and keeps the current selection."""
+    size: int = 256
+    """Longest thumbnail edge in pixels. The grid shows them at half this, so 256 is a sharp 128px cell; raising it costs transfer and disk roughly quadratically."""
+    quality: int = 72
+    """JPEG quality of the thumbnails, 1-95."""
+    min_bytes: int = 8192
+    """Skip source files smaller than this. Drops WhatsApp's sticker and thumbnail clutter, which is never what you are looking for."""
+    jobs: int = 0
+    """Thumbnailing processes per host. 0 uses that host's CPU count."""
+
+
+@app.command(name="index")
+def index_cmd(args: IndexArgs) -> None:
+    """Thumbnail every source and build the contact sheet.
+
+    Runs the thumbnailer on whichever machine holds each source, so only
+    thumbnails cross the network. Safe to re-run: a source file whose
+    thumbnail already exists is not read again.
+    """
+    out = Path(args.dir).expanduser()
+    (out / "thumbs").mkdir(parents=True, exist_ok=True)
+
+    sources = load_sources(out)
+    wanted = resolve_sources(args.sources, sources, out)
+
+    known = {e["id"]: e for e in previous(out)}
+    entries: list[dict] = []
+    failed: list[str] = []
+    for label, src in wanted.items():
+        try:
+            entries += (
+                remote_thumbs(label, src, out, args)
+                if src["host"]
+                else local_thumbs(label, src, out / "thumbs", args, known)
+            )
+        except SourceUnreachable as err:
+            # An away laptop must not cost the sources that did answer, nor the
+            # entries this one had from last time -- so it keeps its old ones and
+            # the run carries on.
+            print(f"  {label}: {err}", file=sys.stderr)
+            failed.append(label)
+            entries += [e for e in known.values() if e["label"] == label]
+            continue
+        # Remembered only once it has worked: a typo'd path that was saved on
+        # sight would join every later `index` run with no way to drop it.
+        sources[label] = src
+    save_sources(out, sources)
+
+    entries += [e for e in known.values() if e["label"] not in wanted]
+    entries.sort(key=lambda e: e["ts"], reverse=True)
+    (out / "manifest.json").write_text(json.dumps(entries))
+    build_page(out, entries)
+    prune_thumbs(out, entries)
+    total = sum(f.stat().st_size for f in (out / "thumbs").iterdir())
+    print(f"media-picker: {len(entries)} files, {total / 1e6:.0f} MB of thumbnails in {out}")
+    if failed:
+        sys.exit(f"media-picker: {', '.join(failed)} could not be reached; the rest is indexed")
+    print("media-picker: now run `media-picker serve --open`")
+
+
+def resolve_sources(specs: list[str], remembered: dict[str, dict], out: Path) -> dict[str, dict]:
+    """The sources this run should index, keyed by label.
+
+    A path is typed once. After that the label is the handle: naming it
+    re-indexes it, and naming nothing re-indexes every source there is.
+    """
+    if not specs:
+        if not remembered:
+            sys.exit(f"media-picker: no sources in {out} yet — name one, e.g. "
+                     f"`media-picker index photos=~/Pictures`")
+        return dict(remembered)
+
+    wanted = {}
+    for spec in specs:
+        label, sep, target = spec.partition("=")
+        if not sep:
+            if label not in remembered:
+                sys.exit(f"media-picker: no source called '{label}' — "
+                         f"`media-picker sources` lists the ones there are")
+            wanted[label] = remembered[label]
+        else:
+            wanted[label] = parse_target(target, label)
+    return wanted
+
+
+stdin_taken = ""
+
+
+def parse_target(target: str, label: str) -> dict:
+    """One source spec as {host, root, paths} -- a tree has a root, a list has paths.
+
+    Only one source per command may read stdin: they would otherwise consume
+    each other's input, and the second would look merely empty.
+    """
+    host, rest = split_host(target)
+    if rest == "-":
+        global stdin_taken
+        if stdin_taken:
+            sys.exit(f"media-picker: only one source can read stdin, and '{stdin_taken}' already does")
+        stdin_taken = label
+        if sys.stdin.isatty():
+            sys.exit(f"media-picker: '{label}=-' reads paths from stdin, and stdin is a terminal")
+        paths = [ln.strip() for ln in sys.stdin if ln.strip()]
+        if not paths:
+            sys.exit(f"media-picker: '{label}=-' read no paths from stdin")
+        return {"host": host, "root": "", "paths": paths}
+    if rest.startswith("@"):
+        return {"host": host, "root": "", "paths": None, "list_file": rest[1:]}
+    return {"host": host, "root": rest, "paths": None}
+
+
+def split_host(target: str) -> tuple[str, str]:
+    """A target as (host, path); the host is empty for this machine.
+
+    A hostname holds no slash, so anything before the colon that has one is
+    part of a local path that happens to contain a colon, not a host.
+    """
+    host, sep, rest = target.partition(":")
+    return ("", target) if not sep or "/" in host else (host, rest)
+
+
+def load_sources(out: Path) -> dict[str, dict]:
+    """The sources this directory remembers, so a path is only ever typed once."""
+    try:
+        return json.loads((out / SOURCES_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sources(out: Path, sources: dict[str, dict]) -> None:
+    (out / SOURCES_FILE).write_text(json.dumps(sources, indent=2, sort_keys=True))
+
+
+def source_files(src: dict, args: IndexArgs) -> list[Path]:
+    """Every file a source names, whether it walks a tree or was handed a list."""
+    if src.get("list_file"):
+        src = dict(src, paths=Path(src["list_file"]).expanduser().read_text().split("\n"))
+    if src.get("paths") is not None:
+        candidates = (Path(p).expanduser() for p in src["paths"] if p.strip())
+    else:
+        root = Path(src["root"]).expanduser()
+        if not root.is_dir():
+            raise SourceUnreachable(f"{root} is not a directory")
+        candidates = root.rglob("*")
+    return [
+        p for p in candidates
+        if p.suffix.lower() in SUFFIXES and p.is_file() and p.stat().st_size >= args.min_bytes
+    ]
+
+
+def previous(out: Path) -> list[dict]:
+    """What this directory already held. Sources not named this time survive re-indexing."""
+    try:
+        return json.loads((out / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def prune_thumbs(out: Path, entries: list[dict]) -> None:
+    """Drop thumbnails no manifest entry claims, left by a source that has since shrunk."""
+    keep = {e["id"] for e in entries}
+    for f in (out / "thumbs").iterdir():
+        if f.stem not in keep:
+            f.unlink()
+
+
+def local_thumbs(label: str, src: dict, thumb_dir: Path, args: IndexArgs,
+                 known: dict[str, dict]) -> list[dict]:
+    """Thumbnail a source on this machine, returning one manifest entry per file.
+
+    A file already described in `known`, whose thumbnail is still on disk, is
+    taken from there. Without that a re-index re-reads every original for its
+    metadata and dimensions, which on a large archive is the whole archive again.
+    """
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    files = source_files(src, args)
+
+    entries, work = [], []
+    for p in files:
+        tid = thumb_id(label, src, p)
+        cached = known.get(tid)
+        if cached is not None and (thumb_dir / f"{tid}.jpg").exists():
+            entries.append(cached)
+        else:
+            work.append((str(p), str(thumb_dir / f"{tid}.jpg"), args.size, args.quality))
+
+    if work:
+        jobs = args.jobs or os.cpu_count() or 4
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            for i, result in enumerate(pool.map(make_thumb, work, chunksize=8), 1):
+                if result is None:
+                    continue
+                result["label"] = label
+                entries.append(result)
+                if i % 500 == 0:
+                    print(f"  {label}: {i}/{len(work)}", file=sys.stderr)
+    print(f"  {label}: {len(entries)} files ({len(work)} new)", file=sys.stderr)
+    return entries
+
+
+def thumb_id(label: str, src: dict, path: Path) -> str:
+    """Stable name for a source file's thumbnail, unique across sources.
+
+    Keyed on the path relative to the source root, so moving a whole archive
+    to a new mount point does not invalidate every thumbnail in it. A list
+    source has no root to be relative to, so it keys on the path itself.
+    """
+    root = src.get("root")
+    key = str(path.relative_to(Path(root).expanduser())) if root else str(path)
+    return hashlib.sha1(f"{label}\0{key}".encode()).hexdigest()[:20]
+
+
+def make_thumb(job: tuple[str, str, int, int]) -> dict | None:
+    """Write one thumbnail and describe its source. Returns None for unreadable files.
+
+    Runs in a worker process, so it takes and returns only plain data.
+    """
+    src, dest, size, quality = job
+    src_path, dest_path = Path(src), Path(dest)
+    video = src_path.suffix.lower() in VIDEO_SUFFIXES
+    try:
+        described = (video_thumb if video else image_thumb)(src_path, dest_path, size, quality)
+    except Exception:
+        return None
+    if described is None:
+        return None
+    return {
+        "id": dest_path.stem,
+        "path": src,
+        "name": src_path.name,
+        "ts": described.pop("ts", None) or name_time(src_path.name) or int(src_path.stat().st_mtime),
+        **described,
+    }
+
+
+def image_thumb(src: Path, dest: Path, size: int, quality: int) -> dict | None:
+    """A downscaled copy of an image, plus what the file says about itself."""
+    from PIL import Image, ImageOps
+
+    if not dest.exists():
+        with Image.open(src) as im:
+            # draft() lets the JPEG decoder downscale while reading, which is
+            # most of the speed here: full-size decode of a 12 MP photo we are
+            # about to throw away dominates everything else.
+            im.draft("RGB", (size, size))
+            im = ImageOps.exif_transpose(im)
+            im.thumbnail((size, size), Image.Resampling.BILINEAR)
+            im.convert("RGB").save(dest, "JPEG", quality=quality)
+    with Image.open(src) as im:
+        return {"w": im.size[0], "h": im.size[1], "ts": shot_time(im)}
+
+
+def video_thumb(src: Path, dest: Path, size: int, quality: int) -> dict | None:
+    """A poster frame for a video, taken a little way in.
+
+    Not frame one: videos routinely open on black or a fade, which makes every
+    cell in the grid look identical. A tenth of the way in is past that and
+    still early enough to be cheap to seek to.
+    """
+    probe = ffprobe(src)
+    if probe is None:
+        return None
+    duration, w, h = probe
+    if not dest.exists():
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{min(max(duration * 0.1, 0.5), 10):.2f}",
+             "-i", str(src), "-frames:v", "1",
+             "-vf", f"scale={size}:{size}:force_original_aspect_ratio=decrease",
+             "-q:v", str(max(2, min(31, 31 - quality * 29 // 95))), "-y", str(dest)],
+            capture_output=True, timeout=120, check=True,
+        )
+        if not dest.exists():
+            return None
+    return {"w": w, "h": h, "dur": round(duration, 1), "kind": "video"}
+
+
+def ffprobe(src: Path) -> tuple[float, int, int] | None:
+    """Duration and pixel size of a video, or None when it holds no video stream."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "format=duration:stream=width,height", "-of", "json", str(src)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if out.returncode:
+        return None
+    data = json.loads(out.stdout)
+    stream = (data.get("streams") or [{}])[0]
+    if not stream.get("width"):
+        return None
+    return float(data.get("format", {}).get("duration") or 0), stream["width"], stream["height"]
+
+
+def shot_time(im) -> int | None:
+    """When the camera says the photo was taken, as a unix timestamp."""
+    try:
+        raw = im.getexif().get(36867) or im.getexif().get(306)  # DateTimeOriginal, DateTime
+        return int(datetime.strptime(raw, "%Y:%m:%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        return None
+
+
+DATE_IN_NAME = re.compile(r"(?:^|[^\d])((?:19|20)\d{2})-?(\d{2})-?(\d{2})(?:[^\d]|$)")
+
+
+def name_time(name: str) -> int | None:
+    """The date a filename carries, for the many that have no EXIF.
+
+    Covers IMG-20171118-WA0009, PXL_20240419_143022, Screenshot_20230101-120000
+    and 'Photo from 2026-07-05' alike -- they differ only in separators.
+    """
+    m = DATE_IN_NAME.search(name)
+    if not m:
+        return None
+    try:
+        return int(datetime(*(int(g) for g in m.groups()), tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return None
+
+
+def remote_thumbs(label: str, src: dict, out: Path, args: IndexArgs) -> list[dict]:
+    """Thumbnail a source on another machine and bring the thumbnails back.
+
+    This script copies itself over and runs its own `index` there against a
+    scratch directory, so the remote needs nothing but uv, ffmpeg and ssh.
+    """
+    host = src["host"]
+    print(f"  {label}: thumbnailing on {host}", file=sys.stderr)
+    # Left in place deliberately: it holds that host's thumbnails, which is what
+    # makes a re-index cheap. /tmp clears it whenever the host reboots.
+    scratch = f"/tmp/media-picker-{label}"
+    self_path = Path(__file__).resolve()
+    rsh = ["-e", f"ssh -o ControlMaster=auto -o ControlPath={SSH_CONTROL} -o ControlPersist=60"]
+    run(["rsync", "-a", *rsh, str(self_path), str(TEMPLATE), f"{host}:/tmp/"])
+
+    # A list source was read here, so the far side is handed the paths in a file
+    # rather than a directory to walk.
+    if src.get("paths"):
+        listing = f"/tmp/media-picker-{label}.paths"
+        sent = subprocess.run(ssh(host, f"cat > {shlex.quote(listing)}"),
+                              input="\n".join(src["paths"]), text=True)
+        if sent.returncode:
+            raise SourceUnreachable(f"could not hand {host} the list of paths")
+        target = f"@{listing}"
+    elif src.get("list_file"):
+        target = f"@{src['list_file']}"
+    else:
+        target = src["root"]
+
+    remote = shlex.join([
+        "uv", "run", "--script", "--quiet", f"/tmp/{self_path.name}", "index",
+        f"{label}={target}", "--dir", scratch,
+        "--size", str(args.size), "--quality", str(args.quality),
+        "--min-bytes", str(args.min_bytes), "--jobs", str(args.jobs),
+    ])
+    run(ssh(host, remote))
+    run(["rsync", "-a", *rsh, f"{host}:{scratch}/thumbs/", str(out / "thumbs/")])
+
+    manifest = subprocess.run(ssh(host, f"cat {shlex.quote(scratch)}/manifest.json"),
+                              capture_output=True, text=True)
+    if manifest.returncode:
+        raise SourceUnreachable(f"{host} produced no manifest")
+    entries = json.loads(manifest.stdout)
+    for e in entries:
+        e["host"] = host
+    return entries
+
+
+def run(cmd: list[str]) -> None:
+    """Run a command as part of reaching a source, saying what it was trying to do."""
+    result = subprocess.run(cmd)
+    if result.returncode:
+        raise SourceUnreachable(f"{cmd[0]} failed (exit {result.returncode}): {shlex.join(cmd)}")
+
+
+def inline(data) -> str:
+    """JSON safe to embed in a script element -- a filename may contain `</script>`."""
+    return json.dumps(data, separators=(",", ":")).replace("</", "<\\/").replace("<!--", "<\\u0021--")
+
+
+def build_page(out: Path, entries: list[dict]) -> None:
+    """Write the contact sheet, with the manifest inlined so it loads as one file."""
+    if not TEMPLATE.exists():
+        sys.exit(f"media-picker: template missing at {TEMPLATE}")
+    labels = sorted({e["label"] for e in entries})
+    page = TEMPLATE.read_text()
+    page = page.replace("/*MANIFEST*/null", inline(entries)).replace("/*LABELS*/null", inline(labels))
+    (out / "picks.html").write_text(page)
+
+
+# ---------------------------------------------------------------- sources
+
+@dataclass
+class SourcesArgs:
+    dir: str = str(DEFAULT_DIR)
+    """The indexed directory to report on."""
+    forget: str = ""
+    """Drop this source: its files leave the page and its thumbnails leave the disk. The originals are not touched."""
+    json: bool = False
+    """Emit JSON to stdout. Pipe to jq for filtering."""
+
+
+@app.command(name="sources")
+def sources_cmd(args: SourcesArgs) -> None:
+    """List the sources this directory remembers, or drop one.
+
+    These are the names `index` takes. Each was defined once with a path and
+    is addressable by label ever after.
+
+    JSON schema (--json):
+
+        [{"label": "str", "host": "str", "root": "str", "kind": "tree|list",
+          "files": 0, "newest": "YYYY-MM-DD"}]
+    """
+    out = Path(args.dir).expanduser()
+    sources = load_sources(out)
+    if not sources:
+        sys.exit(f"media-picker: no sources in {out} yet")
+    if args.forget:
+        forget_source(out, sources, args.forget)
+        return
+
+    counts, newest = {}, {}
+    for e in previous(out):
+        counts[e["label"]] = counts.get(e["label"], 0) + 1
+        newest[e["label"]] = max(newest.get(e["label"], 0), e["ts"])
+
+    rows = [
+        {
+            "label": label,
+            "host": src.get("host", ""),
+            "root": src.get("root") or src.get("list_file", ""),
+            "kind": "tree" if src.get("root") else "list",
+            "files": counts.get(label, 0),
+            "newest": stamp(newest[label]) if label in newest else "",
+        }
+        for label, src in sorted(sources.items())
+    ]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    width = max(len(r["label"]) for r in rows)
+    for r in rows:
+        if r["kind"] == "list":
+            where = f"(a list of paths on {r['host']})" if r["host"] else "(a list of paths)"
+        else:
+            where = f"{r['host']}:{r['root']}" if r["host"] else r["root"]
+        print(f"{r['label']:<{width}}  {r['files']:>6}  {r['newest'] or '-':<10}  {where}")
+
+
+def forget_source(out: Path, sources: dict[str, dict], label: str) -> None:
+    """Drop a source and everything the page held for it."""
+    if label not in sources:
+        sys.exit(f"media-picker: no source called '{label}'")
+    del sources[label]
+    save_sources(out, sources)
+    entries = [e for e in previous(out) if e["label"] != label]
+    (out / "manifest.json").write_text(json.dumps(entries))
+    build_page(out, entries)
+    prune_thumbs(out, entries)
+    print(f"media-picker: dropped '{label}'; {len(entries)} files remain")
+
+
+def stamp(ts: int) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------- scan
+
+@dataclass
+class ScanArgs:
+    target: Annotated[str, tyro.conf.Positional]
+    """Tree to look through, PATH or HOST:PATH."""
+    min_files: int = 30
+    """Only report directories holding at least this many media files."""
+    hidden: bool = False
+    """Include hidden directories. Off by default: caches like .thumbnails hold thousands of files and none of them are yours."""
+    json: bool = False
+    """Emit JSON to stdout. Pipe to jq for filtering."""
+
+
+@app.command(name="scan")
+def scan_cmd(args: ScanArgs) -> None:
+    """Find directories worth indexing, so a source is picked rather than remembered.
+
+    Reports every directory under the target holding media, largest first, as
+    a spec you can paste straight into `index`. Counts are per directory, not
+    cumulative, so a parent does not drown out what is actually in it.
+
+    JSON schema (--json):
+
+        [{"path": "str", "files": 0, "bytes": 0}]
+    """
+    host, root = split_host(args.target)
+
+    script = SCAN_SCRIPT.format(root=shell_path(root), min_files=args.min_files,
+                                suffixes="|".join(sorted(x[1:] for x in SUFFIXES)),
+                                prune="" if args.hidden else "-name '.*' -prune -o")
+    if host:
+        found = subprocess.run(["ssh", host, script], capture_output=True, text=True)
+    else:
+        found = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    if found.returncode:
+        sys.exit(f"media-picker: scan failed: {found.stderr.strip() or found.returncode}")
+
+    rows = []
+    for line in found.stdout.splitlines():
+        count, size, path = line.split("\t", 2)
+        rows.append({"path": path, "files": int(count), "bytes": int(size)})
+    rows.sort(key=lambda r: r["files"], reverse=True)
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        sys.exit(f"media-picker: nothing under {args.target} holds {args.min_files}+ media files")
+    for r in rows:
+        where = f"{host}:{r['path']}" if host else r["path"]
+        print(f"{r['files']:>7}  {r['bytes'] / 1e9:>7.1f} GB  {where}")
+    if sys.stdout.isatty():
+        top = f"{host}:{rows[0]['path']}" if host else rows[0]["path"]
+        print(f"\nindex one with:  media-picker index LABEL='{top}'")
+
+
+def shell_path(path: str) -> str:
+    """A path a remote shell will read as written -- quoted, but with ~ still its own."""
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+# Runs on whichever machine holds the tree, so it is shell rather than Python:
+# the far side is only promised ssh, and this needs to walk 200k files there.
+SCAN_SCRIPT = r"""
+set -o pipefail
+[ -d {root} ] || {{ echo "not a directory: {root}" >&2; exit 2; }}
+find {root} -mindepth 1 {prune} -type f -regextype posix-extended -iregex '.*\.({suffixes})' -printf '%h\t%s\n' 2>/dev/null |
+awk -F'\t' '{{n[$1]++; b[$1]+=$2}} END {{for (d in n) if (n[d] >= {min_files}) printf "%d\t%d\t%s\n", n[d], b[d], d}}'
+"""
+
+
+# ---------------------------------------------------------------- serve
+
+@dataclass
+class ServeArgs:
+    dir: str = str(DEFAULT_DIR)
+    """The indexed directory to serve."""
+    open: bool = False
+    """Open the contact sheet in the browser ($BROWSER, else xdg-open)."""
+
+
+@app.command(name="serve")
+def serve_cmd(args: ServeArgs) -> None:
+    """Serve the contact sheet on localhost, in the background, and return.
+
+    The page needs a server rather than a file:// URL for one reason: Firefox
+    gives every local file its own opaque origin, so a page opened from disk
+    cannot keep a selection across reloads. Served, it saves the selection
+    beside itself.
+    """
+    root = Path(args.dir).expanduser().resolve()
+    if not (root / "picks.html").is_file():
+        sys.exit(f"media-picker: nothing indexed in {root} — run `media-picker index` first")
+    port = already_serving(root) or start_server(root)
+    url = f"http://127.0.0.1:{port}/picks.html"
+    print(f"media-picker: {url}  (exits after {IDLE_EXIT_SECONDS // 60} idle minutes)")
+    if args.open:
+        browser = os.environ.get("BROWSER") or "xdg-open"
+        subprocess.Popen([browser, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def start_server(root: Path) -> int:
+    """Fork a server for this directory and return the port it bound."""
+    server = bind_server(root)
+    port = server.server_address[1]
+    marker = root / SERVE_MARKER
+    pid = os.fork()
+    if pid:
+        # written by the parent, so the marker exists the moment this returns,
+        # and it names the child -- the parent is about to be gone
+        marker.write_text(json.dumps({"port": port, "pid": pid, "root": str(root)}))
+        return port
+
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    # serve on its own thread: shutdown() called from a signal handler running in
+    # the serving thread would wait on a loop that cannot resume until it returns
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=idle_watchdog, args=(server, stop, root), daemon=True).start()
+    try:
+        stop.wait()
+    finally:
+        release_marker(marker, os.getpid())
+    os._exit(0)
+
+
+def release_marker(marker: Path, pid: int) -> None:
+    """Clear the marker only while it still names this server.
+
+    Two serves racing on one directory both bind and both write; the loser
+    exiting must not strand the winner behind a missing marker, which reads
+    as nothing serving.
+    """
+    try:
+        if json.loads(marker.read_text())["pid"] != pid:
+            return
+    except (OSError, ValueError, KeyError):
+        return
+    marker.unlink(missing_ok=True)
+
+
+def already_serving(root: Path) -> int | None:
+    """The port of a live server for this directory, clearing a marker that names a dead one."""
+    marker = root / SERVE_MARKER
+    try:
+        port = json.loads(marker.read_text())["port"]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/.health", timeout=1) as r:
+            if json.loads(r.read())["root"] == str(root):
+                return int(port)
+    except (OSError, ValueError, KeyError):
+        pass
+    marker.unlink(missing_ok=True)
+    return None
+
+
+def idle_watchdog(server, stop: threading.Event, root: Path) -> None:
+    """Nobody has asked for a page in a long while, or the directory went away."""
+    while not stop.wait(60):
+        if not root.is_dir() or time.monotonic() - server.last_request > IDLE_EXIT_SECONDS:
+            stop.set()
+
+
+def bind_server(root: Path):
+    """The server for one indexed directory, bound but not yet serving."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    types = {".html": "text/html; charset=utf-8", ".json": "application/json",
+             ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+             ".webp": "image/webp", ".gif": "image/gif", ".heic": "image/heic", ".bmp": "image/bmp",
+             ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+             ".webm": "video/webm", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+             ".3gp": "video/3gpp", ".mpg": "video/mpeg", ".mpeg": "video/mpeg"}
+    # id → source, so /orig can only ever reach a file this index already knows
+    sources = {e["id"]: e for e in json.loads((root / "manifest.json").read_text())}
+
+    class Handler(BaseHTTPRequestHandler):
+        # Keep-alive, so seeking a video costs one connection rather than one per
+        # range request. A reply that cannot deliver the length it promised closes
+        # the connection instead of leaving the client waiting for bytes that are
+        # never coming.
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.server.last_request = time.monotonic()
+            if not local_request(self):
+                self.reply(403, b"forbidden", "text/plain")
+                return
+            path = self.path.split("?")[0]
+            if path == "/.health":
+                self.reply(200, json.dumps({"root": str(root)}).encode(), types[".json"])
+                return
+            if path.startswith("/orig/"):
+                self.send_original(path[len("/orig/"):])
+                return
+            target = self.resolve(path)
+            if target is None or not target.is_file():
+                self.reply(404, b"not found", "text/plain")
+                return
+            self.reply(200, target.read_bytes(), types.get(target.suffix, "application/octet-stream"))
+
+        def send_original(self, media_id: str) -> None:
+            """The full-size file behind a thumbnail, read over ssh when it lives elsewhere.
+
+            Streamed rather than read whole: a video is the same request as a
+            photo here, and one of them is half a gigabyte. Range requests are
+            answered because that is what a browser seeks a video with.
+
+            Only ids in the manifest resolve, so the served directory is still
+            the boundary even though the file itself is outside it.
+            """
+            entry = sources.get(media_id)
+            if entry is None:
+                self.reply(404, b"not found", "text/plain")
+                return
+            size = entry.get("bytes") if entry.get("bytes") is not None else file_size(entry)
+            if size is None:
+                self.reply(502, b"original unreachable", "text/plain")
+                return
+            entry["bytes"] = size
+            if size == 0:
+                self.reply(200, b"", types.get(Path(entry["path"]).suffix.lower(), "application/octet-stream"))
+                return
+
+            span = parse_range(self.headers.get("Range"), size)
+            if span is None:
+                self.reply(416, b"bad range", "text/plain")
+                return
+            start, end = span
+            ctype = types.get(Path(entry["path"]).suffix.lower(), "application/octet-stream")
+
+            self.send_response(206 if self.headers.get("Range") else 200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            if self.headers.get("Range"):
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            promised, sent = end - start + 1, 0
+            try:
+                for chunk in read_span(entry, start, end):
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+            except (OSError, BrokenPipeError, subprocess.SubprocessError):
+                pass
+            if sent != promised:
+                self.close_connection = True
+
+        def do_POST(self):
+            """Save the selection. The page is the only writer and picks.json the only target."""
+            self.server.last_request = time.monotonic()
+            own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+            if not local_request(self) or self.path != "/picks.json" \
+                    or self.headers.get("Origin") not in (None, own_origin):
+                self.close_connection = True   # the unread body is not the next request
+                self.reply(403, b"forbidden", "text/plain")
+                return
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            if not write_picks(root / "picks.json", body):
+                self.reply(400, b"bad selection", "text/plain")
+                return
+            self.reply(204, b"", "text/plain")
+
+        def resolve(self, path: str) -> Path | None:
+            """The file a request names, or None when it points outside the served directory."""
+            target = (root / path.split("?")[0].lstrip("/")).resolve()
+            return target if root in target.parents or target == root else None
+
+        def reply(self, code: int, body: bytes, ctype: str) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.last_request = time.monotonic()
+    return server
+
+
+def ssh(host: str, command: str) -> list[str]:
+    """An ssh invocation that shares one connection with the others.
+
+    Seeking a video is a range request each time, and a fresh handshake per
+    seek is most of the wait.
+    """
+    return ["ssh", "-o", "ControlMaster=auto", "-o", f"ControlPath={SSH_CONTROL}",
+            "-o", "ControlPersist=60", host, command]
+
+
+def file_size(entry: dict) -> int | None:
+    """How many bytes the original is, asked of whichever machine holds it."""
+    try:
+        if entry.get("host"):
+            out = subprocess.run(ssh(entry["host"], f"stat -c %s {shlex.quote(entry['path'])}"),
+                                 capture_output=True, text=True, timeout=30, check=True)
+            return int(out.stdout.strip())
+        return Path(entry["path"]).stat().st_size
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """The byte span a request asks for, or the whole file when it asks for none."""
+    if not header or not header.startswith("bytes="):
+        return (0, size - 1) if size else (0, 0)
+    first = header[len("bytes="):].split(",")[0].strip()
+    lo, _, hi = first.partition("-")
+    try:
+        if not lo:                       # a suffix range: the last N bytes
+            start, end = max(0, size - int(hi)), size - 1
+        else:
+            start = int(lo)
+            end = int(hi) if hi else size - 1
+    except ValueError:
+        return None
+    end = min(end, size - 1)
+    return None if start > end or start >= size else (start, end)
+
+
+def read_span(entry: dict, start: int, end: int, chunk: int = 1 << 18):
+    """The bytes between two offsets, from a local file or over ssh."""
+    length = end - start + 1
+    if not entry.get("host"):
+        with open(entry["path"], "rb") as f:
+            f.seek(start)
+            while length > 0:
+                block = f.read(min(chunk, length))
+                if not block:
+                    return
+                length -= len(block)
+                yield block
+        return
+    cmd = f"tail -c +{start + 1} {shlex.quote(entry['path'])} | head -c {length}"
+    proc = subprocess.Popen(ssh(entry["host"], cmd), stdout=subprocess.PIPE)
+    try:
+        while True:
+            block = proc.stdout.read(chunk)
+            if not block:
+                return
+            yield block
+    finally:
+        proc.stdout.close()
+        proc.terminate()
+
+
+def local_request(handler) -> bool:
+    """Binding to loopback stops remote sockets, not a web page that points a name at 127.0.0.1."""
+    host = (handler.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+    return host in ("127.0.0.1", "localhost", "::1", "")
+
+
+def write_picks(target: Path, raw: bytes) -> bool:
+    """Store the selection atomically. False when the payload is unusable.
+
+    A partial write would read back as an empty selection, and the next mark
+    would post over what was left -- an hour of marking gone with no error.
+    """
+    try:
+        picked = json.loads(raw)
+        if not isinstance(picked, list):
+            raise ValueError("a selection is a list of ids")
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(picked))
+        os.replace(tmp, target)
+        return True
+    except (ValueError, OSError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------- fetch
+
+@dataclass
+class FetchArgs:
+    out: Annotated[str, tyro.conf.Positional]
+    """Directory to copy the originals into. Created if missing."""
+    dir: str = str(DEFAULT_DIR)
+    """The indexed directory holding the selection."""
+    prefix: bool = True
+    """Prefix each copied file with its source label, so a camera photo and a WhatsApp one with the same name do not collide."""
+
+
+def unique_names(entries: list[dict], prefix: bool) -> dict[str, str]:
+    """One output filename per entry, none of them equal.
+
+    Archives repeat basenames freely -- WhatsApp's Images/ and Images/Sent/ hold
+    the same names -- and copying both under one name loses a photo the page
+    said was picked.
+    """
+    names: dict[str, str] = {}
+    taken: set[str] = set()
+    for e in entries:
+        stem = f"{e['label']}-{e['name']}" if prefix else e["name"]
+        name, n = stem, 1
+        while name in taken:
+            n += 1
+            name = f"{Path(stem).stem}-{n}{Path(stem).suffix}"
+        taken.add(name)
+        names[e["id"]] = name
+    return names
+
+
+@app.command(name="fetch")
+def fetch_cmd(args: FetchArgs) -> None:
+    """Copy the originals of every marked photo into a directory.
+
+    Local sources are copied, remote ones pulled with rsync -- one rsync per
+    host, so a hundred photos cost one connection.
+    """
+    root = Path(args.dir).expanduser().resolve()
+    picks_file = root / "picks.json"
+    if not picks_file.is_file():
+        sys.exit(f"media-picker: no selection in {root} — mark some photos in the page first")
+    picked = set(json.loads(picks_file.read_text()))
+    entries = [e for e in json.loads((root / "manifest.json").read_text()) if e["id"] in picked]
+    if not entries:
+        sys.exit("media-picker: the selection is empty")
+
+    out = Path(args.out).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+
+    by_host: dict[str, list[dict]] = {}
+    for e in entries:
+        by_host.setdefault(e.get("host", ""), []).append(e)
+
+    names = unique_names(entries, args.prefix)
+    for host, group in by_host.items():
+        paths = {e["path"]: names[e["id"]] for e in group}
+        if not host:
+            for src, name in paths.items():
+                shutil.copy2(src, out / name)
+            continue
+        # --files-from implies --relative, so each file lands under its own source
+        # path in the staging tree. That is what keeps two photos with the same
+        # basename from overwriting each other on the way here.
+        listing = "\n".join(p.lstrip("/") for p in paths) + "\n"
+        staging = out / f".staging-{host}"
+        staging.mkdir(exist_ok=True)
+        subprocess.run(
+            ["rsync", "-a", "--files-from=-", f"{host}:/", str(staging)],
+            input=listing, text=True, check=True,
+        )
+        for src, name in paths.items():
+            staged = staging / src.lstrip("/")
+            if staged.exists():
+                staged.rename(out / name)
+        shutil.rmtree(staging, ignore_errors=True)
+
+    print(f"media-picker: {len(entries)} originals in {out}")
+
+
+if __name__ == "__main__":
+    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
