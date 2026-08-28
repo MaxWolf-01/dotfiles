@@ -53,6 +53,7 @@ because SFTPGo sends every share download as an attachment.
 | Give someone ongoing access | `sftpgo-user add <name> --quota 10` |
 | Collect files from someone without an account | `sftpgo-user add`, then `delete` when done |
 | Take access away | `sftpgo-user delete <name>` |
+| Replace a lost or leaked password | `sftpgo-user passwd <name>` |
 | Put files in max's own area | `sftp drop` (SSH-key auth, tailnet only) |
 
 `sftpgo-share create` is read-only by design: a visitor downloads, never writes.
