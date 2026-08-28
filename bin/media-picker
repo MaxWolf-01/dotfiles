@@ -66,6 +66,74 @@ app = SubcommandApp()
 class SourceUnreachable(Exception):
     """A source could not be read this run. The others still can be."""
 
+
+class Job:
+    """The one long task the page can start, and its output while it runs.
+
+    index and scan take minutes, which is longer than a request should hold a
+    connection open. The page starts one and then asks how it is going.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.n = 0            # counts jobs, so a page can tell its own from an old one
+        self.kind = ""
+        self.running = False
+        self.proc: subprocess.Popen | None = None
+        self.lines: list[str] = []
+        self.result: list | None = None
+        self.error = ""
+
+    def start(self, kind: str, argv: list[str], parse=None) -> int:
+        """Begin a job, unless one is already going. Its number, or 0 when one is."""
+        with self.lock:
+            if self.running:
+                return 0
+            self.n += 1
+            self.kind, self.running = kind, True
+            self.lines, self.result, self.error = [], None, ""
+            n = self.n
+        threading.Thread(target=self._run, args=(argv, parse), daemon=True).start()
+        return n
+
+    def cancel(self) -> bool:
+        """Stop the job that is running. False when none is."""
+        with self.lock:
+            proc = self.proc if self.running else None
+        if proc is None:
+            return False
+        proc.terminate()
+        return True
+
+    def _run(self, argv: list[str], parse) -> None:
+        try:
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            with self.lock:
+                self.proc = proc
+            for line in proc.stdout:
+                with self.lock:
+                    self.lines.append(line.rstrip())
+                    del self.lines[:-200]        # the page shows the tail, not the history
+            proc.wait()
+            if parse is not None:
+                self.result = parse(self.lines)
+            if proc.returncode:
+                # index exits nonzero when a source failed but the rest indexed,
+                # so the lines matter as much as the code -- the page shows both.
+                self.error = self.lines[-1] if self.lines else f"exited {proc.returncode}"
+        except Exception as err:
+            self.error = str(err)
+        finally:
+            with self.lock:
+                self.running, self.proc = False, None
+
+    def state(self) -> dict:
+        with self.lock:
+            return {"n": self.n, "kind": self.kind, "running": self.running,
+                    "lines": list(self.lines), "result": self.result, "error": self.error}
+
+
 DEFAULT_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "media-picker"
 TEMPLATE = Path(__file__).resolve().parent / "media-picker.html"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif", ".bmp"}
@@ -108,6 +176,7 @@ def index_cmd(args: IndexArgs) -> None:
 
     sources = load_sources(out)
     wanted = resolve_sources(args.sources, sources, out)
+    save_settings(out, args)
 
     known = {e["id"]: e for e in previous(out)}
     entries: list[dict] = []
@@ -134,7 +203,7 @@ def index_cmd(args: IndexArgs) -> None:
 
     entries += [e for e in known.values() if e["label"] not in wanted]
     entries.sort(key=lambda e: e["ts"], reverse=True)
-    (out / "manifest.json").write_text(json.dumps(entries))
+    write_manifest(out, entries)
     build_page(out, entries)
     prune_thumbs(out, entries)
     total = sum(f.stat().st_size for f in (out / "thumbs").iterdir())
@@ -205,6 +274,22 @@ def split_host(target: str) -> tuple[str, str]:
     return ("", target) if not sep or "/" in host else (host, rest)
 
 
+SETTINGS_FILE = "settings.json"
+
+
+def load_settings(out: Path) -> dict:
+    """The thumbnail settings this directory holds, so a later index matches them."""
+    try:
+        return json.loads((out / SETTINGS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(out: Path, args: "IndexArgs") -> None:
+    (out / SETTINGS_FILE).write_text(json.dumps(
+        {"size": args.size, "quality": args.quality, "min_bytes": args.min_bytes}, indent=2))
+
+
 def load_sources(out: Path) -> dict[str, dict]:
     """The sources this directory remembers, so a path is only ever typed once."""
     try:
@@ -232,6 +317,13 @@ def source_files(src: dict, args: IndexArgs) -> list[Path]:
         p for p in candidates
         if p.suffix.lower() in SUFFIXES and p.is_file() and p.stat().st_size >= args.min_bytes
     ]
+
+
+def write_manifest(out: Path, entries: list[dict]) -> None:
+    """Replace the manifest in one step, so a reader never sees half of one."""
+    tmp = out / "manifest.json.tmp"
+    tmp.write_text(json.dumps(entries))
+    os.replace(tmp, out / "manifest.json")
 
 
 def previous(out: Path) -> list[dict]:
@@ -540,7 +632,7 @@ def forget_source(out: Path, sources: dict[str, dict], label: str) -> None:
     del sources[label]
     save_sources(out, sources)
     entries = [e for e in previous(out) if e["label"] != label]
-    (out / "manifest.json").write_text(json.dumps(entries))
+    write_manifest(out, entries)
     build_page(out, entries)
     prune_thumbs(out, entries)
     print(f"media-picker: dropped '{label}'; {len(entries)} files remain")
@@ -574,7 +666,10 @@ def scan_cmd(args: ScanArgs) -> None:
 
     JSON schema (--json):
 
-        [{"path": "str", "files": 0, "bytes": 0}]
+        [{"path": "str", "target": "str", "files": 0, "bytes": 0}]
+
+    `target` is what `index` takes: the path, prefixed with the host when the
+    tree is on another machine.
     """
     host, root = split_host(args.target)
 
@@ -591,7 +686,8 @@ def scan_cmd(args: ScanArgs) -> None:
     rows = []
     for line in found.stdout.splitlines():
         count, size, path = line.split("\t", 2)
-        rows.append({"path": path, "files": int(count), "bytes": int(size)})
+        rows.append({"path": path, "target": f"{host}:{path}" if host else path,
+                     "files": int(count), "bytes": int(size)})
     rows.sort(key=lambda r: r["files"], reverse=True)
 
     if args.json:
@@ -733,6 +829,8 @@ def bind_server(root: Path):
              ".3gp": "video/3gpp", ".mpg": "video/mpeg", ".mpeg": "video/mpeg"}
     # id → source, so /orig can only ever reach a file this index already knows
     sources = {e["id"]: e for e in json.loads((root / "manifest.json").read_text())}
+    job = Job()
+    self_path = str(Path(__file__).resolve())
 
     class Handler(BaseHTTPRequestHandler):
         # Keep-alive, so seeking a video costs one connection rather than one per
@@ -752,6 +850,9 @@ def bind_server(root: Path):
                 return
             if path.startswith("/orig/"):
                 self.send_original(path[len("/orig/"):])
+                return
+            if path == "/api/state":
+                self.reply(200, json.dumps(api_state(root, job)).encode(), types[".json"])
                 return
             target = self.resolve(path)
             if target is None or not target.is_file():
@@ -807,19 +908,35 @@ def bind_server(root: Path):
                 self.close_connection = True
 
         def do_POST(self):
-            """Save the selection. The page is the only writer and picks.json the only target."""
+            """The page's three writes: the selection, and starting or shaping a job."""
             self.server.last_request = time.monotonic()
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if not local_request(self) or self.path != "/picks.json" \
+            allowed = ("/picks.json", "/api/index", "/api/scan", "/api/forget", "/api/cancel")
+            declared = self.headers.get("Content-Length")
+            if not local_request(self) or self.path not in allowed or declared is None \
                     or self.headers.get("Origin") not in (None, own_origin):
                 self.close_connection = True   # the unread body is not the next request
                 self.reply(403, b"forbidden", "text/plain")
                 return
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            if not write_picks(root / "picks.json", body):
-                self.reply(400, b"bad selection", "text/plain")
+            body = self.rfile.read(int(declared))
+
+            if self.path == "/picks.json":
+                if not write_picks(root / "picks.json", body):
+                    self.reply(400, b"bad selection", "text/plain")
+                    return
+                self.reply(204, b"", "text/plain")
                 return
-            self.reply(204, b"", "text/plain")
+
+            try:
+                ask = json.loads(body or b"{}")
+                if not isinstance(ask, dict):
+                    raise ValueError("a request is an object")
+                ok, why, n = start_job(self.path, ask, job, root, self_path)
+            except (ValueError, TypeError) as err:
+                self.reply(400, json.dumps({"ok": False, "why": str(err)}).encode(), types[".json"])
+                return
+            self.reply(200 if ok else 409,
+                       json.dumps({"ok": ok, "why": why, "n": n}).encode(), types[".json"])
 
         def resolve(self, path: str) -> Path | None:
             """The file a request names, or None when it points outside the served directory."""
@@ -839,6 +956,109 @@ def bind_server(root: Path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.last_request = time.monotonic()
     return server
+
+
+def api_state(root: Path, job: Job) -> dict:
+    """Everything the sources panel draws itself from.
+
+    The counts are cached against the manifest's mtime: the page polls this
+    while an index has the machine busy, and the manifest is megabytes.
+    """
+    counts = source_counts(root)
+    sources = [
+        {"label": label, "host": src.get("host", ""),
+         "root": src.get("root") or src.get("list_file", ""),
+         "kind": "tree" if src.get("root") else "list",
+         "files": counts.get(label, 0)}
+        for label, src in sorted(load_sources(root).items())
+    ]
+    return {"sources": sources, "job": job.state()}
+
+
+LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+_counts: tuple[float, dict[str, int]] = (0.0, {})
+
+
+def source_counts(root: Path) -> dict[str, int]:
+    """How many files each source has, re-read only when the manifest changes."""
+    global _counts
+    try:
+        stamp = (root / "manifest.json").stat().st_mtime
+    except OSError:
+        return {}
+    if stamp != _counts[0]:
+        counts: dict[str, int] = {}
+        for e in previous(root):
+            counts[e["label"]] = counts.get(e["label"], 0) + 1
+        _counts = (stamp, counts)
+    return _counts[1]
+
+
+def start_job(path: str, ask: dict, job: Job, root: Path, self_path: str) -> tuple[bool, str, int]:
+    """Turn a request from the page into the command it asked for.
+
+    Every job is this same script run again, so the page can only ask for what
+    the command line already does. Raises ValueError on a request that does not
+    describe one.
+    """
+    if path == "/api/cancel":
+        stopped = job.cancel()
+        return stopped, "" if stopped else "nothing is running", 0
+
+    if path == "/api/forget":
+        label = str(ask.get("label", "")).strip()
+        if not LABEL.fullmatch(label):
+            raise ValueError("no such source")
+        argv = [self_path, "sources", "--dir", str(root), "--forget", label]
+        return started(job, "forget", argv)
+
+    if path == "/api/scan":
+        target = str(ask.get("target", "")).strip()
+        if not target:
+            raise ValueError("no path to scan")
+        try:
+            min_files = int(ask.get("min_files") or 30)
+        except (TypeError, ValueError):
+            raise ValueError("the fewest files is a number")
+        argv = [self_path, "scan", target, "--min-files", str(min_files), "--json"]
+        return started(job, "scan", argv, parse=parse_scan)
+
+    label, target = str(ask.get("label", "")).strip(), str(ask.get("target", "")).strip()
+    if label and not LABEL.fullmatch(label):
+        raise ValueError("a label is letters, digits, dot, dash and underscore")
+    if target and not label:
+        raise ValueError("a folder needs a name")
+    spec = [f"{label}={target}"] if target else ([label] if label else [])
+    return started(job, "index", [self_path, "index", *spec, "--dir", str(root),
+                                  *index_args(root, label)])
+
+
+def started(job: Job, kind: str, argv: list[str], parse=None) -> tuple[bool, str, int]:
+    n = job.start(kind, argv, parse=parse)
+    return bool(n), "" if n else "something else is running", n
+
+
+def index_args(root: Path, label: str) -> list[str]:
+    """The thumbnailing settings this directory was built with.
+
+    A re-index at the defaults would drop every file an archive indexed at a
+    smaller --min-bytes had kept, and prune their thumbnails after it.
+    """
+    settings = load_settings(root)
+    return [f"--{k.replace('_', '-')}={v}" for k, v in sorted(settings.items())]
+
+
+def parse_scan(lines: list[str]) -> list[dict]:
+    """What `scan --json` reported, as rows the page can list."""
+    blob = "\n".join(lines)
+    start = blob.find("[")
+    try:
+        found = json.loads(blob[start:]) if start >= 0 else []
+    except ValueError:
+        return []
+    return [{"files": f["files"], "gb": round(f["bytes"] / 1e9, 1), "target": f["target"]} for f in found]
 
 
 def ssh(host: str, command: str) -> list[str]:
