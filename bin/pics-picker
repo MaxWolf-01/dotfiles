@@ -22,7 +22,7 @@ Examples:
 
     pics-picker index camera=pc:~/data/phone/DCIM/Camera irl=~/Pictures/irl_pictures
     pics-picker serve --open
-    pics-picker fetch --out ~/Pictures/candidates
+    pics-picker fetch ~/Pictures/candidates
 """
 
 import hashlib
@@ -84,28 +84,55 @@ def index_cmd(args: IndexArgs) -> None:
     out = Path(args.dir).expanduser()
     (out / "thumbs").mkdir(parents=True, exist_ok=True)
 
+    known = {e["id"]: e for e in previous(out)}
     entries: list[dict] = []
+    fresh: set[str] = set()
     for spec in args.sources:
         label, _, target = spec.partition("=")
         if not target:
             sys.exit(f"pics-picker: '{spec}' is not LABEL=PATH or LABEL=HOST:PATH")
-        host, _, path = target.rpartition(":") if ":" in target else ("", "", target)
+        host, _, path = target.partition(":") if ":" in target else ("", "", target)
+        fresh.add(label)
         entries += (
             remote_thumbs(host, path, label, out, args)
             if host
-            else local_thumbs(Path(path).expanduser(), label, out / "thumbs", args)
+            else local_thumbs(Path(path).expanduser(), label, out / "thumbs", args, known)
         )
 
+    entries += [e for e in known.values() if e["label"] not in fresh]
     entries.sort(key=lambda e: e["ts"], reverse=True)
     (out / "manifest.json").write_text(json.dumps(entries))
     build_page(out, entries)
+    prune_thumbs(out, entries)
     total = sum(f.stat().st_size for f in (out / "thumbs").iterdir())
     print(f"pics-picker: {len(entries)} images, {total / 1e6:.0f} MB of thumbnails in {out}")
     print("pics-picker: now run `pics-picker serve --open`")
 
 
-def local_thumbs(root: Path, label: str, thumb_dir: Path, args: IndexArgs) -> list[dict]:
-    """Thumbnail a tree on this machine, returning one manifest entry per image."""
+def previous(out: Path) -> list[dict]:
+    """What this directory already held. Sources not named this time survive re-indexing."""
+    try:
+        return json.loads((out / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def prune_thumbs(out: Path, entries: list[dict]) -> None:
+    """Drop thumbnails no manifest entry claims, left by a source that has since shrunk."""
+    keep = {e["id"] for e in entries}
+    for f in (out / "thumbs").iterdir():
+        if f.stem not in keep:
+            f.unlink()
+
+
+def local_thumbs(root: Path, label: str, thumb_dir: Path, args: IndexArgs,
+                 known: dict[str, dict]) -> list[dict]:
+    """Thumbnail a tree on this machine, returning one manifest entry per image.
+
+    An image already described in `known`, whose thumbnail is still on disk, is
+    taken from there. Without that a re-index re-reads every original for its
+    EXIF and dimensions, which on a large archive is the whole archive again.
+    """
     if not root.is_dir():
         sys.exit(f"pics-picker: {root} is not a directory")
     thumb_dir.mkdir(parents=True, exist_ok=True)
@@ -113,19 +140,28 @@ def local_thumbs(root: Path, label: str, thumb_dir: Path, args: IndexArgs) -> li
         p for p in root.rglob("*")
         if p.suffix.lower() in SUFFIXES and p.is_file() and p.stat().st_size >= args.min_bytes
     ]
-    jobs = args.jobs or os.cpu_count() or 4
-    work = [(str(p), str(thumb_dir / f"{thumb_id(label, root, p)}.jpg"), args.size, args.quality) for p in files]
-    entries = []
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
-        for i, result in enumerate(pool.map(make_thumb, work, chunksize=32), 1):
-            if result is None:
-                continue
-            result["label"] = label
-            result["root"] = str(root)
-            entries.append(result)
-            if i % 500 == 0:
-                print(f"  {label}: {i}/{len(files)}", file=sys.stderr)
-    print(f"  {label}: {len(entries)} images", file=sys.stderr)
+
+    entries, work = [], []
+    for p in files:
+        tid = thumb_id(label, root, p)
+        cached = known.get(tid)
+        if cached is not None and (thumb_dir / f"{tid}.jpg").exists():
+            entries.append(cached)
+        else:
+            work.append((str(p), str(thumb_dir / f"{tid}.jpg"), args.size, args.quality))
+
+    if work:
+        jobs = args.jobs or os.cpu_count() or 4
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            for i, result in enumerate(pool.map(make_thumb, work, chunksize=32), 1):
+                if result is None:
+                    continue
+                result["label"] = label
+                result["root"] = str(root)
+                entries.append(result)
+                if i % 500 == 0:
+                    print(f"  {label}: {i}/{len(work)}", file=sys.stderr)
+    print(f"  {label}: {len(entries)} images ({len(work)} new)", file=sys.stderr)
     return entries
 
 
@@ -202,6 +238,8 @@ def remote_thumbs(host: str, path: str, label: str, out: Path, args: IndexArgs) 
     scratch directory, so the remote needs nothing but uv and ssh.
     """
     print(f"  {label}: thumbnailing on {host}", file=sys.stderr)
+    # Left in place deliberately: it holds that host's thumbnails, which is what
+    # makes a re-index cheap. /tmp clears it whenever the host reboots.
     scratch = f"/tmp/pics-picker-{label}"
     self_path = Path(__file__).resolve()
     run(["rsync", "-a", str(self_path), str(TEMPLATE), f"{host}:/tmp/"])
@@ -232,14 +270,18 @@ def run(cmd: list[str]) -> None:
         sys.exit(f"pics-picker: {cmd[0]} failed (exit {result.returncode}): {shlex.join(cmd)}")
 
 
+def inline(data) -> str:
+    """JSON safe to embed in a script element -- a filename may contain `</script>`."""
+    return json.dumps(data, separators=(",", ":")).replace("</", "<\\/").replace("<!--", "<\\u0021--")
+
+
 def build_page(out: Path, entries: list[dict]) -> None:
     """Write the contact sheet, with the manifest inlined so it loads as one file."""
     if not TEMPLATE.exists():
         sys.exit(f"pics-picker: template missing at {TEMPLATE}")
     labels = sorted({e["label"] for e in entries})
     page = TEMPLATE.read_text()
-    page = page.replace("/*MANIFEST*/null", json.dumps(entries, separators=(",", ":")))
-    page = page.replace("/*LABELS*/null", json.dumps(labels))
+    page = page.replace("/*MANIFEST*/null", inline(entries)).replace("/*LABELS*/null", inline(labels))
     (out / "picks.html").write_text(page)
 
 
@@ -278,9 +320,11 @@ def start_server(root: Path) -> int:
     server = bind_server(root)
     port = server.server_address[1]
     marker = root / SERVE_MARKER
-    if os.fork():
-        # written by the parent, so the marker exists the moment this returns
-        marker.write_text(json.dumps({"port": port, "pid": os.getpid()}))
+    pid = os.fork()
+    if pid:
+        # written by the parent, so the marker exists the moment this returns,
+        # and it names the child -- the parent is about to be gone
+        marker.write_text(json.dumps({"port": port, "pid": pid, "root": str(root)}))
         return port
 
     os.setsid()
@@ -296,8 +340,23 @@ def start_server(root: Path) -> int:
     try:
         stop.wait()
     finally:
-        marker.unlink(missing_ok=True)
+        release_marker(marker, os.getpid())
     os._exit(0)
+
+
+def release_marker(marker: Path, pid: int) -> None:
+    """Clear the marker only while it still names this server.
+
+    Two serves racing on one directory both bind and both write; the loser
+    exiting must not strand the winner behind a missing marker, which reads
+    as nothing serving.
+    """
+    try:
+        if json.loads(marker.read_text())["pid"] != pid:
+            return
+    except (OSError, ValueError, KeyError):
+        return
+    marker.unlink(missing_ok=True)
 
 
 def already_serving(root: Path) -> int | None:
@@ -334,6 +393,9 @@ def bind_server(root: Path):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.server.last_request = time.monotonic()
+            if not local_request(self):
+                self.reply(403, b"forbidden", "text/plain")
+                return
             path = self.path.split("?")[0]
             if path == "/.health":
                 self.reply(200, json.dumps({"root": str(root)}).encode(), types[".json"])
@@ -375,18 +437,16 @@ def bind_server(root: Path):
             """Save the selection. The page is the only writer and picks.json the only target."""
             self.server.last_request = time.monotonic()
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+            if not local_request(self):
+                self.reply(403, b"forbidden", "text/plain")
+                return
             if self.path != "/picks.json" or self.headers.get("Origin") not in (None, own_origin):
                 self.reply(403, b"forbidden", "text/plain")
                 return
             body = self.rfile.read(int(self.headers["Content-Length"]))
-            try:
-                picked = json.loads(body)
-                if not isinstance(picked, list):
-                    raise ValueError
-            except ValueError:
+            if not write_picks(root / "picks.json", body):
                 self.reply(400, b"bad selection", "text/plain")
                 return
-            (root / "picks.json").write_bytes(body)
             self.reply(204, b"", "text/plain")
 
         def resolve(self, path: str) -> Path | None:
@@ -409,6 +469,30 @@ def bind_server(root: Path):
     return server
 
 
+def local_request(handler) -> bool:
+    """Binding to loopback stops remote sockets, not a web page that points a name at 127.0.0.1."""
+    host = (handler.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+    return host in ("127.0.0.1", "localhost", "::1", "")
+
+
+def write_picks(target: Path, raw: bytes) -> bool:
+    """Store the selection atomically. False when the payload is unusable.
+
+    A partial write would read back as an empty selection, and the next mark
+    would post over what was left -- an hour of marking gone with no error.
+    """
+    try:
+        picked = json.loads(raw)
+        if not isinstance(picked, list):
+            raise ValueError("a selection is a list of ids")
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(picked))
+        os.replace(tmp, target)
+        return True
+    except (ValueError, OSError, TypeError):
+        return False
+
+
 # ---------------------------------------------------------------- fetch
 
 @dataclass
@@ -419,6 +503,26 @@ class FetchArgs:
     """The indexed directory holding the selection."""
     prefix: bool = True
     """Prefix each copied file with its source label, so a camera photo and a WhatsApp one with the same name do not collide."""
+
+
+def unique_names(entries: list[dict], prefix: bool) -> dict[str, str]:
+    """One output filename per entry, none of them equal.
+
+    Archives repeat basenames freely -- WhatsApp's Images/ and Images/Sent/ hold
+    the same names -- and copying both under one name loses a photo the page
+    said was picked.
+    """
+    names: dict[str, str] = {}
+    taken: set[str] = set()
+    for e in entries:
+        stem = f"{e['label']}-{e['name']}" if prefix else e["name"]
+        name, n = stem, 1
+        while name in taken:
+            n += 1
+            name = f"{Path(stem).stem}-{n}{Path(stem).suffix}"
+        taken.add(name)
+        names[e["id"]] = name
+    return names
 
 
 @app.command(name="fetch")
@@ -444,23 +548,24 @@ def fetch_cmd(args: FetchArgs) -> None:
     for e in entries:
         by_host.setdefault(e.get("host", ""), []).append(e)
 
+    names = unique_names(entries, args.prefix)
     for host, group in by_host.items():
-        names = {e["path"]: (f"{e['label']}-{e['name']}" if args.prefix else e["name"]) for e in group}
+        paths = {e["path"]: names[e["id"]] for e in group}
         if not host:
-            for src, name in names.items():
+            for src, name in paths.items():
                 shutil.copy2(src, out / name)
             continue
         # --files-from implies --relative, so each file lands under its own source
         # path in the staging tree. That is what keeps two photos with the same
         # basename from overwriting each other on the way here.
-        listing = "\n".join(p.lstrip("/") for p in names) + "\n"
+        listing = "\n".join(p.lstrip("/") for p in paths) + "\n"
         staging = out / f".staging-{host}"
         staging.mkdir(exist_ok=True)
         subprocess.run(
             ["rsync", "-a", "--files-from=-", f"{host}:/", str(staging)],
             input=listing, text=True, check=True,
         )
-        for src, name in names.items():
+        for src, name in paths.items():
             staged = staging / src.lstrip("/")
             if staged.exists():
                 staged.rename(out / name)
