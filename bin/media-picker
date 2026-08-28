@@ -66,6 +66,59 @@ app = SubcommandApp()
 class SourceUnreachable(Exception):
     """A source could not be read this run. The others still can be."""
 
+
+class Job:
+    """The one long task the page can start, and its output while it runs.
+
+    index and scan take minutes, which is longer than a request should hold a
+    connection open. The page starts one and then asks how it is going.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.kind = ""
+        self.running = False
+        self.lines: list[str] = []
+        self.result: list | None = None
+        self.error = ""
+
+    def start(self, kind: str, argv: list[str], parse=None) -> bool:
+        """Begin a job, unless one is already going. False when one is."""
+        with self.lock:
+            if self.running:
+                return False
+            self.kind, self.running = kind, True
+            self.lines, self.result, self.error = [], None, ""
+        threading.Thread(target=self._run, args=(argv, parse), daemon=True).start()
+        return True
+
+    def _run(self, argv: list[str], parse) -> None:
+        try:
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            for line in proc.stdout:
+                with self.lock:
+                    self.lines.append(line.rstrip())
+                    del self.lines[:-200]        # the page shows the tail, not the history
+            proc.wait()
+            if parse is not None:
+                self.result = parse(self.lines)
+            if proc.returncode:
+                # index exits nonzero when a source failed but the rest indexed,
+                # so the lines matter as much as the code -- the page shows both.
+                self.error = self.lines[-1] if self.lines else f"exited {proc.returncode}"
+        except Exception as err:
+            self.error = str(err)
+        finally:
+            with self.lock:
+                self.running = False
+
+    def state(self) -> dict:
+        with self.lock:
+            return {"kind": self.kind, "running": self.running, "lines": list(self.lines),
+                    "result": self.result, "error": self.error}
+
+
 DEFAULT_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "media-picker"
 TEMPLATE = Path(__file__).resolve().parent / "media-picker.html"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif", ".bmp"}
@@ -733,6 +786,8 @@ def bind_server(root: Path):
              ".3gp": "video/3gpp", ".mpg": "video/mpeg", ".mpeg": "video/mpeg"}
     # id → source, so /orig can only ever reach a file this index already knows
     sources = {e["id"]: e for e in json.loads((root / "manifest.json").read_text())}
+    job = Job()
+    self_path = str(Path(__file__).resolve())
 
     class Handler(BaseHTTPRequestHandler):
         # Keep-alive, so seeking a video costs one connection rather than one per
@@ -752,6 +807,9 @@ def bind_server(root: Path):
                 return
             if path.startswith("/orig/"):
                 self.send_original(path[len("/orig/"):])
+                return
+            if path == "/api/state":
+                self.reply(200, json.dumps(api_state(root, job)).encode(), types[".json"])
                 return
             target = self.resolve(path)
             if target is None or not target.is_file():
@@ -807,19 +865,31 @@ def bind_server(root: Path):
                 self.close_connection = True
 
         def do_POST(self):
-            """Save the selection. The page is the only writer and picks.json the only target."""
+            """The page's three writes: the selection, and starting or shaping a job."""
             self.server.last_request = time.monotonic()
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if not local_request(self) or self.path != "/picks.json" \
+            allowed = ("/picks.json", "/api/index", "/api/scan", "/api/forget")
+            if not local_request(self) or self.path not in allowed \
                     or self.headers.get("Origin") not in (None, own_origin):
                 self.close_connection = True   # the unread body is not the next request
                 self.reply(403, b"forbidden", "text/plain")
                 return
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            if not write_picks(root / "picks.json", body):
-                self.reply(400, b"bad selection", "text/plain")
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+            if self.path == "/picks.json":
+                if not write_picks(root / "picks.json", body):
+                    self.reply(400, b"bad selection", "text/plain")
+                    return
+                self.reply(204, b"", "text/plain")
                 return
-            self.reply(204, b"", "text/plain")
+
+            try:
+                ask = json.loads(body or b"{}")
+            except ValueError:
+                self.reply(400, b"bad request", "text/plain")
+                return
+            ok, why = start_job(self.path, ask, job, root, self_path)
+            self.reply(200 if ok else 409, json.dumps({"ok": ok, "why": why}).encode(), types[".json"])
 
         def resolve(self, path: str) -> Path | None:
             """The file a request names, or None when it points outside the served directory."""
@@ -839,6 +909,60 @@ def bind_server(root: Path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.last_request = time.monotonic()
     return server
+
+
+def api_state(root: Path, job: Job) -> dict:
+    """Everything the sources panel draws itself from."""
+    counts: dict[str, int] = {}
+    for e in previous(root):
+        counts[e["label"]] = counts.get(e["label"], 0) + 1
+    sources = [
+        {"label": label, "host": src.get("host", ""),
+         "root": src.get("root") or src.get("list_file", ""),
+         "kind": "tree" if src.get("root") else "list",
+         "files": counts.get(label, 0)}
+        for label, src in sorted(load_sources(root).items())
+    ]
+    return {"sources": sources, "job": job.state()}
+
+
+def start_job(path: str, ask: dict, job: Job, root: Path, self_path: str) -> tuple[bool, str]:
+    """Turn a request from the page into the command it asked for.
+
+    Every job is this same script run again, so the page can only ask for what
+    the command line already does.
+    """
+    if path == "/api/forget":
+        label = str(ask.get("label", ""))
+        if not label:
+            return False, "no label"
+        started = job.start("forget", [self_path, "sources", "--dir", str(root), "--forget", label])
+        return started, "" if started else "something else is running"
+
+    if path == "/api/scan":
+        target = str(ask.get("target", "")).strip()
+        if not target:
+            return False, "no path to scan"
+        argv = [self_path, "scan", target, "--min-files", str(int(ask.get("min_files", 30)))]
+        started = job.start("scan", argv, parse=parse_scan)
+        return started, "" if started else "something else is running"
+
+    label, target = str(ask.get("label", "")).strip(), str(ask.get("target", "")).strip()
+    if label and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", label):
+        return False, "a label is letters, digits, dot, dash and underscore"
+    spec = [f"{label}={target}"] if target else ([label] if label else [])
+    started = job.start("index", [self_path, "index", *spec, "--dir", str(root)])
+    return started, "" if started else "something else is running"
+
+
+def parse_scan(lines: list[str]) -> list[dict]:
+    """The rows `scan` printed, back as data the page can list."""
+    found = []
+    for line in lines:
+        m = re.fullmatch(r"\s*(\d+)\s+([\d.]+) GB\s+(.+)", line)
+        if m:
+            found.append({"files": int(m.group(1)), "gb": float(m.group(2)), "target": m.group(3)})
+    return found
 
 
 def ssh(host: str, command: str) -> list[str]:
