@@ -52,7 +52,7 @@ import threading
 import time
 import urllib.request
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -62,6 +62,10 @@ from tyro.extras import SubcommandApp
 
 app = SubcommandApp()
 
+
+class SourceUnreachable(Exception):
+    """A source could not be read this run. The others still can be."""
+
 DEFAULT_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "media-picker"
 TEMPLATE = Path(__file__).resolve().parent / "media-picker.html"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif", ".bmp"}
@@ -70,13 +74,14 @@ SUFFIXES = IMAGE_SUFFIXES | VIDEO_SUFFIXES
 IDLE_EXIT_SECONDS = 30 * 60
 SERVE_MARKER = ".serve.json"
 SOURCES_FILE = "sources.json"
+SSH_CONTROL = "/tmp/mp-ssh-%r@%h-%p"   # short: a unix socket path caps out around 100 bytes
 
 
 # ---------------------------------------------------------------- index
 
 @dataclass
 class IndexArgs:
-    sources: Annotated[list[str], tyro.conf.Positional] = ()
+    sources: Annotated[list[str], tyro.conf.Positional] = field(default_factory=list)
     """Sources to index. A bare LABEL re-indexes a source already in this directory; LABEL=TARGET defines or redefines one (see the forms above). Nothing at all re-indexes every source there is."""
     dir: str = str(DEFAULT_DIR)
     """Where thumbnails, the manifest and the page are written. Indexing the same directory again keeps thumbnails that are already there and keeps the current selection."""
@@ -103,17 +108,29 @@ def index_cmd(args: IndexArgs) -> None:
 
     sources = load_sources(out)
     wanted = resolve_sources(args.sources, sources, out)
-    sources.update(wanted)
-    save_sources(out, sources)
 
     known = {e["id"]: e for e in previous(out)}
     entries: list[dict] = []
+    failed: list[str] = []
     for label, src in wanted.items():
-        entries += (
-            remote_thumbs(label, src, out, args)
-            if src["host"]
-            else local_thumbs(label, src, out / "thumbs", args, known)
-        )
+        try:
+            entries += (
+                remote_thumbs(label, src, out, args)
+                if src["host"]
+                else local_thumbs(label, src, out / "thumbs", args, known)
+            )
+        except SourceUnreachable as err:
+            # An away laptop must not cost the sources that did answer, nor the
+            # entries this one had from last time -- so it keeps its old ones and
+            # the run carries on.
+            print(f"  {label}: {err}", file=sys.stderr)
+            failed.append(label)
+            entries += [e for e in known.values() if e["label"] == label]
+            continue
+        # Remembered only once it has worked: a typo'd path that was saved on
+        # sight would join every later `index` run with no way to drop it.
+        sources[label] = src
+    save_sources(out, sources)
 
     entries += [e for e in known.values() if e["label"] not in wanted]
     entries.sort(key=lambda e: e["ts"], reverse=True)
@@ -122,6 +139,8 @@ def index_cmd(args: IndexArgs) -> None:
     prune_thumbs(out, entries)
     total = sum(f.stat().st_size for f in (out / "thumbs").iterdir())
     print(f"media-picker: {len(entries)} files, {total / 1e6:.0f} MB of thumbnails in {out}")
+    if failed:
+        sys.exit(f"media-picker: {', '.join(failed)} could not be reached; the rest is indexed")
     print("media-picker: now run `media-picker serve --open`")
 
 
@@ -150,15 +169,21 @@ def resolve_sources(specs: list[str], remembered: dict[str, dict], out: Path) ->
     return wanted
 
 
+stdin_taken = ""
+
+
 def parse_target(target: str, label: str) -> dict:
     """One source spec as {host, root, paths} -- a tree has a root, a list has paths.
 
-    Reading stdin here rather than at thumbnailing time means several list
-    sources in one command would consume each other's input; that is why only
-    one is allowed to.
+    Only one source per command may read stdin: they would otherwise consume
+    each other's input, and the second would look merely empty.
     """
     host, rest = split_host(target)
     if rest == "-":
+        global stdin_taken
+        if stdin_taken:
+            sys.exit(f"media-picker: only one source can read stdin, and '{stdin_taken}' already does")
+        stdin_taken = label
         if sys.stdin.isatty():
             sys.exit(f"media-picker: '{label}=-' reads paths from stdin, and stdin is a terminal")
         paths = [ln.strip() for ln in sys.stdin if ln.strip()]
@@ -201,7 +226,7 @@ def source_files(src: dict, args: IndexArgs) -> list[Path]:
     else:
         root = Path(src["root"]).expanduser()
         if not root.is_dir():
-            sys.exit(f"media-picker: {root} is not a directory")
+            raise SourceUnreachable(f"{root} is not a directory")
         candidates = root.rglob("*")
     return [
         p for p in candidates
@@ -267,10 +292,7 @@ def thumb_id(label: str, src: dict, path: Path) -> str:
     source has no root to be relative to, so it keys on the path itself.
     """
     root = src.get("root")
-    try:
-        key = str(path.relative_to(Path(root).expanduser())) if root else str(path)
-    except ValueError:
-        key = str(path)
+    key = str(path.relative_to(Path(root).expanduser())) if root else str(path)
     return hashlib.sha1(f"{label}\0{key}".encode()).hexdigest()[:20]
 
 
@@ -393,17 +415,22 @@ def remote_thumbs(label: str, src: dict, out: Path, args: IndexArgs) -> list[dic
     # makes a re-index cheap. /tmp clears it whenever the host reboots.
     scratch = f"/tmp/media-picker-{label}"
     self_path = Path(__file__).resolve()
-    run(["rsync", "-a", str(self_path), str(TEMPLATE), f"{host}:/tmp/"])
+    rsh = ["-e", f"ssh -o ControlMaster=auto -o ControlPath={SSH_CONTROL} -o ControlPersist=60"]
+    run(["rsync", "-a", *rsh, str(self_path), str(TEMPLATE), f"{host}:/tmp/"])
 
     # A list source was read here, so the far side is handed the paths in a file
     # rather than a directory to walk.
     if src.get("paths"):
         listing = f"/tmp/media-picker-{label}.paths"
-        subprocess.run(["ssh", host, f"cat > {shlex.quote(listing)}"],
-                       input="\n".join(src["paths"]), text=True, check=True)
+        sent = subprocess.run(ssh(host, f"cat > {shlex.quote(listing)}"),
+                              input="\n".join(src["paths"]), text=True)
+        if sent.returncode:
+            raise SourceUnreachable(f"could not hand {host} the list of paths")
         target = f"@{listing}"
+    elif src.get("list_file"):
+        target = f"@{src['list_file']}"
     else:
-        target = src.get("list_file", "") and f"@{src['list_file']}" or src["root"]
+        target = src["root"]
 
     remote = shlex.join([
         "uv", "run", "--script", "--quiet", f"/tmp/{self_path.name}", "index",
@@ -411,24 +438,24 @@ def remote_thumbs(label: str, src: dict, out: Path, args: IndexArgs) -> list[dic
         "--size", str(args.size), "--quality", str(args.quality),
         "--min-bytes", str(args.min_bytes), "--jobs", str(args.jobs),
     ])
-    run(["ssh", host, remote])
-    run(["rsync", "-a", f"{host}:{scratch}/thumbs/", str(out / "thumbs/")])
+    run(ssh(host, remote))
+    run(["rsync", "-a", *rsh, f"{host}:{scratch}/thumbs/", str(out / "thumbs/")])
 
-    manifest = subprocess.run(
-        ["ssh", host, f"cat {shlex.quote(scratch)}/manifest.json"],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    entries = json.loads(manifest)
+    manifest = subprocess.run(ssh(host, f"cat {shlex.quote(scratch)}/manifest.json"),
+                              capture_output=True, text=True)
+    if manifest.returncode:
+        raise SourceUnreachable(f"{host} produced no manifest")
+    entries = json.loads(manifest.stdout)
     for e in entries:
         e["host"] = host
     return entries
 
 
 def run(cmd: list[str]) -> None:
-    """Run a command, failing loudly with what it was trying to do."""
+    """Run a command as part of reaching a source, saying what it was trying to do."""
     result = subprocess.run(cmd)
     if result.returncode:
-        sys.exit(f"media-picker: {cmd[0]} failed (exit {result.returncode}): {shlex.join(cmd)}")
+        raise SourceUnreachable(f"{cmd[0]} failed (exit {result.returncode}): {shlex.join(cmd)}")
 
 
 def inline(data) -> str:
@@ -452,13 +479,15 @@ def build_page(out: Path, entries: list[dict]) -> None:
 class SourcesArgs:
     dir: str = str(DEFAULT_DIR)
     """The indexed directory to report on."""
+    forget: str = ""
+    """Drop this source: its files leave the page and its thumbnails leave the disk. The originals are not touched."""
     json: bool = False
     """Emit JSON to stdout. Pipe to jq for filtering."""
 
 
 @app.command(name="sources")
 def sources_cmd(args: SourcesArgs) -> None:
-    """List the sources this directory remembers.
+    """List the sources this directory remembers, or drop one.
 
     These are the names `index` takes. Each was defined once with a path and
     is addressable by label ever after.
@@ -472,6 +501,9 @@ def sources_cmd(args: SourcesArgs) -> None:
     sources = load_sources(out)
     if not sources:
         sys.exit(f"media-picker: no sources in {out} yet")
+    if args.forget:
+        forget_source(out, sources, args.forget)
+        return
 
     counts, newest = {}, {}
     for e in previous(out):
@@ -499,6 +531,19 @@ def sources_cmd(args: SourcesArgs) -> None:
         else:
             where = f"{r['host']}:{r['root']}" if r["host"] else r["root"]
         print(f"{r['label']:<{width}}  {r['files']:>6}  {r['newest'] or '-':<10}  {where}")
+
+
+def forget_source(out: Path, sources: dict[str, dict], label: str) -> None:
+    """Drop a source and everything the page held for it."""
+    if label not in sources:
+        sys.exit(f"media-picker: no source called '{label}'")
+    del sources[label]
+    save_sources(out, sources)
+    entries = [e for e in previous(out) if e["label"] != label]
+    (out / "manifest.json").write_text(json.dumps(entries))
+    build_page(out, entries)
+    prune_thumbs(out, entries)
+    print(f"media-picker: dropped '{label}'; {len(entries)} files remain")
 
 
 def stamp(ts: int) -> str:
@@ -563,11 +608,7 @@ def scan_cmd(args: ScanArgs) -> None:
 
 
 def shell_path(path: str) -> str:
-    """A path a remote shell will read as written -- quoted, but with ~ still its own.
-
-    shlex.quote alone would hand the far side a literal tilde, and a directory
-    called ~ is not the one anybody means.
-    """
+    """A path a remote shell will read as written -- quoted, but with ~ still its own."""
     if path == "~":
         return '"$HOME"'
     if path.startswith("~/"):
@@ -578,7 +619,9 @@ def shell_path(path: str) -> str:
 # Runs on whichever machine holds the tree, so it is shell rather than Python:
 # the far side is only promised ssh, and this needs to walk 200k files there.
 SCAN_SCRIPT = r"""
-find {root} {prune} -type f -regextype posix-extended -iregex '.*\.({suffixes})' -printf '%h\t%s\n' 2>/dev/null |
+set -o pipefail
+[ -d {root} ] || {{ echo "not a directory: {root}" >&2; exit 2; }}
+find {root} -mindepth 1 {prune} -type f -regextype posix-extended -iregex '.*\.({suffixes})' -printf '%h\t%s\n' 2>/dev/null |
 awk -F'\t' '{{n[$1]++; b[$1]+=$2}} END {{for (d in n) if (n[d] >= {min_files}) printf "%d\t%d\t%s\n", n[d], b[d], d}}'
 """
 
@@ -692,9 +735,10 @@ def bind_server(root: Path):
     sources = {e["id"]: e for e in json.loads((root / "manifest.json").read_text())}
 
     class Handler(BaseHTTPRequestHandler):
-        # Keep-alive, so seeking a video reuses one connection instead of opening
-        # an ssh session per range request. Safe because every reply here sends a
-        # Content-Length.
+        # Keep-alive, so seeking a video costs one connection rather than one per
+        # range request. A reply that cannot deliver the length it promised closes
+        # the connection instead of leaving the client waiting for bytes that are
+        # never coming.
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):
@@ -729,11 +773,14 @@ def bind_server(root: Path):
             if entry is None:
                 self.reply(404, b"not found", "text/plain")
                 return
-            size = entry.get("bytes") or file_size(entry)
+            size = entry.get("bytes") if entry.get("bytes") is not None else file_size(entry)
             if size is None:
                 self.reply(502, b"original unreachable", "text/plain")
                 return
             entry["bytes"] = size
+            if size == 0:
+                self.reply(200, b"", types.get(Path(entry["path"]).suffix.lower(), "application/octet-stream"))
+                return
 
             span = parse_range(self.headers.get("Range"), size)
             if span is None:
@@ -749,20 +796,23 @@ def bind_server(root: Path):
             if self.headers.get("Range"):
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.end_headers()
+            promised, sent = end - start + 1, 0
             try:
                 for chunk in read_span(entry, start, end):
                     self.wfile.write(chunk)
+                    sent += len(chunk)
             except (OSError, BrokenPipeError, subprocess.SubprocessError):
                 pass
+            if sent != promised:
+                self.close_connection = True
 
         def do_POST(self):
             """Save the selection. The page is the only writer and picks.json the only target."""
             self.server.last_request = time.monotonic()
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if not local_request(self):
-                self.reply(403, b"forbidden", "text/plain")
-                return
-            if self.path != "/picks.json" or self.headers.get("Origin") not in (None, own_origin):
+            if not local_request(self) or self.path != "/picks.json" \
+                    or self.headers.get("Origin") not in (None, own_origin):
+                self.close_connection = True   # the unread body is not the next request
                 self.reply(403, b"forbidden", "text/plain")
                 return
             body = self.rfile.read(int(self.headers["Content-Length"]))
@@ -791,11 +841,21 @@ def bind_server(root: Path):
     return server
 
 
+def ssh(host: str, command: str) -> list[str]:
+    """An ssh invocation that shares one connection with the others.
+
+    Seeking a video is a range request each time, and a fresh handshake per
+    seek is most of the wait.
+    """
+    return ["ssh", "-o", "ControlMaster=auto", "-o", f"ControlPath={SSH_CONTROL}",
+            "-o", "ControlPersist=60", host, command]
+
+
 def file_size(entry: dict) -> int | None:
     """How many bytes the original is, asked of whichever machine holds it."""
     try:
         if entry.get("host"):
-            out = subprocess.run(["ssh", entry["host"], "stat", "-c", "%s", shlex.quote(entry["path"])],
+            out = subprocess.run(ssh(entry["host"], f"stat -c %s {shlex.quote(entry['path'])}"),
                                  capture_output=True, text=True, timeout=30, check=True)
             return int(out.stdout.strip())
         return Path(entry["path"]).stat().st_size
@@ -834,10 +894,8 @@ def read_span(entry: dict, start: int, end: int, chunk: int = 1 << 18):
                 length -= len(block)
                 yield block
         return
-    # tail+head rather than dd: no block-size arithmetic to get wrong, and both
-    # are on any machine ssh can reach.
     cmd = f"tail -c +{start + 1} {shlex.quote(entry['path'])} | head -c {length}"
-    proc = subprocess.Popen(["ssh", entry["host"], cmd], stdout=subprocess.PIPE)
+    proc = subprocess.Popen(ssh(entry["host"], cmd), stdout=subprocess.PIPE)
     try:
         while True:
             block = proc.stdout.read(chunk)
