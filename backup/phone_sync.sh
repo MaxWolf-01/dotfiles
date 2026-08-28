@@ -33,9 +33,7 @@ IO_TIMEOUT=180
 # Directories to sync: phone_path → local_subdir
 #
 # WhatsApp keeps its media under Android/media/, outside the shared picture and
-# document trees, so nothing above reaches it. The whole Media directory is one
-# entry rather than a list of its subdirectories: WhatsApp adds new media types
-# over time and they should land here without anyone editing this map.
+# document trees, so nothing above reaches it.
 declare -A DIRS=(
     ["~/storage/dcim"]="DCIM"
     ["~/storage/pictures"]="Pictures"
