@@ -61,7 +61,7 @@ class Args:
     summary: str = ""
     """One plain-English paragraph on what this change is about (shown at the top; inline markdown ok)."""
     auto_summary: bool = True
-    """Generate the summary with a fresh model instance (`claude -p`) that sees only the diff, deliberately blind to whatever conversation produced the change. Ignored when --summary is given; --no-auto-summary skips the model call."""
+    """Generate the summary with a fresh model instance (`claude -p`) that sees only the diff, deliberately blind to whatever conversation produced the change. It runs after the page is written and opened, so the model call never holds the page back: an open page fills the paragraph in when it arrives, and the file is rewritten so a copy shared later carries it too. Ignored when --summary is given; --no-auto-summary skips the model call."""
     summary_model: str = "sonnet"
     """Model for the auto-summary (passed to `claude --model`): sonnet, opus, haiku, or a full model id."""
     title: str = ""
@@ -116,8 +116,8 @@ def build(args: Args, out: Path, summary: str) -> tuple[str, str]:
         sys.exit("diffview: no changes found in any source")
 
     title = args.title or " + ".join(f"{s['label']} {s['detail']}" for s in sources)
-    if not summary and args.auto_summary:
-        summary = generate_summary(sources, args.summary_model)
+    pending = not summary and args.auto_summary
+    body = summary_body(sources) if pending else ""
     for s in sources:
         s.pop("_patch", None)
 
@@ -135,31 +135,58 @@ def build(args: Args, out: Path, summary: str) -> tuple[str, str]:
         "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "sources": sources,
         "summary": summary,
+        "summaryPending": pending,
         "notes": notes,
         "agentResolved": agent_resolved,
         "saved": saved,
         "key": str(out.resolve()),
     }
 
-    template = (Path(__file__).resolve().parent / "diffview.html").read_text()
-    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
-    page = (
-        template.replace("__TITLE__", title.replace("<", "&lt;"))
-        .replace("__HLJS__", fetch_hljs(langs))
-        .replace('"__DATA__"', payload)
-    )
-    tmp = out.with_name(out.name + ".tmp")
-    tmp.write_text(page)
-    os.replace(tmp, out)  # atomic, so a watch-mode request never sees a half-written page
+    hljs = fetch_hljs(langs)
+    write_page(out, data, hljs)
     n_files = sum(len(s["files"]) for s in sources)
     adds = sum(f["adds"] for s in sources for f in s["files"])
     dels = sum(f["dels"] for s in sources for f in s["files"])
     print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
+    if pending:
+        finish_summary(out, body, args.summary_model, data, hljs, page_id(out))
     return summary, data["generated"]
+
+
+def write_page(out: Path, data: dict, hljs: str) -> None:
+    """Render the page and move it into place atomically, so no request sees it half written."""
+    template = (Path(__file__).resolve().parent / "diffview.html").read_text()
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
+    page = (
+        template.replace("__TITLE__", data["title"].replace("<", "&lt;"))
+        .replace("__HLJS__", hljs)
+        .replace('"__DATA__"', payload)
+    )
+    tmp = out.with_name(f"{out.name}.{os.getpid()}.tmp")  # per-writer, so a background summary and a rebuild never share one
+    tmp.write_text(page)
+    os.replace(tmp, out)
 
 
 def state_path(out: Path) -> Path:
     return Path(str(out) + ".state.json")
+
+
+def summary_path(out: Path) -> Path:
+    return Path(str(out) + ".summary.json")
+
+
+def page_id(out: Path) -> tuple[int, int]:
+    """Which page is at this path right now. Every render replaces the file, so both halves change."""
+    st = out.stat()
+    return st.st_ino, st.st_mtime_ns
+
+
+def load_summary(out: Path) -> str:
+    """The paragraph a background summary already landed beside this page, if it has."""
+    try:
+        return json.loads(summary_path(out).read_text()).get("summary", "")
+    except (OSError, ValueError, AttributeError):
+        return ""
 
 
 def default_output(specs: list[str]) -> Path:
@@ -510,6 +537,14 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
                 body = json.dumps(version).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+            elif self.path.endswith(".summary.json"):
+                if not summary_path(out).is_file():
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = summary_path(out).read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
             else:
                 body = out.read_bytes()
                 self.send_response(200)
@@ -551,6 +586,7 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
                 if sig == last:
                     continue
                 last = sig
+                summary = summary or load_summary(out)  # the first build's summary landed in the background
                 _, version["g"] = build(args, out, summary)
                 print(f"diffview: sources changed, regenerated ({datetime.now():%H:%M:%S})", flush=True)
             except (SystemExit, OSError) as e:
@@ -778,18 +814,57 @@ SUMMARY_PROMPT = (
 )
 
 
-def generate_summary(sources: list[dict], model: str) -> str:
+def summary_body(sources: list[dict]) -> str:
+    """The diff as the model sees it, trimmed so several sources share one context."""
     budget = 400_000 // max(len(sources), 1)
-    body = "\n\n".join(f"### {s['label']} ({s['detail']})\n{s['_patch'][:budget]}" for s in sources)
+    return "\n\n".join(f"### {s['label']} ({s['detail']})\n{s['_patch'][:budget]}" for s in sources)
+
+
+def generate_summary(body: str, model: str) -> tuple[str, str]:
+    """The model's paragraph for this diff, or ("", reason) when the call fails."""
     try:
         proc = subprocess.run(["claude", "-p", "--model", model, SUMMARY_PROMPT], input=body, capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"diffview: warning: auto-summary failed ({e}); continuing without one", file=sys.stderr)
-        return ""
+        return "", str(e)
     if proc.returncode != 0:
-        print(f"diffview: warning: auto-summary failed:\n{proc.stderr.strip()[:500]}", file=sys.stderr)
-        return ""
-    return proc.stdout.strip()
+        return "", proc.stderr.strip()[:500] or f"claude exited {proc.returncode}"
+    return proc.stdout.strip(), ""
+
+
+def finish_summary(out: Path, body: str, model: str, data: dict, hljs: str, rendered: tuple[int, int]) -> None:
+    """Summarize in a detached child, once the page it belongs to is already on screen.
+
+    The model call costs seconds, which is the whole reason it happens here rather than
+    before the browser opens. A served page picks the paragraph up from the sidecar
+    written here; the page file is rewritten too, so a copy shared later carries it.
+    A failure reaches the page the same way, never the terminal -- by the time it is
+    known the command has returned and the page is where anyone is still looking.
+    """
+    pid = os.fork()
+    if pid:
+        os.waitpid(pid, 0)  # the intermediate exits at once, and reaping it leaves no zombie behind
+        return
+    if os.fork():
+        os._exit(0)
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    try:
+        summary, error = generate_summary(body, model)
+        sidecar = summary_path(out)
+        tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"summary": summary, "error": error}))
+        os.replace(tmp, sidecar)
+        # rendering to this path again while the model ran makes the page on disk somebody
+        # else's; the sidecar still stands, so a page open on it is not left waiting
+        if summary and page_id(out) == rendered:
+            data["summary"] = summary
+            data["summaryPending"] = False
+            write_page(out, data, hljs)
+    except OSError:
+        pass
+    os._exit(0)
 
 
 # ---------------------------------------------------------------- highlight.js (fetched once, cached, inlined)
