@@ -17,7 +17,8 @@ work=$(mktemp -d)
 cleanup() {
     for marker in "$work"/.serve.json "$work"/*/.serve.json "$work"/*/*/.serve.json; do
         [ -f "$marker" ] || continue
-        kill "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['pid'])" "$marker")" 2>/dev/null
+        # the server clears its own marker as it goes, so reading one is always a race
+        kill "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['pid'])" "$marker" 2>/dev/null)" 2>/dev/null
     done
     rm -rf "$work"
 }
@@ -209,6 +210,65 @@ check "a foreign Host header is refused" 403 "$(curl -s -o /dev/null -w '%{http_
 check "and a loopback one is not" 200 "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/.health")"
 kill "$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['pid'])")" 2>/dev/null
 
+# --- the auto summary lands after the page, never before it
+
+cat > "$work/stub/claude" <<'STUB'
+#!/bin/sh
+cat > /dev/null
+sleep 1
+echo "a stub summary paragraph"
+STUB
+chmod +x "$work/stub/claude"
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/async.html" >/dev/null
+cp "$work/async.html" "$work/pending.html"   # the page as it looks before the summary lands, for the DOM checks below
+check "the page holds a slot for the summary" yes "$(grep -q '"summaryPending": true' "$work/async.html" && echo yes)"
+check "and is written before that summary exists" no "$([ -f "$work/async.html.summary.json" ] && echo yes || echo no)"
+for _ in $(seq 40); do [ -f "$work/async.html.summary.json" ] && break; sleep 0.2; done
+check "the summary lands in the sidecar a served page polls" yes "$(grep -q 'a stub summary paragraph' "$work/async.html.summary.json" && echo yes)"
+check "and is baked into the page file too" yes "$(grep -q 'a stub summary paragraph' "$work/async.html" && echo yes)"
+cp "$work/async.html.summary.json" "$work/pending.html.summary.json"
+check "which clears the slot" yes "$(grep -q '"summaryPending": false' "$work/async.html" && echo yes)"
+
+# a failed model call belongs in the page, not in a terminal that has moved on
+cat > "$work/stub/claude" <<'STUB'
+#!/bin/sh
+cat > /dev/null
+echo "claude: not logged in" >&2
+exit 1
+STUB
+err=$(PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~2..HEAD" -o "$work/failed.html" 2>&1 >/dev/null)
+for _ in $(seq 40); do [ -f "$work/failed.html.summary.json" ] && break; sleep 0.2; done
+check "a failed summary says nothing on the command line" "" "$err"
+check "and carries its reason in the sidecar instead" yes "$(grep -q 'not logged in' "$work/failed.html.summary.json" && echo yes)"
+check "leaving the page as it was written" yes "$(grep -q '"summaryPending": true' "$work/failed.html" && echo yes)"
+
+# the page is open and commentable for the seconds the model runs, and the rewrite must keep what lands
+cat > "$work/stub/claude" <<'STUB'
+#!/bin/sh
+cat > /dev/null
+sleep 2
+echo "a slow summary paragraph"
+STUB
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/commented.html" >/dev/null
+echo '{"savedAt":1,"comments":[{"id":1,"text":"written while the model ran"}],"viewed":[],"nextId":2,"verdict":[]}' > "$work/commented.html.state.json"
+for _ in $(seq 60); do grep -q 'a slow summary paragraph' "$work/commented.html" && break; sleep 0.2; done
+check "a comment made while the summary was written survives the rewrite" yes "$(grep -q 'written while the model ran' "$work/commented.html" && echo yes)"
+
+# rendering to the same path again while the model runs makes the page somebody else's
+cat > "$work/stub/claude" <<'STUB'
+#!/bin/sh
+cat > /dev/null
+sleep 2
+echo "a late summary paragraph"
+STUB
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/raced.html" >/dev/null
+"$diffview" "$repo@HEAD~2..HEAD" -o "$work/raced.html" --no-auto-summary --summary "the newer render" >/dev/null
+for _ in $(seq 40); do [ -f "$work/raced.html.summary.json" ] && break; sleep 0.2; done
+sleep 0.5
+check "a late summary does not clobber the render that replaced it" yes "$(grep -q 'the newer render' "$work/raced.html" && echo yes)"
+check "though the sidecar still holds it for a page already open" yes "$(grep -q 'a late summary paragraph' "$work/raced.html.summary.json" && echo yes)"
+rm -f "$work/stub/claude"
+
 # --- rendered DOM, when a browser is around
 
 if command -v chromium >/dev/null; then
@@ -221,6 +281,12 @@ if command -v chromium >/dev/null; then
         "$work/range.html" > "$work/dom.html"
     dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 \
         --dump-dom "$base/dom.html" 2>/dev/null)
+    # a page whose summary was still being written picks it up from the sidecar, in place
+    pending=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/pending.html" 2>/dev/null)
+    check "an open page fills its summary slot from the sidecar" yes "$(grep -q 'a stub summary paragraph' <<<"$pending" && echo yes)"
+    failed=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/failed.html" 2>/dev/null)
+    check "and shows why there is none when the model call failed" yes "$(grep -q 'no summary — claude: not logged in' <<<"$failed" && echo yes)"
+
     check "tree renders one row per file" 1 "$(grep -o 'class="tree-file' <<<"$dom" | wc -l)"
     check "diff hunks render" yes "$([ "$(grep -o 'tbody class="hunk"' <<<"$dom" | wc -l)" -ge 1 ] && echo yes)"
     check "comment gutters present" yes "$([ "$(grep -o 'data-no=' <<<"$dom" | wc -l)" -ge 3 ] && echo yes)"
