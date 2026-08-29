@@ -143,8 +143,6 @@ in
         "browser.translations.neverTranslateLanguages" = "de";
 
         # GPU / performance
-        "dom.webgpu.enabled" = true;
-        "gfx.webgpu.ignore-blocklist" = true;
         "media.ffmpeg.vaapi.enabled" = true;
         "widget.use-xdg-desktop-portal.file-picker" = 1;
         "media.eme.enabled" = true;
