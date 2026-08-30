@@ -38,8 +38,15 @@ in
       Environment = [
         "PATH=${ytPath}"
         "YOUTUBE_COOKIES=${cookieFile}"
+        # ProtectHome=tmpfs hides the real ~/.cache, so point yt-dlp at the
+        # CacheDirectory below. Without a writable cache it re-derives YouTube's
+        # player signature functions for every single video.
+        "XDG_CACHE_HOME=/var/cache"
       ];
       ExecStart = "${dotfiles}/backup/youtube_archive.sh ${secrets}/backup/playlists.txt /home/max/data/yt";
+
+      # /var/cache/yt-dlp, owned by User=, carved out of ProtectSystem=strict.
+      CacheDirectory = "yt-dlp";
 
       # Sandboxing: yt-dlp parses arbitrary web content, isolate it from secrets
       NoNewPrivileges = true;
