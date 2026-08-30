@@ -5,10 +5,18 @@ let
   secrets = "${dotfiles}/secrets";
   cookieFile = "/home/max/.local/secrets/youtube-cookies.txt";
 
-  # yt-dlp with bgutil PO token plugin (anti-bot verification)
+  # yt-dlp with bgutil PO token plugin (anti-bot verification). Without the
+  # plugin YouTube serves no media URLs and every download 403s.
+  #
+  # PYTHONPATH, not --plugin-dirs: yt-dlp accepts the flag but then discovers
+  # nothing in a site-packages directory, reporting "Plugin directories: none".
+  # Verify after a version bump with
+  #   yt-dlp --verbose --simulate <any video> | grep 'PO Token Providers'
+  # which must name bgutil rather than "none".
   bgutilPlugin = pkgs.python3Packages.bgutil-ytdlp-pot-provider;
   yt-dlp-wrapped = pkgs.writeShellScriptBin "yt-dlp" ''
-    exec ${pkgs.yt-dlp}/bin/yt-dlp --plugin-dirs ${bgutilPlugin}/${pkgs.python3.sitePackages} "$@"
+    export PYTHONPATH=${bgutilPlugin}/${pkgs.python3.sitePackages}''${PYTHONPATH:+:$PYTHONPATH}
+    exec ${pkgs.yt-dlp}/bin/yt-dlp "$@"
   '';
 
   # jq: bin/run-log builds its JSON line with it. No curl — the script's only
@@ -38,8 +46,15 @@ in
       Environment = [
         "PATH=${ytPath}"
         "YOUTUBE_COOKIES=${cookieFile}"
+        # ProtectHome=tmpfs hides the real ~/.cache, so point yt-dlp at the
+        # CacheDirectory below. Without a writable cache it re-derives YouTube's
+        # player signature functions for every single video.
+        "XDG_CACHE_HOME=/var/cache"
       ];
       ExecStart = "${dotfiles}/backup/youtube_archive.sh ${secrets}/backup/playlists.txt /home/max/data/yt";
+
+      # /var/cache/yt-dlp, owned by User=, carved out of ProtectSystem=strict.
+      CacheDirectory = "yt-dlp";
 
       # Sandboxing: yt-dlp parses arbitrary web content, isolate it from secrets
       NoNewPrivileges = true;
