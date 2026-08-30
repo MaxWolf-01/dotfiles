@@ -39,14 +39,24 @@ check() {
 }
 
 # Stubs stand in for the two things a check reaches outside this machine for.
-# curl writes the notification to a file so a test can count and read it; ssh
-# refuses to connect, the way a host that is off does.
+# Alerts go through the real bin/alert-send, whose curl is stubbed to decode the
+# subject and body of what would have been submitted, so a test can count and
+# read them; ssh refuses to connect, the way a host that is off does.
 mkdir -p "$work/stub"
-cat >"$work/stub/curl" <<EOF
+cat >"$work/stub/curl" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\n' "\$@" >> "$work/ntfy.log"
-echo "---" >> "$work/ntfy.log"
-EOF
+msg="" prev=""
+for a in "$@"; do
+    [ "$prev" = "--upload-file" ] && msg="$a"
+    prev="$a"
+done
+[ -n "$msg" ] && [ -f "$msg" ] || exit 0
+sed -n 's/^Subject: =?UTF-8?B?\(.*\)?=$/\1/p' "$msg" | base64 -d >> "$ALERTS_SENT"
+echo >> "$ALERTS_SENT"
+awk '/^Content-Transfer-Encoding: base64$/{f=1;next} f&&/^$/{b=1;next} b&&/^--/{exit} b{print}' "$msg" \
+    | base64 -d >> "$ALERTS_SENT"
+echo "---" >> "$ALERTS_SENT"
+STUB
 cat >"$work/stub/ssh" <<'EOF'
 #!/usr/bin/env bash
 echo "ssh: connect to host: Connection timed out" >&2
@@ -54,12 +64,24 @@ exit 255
 EOF
 chmod +x "$work/stub/curl" "$work/stub/ssh"
 export PATH="$work/stub:$PATH"
+export ALERTS_SENT="$work/alerts.log"
 
 export HOME="$work/home"
 mkdir -p "$HOME/logs/runs" "$HOME/.local/secrets"
 # The repo cases need a key file to exist at all; none of them needs sops, since
 # their password command is a `cat`.
 touch "$HOME/.local/secrets/age-key.txt"
+
+# HOME is redirected, so alert-send's default config path lands on this
+# throwaway channel rather than the real one.
+mkdir -p "$HOME/.dotfiles/secrets/monitoring"
+cat >"$HOME/.dotfiles/secrets/monitoring/alert.conf" <<'CONF'
+smtp_url="smtp://localhost:587"
+smtp_user="test@example.invalid"
+password_command="echo test-token"
+mail_from="test@example.invalid"
+mail_to="test@example.invalid"
+CONF
 
 days_ago() { date -Iseconds -d "$1 days ago"; }
 
@@ -72,13 +94,13 @@ log_line() {  # unit outcome days_ago
 run() {  # config-body-on-stdin, args... -> stdout+stderr, sets $rc
     local config="$work/overdue.conf"
     cat > "$config"
-    : > "$work/ntfy.log"
+    : > "$ALERTS_SENT"
     out=$("$bin_dir/overdue-check" --config "$config" "$@" 2>&1)
     rc=$?
 }
 
 # grep -c prints its 0 and then exits 1; the || keeps that from ending the run.
-ntfy_count() { grep -c -- '^---$' "$work/ntfy.log" 2>/dev/null || true; }
+sent_count() { grep -c -- '^---$' "$ALERTS_SENT" 2>/dev/null || true; }
 
 this_host="$(uname -n)"
 
@@ -88,38 +110,62 @@ log_line fresh-unit ok 1
 log_line stale-unit ok 9
 
 run <<EOF
-ntfy_topic: a-topic
 fresh-unit $this_host 3 run-log
 EOF
 check "a unit inside its bound exits 0" 0 "$rc"
-check "...and sends nothing" 0 "$(ntfy_count)"
+check "...and sends nothing" 0 "$(sent_count)"
 
 run <<EOF
-ntfy_topic: a-topic
 stale-unit $this_host 3 run-log
 EOF
 check "a unit past its bound exits 1" 1 "$rc"
-check "...sends exactly one notification" 1 "$(ntfy_count)"
+check "...sends exactly one notification" 1 "$(sent_count)"
 check "...naming the unit and both ages" \
     "yes" \
-    "$(grep -q 'stale-unit' "$work/ntfy.log" && grep -q '9d since last success (limit 3d)' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'stale-unit' "$ALERTS_SENT" && grep -q '9d since last success (limit 3d)' "$ALERTS_SENT" && echo yes || echo no)"
+check "...and its own run log line says the alert was delivered" \
+    "delivered" \
+    "$(jq -r '.stats.alert' "$HOME/logs/runs/overdue-check.jsonl" | tail -1)"
+
+# --- a breach whose alert cannot be delivered is a failed run of the watchdog
+#
+# The channel going dark must not look like a quiet day: the fail line is what
+# turns it into a red dashboard row, and the missing ok line is what makes the
+# other host's copy of this check speak up.
+
+cp "$HOME/.dotfiles/secrets/monitoring/alert.conf" "$work/alert.conf.good"
+sed -i 's/^password_command=.*/password_command="false"/' \
+    "$HOME/.dotfiles/secrets/monitoring/alert.conf"
+run <<EOF
+stale-unit $this_host 3 run-log
+EOF
+check "a breach with a dead channel still exits 1" 1 "$rc"
+check "...but the watchdog's own run is recorded as fail" \
+    "fail" \
+    "$(jq -r '.outcome' "$HOME/logs/runs/overdue-check.jsonl" | tail -1)"
+check "...naming the undelivered alert as the reason" \
+    "found overdue units but the alert was not delivered" \
+    "$(jq -r '.reason' "$HOME/logs/runs/overdue-check.jsonl" | tail -1)"
+check "...with the mailer's exit in stats.alert" \
+    "yes" \
+    "$(jq -r '.stats.alert' "$HOME/logs/runs/overdue-check.jsonl" | tail -1 \
+        | grep -q 'delivery failed' && echo yes || echo no)"
+cp "$work/alert.conf.good" "$HOME/.dotfiles/secrets/monitoring/alert.conf"
 
 # The acceptance case: tighten a bound to 0 and the unit must surface.
 run <<EOF
-ntfy_topic: a-topic
 fresh-unit $this_host 0 run-log
 EOF
 check "bound 0 makes a unit that ran yesterday overdue" 1 "$rc"
-check "...in exactly one notification" 1 "$(ntfy_count)"
+check "...in exactly one notification" 1 "$(sent_count)"
 
 # --- --extra-days lifts every bound, which is how the second host stays quiet
 
 run --extra-days 7 <<EOF
-ntfy_topic: a-topic
 stale-unit $this_host 3 run-log
 EOF
 check "--extra-days lifts the bound past the breach" 0 "$rc"
-check "...so the offset host stays silent" 0 "$(ntfy_count)"
+check "...so the offset host stays silent" 0 "$(sent_count)"
 
 # --- a unit that only ever fails has no last success
 
@@ -127,13 +173,12 @@ log_line failing-unit fail 5
 log_line failing-unit fail 1
 
 run <<EOF
-ntfy_topic: a-topic
 failing-unit $this_host 30 run-log
 EOF
 check "a unit that only ever fails is overdue however loose the bound" 1 "$rc"
 check "...reported as having no successful run" \
     "yes" \
-    "$(grep -q 'no successful run on record' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'no successful run on record' "$ALERTS_SENT" && echo yes || echo no)"
 
 # --- deliberate skips are not successes
 
@@ -142,24 +187,22 @@ log_line skipping-unit skip 2
 log_line skipping-unit skip 1
 
 run <<EOF
-ntfy_topic: a-topic
 skipping-unit $this_host 30 run-log
 EOF
 check "a skip streak does not refresh the clock" 1 "$rc"
 check "...the age is measured from the last real success" \
     "yes" \
-    "$(grep -q '40d since last success' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q '40d since last success' "$ALERTS_SENT" && echo yes || echo no)"
 
 # --- a unit nothing has ever heard of
 
 run <<EOF
-ntfy_topic: a-topic
 never-ran-unit $this_host 90 run-log
 EOF
 check "a unit with nothing on record is reported" 1 "$rc"
 check "...rather than skipped" \
     "yes" \
-    "$(grep -q 'never-ran-unit' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'never-ran-unit' "$ALERTS_SENT" && echo yes || echo no)"
 
 # --- a unit judged by its run log is never judged by systemd instead
 #
@@ -182,20 +225,17 @@ if [ -z "$journal_unit" ]; then
     echo "skip journald cases — no unit with a clean finish in this journal"
 else
     run <<EOF
-ntfy_topic: a-topic
 $journal_unit $this_host 30 systemd
 EOF
     check "the systemd witness reads a real clean finish ($journal_unit)" 0 "$rc"
 
     run <<EOF
-ntfy_topic: a-topic
 $journal_unit $this_host 30 run-log
 EOF
     check "...and the same unit with no run log is overdue, not healthy" 1 "$rc"
 
     log_line "$journal_unit" skip 1
     run <<EOF
-ntfy_topic: a-topic
 $journal_unit $this_host 30 run-log
 EOF
     check "...still overdue when its only record is a fresh skip" 1 "$rc"
@@ -205,11 +245,10 @@ fi
 # --- a host that is off is not an alarm
 
 run <<EOF
-ntfy_topic: a-topic
 some-unit a-host-that-is-off 1 run-log
 EOF
 check "an unreachable host exits 0" 0 "$rc"
-check "...sends nothing" 0 "$(ntfy_count)"
+check "...sends nothing" 0 "$(sent_count)"
 check "...and says so on stdout" \
     "yes" \
     "$(grep -q 'a-host-that-is-off not reachable' <<<"$out" && echo yes || echo no)"
@@ -242,10 +281,9 @@ log_line repos-away ok 1
 
 repo_config away "$unreachable_repo"
 run "$work/repos/away.conf" <<EOF
-ntfy_topic: a-topic
 EOF
 check "a repository whose target refuses the connection exits 0" 0 "$rc"
-check "...sends nothing" 0 "$(ntfy_count)"
+check "...sends nothing" 0 "$(sent_count)"
 check "...and is listed as away on stdout" \
     "yes" \
     "$(grep -q 'repos-away: .*[Cc]onnection refused' <<<"$out" && echo yes || echo no)"
@@ -256,36 +294,33 @@ check "...with the age of the backup that keeps it quiet" \
 log_line repos-stale ok 20
 repo_config stale "$unreachable_repo"
 run "$work/repos/stale.conf" <<EOF
-ntfy_topic: a-topic
 EOF
 check "an away streak past the repo's bound exits 1" 1 "$rc"
-check "...sends exactly one notification" 1 "$(ntfy_count)"
+check "...sends exactly one notification" 1 "$(sent_count)"
 check "...naming the unreachability as the reason" \
     "yes" \
-    "$(grep -q 'repos-stale: target away' "$work/ntfy.log" \
-        && grep -qi 'connection refused' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'repos-stale: target away' "$ALERTS_SENT" \
+        && grep -qi 'connection refused' "$ALERTS_SENT" && echo yes || echo no)"
 check "...and how long the backup has been missing" \
     "yes" \
-    "$(grep -q 'no backup for 20d (limit 7d)' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'no backup for 20d (limit 7d)' "$ALERTS_SENT" && echo yes || echo no)"
 
 log_line repos-failing fail 1
 repo_config failing "$unreachable_repo"
 run "$work/repos/failing.conf" <<EOF
-ntfy_topic: a-topic
 EOF
 check "an away repository whose every run failed exits 1" 1 "$rc"
 check "...saying nothing has succeeded, rather than waiting out the outage" \
     "yes" \
-    "$(grep -q 'no successful backup on record' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'no successful backup on record' "$ALERTS_SENT" && echo yes || echo no)"
 
 repo_config unlogged "$unreachable_repo"
 run "$work/repos/unlogged.conf" <<EOF
-ntfy_topic: a-topic
 EOF
 check "an away repository nothing has ever logged exits 1" 1 "$rc"
 check "...naming the missing log, which is a different fact from a failed backup" \
     "yes" \
-    "$(grep -q 'keeps no run log for this backup' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'keeps no run log for this backup' "$ALERTS_SENT" && echo yes || echo no)"
 
 # A repo backed up by the other host: the run log that could date it is over
 # there, and the stub ssh refuses, so nothing here can say how old it is. It also
@@ -312,10 +347,9 @@ password_command="cat $work/pw"
 max_age_days="7"
 EOF
     run "$away_dir/$(basename "$away_conf")" <<EOF
-ntfy_topic: a-topic
 EOF
     check "a repo away whose backup host is away too exits 0 ($away_unit)" 0 "$rc"
-    check "...sends nothing, because nothing can date it either way" 0 "$(ntfy_count)"
+    check "...sends nothing, because nothing can date it either way" 0 "$(sent_count)"
     check "...and says both are away on stdout" \
         "yes" \
         "$(grep -q "$away_unit: .*is away too" <<<"$out" && echo yes || echo no)"
@@ -324,23 +358,21 @@ fi
 mkdir -p "$work/not-a-repo"
 repo_config broken "$work/not-a-repo"
 run "$work/repos/broken.conf" <<EOF
-ntfy_topic: a-topic
 EOF
 check "a reachable repository that cannot be read exits 1" 1 "$rc"
-check "...sends exactly one notification" 1 "$(ntfy_count)"
+check "...sends exactly one notification" 1 "$(sent_count)"
 check "...naming it as unreadable" \
     "yes" \
-    "$(grep -q 'repos-broken: no snapshots, or repo unreadable' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'repos-broken: no snapshots, or repo unreadable' "$ALERTS_SENT" && echo yes || echo no)"
 
 # --- --dry-run is the same check with the notification withheld
 
 runs_before=$(wc -l < "$HOME/logs/runs/overdue-check.jsonl")
 run --dry-run <<EOF
-ntfy_topic: a-topic
 stale-unit $this_host 3 run-log
 EOF
 check "--dry-run still reports a breach" 1 "$rc"
-check "...sends nothing" 0 "$(ntfy_count)"
+check "...sends nothing" 0 "$(sent_count)"
 check "...prints what it would have sent" \
     "yes" \
     "$(grep -q 'stale-unit' <<<"$out" && grep -q 'dry-run: nothing sent' <<<"$out" && echo yes || echo no)"
@@ -355,7 +387,7 @@ check "...and leaves the watchdog's own run log alone" \
 # reboot silence the units too, and send nothing to say so.
 
 log_line locked-key-unit ok 9
-printf 'ntfy_topic: a-topic\nlocked-key-unit %s 3 run-log\n' "$this_host" > "$work/locked.conf"
+printf 'locked-key-unit %s 3 run-log\n' "$this_host" > "$work/locked.conf"
 out=$(SOPS_AGE_KEY_FILE="$work/no-such-key" "$bin_dir/overdue-check" \
     --config "$work/locked.conf" "$work/some-repo.conf" 2>&1)
 rc=$?
@@ -382,13 +414,13 @@ check "...carrying what it found" \
 # Appending a line with something that leaves the file unterminated would
 # otherwise drop that unit silently: no error, and nothing watching it.
 
-printf 'ntfy_topic: a-topic\nstale-unit %s 3 run-log' "$this_host" > "$work/unterminated.conf"
-: > "$work/ntfy.log"
+printf 'stale-unit %s 3 run-log' "$this_host" > "$work/unterminated.conf"
+: > "$ALERTS_SENT"
 out=$("$bin_dir/overdue-check" --config "$work/unterminated.conf" 2>&1); rc=$?
 check "a unit on an unterminated last line is still checked" 1 "$rc"
 check "...and named in the notification" \
     "yes" \
-    "$(grep -q 'stale-unit' "$work/ntfy.log" && echo yes || echo no)"
+    "$(grep -q 'stale-unit' "$ALERTS_SENT" && echo yes || echo no)"
 
 # --- a config it cannot make sense of stops the check instead of guessing
 
@@ -414,6 +446,7 @@ reject "a witness nothing can read" "some-unit $this_host 7 vibes"
 reject "a unit name that would escape into a path or a command" \
     "../evil $this_host 7 run-log"
 reject "an unknown setting" "colour: green"
+reject "the retired ntfy_topic setting" "ntfy_topic: a-topic"
 
 out=$("$bin_dir/overdue-check" --config "$work/does-not-exist.conf" 2>&1); rc=$?
 check "a missing config refuses to run" 2 "$rc"

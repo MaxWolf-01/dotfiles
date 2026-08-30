@@ -208,7 +208,8 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
-      # ${home}/bin for run-log, which the script records each run with
+      # ${home}/bin for run-log and alert-send: the script records each run and
+      # mails what needs a person with them
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/report.sh";
     };
@@ -232,7 +233,8 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
-      # ${home}/bin for run-log, which the script records each run with
+      # ${home}/bin for run-log and alert-send: the script records each run and
+      # mails what needs a person with them
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/dep-scout.sh";
     };
@@ -379,7 +381,7 @@ in
     };
     Service = {
       Type = "oneshot";
-      # Exit 1 means it found something overdue and said so by ntfy; only exit 2
+      # Exit 1 means it found something overdue and said so by email; only exit 2
       # means the check itself broke. Without this the unit sits red in
       # systemctl --failed for as long as anything is overdue, which reads as
       # "the watchdog is broken" to everyone who looks later.

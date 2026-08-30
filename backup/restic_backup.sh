@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Restic backup wrapper. Every run appends its outcome and stats to the run log
-# (bin/run-log); ntfy is reserved for the failures a person has to act on, which
-# is every failure this script can name. A green run and a deliberate skip —
-# dataset unmounted, age key still encrypted — are silent.
+# (bin/run-log); an alert email (bin/alert-send) is reserved for the failures a
+# person has to act on, which is every failure this script can name. A green run
+# and a deliberate skip — dataset unmounted, age key still encrypted — are silent.
 
 set -uo pipefail
 
@@ -20,7 +20,6 @@ set -uo pipefail
 # keep_weekly - Number of weekly snapshots to keep
 # keep_monthly - Number of monthly snapshots to keep
 # check_data - (optional) "true", "false", or percentage like "5%" (default: false)
-# ntfy_topic - (optional) Ntfy topic for notifications
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
 # require_mount - (optional) Path that must be a mountpoint, else skip (for encrypted ZFS datasets)
 # backup_opts - (optional) Extra flags for `restic backup`, word-split (e.g. "--ignore-inode")
@@ -30,6 +29,7 @@ set -uo pipefail
 bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
 run_log_bin="$bin_dir/run-log"
 unreachable_reason="$bin_dir/restic-unreachable-reason"
+alert_send_bin="$bin_dir/alert-send"
 
 # Recording the run must never decide whether the backup succeeded: run-log
 # explains itself on stderr and the backup carries on.
@@ -37,21 +37,26 @@ log_run() {
     "$run_log_bin" "$config_name" "$@" || true
 }
 
+# Deliver one alert and print what happened to it, for the run log's stats:
+# delivery failure is recorded there, and never changes the run's own outcome
+# (decisions/0002-alerts-by-email.md).
+deliver_alert() {
+    if "$alert_send_bin" "$@"; then
+        echo delivered
+    else
+        echo "delivery failed (alert-send exited $?)"
+    fi
+}
+
 # A failure that needs a human: notify, record, stop. $1 is the one-line reason
-# for the run log, $2 the full text for the notification.
+# for the run log, $2 the full text for the alert.
 fail_out() {
     local reason="$1"
     local detail="$2"
 
-    log_run fail --reason "$reason"
-    if [ -n "${ntfy_topic:-}" ]; then
-        curl -s \
-            -H "Title: ❌ $config_name - Backup Failed" \
-            -H "Priority: 5" \
-            -H "Tags: backup,restic,$config_name,error" \
-            -d "$detail" \
-            "https://ntfy.sh/$ntfy_topic"
-    fi
+    local alert
+    alert=$(deliver_alert "❌ $config_name - Backup Failed" <<<"$detail")
+    log_run fail --reason "$reason" --stats "$(jq -n --arg alert "$alert" '$ARGS.named')"
     echo "$detail" >&2
     exit 1
 }
@@ -218,7 +223,8 @@ restic --repo "$repo_path" --password-command "$password_command" unlock 2>/dev/
 backup_output=$(mktemp)
 error_log=$(mktemp)
 repo_stats_out=$(mktemp)
-trap "rm -f $backup_output $error_log $repo_stats_out" EXIT
+check_output=$(mktemp)
+trap "rm -f $backup_output $error_log $repo_stats_out $check_output" EXIT
 
 echo "Starting backup for $config_name..."
 backup_start_time=$(date +%s)
@@ -332,13 +338,19 @@ ${stats_error:-nothing}" >&2
     # Remove stale locks before check (prune may leave one if interrupted)
     restic --repo "$repo_path" --password-command "$password_command" unlock 2>/dev/null
 
-    # Run repository check
+    # Run repository check, keeping everything restic prints: on a failure that
+    # text — read error, hash mismatch, dropped connection — is the only record
+    # of what broke.
     echo "Checking repository integrity..."
-    if check_error_msg=$(restic check --repo "$repo_path" --password-command "$password_command" $check_args 2>&1 >/dev/null); then
+    check_log=""
+    if restic check --repo "$repo_path" --password-command "$password_command" $check_args >"$check_output" 2>&1; then
         check_status="passed"
     else
         check_status="FAILED"
         backup_success=false
+        check_log="$log_dir/restic_check_${config_name}_$(date +%Y%m%d_%H%M%S).log"
+        cp "$check_output" "$check_log"
+        echo "Check log saved to: $check_log"
     fi
 
     # Unreadable files are reported as JSON error lines, but other exit-3 causes
@@ -372,34 +384,31 @@ ${stats_error:-nothing}" >&2
         --argjson repo_snapshots "$repo_snapshots" \
         --argjson warnings "$warn_count" \
         --arg warning_log "$warning_log" \
+        --arg check_log "$check_log" \
         '$ARGS.named
          | if .warning_log == "" then del(.warning_log) else . end
+         | if .check_log == "" then del(.check_log) else . end
          | if .repo_size == null then del(.repo_size, .repo_snapshots) else . end
          | if .snapshot_id == "" then del(.snapshot_id) else . end')
 
     if [ "$backup_success" = true ]; then
         log_run ok --stats "$stats"
     else
-        log_run fail --reason "$check_description integrity check failed" --stats "$stats"
-
-        if [ -n "${ntfy_topic:-}" ]; then
-            message="❌ Repository integrity check failed!
+        message="❌ Repository integrity check failed!
 
 📦 Snapshot ${snapshot_id} was created successfully
 ⏱️ Duration: $(format_duration $backup_duration)
 📊 Files: $total_files_processed processed
 💾 Size: $(format_bytes $data_added) added
 
-⚠️ The $check_description integrity check failed:
-${check_error_msg}"
+⚠️ The $check_description integrity check failed. Last lines:
+$(tail -n 40 "$check_log")
 
-            curl -s \
-                -H "Title: ⚠️ $config_name - Integrity Check Failed" \
-                -H "Priority: 5" \
-                -H "Tags: backup,restic,$config_name,warning" \
-                -d "$message" \
-                "https://ntfy.sh/$ntfy_topic"
-        fi
+Full output attached; local copy: $check_log"
+
+        alert=$(deliver_alert "⚠️ $config_name - Integrity Check Failed" --attach "$check_log" <<<"$message")
+        stats=$(jq --arg alert "$alert" '. + {alert: $alert}' <<<"$stats")
+        log_run fail --reason "$check_description integrity check failed" --stats "$stats"
     fi
 
     if [ "$backup_success" = false ]; then
@@ -435,26 +444,17 @@ else
     } > "$local_log_file"
     echo "Error log saved to: $local_log_file"
 
+    alert=$(deliver_alert "❌ $config_name - Backup Failed" --attach "$local_log_file" <<<"Restic backup failed (exit $backup_exit) after $(format_duration $backup_duration).
+
+$error_message
+
+Full log attached; local copy: $local_log_file")
     log_run fail \
         --reason "restic backup exited $backup_exit: $(head -1 <<<"$error_message")" \
         --stats "$(jq -n --argjson duration_s "$backup_duration" \
                         --argjson exit_code "$backup_exit" \
-                        --arg error_log "$local_log_file" '$ARGS.named')"
-
-    if [ -n "${ntfy_topic:-}" ]; then
-        # Send error notification with log file attached
-        filename="backup_error_${config_name}_$(date +%Y%m%d_%H%M%S).log"
-        curl -s \
-            -T "$local_log_file" \
-            -H "Filename: $filename" \
-            -H "Title: ❌ $config_name - Backup Failed" \
-            -H "Priority: 5" \
-            -H "Tags: backup,restic,$config_name,error" \
-            "https://ntfy.sh/$ntfy_topic"
-
-        # Give ntfy time to process the attachment
-        sleep 2
-    fi
+                        --arg error_log "$local_log_file" \
+                        --arg alert "$alert" '$ARGS.named')"
 
     exit 1
 fi

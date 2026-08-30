@@ -28,20 +28,42 @@ ssh-add "$work/key" 2>/dev/null
 export HOME="$work/home"          # keeps ~/logs/backup out of the real home
 export RUN_LOG_DIR="$work/runs"
 export SOPS_AGE_KEY_FILE="$work/age-key.txt"
-export PATH="$work/stub:$PATH"    # curl stub, so a test never sends an ntfy
+export PATH="$work/stub:$PATH"    # curl stub, so a test never sends mail
 mkdir -p "$HOME" "$work/stub" "$work/src"
 touch "$SOPS_AGE_KEY_FILE"
 printf 'testpw\n' >"$work/pw"
 head -c 100000 /dev/urandom >"$work/src/a.bin"
 echo "src" >"$work/dirs.txt"
 
+# Alerts go through the real bin/alert-send: HOME is redirected, so its default
+# config path lands on this throwaway channel, and the curl underneath it is a
+# stub that decodes the subject and body of what would have been submitted.
+mkdir -p "$HOME/.dotfiles/secrets/monitoring"
+cat >"$HOME/.dotfiles/secrets/monitoring/alert.conf" <<'CONF'
+smtp_url="smtp://localhost:587"
+smtp_user="test@example.invalid"
+password_command="echo test-token"
+mail_from="test@example.invalid"
+mail_to="test@example.invalid"
+CONF
+
 cat >"$work/stub/curl" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "$NTFY_SENT"
+msg="" prev=""
+for a in "$@"; do
+    [ "$prev" = "--upload-file" ] && msg="$a"
+    prev="$a"
+done
+[ -n "$msg" ] && [ -f "$msg" ] || exit 0
+sed -n 's/^Subject: =?UTF-8?B?\(.*\)?=$/\1/p' "$msg" | base64 -d >> "$ALERTS_SENT"
+echo >> "$ALERTS_SENT"
+awk '/^Content-Transfer-Encoding: base64$/{f=1;next} f&&/^$/{b=1;next} b&&/^--/{exit} b{print}' "$msg" \
+    | base64 -d >> "$ALERTS_SENT"
+echo "---" >> "$ALERTS_SENT"
 STUB
 chmod +x "$work/stub/curl"
-export NTFY_SENT="$work/ntfy.log"
-: >"$NTFY_SENT"
+export ALERTS_SENT="$work/alerts.log"
+: >"$ALERTS_SENT"
 
 failures=0
 
@@ -71,7 +93,6 @@ keep_last="1"
 keep_daily="1"
 keep_weekly="1"
 keep_monthly="1"
-ntfy_topic="test-topic"
 CONF
 }
 
@@ -95,14 +116,14 @@ check "refused connection is a skip" skip "$(jq -r .outcome <<<"$line")"
 check "its reason names unreachability and the cause" \
     "yes" \
     "$(jq -r 'if .reason | test("^target unreachable:.*[Cc]onnection refused") then "yes" else .reason end' <<<"$line")"
-check "nothing was sent" "" "$(cat "$NTFY_SENT")"
+check "nothing was sent" "" "$(cat "$ALERTS_SENT")"
 
 # --- 2. unreachable: the name does not resolve
 
 write_config dns "sftp:nosuchhost.invalid:restic-test"
 check "unresolvable host exits 0" 0 "$(run_case dns)"
 check "unresolvable host is a skip" skip "$(jq -r .outcome <<<"$(last_line dns)")"
-check "still nothing sent" "" "$(cat "$NTFY_SENT")"
+check "still nothing sent" "" "$(cat "$ALERTS_SENT")"
 
 # --- 3. reachable target, no repository yet: the init path is untouched
 
@@ -110,7 +131,7 @@ write_config missing "$work/fresh-repo"
 check "a missing repository still runs to a green backup" 0 "$(run_case missing)"
 check "it was initialised" "yes" "$([ -f "$work/fresh-repo/config" ] && echo yes || cat "$work/out.txt")"
 check "the run is logged ok" ok "$(jq -r .outcome <<<"$(last_line missing)")"
-check "a green run sends nothing" "" "$(cat "$NTFY_SENT")"
+check "a green run sends nothing" "" "$(cat "$ALERTS_SENT")"
 
 # --- 4. an existing repository under an exclusive lock left by a dead run
 #
@@ -137,16 +158,19 @@ check "and is never reported as an init failure" \
     "" \
     "$(grep -o 'Failed to initialize restic repository' "$work/out.txt")"
 check "the locked run is logged ok" ok "$(jq -r .outcome <<<"$(last_line locked)")"
-check "a locked repository sends nothing" "" "$(cat "$NTFY_SENT")"
+check "a locked repository sends nothing" "" "$(cat "$ALERTS_SENT")"
 
 # --- 5. an error of any other kind keeps its rich failure
 
 write_config badinit "/proc/no/such/place/repo"
 check "an uncreatable repository exits 1" 1 "$(run_case badinit)"
 check "it is logged fail" fail "$(jq -r .outcome <<<"$(last_line badinit)")"
-check "and it notifies" \
+check "and it notifies, naming the unit in the subject" \
     "yes" \
-    "$(grep -q 'ntfy.sh/test-topic' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+    "$(grep -q 'badinit-case - Backup Failed' "$ALERTS_SENT" && echo yes || cat "$ALERTS_SENT")"
+check "and the run log says the alert was delivered" \
+    "delivered" \
+    "$(jq -r .stats.alert <<<"$(last_line badinit)")"
 
 # --- 6. the boundary: an ssh that fails for a reason of its own
 #
@@ -167,13 +191,13 @@ Host *
     UserKnownHostsFile /dev/null
 SSHCONF
     chmod 600 "$HOME/.ssh/config"
-    : >"$NTFY_SENT"
+    : >"$ALERTS_SENT"
     write_config denied "sftp://nosuchuser@127.0.0.1//tmp/does-not-matter"
     check "a rejected key exits 1" 1 "$(run_case denied)"
     check "a rejected key is a failure, not a skip" fail "$(jq -r .outcome <<<"$(last_line denied)")"
     check "a rejected key notifies" \
         "yes" \
-        "$(grep -q 'denied-case' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+        "$(grep -q 'denied-case' "$ALERTS_SENT" && echo yes || cat "$ALERTS_SENT")"
     check "a rejected key is reported as what it is, not as a failed init" \
         "yes" \
         "$(jq -r 'if .reason | test("^could not open repository") then "yes" else .reason end' \
@@ -189,7 +213,7 @@ fi
 # nothing: no ssh attempt, no init, no notification — just a skip that says which
 # credential is missing, so backup-catchup.target can run it again later.
 
-: >"$NTFY_SENT"
+: >"$ALERTS_SENT"
 write_config keyless "sftp://max@127.0.0.1:2222//tmp/does-not-matter"
 saved_sock="$SSH_AUTH_SOCK"
 empty_agent="$work/empty-agent.sock"
@@ -202,7 +226,7 @@ line=$(last_line keyless)
 check "an empty agent is a skip" skip "$(jq -r .outcome <<<"$line")"
 check "and the skip names the key, not the network" \
     "ssh agent holds no key" "$(jq -r .reason <<<"$line")"
-check "an empty agent sends nothing" "" "$(cat "$NTFY_SENT")"
+check "an empty agent sends nothing" "" "$(cat "$ALERTS_SENT")"
 kill "$empty_agent_pid" 2>/dev/null
 
 # --- 8. no agent at all
@@ -211,24 +235,24 @@ kill "$empty_agent_pid" 2>/dev/null
 # name its socket. So it is a broken session rather than a credential in transit,
 # and it is the one credential case that wakes somebody.
 
-: >"$NTFY_SENT"
+: >"$ALERTS_SENT"
 write_config noagent "sftp://max@127.0.0.1:2222//tmp/does-not-matter"
 SSH_AUTH_SOCK="$work/there-is-no-agent-here"
 check "a missing agent exits 1" 1 "$(run_case noagent)"
 check "a missing agent is a failure" fail "$(jq -r .outcome <<<"$(last_line noagent)")"
 check "a missing agent notifies" \
     "yes" \
-    "$(grep -q 'ntfy.sh/test-topic' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+    "$(grep -q 'noagent-case - Backup Failed' "$ALERTS_SENT" && echo yes || cat "$ALERTS_SENT")"
 
 # --- 9. a local repository does not need an agent at all
 #
 # The gate keys on the repo being sftp:. Still no agent here, and the backup runs.
 
-: >"$NTFY_SENT"
+: >"$ALERTS_SENT"
 write_config localrepo "$work/fresh-repo"
 check "a local repository backs up with no agent" 0 "$(run_case localrepo)"
 check "and is logged ok" ok "$(jq -r .outcome <<<"$(last_line localrepo)")"
-check "and sends nothing" "" "$(cat "$NTFY_SENT")"
+check "and sends nothing" "" "$(cat "$ALERTS_SENT")"
 SSH_AUTH_SOCK="$saved_sock"
 
 # --- 10. a probe that fails for a reason restic cannot call "missing"
@@ -237,7 +261,7 @@ SSH_AUTH_SOCK="$saved_sock"
 # would fail and blame a cause that was never true, which is what an empty agent
 # used to be reported as. It must fail on its own terms and never reach init.
 
-: >"$NTFY_SENT"
+: >"$ALERTS_SENT"
 write_config unreadable "$work/unreadable-repo"
 restic init --repo "$work/unreadable-repo" --password-command "cat $work/pw" >/dev/null 2>&1
 chmod 000 "$work/unreadable-repo/config"
@@ -250,7 +274,7 @@ check "the reason names opening the repository, not initialising it" \
 check "no init was attempted" "" "$(grep -o 'Initializing restic repository' "$work/out.txt")"
 check "it notifies" \
     "yes" \
-    "$(grep -q 'ntfy.sh/test-topic' "$NTFY_SENT" && echo yes || cat "$NTFY_SENT")"
+    "$(grep -q 'unreadable-case - Backup Failed' "$ALERTS_SENT" && echo yes || cat "$ALERTS_SENT")"
 chmod 644 "$work/unreadable-repo/config"
 
 echo
