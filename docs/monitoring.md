@@ -9,7 +9,7 @@ Three layers carry the rest:
 | Layer | What it holds | Where |
 | --- | --- | --- |
 | Run log | one JSON line per run: outcome, why, the run's own numbers | `~/logs/runs/<unit>.jsonl`, appended by `bin/run-log` |
-| Overdue watchdog | the one job whose purpose is to alert: one ntfy naming every unit that stopped succeeding | `bin/overdue-check`, daily on both hosts |
+| Overdue watchdog | the one job whose purpose is to alert: one email naming every unit that stopped succeeding | `bin/overdue-check`, daily on both hosts |
 | Dashboards | one static HTML page per topic, rebuilt hourly, read when there is time | `~/Documents/dashboards/` |
 
 The split answers two ways this setup failed before. A message on every green
@@ -21,16 +21,22 @@ in `secrets/backup/README.md`. Only the job itself knows which of the two it
 did, so it writes that down, and the watchdog reads the record instead of the
 exit code.
 
-## A notification arrived
+## An alert arrived
+
+Alerts are email, delivered by `bin/alert-send`; the channel — who sends, who
+receives, over what — is `secrets/monitoring/alert.conf`, and the reasoning is
+`secrets/decisions/0002-alerts-by-email.md`. Every sender records what became
+of its delivery as `stats.alert` in its own run log line, so a send that failed
+is readable somewhere that is not the channel that just failed.
 
 Everything that can send one, and where it points:
 
-| Title | Sender | What it means | Where to look next |
+| Subject | Sender | What it means | Where to look next |
 | --- | --- | --- | --- |
 | `❌ <unit> - Backup Failed` | `backup/restic_backup.sh` | that run left no snapshot; the message carries restic's own error | the same run is a `fail` line in `~/logs/runs/<unit>.jsonl`, with the path to the error log |
-| `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository | `/backup-audit <unit>` — it opens the repo and reports what is broken |
+| `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message and the `check_log` path in the run log carry restic's full output | `/backup-audit <unit>` — it opens the repo and reports what is broken |
 | `🕸️ Overdue units` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Could not check:`, one whose evidence could not be read at all — a repository that answers but cannot be opened, or an age key still locked after a reboot | overdue: the unit's run log, then its bound (below). Could not check: `/backup-audit`, which opens the repositories |
-| `⚠️ Yapit health` / `⚠️ Yapit deps` | `scripts/report.sh` / `scripts/dep-scout.sh` in `~/repos/code/yapit-tts/yapit`, on yapit's own topic | last night's agent found issues, or a dependency needs acting on | the report itself, on the yapit dashboard |
+| `⚠️ Yapit health` / `⚠️ Yapit deps` | `scripts/report.sh` / `scripts/dep-scout.sh` in `~/repos/code/yapit-tts/yapit` | last night's agent found issues, or a dependency needs acting on | the report itself, on the yapit dashboard |
 
 Nothing else on these two machines sends on its own. A green backup, a skipped
 one, a newly blocked domain, an exit node rotation, a routine dependency
@@ -71,8 +77,8 @@ systemctl --user start overdue-check.service
 ```
 
 A red `overdue-check.service` means the watchdog itself could not run. Finding
-something overdue is exit 1, which the units count as success — the ntfy is how
-that gets reported, not the unit's state.
+something overdue is exit 1, which the units count as success — the email is
+how that gets reported, not the unit's state.
 
 Both hosts run the check daily and each judges the other's units over ssh
 (`nix/home/timers.nix`, `nix/home/pc-timers.nix`). pc runs the bounds as

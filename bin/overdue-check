@@ -5,7 +5,7 @@
 # fetch — exits 0 and notifies nobody, so "healthy" and "dead for months" look
 # identical from the outside. This is the one scheduled alerter in the setup: it
 # ignores runs and asks, per unit, how long it has been since the last real
-# success. Anything over its bound goes into one ntfy message; otherwise silence.
+# success. Anything over its bound goes into one alert email; otherwise silence.
 #
 # Two kinds of unit, two kinds of evidence:
 #
@@ -67,15 +67,14 @@ watchdog rather than an overdue backup.
                   running this both cover everything, but the one with the
                   offset stays quiet unless the other stopped alerting (i.e.
                   died), so a healthy setup alerts only once.
-  --config FILE   unit bounds and the ntfy topic (default: the file bin/overdue-conf
-                  reads, which is also where the syntax is described).
+  --config FILE   unit bounds (default: the file bin/overdue-conf reads, which
+                  is also where the syntax is described).
   --dry-run       check everything and print what would have been sent, without
                   sending it or recording this run. For trying out a config
                   change without it reaching a phone.
 
-Environment:
+Findings are delivered by bin/alert-send. Environment:
   RUN_LOG_DIR     where this host's run logs live (default ~/logs/runs).
-  NTFY_BASE_URL   where to send the alert (default https://ntfy.sh).
 EOF
 }
 
@@ -108,6 +107,7 @@ run_log_bin="$bin_dir/run-log"
 unreachable_reason="$bin_dir/restic-unreachable-reason"
 config_name_bin="$bin_dir/restic-config-name"
 backup_hosts_bin="$bin_dir/backup-hosts"
+alert_send_bin="$bin_dir/alert-send"
 
 # Read before any repo is probed, so a config nobody can parse costs a message
 # rather than two minutes of ssh timeouts first.
@@ -126,7 +126,6 @@ fi
 
 this_host="$(uname -n)"
 run_log_dir="${RUN_LOG_DIR:-$HOME/logs/runs}"
-ntfy_base="${NTFY_BASE_URL:-https://ntfy.sh}"
 now=$(date +%s)
 
 # Run a read-only probe here or on another host. Every argument is a plain token
@@ -239,8 +238,6 @@ overdue_count=0
 unchecked_count=0
 unreachable_count=0
 ok_count=0
-ntfy_topic=""
-config_file=""
 
 # --- restic repos: the age of the newest snapshot
 
@@ -349,11 +346,6 @@ done
 while IFS=$'\t' read -r -u 3 kind unit host days witness; do
     [ -n "$kind" ] || continue
     if [ "$kind" = file ]; then
-        config_file="$unit"
-        continue
-    fi
-    if [ "$kind" = set ]; then
-        [ "$unit" = ntfy_topic ] && ntfy_topic="$host"
         continue
     fi
     # Everything else has to be a unit line. A record kind this does not know
@@ -390,49 +382,52 @@ done 3<<<"$unit_records"
 
 [ -n "$unreachable" ] && printf 'Not checked, target away:\n%s' "$unreachable"
 
-# Recording this run must never decide whether the check succeeded. `ok` means
-# the check completed, not that it found nothing: the findings go to ntfy, while
-# the other host reads this log to see that the watchdog itself is still alive.
-# A dry run writes no line — it is a rehearsal, and the other host should not
-# read it as the watchdog's own timer still firing.
-if [ "$dry_run" = false ]; then
-    "$run_log_bin" overdue-check ok --stats "$(jq -n \
-        --argjson overdue "$overdue_count" \
-        --argjson unchecked "$unchecked_count" \
-        --argjson unreachable "$unreachable_count" \
-        --argjson ok "$ok_count" \
-        '{overdue: $overdue, unchecked: $unchecked, unreachable: $unreachable, ok: $ok}')" || true
-fi
-
-if [ -z "$overdue" ] && [ -z "$unchecked" ]; then
-    echo "All $ok_count monitored unit(s) are within their bounds."
-    exit 0
-fi
-
 message=""
 [ -n "$overdue" ] && message="Overdue:"$'\n'"$overdue"
 [ -n "$unchecked" ] && message="${message}Could not check:"$'\n'"$unchecked"
-message="${message}"$'\n'"$ok_count unit(s) fine."
+[ -n "$message" ] && message="${message}"$'\n'"$ok_count unit(s) fine."
 
+# A dry run neither sends nor records — it is a rehearsal, and the other host
+# should not read its line as the watchdog's own timer still firing.
 if [ "$dry_run" = true ]; then
+    if [ -z "$message" ]; then
+        echo "All $ok_count monitored unit(s) are within their bounds."
+        exit 0
+    fi
     echo "$message"
-    echo "--dry-run: nothing sent${ntfy_topic:+ (topic $ntfy_topic)}"
+    echo "--dry-run: nothing sent"
     exit 1
 fi
 
-echo "$message" >&2
+# The findings go out by email before the run is recorded, so the record can
+# say what became of them: a delivery failure must not change this run's own
+# outcome, but it has to be readable somewhere that is not the channel that
+# just failed.
+alert=""
+if [ -n "$message" ]; then
+    echo "$message" >&2
+    if "$alert_send_bin" "🕸️ Overdue units" <<<"$message"; then
+        alert="delivered"
+    else
+        alert="delivery failed (alert-send exited $?)"
+    fi
+fi
 
-if [ -n "$ntfy_topic" ]; then
-    # --max-time: this runs as a oneshot with no start timeout, so a server that
-    # accepts the connection and then says nothing would wedge the unit forever.
-    curl -s --max-time 20 \
-        -H "Title: 🕸️ Overdue units" \
-        -H "Priority: 4" \
-        -H "Tags: watchdog,stale" \
-        -d "$message" \
-        "$ntfy_base/$ntfy_topic" >/dev/null
-else
-    echo "No ntfy_topic in $config_file — the report above went nowhere else." >&2
+# Recording this run must never decide whether the check succeeded. `ok` means
+# the check completed, not that it found nothing: the findings went by email,
+# while the other host reads this log to see that the watchdog itself is still
+# alive.
+"$run_log_bin" overdue-check ok --stats "$(jq -n \
+    --argjson overdue "$overdue_count" \
+    --argjson unchecked "$unchecked_count" \
+    --argjson unreachable "$unreachable_count" \
+    --argjson ok "$ok_count" \
+    --arg alert "$alert" \
+    '$ARGS.named | if .alert == "" then del(.alert) else . end')" || true
+
+if [ -z "$message" ]; then
+    echo "All $ok_count monitored unit(s) are within their bounds."
+    exit 0
 fi
 
 exit 1

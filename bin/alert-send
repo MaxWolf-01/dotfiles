@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Send one alert email to the configured recipient — the single send path every
+# unattended alerter uses. Subject as the argument, body on stdin.
+# Channel and rationale: secrets/decisions/0002-alerts-by-email.md.
+
+set -uo pipefail
+
+DEFAULT_CONFIG="$HOME/.dotfiles/secrets/monitoring/alert.conf"
+
+usage() {
+    cat <<EOF
+Usage: alert-send SUBJECT [--attach FILE]... [--config FILE]
+
+Reads the message body from stdin and mails it, with any attachments, to the
+recipient in the config (default: $DEFAULT_CONFIG,
+which documents its own variables).
+
+An attachment that does not exist is replaced by a note in the body naming it:
+the alert still goes out, because it matters more than its enclosure.
+
+Exits 0 when the SMTP server accepted the message, 1 when it did not, 2 on a
+config or usage error. Unattended callers record a nonzero exit in their run
+log — a delivery failure must be visible somewhere that is not the channel
+that just failed.
+EOF
+}
+
+subject=""
+config="$DEFAULT_CONFIG"
+attachments=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --attach)
+            [ $# -ge 2 ] || { echo "alert-send: --attach needs a value" >&2; exit 2; }
+            attachments+=("$2"); shift 2 ;;
+        --attach=*) attachments+=("${1#*=}"); shift ;;
+        --config)
+            [ $# -ge 2 ] || { echo "alert-send: --config needs a value" >&2; exit 2; }
+            config="$2"; shift 2 ;;
+        --config=*) config="${1#*=}"; shift ;;
+        -*) echo "alert-send: unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [ -n "$subject" ]; then
+                echo "alert-send: exactly one SUBJECT, got a second: $1" >&2
+                exit 2
+            fi
+            subject="$1"; shift ;;
+    esac
+done
+
+if [ -z "$subject" ]; then
+    echo "alert-send: a SUBJECT is required" >&2
+    usage >&2
+    exit 2
+fi
+
+if [ ! -f "$config" ]; then
+    echo "alert-send: no channel config at $config — nothing was sent.
+On a fresh host, the secrets repo provides it; check the checkout." >&2
+    exit 2
+fi
+source "$config"
+
+missing=""
+for var in smtp_url smtp_user password_command mail_from mail_to; do
+    [ -n "${!var:-}" ] || missing="$missing $var"
+done
+if [ -n "$missing" ]; then
+    echo "alert-send: $config does not set:$missing — nothing was sent." >&2
+    exit 2
+fi
+
+# The password command is sops on every host here, and sops needs to know where
+# the age key lives when the caller (a systemd unit, usually) did not say.
+export SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
+if ! token=$(eval "$password_command"); then
+    echo "alert-send: the password command failed ($password_command) — nothing was sent." >&2
+    exit 2
+fi
+
+msg=$(mktemp)
+trap 'rm -f "$msg"' EXIT
+boundary="alert-send-$(date +%s)-$$"
+
+# RFC 2047 for the subject and base64 for the body: alert text here carries
+# UTF-8 (unit names are ASCII, the markers are not), and encoding it always is
+# one code path instead of a sniff.
+{
+    printf 'From: %s\n' "$mail_from"
+    printf 'To: %s\n' "$mail_to"
+    printf 'Subject: =?UTF-8?B?%s?=\n' "$(printf '%s' "$subject" | base64 -w0)"
+    printf 'Date: %s\n' "$(date -R)"
+    printf 'MIME-Version: 1.0\n'
+    printf 'Content-Type: multipart/mixed; boundary="%s"\n' "$boundary"
+    printf '\n'
+    printf -- '--%s\n' "$boundary"
+    printf 'Content-Type: text/plain; charset=utf-8\n'
+    printf 'Content-Transfer-Encoding: base64\n'
+    printf '\n'
+    {
+        cat
+        for file in "${attachments[@]}"; do
+            [ -r "$file" ] || printf '\n[attachment missing or unreadable: %s]\n' "$file"
+        done
+    } | base64
+    for file in "${attachments[@]}"; do
+        [ -r "$file" ] || continue
+        printf -- '--%s\n' "$boundary"
+        printf 'Content-Type: application/octet-stream; name="%s"\n' "$(basename "$file")"
+        printf 'Content-Disposition: attachment; filename="%s"\n' "$(basename "$file")"
+        printf 'Content-Transfer-Encoding: base64\n'
+        printf '\n'
+        base64 "$file"
+    done
+    printf -- '--%s--\n' "$boundary"
+} > "$msg"
+
+# The credential rides in on stdin (-K -), never on the command line, where it
+# would sit in /proc/<pid>/cmdline for the whole submission. --ssl-reqd: 587 is
+# STARTTLS, and a server that cannot offer TLS must not see the token at all.
+# --max-time: this runs from oneshot units with no start timeout of their own.
+if ! curl -sS --max-time 60 --ssl-reqd \
+    --url "$smtp_url" \
+    --mail-from "$mail_from" \
+    --mail-rcpt "$mail_to" \
+    --upload-file "$msg" \
+    -K - <<EOF
+user = "$smtp_user:$token"
+EOF
+then
+    echo "alert-send: SMTP submission to $smtp_url failed — the alert did not go out." >&2
+    exit 1
+fi

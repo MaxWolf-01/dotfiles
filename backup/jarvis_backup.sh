@@ -27,7 +27,7 @@ log_run() {
 # one of the causes that reach us as an indistinguishable "Connection reset by
 # peer" (see the mount below). An empty agent is the ordinary state after a boot
 # and skips like any other missing precondition. No agent at all is a broken
-# session; the ntfy for that comes from this host's sftp repos, which meet the
+# session; the alert for that comes from this host's sftp repos, which meet the
 # same condition in restic_backup.sh, so it is not raised twice here.
 agent_state=0
 ssh-add -l >/dev/null 2>&1 || agent_state=$?
