@@ -39,7 +39,7 @@ Everything that can send one, and where it points:
 | `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message, the attachment, and the `check_log` path in the run log carry restic's full output | `/backup-audit <unit>` — it opens the repo and reports what is broken |
 | `🕸️ Overdue units` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Could not check:`, one whose evidence could not be read at all — a repository that answers but cannot be opened, or an age key still locked after a reboot | overdue: the unit's run log, then its bound (below). Could not check: `/backup-audit`, which opens the repositories |
 | `⚠️ Yapit health` / `⚠️ Yapit deps` | `scripts/report.sh` / `scripts/dep-scout.sh` in `~/repos/code/yapit-tts/yapit` | last night's agent found issues, or a dependency needs acting on | the report itself, on the yapit dashboard |
-| `❌ yapit deploy: <commit>` | `scripts/deploy.sh`, run by hand from the yapit repo | a production deploy failed partway; deploys never mail on success | the deploy terminal output and `.deploys.log` in the repo |
+| `❌ / ✅ yapit deploy: <commit>` | `scripts/deploy.sh`, run by hand from the yapit repo | a production deploy failed partway, or shipped — deploys are rare and hand-run, so completion mails too | the deploy terminal output and `.deploys.log` in the repo |
 | `CF firewall sync failed` | `scripts/sync-cf-firewall.sh`, hourly cron on yapit-prod | the Hetzner firewall could not be updated with current Cloudflare IPs | `/var/log/cf-firewall-sync.log` on the VPS |
 
 Nothing else sends on its own. A green backup, a skipped
