@@ -37,10 +37,9 @@ log_run() {
     "$run_log_bin" "$config_name" "$@" || true
 }
 
-# Deliver one alert and print what happened to it, for the run log's stats.
-# Delivery failure must never change the run's own outcome — but it has to be
-# visible somewhere that is not the channel that just failed, which is how the
-# 2026-08-30 check failure lost its error text (decisions/0002-alerts-by-email.md).
+# Deliver one alert and print what happened to it, for the run log's stats:
+# delivery failure is recorded there, and never changes the run's own outcome
+# (decisions/0002-alerts-by-email.md).
 deliver_alert() {
     if "$alert_send_bin" "$@"; then
         echo delivered
@@ -339,10 +338,9 @@ ${stats_error:-nothing}" >&2
     # Remove stale locks before check (prune may leave one if interrupted)
     restic --repo "$repo_path" --password-command "$password_command" unlock 2>/dev/null
 
-    # Run repository check. Everything restic prints is kept: on a failure that
+    # Run repository check, keeping everything restic prints: on a failure that
     # text — read error, hash mismatch, dropped connection — is the only record
-    # of what broke, and the run of 2026-08-30 lost it by holding it in a
-    # variable whose only reader was a notification that never arrived.
+    # of what broke.
     echo "Checking repository integrity..."
     check_log=""
     if restic check --repo "$repo_path" --password-command "$password_command" $check_args >"$check_output" 2>&1; then
@@ -403,12 +401,12 @@ ${stats_error:-nothing}" >&2
 📊 Files: $total_files_processed processed
 💾 Size: $(format_bytes $data_added) added
 
-⚠️ The $check_description integrity check failed:
-$(cat "$check_log")
+⚠️ The $check_description integrity check failed. Last lines:
+$(tail -n 40 "$check_log")
 
-Local copy of this check output: $check_log"
+Full output attached; local copy: $check_log"
 
-        alert=$(deliver_alert "⚠️ $config_name - Integrity Check Failed" <<<"$message")
+        alert=$(deliver_alert "⚠️ $config_name - Integrity Check Failed" --attach "$check_log" <<<"$message")
         stats=$(jq --arg alert "$alert" '. + {alert: $alert}' <<<"$stats")
         log_run fail --reason "$check_description integrity check failed" --stats "$stats"
     fi

@@ -25,20 +25,24 @@ exit code.
 
 Alerts are email, delivered by `bin/alert-send`; the channel — who sends, who
 receives, over what — is `secrets/monitoring/alert.conf`, and the reasoning is
-`secrets/decisions/0002-alerts-by-email.md`. Every sender records what became
-of its delivery as `stats.alert` in its own run log line, so a send that failed
-is readable somewhere that is not the channel that just failed.
+`secrets/decisions/0002-alerts-by-email.md`. Senders that keep a run log record
+what became of the delivery as `stats.alert` in their line; the watchdog goes
+further and logs its run as `fail` when its alert could not be delivered, so a
+dead channel shows as a red row here and, once its ok lines stop, as an alert
+from the other host.
 
 Everything that can send one, and where it points:
 
 | Subject | Sender | What it means | Where to look next |
 | --- | --- | --- | --- |
 | `❌ <unit> - Backup Failed` | `backup/restic_backup.sh` | that run left no snapshot; the message carries restic's own error | the same run is a `fail` line in `~/logs/runs/<unit>.jsonl`, with the path to the error log |
-| `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message and the `check_log` path in the run log carry restic's full output | `/backup-audit <unit>` — it opens the repo and reports what is broken |
+| `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message, the attachment, and the `check_log` path in the run log carry restic's full output | `/backup-audit <unit>` — it opens the repo and reports what is broken |
 | `🕸️ Overdue units` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Could not check:`, one whose evidence could not be read at all — a repository that answers but cannot be opened, or an age key still locked after a reboot | overdue: the unit's run log, then its bound (below). Could not check: `/backup-audit`, which opens the repositories |
 | `⚠️ Yapit health` / `⚠️ Yapit deps` | `scripts/report.sh` / `scripts/dep-scout.sh` in `~/repos/code/yapit-tts/yapit` | last night's agent found issues, or a dependency needs acting on | the report itself, on the yapit dashboard |
+| `❌ yapit deploy: <commit>` | `scripts/deploy.sh`, run by hand from the yapit repo | a production deploy failed partway; deploys never mail on success | the deploy terminal output and `.deploys.log` in the repo |
+| `CF firewall sync failed` | `scripts/sync-cf-firewall.sh`, hourly cron on yapit-prod | the Hetzner firewall could not be updated with current Cloudflare IPs | `/var/log/cf-firewall-sync.log` on the VPS |
 
-Nothing else on these two machines sends on its own. A green backup, a skipped
+Nothing else sends on its own. A green backup, a skipped
 one, a newly blocked domain, an exit node rotation, a routine dependency
 report: run log and dashboard only. `🔍` in a yapit title means the report had
 no readable status line, so the setup could not tell whether the agent found

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Drive bin/alert-send against a stubbed curl and check what it would have
+# submitted. Run it directly; no framework.
+#
+# The promises here: the subject and body survive UTF-8, the attachment rides
+# along, a missing attachment costs a note rather than the alert, the
+# credential never touches the command line, and every failure — config, token,
+# SMTP — comes back as the exit code the callers record.
+
+set -uo pipefail
+
+bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+failures=0
+
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+# The stub records curl's argv and the raw message file, so the cases below can
+# look at both the wire arguments and the MIME the script built. STUB_CURL_EXIT
+# lets a case play the server rejecting the submission.
+mkdir -p "$work/stub"
+cat >"$work/stub/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$WORK/argv"
+msg="" prev=""
+for a in "$@"; do
+    [ "$prev" = "--upload-file" ] && msg="$a"
+    prev="$a"
+done
+[ -n "$msg" ] && cp "$msg" "$WORK/message"
+exit "${STUB_CURL_EXIT:-0}"
+STUB
+chmod +x "$work/stub/curl"
+export PATH="$work/stub:$PATH"
+export WORK="$work"
+
+export HOME="$work/home"
+mkdir -p "$HOME/.dotfiles/secrets/monitoring"
+cat >"$HOME/.dotfiles/secrets/monitoring/alert.conf" <<'CONF'
+smtp_url="smtp://localhost:587"
+smtp_user="test@example.invalid"
+password_command="echo test-token"
+mail_from="from@example.invalid"
+mail_to="to@example.invalid"
+CONF
+
+decoded_subject() { sed -n 's/^Subject: =?UTF-8?B?\(.*\)?=$/\1/p' "$work/message" | base64 -d; }
+decoded_body() {
+    awk '/^Content-Transfer-Encoding: base64$/{f=1;next} f&&/^$/{b=1;next} b&&/^--/{exit} b{print}' \
+        "$work/message" | base64 -d
+}
+
+# --- the happy path: subject, body and attachment all arrive intact
+
+printf 'attached payload\n' > "$work/payload.log"
+printf 'body line one\nbody line two\n' \
+    | "$bin_dir/alert-send" "⚠️ unit-x - Integrity Check Failed" --attach "$work/payload.log"
+check "a delivered alert exits 0" 0 "$?"
+check "the UTF-8 subject survives the encoding" \
+    "⚠️ unit-x - Integrity Check Failed" "$(decoded_subject)"
+check "the body survives it too" \
+    "body line one
+body line two" "$(decoded_body)"
+check "the attachment is a named MIME part" \
+    "yes" \
+    "$(grep -q 'Content-Disposition: attachment; filename="payload.log"' "$work/message" && echo yes || echo no)"
+check "the attachment content rides along" \
+    "yes" \
+    "$(grep -q "$(printf 'attached payload\n' | base64)" "$work/message" && echo yes || echo no)"
+check "the sender and recipient come from the config" \
+    "yes" \
+    "$(grep -q '^From: from@example.invalid$' "$work/message" \
+        && grep -q '^To: to@example.invalid$' "$work/message" && echo yes || echo no)"
+check "the token never touches curl's command line" \
+    "" "$(grep -o 'test-token' "$work/argv")"
+check "the submission asks for TLS and CRLF" \
+    "yes" \
+    "$(grep -qx -- '--ssl-reqd' "$work/argv" && grep -qx -- '--crlf' "$work/argv" && echo yes || echo no)"
+
+# --- a missing attachment costs a note, never the alert
+
+rm -f "$work/message"
+echo body | "$bin_dir/alert-send" "subject" --attach "$work/does-not-exist.log"
+check "a missing attachment still sends, exit 0" 0 "$?"
+check "...with the missing file named in the body" \
+    "yes" \
+    "$(decoded_body | grep -q 'attachment missing or unreadable: .*does-not-exist' && echo yes || echo no)"
+
+# --- every failure is the exit code the run logs record
+
+echo body | STUB_CURL_EXIT=67 "$bin_dir/alert-send" "subject" 2>/dev/null
+check "an SMTP rejection exits 1" 1 "$?"
+
+echo body | "$bin_dir/alert-send" 2>/dev/null
+check "a missing subject exits 2" 2 "$?"
+
+echo 'password_command="false"' >> "$HOME/.dotfiles/secrets/monitoring/alert.conf"
+echo body | "$bin_dir/alert-send" "subject" 2>/dev/null
+check "a failing password command exits 2" 2 "$?"
+sed -i '$d' "$HOME/.dotfiles/secrets/monitoring/alert.conf"
+
+HOME="$work/nowhere" bash -c 'echo body | "$0" "subject"' "$bin_dir/alert-send" 2>/dev/null
+check "a missing channel config exits 2" 2 "$?"
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+    exit 0
+fi
+echo "$failures check(s) failed"
+exit 1
