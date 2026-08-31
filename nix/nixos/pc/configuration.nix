@@ -138,6 +138,24 @@
   # Disable deprecated udev-settle (times out waiting for NVIDIA/ZFS events, nothing needs it)
   systemd.services.systemd-udev-settle.serviceConfig.ExecStart = [ "" "${pkgs.coreutils}/bin/true" ];
 
+  # Deploys the commit sitting in pc's own checkout, so `git pull` here is what
+  # releases a change. nixos-rebuild resolves nothing on its own: the committed
+  # lock decides every input, and --upgrade is off because it belongs to
+  # channels. ?ref=HEAD reads the commit rather than the working tree, so a file
+  # left half-edited in that checkout cannot reach the running system.
+  #
+  # A kernel or ZFS module bump is built and made default but not booted, and
+  # nothing reports that a reboot is pending — check `booted-system` against
+  # `current-system` after an upgrade that touched them.
+  system.autoUpgrade = {
+    enable = true;
+    flake = "git+file:///home/max/.dotfiles?ref=HEAD";
+    upgrade = false;
+    dates = "04:40";
+    randomizedDelaySec = "45min";
+    allowReboot = false;
+  };
+
   system.configurationRevision = self.rev or self.dirtyRev or "unknown";
 
   system.stateVersion = "26.05";
