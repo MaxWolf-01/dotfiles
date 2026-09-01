@@ -145,6 +145,11 @@ in
         # GPU / performance
         "media.ffmpeg.vaapi.enabled" = true;
         "widget.use-xdg-desktop-portal.file-picker" = 1;
+        # Hand external protocols (slack://, obsidian://) to xdg-desktop-portal.
+        # Firefox runs under firejail with a tmpfs $HOME, so a handler it launches
+        # itself sees an empty ~/.config and cannot reach an already-running
+        # instance. The portal launches it in the session instead.
+        "widget.use-xdg-desktop-portal.open-uri" = 1;
         "media.eme.enabled" = true;
         "media.webspeech.synth.enabled" = false;
       };
