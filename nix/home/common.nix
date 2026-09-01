@@ -1,9 +1,4 @@
 { config, pkgs, lib, rime, system, ... }:
-let
-  # nixpkgs dropped nodePackages."@angular/cli" and packages no replacement.
-  # npx runs the project's own CLI, whose schematics match its Angular version.
-  ng = pkgs.writeShellScriptBin "ng" "exec ${pkgs.nodejs}/bin/npx ng \"$@\"";
-in
 {
   imports = [
     ./tmux.nix
@@ -386,7 +381,6 @@ in
     manix
     ncdu
     neovim
-    ng
     nerd-fonts.hack
     nodejs
     nvd
