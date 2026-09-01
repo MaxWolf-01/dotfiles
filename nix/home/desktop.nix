@@ -34,6 +34,7 @@ in
     obsidian
     qdirstat
     signal-desktop
+    slack
     sshfs
     chromium
     codex
