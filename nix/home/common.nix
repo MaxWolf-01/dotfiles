@@ -1,4 +1,9 @@
 { config, pkgs, lib, rime, system, ... }:
+let
+  # nixpkgs dropped nodePackages."@angular/cli" and packages no replacement.
+  # npx runs the project's own CLI, whose schematics match its Angular version.
+  ng = pkgs.writeShellScriptBin "ng" "exec ${pkgs.nodejs}/bin/npx ng \"$@\"";
+in
 {
   imports = [
     ./tmux.nix
@@ -381,6 +386,7 @@
     manix
     ncdu
     neovim
+    ng
     nerd-fonts.hack
     nodejs
     nvd
@@ -405,6 +411,7 @@
     # neovim toolchain: language servers enabled in nvim/lua/plugins/lspconfig.lua
     # and formatters referenced by nvim/lua/fmts/*.lua. Keep both in sync with
     # this list -- a server enabled without its binary here fails at spawn time.
+    angular-language-server
     bash-language-server
     biome
     clang-tools # clangd + clang-format

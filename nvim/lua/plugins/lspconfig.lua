@@ -49,6 +49,7 @@ return {
     -- every server here needs its binary in nix/home/common.nix (home.packages);
     -- vim.lsp.enable() does not check, it fails when the filetype is opened
     local servers = {
+      "angularls",
       "bashls",
       "biome",
       "clangd",
