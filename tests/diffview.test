@@ -1,0 +1,150 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["playwright"]
+# ///
+"""Drive a rendered diffview page in a headless browser and check the contract its
+readers depend on: context opens from the baked file with the right line numbers on
+both sides, survives a reload once served, takes comments like any hunk line, and a
+note on a file outside the diff puts that file on the page.
+
+Run it directly; no framework. Uses the chromium build playwright keeps in its cache
+(`uv run --with playwright playwright install chromium` once, if it is missing).
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+DIFFVIEW = Path(__file__).resolve().parent.parent / "bin" / "diffview"
+failures = 0
+
+
+def check(what: str, expected, actual) -> None:
+    global failures
+    if expected == actual:
+        print(f"ok   {what}")
+    else:
+        print(f"FAIL {what}\n       expected: {expected!r}\n       actual:   {actual!r}")
+        failures += 1
+
+
+def git(repo: Path, *args: str) -> None:
+    # a bare identity and no user config, so signing or hooks set up for real repos stay out of the fixture
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                   env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+
+def fixture(root: Path) -> Path:
+    """Two commits: an 80-line file, then one hunk that grows it by a line and one that does not."""
+    repo = root / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    lines = [f"line {n}" for n in range(1, 81)]
+    (repo / "a.txt").write_text("\n".join(lines) + "\n")
+    (repo / "b.txt").write_text("\n".join(f"other {n}" for n in range(1, 31)) + "\n")
+    git(repo, "add", "."); git(repo, "commit", "-qm", "base"); git(repo, "tag", "base")
+    lines[19] = "line 20 changed"
+    lines.insert(20, "line 20b inserted")
+    lines[60] = "line 60 changed"   # was line 60, shifted by the insert above
+    (repo / "a.txt").write_text("\n".join(lines) + "\n")
+    git(repo, "commit", "-qam", "change")
+    return repo
+
+
+def main() -> int:
+    root = Path(tempfile.mkdtemp(prefix="diffview-test-"))
+    repo = fixture(root)
+    pages = Path.home() / "Downloads" / "diffview" / "test"   # the served tree must sit below home, not at it
+    pages.mkdir(parents=True, exist_ok=True)
+    out = pages / f"page-{os.getpid()}.html"
+    notes = root / "notes.json"
+    notes.write_text(json.dumps({"notes": [
+        {"id": 1, "path": "b.txt", "line": 5, "end": 6, "text": "read this, left it alone"},
+        {"id": 2, "path": "nowhere.txt", "text": "no such file"},
+    ]}))
+    proc = subprocess.run([str(DIFFVIEW), f"{repo}@base..main", "--notes", str(notes), "--no-auto-summary", "-o", str(out)],
+                          capture_output=True, text=True)
+    check("render exits 0", 0, proc.returncode)
+    check("a note on a missing file is reported, not silently dropped", True, "nowhere.txt" in proc.stderr)
+    check("the file count names changed files only", True, "(1 files," in proc.stdout)
+
+    serve = subprocess.run([str(DIFFVIEW), "--serve", str(pages)], capture_output=True, text=True)
+    url = serve.stdout.split(" at ")[-1].split()[0].rstrip("/") + "/" + out.name
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.on("dialog", lambda d: d.dismiss())
+            page.goto(url)
+            page.wait_for_selector("tbody.hunk")
+            gaps = lambda: page.locator('.fcard[data-key="0:a.txt"] tr.gap td').evaluate_all("tds => tds.map(td => td.firstChild.textContent)")
+            hunk_nos = lambda hi, side: [int(t) for t in page.locator(f'tbody.hunk[data-key="0:a.txt"][data-hi="{hi}"] td.no[data-side="{side}"][data-no]').all_inner_texts()]
+            original = ["⋯ 16 unchanged lines", "⋯ 33 unchanged lines", "⋯ 17 unchanged lines"]
+            check("gaps before, between and after the hunks", original, gaps())
+            check("no toast on load", "", page.locator("#toast").inner_text())
+
+            page.keyboard.press("j")          # focus hunk 0
+            page.keyboard.press("[")          # 20 above, but only 16 exist
+            check("[ opens the whole leading gap when it is under 20 lines", 1, hunk_nos(0, "new")[0])
+            check("leading gap row is gone", 2, len(gaps()))
+            check("lines before the first hunk carry equal old and new numbers", hunk_nos(0, "old")[:16], hunk_nos(0, "new")[:16])
+
+            page.keyboard.press("]")          # 20 below hunk 0, into the middle gap
+            check("] appends 20 lines to the focused hunk", 24 + 20, hunk_nos(0, "new")[-1])
+            check("lines after a hunk that grew by one are offset by one on the old side", hunk_nos(0, "new")[-1] - 1, hunk_nos(0, "old")[-1])
+            check("the middle gap shrank by 20", "⋯ 13 unchanged lines", gaps()[0])
+
+            page.keyboard.press("j")          # focus hunk 1
+            page.keyboard.press("{")          # the rest of the middle gap, into hunk 1
+            check("{ opens the whole gap above", 45, hunk_nos(1, "new")[0])
+            check("only the trailing gap is left", 1, len(gaps()))
+
+            page.keyboard.press("F")
+            check("F opens every gap in the file", 0, len(gaps()))
+            check("F reaches the last line of the file", 81, hunk_nos(1, "new")[-1])
+            page.keyboard.press("F")
+            check("F again folds back to the original hunks", original, gaps())
+
+            page.keyboard.press("k"); page.keyboard.press("[")   # hunk 0, leading gap open again
+            page.wait_for_timeout(300)                            # the state POST is fire-and-forget
+            # a --watch rebuild bakes the saved state back into the page, then the page reloads
+            subprocess.run([str(DIFFVIEW), f"{repo}@base..main", "--notes", str(notes), "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
+            page.reload()
+            page.wait_for_selector("tbody.hunk")
+            check("expansion survives a rebuild and reload", 1, hunk_nos(0, "new")[0])
+
+            page.locator('tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="3"]').click()
+            page.keyboard.type("comment on an expanded line")
+            page.keyboard.press("Control+Enter")
+            md = page.evaluate("commentsMarkdown()")
+            check("a comment on an expanded line exports with its line and text", True, "new line 3" in md and "  line 3" in md)
+
+            check("the untouched file is on the page as its own card", 1, page.locator('.fcard[data-key="0:b.txt"] .st.untouched').count())
+            check("the untouched card opens at the noted lines plus 3", "L2", page.locator('.fcard[data-key="0:b.txt"] tr.hunkhdr').first.inner_text())
+            check("the note anchors inside the untouched card", 1, page.locator('.fcard[data-key="0:b.txt"] .abox').count())
+            check("the untouched card does not count as a file", "1 files", page.locator(".top .dim").first.inner_text())
+            page.locator('.fcard[data-key="0:b.txt"] tr.gap button', has_text="⇕").last.click()
+            check("⇕ on the untouched card reaches the end of the file", 30, int(page.locator('.fcard[data-key="0:b.txt"] td.no[data-side="new"][data-no]').last.inner_text()))
+            browser.close()
+    finally:
+        try:
+            os.kill(json.loads((pages / ".serve.json").read_text())["pid"], signal.SIGTERM)
+        except (OSError, ValueError, KeyError):
+            pass
+        for p in pages.glob(f"{out.stem}*"):
+            p.unlink()
+    print(f"\n{failures} failure(s)")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
