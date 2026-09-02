@@ -20,7 +20,7 @@ browser is confined to a home whitelist and cannot read anywhere else.
 
 Source specs (positional, several allowed; one page with a section per source):
 - REPO@A..B      git range in REPO (A...B also works)
-- REPO@A..       A versus the working tree, uncommitted changes included (HEAD.. = just the uncommitted)
+- REPO@A..       A versus the working tree, uncommitted and untracked files included (HEAD.. = just those)
 - A..B           git range in the current directory
 - OLD=NEW        two directories or two files, no git metadata needed
 
@@ -70,7 +70,7 @@ class Args:
     open: bool = False
     """Open the generated page in the browser ($DIFFVIEW_BROWSER, else xdg-open), served from its own directory so it can take comments."""
     watch: bool = False
-    """Regenerate whenever the sources change and serve the page on localhost with live reload (the summary is computed once and reused). The written file stays a plain snapshot you can share."""
+    """Regenerate whenever the sources change and serve the page on localhost with live reload. The summary is written once; the ↻ beside it says how far the diff has moved since and rewrites it on request. Starts fine on sources with no changes yet: the page says so and fills in. The written file stays a plain snapshot you can share."""
     notes: str = ""
     """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top): the place to say what was read and deliberately left alone. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is display-only and never part of the comment export. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
@@ -88,9 +88,9 @@ def main(args: Args) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     if derived:
         warn_displaced(out)
-    summary, generated = build(args, out, args.summary)
+    page = build(args, out, args.summary)
     if args.watch:
-        watch(args, out, summary, generated)
+        watch(args, out, page)
         return
     # a derived page is the throwaway case, so serve it: the url this prints should be
     # one you can comment on, not a read-only file
@@ -110,24 +110,27 @@ def warn_displaced(out: Path) -> None:
             return
 
 
-def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> tuple[str, str]:
-    """Collect, render, write. Returns (summary used, generation timestamp) so watch mode can reuse them.
+def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
+    """Collect, render, write. Returns the page data, so watch mode can reuse the summary and stamp.
 
     awaiting says a summary asked for by an earlier build is still being written, so this
     page keeps the slot open for it rather than starting a second model call.
     """
     sources = [collect_source(spec, args.context) for spec in args.sources]
-    if not any(s["files"] for s in sources):
+    empty = not any(s["files"] for s in sources)
+    if empty and not args.watch:
         sys.exit("diffview: no changes found in any source")
+    # under --watch an empty diff is a state the page shows, not an error: the work it is
+    # meant to follow may not have started, and the page fills in as the sources change
 
     title = args.title or " + ".join(f"{s['label']} {s['detail']}" for s in sources)
-    generate = not summary and args.auto_summary
+    generate = not empty and not summary and args.auto_summary
     body = summary_body(sources) if generate else ""
     for s in sources:
         s.pop("_patch", None)
 
     notes, agent_resolved = load_notes(args.notes)
-    n_files = sum(len(s["files"]) for s in sources)   # the changed ones; untouched cards join the sources next
+    size = diff_size(sources)   # of the changed files; the untouched cards that join next are not part of it
     attach_untouched(sources, notes, args.context)
     for s in sources:
         for f in s["files"]:
@@ -143,6 +146,7 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> tuple[
         "title": title,
         "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "sources": sources,
+        "size": size,
         "summary": summary,
         "summaryPending": generate or awaiting,
         "notes": notes,
@@ -153,12 +157,10 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> tuple[
 
     hljs = fetch_hljs(langs)
     write_page(out, data, hljs)
-    adds = sum(f["adds"] for s in sources for f in s["files"])
-    dels = sum(f["dels"] for s in sources for f in s["files"])
-    print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
+    print(f"{out.resolve()}  ({size['files']} files, +{size['adds']} -{size['dels']}, {out.stat().st_size // 1024} KB)")
     if generate:
         finish_summary(out, body, args.summary_model, data, hljs, page_id(out))
-    return summary, data["generated"]
+    return data
 
 
 def write_page(out: Path, data: dict, hljs: str) -> None:
@@ -189,12 +191,34 @@ def page_id(out: Path) -> tuple[int, int]:
     return st.st_ino, st.st_mtime_ns
 
 
-def load_summary(out: Path) -> str:
-    """The paragraph a background summary already landed beside this page, if it has."""
+def load_sidecar(out: Path) -> dict:
+    """What the background summary landed beside this page: the paragraph or the reason there is none, and the diff it saw."""
     try:
-        return json.loads(summary_path(out).read_text()).get("summary", "")
-    except (OSError, ValueError, AttributeError):
-        return ""
+        sidecar = json.loads(summary_path(out).read_text())
+    except (OSError, ValueError):
+        return {}
+    return sidecar if isinstance(sidecar, dict) else {}
+
+
+def load_summary(out: Path) -> str:
+    return load_sidecar(out).get("summary", "")
+
+
+def write_summary(out: Path, summary: str, error: str, written_for: dict) -> None:
+    """The summary sidecar. written_for is the diff size the paragraph describes, which is what lets a
+    served page say how far the diff has moved since; the time of writing joins it, unless it is an
+    earlier record going back as it was."""
+    sidecar = summary_path(out)
+    tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
+    record = {"at": datetime.now().astimezone().isoformat(timespec="seconds"), **written_for}
+    tmp.write_text(json.dumps({"summary": summary, "error": error, "for": record}))
+    os.replace(tmp, sidecar)
+
+
+def diff_size(sources: list[dict]) -> dict:
+    """How much diff there is: changed files, lines added, lines removed."""
+    files = [f for s in sources for f in s["files"]]
+    return {"files": len(files), "adds": sum(f["adds"] for f in files), "dels": sum(f["dels"] for f in files)}
 
 
 def default_output(specs: list[str]) -> Path:
@@ -528,13 +552,17 @@ def write_state(target: Path, raw: bytes) -> bool:
 # ---------------------------------------------------------------- watch mode
 
 
-def watch(args: Args, out: Path, summary: str, generated: str) -> None:
+def watch(args: Args, out: Path, page: dict) -> None:
     """Serve the page on localhost, regenerate when the sources change, let the page live-reload."""
     from http.server import BaseHTTPRequestHandler
 
-    expecting = not summary and args.auto_summary  # the first build's summary is still being written
-    args.auto_summary = False  # the summary was computed (or attempted) once; never re-pay per rebuild
-    version = {"g": generated, "k": str(out.resolve())}
+    summary = page["summary"]
+    expecting = page["summaryPending"]  # the first build asked for a summary that is still being written
+    if expecting:
+        args.auto_summary = False  # asked once; never re-pay per rebuild
+    version = {"g": page["generated"], "k": str(out.resolve())}
+    rewrite = threading.Event()   # the page asked for the summary to be written again; the loop below does it
+    superseded: dict = {}         # the sidecar that request replaced, kept for when the model call fails
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -566,8 +594,19 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
 
         def do_POST(self):
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if not local_request(self) or not self.path.endswith(".state.json") or self.headers.get("Origin") not in (None, own_origin):
-                self.send_response(403 if self.path.endswith(".state.json") else 404)
+            if not local_request(self) or self.headers.get("Origin") not in (None, own_origin):
+                self.send_response(403)
+                self.end_headers()
+                return
+            if self.path == "/summary":
+                superseded.update(load_sidecar(out))
+                summary_path(out).unlink(missing_ok=True)   # gone before the page starts polling, so it waits for the new one
+                rewrite.set()
+                self.send_response(204)
+                self.end_headers()
+                return
+            if not self.path.endswith(".state.json"):
+                self.send_response(404)
                 self.end_headers()
                 return
             if not write_state(state_path(out), self.rfile.read(int(self.headers["Content-Length"]))):
@@ -583,27 +622,61 @@ def watch(args: Args, out: Path, summary: str, generated: str) -> None:
     server = bind_local(Handler, " ".join(args.sources))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/"
+    last = sources_sig(args)   # taken before the announcement, so "watching" means: from here on
     print(f"diffview: watching {len(args.sources)} source(s); live page at {url}  (Ctrl-C stops)", flush=True)
     if args.open:
         launch(url)
 
-    last = sources_sig(args)
     try:
         while True:
             time.sleep(2)
             try:
+                if rewrite.is_set():
+                    rewrite.clear()
+                    text, page = rewrite_summary(args, out, superseded)
+                    if page:
+                        summary = text
+                        version["g"] = page["generated"]
+                    superseded.clear()
+                    superseded.update(load_sidecar(out))   # a request that arrived mid-call found no sidecar to keep
                 sig = sources_sig(args)
                 if sig == last:
                     continue
                 last = sig
-                summary = summary or load_summary(out)  # the first build's summary landed in the background
-                _, version["g"] = build(args, out, summary, awaiting=expecting and not summary)
+                if expecting and not summary:   # only a summary this run asked for; a sidecar left by an earlier round is not one
+                    summary = load_summary(out)
+                page = build(args, out, summary, awaiting=expecting and not summary)
+                version["g"] = page["generated"]
+                if args.auto_summary and page["summaryPending"]:  # the first build with anything in it asks for the summary
+                    expecting, args.auto_summary = True, False
                 print(f"diffview: sources changed, regenerated ({datetime.now():%H:%M:%S})", flush=True)
             except (SystemExit, OSError) as e:
                 # transient states are normal mid-review: a rebase in flight, a branch reset to base
                 print(f"diffview: sources unreadable right now, still serving the last page ({e})", flush=True)
     except KeyboardInterrupt:
         print("\ndiffview: watch stopped; the written file stays valid")
+
+
+def rewrite_summary(args: Args, out: Path, previous: dict) -> tuple[str, dict | None]:
+    """The summary written again for the diff as it is now, and the page rebuilt around it.
+
+    Returns ("", None) when the model call fails or the sources cannot be read; the previous
+    sidecar then goes back with the reason, so the page keeps its paragraph and says why.
+    """
+    try:
+        sources = [collect_source(spec, args.context) for spec in args.sources]
+        size = diff_size(sources)   # what the model sees; the tree may move on while it writes
+        text, error = generate_summary(summary_body(sources), args.summary_model)
+        if text:
+            page = build(args, out, text)
+            write_summary(out, text, "", size)
+            print(f"diffview: summary rewritten ({datetime.now():%H:%M:%S})", flush=True)
+            return text, page
+    except (SystemExit, OSError) as e:
+        error = str(e)
+    write_summary(out, previous.get("summary", ""), error, previous.get("for", {}))
+    print(f"diffview: summary not rewritten: {error}", flush=True)
+    return "", None
 
 
 def sources_sig(args: Args) -> str:
@@ -616,6 +689,14 @@ def sources_sig(args: Args) -> str:
             repo, range_ = spec.rsplit("@", 1) if "@" in spec else (".", spec)
             repo = str(Path(repo).expanduser().resolve())
             patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", *rev_args(range_)])
+            if is_worktree(range_):
+                root, names = untracked_files(repo)
+                for name in names:   # name, size and mtime stand in for the content; cheaper than diffing each file every tick
+                    try:
+                        st = os.stat(os.path.join(root, name))
+                    except OSError:
+                        continue   # gone between the listing and the stat; the next tick's listing says so
+                    patch += f"\0{name}\0{st.st_size}\0{st.st_mtime_ns}"
         h.update(patch.encode())
     if args.notes and Path(args.notes).expanduser().is_file():
         h.update(Path(args.notes).expanduser().read_bytes())
@@ -642,6 +723,8 @@ def collect_source(spec: str, context: int) -> dict:
         sys.exit(f"diffview: bad spec {spec!r}; need REPO@A..B, A..B, or OLD=NEW (see --help)")
 
     patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", *rev_args(range_)])
+    if is_worktree(range_):
+        patch += untracked_patch(repo, context)
     files = parse_patch(patch)
     base = (range_[:-2] or "HEAD") if is_worktree(range_) else ""
     commits = collect_commits(repo, f"{base}..HEAD" if base else range_)
@@ -736,6 +819,31 @@ def merge_windows(windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
 def is_worktree(range_: str) -> bool:
     """A trailing '..' means: compare against the working tree, uncommitted changes included."""
     return range_.endswith("..") and not range_.endswith("...")
+
+
+def untracked_files(repo: str) -> tuple[str, list[str]]:
+    """The repo root and the files git neither tracks nor ignores, root-relative.
+
+    A nested repository is listed as one entry with a trailing slash and is left out: it is
+    not a file, and its contents are that repository's business.
+    """
+    root = git_root(repo)
+    names = run_git(["-C", root, "ls-files", "--others", "--exclude-standard", "--full-name", "-z"]).split("\0")
+    return root, [n for n in names if n and not n.endswith("/")]
+
+
+def untracked_patch(repo: str, context: int) -> str:
+    """Untracked files as new-file diffs, for a worktree compare to append to `git diff`.
+
+    `git diff` shows what the index knows, and the files a session creates are exactly what
+    it does not: a review of fresh work would show nothing until someone staged it. Diffing
+    each file against /dev/null reads the tree and leaves the index alone.
+    """
+    root, names = untracked_files(repo)
+    return "".join(
+        run_git(["-C", root, "diff", "--no-color", "--no-ext-diff", f"-U{context}", "--no-index", "--", "/dev/null", name], ok_codes=(0, 1))
+        for name in names
+    )
 
 
 def rev_args(range_: str) -> list[str]:
@@ -947,10 +1055,7 @@ def finish_summary(out: Path, body: str, model: str, data: dict, hljs: str, rend
         os.dup2(devnull, fd)
     try:
         summary, error = generate_summary(body, model)
-        sidecar = summary_path(out)
-        tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"summary": summary, "error": error}))
-        os.replace(tmp, sidecar)
+        write_summary(out, summary, error, data["size"])
         # rendering to this path again while the model ran makes the page on disk somebody
         # else's; the sidecar still stands, so a page open on it is not left waiting
         if summary and page_id(out) == rendered:

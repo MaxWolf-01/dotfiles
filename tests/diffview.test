@@ -14,11 +14,14 @@ Run it directly; no framework. Uses the chromium build playwright keeps in its c
 
 import json
 import os
+import queue
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -60,6 +63,137 @@ def fixture(root: Path) -> Path:
     return repo
 
 
+class Watcher:
+    """A --watch process; its stdout lines are the clock the checks wait on."""
+
+    def __init__(self, spec: str, out: Path, *flags: str, env: dict | None = None):
+        self.proc = subprocess.Popen([str(DIFFVIEW), spec, "--watch", "-o", str(out), *flags],
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        self.lines: queue.Queue[str] = queue.Queue()
+        threading.Thread(target=lambda: [self.lines.put(line) for line in self.proc.stdout], daemon=True).start()
+        self.url = ""
+
+    def printed(self, word: str, seconds: float = 15) -> bool:
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                line = self.lines.get(timeout=left)
+            except queue.Empty:
+                break
+            if "live page at " in line:
+                self.url = line.split("live page at ")[1].split()[0]
+            if word in line:
+                return True
+        return False
+
+    def stop(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+
+
+def watch_case(repo: Path, pages: Path) -> None:
+    """--watch starts on sources with no changes, and an untracked file then shows up as an added one."""
+    out = pages / f"watch-{os.getpid()}.html"
+    spec = f"{repo}@HEAD.."   # the fixture is clean at HEAD: nothing to show until a file appears
+    proc = subprocess.run([str(DIFFVIEW), spec, "--no-auto-summary", "-o", str(out)], capture_output=True, text=True)
+    check("without --watch an empty diff is refused", 1, proc.returncode)
+    check("and no page is written", False, out.exists())
+
+    w = Watcher(spec, out, "--no-auto-summary")
+    try:
+        check("--watch starts on an empty diff", True, w.printed("watching"))
+        check("the empty page is written", True, out.is_file() and '"files": []' in out.read_text())
+        nested = repo / "nested"   # an untracked repository inside the repo: listed by git as a directory, not a file
+        nested.mkdir()
+        git(nested, "init", "-q")
+        (nested / "inner.txt").write_text("theirs\n")
+        (repo / "c.txt").write_text("fresh\n")
+        check("an untracked file regenerates the page", True, w.printed("regenerated"))
+        page = out.read_text()
+        check("and is on it as an added file", True, '"path": "c.txt"' in page and '"status": "added"' in page)
+        check("a nested repository is neither shown nor an error", True, '"path": "nested' not in page and not w.printed("error", seconds=3))
+        status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True).stdout
+        check("the viewer left the index alone", "?? c.txt\n?? nested/\n", status)
+    finally:
+        w.stop()
+        (repo / "c.txt").unlink(missing_ok=True)
+        shutil.rmtree(repo / "nested", ignore_errors=True)
+
+
+def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
+    """The summary records the diff it saw; ↻ says how far the diff has moved since and has it written again."""
+    shim = root / "shim"   # stands in for `claude -p`: prints what the mode file says, or fails when it says fail
+    shim.mkdir()
+    mode = root / "summary-mode"
+    mode.write_text("summary one")
+    (shim / "claude").write_text('#!/usr/bin/env bash\nm=$(cat "$MODE_FILE")\n'
+                                 'case "$m" in fail) echo shim refused >&2; exit 1;; slow*) sleep 4; m=${m#slow };; esac\n'
+                                 'cat >/dev/null\necho "$m"\n')
+    (shim / "claude").chmod(0o755)
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "MODE_FILE": str(mode)}
+    out = pages / f"rewrite-{os.getpid()}.html"
+    sidecar = Path(str(out) + ".summary.json")
+    original = (repo / "a.txt").read_text()
+
+    def landed() -> dict:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                return json.loads(sidecar.read_text())
+            except (OSError, ValueError):
+                time.sleep(0.2)
+        return {}
+
+    mode.write_text("fail")   # the first attempt fails: the state that most needs a way to ask again
+    w = Watcher(f"{repo}@base..", out, env=env)
+    title = lambda: page.locator(".summary .rewrite").get_attribute("title")
+    try:
+        check("a watch with a summary starts", True, w.printed("watching"))
+        failed = landed()
+        check("a failed first summary lands as its reason", ("", True), (failed.get("summary"), bool(failed.get("error"))))
+        page = browser.new_page()
+        page.goto(w.url + out.name)
+        page.wait_for_selector(".summary .rewrite.stale")
+        check("and the page offers to try again", True, "try again" in title())
+        mode.write_text("summary one")
+        page.click(".summary .rewrite")
+        check("↻ has the watcher try again", True, w.printed("summary rewritten", 20))
+        first = landed()
+        check("the summary records the diff it was written for", ("summary one", 3, 2),
+              (first.get("summary"), first.get("for", {}).get("adds"), first.get("for", {}).get("dels")))
+        page.wait_for_selector(".summary .rewrite:not(.stale)")
+        check("↻ on a fresh summary says it is current", True, "for this diff" in title())
+        (repo / "a.txt").write_text(original + "line 81 appended\n")
+        check("more changes regenerate the page", True, w.printed("regenerated"))
+        page.reload()
+        page.wait_for_selector(".summary .rewrite.stale")
+        check("↻ then says how far the diff has moved", True, "the diff is now +4 −2" in title())
+        mode.write_text("slow summary two")   # the model takes a while, and the tree moves on meanwhile
+        page.click(".summary .rewrite")
+        time.sleep(2.5)   # past the watcher's 2 s tick, so the sources are read and the model is "writing"
+        (repo / "a.txt").write_text(original + "line 81 appended\nline 82 appended\n")
+        check("↻ has the watcher write the summary again", True, w.printed("summary rewritten", 20))
+        second = landed()
+        check("the new summary records the diff the model saw, not the one after it", ("summary two", 4), (second.get("summary"), second.get("for", {}).get("adds")))
+        page.wait_for_selector(".summary .rewrite.stale")
+        check("so the page knows the diff moved on during the call", True, "the diff is now +5 −2" in title())
+        check("and shows the new summary", True, "summary two" in page.locator(".summary").inner_text())
+        mode.write_text("fail")
+        page.click(".summary .rewrite")
+        check("a failed rewrite is reported", True, w.printed("not rewritten", 20))
+        third = landed()
+        check("and keeps the old summary, its record and the reason", ("summary two", 4, True),
+              (third.get("summary"), third.get("for", {}).get("adds"), bool(third.get("error"))))
+        page.wait_for_selector(".summary .rewrite")
+        check("the page still shows the old summary", True, "summary two" in page.locator(".summary").inner_text())
+        page.close()
+    finally:
+        w.stop()
+        (repo / "a.txt").write_text(original)
+        for p in pages.glob(f"{out.stem}*"):
+            p.unlink()
+
+
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="diffview-test-"))
     repo = fixture(root)
@@ -82,6 +216,8 @@ def main() -> int:
     check("a note path outside the source is refused the same way", True, "outside.txt" in proc.stderr)
     check("the file count names changed files only", True, "(1 files," in proc.stdout)
     check("nothing outside the source got baked in", False, "not yours" in out.read_text())
+
+    watch_case(repo, pages)
 
     serve = subprocess.run([str(DIFFVIEW), "--serve", str(pages)], capture_output=True, text=True)
     url = serve.stdout.split(" at ")[-1].split()[0].rstrip("/") + "/" + out.name
@@ -183,6 +319,7 @@ def main() -> int:
             page.mouse.wheel(0, 100000)       # to the bottom by mouse: b.txt is now under the header
             page.wait_for_timeout(100)
             check("the tree follows the mouse wheel, not the keyboard focus", ["0:b.txt"], page.locator(".tree-file.current").evaluate_all("els => els.map(e => e.dataset.key)"))
+            rewrite_case(root, repo, pages, browser)
             browser.close()
     finally:
         try:
