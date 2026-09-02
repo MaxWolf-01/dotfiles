@@ -432,6 +432,7 @@
     stylua
     tailwindcss-language-server
     taplo
+    tree-sitter # parser builds for nvim-treesitter
     typescript-language-server
     vscode-langservers-extracted # html, cssls, jsonls, eslint
   ];
