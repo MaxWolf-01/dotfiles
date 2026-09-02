@@ -70,7 +70,7 @@ class Args:
     open: bool = False
     """Open the generated page in the browser ($DIFFVIEW_BROWSER, else xdg-open), served from its own directory so it can take comments."""
     watch: bool = False
-    """Regenerate whenever the sources change and serve the page on localhost with live reload (the summary is computed once and reused). Starts fine on sources with no changes yet: the page says so and fills in. The written file stays a plain snapshot you can share."""
+    """Regenerate whenever the sources change and serve the page on localhost with live reload. The summary is written once; the ↻ beside it says how far the diff has moved since and rewrites it on request. Starts fine on sources with no changes yet: the page says so and fills in. The written file stays a plain snapshot you can share."""
     notes: str = ""
     """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top): the place to say what was read and deliberately left alone. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is display-only and never part of the comment export. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
@@ -141,11 +141,17 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
 
     langs = {f["lang"] for s in sources for f in s["files"] if f["lang"]}
     saved = load_saved_state(out)
+    size = {
+        "files": n_files,
+        "adds": sum(f["adds"] for s in sources for f in s["files"]),
+        "dels": sum(f["dels"] for s in sources for f in s["files"]),
+    }
 
     data = {
         "title": title,
         "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "sources": sources,
+        "size": size,
         "summary": summary,
         "summaryPending": generate or awaiting,
         "notes": notes,
@@ -156,9 +162,7 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
 
     hljs = fetch_hljs(langs)
     write_page(out, data, hljs)
-    adds = sum(f["adds"] for s in sources for f in s["files"])
-    dels = sum(f["dels"] for s in sources for f in s["files"])
-    print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
+    print(f"{out.resolve()}  ({size['files']} files, +{size['adds']} -{size['dels']}, {out.stat().st_size // 1024} KB)")
     if generate:
         finish_summary(out, body, args.summary_model, data, hljs, page_id(out))
     return data
@@ -192,12 +196,26 @@ def page_id(out: Path) -> tuple[int, int]:
     return st.st_ino, st.st_mtime_ns
 
 
-def load_summary(out: Path) -> str:
-    """The paragraph a background summary already landed beside this page, if it has."""
+def load_sidecar(out: Path) -> dict:
+    """What the background summary landed beside this page: the paragraph or the reason there is none, and the diff it saw."""
     try:
-        return json.loads(summary_path(out).read_text()).get("summary", "")
-    except (OSError, ValueError, AttributeError):
-        return ""
+        sidecar = json.loads(summary_path(out).read_text())
+    except (OSError, ValueError):
+        return {}
+    return sidecar if isinstance(sidecar, dict) else {}
+
+
+def load_summary(out: Path) -> str:
+    return load_sidecar(out).get("summary", "")
+
+
+def write_summary(out: Path, summary: str, error: str, written_for: dict) -> None:
+    """The summary sidecar. written_for is the page size the paragraph describes plus when it was written,
+    which is what lets a served page say how far the diff has moved since."""
+    sidecar = summary_path(out)
+    tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"summary": summary, "error": error, "for": written_for}))
+    os.replace(tmp, sidecar)
 
 
 def default_output(specs: list[str]) -> Path:
@@ -540,6 +558,8 @@ def watch(args: Args, out: Path, page: dict) -> None:
     if expecting:
         args.auto_summary = False  # asked once; never re-pay per rebuild
     version = {"g": page["generated"], "k": str(out.resolve())}
+    rewrite = threading.Event()   # the page asked for the summary to be written again; the loop below does it
+    superseded: dict = {}         # the sidecar that request replaced, kept for when the model call fails
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -571,8 +591,19 @@ def watch(args: Args, out: Path, page: dict) -> None:
 
         def do_POST(self):
             own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if not local_request(self) or not self.path.endswith(".state.json") or self.headers.get("Origin") not in (None, own_origin):
-                self.send_response(403 if self.path.endswith(".state.json") else 404)
+            if not local_request(self) or self.headers.get("Origin") not in (None, own_origin):
+                self.send_response(403)
+                self.end_headers()
+                return
+            if self.path == "/summary":
+                superseded.update(load_sidecar(out))
+                summary_path(out).unlink(missing_ok=True)   # gone before the page starts polling, so it waits for the new one
+                rewrite.set()
+                self.send_response(204)
+                self.end_headers()
+                return
+            if not self.path.endswith(".state.json"):
+                self.send_response(404)
                 self.end_headers()
                 return
             if not write_state(state_path(out), self.rfile.read(int(self.headers["Content-Length"]))):
@@ -597,6 +628,19 @@ def watch(args: Args, out: Path, page: dict) -> None:
         while True:
             time.sleep(2)
             try:
+                if rewrite.is_set():
+                    rewrite.clear()
+                    sources = [collect_source(spec, args.context) for spec in args.sources]
+                    text, error = generate_summary(summary_body(sources), args.summary_model)
+                    if text:
+                        summary = text
+                        page = build(args, out, summary)
+                        version["g"] = page["generated"]
+                        write_summary(out, text, "", {**page["size"], "at": page["generated"]})
+                        print(f"diffview: summary rewritten ({datetime.now():%H:%M:%S})", flush=True)
+                    else:   # the old paragraph stays, and the page shows why there is no new one
+                        write_summary(out, superseded.get("summary", ""), error, superseded.get("for", {}))
+                        print(f"diffview: summary not rewritten: {error}", flush=True)
                 sig = sources_sig(args)
                 if sig == last:
                     continue
@@ -991,10 +1035,7 @@ def finish_summary(out: Path, body: str, model: str, data: dict, hljs: str, rend
         os.dup2(devnull, fd)
     try:
         summary, error = generate_summary(body, model)
-        sidecar = summary_path(out)
-        tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"summary": summary, "error": error}))
-        os.replace(tmp, sidecar)
+        write_summary(out, summary, error, {**data["size"], "at": data["generated"]})
         # rendering to this path again while the model ran makes the page on disk somebody
         # else's; the sidecar still stands, so a page open on it is not left waiting
         if summary and page_id(out) == rendered:
