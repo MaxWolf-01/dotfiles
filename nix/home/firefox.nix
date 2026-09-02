@@ -1,6 +1,21 @@
 { config, pkgs, ... }:
 let
   home = config.home.homeDirectory;
+  # Firefox runs under firejail with a tmpfs $HOME. A protocol handler it
+  # launches itself runs inside that jail: empty ~/.config, no access to the
+  # already-running instance outside (Slack's magic-login lands in a throwaway
+  # second Slack, Obsidian opens without its vaults). Firefox's own portal
+  # pref covers file reveal only, not protocol links, so route
+  # those through the OpenURI portal explicitly: this xdg-open is a pure
+  # portal client and the portal launches the handler in the host session.
+  portalOpen = {
+    action = "useHelperApp";
+    ask = false;
+    handlers = [{
+      name = "xdg-desktop-portal";
+      path = "${pkgs.flatpak-xdg-utils}/bin/xdg-open";
+    }];
+  };
   firefoxBin = "${home}/.nix-profile/bin/firefox";
   # Pre-launch history maintenance — fresh starts only. When Firefox is already
   # running (link clicks from other apps), exec immediately: any delay here sits
@@ -65,6 +80,11 @@ in
       GenerativeAI = {
         Chatbot = false;
         LinkPreviews = false;
+      };
+
+      Handlers.schemes = {
+        slack = portalOpen;
+        obsidian = portalOpen;
       };
     };
 
@@ -145,10 +165,9 @@ in
         # GPU / performance
         "media.ffmpeg.vaapi.enabled" = true;
         "widget.use-xdg-desktop-portal.file-picker" = 1;
-        # Hand external protocols (slack://, obsidian://) to xdg-desktop-portal.
-        # Firefox runs under firejail with a tmpfs $HOME, so a handler it launches
-        # itself sees an empty ~/.config and cannot reach an already-running
-        # instance. The portal launches it in the session instead.
+        # Reveal-in-file-manager goes through the portal, so it runs the
+        # session's file manager, not one inside the jail. Protocol links are
+        # not covered by this pref: see Handlers above.
         "widget.use-xdg-desktop-portal.open-uri" = 1;
         "media.eme.enabled" = true;
         "media.webspeech.synth.enabled" = false;
