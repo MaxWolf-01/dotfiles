@@ -14,11 +14,14 @@ Run it directly; no framework. Uses the chromium build playwright keeps in its c
 
 import json
 import os
+import queue
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -60,6 +63,46 @@ def fixture(root: Path) -> Path:
     return repo
 
 
+def watch_case(repo: Path, pages: Path) -> None:
+    """--watch starts on sources with no changes, and an untracked file then shows up as an added one."""
+    out = pages / f"watch-{os.getpid()}.html"
+    spec = f"{repo}@HEAD.."   # the fixture is clean at HEAD: nothing to show until a file appears
+    proc = subprocess.run([str(DIFFVIEW), spec, "--no-auto-summary", "-o", str(out)], capture_output=True, text=True)
+    check("without --watch an empty diff is refused", 1, proc.returncode)
+    check("and no page is written", False, out.exists())
+
+    watcher = subprocess.Popen([str(DIFFVIEW), spec, "--watch", "--no-auto-summary", "-o", str(out)],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines: queue.Queue[str] = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(line) for line in watcher.stdout], daemon=True).start()
+
+    def printed(word: str, seconds: float = 15) -> bool:
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                if word in lines.get(timeout=left):
+                    return True
+            except queue.Empty:
+                break
+        return False
+
+    try:
+        check("--watch starts on an empty diff", True, printed("watching"))
+        check("the empty page is written", True, out.is_file() and '"files": []' in out.read_text())
+        (repo / "c.txt").write_text("fresh\n")
+        check("an untracked file regenerates the page", True, printed("regenerated"))
+        page = out.read_text()
+        check("and is on it as an added file", True, '"path": "c.txt"' in page and '"status": "added"' in page)
+        status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True).stdout
+        check("the viewer left the index alone", "?? c.txt\n", status)
+    finally:
+        watcher.terminate()
+        watcher.wait(timeout=5)
+        (repo / "c.txt").unlink(missing_ok=True)
+        for p in pages.glob(f"{out.stem}*"):
+            p.unlink()
+
+
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="diffview-test-"))
     repo = fixture(root)
@@ -82,6 +125,8 @@ def main() -> int:
     check("a note path outside the source is refused the same way", True, "outside.txt" in proc.stderr)
     check("the file count names changed files only", True, "(1 files," in proc.stdout)
     check("nothing outside the source got baked in", False, "not yours" in out.read_text())
+
+    watch_case(repo, pages)
 
     serve = subprocess.run([str(DIFFVIEW), "--serve", str(pages)], capture_output=True, text=True)
     url = serve.stdout.split(" at ")[-1].split()[0].rstrip("/") + "/" + out.name
