@@ -14,6 +14,7 @@
 
   imports = [
     ../desktop.nix
+    ../dotnet.nix
     ../gnome.nix
     ../greyline.nix
     ../timers.nix

@@ -46,7 +46,8 @@ return {
       end,
     })
 
-    -- every server here needs its binary in nix/home/common.nix (home.packages);
+    -- every server here needs its binary in nix/home/common.nix (home.packages)
+    -- or in the host module that owns its toolchain (roslyn_ls: dotnet.nix);
     -- vim.lsp.enable() does not check, it fails when the filetype is opened
     local servers = {
       "angularls",
@@ -64,6 +65,7 @@ return {
       "lua_ls",
       "markdown_oxide",
       "nixd",
+      "roslyn_ls",
       "rust_analyzer",
       "tailwindcss",
       "taplo",

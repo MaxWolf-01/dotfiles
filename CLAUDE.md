@@ -77,6 +77,7 @@ Structure:
 - `flake.nix` — defines all hosts. PC is a NixOS system (with HM as module); laptops are HM standalone.
 - `nix/home/common.nix` - CLI tools for all hosts (auto-included via mkHome)
 - `nix/home/desktop.nix` - GUI apps (vesktop, obsidian, etc.) — workstation machines only
+- `nix/home/dotnet.nix` - .NET SDK 8, Roslyn C# language server, sqlcmd — zephyrus only
 - `nix/home/firefox.nix` - Firefox: policies, search engines, about:config
 - `nix/home/ghostty.nix` - terminal emulator
 - `nix/home/gnome.nix` - GNOME keybindings, tiling-shell, dconf settings
