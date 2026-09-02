@@ -14,6 +14,9 @@ in
 
   programs.vesktop = {
     enable = true;
+    # Nix-pinned Vencord: no runtime self-download to go stale. Forgoes the
+    # binary cache; vesktop builds from source on every bump.
+    vencord.useSystem = true;
     settings = {
       discordBranch = "stable";
       minimizeToTray = true;
