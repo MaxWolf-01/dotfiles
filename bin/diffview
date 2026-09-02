@@ -130,7 +130,7 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
         s.pop("_patch", None)
 
     notes, agent_resolved = load_notes(args.notes)
-    n_files = sum(len(s["files"]) for s in sources)   # the changed ones; untouched cards join the sources next
+    size = diff_size(sources)   # of the changed files; the untouched cards that join next are not part of it
     attach_untouched(sources, notes, args.context)
     for s in sources:
         for f in s["files"]:
@@ -141,11 +141,6 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
 
     langs = {f["lang"] for s in sources for f in s["files"] if f["lang"]}
     saved = load_saved_state(out)
-    size = {
-        "files": n_files,
-        "adds": sum(f["adds"] for s in sources for f in s["files"]),
-        "dels": sum(f["dels"] for s in sources for f in s["files"]),
-    }
 
     data = {
         "title": title,
@@ -210,12 +205,20 @@ def load_summary(out: Path) -> str:
 
 
 def write_summary(out: Path, summary: str, error: str, written_for: dict) -> None:
-    """The summary sidecar. written_for is the page size the paragraph describes plus when it was written,
-    which is what lets a served page say how far the diff has moved since."""
+    """The summary sidecar. written_for is the diff size the paragraph describes, which is what lets a
+    served page say how far the diff has moved since; the time of writing joins it, unless it is an
+    earlier record going back as it was."""
     sidecar = summary_path(out)
     tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"summary": summary, "error": error, "for": written_for}))
+    record = {"at": datetime.now().astimezone().isoformat(timespec="seconds"), **written_for}
+    tmp.write_text(json.dumps({"summary": summary, "error": error, "for": record}))
     os.replace(tmp, sidecar)
+
+
+def diff_size(sources: list[dict]) -> dict:
+    """How much diff there is: changed files, lines added, lines removed."""
+    files = [f for s in sources for f in s["files"]]
+    return {"files": len(files), "adds": sum(f["adds"] for f in files), "dels": sum(f["dels"] for f in files)}
 
 
 def default_output(specs: list[str]) -> Path:
@@ -630,17 +633,12 @@ def watch(args: Args, out: Path, page: dict) -> None:
             try:
                 if rewrite.is_set():
                     rewrite.clear()
-                    sources = [collect_source(spec, args.context) for spec in args.sources]
-                    text, error = generate_summary(summary_body(sources), args.summary_model)
-                    if text:
+                    text, page = rewrite_summary(args, out, superseded)
+                    if page:
                         summary = text
-                        page = build(args, out, summary)
                         version["g"] = page["generated"]
-                        write_summary(out, text, "", {**page["size"], "at": page["generated"]})
-                        print(f"diffview: summary rewritten ({datetime.now():%H:%M:%S})", flush=True)
-                    else:   # the old paragraph stays, and the page shows why there is no new one
-                        write_summary(out, superseded.get("summary", ""), error, superseded.get("for", {}))
-                        print(f"diffview: summary not rewritten: {error}", flush=True)
+                    superseded.clear()
+                    superseded.update(load_sidecar(out))   # a request that arrived mid-call found no sidecar to keep
                 sig = sources_sig(args)
                 if sig == last:
                     continue
@@ -657,6 +655,28 @@ def watch(args: Args, out: Path, page: dict) -> None:
                 print(f"diffview: sources unreadable right now, still serving the last page ({e})", flush=True)
     except KeyboardInterrupt:
         print("\ndiffview: watch stopped; the written file stays valid")
+
+
+def rewrite_summary(args: Args, out: Path, previous: dict) -> tuple[str, dict | None]:
+    """The summary written again for the diff as it is now, and the page rebuilt around it.
+
+    Returns ("", None) when the model call fails or the sources cannot be read; the previous
+    sidecar then goes back with the reason, so the page keeps its paragraph and says why.
+    """
+    try:
+        sources = [collect_source(spec, args.context) for spec in args.sources]
+        size = diff_size(sources)   # what the model sees; the tree may move on while it writes
+        text, error = generate_summary(summary_body(sources), args.summary_model)
+        if text:
+            page = build(args, out, text)
+            write_summary(out, text, "", size)
+            print(f"diffview: summary rewritten ({datetime.now():%H:%M:%S})", flush=True)
+            return text, page
+    except (SystemExit, OSError) as e:
+        error = str(e)
+    write_summary(out, previous.get("summary", ""), error, previous.get("for", {}))
+    print(f"diffview: summary not rewritten: {error}", flush=True)
+    return "", None
 
 
 def sources_sig(args: Args) -> str:
@@ -1035,7 +1055,7 @@ def finish_summary(out: Path, body: str, model: str, data: dict, hljs: str, rend
         os.dup2(devnull, fd)
     try:
         summary, error = generate_summary(body, model)
-        write_summary(out, summary, error, {**data["size"], "at": data["generated"]})
+        write_summary(out, summary, error, data["size"])
         # rendering to this path again while the model ran makes the page on disk somebody
         # else's; the sidecar still stands, so a page open on it is not left waiting
         if summary and page_id(out) == rendered:
