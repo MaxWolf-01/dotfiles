@@ -14,6 +14,10 @@ in
 
   programs.vesktop = {
     enable = true;
+    # Vencord from nixpkgs instead of Vesktop's runtime self-download, which
+    # can silently stop updating and then breaks features that call Vencord
+    # (screen share picker). Forgoes the binary cache: vesktop builds from source.
+    vencord.useSystem = true;
     settings = {
       discordBranch = "stable";
       minimizeToTray = true;
