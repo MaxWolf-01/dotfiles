@@ -71,7 +71,7 @@ class Args:
     watch: bool = False
     """Regenerate whenever the sources change and serve the page on localhost with live reload (the summary is computed once and reused). The written file stays a plain snapshot you can share."""
     notes: str = ""
-    """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is display-only and never part of the comment export. In --watch mode the page refreshes when this file changes."""
+    """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top): the place to say what was read and deliberately left alone. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is display-only and never part of the comment export. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
     """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own once nobody has asked for a page in a while."""
     context: int = 3
@@ -125,14 +125,18 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> tuple[
     for s in sources:
         s.pop("_patch", None)
 
-    langs = {f["lang"] for s in sources for f in s["files"] if f["lang"]}
-
     notes, agent_resolved = load_notes(args.notes)
+    n_files = sum(len(s["files"]) for s in sources)   # the changed ones; untouched cards join the sources next
+    attach_untouched(sources, notes, args.context)
+    for s in sources:
+        for f in s["files"]:
+            if f["status"] in ("modified", "renamed") and not f["binary"]:
+                f["content"] = file_lines(s, f["path"])
+        s.pop("_root", None)
+        s.pop("_rev", None)
+
+    langs = {f["lang"] for s in sources for f in s["files"] if f["lang"]}
     saved = load_saved_state(out)
-    changed_paths = {f["path"] for s in sources for f in s["files"]}
-    for n in notes:
-        if n["path"] not in changed_paths and not any(p.endswith("/" + n["path"]) for p in changed_paths):
-            print(f"diffview: warning: --notes path {n['path']!r} matches no changed file; that note is shown nowhere", file=sys.stderr)
 
     data = {
         "title": title,
@@ -148,7 +152,6 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> tuple[
 
     hljs = fetch_hljs(langs)
     write_page(out, data, hljs)
-    n_files = sum(len(s["files"]) for s in sources)
     adds = sum(f["adds"] for s in sources for f in s["files"])
     dels = sum(f["dels"] for s in sources for f in s["files"])
     print(f"{out.resolve()}  ({n_files} files, +{adds} -{dels}, {out.stat().st_size // 1024} KB)")
@@ -625,7 +628,8 @@ def collect_source(spec: str, context: int) -> dict:
         old, new = (str(Path(p).expanduser()) for p in spec.split("=", 1))
         patch = run_git(["diff", "--no-color", "--no-ext-diff", f"-U{context}", "--no-index", "--", old, new], ok_codes=(0, 1))
         files = parse_patch(patch, strip_roots=(old, new))
-        return {"label": Path(new).name, "kind": "paths", "detail": f"{old} → {new}", "files": files, "commits": None, "_patch": patch}
+        return {"label": Path(new).name, "kind": "paths", "detail": f"{old} → {new}", "files": files, "commits": None,
+                "_patch": patch, "_root": new, "_rev": None}
 
     if "@" in spec:
         repo, range_ = spec.rsplit("@", 1)
@@ -640,7 +644,91 @@ def collect_source(spec: str, context: int) -> dict:
     base = (range_[:-2] or "HEAD") if is_worktree(range_) else ""
     commits = collect_commits(repo, f"{base}..HEAD" if base else range_)
     detail = f"{base}..worktree" if base else range_
-    return {"label": Path(repo).name, "kind": "git", "detail": detail, "files": files, "commits": commits, "_patch": patch}
+    rev = None if base else (re.split(r"\.{2,3}", range_)[-1] or "HEAD")
+    return {"label": Path(repo).name, "kind": "git", "detail": detail, "files": files, "commits": commits,
+            "_patch": patch, "_root": repo, "_rev": rev}
+
+
+MAX_BAKED_BYTES = 1_000_000   # a lockfile or generated blob in the diff must not turn the page into a copy of it
+
+
+def file_lines(source: dict, path: str) -> list[str] | None:
+    """The new side of a file in this source, whole; None when the source has no such file, or it is too big to bake.
+
+    Unchanged regions are identical on both sides, so the new side is enough for the page
+    to open any gap between hunks, and the old line numbers follow from the offset.
+    """
+    root = Path(source["_root"]).resolve()
+    if source["_rev"] is None:
+        if root.is_file():   # file=file compare: the source holds exactly one file
+            target = root if path == root.name else None
+        else:
+            target = (root / path).resolve()
+            if not target.is_relative_to(root):   # a note names a path; it must not pull anything outside the source in
+                target = None
+        try:
+            raw = target.read_bytes() if target else None
+        except OSError:
+            raw = None
+    else:
+        proc = subprocess.run(["git", "-C", str(root), "show", f"{source['_rev']}:{path}"], capture_output=True)
+        raw = proc.stdout if proc.returncode == 0 else None
+    if raw is None or len(raw) > MAX_BAKED_BYTES:
+        return None
+    lines = raw.decode(errors="replace").split("\n")   # git counts \n only; splitlines() would also break on \f, \v, U+2028…
+    return lines[:-1] if lines and lines[-1] == "" else lines
+
+
+TOP_WINDOW = 20   # what a line-less note on an untouched file opens: the top of the file, one expansion step's worth
+
+
+def attach_untouched(sources: list[dict], notes: list[dict], context: int) -> None:
+    """A note on a file outside the diff puts that file on the page, opened at the noted lines.
+
+    The file joins the first source that has it, as a card with no changes and one all-context
+    hunk per noted window, so the page treats it like any other file: the note anchors to
+    its lines, comments attach, and the hunk expands from the baked content like the rest.
+    """
+    changed = {f["path"] for s in sources for f in s["files"]}
+    by_path: dict[str, list[dict]] = {}
+    for n in notes:
+        if n["path"] in changed or any(p.endswith("/" + n["path"]) for p in changed):
+            continue
+        by_path.setdefault(n["path"], []).append(n)
+    for path, ns in by_path.items():
+        for s in sources:
+            lines = file_lines(s, path)
+            if lines is None:
+                continue
+            windows = merge_windows([note_window(n, len(lines), context) for n in ns])
+            # no old side: nothing to compare against, so only the new gutter takes comments
+            hunks = [{"os": a, "ns": a, "header": "", "lines": [[0, None, no, lines[no - 1]] for no in range(a, b + 1)]}
+                     for a, b in windows]
+            f = {"path": path, "oldPath": None, "status": "untouched", "adds": 0, "dels": 0, "binary": False,
+                 "lang": None, "hunks": hunks, "content": lines}
+            f["lang"] = guess_lang(f)
+            s["files"].append(f)
+            break
+        else:
+            print(f"diffview: warning: --notes path {path!r} is in no source, changed or not; that note is shown nowhere", file=sys.stderr)
+
+
+def note_window(n: dict, n_lines: int, context: int) -> tuple[int, int]:
+    """The lines an untouched-file note opens: the noted range plus --context around it, or the top of the file."""
+    if n.get("line") is None:
+        return 1, min(TOP_WINDOW, n_lines)
+    start, end = min(n["line"], n_lines), min(n.get("end") or n["line"], n_lines)
+    return max(1, start - context), min(n_lines, end + context)
+
+
+def merge_windows(windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for a, b in sorted(windows):
+        if out and a <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
 
 
 def is_worktree(range_: str) -> bool:
