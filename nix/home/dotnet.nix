@@ -1,5 +1,4 @@
-# .NET toolchain: SDK 8, the Roslyn C# language server for neovim, and sqlcmd
-# for MSSQL.
+# .NET toolchain: SDK 8 and the Roslyn C# language server for neovim.
 #
 # roslyn-ls is built with useDotnetFromEnv, so it runs on the SDK from PATH
 # rather than a bundled runtime -- the two belong in the same module.
@@ -8,7 +7,6 @@
   home.packages = with pkgs; [
     dotnet-sdk_8
     roslyn-ls
-    sqlcmd
   ];
 
   home.sessionVariables.DOTNET_CLI_TELEMETRY_OPTOUT = "1";
