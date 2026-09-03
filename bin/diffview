@@ -71,7 +71,7 @@ class Args:
     watch: bool = False
     """Regenerate whenever the sources change and serve the page on localhost with live reload. The summary is written once; the ↻ beside it says how far the diff has moved since and rewrites it on request. Starts fine on sources with no changes yet: the page says so and fills in. The written file stays a plain snapshot you can share."""
     notes: str = ""
-    """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top): the place to say what was read and deliberately left alone. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
+    """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top): the place to say what was read and deliberately left alone. A note with "re": "C4" answers that review comment: it sits under it, indented, and needs no path or line of its own; the thread can go on from there (the reviewer replies to a note with c or its reply button, and the reply carries "re A3"). Answering a comment does not resolve it. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
     """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own once nobody has asked for a page in a while."""
     context: int = 3
@@ -128,7 +128,9 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
     for s in sources:
         s.pop("_patch", None)
 
+    saved = load_saved_state(out)
     notes, agent_resolved = load_notes(args.notes)
+    inherit_anchors(notes, saved, args.notes)
     size = diff_size(sources)   # of the changed files; the untouched cards that join next are not part of it
     attach_untouched(sources, notes, args.context)
     for s in sources:
@@ -139,7 +141,6 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
         s.pop("_rev", None)
 
     langs = {f["lang"] for s in sources for f in s["files"] if f["lang"]}
-    saved = load_saved_state(out)
 
     data = {
         "title": title,
@@ -290,11 +291,11 @@ def load_notes(path: str) -> tuple[list[dict], list[int]]:
     if not isinstance(blob, dict) or not isinstance(blob.get("notes"), list):
         sys.exit(f'diffview: --notes {path} must be a JSON object with a "notes" list (see --help)')
     notes = blob["notes"]
-    if not all(isinstance(n, dict) and n.get("path") and n.get("text") and "id" in n for n in notes):
-        sys.exit(f"diffview: --notes {path}: every note needs at least 'id', 'path' and 'text'")
+    if not all(isinstance(n, dict) and n.get("text") and "id" in n and (n.get("path") or n.get("re")) for n in notes):
+        sys.exit(f"diffview: --notes {path}: every note needs 'id', 'text', and a 'path' or a 're' comment it answers")
     seen: set[int] = set()
     for n in notes:
-        n["id"] = as_int(n["id"], f"--notes {path}: 'id' (note on {n['path']})")
+        n["id"] = as_int(n["id"], f"--notes {path}: 'id' (note on {n.get('path') or n.get('re')})")
         if n["id"] in seen:
             sys.exit(f"diffview: --notes {path}: two notes share id {n['id']}; ids are handles the agent refers to and must be unique")
         seen.add(n["id"])
@@ -303,7 +304,28 @@ def load_notes(path: str) -> tuple[list[dict], list[int]]:
                 n[key] = as_int(n[key], f"--notes {path}: {key!r} (note A{n['id']})")
         if "side" in n and n["side"] not in ("old", "new"):
             sys.exit(f"diffview: --notes {path}: 'side' must be \"old\" or \"new\" (note A{n['id']})")
-    return notes, parse_resolved(blob.get("resolved", []), path)
+        if "re" in n:
+            n["re"] = comment_id(n["re"], path)
+    return notes, [comment_id(item, path) for item in resolved_list(blob.get("resolved", []), path)]
+
+
+def inherit_anchors(notes: list[dict], saved: dict | None, path: str) -> None:
+    """A note answering a comment sits under it, so it may leave its place unsaid: the comment's
+    file and lines fill in, and stay with the note should the comment be deleted later (a note
+    under a whole-hunk comment then lands at the file's top). The comment must be on the page for
+    that; a note answering one that is gone needs a path of its own to land anywhere."""
+    comments = {c.get("id"): c for c in (saved or {}).get("comments", []) if isinstance(c, dict)}
+    for n in notes:
+        if "re" not in n:
+            continue
+        c = comments.get(n["re"])
+        if c is None:
+            if not n.get("path"):
+                sys.exit(f"diffview: --notes {path}: note A{n['id']} answers C{n['re']}, which is not on the page; give it a path")
+            continue
+        n.setdefault("path", str(c.get("fileKey", "")).split(":", 1)[-1])
+        if "line" not in n and c.get("side") in ("old", "new"):
+            n["side"], n["line"], n["end"] = c["side"], c["start"], c["end"]
 
 
 def as_int(value: object, where: str) -> int:
@@ -314,17 +336,18 @@ def as_int(value: object, where: str) -> int:
     return value
 
 
-def parse_resolved(raw: object, path: str) -> list[int]:
-    """Comment ids the agent addressed, written the way the export prints them ("C4")."""
+def resolved_list(raw: object, path: str) -> list:
     if not isinstance(raw, list):
         sys.exit(f'diffview: --notes {path}: "resolved" must be a list of comment ids like ["C1", "C4"]')
-    out = []
-    for item in raw:
-        m = re.fullmatch(r"[Cc]?(\d+)", str(item).strip())
-        if not m:
-            sys.exit(f'diffview: --notes {path}: {item!r} is not a comment id; write them as the export shows them ("C4")')
-        out.append(int(m[1]))
-    return out
+    return raw
+
+
+def comment_id(item: object, path: str) -> int:
+    """A comment id written the way the export prints it ("C4")."""
+    m = re.fullmatch(r"[Cc]?(\d+)", str(item).strip())
+    if not m:
+        sys.exit(f'diffview: --notes {path}: {item!r} is not a comment id; write them as the export shows them ("C4")')
+    return int(m[1])
 
 
 # ---------------------------------------------------------------- serve mode
