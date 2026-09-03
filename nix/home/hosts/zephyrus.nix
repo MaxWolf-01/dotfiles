@@ -4,7 +4,13 @@
   home.homeDirectory = "/home/max";
   home.stateVersion = "26.05";
 
-  home.packages = [ pkgs.brave ];
+  programs.brave = {
+    enable = true;
+    # External-extension manifests: Brave installs these into every profile.
+    extensions = [
+      { id = "jnbbnacmeggbgdjgaoojpmhdlkkpblgi"; } # WakaTime
+    ];
+  };
 
   # This machine's capability record, read by a worker running locally and by
   # `worker-hosts` (bin/). No @TOOLCHAIN@ token: what is installed here is

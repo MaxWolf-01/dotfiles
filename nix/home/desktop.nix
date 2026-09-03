@@ -17,6 +17,22 @@ in
     # Nix-pinned Vencord: no runtime self-download to go stale. Forgoes the
     # binary cache; vesktop builds from source on every bump.
     vencord.useSystem = true;
+    # Vencord only loads userplugins that were in src/ at build time, so the
+    # WakaTime plugin is spliced into the nixpkgs Vencord source. Its API key
+    # is entered in the plugin's settings UI, never here.
+    package = pkgs.vesktop.override {
+      vencord = pkgs.vencord.overrideAttrs (old: {
+        postPatch = (old.postPatch or "") + ''
+          mkdir -p src/userplugins
+          cp -r ${pkgs.fetchFromGitHub {
+            owner = "wakatime";
+            repo = "vencord-wakatime";
+            rev = "de045a0767dde6708d36f96387d389c814789fd4";
+            hash = "sha256-k+UqTHCTTsSCb6Enl6gNUhIvb5+5OGsYa0jbJB2pL3U=";
+          }} src/userplugins/vencord-wakatime
+        '';
+      });
+    };
     settings = {
       discordBranch = "stable";
       minimizeToTray = true;
