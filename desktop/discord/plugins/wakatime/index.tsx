@@ -3,8 +3,7 @@
  * Copyright (c) 2024 Vendicated and contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Derived from wakatime/vencord-wakatime (de045a0). Upstream sends a heartbeat
- * on a two-minute timer regardless of focus; this version sends on activity.
+ * Derived from wakatime/vencord-wakatime (de045a0).
  */
 
 import { definePluginSettings } from "@api/Settings";
