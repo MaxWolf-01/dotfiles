@@ -340,6 +340,35 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- WakaTime heartbeats → ~/data/wakatime ---
+  # The local copy of every heartbeat; why it exists is in bin/wakatime-sync.
+  # Early morning so the day just ended is complete, and the run re-fetches the
+  # last three days for heartbeats plugins delivered late.
+
+  systemd.user.services.wakatime-sync = {
+    Unit = {
+      Description = "Mirror WakaTime heartbeats into per-day files";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${uvScriptPath}" ];
+      ExecStart = "${dotfiles}/bin/wakatime-sync --record";
+      TimeoutStartSec = "30min";
+    };
+  };
+
+  systemd.user.timers.wakatime-sync = {
+    Unit.Description = "Daily WakaTime heartbeat mirror";
+    Timer = {
+      OnCalendar = "*-*-* 03:30:00";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Documents → jarvis (read-only mirror for the agent) ---
 
   systemd.user.services.jarvis-sync = {
