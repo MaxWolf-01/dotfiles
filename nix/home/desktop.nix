@@ -18,30 +18,13 @@ in
     # binary cache; vesktop builds from source on every bump.
     vencord.useSystem = true;
     # Vencord only loads userplugins that were in src/ at build time, so the
-    # WakaTime plugin is spliced into the nixpkgs Vencord source. Its API key
-    # is entered in the plugin's settings UI, never here.
+    # plugins under desktop/discord/plugins are spliced into the nixpkgs
+    # Vencord source. Their settings (API keys included) live in the plugin
+    # settings UI, never here.
     package = pkgs.vesktop.override {
       vencord = pkgs.vencord.overrideAttrs (old: {
         postPatch = (old.postPatch or "") + ''
-          mkdir -p src/userplugins
-          cp -r ${pkgs.fetchFromGitHub {
-            owner = "wakatime";
-            repo = "vencord-wakatime";
-            rev = "de045a0767dde6708d36f96387d389c814789fd4";
-            hash = "sha256-k+UqTHCTTsSCb6Enl6gNUhIvb5+5OGsYa0jbJB2pL3U=";
-          }} src/userplugins/vencord-wakatime
-          chmod -R u+w src/userplugins/vencord-wakatime
-          # Upstream sends a heartbeat every two minutes while Discord runs,
-          # even minimized to tray. Only a focused window counts as activity.
-          substituteInPlace src/userplugins/vencord-wakatime/index.tsx \
-            --replace-fail 'if (!apiKey) return;' 'if (!apiKey || !document.hasFocus()) return;'
-          # Vencord's content-security policy blocks renderer requests to hosts
-          # outside its allowlist. A plugin registers its host from native.ts.
-          cat > src/userplugins/vencord-wakatime/native.ts <<'EOF'
-          import { ConnectSrc, CspPolicies } from "@main/csp";
-
-          CspPolicies["api.wakatime.com"] = ConnectSrc;
-          EOF
+          cp -r ${../../desktop/discord/plugins} src/userplugins
         '';
       });
     };
