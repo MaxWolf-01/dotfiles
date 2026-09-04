@@ -1,15 +1,15 @@
 # The unprivileged users dispatch workers run as (/mx:dispatch), one per Claude
 # account: `agent` on the personal account, `agent-hl` on the Helferline one.
 #
-# Workers here run with permission prompts bypassed, so a user's boundary is the
-# only thing between a worker and the rest of the machine: no read access to
+# Workers here run with permission prompts bypassed, so the unix user is the
+# only boundary between a worker and the rest of the machine: no read access to
 # max's home or the HDD pool mounted inside it, none to the other worker's home
 # (both are mode 700, the NixOS default), no wheel, no sudo, no docker group, no
 # outgoing tailnet. Two users rather than two config dirs under one user
-# because the account boundary is a data boundary: what the team-shared
-# account's sessions can read of the personal account's -- transcripts,
-# worktrees, plugin cache -- is exactly what sits outside a home, which today is
-# dispatch's scratch dir and worker logs under /tmp.
+# because the Helferline account is shared with a whole team: a session on it
+# must not be able to read the personal account's transcripts, worktrees or
+# plugin cache. A home boundary covers exactly what is inside a home; dispatch's
+# scratch dir and worker logs under /tmp are outside it.
 { pkgs, lib, ... }:
 
 let
@@ -21,9 +21,9 @@ let
   };
   names = lib.attrNames workers;
 
-  # One line per machine that dispatches here. A machine whose key is missing
-  # sees these users as unreachable, which `worker-hosts` reports as the
-  # permission denial it is.
+  # One key per machine that dispatches here. Without its key a machine gets
+  # "Permission denied (publickey)" from these users, and `worker-hosts` shows
+  # that message in place of the host's state.
   dispatcherKeys = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
   ];
@@ -57,10 +57,11 @@ in
       openssh.authorizedKeys.keys = dispatcherKeys;
     }) workers)
     {
-      # The workers are kept out of max's data by this mode and nothing else --
-      # the pool's datasets mount inside that directory, so it covers them too.
-      # It is the default, but the boundary above should not rest on a default
-      # staying put.
+      # rwx------ on /home/max. The workers are in no group of max's and there
+      # are no ACLs, so this directory mode is the only thing that denies them
+      # /home/max, and with it the pool's datasets, which mount inside it. 700
+      # is already the NixOS default for normal users; it is pinned here so the
+      # boundary does not depend on that default staying put.
       max.homeMode = "700";
     }
   ];
