@@ -1,15 +1,31 @@
-# The unprivileged user dispatch workers run as (/mx:dispatch).
+# The unprivileged users dispatch workers run as (/mx:dispatch), one per Claude
+# account: `agent` on the personal account, `agent-hl` on the Helferline one.
 #
-# Workers here run with permission prompts bypassed, so this user's boundary is
-# the only thing between a worker and the rest of the machine: no read access to
-# max's home or the HDD pool mounted inside it, no wheel, no sudo, no docker
-# group, no outgoing tailnet.
+# Workers here run with permission prompts bypassed, so a user's boundary is the
+# only thing between a worker and the rest of the machine: no read access to
+# max's home or the HDD pool mounted inside it, none to the other worker's home
+# (both are mode 700, the NixOS default), no wheel, no sudo, no docker group, no
+# outgoing tailnet. Two users rather than two config dirs under one user
+# because the account boundary is a data boundary: the team-shared account's
+# sessions must not be able to read the personal account's transcripts, or
+# even its paths.
 { pkgs, lib, ... }:
 
 let
-  # Fixed so the rootless docker socket path is known at build time (the agent's
+  # Fixed uids so each rootless docker socket path is known at build time (the
   # home-manager config points DOCKER_HOST at /run/user/<uid>).
-  agentUid = 1001;
+  workers = {
+    agent = { uid = 1001; description = "dispatch workers"; };
+    agent-hl = { uid = 1002; description = "dispatch workers, Helferline account"; };
+  };
+  names = lib.attrNames workers;
+
+  # One line per machine that dispatches here. A machine whose key is missing
+  # sees these users as unreachable, which `worker-hosts` reports as the
+  # permission denial it is.
+  dispatcherKeys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
+  ];
 
   # Tailscale ACLs are per-node and cannot separate unix users, so the tailnet
   # boundary is drawn by uid instead. The firewall's reload script re-runs
@@ -17,58 +33,53 @@ let
   # added -- otherwise each rebuild leaves another copy behind.
   # ip46tables covers v4 and v6: tailscale is dual-stack and nothing mirrors
   # v4 rules to v6 by itself.
-  agentTailnetRules = [
+  tailnetRules = lib.concatMap (name: [
     # Inbound ssh is answered by sshd's session process, which runs as the
-    # agent -- so its reply packets carry that uid. Without this exemption the
-    # reject below kills dispatch's own connection.
-    "OUTPUT -o tailscale0 -m owner --uid-owner agent -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+    # worker user -- so its reply packets carry that uid. Without this exemption
+    # the reject below kills dispatch's own connection.
+    "OUTPUT -o tailscale0 -m owner --uid-owner ${name} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
     # REJECT rather than DROP: a blocked worker fails immediately instead of
     # hanging until some timeout.
-    "OUTPUT -o tailscale0 -m owner --uid-owner agent -j REJECT"
-  ];
+    "OUTPUT -o tailscale0 -m owner --uid-owner ${name} -j REJECT"
+  ]) names;
 in
 {
-  users.users.agent = {
+  users.users = lib.mapAttrs (name: w: {
     isNormalUser = true;
-    description = "dispatch workers";
-    uid = agentUid;
-    group = "agent";
+    inherit (w) uid description;
+    group = name;
     shell = pkgs.zsh;
     # Without lingering, the user's tmux server dies with its last session and
     # takes every worker in it along.
     linger = true;
-    # One line per machine that dispatches here. A machine whose key is missing
-    # sees this host as unreachable, which `worker-hosts` reports as the
-    # permission denial it is.
-    openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
-    ];
+    openssh.authorizedKeys.keys = dispatcherKeys;
+  }) workers // {
+    # The workers are kept out of max's data by this mode and nothing else --
+    # the pool's datasets mount inside that directory, so it covers them too.
+    # It is the default, but the boundary above should not rest on a default
+    # staying put.
+    max.homeMode = "700";
   };
-  users.groups.agent.gid = agentUid;
+  users.groups = lib.mapAttrs (_: w: { gid = w.uid; }) workers;
 
-  # The agent is kept out of max's data by this mode and nothing else -- the
-  # pool's datasets mount inside that directory, so it covers them too. It is
-  # the default, but the boundary above should not rest on a default staying
-  # put.
-  users.users.max.homeMode = "700";
-
-  # Rootless docker, for the agent alone. Two things about the upstream module
+  # Rootless docker, for the workers alone. Two things about the upstream module
   # make "just enable it" wrong here: its user service is wantedBy every
   # non-root user's default.target, and `setSocketVariable` exports DOCKER_HOST
   # from /etc/profile for everyone -- which would silently move max's docker CLI
   # off the system daemon onto a rootless one of his own. So the socket variable
-  # is set in the agent's home-manager config instead of globally, and the
-  # daemon is pinned to the one user who runs containers unsupervised.
+  # is set in the workers' home-manager config instead of globally, and the
+  # daemon is pinned to the users who run containers unsupervised: `|` makes
+  # these triggering conditions, of which one has to hold.
   virtualisation.docker.rootless.enable = true;
-  systemd.user.services.docker.unitConfig.ConditionUser = lib.mkForce "agent";
+  systemd.user.services.docker.unitConfig.ConditionUser = lib.mkForce (map (name: "|${name}") names);
 
-  # The uid rule above only sees packets the agent's own processes send.
+  # The uid rules above only see packets the workers' own processes send.
   # tailscaled originates its own as root, and its control socket is world
   # readable -- which hands any local user the full tailnet inventory and
   # `tailscale ping` to any node. Mutations are already gated in-process by
   # --operator=max, so what leaks is disclosure and a probe, not control.
   # Closing the directory rather than the socket keeps that operator access
-  # working: max is in wheel, the agent is in no group but its own. systemd
+  # working: max is in wheel, the workers are in no group but their own. systemd
   # recreates this directory on every start, so the mode belongs on the unit
   # rather than in tmpfiles.
   systemd.services.tailscaled.serviceConfig = {
@@ -77,7 +88,7 @@ in
   };
 
   networking.firewall = {
-    extraCommands = lib.concatMapStringsSep "\n" (rule: "ip46tables -A ${rule}") agentTailnetRules;
-    extraStopCommands = lib.concatMapStringsSep "\n" (rule: "ip46tables -D ${rule} || true") agentTailnetRules;
+    extraCommands = lib.concatMapStringsSep "\n" (rule: "ip46tables -A ${rule}") tailnetRules;
+    extraStopCommands = lib.concatMapStringsSep "\n" (rule: "ip46tables -D ${rule} || true") tailnetRules;
   };
 }

@@ -86,6 +86,7 @@ Structure:
 - `nix/home/timers.nix` - systemd user timers, zephyrus only
 - `nix/home/pc-timers.nix` - PC user timers (youtube backup, phone sync + backup, encrypted backup)
 - `nix/home/wayland.nix` - Wayland clipboard (wl-clipboard)
+- `nix/home/worker.nix` - a dispatch worker user on pc, one instance per Claude account (`hosts/pc-agent.nix`, `hosts/pc-agent-hl.nix`); the users themselves: `nix/nixos/pc/agent-user.nix`
 - `nix/home/hosts/` - per-machine configs (stateVersion + imports)
 - `nix/nixos/pc/` - NixOS system config for PC (configuration.nix, hardware-configuration.nix, youtube-download.nix)
 

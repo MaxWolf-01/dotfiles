@@ -52,6 +52,7 @@
             home-manager.extraSpecialArgs = { inherit rime system; };
             home-manager.users.max = import ./nix/home/hosts/pc.nix;
             home-manager.users.agent = import ./nix/home/hosts/pc-agent.nix;
+            home-manager.users.agent-hl = import ./nix/home/hosts/pc-agent-hl.nix;
           }
         ];
       };
