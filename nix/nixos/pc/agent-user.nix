@@ -6,9 +6,10 @@
 # max's home or the HDD pool mounted inside it, none to the other worker's home
 # (both are mode 700, the NixOS default), no wheel, no sudo, no docker group, no
 # outgoing tailnet. Two users rather than two config dirs under one user
-# because the account boundary is a data boundary: the team-shared account's
-# sessions must not be able to read the personal account's transcripts, or
-# even its paths.
+# because the account boundary is a data boundary: what the team-shared
+# account's sessions can read of the personal account's -- transcripts,
+# worktrees, plugin cache -- is exactly what sits outside a home, which today is
+# dispatch's scratch dir and worker logs under /tmp.
 { pkgs, lib, ... }:
 
 let
@@ -44,22 +45,25 @@ let
   ]) names;
 in
 {
-  users.users = lib.mapAttrs (name: w: {
-    isNormalUser = true;
-    inherit (w) uid description;
-    group = name;
-    shell = pkgs.zsh;
-    # Without lingering, the user's tmux server dies with its last session and
-    # takes every worker in it along.
-    linger = true;
-    openssh.authorizedKeys.keys = dispatcherKeys;
-  }) workers // {
-    # The workers are kept out of max's data by this mode and nothing else --
-    # the pool's datasets mount inside that directory, so it covers them too.
-    # It is the default, but the boundary above should not rest on a default
-    # staying put.
-    max.homeMode = "700";
-  };
+  users.users = lib.mkMerge [
+    (lib.mapAttrs (name: w: {
+      isNormalUser = true;
+      inherit (w) uid description;
+      group = name;
+      shell = pkgs.zsh;
+      # Without lingering, the user's tmux server dies with its last session and
+      # takes every worker in it along.
+      linger = true;
+      openssh.authorizedKeys.keys = dispatcherKeys;
+    }) workers)
+    {
+      # The workers are kept out of max's data by this mode and nothing else --
+      # the pool's datasets mount inside that directory, so it covers them too.
+      # It is the default, but the boundary above should not rest on a default
+      # staying put.
+      max.homeMode = "700";
+    }
+  ];
   users.groups = lib.mapAttrs (_: w: { gid = w.uid; }) workers;
 
   # Rootless docker, for the workers alone. Two things about the upstream module

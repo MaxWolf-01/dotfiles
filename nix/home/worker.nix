@@ -97,11 +97,17 @@ in
   # What dispatch reads before planning a wave, and where `worker-hosts` (bin/)
   # finds this user's description. Hand-written beside the host config so that
   # a host which is down still describes itself from the orchestrator's
-  # checkout; only the tool list is spliced in from the packages above, so that
-  # half cannot drift from what is installed.
-  home.file."HOST.md".text = builtins.replaceStrings [ "@TOOLCHAIN@" ] [
-    (lib.concatStringsSep " " (
-      map (c: "`${c}`") (lib.sort lib.lessThan (map (p: p.meta.mainProgram) toolchain))
-    ))
-  ] (builtins.readFile record);
+  # checkout. The record is the user's own lead; @BODY@ is the machine's tools
+  # and limits, one file for every worker user on it, and inside that the tool
+  # list is spliced in from the packages above, so that neither half can drift:
+  # not from what is installed, not between the users.
+  home.file."HOST.md".text =
+    let
+      body = builtins.readFile ./hosts/pc-worker-body.md;
+      tools = lib.concatStringsSep " " (
+        map (c: "`${c}`") (lib.sort lib.lessThan (map (p: p.meta.mainProgram) toolchain))
+      );
+    in
+    builtins.replaceStrings [ "@TOOLCHAIN@" ] [ tools ]
+      (builtins.replaceStrings [ "@BODY@\n" ] [ body ] (builtins.readFile record));
 }
