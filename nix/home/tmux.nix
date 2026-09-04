@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 let
   tmux = "${pkgs.tmux}/bin/tmux";
   tms = pkgs.writeShellScriptBin "tms" ''
@@ -38,6 +38,12 @@ let
 
     exec ${tmux} new-session -A -s "$1"
   '';
+
+  # `tmux` on PATH is the guard in tmux-guard.sh, with the real binary behind
+  # it; the script's header says what it refuses. Tested by tests/tmux-guard.test.
+  tmuxGuard = lib.hiPrio (pkgs.writeShellScriptBin "tmux" ''
+    exec ${pkgs.bash}/bin/bash ${./tmux-guard.sh} ${tmux} "$@"
+  '');
 in
 {
   # Systemd timer for tmux session auto-save (more reliable than continuum)
@@ -90,7 +96,7 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  home.packages = [ tms ];
+  home.packages = [ tms tmuxGuard ];
 
   programs.tmux = {
     enable = true;
