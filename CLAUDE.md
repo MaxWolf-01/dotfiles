@@ -22,6 +22,7 @@ Dotfiles are not exempt from branch discipline: the mechanical-vs-review seam ap
 ALWAYS read README.md and secrets/README.md to get a quick high-level overview of the project structure / setup / usage flow.
 ALWAYS read the nix config files etc. first when debugging anything/before answering anything, etc.
 And check which host you're on.
+NEVER include any work related details whatsoever in commit messages, PRs, issues, or comments, code, ... unless you got an explicit yes on a specific detail, then that detail is allowed. In the private repo, it's fine, and can be documented. The mere mention of the company and stuff like that is ofc fine, but no details about repos, stacks, infrastructure, etc. are allowed. 
 
 ‼️‼️‼️
 
