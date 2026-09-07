@@ -98,6 +98,17 @@ in
 
   home.packages = [ tms tmuxGuard ];
 
+  # tmux puts every pane in its own tmux-spawn-<uuid>.scope, and systemd-oomd
+  # relieves memory pressure by SIGKILLing one whole scope. Panes hold the
+  # work (agents, editors, servers); browsers and other desktop apps are
+  # cheaper to lose, so panes are the last candidates. The prefix directory
+  # covers every pane scope, at creation: panes already running when the
+  # drop-in lands are not marked.
+  xdg.configFile."systemd/user/tmux-spawn-.scope.d/oomd.conf".text = ''
+    [Scope]
+    ManagedOOMPreference=avoid
+  '';
+
   programs.tmux = {
     enable = true;
 
