@@ -1,0 +1,463 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro", "requests", "beautifulsoup4", "lxml"]
+# ///
+"""Read JKU's KUSSS course catalogue and Studienhandbuch without logging in.
+
+KUSSS (kusss.jku.at) publishes the whole course catalogue anonymously: the curriculum tree,
+each course's classes, every LVA (group) with dates, rooms, lecturer, seats and today's
+registration counts. Only the act of registering needs a login. This tool turns those pages
+into JSON, answers "is there a seat" for given course classes, and can watch full courses
+for a freed seat.
+
+Vocabulary (KUSSS German → what it is):
+- Kursklasse / courseclass: one course as it appears in a curriculum (e.g. "UE Reinforcement Learning");
+  its numeric id is stable across semesters and is what `seats`/`watch` take.
+- LVA: one concrete group of a course class, numbered like 344.125 (a letter may appear: 344.W01).
+- Mögl. / bisher / zugeteilt: seats, registrations still pending allocation, registrations already
+  assigned. Direktzuteilung courses assign instantly (all in "zugeteilt"); Vorrangzahl and
+  Reihenfolge courses hold everything in "bisher" until the window closes. Fill = bisher + zugeteilt.
+- Art: Präsenz or Fernstudium (distance). Hybrid groups are Präsenz with "distance" in their info text.
+
+JSON schema (scrape):
+
+    [{"grpCode": "str", "type": "UE|VL|VO|KV|KS|PR|SE|VU", "name": "str", "ects": 1.5, "subject": "str",
+      "courseclasses": [{"courseclass": "str", "cc_name": "str", "n_current_term": 0,
+        "registration_window": "str|null", "allocation": "str|null", "waitlist": 0,
+        "lvas": [{"lva_nr": "344.125", "coursegroupid": "str|null", "course_id": "str|null",
+          "first_day": "str", "first_date": "str", "first_time": "str", "lecturer": "str",
+          "capacity": "str", "registered": "str", "assigned": "str", "art": "str", "info": "str",
+          "language": "str|null", "institute": "str|null",
+          "dates": [{"day": "Do.", "date": "08.10.26", "time": "15:30 – 16:15", "room": "str"}]}]}]}]
+
+JSON schema (seats --json):
+
+    [{"courseclass": "str", "course": "str", "allocation": "str|null", "lva": "str", "lecturer": "str",
+      "art": "str", "capacity": 0, "pending": 0, "assigned": 0, "free": true}]
+
+Examples:
+
+    kusss scrape --curriculum 376 --out kusss.json
+    kusss handbook --curriculum 1174 --out studienhandbuch.json --extra 536DASCICSV26
+    kusss seats 37357 37359
+    kusss seats 46721 --json | jq '.[] | select(.free)'
+    kusss watch 37357 37359 --once --until 2026-10-08
+    kusss check --curriculum 376
+"""
+
+from __future__ import annotations
+
+import json as jsonlib
+import re
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from pathlib import Path
+from typing import Annotated
+
+import requests
+import tyro
+from bs4 import BeautifulSoup
+from tyro.extras import SubcommandApp
+
+KUSSS = "https://kusss.jku.at/kusss/"
+HANDBOOK = "https://studienhandbuch.jku.at/"
+LVA_NR = re.compile(r"^\d{3}\.[A-Z0-9]\d{2}$")
+ALLOCATION = re.compile(r"Zuteilung nach Vorrangzahl|Zuteilung nach Reihenfolge|Direktzuteilung|Zuteilung erfolgt manuell[^.]{0,40}")
+TYPES = ("VL", "VO", "UE", "KV", "KS", "PR", "SE", "VU")
+
+S = requests.Session()
+S.headers["User-Agent"] = "Mozilla/5.0 (kusss cli; course planning)"
+
+app = SubcommandApp()
+
+
+def get(url: str) -> BeautifulSoup:
+    r = S.get(url, timeout=60)
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    return BeautifulSoup(r.text, "lxml")
+
+
+def clean(s: str) -> str:
+    return re.sub(r"\s+", " ", s.replace("\xa0", " ").replace("(*)", "")).strip()
+
+
+def norm_time(t: str) -> str:
+    """One spelling for '10:15 – 11:45' / '10:15 - 11:45' / non-breaking spaces, so equal slots compare equal."""
+    return re.sub(r"\s*[–-]\s*", " – ", clean(t))
+
+
+# ----------------------------------------------------------------------------- KUSSS pages
+
+def catalogue(curriculum: int) -> list[dict]:
+    """Curriculum tree → one slot per (type, name) with grpCode, ECTS and the subject path."""
+    soup = get(KUSSS + f"coursecatalogue-get-currbranches-or-segments.action?set.listsubjects-overview.treeView.expandAll=true&curId={curriculum}")
+    slots, path = [], []
+    for tr in soup.select("table tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 3:
+            continue
+        text = tds[1].get_text(" ", strip=True)
+        depth = len(re.match(r"^[. ]*", text).group(0).replace(" ", "")) // 8
+        label = text.lstrip(". ").strip()
+        ects = tds[2].get_text(strip=True).replace(",", ".")
+        link = tds[1].find("a", href=re.compile("grpCode="))
+        if link:
+            m = re.match(r"^(" + "|".join(TYPES) + r")\s+(.*)$", label)
+            if not m:  # e.g. the semester selector row, which also carries a grpCode link
+                continue
+            slots.append({"grpCode": re.search(r"grpCode=(\d+)", link["href"]).group(1), "type": m.group(1), "name": m.group(2),
+                          "ects": float(ects) if ects else None, "subject": " / ".join(path[:depth])})
+        elif label:
+            path = path[:depth] + [label]
+    return slots
+
+
+def courseclasses(curriculum: int, grp: str) -> list[dict]:
+    """A grpCode page lists the same course class once per curriculum version; dedupe by id."""
+    soup = get(KUSSS + f"coursecatalogue-get-courseclasses.action?curId={curriculum}&segId=1&grpCode={grp}")
+    out: dict[str, dict] = {}
+    for tr in soup.select("table tr"):
+        a = tr.find("a", href=re.compile("courseclass="))
+        if not a:
+            continue
+        tds = tr.find_all("td")
+        n = tds[2].get_text(strip=True) if len(tds) > 2 else ""
+        cc = re.search(r"courseclass=(\d+)", a["href"]).group(1)
+        cur = out.setdefault(cc, {"courseclass": cc, "cc_name": a.get_text(strip=True), "n_current_term": 0})
+        cur["n_current_term"] = max(cur["n_current_term"], int(n) if n.isdigit() else 0)
+    return list(out.values())
+
+
+def lva_rows(courseclass: str) -> dict:
+    """The registration page of a course class: window, allocation mode, and one row per LVA.
+
+    Rows without dates ('Keine Termine gefunden', 'Blocktermin') merge the three date columns into one;
+    info rows (Abhaltungsinformation / Zusatzinfo / Untertitel) follow their LVA row.
+    """
+    soup = get(KUSSS + f"lvaregistrationlist.action?courseclass={courseclass}")
+    head = clean(soup.get_text(" ", strip=True))
+    title = re.search(r"((?:" + "|".join(TYPES) + r")\s*:\s*.+?)\s*\[", head)
+    reg = re.search(r"Anmeldung vom ([^|]+?)\s*\|", head)
+    wl = re.search(r"Wartelistenplätze:\s*(\d+)", head)
+    alloc = ALLOCATION.search(head)
+    rows = soup.select("table tr")
+    lvas = []
+    for idx, tr in enumerate(rows):
+        tds = [clean(td.get_text(" ", strip=True)) for td in tr.find_all("td")]
+        if len(tds) < 7 or not LVA_NR.match(tds[0]):
+            continue
+        if len(tds) < 9:
+            tds = tds[:2] + [tds[2], "", ""] + tds[3:]
+        a = tr.find("a", href=re.compile(r"selectcoursegroup\.action\?coursegroupid=\d+"))
+        grp = re.search(r"coursegroupid=(\d+)", a["href"]).group(1) if a else None
+        det = re.search(r"showdetails=(\d+)", a["href"]) if a else None
+        info = []
+        for nxt in rows[idx + 1: idx + 4]:
+            if len(nxt.find_all("td")) >= 7:
+                break
+            t = clean(nxt.get_text(" ", strip=True))
+            if re.search(r"Abhaltungsinformation|Zusatzinfo|Untertitel", t):
+                info.append(t)
+        lvas.append({"lva_nr": tds[0], "coursegroupid": grp, "course_id": det.group(1) if det else None,
+                     "first_day": tds[2], "first_date": tds[3], "first_time": norm_time(tds[4]) if tds[4] else "",
+                     "lecturer": tds[5].strip(" ,"), "capacity": tds[6], "registered": tds[7], "assigned": tds[8],
+                     "art": tds[9] if len(tds) > 9 else "", "info": " ".join(dict.fromkeys(info))})
+    return {"course": re.sub(r"\s*:\s*", " ", clean(title.group(1)), count=1) if title else None, "registration_window": clean(reg.group(1)) if reg else None,
+            "allocation": alloc.group(0) if alloc else None, "waitlist": int(wl.group(1)) if wl else None, "lvas": lvas}
+
+
+def lva_dates(lva: dict, courseclass: str) -> dict:
+    """All dates/rooms of one LVA plus language and institute. LVAs without a detail id have no dates."""
+    if not lva.get("course_id"):
+        return {"dates": [], "language": None, "institute": None}
+    try:
+        soup = get(KUSSS + f"selectcoursegroup.action?coursegroupid={lva['coursegroupid']}&showdetails={lva['course_id']}&courseclassid={courseclass}")
+    except requests.RequestException as e:
+        print(f"detail failed {lva['lva_nr']}: {e}", file=sys.stderr)
+        return {"dates": [], "language": None, "institute": None}
+    txt = soup.get_text("\n", strip=True)
+    lang = re.search(r"Abhaltungs-Sprache:\s*\n?\s*([^\n]+)", txt)
+    inst = re.search(r"Institut:\s*\n?\s*([^\n]+)", txt)
+    dates = []
+    for tr in soup.select("table tr"):
+        tds = [clean(td.get_text(" ", strip=True)) for td in tr.find_all("td")]
+        if len(tds) == 4 and re.match(r"\d\d\.\d\d\.\d\d", tds[1]):
+            dates.append({"day": tds[0], "date": tds[1], "time": norm_time(tds[2]), "room": tds[3]})
+    return {"dates": dates, "language": clean(lang.group(1)) if lang else None, "institute": clean(inst.group(1)) if inst else None}
+
+
+def fill(l: dict) -> tuple[int, int, int]:
+    cap, pend, ass = (int(l[k]) if l[k].isdigit() else 0 for k in ("capacity", "registered", "assigned"))
+    return cap, pend, ass
+
+
+# ----------------------------------------------------------------------------- subcommands
+
+@dataclass
+class Scrape:
+    curriculum: int = 376
+    """KUSSS curriculum id (curId in the catalogue URL). 376 = BSc Artificial Intelligence."""
+    out: Path = Path("kusss.json")
+    """Where to write the JSON."""
+    workers: int = 8
+    """Parallel requests."""
+
+
+@app.command(name="scrape")
+def scrape(args: Scrape) -> None:
+    """Dump the whole curriculum: slots, course classes, LVAs, dates. A few minutes for a full curriculum."""
+    slots = catalogue(args.curriculum)
+    print(f"{len(slots)} slots", file=sys.stderr)
+    with ThreadPoolExecutor(args.workers) as ex:
+        for slot, ccs in zip(slots, ex.map(lambda s: courseclasses(args.curriculum, s["grpCode"]), slots)):
+            slot["courseclasses"] = ccs
+    jobs = [cc for s in slots for cc in s["courseclasses"]]
+    print(f"{len(jobs)} course classes", file=sys.stderr)
+    with ThreadPoolExecutor(args.workers) as ex:
+        for cc, info in zip(jobs, ex.map(lambda c: lva_rows(c["courseclass"]), jobs)):
+            cc.update({k: v for k, v in info.items() if k != "course"})
+    djobs = [(cc, l) for cc in jobs for l in cc["lvas"]]
+    print(f"{len(djobs)} LVAs", file=sys.stderr)
+    with ThreadPoolExecutor(args.workers) as ex:
+        for (cc, l), d in zip(djobs, ex.map(lambda j: lva_dates(j[1], j[0]["courseclass"]), djobs)):
+            l.update(d)
+    args.out.write_text(jsonlib.dumps(slots, indent=1, ensure_ascii=False))
+    print(f"wrote {args.out}", file=sys.stderr)
+
+
+@dataclass
+class Handbook:
+    curriculum: int = 1174
+    """Studienhandbuch curriculum id (studienhandbuch.jku.at/curr/<id>). 1174 = BSc AI, version 2025W."""
+    out: Path = Path("studienhandbuch.json")
+    """Where to write the JSON."""
+    extra: list[str] = field(default_factory=list)
+    """Course codes (klaId, e.g. 536DASCICSV26) not in the curriculum listing but referenced by KUSSS."""
+    workers: int = 8
+    """Parallel requests."""
+
+
+HB_FIELDS = ["Beurteilungskriterien", "Lehrmethoden", "Abhaltungssprache", "Literatur", "Lehrinhalte wechselnd?",
+             "Anmeldevoraussetzungen", "Äquivalenzen", "Teilungsziffer", "Zuteilungsverfahren", "Quellcurriculum",
+             "Lehrinhalte", "Sonstige Informationen", "Frühere Varianten", "Ist gemeinsam abzuhalten mit", "Studienfach", "Lernergebnisse"]
+
+
+def handbook_course(item: dict) -> dict:
+    d = dict(item)
+    try:
+        soup = get(HANDBOOK + item["id"])
+    except requests.RequestException as e:
+        print(f"failed {item['id']}: {e}", file=sys.stderr)
+        return d
+    txt = soup.get_text("\n", strip=True)
+    h = soup.find("h3") or soup.find("h2")
+    m = re.match(r"\[\s*(\S+)\s*\]\s*(" + "|".join(TYPES) + r")\s*(.*)", clean(h.get_text(" ", strip=True)) if h else "")
+    if m:
+        d["code"], d["type"], d["name"] = m.group(1), m.group(2), m.group(3).strip()
+    t = next((t for t in soup.find_all("table") if t.find("tr") and "Workload" in [clean(x.get_text()) for x in t.find("tr").find_all(["th", "td"])]), None)
+    if t and len(t.find_all("tr")) >= 2:
+        rows = t.find_all("tr")
+        d["meta"] = dict(zip([clean(x.get_text()) for x in rows[0].find_all(["th", "td"])], [clean(x.get_text()) for x in rows[1].find_all(["th", "td"])]))
+    lr = {}
+    for key in ["Kompetenzen", "Fertigkeiten", "Kenntnisse"]:
+        cell = soup.find(lambda tag, k=key: tag.name in ("strong", "small", "b") and tag.get_text(strip=True) == k)
+        if cell and cell.find_parent("td") and cell.find_parent("td").find_next("td"):
+            lr[key] = clean(cell.find_parent("td").find_next("td").get_text(" ", strip=True))
+    d["learning_outcomes"] = lr
+    stop = "|".join(map(re.escape, HB_FIELDS + ["Präsenzlehrveranstaltung", "Fernlehrveranstaltung", "Version v"]))
+    for f in HB_FIELDS:
+        m = re.search(r"\n" + re.escape(f) + r"\n(.*?)(?=\n(?:" + stop + r")\n|\Z)", txt, re.S)
+        if m:
+            d[f] = clean(m.group(1)).replace("Version v1.0.25 Impressum", "").strip()
+    return d
+
+
+@app.command(name="handbook")
+def handbook(args: Handbook) -> None:
+    """Dump every course page of a Studienhandbuch curriculum: competences, assessment, allocation, prerequisites."""
+    soup = get(HANDBOOK + f"curr/{args.curriculum}")
+    items, path = [], []
+    for tr in soup.select("table tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        text = tds[0].get_text(" ", strip=True)
+        depth = len(re.match(r"^[. ]*", text).group(0).replace(" ", "")) // 8
+        label = clean(text.lstrip(". "))
+        a = tds[0].find("a", href=re.compile(r"(\d{6})$"))
+        if a:
+            items.append({"id": re.search(r"(\d{6})$", a["href"]).group(1), "label": label, "subject": " / ".join(path[:depth])})
+        elif label:
+            path = path[:depth] + [label]
+    items += [{"id": f"detail.php?lang=de&klaId={k}", "label": k, "subject": "?"} for k in args.extra]
+    print(f"{len(items)} courses", file=sys.stderr)
+    with ThreadPoolExecutor(args.workers) as ex:
+        data = list(ex.map(handbook_course, items))
+    args.out.write_text(jsonlib.dumps(data, indent=1, ensure_ascii=False))
+    print(f"wrote {args.out}", file=sys.stderr)
+
+
+@dataclass
+class Seats:
+    courseclasses: Annotated[list[str], tyro.conf.Positional]
+    """KUSSS course class ids (the courseclass= number in a registration URL)."""
+    json: bool = False
+    """Emit JSON to stdout. Pipe to jq for filtering."""
+
+
+def seat_rows(courseclasses: list[str]) -> list[dict]:
+    out = []
+    for cc in courseclasses:
+        info = lva_rows(cc)
+        for l in info["lvas"]:
+            cap, pend, ass = fill(l)
+            out.append({"courseclass": cc, "course": info["course"], "allocation": info["allocation"], "lva": l["lva_nr"],
+                        "lecturer": l["lecturer"], "art": l["art"], "capacity": cap, "pending": pend, "assigned": ass,
+                        "free": bool(cap) and pend + ass < cap})
+    return out
+
+
+@app.command(name="seats")
+def seats(args: Seats) -> None:
+    """Live fill of every LVA in the given course classes (pending + assigned against seats)."""
+    rows = seat_rows(args.courseclasses)
+    if args.json:
+        print(jsonlib.dumps(rows, indent=1, ensure_ascii=False))
+        return
+    for cc in dict.fromkeys(r["courseclass"] for r in rows):
+        rs = [r for r in rows if r["courseclass"] == cc]
+        print(f"\n{rs[0]['course']}  [{cc}]  {rs[0]['allocation'] or '?'}")
+        for r in rs:
+            print(f"  {r['lva']}  {r['pending'] + r['assigned']:>4}/{r['capacity']:<4} {'free' if r['free'] else 'full'}  {r['art']:<11} {r['lecturer'][:40]}")
+
+
+@dataclass
+class Watch:
+    courseclasses: Annotated[list[str], tyro.conf.Positional]
+    """Course classes to watch, typically ones that are full."""
+    once: bool = False
+    """Check once and exit (for a systemd timer). Default loops with --interval."""
+    interval: int = 180
+    """Seconds between checks when looping."""
+    until: str = ""
+    """ISO date; after it, exit 0 without checking (course start, when deregistration ends)."""
+    notify: bool = True
+    """Desktop notification (notify-send) when a seat opens."""
+    alert: bool = False
+    """Also email via alert-send (the unattended alert channel) when a seat opens."""
+    state: Path = Path.home() / ".local/state/kusss/watch.json"
+    """Remembers what was already announced, so a free seat is announced once, then every 30 min while it stays free."""
+    log: Path = Path.home() / "logs/kusss-watch.log"
+    """One line per check."""
+
+
+def announce(title: str, body: str, args: Watch) -> None:
+    if args.notify:
+        subprocess.run(["notify-send", "-u", "critical", title, body], check=False)
+    if args.alert:
+        subprocess.run(["alert-send", title], input=body.encode(), check=False)
+
+
+def watch_once(args: Watch) -> bool:
+    """One pass over all watched course classes. Returns True if any seat is free."""
+    args.state.parent.mkdir(parents=True, exist_ok=True)
+    args.log.parent.mkdir(parents=True, exist_ok=True)
+    st = jsonlib.loads(args.state.read_text()) if args.state.exists() else {}
+    now = time.time()
+    any_free = False
+    for cc in args.courseclasses:
+        try:
+            info = lva_rows(cc)
+        except requests.RequestException as e:
+            line = f"{datetime.now():%Y-%m-%d %H:%M} {cc} fetch failed: {e}"
+            print(line, file=sys.stderr)
+            args.log.open("a").write(line + "\n")
+            continue
+        for l in info["lvas"]:
+            cap, pend, ass = fill(l)
+            free = bool(cap) and pend + ass < cap
+            line = f"{datetime.now():%Y-%m-%d %H:%M} {l['lva_nr']} {info['course']}: {pend + ass}/{cap}{'  FREE SEAT' if free else ''}"
+            print(line)
+            args.log.open("a").write(line + "\n")
+            key = f"{cc}/{l['lva_nr']}"
+            if free:
+                any_free = True
+                if now - st.get(key, 0) > 1800:
+                    announce(f"KUSSS seat open: {info['course']}", f"{l['lva_nr']} {pend + ass}/{cap}\n{KUSSS}lvaregistrationlist.action?courseclass={cc}", args)
+                    st[key] = now
+            else:
+                st.pop(key, None)
+    args.state.write_text(jsonlib.dumps(st))
+    return any_free
+
+
+@app.command(name="watch")
+def watch(args: Watch) -> None:
+    """Announce when a full course gets a free seat (someone deregistered; Direktzuteilung seats go to the first click)."""
+    if args.until and date.today() > date.fromisoformat(args.until):
+        print(f"past {args.until}, nothing to watch", file=sys.stderr)
+        return
+    if args.once:
+        watch_once(args)
+        return
+    while True:
+        watch_once(args)
+        time.sleep(args.interval)
+
+
+@dataclass
+class Check:
+    curriculum: int = 376
+    """KUSSS curriculum id."""
+    sample: int = 12
+    """How many course classes to sample for row-shape checks."""
+
+
+@app.command(name="check")
+def check(args: Check) -> None:
+    """Sanity-check the parser against live pages and report what looks new: rows the parser skips,
+    LVA numbers with unseen shapes, allocation modes or Art values not seen before, empty fields.
+    Run this before trusting a scrape at the start of a new registration round.
+    """
+    slots = catalogue(args.curriculum)
+    problems = []
+    if len(slots) < 50:
+        problems.append(f"only {len(slots)} slots in the curriculum tree; the tree markup may have changed")
+    ccs = []
+    for s in slots[:: max(1, len(slots) // args.sample)]:
+        ccs += [c["courseclass"] for c in courseclasses(args.curriculum, s["grpCode"]) if c["n_current_term"]]
+    ccs = ccs[: args.sample]
+    known_art, known_alloc = {"Präsenz", "Fernstudium", "MuSSS", "MMJUS", "SBP", ""}, set()
+    for cc in ccs:
+        soup = get(KUSSS + f"lvaregistrationlist.action?courseclass={cc}")
+        info = lva_rows(cc)
+        if info["allocation"]:
+            known_alloc.add(info["allocation"])
+        else:
+            problems.append(f"{cc}: no allocation mode found in page text")
+        for tr in soup.select("table tr"):
+            tds = [clean(td.get_text(" ", strip=True)) for td in tr.find_all("td")]
+            if len(tds) >= 7 and re.match(r"^\d{3}\.", tds[0]) and not LVA_NR.match(tds[0]):
+                problems.append(f"{cc}: LVA number with unseen shape: {tds[0]!r}")
+        for l in info["lvas"]:
+            if l["art"] not in known_art:
+                problems.append(f"{cc} {l['lva_nr']}: unseen Art value {l['art']!r}")
+            if not l["capacity"].isdigit():
+                problems.append(f"{cc} {l['lva_nr']}: capacity not numeric: {l['capacity']!r}")
+            if re.search(r"\d{1,2}[:.]\d{2}\s*-\s*\d{1,2}[:.]\d{2}", l["info"]) and not l["course_id"]:
+                pass  # schedule only in the info text: expected for date-less groups, the consumer parses it
+    print(f"sampled {len(ccs)} course classes; allocation modes seen: {sorted(known_alloc)}")
+    if problems:
+        print("\n".join("! " + p for p in problems))
+        sys.exit(1)
+    print("no parser surprises")
+
+
+if __name__ == "__main__":
+    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
