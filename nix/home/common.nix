@@ -75,6 +75,8 @@
       "agent/handoffs"
       "agent/research"
       "agent/diffviews"
+      "agent/board.html"
+      "agent/board.html.stamp.js"
       "node_modules"
       "repomix-output.*"
       "**/uv.lock"
