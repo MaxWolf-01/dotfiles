@@ -10,7 +10,7 @@ Three layers carry the rest:
 | --- | --- | --- |
 | Run log | one JSON line per run: outcome, why, the run's own numbers | `~/logs/runs/<unit>.jsonl`, appended by `bin/run-log` |
 | Overdue watchdog | the one job whose purpose is to alert: one email naming every unit that stopped succeeding | `bin/overdue-check`, daily on both hosts |
-| Dashboards | one static HTML page per topic, rebuilt hourly, read when there is time | `~/Documents/dashboards/` |
+| Dashboards | one static HTML page per topic, rebuilt on a timer, read when there is time | `~/Documents/dashboards/` |
 
 The split answers two ways this setup failed before. A message on every green
 run teaches you to swipe the channel away, and the red one goes with it. A job
@@ -100,18 +100,27 @@ named. A repository nothing can date — no run log on the host that backs it up
 
 ## Dashboards
 
-Three pages, all in `~/Documents/dashboards/`: `backups.html`, `dns-vpn.html`,
-`yapit.html`. Bookmark them by hand — where they sit and in what order is a
-matter of taste, and a policy-managed bookmark cannot be moved or renamed
-without the policy fighting back. The bookmarks are the index; the pages do
-not link each other.
+Four pages, all in `~/Documents/dashboards/`: `backups.html`, `dns-vpn.html`,
+`yapit.html`, `activity.html`. Bookmark them by hand — where they sit and in
+what order is a matter of taste, and a policy-managed bookmark cannot be moved
+or renamed without the policy fighting back. The bookmarks are the index; the
+pages do not link each other.
 
 Each page is one self-contained file written by its own collector,
-`secrets/scripts/dashboard-<topic>`, on an hourly timer in
-`nix/home/timers.nix`. `dashboard-<topic> --help` says what that page reads and
-from where; `--json` prints the same data unrendered. They live in `~/Documents`
-because Firefox runs firejailed and can see that directory, and a symlink into
-`~/.dotfiles` dangles inside the jail.
+`secrets/scripts/dashboard-<topic>`, on a timer in `nix/home/timers.nix` —
+hourly, except the activity page, which re-reads years of records each run and
+goes daily. `dashboard-<topic> --help` says what that page reads and from where;
+`--json` prints the same data unrendered, where the collector has one. They live
+in `~/Documents` because Firefox runs firejailed and can see that directory, and
+a symlink into `~/.dotfiles` dangles inside the jail.
+
+The activity page is the one that watches no job. It draws when this machine was
+in use, from the records the day left behind anyway — editor and browser
+heartbeats, browser history, agent prompts, commits, the phone, sleep — as a
+raster of every day against the hour of day, one day or one week in detail, a
+weekday punchcard and monthly hours. It shares the shape of the others because
+the shape is what makes a page durable: one file, one collector, one timer, one
+bound.
 
 Every figure on a page, repository sizes included, was measured by the job that
 wrote it down: a collector reads records, never a restic repository, and the
