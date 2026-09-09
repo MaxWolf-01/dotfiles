@@ -663,31 +663,4 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- KUSSS seat watch (WS 2026 registration) ---
-  # Two full Direktzuteilung lectures; a seat opens only when someone deregisters and goes to
-  # the first click. Polls every 3 minutes until the courses start (8 Oct), then records a skip
-  # each run. Course class ids and the end date are the semester's; retire the unit (here and
-  # in secrets/monitoring/overdue.conf) after 8 Oct 2026.
-  systemd.user.services.kusss-watch = {
-    Unit = {
-      Description = "Announce free seats in full KUSSS courses";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      Environment = [ "PATH=${kusssPath}:${home}/bin:/usr/bin:/bin" ];
-      ExecStart = "${dotfiles}/bin/kusss watch 37357 37359 --once --until 2026-10-08 --alert --run-log kusss-watch";
-      TimeoutStartSec = "5min";
-    };
-  };
-
-  systemd.user.timers.kusss-watch = {
-    Unit.Description = "KUSSS seat watch every 3 minutes";
-    Timer = {
-      OnBootSec = "2min";
-      OnUnitActiveSec = "3min";
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
 }
