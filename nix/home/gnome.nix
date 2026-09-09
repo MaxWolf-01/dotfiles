@@ -137,7 +137,7 @@
       binding = "<Primary><Super>n";
     };
 
-    # Custom: hibernate (bin/hibernate: refuses while a newer kernel waits for a reboot)
+    # Custom: hibernate (bin/hibernate)
     "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2" = {
       name = "Hibernate";
       command = "hibernate";
