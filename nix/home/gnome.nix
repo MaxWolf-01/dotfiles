@@ -119,7 +119,6 @@
       custom-keybindings = [
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/"
-        "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2/"
       ];
     };
 
@@ -135,13 +134,6 @@
       name = "Toggle nightlight";
       command = "toggle_nightlight";
       binding = "<Primary><Super>n";
-    };
-
-    # Custom: hibernate (bin/hibernate)
-    "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2" = {
-      name = "Hibernate";
-      command = "hibernate";
-      binding = "<Shift><Super>h";
     };
 
     # ibus lives under /desktop/ibus/, not /org/freedesktop/ibus/.

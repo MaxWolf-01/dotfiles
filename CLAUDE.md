@@ -162,14 +162,6 @@ for anything that stopped succeeding. Never add a notification to a job without
 reading why it is silent first. Layers, bounds, the dashboards, and what to do
 when one of them goes red: `docs/monitoring.md`.
 
-## Sleep
-
-zephyrus sleeps in S3 and hibernates to a swap file inside LUKS, both from
-`./setup sleep_modes`; why each setting is what it is: that function's header.
-`hibernate` (bin/) is the command to hibernate with: it refuses while a kernel
-newer than the running one waits for a reboot, because that boot would erase
-the image. `nosleep` blocks sleep and hibernation alike.
-
 ## Knowledge Base Publishing
 
 The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:
