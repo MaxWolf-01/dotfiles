@@ -350,7 +350,13 @@ ${stats_error:-nothing}" >&2
     # of what broke.
     echo "Checking repository integrity..."
     check_log=""
-    if restic check --repo "$repo_path" --password-command "$password_command" $check_args >"$check_output" 2>&1; then
+    # Keep check's throwaway cache off tmpfs. It builds a fresh one per run
+    # either way, so nothing is carried between runs and the check still reads
+    # everything from the repository; the default places it under /tmp, which is
+    # tmpfs here. On 2026-09-09 writes into it failed part-way through two runs,
+    # and because restic reports a failed cache write as a failed load, both
+    # repositories were reported damaged while being intact.
+    if restic check --repo "$repo_path" --password-command "$password_command" --cache-dir "$HOME/.cache/restic-check" $check_args >"$check_output" 2>&1; then
         check_status="passed"
     else
         check_status="FAILED"
