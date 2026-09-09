@@ -36,12 +36,6 @@ let
     bash coreutils uv jq
   ]);
 
-  # kusss watch announces via notify-send (libnotify) and alert-send (~/bin, needs
-  # curl and sops), and records each pass with run-log (~/bin, needs jq)
-  kusssPath = lib.makeBinPath (with pkgs; [
-    bash coreutils uv libnotify curl sops jq
-  ]);
-
   dashboardPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv openssh jq
   ]);
