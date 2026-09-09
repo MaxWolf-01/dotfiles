@@ -62,12 +62,14 @@ in
 
         # Rotate pane_contents.tar.gz before save. Retention: 8 days for the
         # rotated archives, 14 for the state files below. The archives are what
-        # the offsite backup pays for, ~167 MiB a day against the state files'
-        # ~1 MiB, and 8 days is the floor that still carries each archive to the
-        # snapshot that captures it: past 30 days back only one snapshot per week
-        # is retained. Both keep a 100k count cap that cannot bind under real
-        # usage (8d of every-minute saves is ~11k) and only guards runaway
-        # growth. Worst-case size: tars ~11k x ~180 KB = ~2 GB, state ~100 MB.
+        # the offsite backup pays for, ~130 MB a day against the state files'
+        # ~1 MB, and 8 days still carries each archive to the snapshot that
+        # captures it for as long as one snapshot a week survives retention.
+        # Further back the survivors are a month apart and no window worth
+        # keeping on disk bridges that. Both pipelines keep a 100k count cap
+        # that cannot bind under real usage (8d of every-minute saves is ~11.5k)
+        # and only guards runaway growth. Worst case: tars ~11.5k x ~250 KB =
+        # ~2.9 GB, state files ~100 MB.
         pane_archive="$resurrect_dir/pane_contents.tar.gz"
         if [ -f "$pane_archive" ]; then
           ${pkgs.coreutils}/bin/cp "$pane_archive" "$resurrect_dir/pane_contents_$(${pkgs.coreutils}/bin/date +%Y%m%dT%H%M%S).tar.gz"
