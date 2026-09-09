@@ -60,15 +60,18 @@ in
 
         resurrect_dir="$HOME/.tmux/resurrect"
 
-        # Rotate pane_contents.tar.gz before save. Retention for both the
-        # rotated archives and the state files below: 14 days, with a 100k
-        # count cap that cannot bind under real usage (14d of every-minute
-        # saves is ~20k) and only guards runaway growth. Worst-case size:
-        # tars ~20k x ~180 KB = ~3.6 GB, state files ~100 MB.
+        # Rotate pane_contents.tar.gz before save. Retention: 8 days for the
+        # rotated archives, 14 for the state files below. The archives are what
+        # the offsite backup pays for, ~167 MiB a day against the state files'
+        # ~1 MiB, and 8 days is the floor that still carries each archive to the
+        # snapshot that captures it: past 30 days back only one snapshot per week
+        # is retained. Both keep a 100k count cap that cannot bind under real
+        # usage (8d of every-minute saves is ~11k) and only guards runaway
+        # growth. Worst-case size: tars ~11k x ~180 KB = ~2 GB, state ~100 MB.
         pane_archive="$resurrect_dir/pane_contents.tar.gz"
         if [ -f "$pane_archive" ]; then
           ${pkgs.coreutils}/bin/cp "$pane_archive" "$resurrect_dir/pane_contents_$(${pkgs.coreutils}/bin/date +%Y%m%dT%H%M%S).tar.gz"
-          ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'pane_contents_*.tar.gz' -mtime +14 -delete
+          ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'pane_contents_*.tar.gz' -mtime +8 -delete
           ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/pane_contents_*.tar.gz 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +100001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
         fi
 
