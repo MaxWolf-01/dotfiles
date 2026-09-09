@@ -40,6 +40,12 @@ let
     bash coreutils uv openssh jq
   ]);
 
+  # The activity board shells out to git in every checkout it finds, and finds
+  # them with fd.
+  activityPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv jq git fd
+  ]);
+
   # util-linux for flock (vpn-pick serializes watcher vs. manual runs), jq for
   # both the tailscale state reads and the run-log lines vpn-pick writes
   vpnPath = lib.makeBinPath (with pkgs; [
@@ -521,6 +527,37 @@ in
       OnCalendar = "*:20:00";
       Persistent = true;
       RandomizedDelaySec = "5m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # The odd one out: it reports on no job, only on when this machine was in use.
+  # It re-reads every source in full — a year of wakatime heartbeats, every git
+  # checkout under ~/repos — for about ten seconds of CPU, so it runs once a day
+  # rather than hourly. The page is a record of years; the last hour of it is not
+  # what anyone opens it for, and `systemctl --user start` covers wanting today.
+
+  systemd.user.services.dashboard-activity = {
+    Unit.Description = "Rebuild the activity dashboard from this machine's own traces";
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${activityPath}" ];
+      ExecStart = "${secrets}/scripts/dashboard-activity --record";
+      TimeoutStartSec = "10min";
+      # Nothing waits on this page, and it competes with whatever max is doing.
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.dashboard-activity = {
+    Unit.Description = "Daily activity dashboard refresh";
+    Timer = {
+      # Late morning: yesterday is complete by then, and the laptop is usually up,
+      # so Persistent rarely has to catch the run up after a suspend.
+      OnCalendar = "*-*-* 11:40:00";
+      Persistent = true;
+      RandomizedDelaySec = "20m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
