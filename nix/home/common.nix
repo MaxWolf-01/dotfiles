@@ -57,6 +57,7 @@
       size = 1000000;
       save = 1000000;
       ignoreAllDups = true;
+      extended = true;  # timestamp and duration per entry; zsh reads the old format too
     };
   };
 
