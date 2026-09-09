@@ -30,7 +30,7 @@ NEVER include any work related details whatsoever in commit messages, PRs, issue
 
 ## Issue Tracker
 
-`agent/tasks/` is a symlink into `secrets/agent/tasks/` — tickets are versioned in the private secrets repo, never in this public one (commit them there). Standard mx markdown-tracker conventions apply; `archive/` holds retired pre-mx-workflow task files.
+`agent/tickets/` is a symlink into `secrets/agent/tickets/` — tickets are versioned in the private secrets repo, never in this public one (commit them there). Standard mx markdown-tracker conventions apply; `archive/` holds retired pre-mx-workflow task files.
 
 ## Workflow Artefacts
 

@@ -8,7 +8,7 @@ mechanisms deliver it:
 | --- | --- |
 | zephylux | local failover chain, `bin/dns-failover-install` |
 | phone | tailnet DNS: tailscaled forwards to Mullvad over DoH |
-| xmg19 | tailnet DNS; offline, and planned to opt out as a server (`agent/tasks/xmg19-offsite-server-planning.md`) |
+| xmg19 | tailnet DNS; offline, and planned to opt out as a server (`agent/tickets/xmg19-offsite-server-planning.md`) |
 | pc | unfiltered: the LAN router, via dhcpcd + resolvconf |
 | jarvis, yapit-prod | unfiltered: each VPS's own resolver |
 
@@ -29,7 +29,7 @@ What follows from the shape:
 
 - A dead tunnel costs ~2 s per uncached lookup instead of an outage. The chain
   exists because tailnet DNS died three times in one day of tunnel trouble:
-  `agent/tasks/dns-fails-closed-on-flaky-link.md`.
+  `agent/tickets/dns-fails-closed-on-flaky-link.md`.
 - No failure path reaches a non-Mullvad resolver. Plain 53 is used only on
   networks that block both DoT paths.
 - Queries carry the real source IP only while the tunnel path is failing.
@@ -61,7 +61,7 @@ as `nm.DNS.Resolvers` in `ipn/ipnlocal/node_backend.go`, where
 `if len(nm.DNS.Resolvers) > 0 { addDefault(...) }` runs unconditionally — which
 also means `fallbackResolvers` never apply, and DNS on these hosts fails
 closed when the resolver is unreachable (the incident record in
-`agent/tasks/dns-fails-closed-on-flaky-link.md` is the full analysis, source
+`agent/tickets/dns-fails-closed-on-flaky-link.md` is the full analysis, source
 references included).
 
 Two consequences:
