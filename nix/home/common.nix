@@ -75,6 +75,7 @@
       "agent/handoffs"
       "agent/research"
       "agent/diffviews"
+      "agent/harden"
       "agent/board.html"
       "agent/board.html.stamp.js"
       "node_modules"
