@@ -292,8 +292,15 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         fi
     fi
 
+    # One retention pool per repository. restic's default groups snapshots by
+    # host and paths together, so editing a dirs.txt starts a fresh pool and
+    # strands the old one: its snapshots satisfy keep-last against each other
+    # forever, because every keep rule counts snapshots rather than days on the
+    # calendar. Each repository here backs up a single host, so host alone is
+    # the whole grouping.
     echo "Pruning old snapshots..."
     restic --repo "$repo_path" forget --prune \
+        --group-by host \
         --keep-last "$keep_last" \
         --keep-daily "$keep_daily" \
         --keep-weekly "$keep_weekly" \
