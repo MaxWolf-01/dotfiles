@@ -75,21 +75,10 @@ tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
 ## Home Manager
 
 Structure:
-- `flake.nix` — defines all hosts. PC is a NixOS system (with HM as module); laptops are HM standalone.
-- `nix/home/common.nix` - CLI tools for all hosts (auto-included via mkHome)
-- `nix/home/desktop.nix` - GUI apps (vesktop, obsidian, etc.) — workstation machines only
-- `nix/home/dotnet.nix` - .NET SDK 8, Roslyn C# language server, sqlcmd — zephyrus only
-- `nix/home/firefox.nix` - Firefox: policies, search engines, about:config
-- `nix/home/ghostty.nix` - terminal emulator
-- `nix/home/gnome.nix` - GNOME keybindings, tiling-shell, dconf settings
-- `nix/home/newsboat.nix` - RSS reader with desktop notifications
-- `nix/home/tmux.nix` - tmux config
-- `nix/home/timers.nix` - systemd user timers, zephyrus only
-- `nix/home/pc-timers.nix` - PC user timers (youtube backup, phone sync + backup, encrypted backup)
-- `nix/home/wayland.nix` - Wayland clipboard (wl-clipboard)
-- `nix/home/worker.nix` - a dispatch worker user on pc, instantiated per Claude account
-- `nix/home/hosts/` - per-machine configs (stateVersion + imports)
-- `nix/nixos/pc/` - NixOS system config for PC (configuration.nix, hardware-configuration.nix, youtube-download.nix)
+- `flake.nix` defines all hosts. PC is a NixOS system (with HM as a module); laptops are HM standalone.
+- `nix/home/` holds one Home Manager module per concern: a program (`firefox.nix`, `ghostty.nix`, `tmux.nix`, ...), a desktop layer (`desktop.nix`, `gnome.nix`, `wayland.nix`), a toolchain (`dotnet.nix`), the systemd user timers (`timers.nix` and `pc-timers.nix`, one file per host that has them), a user (`worker.nix`), and `common.nix` for what every machine gets. `ls nix/home/` is the index; each module's own options say what it sets.
+- `nix/home/hosts/` is per-machine: stateVersion plus the imports that pick the tier below.
+- `nix/nixos/pc/` is PC's NixOS system config.
 
 Host tiers:
 - **CLI** (common.nix): every machine — shell, dev tools, restic, etc.
@@ -180,29 +169,4 @@ The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to GitHub Pa
 
 # Rime MCP
 
-You have access to Nix tooling via the rime MCP server. Use it for Nix-related tasks in this project.
-
-**Package/Flake Operations:**
-- `nix_packages_search` — Search packages in nixpkgs or a flake
-- `nix_packages_why_depends` — Show dependency chains between packages
-- `nix_flakes_show` — Show flake outputs
-- `nix_flakes_metadata` — Show flake metadata (inputs, locks)
-- `nix_evaluate` — Evaluate Nix expressions
-- `nix_log` — Get build logs for debugging
-
-**Documentation (use these before web searches for Nix questions):**
-- `manix_search` — Fast doc search across Nix/NixOS/HM options
-- `home_manager_options_search` — Search Home Manager options specifically
-- `nixpkgs_options_search` — Search NixOS module options for a specific nixpkgs ref
-- `nvf_options_search` / `nvf_manual_*` — Search nvf (Neovim Flake) options
-- `nix_manual_list` / `nix_manual_read` — Browse Nix manual source
-- `nixos_wiki_search` / `nixos_wiki_read` — NixOS wiki access
-
-**System Info:**
-- `nix_config_show` — Current Nix configuration
-- `nixos_channels` — Available channels and status
-- `nixhub_package_versions` — Version history for a package (useful for pinning)
-
-When to use rime vs web search:
-- **rime first**: ALWAYS USE IT WHEN ADDING / CHANGING ANYTHING NIX RELATED: HM options, Nix builtins, package search, flake introspection, ...
-- **web search**: Tutorials, complex debugging, community patterns not in docs
+ALWAYS reach for the `rime` MCP server before a web search when adding or changing ANYTHING Nix: options, builtins, packages, flake introspection, manual and wiki lookups. The server lists its own tools. Web search is for tutorials, hard debugging, and community patterns the docs do not cover.
