@@ -1,0 +1,289 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Drive bin/display-layout's parsing and its arrangement. Run it directly; no framework.
+
+The cases fix the two judgements the tool rests on: what counts as the row
+mutter falls back to, and where the panel goes underneath. Everything else it
+does is one gdctl call away from mutter's own API, and gdctl -V verifies that
+live in a way a fixture cannot.
+
+The fixtures are gdctl show output, kept down to the lines the parser reads plus
+the deeper ones it has to walk past.
+"""
+
+import importlib.util
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+
+def load(name: str, path: Path):
+    loader = SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    assert spec
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+dl = load("display_layout", Path(__file__).resolve().parent.parent / "bin" / "display-layout")
+
+MONITORS = """\
+Monitors:
+├──Monitor eDP-1 (Built-in display)
+│  ├──Vendor: AUO
+│  ├──Product: 0xc199
+│  ├──Serial: 0x00000000
+│  ├──Current mode
+│  │   └──2560x1600@165.040
+│  └──Preferences
+│      └──Backlight:
+│          ├──active ⇒  True
+│          └──max ⇒  19200
+└──Monitor HDMI-1 (ASUSTek COMPUTER INC 28")
+   ├──Vendor: AUS
+   ├──Product: ASUS VP28U
+   ├──Serial: 0x00039bf2
+   ├──Current mode
+   │   └──3840x2160@60.000
+   └──Preferences
+       └──Backlight: None
+"""
+
+ROW = MONITORS + """
+Logical monitors:
+├──Logical monitor #1
+│  ├──Position: (0, 0)
+│  ├──Scale: 1.3333333730697632
+│  ├──Transform: normal
+│  ├──Primary: yes
+│  └──Monitors: (1)
+│      └──eDP-1 (Built-in display)
+└──Logical monitor #2
+   ├──Position: (1920, 0)
+   ├──Scale: 1.5
+   ├──Transform: normal
+   ├──Primary: no
+   └──Monitors: (1)
+       └──HDMI-1 (ASUSTek COMPUTER INC 28")
+"""
+
+STACKED = MONITORS + """
+Logical monitors:
+├──Logical monitor #1
+│  ├──Position: (320, 1440)
+│  ├──Scale: 1.3333333730697632
+│  ├──Transform: normal
+│  ├──Primary: yes
+│  └──Monitors: (1)
+│      └──eDP-1 (Built-in display)
+└──Logical monitor #2
+   ├──Position: (0, 0)
+   ├──Scale: 1.5
+   ├──Transform: normal
+   ├──Primary: no
+   └──Monitors: (1)
+       └──HDMI-1 (ASUSTek COMPUTER INC 28")
+"""
+
+# Both monitors in one logical monitor: a mirror, and never mutter's fallback.
+MIRRORED = MONITORS + """
+Logical monitors:
+└──Logical monitor #1
+   ├──Position: (0, 0)
+   ├──Scale: 1.0
+   ├──Transform: normal
+   ├──Primary: yes
+   └──Monitors: (2)
+       ├──eDP-1 (Built-in display)
+       └──HDMI-1 (ASUSTek COMPUTER INC 28")
+"""
+
+PANEL_ONLY = """\
+Monitors:
+└──Monitor eDP-1 (Built-in display)
+   ├──Vendor: AUO
+   ├──Product: 0xc199
+   ├──Serial: 0x00000000
+   └──Current mode
+       └──2560x1600@165.040
+
+Logical monitors:
+└──Logical monitor #1
+   ├──Position: (0, 0)
+   ├──Scale: 1.3333333730697632
+   ├──Transform: normal
+   ├──Primary: yes
+   └──Monitors: (1)
+       └──eDP-1 (Built-in display)
+"""
+
+failures = 0
+
+
+def check(what, expected, actual):
+    global failures
+    if expected == actual:
+        print(f"ok   {what}")
+    else:
+        print(f"FAIL {what}")
+        print(f"       expected: {expected}")
+        print(f"       actual:   {actual}")
+        failures += 1
+
+
+# --- the parser reads the tree, and walks past what sits below it
+
+row = dl.parse_show(ROW)
+check("monitors, in gdctl's order", ["eDP-1", "HDMI-1"], list(row.monitors))
+check("current mode", "3840x2160@60.000", row.monitors["HDMI-1"].mode)
+check("the panel is the built-in one", True, row.monitors["eDP-1"].is_builtin)
+check("an external is not", False, row.monitors["HDMI-1"].is_builtin)
+check("logical monitors", 2, len(row.logicals))
+check("position", (1920, 0), (row.logicals[1].x, row.logicals[1].y))
+check("scale", 1.5, row.logicals[1].scale)
+check("primary", [True, False], [logical.primary for logical in row.logicals])
+check("connectors, not the display names beside them", ["HDMI-1"], row.logicals[1].connectors)
+# Backlight sits two levels under the monitor, where a mode name sits under
+# "Current mode". Reading it as one would give an unparseable resolution.
+check("Preferences are not mistaken for a mode", "2560x1600@165.040", row.monitors["eDP-1"].mode)
+
+check("logical size is the mode over the scale", (2560, 1440), row.size_of(row.logicals[1]))
+
+# --- what counts as mutter's row
+
+check("a row is recognised", True, dl.is_mutter_row(row))
+check("an arrangement is not", False, dl.is_mutter_row(dl.parse_show(STACKED)))
+check("one monitor is never worth rearranging", False, dl.is_mutter_row(dl.parse_show(PANEL_ONLY)))
+
+# A gap between two monitors means someone placed them, so leave them placed.
+gapped = dl.parse_show(ROW.replace("Position: (1920, 0)", "Position: (2000, 0)"))
+check("a gap in the row is not the row", False, dl.is_mutter_row(gapped))
+# mutter rounds logical sizes, so a pixel of drift is still the row.
+drifted = dl.parse_show(ROW.replace("Position: (1920, 0)", "Position: (1921, 0)"))
+check("a pixel of drift still is", True, dl.is_mutter_row(drifted))
+
+# --- where the arrangement puts things
+
+plan = dl.plan(row)
+check("no --persistent, which would raise mutter's confirmation dialog", [], [a for a in plan if a in ("-P", "--persistent")])
+check(
+    "external on top, panel centred below it, panel primary",
+    [
+        "--logical-monitor", "--x", "0", "--y", "0", "--scale", "1.5",
+        "--transform", "normal",
+        "--monitor", "HDMI-1", "--mode", "3840x2160@60.000",
+        "--logical-monitor", "--x", "320", "--y", "1440",
+        "--scale", "1.3333333730697632", "--transform", "normal", "--primary",
+        "--monitor", "eDP-1", "--mode", "2560x1600@165.040",
+    ],
+    plan,
+)
+# gdctl fills a missing --mode with the monitor's preferred mode, which would
+# drop a variable-refresh mode: those are separate, non-preferred modes.
+vrr_plan = dl.plan(dl.parse_show(ROW.replace("2560x1600@165.040", "2560x1600@165.040+vrr")))
+check(
+    "the current mode is named, variable-refresh variant included",
+    ["3840x2160@60.000", "2560x1600@165.040+vrr"],
+    [a for flag, a in zip(vrr_plan, vrr_plan[1:]) if flag == "--mode"],
+)
+
+# A turned monitor's mode height lies along the layout's x axis, so centring the
+# panel under it has to measure the turned width.
+turned = dl.parse_show(ROW.replace("   ├──Transform: normal\n   ├──Primary: no", "   ├──Transform: 90\n   ├──Primary: no"))
+check("a turned external keeps its transform", "90", dl.plan(turned)[dl.plan(turned).index("--transform") + 1])
+check(
+    "a turned external is measured on its turned edge",
+    (1440, 2560),
+    turned.size_of(turned.logicals[1]),
+)
+check("nothing to arrange without an external", [], dl.plan(dl.parse_show(PANEL_ONLY)))
+check("a mirror is left alone", [], dl.plan(dl.parse_show(MIRRORED)))
+
+def positions(plan):
+    """The plan's --x/--y per connector, read back the way gdctl reads it."""
+    out, current = {}, {}
+    for flag, value in zip(plan, plan[1:]):
+        if flag in ("--x", "--y"):
+            current[flag] = int(value)
+        elif flag == "--monitor":
+            out[value] = (current.get("--x"), current.get("--y"))
+            current = {}
+    return out
+
+
+# A panel wider than the externals would centre at a negative x, which mutter
+# rejects; the row moves right instead.
+narrow = dl.parse_show(
+    ROW.replace("3840x2160@60.000", "1280x1024@60.000").replace("Scale: 1.5", "Scale: 1.0")
+)
+check(
+    "a panel wider than the row pushes the row right instead of going off-canvas",
+    {"HDMI-1": (320, 0), "eDP-1": (0, 1024)},
+    positions(dl.plan(narrow)),
+)
+
+# --- unreadable input is an error, not a silent misreading
+
+try:
+    dl.parse_show("Monitors:\n")
+    check("empty output is refused", "ParseError", "no error")
+except dl.ParseError:
+    check("empty output is refused", "ParseError", "ParseError")
+
+try:
+    dl.parse_show(MONITORS.replace("│  │   └──2560x1600@165.040\n", "") + "\nLogical monitors:\n")
+    check("a monitor without a mode is refused", "ParseError", "no error")
+except dl.ParseError:
+    check("a monitor without a mode is refused", "ParseError", "ParseError")
+
+# --- the watch loop acts once per change of the connected set, and only out of the row
+#
+# This is the guard that keeps the tool off a hand-made arrangement, and the one
+# thing a forced layout on a live display cannot exercise: forcing a row does not
+# change the connected set, which is exactly why nothing should happen.
+
+
+def drive(startup, *changes, failing=False):
+    """Run follow() over a startup state plus one MonitorsChanged per change.
+
+    Returns the gdctl argument lists it applied, dropping the leading
+    "gdctl set". With failing=True every apply raises, as a rejected
+    configuration does.
+    """
+    applied = []
+    served = iter((startup,) + changes)
+
+    def fake_run(argv):
+        applied.append(argv[2:])
+        if failing:
+            raise RuntimeError("mutter rejected the configuration")
+        return ""
+
+    original = dl.read_state, dl.run, dl.log_run
+    dl.read_state = lambda: dl.parse_show(next(served))
+    dl.run = fake_run
+    dl.log_run = lambda *a, **k: None
+    try:
+        dl.follow(["MonitorsChanged\n"] * len(changes), 0)
+    finally:
+        dl.read_state, dl.run, dl.log_run = original
+    return applied
+
+
+check("a row the set did not change into is left alone", 0, len(drive(STACKED, ROW)))
+check("a row a new monitor brought is arranged", 1, len(drive(PANEL_ONLY, ROW)))
+check("a new monitor already arranged is left alone", 0, len(drive(PANEL_ONLY, STACKED)))
+check("the same row twice is arranged once", 1, len(drive(PANEL_ONLY, ROW, ROW)))
+# Docking before the session starts means the fallback already happened and no
+# signal is coming; the startup look is the only chance to catch it.
+check("a row already on screen at startup is arranged", 1, len(drive(ROW)))
+# Giving up after one rejection would leave the row until the next plug.
+check("a rejected apply is retried on the next signal", 2, len(drive(ROW, ROW, failing=True)))
+
+print()
+print("FAILED" if failures else "all ok")
+sys.exit(1 if failures else 0)

@@ -1,0 +1,516 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Put the external monitors above the laptop panel when mutter falls back to its row.
+
+GNOME keys saved layouts in ~/.config/monitors.xml on each monitor's connector
+name plus its EDID. One monitor reaches a different connector through a
+different port -- HDMI on the discrete GPU, DP-1 or DP-2 on the USB-C ports --
+so a layout saved on one port is not found on another. mutter then lays the
+monitors out in a left-to-right row.
+
+This recognises that row and replaces it: externals along the top in the order
+mutter lists them, laptop panel centred below it and made primary. Modes,
+scales and transforms are carried over untouched; only positions change.
+
+The arrangement lasts for the session, and gdctl's --persistent is deliberately
+left out of every call here. mutter makes a person confirm any display
+configuration a D-Bus client saves, so saving this one would raise the
+keep-these-settings dialog on every replug. Nothing is written to
+monitors.xml, and the arrangement is remade on each fallback instead.
+
+Reads and writes display state through gdctl(1).
+
+Examples:
+
+    display-layout show
+    display-layout show --json
+    display-layout apply --dry-run
+    display-layout apply
+    display-layout watch
+"""
+
+import ctypes
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import tyro
+from tyro.extras import SubcommandApp
+
+app = SubcommandApp()
+
+# Reached relative to this script, not through PATH: the systemd unit pins its
+# own PATH and it does not carry ~/bin.
+RUN_LOG = Path(__file__).resolve().parent / "run-log"
+
+PR_SET_PDEATHSIG = 1
+"""prctl(2) option: signal this process when its parent dies."""
+
+SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
+"""Where gdctl and gdbus are looked up.
+
+gdctl is a system GNOME tool that imports the system python3's GObject
+bindings. The uv virtualenv this script runs in puts its own python3 ahead of
+the system one, and those bindings are not installed there.
+"""
+
+BUILTIN_PREFIXES = ("eDP", "LVDS", "DSI")
+"""Connector types mutter treats as the built-in panel (meta_monitor_is_builtin)."""
+
+TREE = re.compile(r"^(?P<prefix>[│ ]*)[├└]──(?P<text>.*)$")
+"""One row of gdctl's box-drawing tree. Indent is 4 columns per level."""
+
+RESOLUTION = re.compile(r"^(\d+)x(\d+)@")
+POSITION = re.compile(r"^Position: \((-?\d+), (-?\d+)\)$")
+
+ADJACENCY_TOLERANCE = 2
+"""Pixels of slack when testing whether two logical monitors touch.
+
+mutter rounds logical sizes to whole pixels, so a row's x offsets need not be an
+exact running sum of the widths computed here.
+"""
+
+
+class ParseError(Exception):
+    pass
+
+
+@dataclass
+class Monitor:
+    connector: str
+    mode: str = ""
+
+    @property
+    def is_builtin(self) -> bool:
+        return self.connector.startswith(BUILTIN_PREFIXES)
+
+    @property
+    def resolution(self) -> tuple[int, int]:
+        m = RESOLUTION.match(self.mode)
+        if not m:
+            raise ParseError(f"{self.connector}: unreadable mode {self.mode!r}")
+        return int(m[1]), int(m[2])
+
+
+@dataclass
+class Logical:
+    x: int = 0
+    y: int = 0
+    scale: float = 1.0
+    transform: str = "normal"
+    primary: bool = False
+    connectors: list[str] = field(default_factory=list)
+
+    @property
+    def is_turned(self) -> bool:
+        """Whether the transform puts the mode's height along the layout's x axis."""
+        return self.transform in ("90", "270", "flipped-90", "flipped-270")
+
+
+@dataclass
+class State:
+    monitors: dict[str, Monitor]
+    logicals: list[Logical]
+
+    def size_of(self, logical: Logical) -> tuple[int, int]:
+        """Logical size in the layout's coordinate space.
+
+        gdctl rejects a logical monitor whose monitors differ in resolution, so
+        the first one speaks for all of them.
+        """
+        w, h = self.monitors[logical.connectors[0]].resolution
+        if logical.is_turned:
+            w, h = h, w
+        return round(w / logical.scale), round(h / logical.scale)
+
+
+def read_state() -> State:
+    return parse_show(run(["gdctl", "show"]))
+
+
+def parse_show(out: str) -> State:
+    """Turn `gdctl show` output into monitors and the logical monitors they sit in."""
+    monitors: dict[str, Monitor] = {}
+    logicals: list[Logical] = []
+    section = ""
+    monitor: Monitor | None = None
+    logical: Logical | None = None
+    expect = ""
+
+    for line in out.splitlines():
+        if line == "Monitors:":
+            section, expect = "monitors", ""
+            continue
+        if line == "Logical monitors:":
+            section, expect = "logical", ""
+            continue
+        row = TREE.match(line)
+        if not row:
+            continue
+        level = (len(row["prefix"]) + 1) // 4
+        text = row["text"]
+
+        if level < 2:
+            expect = ""
+
+        if section == "monitors":
+            if level == 0 and text.startswith("Monitor "):
+                monitor = Monitor(connector=text.split()[1])
+                monitors[monitor.connector] = monitor
+            elif level == 1 and text in ("Current mode", "Preferred mode"):
+                expect = "mode"
+            elif level == 2 and expect == "mode" and monitor:
+                monitor.mode = text
+                expect = ""
+
+        elif section == "logical":
+            if level == 0 and text.startswith("Logical monitor #"):
+                logical = Logical()
+                logicals.append(logical)
+            elif logical is None:
+                continue
+            elif pos := POSITION.match(text):
+                logical.x, logical.y = int(pos[1]), int(pos[2])
+            elif text.startswith("Scale: "):
+                logical.scale = float(text.removeprefix("Scale: "))
+            elif text.startswith("Transform: "):
+                logical.transform = text.removeprefix("Transform: ")
+            elif text.startswith("Primary: "):
+                logical.primary = text.endswith("yes")
+            elif text.startswith("Monitors: ("):
+                expect = "connectors"
+            elif level == 2 and expect == "connectors":
+                logical.connectors.append(text.split()[0])
+
+    if not monitors:
+        raise ParseError("gdctl show listed no monitors")
+    for name, mon in monitors.items():
+        if not mon.mode:
+            raise ParseError(f"{name}: gdctl show reported no mode")
+    return State(monitors=monitors, logicals=logicals)
+
+
+def is_mutter_row(state: State) -> bool:
+    """True when the layout is what mutter's create_linear() emits.
+
+    Every logical monitor sits at y=0 and each one starts where the previous
+    ended, in the order mutter itself lists them. A single monitor is trivially
+    such a row and is never worth rearranging.
+    """
+    if len(state.logicals) < 2:
+        return False
+    edge = 0
+    for logical in state.logicals:
+        if logical.y != 0 or abs(logical.x - edge) > ADJACENCY_TOLERANCE:
+            return False
+        edge += state.size_of(logical)[0]
+    return True
+
+
+def plan(state: State) -> list[str]:
+    """gdctl arguments placing the externals in a row with the panel centred below.
+
+    Empty when there is nothing to arrange: no external, no built-in panel, or a
+    mirrored logical monitor, which is always deliberate.
+    """
+    if any(len(logical.connectors) > 1 for logical in state.logicals):
+        return []
+
+    by_connector = {
+        logical.connectors[0]: logical
+        for logical in state.logicals
+        if logical.connectors
+    }
+    externals = [
+        c for c, m in state.monitors.items() if not m.is_builtin and c in by_connector
+    ]
+    builtins = [
+        c for c, m in state.monitors.items() if m.is_builtin and c in by_connector
+    ]
+    if not externals or not builtins:
+        return []
+
+    panel = builtins[0]
+    sizes = {c: state.size_of(by_connector[c]) for c in externals + [panel]}
+    top_width = sum(sizes[c][0] for c in externals)
+    top_height = max(sizes[c][1] for c in externals)
+
+    panel_x = (top_width - sizes[panel][0]) // 2
+    shift = max(0, -panel_x)  # a panel wider than the row pushes the row right
+
+    args: list[str] = []  # --persistent is left out on purpose; see this module's docstring
+    x = shift
+    for connector in externals:
+        args += monitor_args(state, connector, x, 0)
+        x += sizes[connector][0]
+    args += monitor_args(state, panel, panel_x + shift, top_height, primary=True)
+    return args
+
+
+def monitor_args(
+    state: State, connector: str, x: int, y: int, primary: bool = False
+) -> list[str]:
+    """One --logical-monitor group for gdctl set.
+
+    Mode and transform are spelled out rather than left to gdctl, which fills a
+    missing mode with the monitor's preferred one. That would drop a chosen
+    refresh rate, and every variable-refresh mode, since those are separate
+    non-preferred modes of their own ("2560x1600@165.040+vrr").
+    """
+    logical = next(
+        lo for lo in state.logicals if connector in lo.connectors
+    )
+    args = [
+        "--logical-monitor",
+        "--x",
+        str(x),
+        "--y",
+        str(y),
+        "--scale",
+        str(logical.scale),
+        "--transform",
+        logical.transform,
+    ]
+    if primary:
+        args.append("--primary")
+    return args + ["--monitor", connector, "--mode", state.monitors[connector].mode]
+
+
+def describe(state: State) -> dict:
+    return {
+        "monitors": {
+            c: {"mode": m.mode, "builtin": m.is_builtin}
+            for c, m in state.monitors.items()
+        },
+        "logicals": [
+            {
+                "x": logical.x,
+                "y": logical.y,
+                "scale": logical.scale,
+                "primary": logical.primary,
+                "connectors": logical.connectors,
+            }
+            for logical in state.logicals
+        ],
+        "is_mutter_row": is_mutter_row(state),
+    }
+
+
+def die_with_parent() -> None:
+    """Ask the kernel to kill this child when its parent goes (PR_SET_PDEATHSIG).
+
+    The `finally` around the watch loop covers the orderly exits. This covers the
+    rest -- SIGKILL, a crash, a signal arriving inside a syscall -- where the
+    parent never runs another line and gdbus would otherwise be left reparented
+    to the session manager, holding a bus connection nobody reads.
+    """
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
+
+def system_env() -> dict[str, str]:
+    """The session's environment with this script's virtualenv taken back out."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH")
+    }
+    env["PATH"] = SYSTEM_PATH
+    return env
+
+
+def run(argv: list[str]) -> str:
+    proc = subprocess.run(argv, capture_output=True, text=True, env=system_env())
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(f"{' '.join(argv)} failed: {detail}")
+    return proc.stdout
+
+
+def log_run(outcome: str, reason: str, stats: dict) -> None:
+    """Record one outcome via bin/run-log."""
+    proc = subprocess.run(
+        [
+            str(RUN_LOG),
+            "display-layout",
+            outcome,
+            "--reason",
+            reason,
+            "--stats",
+            json.dumps(stats),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        print(f"display-layout: run-log failed: {proc.stderr.strip()}", file=sys.stderr)
+
+
+@dataclass
+class ShowArgs:
+    json: bool = False
+    """Emit the parsed state as JSON instead of prose."""
+
+
+@app.command(name="show")
+def show(args: ShowArgs) -> None:
+    """Report what gdctl sees, whether it is mutter's row, and what apply would do.
+
+    JSON schema (--json):
+
+        {"monitors": {"<connector>": {"mode": "str", "builtin": bool}},
+         "logicals": [{"x": int, "y": int, "scale": float,
+                       "primary": bool, "connectors": ["str"]}],
+         "is_mutter_row": bool,
+         "plan": ["str"]}
+    """
+    state = read_state()
+    report = describe(state) | {"plan": plan(state)}
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+    for connector, monitor in state.monitors.items():
+        kind = "built-in" if monitor.is_builtin else "external"
+        print(f"{connector:10s} {monitor.mode:22s} {kind}")
+    print()
+    for logical in state.logicals:
+        w, h = state.size_of(logical)
+        star = " *primary" if logical.primary else ""
+        print(
+            f"{','.join(logical.connectors):10s} "
+            f"{w}x{h} at ({logical.x}, {logical.y}) scale {logical.scale:g}{star}"
+        )
+    print()
+    print(f"mutter's row: {'yes' if report['is_mutter_row'] else 'no'}")
+    if report["plan"]:
+        print("plan: gdctl set " + " ".join(report["plan"]))
+    else:
+        print("plan: nothing to arrange")
+
+
+@dataclass
+class ApplyArgs:
+    dry_run: bool = False
+    """Print the gdctl command without running it."""
+
+
+@app.command(name="apply")
+def apply(args: ApplyArgs) -> None:
+    """Arrange the current monitors now, whatever the layout already is.
+
+    For the session only. An arrangement that should outlive the session goes
+    through GNOME Settings, which saves it against the connectors it was made on.
+    """
+    state = read_state()
+    argv = plan(state)
+    if not argv:
+        print("nothing to arrange", file=sys.stderr)
+        raise SystemExit(1)
+    print("gdctl set " + " ".join(argv))
+    if not args.dry_run:
+        run(["gdctl", "set", *argv])
+
+
+@dataclass
+class WatchArgs:
+    settle: float = 2.0
+    """Seconds to wait after a change before looking, so a hotplug can finish."""
+
+
+@app.command(name="watch")
+def watch(args: WatchArgs) -> None:
+    """Replace mutter's row with the arrangement whenever mutter falls back to it.
+
+    Listens for MonitorsChanged on the session bus, and looks once on startup at
+    a display that was already connected.
+
+    Arranges only when the set of connected monitors has changed, which is the
+    only way mutter reaches the row. Rearranging monitors by hand leaves that set
+    alone, so an arrangement made during a session is never overwritten -- a
+    deliberate side-by-side one is indistinguishable from the row, and survives
+    on that rule alone.
+
+    Records one line per resolved change via bin/run-log.
+    """
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    monitor = subprocess.Popen(
+        ["gdbus", "monitor", "--session", "--dest", "org.gnome.Mutter.DisplayConfig"],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=system_env(),
+        preexec_fn=die_with_parent,
+    )
+    assert monitor.stdout
+    try:
+        follow(monitor.stdout, args.settle)
+    finally:
+        monitor.terminate()
+        monitor.wait(timeout=5)
+    raise SystemExit("gdbus monitor exited")
+
+
+def follow(stream, settle: float) -> None:
+    """Arrange once per change of the connected set, and only out of the row.
+
+    The display is looked at once on startup too, because a monitor plugged in
+    before the session began has already had its fallback and will send no
+    signal about it.
+    """
+    settled = arrange(None)
+    for line in stream:
+        if "MonitorsChanged" not in line:
+            continue
+        time.sleep(settle)
+        settled = arrange(settled)
+
+
+def arrange(settled: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    """Replace the row if mutter has just fallen back into it.
+
+    Takes the connected set this already dealt with, and returns the set it
+    leaves dealt with -- which is the old one whenever nothing was resolved, so
+    a display that could not be read or arranged is tried again on the next
+    signal rather than written off.
+
+    Acting only on a change of the set is what keeps this off an arrangement
+    made by hand: mutter reaches the row by falling back, which follows a plug
+    or an unplug, and rearranging monitors never touches the set.
+    """
+    try:
+        state = read_state()
+    except (ParseError, RuntimeError) as exc:
+        log_run("fail", str(exc), {})
+        return settled
+
+    connectors = tuple(state.monitors)
+    if connectors == settled:
+        return settled
+    stats = {"monitors": list(connectors)}
+
+    if not is_mutter_row(state):
+        log_run("skip", "layout is not the row", stats)
+        return connectors
+    argv = plan(state)
+    if not argv:
+        log_run("skip", "nothing to arrange", stats)
+        return connectors
+    try:
+        run(["gdctl", "set", *argv])
+    except RuntimeError as exc:
+        log_run("fail", str(exc), stats)
+        return settled
+    log_run("ok", "replaced mutter's row", stats)
+    return connectors
+
+
+if __name__ == "__main__":
+    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
