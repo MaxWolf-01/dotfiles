@@ -20,6 +20,7 @@
 
   imports = [
     ../desktop.nix
+    ../display-layout.nix
     ../dotnet.nix
     ../gnome.nix
     ../greyline.nix
