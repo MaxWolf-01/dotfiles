@@ -21,7 +21,9 @@ set -uo pipefail
 # keep_monthly - Number of monthly snapshots to keep
 # check_data - (optional) "true", "false", or percentage like "5%" (default: false)
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
-# require_mount - (optional) Path that must be a mountpoint, else skip (for encrypted ZFS datasets)
+# require_mount - (optional) Path that must be a mountpoint: missing before the run is a skip,
+#                 gone after it is a failure. Read from the environment as well as the config,
+#                 so a caller that owns the mount can pass it (backup/jarvis_backup.sh)
 # backup_opts - (optional) Extra flags for `restic backup`, word-split (e.g. "--ignore-inode")
 
 # Reached relative to this script, not through PATH: the systemd units pin
@@ -290,6 +292,24 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
             data_added_packed=$(echo "$summary_json" | jq -r '.data_added_packed // 0')
             total_bytes_processed=$(echo "$summary_json" | jq -r '.total_bytes_processed // 0')
         fi
+    fi
+
+    # The mountpoint is checked again, because a source mount can go away while
+    # the run is in flight, and then the snapshot covers a tree that was partly
+    # or wholly missing. restic cannot tell that from an ordinary race with
+    # ephemeral files, so nothing above this notices. Retention keeps the most
+    # recent snapshot of each day, so re-running is what repairs the day; that
+    # makes this a failure to report rather than anything to undo here.
+    if [ -n "${require_mount:-}" ] && ! mountpoint -q "$require_mount"; then
+        fail_out "$require_mount went away mid-run" \
+            "$require_mount was mounted when this run started and is gone now, so
+snapshot ${snapshot_id:-<none written>} may cover a partial tree.
+
+restic exited $backup_exit and processed $total_files_processed files.
+
+Re-run the backup once the mount is back. Retention keeps the most recent
+snapshot of each day, so a good run today supersedes this one and the next
+prune removes it. Nothing was pruned by this run."
     fi
 
     # One retention pool per repository. restic's default groups snapshots by

@@ -82,4 +82,4 @@ else
 fi
 
 echo "[jarvis-backup] Running restic backup"
-"$SCRIPT_DIR/restic_backup.sh" "$config_file"
+require_mount="$MOUNTPOINT" "$SCRIPT_DIR/restic_backup.sh" "$config_file"
