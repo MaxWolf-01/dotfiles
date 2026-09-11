@@ -21,7 +21,9 @@ set -uo pipefail
 # keep_monthly - Number of monthly snapshots to keep
 # check_data - (optional) "true", "false", or percentage like "5%" (default: false)
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
-# require_mount - (optional) Path that must be a mountpoint, else skip (for encrypted ZFS datasets)
+# require_mount - (optional) Path that must be a mountpoint: missing before the run is a skip,
+#                 gone after it is a failure and the snapshot is dropped. Settable from the
+#                 environment too, for a caller that owns the mount (backup/jarvis_backup.sh)
 # backup_opts - (optional) Extra flags for `restic backup`, word-split (e.g. "--ignore-inode")
 
 # Reached relative to this script, not through PATH: the systemd units pin
@@ -290,6 +292,32 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
             data_added_packed=$(echo "$summary_json" | jq -r '.data_added_packed // 0')
             total_bytes_processed=$(echo "$summary_json" | jq -r '.total_bytes_processed // 0')
         fi
+    fi
+
+    # The mountpoint is checked again, because it can go away mid-run: a suspend
+    # takes the network down under an sshfs mount, and restic reads the empty
+    # tree left behind as unreadable files, which is exit 3 and passes for a
+    # success above. The snapshot that lands is nearly empty and would hold that
+    # day's retention slot against the real one, so it is dropped here, before
+    # the prune that would enact it, and the run is a failure a person hears about.
+    if [ -n "${require_mount:-}" ] && ! mountpoint -q "$require_mount"; then
+        if [ -n "$snapshot_id" ]; then
+            restic --repo "$repo_path" --password-command "$password_command" \
+                forget "$snapshot_id" >/dev/null 2>&1
+        fi
+        fail_out "$require_mount went away mid-run" \
+            "$require_mount was mounted when this run started and is gone now, so restic
+backed up an empty or partial tree.
+
+Snapshot ${snapshot_id:-<none recorded>} was dropped from the repository so it cannot take
+a retention slot from a real one. Nothing else was pruned, and earlier snapshots
+are untouched.
+
+Files restic thought it processed: $total_files_processed
+Duration: $(format_duration $((  $(date +%s) - backup_start_time )))
+
+The usual cause is the machine suspending mid-run; see the sshfs sleep hook in
+systemd/system-sleep/. Re-running the backup is safe."
     fi
 
     # One retention pool per repository. restic's default groups snapshots by
