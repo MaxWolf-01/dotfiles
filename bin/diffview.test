@@ -255,21 +255,23 @@ kill "$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))
 # the server takes writes from the page that owns the file, and refuses the one that is behind
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/race.html" --no-auto-summary >/dev/null
 "$diffview" --serve "$work/pages" >/dev/null
-state="http://127.0.0.1:$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['port'])")/race.html.state.json"
-post() { curl -s -o /dev/null -w '%{http_code}' -X POST -d "$1" "$state"; }
+port=$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['port'])")
+origin="http://127.0.0.1:$port"
+state="$origin/race.html.state.json"
+post() { curl -s -o /dev/null -w '%{http_code}\n' -X POST -H "Origin: $origin" -d "$1" "$state"; }   # one write per code, so parallel posts below never interleave
 held() { python3 -c "import json;print(json.dumps(json.load(open('$work/pages/race.html.state.json'))$1))"; }
 check "the first write to a review lands" 204 "$(post '{"savedAt": 1001, "writer": "a", "since": null, "comments": ["a1"]}')"
 check "and the page that wrote it goes on writing" 204 "$(post '{"savedAt": 1002, "writer": "a", "since": null, "comments": ["a2"]}')"
 check "a page that never saw that write is refused" 409 "$(post '{"savedAt": 1003, "writer": "b", "since": 1001, "comments": ["b1"]}')"
 check "the refused write left the file alone" '["a2"]' "$(held '["comments"]')"
-check "the refusal names the save the page missed" 1002 "$(curl -s -X POST -d '{"savedAt": 1003, "writer": "b", "since": 1001}' "$state" | python3 -c 'import json,sys;print(json.load(sys.stdin)["savedAt"])')"
+check "the refusal names the save the page missed" 1002 "$(curl -s -X POST -H "Origin: $origin" -d '{"savedAt": 1003, "writer": "b", "since": 1001}' "$state" | python3 -c 'import json,sys;print(json.load(sys.stdin)["savedAt"])')"
 check "a page that did see it writes" 204 "$(post '{"savedAt": 1004, "writer": "b", "since": 1002, "comments": ["b2"]}')"
 check "and takes the review over" '["b2"] "b"' "$(held '["comments"]') $(held '["writer"]')"
 # one page is enough to put two writes in flight, and a file half of one write and half of
 # another reads as no state at all -- which would wave the next write through unchecked
 big=$(python3 -c "import json;print(json.dumps({'savedAt': 7001, 'writer': 'b', 'since': None, 'comments': ['x' * 400] * 200}))")
 rm -f "$work/pages/codes"
-for _ in $(seq 1 12); do (post "$big" >> "$work/pages/codes"; echo >> "$work/pages/codes") & done
+for _ in $(seq 1 12); do post "$big" >> "$work/pages/codes" & done
 wait
 check "concurrent writes from one page all land" 12 "$(grep -c '^204$' "$work/pages/codes")"
 check "and leave the state file readable" ok "$(python3 -c "import json;json.load(open('$work/pages/race.html.state.json'));print('ok')" 2>&1 | tail -1)"
@@ -282,7 +284,43 @@ check "and one that loaded an unnamed write goes on from it" 204 "$(post '{"save
 
 check "what a write was based on is not kept" yes "$(held '' | grep -q since || echo yes)"
 check "a state file that is not an object is still refused" 400 "$(post '[1, 2]')"
+
+# a page on another site can aim a form-shaped POST at loopback without a preflight; the
+# browser names that page in Origin, and only the server's own pages may write
+before=$(held '')
+foreign() { curl -s -o /dev/null -w '%{http_code}' -X POST "$@" -d '{"savedAt": 9001, "writer": "c", "since": 8003, "comments": ["planted"]}' "$state"; }
+check "a write from another origin is refused" 403 "$(foreign -H 'Origin: http://attacker.example')"
+check "so is one from a null origin" 403 "$(foreign -H 'Origin: null')"
+check "and one that names no origin at all" 403 "$(foreign -H 'Origin:')"
+check "none of them touched the file" "$before" "$(held '')"
+check "the server's own origin on localhost writes too" 204 "$(foreign -H "Origin: http://localhost:$port")"
+check "a write must announce its length" 411 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" "$state")"
+head -c 4200000 /dev/zero | tr '\0' x > "$work/pages/huge"
+check "and one over the size cap is refused unread" 413 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" --data-binary "@$work/pages/huge" "$state")"
+check "a write lands only beside a page that exists" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" -d '{}' "$origin/nopage.html.state.json")"
+check "and never outside the served tree" 404 "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is -X POST -H "Origin: $origin" -d '{}' "$origin/../race.html.state.json")"
+check "so no such files appear" yes "$([ ! -e "$work/pages/nopage.html.state.json" ] && [ ! -e "$work/race.html.state.json" ] && echo yes)"
 kill "$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['pid'])")" 2>/dev/null
+
+# --- the server lives as long as a page is open: an open page beats once a minute, and the
+# server exits a grace period after the last beat; the marker keeps the port for the next one
+
+mkdir -p "$work/beat"
+"$diffview" "$repo@HEAD~1..HEAD" -o "$work/beat/b.html" --no-auto-summary >/dev/null
+DIFFVIEW_IDLE_SECONDS=3 "$diffview" --serve "$work/beat" >/dev/null
+bport=$(python3 -c "import json;print(json.load(open('$work/beat/.serve.json'))['port'])")
+bpid=$(python3 -c "import json;print(json.load(open('$work/beat/.serve.json'))['pid'])")
+for _ in $(seq 7); do curl -s -o /dev/null "http://127.0.0.1:$bport/.health"; sleep 1; done
+check "a page beating every second keeps the server past its grace period" yes "$(kill -0 "$bpid" 2>/dev/null && echo yes)"
+sleep 6
+check "without beats it exits once the grace period passes" no "$(kill -0 "$bpid" 2>/dev/null && echo yes || echo no)"
+check "and leaves its port in the marker, its pid gone" "$bport no" "$(python3 -c "import json;m=json.load(open('$work/beat/.serve.json'));print(m['port'], 'yes' if 'pid' in m else 'no')")"
+# the tab still open on the old port must reach the next server without a reload
+free=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])")
+python3 -c "import json;json.dump({'port': $free, 'root': '$work/beat'}, open('$work/beat/.serve.json', 'w'))"
+"$diffview" --serve "$work/beat" >/dev/null
+check "a restarted server answers on the port the marker holds" "$work/beat" "$(curl -s "http://127.0.0.1:$free/.health" | python3 -c 'import json,sys;print(json.load(sys.stdin)["root"])')"
+kill "$(python3 -c "import json;print(json.load(open('$work/beat/.serve.json'))['pid'])")" 2>/dev/null
 
 # --- the auto summary lands after the page, never before it
 
@@ -584,12 +622,17 @@ setTimeout(() => {
   window.fetch = () => Promise.resolve({ ok: false, status: 503 });
   key("m"); key("r");
   setTimeout(() => document.body.append(Object.assign(document.createElement("pre"), { id: "fail", textContent:
-    "banners=" + document.querySelectorAll(".savefail").length })), 200);
+    "banners=" + document.querySelectorAll(".savefail").length
+    + " command=" + document.querySelector(".savefail code").textContent
+    + " copy=" + document.querySelector(".savefail button.btn").textContent
+    + " local=" + JSON.parse(localStorage.getItem("dv-state:" + DATA.key)).verdict.length })), 200);
 }, 300);
 EOF
     sed 's#</body>#<script src="fail.js"></script></body>#' "$work/ann.html" > "$work/fail.html"
     dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/fail.html" 2>/dev/null)
     check "a rejected save says so instead of passing silently" yes "$(grep -q 'banners=1' <<<"$dom" && echo yes)"
+    check "the warning carries the restart command with a copy button, and the browser holds what did not land" \
+        "command=diffview --serve $work copy=copy local=1" "$(grep -o 'id="fail">[^<]*' <<<"$dom" | cut -d'>' -f2 | sed 's/^banners=1 //')"
 
     # that warning is a live fact, not a notice: the server answering again clears it and lands what was typed meanwhile
     cat > "$work/back.js" <<'EOF'
@@ -655,6 +698,29 @@ EOF
     check "the banner names the command that enables comments" yes "$(grep -q "diffview --serve $work" <<<"$dom" && echo yes)"
     check "a file:// page opens no comment editor, resolves nothing, marks nothing seen" "editors=0 resolved=false seen=false" "$(grep -o 'id="ro">[^<]*' <<<"$dom" | cut -d'>' -f2)"
     check "a file:// page writes no state" yes "$([ ! -f "$work/ro.html.state.json" ] && echo yes)"
+
+    # what a reviewer or an agent writes is shown, never run: markup in a comment, a note or
+    # the summary comes out as the characters typed
+    cat > "$work/markup.html.state.json" <<'EOF'
+{"savedAt": 1, "nextId": 2, "viewed": [], "verdict": [],
+ "comments": [{"id": 1, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 3, "end": 3,
+               "text": "quoting <b>bold</b> and <script>alert(1)</script>", "excerpt": ["+ three"]}]}
+EOF
+    "$diffview" "$repo@HEAD~1..HEAD" -o "$work/markup.html" --summary 'a summary with <img src=x onerror=alert(2)> in it' \
+        --notes <(echo '{"notes": [{"id": 1, "path": "b.txt", "line": 3, "text": "note with <iframe src=x></iframe> `and <u>code</u>`"}]}') >/dev/null
+    cat > "$work/markup.js" <<'EOF'
+setTimeout(() => {
+  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
+  document.body.append(Object.assign(document.createElement("pre"), { id: "markup", textContent:
+    "elements=" + document.querySelectorAll(".ctext b, .ctext script, .atext iframe, .atext u, .summary img").length }));
+}, 300);
+EOF
+    sed 's#</body>#<script src="markup.js"></script></body>#' "$work/markup.html" > "$work/markup-dom.html"
+    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/markup-dom.html" 2>/dev/null)
+    check "markup in a comment renders as text" 1 "$(grep -c 'quoting &lt;b&gt;bold&lt;/b&gt; and &lt;script&gt;alert(1)&lt;/script&gt;' <<<"$dom")"
+    check "markup in a note renders as text, inside code too" 1 "$(grep -c 'note with &lt;iframe src=x&gt;&lt;/iframe&gt; <code>and &lt;u&gt;code&lt;/u&gt;</code>' <<<"$dom")"
+    check "markup in the summary renders as text" 1 "$(grep -c 'a summary with &lt;img src=x onerror=alert(2)&gt; in it' <<<"$dom")"
+    check "and none of it became an element" "elements=0" "$(grep -o 'id="markup">[^<]*' <<<"$dom" | cut -d'>' -f2)"
 
     # a gap opened all the way must not leave a header that reads as more folded lines
     seq 1 40 | sed 's/^/line /' > "$work/gap-old.txt"

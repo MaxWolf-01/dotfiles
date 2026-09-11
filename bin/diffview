@@ -75,7 +75,7 @@ class Args:
     notes: str = ""
     """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top): the place to say what was read and deliberately left alone. A note with "re": "C4" answers that review comment: it sits under it, indented, and needs no path or line of its own; the thread can go on from there (the reviewer replies to a note with c or its reply button, and the reply carries "re A3"). Answering a comment does not resolve it. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
-    """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own once nobody has asked for a page in a while."""
+    """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own half an hour after the last page on it was closed. A page cut off from its server says so and keeps what you type in the browser until the server is back: run this again, and it answers on the port the page knows."""
     context: int = 3
     """Context lines around each hunk (git diff -U)."""
 
@@ -356,7 +356,8 @@ def comment_id(item: object, path: str) -> int:
 
 # ---------------------------------------------------------------- serve mode
 
-IDLE_EXIT_SECONDS = 30 * 60
+IDLE_EXIT_SECONDS = int(os.environ.get("DIFFVIEW_IDLE_SECONDS") or 30 * 60)   # the tests shrink it to seconds
+MAX_STATE_BYTES = 4_000_000   # a real state file is under 20 KB; anything near this is not a page saving
 SERVE_MARKER = ".serve.json"
 CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".json": "application/json", ".png": "image/png",
                  ".svg": "image/svg+xml", ".css": "text/css", ".js": "text/javascript"}
@@ -391,7 +392,7 @@ def serve_root(root_spec: str) -> None:
     if running:
         print(f"diffview: already serving {root} at http://127.0.0.1:{port}/")
         return
-    print(f"diffview: serving {root} at http://127.0.0.1:{port}/  (exits after {IDLE_EXIT_SECONDS // 60} idle minutes)")
+    print(f"diffview: serving {root} at http://127.0.0.1:{port}/  (exits {IDLE_EXIT_SECONDS // 60} minutes after the last page closes)")
 
 
 def ensure_server(root: Path) -> int | None:
@@ -400,13 +401,15 @@ def ensure_server(root: Path) -> int | None:
     home = Path.home().resolve()  # resolved on both sides, or a symlinked home walks straight past this
     if root == home or root in home.parents:
         return None
+    marker = root / SERVE_MARKER
     port = already_serving(root)
     if port:
         return port
 
-    server = bind_server(root)
+    # a page left open on the last server still points at its port; answering there again
+    # is what lets that page save without a reload
+    server = bind_server(root, marker_port(marker))
     port = server.server_address[1]
-    marker = root / SERVE_MARKER
     pid = os.fork()
     if pid:
         # written here, so the marker exists the moment this command returns
@@ -431,17 +434,28 @@ def ensure_server(root: Path) -> int | None:
 
 
 def release_marker(marker: Path, pid: int) -> None:
-    """Clear the marker only while it still names this server.
+    """Drop this server's pid from the marker, keeping the port for the next server on this root.
 
-    Two --serve racing on one root both bind and both write; the loser exiting must
-    not strand the winner behind a missing marker, which reads as nothing serving.
+    Only while the marker still names this server: two --serve racing on one root both bind
+    and both write, and the loser exiting must not strand the winner behind a marker that
+    reads as nothing serving.
     """
     try:
-        if json.loads(marker.read_text())["pid"] != pid:
+        record = json.loads(marker.read_text())
+        if record["pid"] != pid:
             return
+        del record["pid"]
+        marker.write_text(json.dumps(record))
     except (OSError, ValueError, KeyError):
         return
-    marker.unlink(missing_ok=True)
+
+
+def marker_port(marker: Path) -> int | None:
+    """The port the last server on this root answered on, dead or alive."""
+    try:
+        return int(json.loads(marker.read_text())["port"])
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def index_page(root: Path, directory: Path) -> bytes:
@@ -458,31 +472,38 @@ def index_page(root: Path, directory: Path) -> bytes:
 
 
 def already_serving(root: Path) -> int | None:
-    """The port of a live server for this root, clearing the marker when it names a dead one."""
-    marker = root / SERVE_MARKER
+    """The port of a live server for this root; None when the marker names a dead one, or nothing."""
+    port = marker_port(root / SERVE_MARKER)
+    if port is None:
+        return None
     try:
-        port = json.loads(marker.read_text())["port"]
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/.health", timeout=1) as r:
             if json.loads(r.read())["root"] == str(root):
-                return int(port)
+                return port
     except (OSError, ValueError, KeyError):
         pass
-    marker.unlink(missing_ok=True)
     return None
 
 
 def idle_watchdog(server, stop: threading.Event, root: Path) -> None:
-    """Nobody asked for a page in a long while, or the tree went away — either way it is not under review."""
-    while not stop.wait(60):
+    """No page has been heard from for the grace period, or the tree went away: either way the review is over.
+
+    An open page sends a heartbeat every minute, so the grace period only starts counting
+    once the last tab is closed, frozen or discarded. The clock is monotonic: on Linux
+    it pauses through suspend, so a laptop woken after a night does not read as a night idle.
+    """
+    while not stop.wait(min(60, IDLE_EXIT_SECONDS / 4)):
         if not root.is_dir() or time.monotonic() - server.last_request > IDLE_EXIT_SECONDS:
             stop.set()
 
 
-def bind_server(root: Path):
+def bind_server(root: Path, port: int | None):
     """The server for one review tree, bound but not yet serving."""
     from http.server import BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 30   # a client that announces a body and never sends it must not hold a thread for good
+
         def do_GET(self):
             self.server.last_request = time.monotonic()
             if not local_request(self):
@@ -505,16 +526,12 @@ def bind_server(root: Path):
 
         def do_POST(self):
             self.server.last_request = time.monotonic()
-            own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if not local_request(self):
-                self.respond(403, b"forbidden", "text/plain")
+            if refused := write_refusal(self):
+                self.respond(*refused, "text/plain")
                 return
             target = self.resolve(self.path)
-            if target is None or not target.name.endswith(".html.state.json"):
+            if target is None or not is_state_file(target):
                 self.respond(404, b"not found", "text/plain")
-                return
-            if self.headers.get("Origin") not in (None, own_origin):
-                self.respond(403, b"forbidden", "text/plain")
                 return
             code, body = write_state(target, self.rfile.read(int(self.headers["Content-Length"])))
             self.respond(code, body, "application/json" if code == 409 else "text/plain")
@@ -537,26 +554,57 @@ def bind_server(root: Path):
         def log_message(self, *_):
             pass
 
-    server = bind_local(Handler, str(root))
+    server = bind_local(Handler, str(root), port)
     server.last_request = time.monotonic()
     return server
 
 
-def bind_local(handler_cls, seed: str):
-    """Loopback on a port derived from seed, so the origin stays stable across relaunches."""
+def bind_local(handler_cls, seed: str, preferred: int | None = None):
+    """Loopback on the preferred port, else one derived from seed, so the origin stays stable across relaunches."""
     from http.server import ThreadingHTTPServer
 
-    port = 41000 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 4000
-    try:
-        return ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
-    except OSError:
-        return ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    derived = 41000 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 4000
+    for port in dict.fromkeys([preferred, derived, 0]):
+        if port is None:
+            continue
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+        except OSError:
+            continue
+    raise OSError("no loopback port to bind")
 
 
 def local_request(handler) -> bool:
     """Binding to loopback stops remote sockets, not a web page that points a name at 127.0.0.1."""
     host = (handler.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
     return host in ("127.0.0.1", "localhost", "::1", "")
+
+
+def write_refusal(handler) -> tuple[int, bytes] | None:
+    """Why a write is not taken, as (status, body); None when it may go ahead.
+
+    A page on another site can send a form-shaped POST to loopback without a preflight, and
+    the browser hides the answer but the server would still act. Browsers put the sending
+    page's origin on every POST, so a write is taken only from this server's own origin;
+    nothing but a page saves state, so a missing Origin has no honest sender. The body is
+    bounded and must announce its length, so the read that follows is never open-ended.
+    """
+    if not local_request(handler):
+        return 403, b"forbidden"
+    port = handler.server.server_address[1]
+    if handler.headers.get("Origin") not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+        return 403, b"forbidden"
+    length = handler.headers.get("Content-Length", "")
+    if not length.isdigit():
+        return 411, b"length required"
+    if int(length) > MAX_STATE_BYTES:
+        return 413, b"too large"
+    return None
+
+
+def is_state_file(target: Path) -> bool:
+    """A state file of a page that exists: the only path a write may land on."""
+    return target.name.endswith(".html.state.json") and target.with_name(target.name.removesuffix(".state.json")).is_file()
 
 
 STATE_WRITE = threading.Lock()   # a review's state is read, judged and replaced as one step, never interleaved
@@ -610,6 +658,8 @@ def watch(args: Args, out: Path, page: dict) -> None:
     superseded: dict = {}         # the sidecar that request replaced, kept for when the model call fails
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 30
+
         def do_GET(self):
             if not local_request(self):
                 self.send_response(403)
@@ -617,6 +667,10 @@ def watch(args: Args, out: Path, page: dict) -> None:
                 return
             if self.path == "/version":
                 body = json.dumps(version).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+            elif self.path == "/.health":   # the page's heartbeat; only a --serve server has a lifetime that hangs on it
+                body = json.dumps({"root": str(out.parent)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
             elif self.path.endswith(".summary.json") or self.path.endswith(".state.json"):
@@ -638,9 +692,8 @@ def watch(args: Args, out: Path, page: dict) -> None:
             self.wfile.write(body)
 
         def do_POST(self):
-            own_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
-            if not local_request(self) or self.headers.get("Origin") not in (None, own_origin):
-                self.send_response(403)
+            if refused := write_refusal(self):
+                self.send_response(refused[0])
                 self.end_headers()
                 return
             if self.path == "/summary":

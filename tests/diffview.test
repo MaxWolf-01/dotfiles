@@ -5,8 +5,9 @@
 # ///
 """Drive a rendered diffview page in a headless browser and check the contract its
 readers depend on: context opens from the baked file with the right line numbers on
-both sides, survives a reload once served, takes comments like any hunk line, and a
-note on a file outside the diff puts that file on the page.
+both sides, survives a reload once served, takes comments like any hunk line, a
+note on a file outside the diff puts that file on the page, and a server that dies
+mid-review loses nothing typed.
 
 Run it directly; no framework. Uses the chromium build playwright keeps in its cache
 (`uv run --with playwright playwright install chromium` once, if it is missing).
@@ -220,6 +221,85 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
             p.unlink()
 
 
+def outage_case(repo: Path, pages: Path, browser) -> None:
+    """The server dies mid-review: the page says so, keeps what is typed in the browser, and lands it
+    all once a server is back; a file that changed meanwhile is put to the reviewer, never overwritten."""
+    out = pages / f"outage-{os.getpid()}.html"
+    state = Path(str(out) + ".state.json")
+    subprocess.run([str(DIFFVIEW), f"{repo}@base..HEAD", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
+    marker = pages / ".serve.json"
+    served = lambda: json.loads(marker.read_text())
+    on_disk = lambda: [c["text"] for c in json.loads(state.read_text())["comments"]] if state.is_file() else []
+
+    def wait_for(cond, seconds: float = 10) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not cond():
+            time.sleep(0.2)
+        return cond()
+
+    def stop() -> None:
+        pid = served()["pid"]
+        os.kill(pid, signal.SIGTERM)
+        wait_for(lambda: "pid" not in served())
+
+    def restart() -> None:
+        subprocess.run([str(DIFFVIEW), "--serve", str(pages)], check=True, capture_output=True)
+
+    port = served()["port"]
+    context = browser.new_context()   # one context: the local copy lives in it, as it does in a real browser profile
+    page = context.new_page()
+    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.wait_for_selector("tbody.hunk")
+
+    def comment(text: str, line: int) -> None:
+        page.locator(f'tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="{line}"]').click()
+        page.keyboard.type(text)
+        page.keyboard.press("Control+Enter")
+
+    comment("saved while the server lived", 20)
+    check("a comment lands while the server is up", True, wait_for(lambda: on_disk() == ["saved while the server lived"]))
+    stop()
+    comment("typed while it was gone", 21)
+    page.wait_for_selector(".savefail")
+    check("the next save raises the warning", True, "not saving" in page.locator(".savefail").inner_text())
+    check("with the restart command", f"diffview --serve {pages}", page.locator(".savefail code").first.inner_text())
+    check("and the file did not get it", ["saved while the server lived"], on_disk())
+    restart()
+    check("a restarted server gets what was typed meanwhile", True,
+          wait_for(lambda: on_disk() == ["saved while the server lived", "typed while it was gone"]))
+    check("on the port the page knows", port, served()["port"])
+    check("and the warning clears", True, wait_for(lambda: page.locator(".savefail").count() == 0))
+    page.reload()
+    page.wait_for_selector("tbody.hunk")
+    check("a reload shows both, with no warning", (2, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
+
+    # the server dies again, a comment is typed, and the tab goes away as a discarded one would;
+    # the file is then changed by hand, and a tab opened after that holds the local copy: the
+    # reviewer picks which survives, and nothing is overwritten on its own
+    stop()
+    comment("typed during the second outage", 22)
+    page.wait_for_selector(".savefail")
+    page.close()
+    held = json.loads(state.read_text())
+    held["comments"].append({**held["comments"][0], "id": 9, "text": "restored by hand"})
+    held.update(savedAt=held["savedAt"] + 1, writer="hand")
+    state.write_text(json.dumps(held))
+    restart()
+    page = context.new_page()
+    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.wait_for_selector(".savefail button")
+    check("a fresh tab shows the local copy, and says the file moved on", (3, True),
+          (page.locator(".cbox .ctext").count(), "another page saved" in page.locator(".savefail").inner_text()))
+    check("while the file still holds the hand edit", True, "restored by hand" in on_disk())
+    page.locator(".savefail button", has_text="keep this page").click()
+    check("keeping this page lands the local copy over the hand edit", True, wait_for(lambda: on_disk() == [
+        "saved while the server lived", "typed while it was gone", "typed during the second outage"]))
+    page.reload()
+    page.wait_for_selector("tbody.hunk")
+    check("and the next reload reads the file, quietly", (3, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
+    context.close()
+
+
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="diffview-test-"))
     repo = fixture(root)
@@ -405,6 +485,7 @@ def main() -> int:
             page.keyboard.press("Escape")
             check("Esc closes the tree first, the annotation focus stays", (True, "note"), (no_side(), page.evaluate("S.ann && S.ann.kind")))
             check("no toast from the resize", "", page.locator("#toast").inner_text())
+            outage_case(repo, pages, browser)
             rewrite_case(root, repo, pages, browser)
             browser.close()
     finally:
