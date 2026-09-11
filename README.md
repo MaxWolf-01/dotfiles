@@ -107,7 +107,7 @@ All `./setup` functions are idempotent — safe to re-run.
 ./setup docker
 ./setup nvidia_container_toolkit
 ./setup get_vibetyper
-./setup sleep_modes
+./setup hibernation
 ```
 </details>
 
