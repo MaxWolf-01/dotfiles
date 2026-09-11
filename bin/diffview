@@ -75,7 +75,7 @@ class Args:
     notes: str = ""
     """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top): the place to say what was read and deliberately left alone. A note with "re": "C4" answers that review comment: it sits under it, indented, and needs no path or line of its own; the thread can go on from there (the reviewer replies to a note with c or its reply button, and the reply carries "re A3"). Answering a comment does not resolve it. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
-    """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own half an hour after the last page on it was closed. A page cut off from its server says so and keeps what you type in the browser until the server is back: run this again, and it answers on the port the page knows."""
+    """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own once every page on it has been closed for a grace period: the message it prints says how long, and $DIFFVIEW_IDLE_SECONDS changes it. A page cut off from its server says so and keeps what you type in the browser until the server is back: run this again, and it answers on the port the page knows."""
     context: int = 3
     """Context lines around each hunk (git diff -U)."""
 
@@ -358,6 +358,7 @@ def comment_id(item: object, path: str) -> int:
 
 IDLE_EXIT_SECONDS = int(os.environ.get("DIFFVIEW_IDLE_SECONDS") or 30 * 60)   # the tests shrink it to seconds
 MAX_STATE_BYTES = 4_000_000   # a real state file is under 20 KB; anything near this is not a page saving
+REQUEST_TIMEOUT = 30          # a client that announces a body and never sends it must not hold a thread for good
 SERVE_MARKER = ".serve.json"
 CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".json": "application/json", ".png": "image/png",
                  ".svg": "image/svg+xml", ".css": "text/css", ".js": "text/javascript"}
@@ -445,7 +446,9 @@ def release_marker(marker: Path, pid: int) -> None:
         if record["pid"] != pid:
             return
         del record["pid"]
-        marker.write_text(json.dumps(record))
+        tmp = marker.with_name(f"{marker.name}.{pid}.tmp")
+        tmp.write_text(json.dumps(record))
+        os.replace(tmp, marker)
     except (OSError, ValueError, KeyError):
         return
 
@@ -492,7 +495,7 @@ def idle_watchdog(server, stop: threading.Event, root: Path) -> None:
     once the last tab is closed, frozen or discarded. The clock is monotonic: on Linux
     it pauses through suspend, so a laptop woken after a night does not read as a night idle.
     """
-    while not stop.wait(min(60, IDLE_EXIT_SECONDS / 4)):
+    while not stop.wait(max(1, min(60, IDLE_EXIT_SECONDS / 4))):
         if not root.is_dir() or time.monotonic() - server.last_request > IDLE_EXIT_SECONDS:
             stop.set()
 
@@ -502,7 +505,7 @@ def bind_server(root: Path, port: int | None):
     from http.server import BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
-        timeout = 30   # a client that announces a body and never sends it must not hold a thread for good
+        timeout = REQUEST_TIMEOUT
 
         def do_GET(self):
             self.server.last_request = time.monotonic()
@@ -564,14 +567,14 @@ def bind_local(handler_cls, seed: str, preferred: int | None = None):
     from http.server import ThreadingHTTPServer
 
     derived = 41000 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 4000
-    for port in dict.fromkeys([preferred, derived, 0]):
+    for port in (preferred, derived):
         if port is None:
             continue
         try:
             return ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
         except OSError:
             continue
-    raise OSError("no loopback port to bind")
+    return ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
 
 
 def local_request(handler) -> bool:
@@ -603,7 +606,7 @@ def write_refusal(handler) -> tuple[int, bytes] | None:
 
 
 def is_state_file(target: Path) -> bool:
-    """A state file of a page that exists: the only path a write may land on."""
+    """A state file of a page that exists: the only path a write to a --serve server may land on."""
     return target.name.endswith(".html.state.json") and target.with_name(target.name.removesuffix(".state.json")).is_file()
 
 
@@ -658,7 +661,7 @@ def watch(args: Args, out: Path, page: dict) -> None:
     superseded: dict = {}         # the sidecar that request replaced, kept for when the model call fails
 
     class Handler(BaseHTTPRequestHandler):
-        timeout = 30
+        timeout = REQUEST_TIMEOUT
 
         def do_GET(self):
             if not local_request(self):

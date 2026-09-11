@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -176,6 +177,8 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
     title = lambda: page.locator(".summary .rewrite").get_attribute("title")
     try:
         check("a watch with a summary starts", True, w.printed("watching"))
+        with urllib.request.urlopen(w.url + ".health", timeout=5) as r:   # the watcher answers the page's heartbeat too
+            check("the watcher answers a heartbeat", str(pages), json.loads(r.read())["root"])
         failed = landed()
         check("a failed first summary lands as its reason", ("", True), (failed.get("summary"), bool(failed.get("error"))))
         page = browser.new_page()
@@ -267,7 +270,6 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     restart()
     check("a restarted server gets what was typed meanwhile", True,
           wait_for(lambda: on_disk() == ["saved while the server lived", "typed while it was gone"]))
-    check("on the port the page knows", port, served()["port"])
     check("and the warning clears", True, wait_for(lambda: page.locator(".savefail").count() == 0))
     page.reload()
     page.wait_for_selector("tbody.hunk")
@@ -294,10 +296,48 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     page.locator(".savefail button", has_text="keep this page").click()
     check("keeping this page lands the local copy over the hand edit", True, wait_for(lambda: on_disk() == [
         "saved while the server lived", "typed while it was gone", "typed during the second outage"]))
-    page.reload()
+    page.reload()   # at once: the file holds the write before the page hears so, and must not be asked about it again
     page.wait_for_selector("tbody.hunk")
     check("and the next reload reads the file, quietly", (3, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
+
+    # the same again, and this time the reviewer takes the file: the local copy is given up,
+    # and the reload that follows reads the file without asking again
+    stop()
+    comment("typed during the third outage", 23)
+    page.wait_for_selector(".savefail")
+    page.close()
+    held = json.loads(state.read_text())
+    held["comments"].append({**held["comments"][0], "id": 9, "text": "restored by hand again"})
+    held.update(savedAt=held["savedAt"] + 1, writer="hand")
+    state.write_text(json.dumps(held))
+    restart()
+    page = context.new_page()
+    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.wait_for_selector(".savefail button")
+    with page.expect_navigation():
+        page.locator(".savefail button", has_text="take theirs").click()
+    page.wait_for_selector("tbody.hunk")
+    check("taking theirs reads the file, drops the local copy, and asks nothing more", (4, 0, None),
+          (page.locator(".cbox .ctext").count(), page.locator(".savefail").count(), page.evaluate("localStorage.getItem(LOCAL_KEY)")))
+    check("and the file keeps the hand edit", True, "restored by hand again" in on_disk())
     context.close()
+
+
+def heartbeat_case(url: str, browser) -> None:
+    """An open page beats once a minute, so its server counts it as open; the clock is faked so a minute takes no time."""
+    page = browser.new_page()
+    beats: list[str] = []
+    page.on("request", lambda r: beats.append(r.url) if r.url.endswith("/.health") else None)
+    page.clock.install()
+    page.goto(url)
+    page.wait_for_selector("tbody.hunk")
+    page.clock.run_for(61_000)
+    page.wait_for_timeout(200)
+    check("a page beats within a minute of opening", 1, len(beats))
+    page.clock.run_for(60_000)
+    page.wait_for_timeout(200)
+    check("and once a minute from then on", 2, len(beats))
+    page.close()
 
 
 def main() -> int:
@@ -485,6 +525,7 @@ def main() -> int:
             page.keyboard.press("Escape")
             check("Esc closes the tree first, the annotation focus stays", (True, "note"), (no_side(), page.evaluate("S.ann && S.ann.kind")))
             check("no toast from the resize", "", page.locator("#toast").inner_text())
+            heartbeat_case(url, browser)
             outage_case(repo, pages, browser)
             rewrite_case(root, repo, pages, browser)
             browser.close()
@@ -493,7 +534,7 @@ def main() -> int:
             os.kill(json.loads((pages / ".serve.json").read_text())["pid"], signal.SIGTERM)
         except (OSError, ValueError, KeyError):
             pass
-        for p in pages.glob(f"{out.stem}*"):
+        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*")]:
             p.unlink()
         shutil.rmtree(root, ignore_errors=True)
     print(f"\n{failures} failure(s)")

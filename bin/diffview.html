@@ -310,8 +310,9 @@ const AT_ROOT = SERVED && location.pathname === "/";   // only --watch addresses
 const AGENT_RESOLVED = new Set(DATA.agentResolved || []);
 const WRITER = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}`;  // this page, while it is open
 // localStorage is per origin, so per server; the page's path is the review's identity within it
-const LOCAL_KEY = "dv-state:" + DATA.key, LANDED_KEY = "dv-landed:" + DATA.key;
+const LOCAL_KEY = "dv-state:" + DATA.key;
 let SINCE = null;      // the file version this page's next write is based on: what it loaded, then each write of its own that landed
+let LAST_SAVED = 0;    // savedAt of the last write sent: the next is later, however fast the clock
 let UNSAVED = false;   // the state loaded is the local copy, holding a write that never landed
 let RETRY = null;      // polling a server that stopped answering
 let CONFLICT = false;  // another page owns the state file; saving waits on a human
@@ -334,33 +335,39 @@ function initState(stored) {
 }
 /* the state baked into the page is as old as the render; the file beside a served page holds
    everything saved since, so a plain reload reads that -- unless this browser holds a write
-   that never landed, which is then what the page loads, and saves at once: the server's own
-   rule says whether the file moved on meanwhile and a human must pick */
+   the file does not, which is then what the page loads, and saves at once: the server's own
+   rule says whether the file moved on meanwhile and a human must pick. The file, not a
+   record the page keeps, says whether a write landed: a reload can beat the acknowledgement. */
 async function savedState() {
   if (!SERVED) return DATA.saved || {};
-  const local = localCopy();
-  if (local) { UNSAVED = true; return local; }
+  let file = null;
   try {
     const res = await fetch(location.pathname + ".state.json", { cache: "no-store" });
-    if (res.ok) return await res.json();
+    if (res.ok) file = await res.json();
   } catch (e) {}
-  return DATA.saved || {};
+  const local = localCopy();
+  if (local && !(file && file.savedAt === local.savedAt)) {
+    UNSAVED = true;
+    // the file's last write is this browser's own, so nothing came between: it is the base
+    if (file && file.writer === local.writer) local.since = file.savedAt;
+    return local;
+  }
+  if (local) dropLocal();   // landed after all
+  return file || DATA.saved || {};
 }
-/* the local copy, when it holds a write that never landed; based on the newest one that did */
 function localCopy() {
-  try {
-    const blob = JSON.parse(localStorage.getItem(LOCAL_KEY));
-    const landed = +localStorage.getItem(LANDED_KEY) || 0;
-    return blob && blob.savedAt > landed ? { ...blob, since: landed || null } : null;
-  } catch (e) { return null; }
+  try { return JSON.parse(localStorage.getItem(LOCAL_KEY)); } catch (e) { return null; }
 }
+let copyRefused = false;
 function persist() {
   if (!SERVED) return;
   // savedAt names this write to whoever loads it next, and writer/since let the server tell
   // a second page holding this same review from this one writing twice
-  const blob = { savedAt: Date.now(), writer: WRITER, since: SINCE, viewed: [...S.viewed], comments: S.comments,
+  LAST_SAVED = Math.max(Date.now(), LAST_SAVED + 1);
+  const blob = { savedAt: LAST_SAVED, writer: WRITER, since: SINCE, viewed: [...S.viewed], comments: S.comments,
                  nextId: S.nextId, verdict: [...S.verdict], seen: [...S.seen], expand: [...S.expand] };
-  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(blob)); } catch (e) {}   // before the send, so the file is never the only copy
+  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(blob)); }   // before the send, so the file is never the only copy
+  catch (e) { if (!copyRefused) toast("the browser refused to keep a copy of this review (storage full?); the file is the only one"); copyRefused = true; }
   if (CONFLICT) return;   // the send waits on a human; the copy above does not, so a tab closed meanwhile loses nothing
   // keepalive: a reload right after typing must not cancel the save the reload then reads
   fetch(location.pathname + ".state.json", { method: "POST", body: JSON.stringify(blob), keepalive: true })
@@ -372,10 +379,12 @@ function persist() {
     })
     .catch(() => saveBroke());   // a dead server must not look like a saved comment
 }
-/* the file holds this write now: it is the base of the next one, here and for a page loading the local copy later */
+/* the file holds this write now: it is the base of the next one, and the copy of it here has
+   done its job -- unless a later write has already taken the slot */
 function landed(at) {
   SINCE = Math.max(SINCE || 0, at);
-  try { if (at > (+localStorage.getItem(LANDED_KEY) || 0)) localStorage.setItem(LANDED_KEY, at); } catch (e) {}
+  const held = localCopy();
+  if (held && held.savedAt === at) dropLocal();
 }
 function saveWorks() {
   if (!RETRY) return;
@@ -391,10 +400,10 @@ function saveBroke() {
   copy.addEventListener("click", () => copyText(cmd, () => { copy.textContent = "copied ✓"; setTimeout(() => copy.textContent = "copy", 1200); }));
   const bar = h("div", "readonly savefail",
     h("strong", null, "not saving"),
-    " — the server stopped answering. What you type stays in this browser and is saved once the server is back; reload only after that. Start it again",
-    AT_ROOT ? h("span", null, " with the same ", h("code", null, "diffview --watch"), " command, whose port comes from the sources it watches.")
-            : h("span", null, ": ", h("code", null, cmd), copy),
-    " Or press ", h("code", null, "C"), " to copy your comments out.",
+    " — the server stopped answering. What you type stays in this browser and is saved once the server is back; reload only after that. Start it again with ",
+    AT_ROOT ? h("span", null, "the same ", h("code", null, "diffview --watch"), " command, whose port comes from the sources it watches")
+            : h("span", null, h("code", null, cmd), copy),
+    ", and this page saves everything back on its own. Or press ", h("code", null, "C"), " to copy your comments out.",
     h("button", { cls: "rox", title: "dismiss", onclick: () => bar.remove() }, "×"));
   document.querySelector(".top").after(bar);
 }
@@ -410,9 +419,8 @@ function saveConflict(held) {
     h("button", { cls: "btn", onclick: () => { dropLocal(); location.reload(); } }, "take theirs, drop what is unsaved here"));
   document.querySelector(".top").after(bar);
 }
-/* what is unsaved here is given up: the reload that follows must read the file, not this again */
 function dropLocal() {
-  try { localStorage.removeItem(LOCAL_KEY); localStorage.removeItem(LANDED_KEY); } catch (e) {}
+  try { localStorage.removeItem(LOCAL_KEY); } catch (e) {}
 }
 function canEdit() {
   if (SERVED) return true;
