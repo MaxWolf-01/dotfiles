@@ -82,6 +82,4 @@ else
 fi
 
 echo "[jarvis-backup] Running restic backup"
-# Passed rather than set in the config, so the path stays defined here alone:
-# restic_backup.sh fails the run if this mount is gone by the time it finishes.
 require_mount="$MOUNTPOINT" "$SCRIPT_DIR/restic_backup.sh" "$config_file"

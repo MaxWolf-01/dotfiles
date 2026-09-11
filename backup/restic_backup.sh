@@ -22,8 +22,8 @@ set -uo pipefail
 # check_data - (optional) "true", "false", or percentage like "5%" (default: false)
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
 # require_mount - (optional) Path that must be a mountpoint: missing before the run is a skip,
-#                 gone after it is a failure and the snapshot is dropped. Settable from the
-#                 environment too, for a caller that owns the mount (backup/jarvis_backup.sh)
+#                 gone after it is a failure. Read from the environment as well as the config,
+#                 so a caller that owns the mount can pass it (backup/jarvis_backup.sh)
 # backup_opts - (optional) Extra flags for `restic backup`, word-split (e.g. "--ignore-inode")
 
 # Reached relative to this script, not through PATH: the systemd units pin
@@ -294,30 +294,37 @@ if [ "$backup_exit" -eq 0 ] || [ "$backup_exit" -eq 3 ]; then
         fi
     fi
 
-    # The mountpoint is checked again, because it can go away mid-run: a suspend
-    # takes the network down under an sshfs mount, and restic reads the empty
-    # tree left behind as unreadable files, which is exit 3 and passes for a
-    # success above. The snapshot that lands is nearly empty and would hold that
-    # day's retention slot against the real one, so it is dropped here, before
-    # the prune that would enact it, and the run is a failure a person hears about.
+    # The mountpoint is checked again, because a source mount can go away while
+    # the run is in flight and the snapshot that lands then holds the day's
+    # retention slot against a real one. Unreadable files are how a vanishing
+    # tree reaches restic, so exit 3 together with a gone mount is the snapshot
+    # worth dropping, and it goes before the prune that would enact it. Exit 0
+    # means restic read the whole tree before the mount went, so that snapshot
+    # is sound and stays; the run still fails, because which of the two happened
+    # is not a thing to leave to a silent log line.
     if [ -n "${require_mount:-}" ] && ! mountpoint -q "$require_mount"; then
-        if [ -n "$snapshot_id" ]; then
-            restic --repo "$repo_path" --password-command "$password_command" \
-                forget "$snapshot_id" >/dev/null 2>&1
+        dropped="kept: restic read the whole tree before the mount went"
+        if [ "$backup_exit" -eq 3 ]; then
+            if [ -z "$snapshot_id" ]; then
+                dropped="kept: the run wrote no snapshot to drop"
+            elif restic --repo "$repo_path" --password-command "$password_command" \
+                    forget "$snapshot_id" >/dev/null 2>&1; then
+                dropped="dropped from the repository, so it cannot take a retention slot"
+            else
+                dropped="STILL IN THE REPOSITORY: dropping it failed, and the next prune
+will treat it as this day's snapshot. Remove it by hand:
+  restic --repo $repo_path forget $snapshot_id"
+            fi
         fi
         fail_out "$require_mount went away mid-run" \
-            "$require_mount was mounted when this run started and is gone now, so restic
-backed up an empty or partial tree.
+            "$require_mount was mounted when this run started and is gone now.
 
-Snapshot ${snapshot_id:-<none recorded>} was dropped from the repository so it cannot take
-a retention slot from a real one. Nothing else was pruned, and earlier snapshots
-are untouched.
+Snapshot ${snapshot_id:-<none>}: $dropped
 
-Files restic thought it processed: $total_files_processed
-Duration: $(format_duration $((  $(date +%s) - backup_start_time )))
+restic exited $backup_exit and processed $total_files_processed files.
+Nothing was pruned, so earlier snapshots are as they were.
 
-The usual cause is the machine suspending mid-run; see the sshfs sleep hook in
-systemd/system-sleep/. Re-running the backup is safe."
+Re-running the backup is safe."
     fi
 
     # One retention pool per repository. restic's default groups snapshots by
