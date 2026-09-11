@@ -130,7 +130,7 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
     for s in sources:
         s.pop("_patch", None)
 
-    saved = load_saved_state(out)
+    saved = load_saved_state(state_path(out))
     notes, agent_resolved = load_notes(args.notes)
     inherit_anchors(notes, saved, args.notes)
     size = diff_size(sources)   # of the changed files; the untouched cards that join next are not part of it
@@ -269,9 +269,8 @@ def resolved_revs(root: str, range_: str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def load_saved_state(out: Path) -> dict | None:
-    """Review state (comments, viewed) saved beside the page while it was served; baked back in on rebuild."""
-    sp = state_path(out)
+def load_saved_state(sp: Path) -> dict | None:
+    """Review state (comments, viewed) saved beside the page while it was served; None when there is none to read."""
     if not sp.is_file():
         return None
     try:
@@ -517,10 +516,8 @@ def bind_server(root: Path):
             if self.headers.get("Origin") not in (None, own_origin):
                 self.respond(403, b"forbidden", "text/plain")
                 return
-            if not write_state(target, self.rfile.read(int(self.headers["Content-Length"]))):
-                self.respond(400, b"bad state", "text/plain")
-                return
-            self.respond(204, b"", "text/plain")
+            code, body = write_state(target, self.rfile.read(int(self.headers["Content-Length"])))
+            self.respond(code, body, "application/json" if code == 409 else "text/plain")
 
         def resolve(self, path: str) -> Path | None:
             """The file a request names, or None when it points outside the served tree."""
@@ -562,18 +559,32 @@ def local_request(handler) -> bool:
     return host in ("127.0.0.1", "localhost", "::1", "")
 
 
-def write_state(target: Path, raw: bytes) -> bool:
-    """Persist a page's review state atomically. False when the payload is unusable."""
+def write_state(target: Path, raw: bytes) -> tuple[int, bytes]:
+    """Persist a page's review state atomically; answer the write with the status it earns.
+
+    A page sends the whole state every time, so two pages on one review erase each other by
+    turns. Every write names the page it came from and the savedAt that page loaded: a write
+    from a page that never saw what is on the file is refused, and its human is asked which
+    of the two survives. Writes from the page that owns the file always pass, so nothing here
+    depends on two of them arriving in the order they were sent.
+    """
     try:
         blob = json.loads(raw)
         if not isinstance(blob, dict):
             raise ValueError("state must be a JSON object")
+    except ValueError:
+        return 400, b"bad state"
+    held = load_saved_state(target)
+    if held is not None and held.get("writer") != blob.get("writer") and held.get("savedAt") != blob.get("since"):
+        return 409, json.dumps({"savedAt": held.get("savedAt")}).encode()
+    blob.pop("since", None)   # what a write was based on is spent once checked; the file states what it holds
+    try:
         tmp = target.with_name(target.name + ".tmp")
         tmp.write_text(json.dumps(blob))
         os.replace(tmp, target)
-        return True
-    except (ValueError, OSError, TypeError):
-        return False
+    except (OSError, TypeError):
+        return 400, b"bad state"
+    return 204, b""
 
 
 # ---------------------------------------------------------------- watch mode
@@ -636,12 +647,13 @@ def watch(args: Args, out: Path, page: dict) -> None:
                 self.send_response(404)
                 self.end_headers()
                 return
-            if not write_state(state_path(out), self.rfile.read(int(self.headers["Content-Length"]))):
-                self.send_response(400)
-                self.end_headers()
-                return
-            self.send_response(204)
+            code, body = write_state(state_path(out), self.rfile.read(int(self.headers["Content-Length"])))
+            self.send_response(code)
+            if body:
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
 
         def log_message(self, *_):
             pass
@@ -1124,7 +1136,7 @@ def finish_summary(out: Path, body: str, model: str, data: dict, hljs: str, rend
         if summary and page_id(out) == rendered:
             data["summary"] = summary
             data["summaryPending"] = False
-            data["saved"] = load_saved_state(out)  # the page has been open and commentable all along
+            data["saved"] = load_saved_state(state_path(out))  # the page has been open and commentable all along
             write_page(out, data, hljs)
     except OSError:
         pass

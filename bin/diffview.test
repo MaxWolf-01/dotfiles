@@ -229,6 +229,24 @@ check "a foreign Host header is refused" 403 "$(curl -s -o /dev/null -w '%{http_
 check "and a loopback one is not" 200 "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/.health")"
 kill "$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['pid'])")" 2>/dev/null
 
+# a page writes the state whole, so a second page on the same review would erase the first;
+# the server takes writes from the page that owns the file, and refuses the one that is behind
+"$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/race.html" --no-auto-summary >/dev/null
+"$diffview" --serve "$work/pages" >/dev/null
+state="http://127.0.0.1:$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['port'])")/race.html.state.json"
+post() { curl -s -o /dev/null -w '%{http_code}' -X POST -d "$1" "$state"; }
+held() { python3 -c "import json;print(json.dumps(json.load(open('$work/pages/race.html.state.json'))$1))"; }
+check "the first write to a review lands" 204 "$(post '{"savedAt": 1001, "writer": "a", "since": null, "comments": ["a1"]}')"
+check "and the page that wrote it goes on writing" 204 "$(post '{"savedAt": 1002, "writer": "a", "since": null, "comments": ["a2"]}')"
+check "a page that never saw that write is refused" 409 "$(post '{"savedAt": 1003, "writer": "b", "since": 1001, "comments": ["b1"]}')"
+check "the refused write left the file alone" '["a2"]' "$(held '["comments"]')"
+check "the refusal names the save the page missed" 1002 "$(curl -s -X POST -d '{"savedAt": 1003, "writer": "b", "since": 1001}' "$state" | python3 -c 'import json,sys;print(json.load(sys.stdin)["savedAt"])')"
+check "a page that did see it writes" 204 "$(post '{"savedAt": 1004, "writer": "b", "since": 1002, "comments": ["b2"]}')"
+check "and takes the review over" '["b2"] "b"' "$(held '["comments"]') $(held '["writer"]')"
+check "what a write was based on is not kept" yes "$(held '' | grep -q since || echo yes)"
+check "a state file that is not an object is still refused" 400 "$(post '[1, 2]')"
+kill "$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['pid'])")" 2>/dev/null
+
 # --- the auto summary lands after the page, never before it
 
 cat > "$work/stub/claude" <<'STUB'
@@ -535,6 +553,52 @@ EOF
     sed 's#</body>#<script src="fail.js"></script></body>#' "$work/ann.html" > "$work/fail.html"
     dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/fail.html" 2>/dev/null)
     check "a rejected save says so instead of passing silently" yes "$(grep -q 'banners=1' <<<"$dom" && echo yes)"
+
+    # that warning is a live fact, not a notice: the server answering again clears it and lands what was typed meanwhile
+    cat > "$work/back.js" <<'EOF'
+const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
+const real = window.fetch.bind(window);
+setTimeout(() => {
+  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
+  window.fetch = () => Promise.resolve({ ok: false, status: 503 });
+  key("m"); key("r");                 // resolve a comment into a server that is gone
+  setTimeout(() => {
+    const broke = document.querySelectorAll(".savefail").length;
+    window.fetch = real;              // and now it is back
+    setTimeout(() => document.body.append(Object.assign(document.createElement("pre"), { id: "back", textContent:
+      `broke=${broke} bars=${document.querySelectorAll(".savefail").length} retrying=${!!RETRY}` })), 5000);
+  }, 100);
+}, 300);
+EOF
+    sed 's#</body>#<script src="back.js"></script></body>#' "$work/ann.html" > "$work/back.html"
+    dom=$(chromium --headless --disable-gpu --virtual-time-budget=20000 --dump-dom "$base/back.html" 2>/dev/null)
+    check "a server that comes back clears the warning by itself" "broke=1 bars=0 retrying=false" "$(grep -o 'id="back">[^<]*' <<<"$dom" | cut -d'>' -f2)"
+    check "and the retry writes what was typed while it was down" True "$(python3 -c "import json;print(json.load(open('$work/back.html.state.json'))['verdict'] != [])")"
+
+    # a second page on one review: the save is refused, and the human picks which of the two survives
+    cat > "$work/rival.js" <<'EOF'
+const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
+setTimeout(async () => {
+  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
+  // another page has this review open and saves first
+  await fetch(location.pathname + ".state.json", { method: "POST",
+    body: JSON.stringify({ savedAt: 1234, writer: "another-page", since: SINCE, comments: [], verdict: [] }) });
+  key("m"); key("r");                 // this page's own save would erase it
+  setTimeout(() => {
+    const bar = document.querySelector(".savefail");
+    const choices = [...bar.querySelectorAll("button")].map(b => b.textContent.split(",")[0]).join("|");
+    const blocked = CONFLICT;
+    bar.querySelector("button").click();   // keep this page
+    setTimeout(() => document.body.append(Object.assign(document.createElement("pre"), { id: "rival", textContent:
+      `blocked=${blocked} choices=${choices} bars=${document.querySelectorAll(".savefail").length} conflict=${CONFLICT}` })), 300);
+  }, 300);
+}, 300);
+EOF
+    sed 's#</body>#<script src="rival.js"></script></body>#' "$work/ann.html" > "$work/rival.html"
+    dom=$(chromium --headless --disable-gpu --virtual-time-budget=20000 --dump-dom "$base/rival.html" 2>/dev/null)
+    check "a rival page's save is refused, with both ways out on offer" \
+        "blocked=true choices=keep this page|take theirs bars=0 conflict=false" "$(grep -o 'id="rival">[^<]*' <<<"$dom" | cut -d'>' -f2)"
+    check "and keeping this page takes the review back" True "$(python3 -c "import json;s=json.load(open('$work/rival.html.state.json'));print(s['writer'] != 'another-page' and s['verdict'] != [])")"
 
     # a page opened as a file cannot write anywhere, so it says so and refuses comments
     cat > "$work/ro.js" <<'EOF'
