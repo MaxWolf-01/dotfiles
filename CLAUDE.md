@@ -140,8 +140,8 @@ answers "is this domain blocked, and by which list". Chain, gotchas, and the
 captive-portal escape (`vpn-dns-off`): `docs/dns.md`.
 
 Mullvad exit node: Cloudflare blocks some node IPs for Chrome-family clients
-(Electron apps break, browsers work) — `vpn-on` (= `bin/vpn-pick`) verifies and
-rotates, a watcher service re-checks; rationale in the script header.
+(Electron apps break, browsers work) — `vpn` (`bin/vpn`) verifies and rotates,
+and its watcher service (`vpn watch`) re-checks; rationale in `vpn --help`.
 
 ## Monitoring
 

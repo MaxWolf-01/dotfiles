@@ -137,7 +137,7 @@ which list refused the name; the resolver it asks comes from
 For the other direction — what started being refused lately, and which of it
 something on this machine keeps retrying — read
 `~/Documents/dashboards/dns-vpn.html`. A newly blocked domain notifies nobody;
-it waits on that page, alongside the exit-node rotations `vpn-pick` made.
+it waits on that page, alongside the exit-node changes `vpn` recorded.
 `docs/monitoring.md` covers how that page is built and kept fresh.
 
 ## Verify
