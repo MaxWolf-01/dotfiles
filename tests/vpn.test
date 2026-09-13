@@ -5,21 +5,27 @@
 # ///
 """Drive bin/vpn's decisions. Run it directly; no framework.
 
-The cases fix what the tool decides from what tailscaled and the internet tell
-it: what a status reading names, where a move goes, what a Discord answer means,
-what the watcher does on each look, and which exit-node changes it records.
-Everything that actually moves the node is one `tailscale set` away, and is
-verified live by switching and reading am.i.mullvad.net.
+The cases fix what the tool decides from what tailscaled, the internet and
+Vesktop tell it: what a status reading names, where a move goes, what a Discord
+answer means, what the watcher does on each look, and which exit-node changes
+end up in the node log.
 
-The fixtures are status readings in the shape tailscaled's LocalAPI answers
-with, kept down to the fields bin/vpn reads.
+Only the boundaries are faked: tailscaled's readings, `tailscale set`, egress,
+the Discord check, Vesktop and sleeping. The node lock and the run log are the
+real ones, in a scratch directory. The fake network is a handful of Mullvad
+peers in tailscaled's shape, kept down to the fields bin/vpn reads.
 """
 
+import contextlib
+import fcntl
 import importlib.util
+import io
+import json
 import os
 import sys
 import tempfile
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -91,6 +97,7 @@ def status(exit_name=None, online=True):
 
 
 NODES = vpn.mullvad_nodes(status())
+by_name = {n.name: n for n in NODES}
 
 
 def names(nodes):
@@ -115,6 +122,7 @@ check("a peerless reading still carries both fields",
       vpn.exit_state({"BackendState": "Running", "Peer": None,
                       "ExitNodeStatus": {"ID": "nMQ9SbK6Q721CNTRL", "Online": True,
                                          "TailscaleIPs": ["100.83.36.108/32"]}}))
+check("a peerless reading names no exit peer", None, vpn.exit_peer({"Peer": None}))
 
 check("only Mullvad exit nodes, by country, city and name",
       ["at-vie-wg-001", "de-ber-wg-001", "de-dus-wg-101", "de-fra-wg-001", "de-fra-wg-202",
@@ -144,9 +152,16 @@ check("a US city without its state", ["us-ash-wg-001"], names(vpn.resolve("Ashbu
 check("and with it", ["us-ash-wg-001"], names(vpn.resolve("Ashburn, VA", NODES)))
 check("a place with no node", [], vpn.resolve("Atlantis", NODES))
 
+frankfurt = vpn.resolve("Frankfurt", NODES)
+check("vpn to a city skips the node in use and the offline one",
+      ["de-fra-wg-001", "de-fra-wg-401"], names(vpn.destinations("Frankfurt", frankfurt, by_name["de-fra-wg-202"])))
+check("vpn to a node by name keeps it, offline or not",
+      ["de-fra-wg-203"], names(vpn.destinations("de-fra-wg-203", [by_name["de-fra-wg-203"]], None)))
+check("and in use or not",
+      ["de-fra-wg-202"], names(vpn.destinations("de-fra-wg-202", [by_name["de-fra-wg-202"]], by_name["de-fra-wg-202"])))
+
 # --- where a move goes
 
-by_name = {n.name: n for n in NODES}
 check("from Frankfurt: the rest of the city after it, wrapping, then the country, then the fallbacks",
       ["de-fra-wg-401", "de-fra-wg-001", "de-ber-wg-001", "de-dus-wg-101",
        "at-vie-wg-001", "ch-zrh-wg-001", "nl-ams-wg-001"],
@@ -172,7 +187,7 @@ check("repeated moves walk the whole city, skipping the offline node",
 
 check("403 is a block", "blocked", vpn.verdict(403))
 check("no answer says nothing about the node", "unreachable", vpn.verdict(0))
-check("nor does Discord failing", "unreachable", vpn.verdict(502))
+check("nor does Discord failing, from its first 5xx", ("unreachable", "clean"), (vpn.verdict(500), vpn.verdict(499)))
 check("200 is clean", "clean", vpn.verdict(200))
 check("a rate limit is not a block", "clean", vpn.verdict(429))
 
@@ -201,6 +216,8 @@ guarding = status("de-fra-wg-202")
 check("guarding a live node is ok and names it",
       ("ok", "", {"state": "guarding", "exit_node": "de-fra-wg-202", "vesktop": True, "bus": True}),
       vpn.heartbeat(guarding, guarding, True, True))
+check("without the full reading it still guards, unnamed", ("ok", "guarding", None),
+      (lambda o, _, s: (o, s["state"], s["exit_node"]))(*vpn.heartbeat(guarding, None, True, True)))
 check("the VPN off is ok", "no-exit-node", vpn.heartbeat(status(), status(), False, True)[2]["state"])
 check("tailscaled down is ok", ("ok", "tailscale-down"),
       (lambda o, _, s: (o, s["state"]))(*vpn.heartbeat(None, None, False, False)))
@@ -211,142 +228,374 @@ check("a watcher blind to a live exit node fails",
 
 # --- which exit-node changes a vpn line accounts for
 
-NOW = datetime.fromisoformat("2026-09-14T12:00:00+02:00")
+SINCE = datetime.fromisoformat("2026-09-14T12:00:00+02:00").timestamp()
 
 
-def line(event, node=None, to=None, age=10):
-    return {"ts": (NOW - timedelta(seconds=age)).isoformat(),
+def line(event, node=None, to=None, offset=10.0):
+    return {"ts": datetime.fromtimestamp(SINCE + offset).astimezone().isoformat(),
             "stats": {"event": event, "node": node, "rotated_to": to}}
 
 
-now = NOW.timestamp()
-check("a pin accounts for the node it pinned", True, vpn.explains(line("pinned", "a", "b"), "b", now))
-check("but not for another", False, vpn.explains(line("pinned", "a", "b"), "c", now))
-check("nor for the node it left", False, vpn.explains(line("pinned", "a", "b"), "a", now))
-check("a clean check accounts for the node it checked", True, vpn.explains(line("clean", "a"), "a", now))
-check("off accounts for no exit node", True, vpn.explains(line("off", "a"), None, now))
-check("a change to no exit node accounts for none", True, vpn.explains(line("changed", "a", None), None, now))
-check("giving up accounts for wherever automatic mode went", True, vpn.explains(line("exhausted", "a"), "z", now))
-check("an old line accounts for nothing", False,
-      vpn.explains(line("pinned", "a", "b", age=vpn.EXPLAIN_SECS + 1), "b", now))
-check("no line accounts for nothing", False, vpn.explains(None, "b", now))
-check("nor does one with an unreadable time", False, vpn.explains({"ts": "yesterday", "stats": {}}, "b", now))
+def accounts(record, node):
+    return vpn.explains(record, node, SINCE)
 
 
-# --- the watcher's looks
-#
-# look() is driven over a sequence of readings with everything that talks to
-# tailscaled, Discord or the run log replaced, and reports what it did.
+check("a pin accounts for the node it pinned, not the one it left or another",
+      (True, False, False), (accounts(line("pinned", "a", "b"), "b"),
+                             accounts(line("pinned", "a", "b"), "a"), accounts(line("pinned", "a", "b"), "c")))
+check("so does a rotation", (True, False), (accounts(line("rotated", "a", "b"), "b"), accounts(line("rotated", "a", "b"), "a")))
+check("and a move off a dead node", (True, False), (accounts(line("offline", "a", "b"), "b"), accounts(line("offline", "a", "b"), "a")))
+check("a clean check accounts for the node it checked, only",
+      (True, False), (accounts(line("clean", "a"), "a"), accounts(line("clean", "a"), "b")))
+check("automatic mode from a pin accounts for the node it picked, not the pin",
+      (True, False), (accounts(line("clean", "a", "b"), "b"), accounts(line("clean", "a", "b"), "a")))
+check("off accounts for no exit node, only", (True, False), (accounts(line("off", "a"), None), accounts(line("off", "a"), "a")))
+check("a change to no exit node accounts for none", True, accounts(line("changed", "a", None), None))
+check("giving up accounts for wherever automatic mode went", True, accounts(line("exhausted", "a"), "z"))
+check("an event vpn does not write accounts for nothing", False, accounts(line("teleported", "a", "b"), "b"))
+check("a line from before the last comparison accounts for nothing", False, accounts(line("pinned", "a", "b", -5), "b"))
+check("one inside its timestamp's second still does", True, accounts(line("pinned", "a", "b", -0.5), "b"))
+check("no line accounts for nothing", False, accounts(None, "b"))
+check("nor does one with an unreadable time", False, accounts({"ts": "yesterday", "stats": {}}, "b"))
 
 
-def drive(readings, vesktop=True, verdicts=(), egress="de-fra-wg-202", busy=False,
-          record=None, times=None, bus_up=True):
-    done, waits = [], []
-    verdicts = iter(verdicts)
-    vesktop_at = vesktop if callable(vesktop) else (lambda _i: vesktop)
-    busy_at = busy if callable(busy) else (lambda _i: busy)
-    current = {}
+# --- the watcher and the commands, against a fake network
 
-    def checked():
-        done.append("check")
-        return next(verdicts)
 
-    patched = {
-        "peerless_status": lambda: current["reading"],
-        "full_status": lambda: current["reading"],
-        "vesktop_running": lambda: vesktop_at(current["i"]),
-        "check_confirmed": checked,
-        "egress_node": lambda: egress,
-        "recover": lambda cause: done.append(("recover", cause)),
-        "log_run": lambda unit, outcome, reason="", stats=None: done.append((unit, outcome, stats)),
-        "lock_busy": lambda: busy_at(current["i"]),
-        "last_node_record": lambda: record,
+class Net:
+    """tailscaled, egress, Discord, Vesktop and sleeping, as bin/vpn reaches them."""
+
+    def __init__(self, exit_name="de-fra-wg-202", *, online=True, automatic=False, blocked=(), dead=(),
+                 network=True, discord=True, vesktop=True, auto_pick="de-fra-wg-001"):
+        self.exit, self.online, self.automatic = exit_name, online, automatic
+        self.blocked, self.dead = set(blocked), set(dead)
+        self.network, self.discord, self.vesktop = network, discord, vesktop
+        self.auto_pick = auto_pick
+        self.down = False
+        self.checks = []
+        self.sets = []
+        self.on_sleep = None
+
+    def full(self):
+        return None if self.down else status(self.exit, self.online)
+
+    def peerless(self):
+        reading = self.full()
+        if reading is not None:
+            reading["Peer"] = None
+        return reading
+
+    def prefs(self, _path):
+        if self.exit is None:
+            return {"ExitNodeID": ""}
+        return {"ExitNodeID": f"id-{self.exit}"} | ({"AutoExitNode": "any"} if self.automatic else {})
+
+    def set_exit_node(self, target):
+        """`tailscale set`, whether vpn or something else runs it."""
+        self.sets.append(target)
+        self.online = True
+        if target == "":
+            self.exit, self.automatic = None, False
+        elif target == "auto:any":
+            self.exit, self.automatic = self.auto_pick, True
+        else:
+            self.exit, self.automatic = target.split(".")[0], False
+
+    def carries(self):
+        return self.network and self.exit is not None and self.exit not in self.dead
+
+    def settle(self, want):
+        return self.carries() and want in (None, self.exit)
+
+    def egress_node(self):
+        return self.exit if self.carries() else ""
+
+    def check(self):
+        self.checks.append(self.exit)
+        if not self.carries() or not self.discord:
+            return "unreachable"
+        return "blocked" if self.exit in self.blocked else "clean"
+
+    def sleep(self, _secs):
+        if self.on_sleep:
+            hook, self.on_sleep = self.on_sleep, None
+            hook()
+
+
+class Logs:
+    def __init__(self, runs: Path):
+        self.runs = runs
+
+    def lines(self, unit):
+        path = self.runs / f"{unit}.jsonl"
+        return [json.loads(text) for text in path.read_text().splitlines()] if path.exists() else []
+
+    def events(self):
+        return [record["stats"]["event"] for record in self.lines(vpn.NODE_UNIT)]
+
+    def last(self):
+        return self.lines(vpn.NODE_UNIT)[-1]["stats"]
+
+
+@contextlib.contextmanager
+def wired(net: Net):
+    """bin/vpn with its boundaries pointed at `net`, its lock and run log in a scratch directory."""
+    scratch = Path(tempfile.mkdtemp())
+    fakes = {
+        "peerless_status": net.peerless, "full_status": net.full, "local_api": net.prefs,
+        "set_exit_node": net.set_exit_node, "settle": net.settle, "egress_node": net.egress_node,
+        "check": net.check, "vesktop_running": lambda: net.vesktop, "LOCKFILE": scratch / "vpn.lock",
     }
-    original = {name: getattr(vpn, name) for name in patched}
-    for name, fake in patched.items():
+    original = {name: getattr(vpn, name) for name in fakes}
+    real_sleep = vpn.time.sleep
+    for name, fake in fakes.items():
         setattr(vpn, name, fake)
+    vpn.time.sleep = net.sleep
+    os.environ["RUN_LOG_DIR"] = str(scratch / "runs")
     try:
-        w = vpn.Watch()
-        for i, reading in enumerate(readings):
-            current.update(reading=reading, i=i)
-            waits.append(vpn.look(w, (times or range(len(readings)))[i], bus_up))
+        with contextlib.redirect_stdout(io.StringIO()):
+            yield Logs(scratch / "runs")
     finally:
         for name, fn in original.items():
             setattr(vpn, name, fn)
-    return done, waits, w
+        vpn.time.sleep = real_sleep
+        del os.environ["RUN_LOG_DIR"]
 
 
-def of(done, kind):
-    if kind == "node":
-        return [d for d in done if isinstance(d, tuple) and d[0] == vpn.NODE_UNIT]
-    if kind == "beat":
-        return [d for d in done if isinstance(d, tuple) and d[0] == vpn.WATCH_UNIT]
-    return [d for d in done if d == kind or (isinstance(d, tuple) and d[0] == kind)]
+def attempt(command, *args):
+    """Run a command; its error message, or None when it succeeded."""
+    try:
+        command(*args)
+    except vpn.VpnError as e:
+        return str(e)
+    return None
 
 
-fra = status("de-fra-wg-202")
+BASE = time.time()
+EVERYTHING = {n.name for n in NODES}
 
-done, _, _ = drive([fra], vesktop=False)
-check("Vesktop closed: a new node is not checked", [], of(done, "check"))
+# --- the watcher's looks
 
-done, _, _ = drive([fra, fra], vesktop=lambda i: i == 1, verdicts=["clean"])
-check("Vesktop opening on a node nobody checked checks it", ["check"], of(done, "check"))
+net = Net(vesktop=False)
+with wired(net):
+    vpn.look(vpn.Watch(), BASE, True)
+check("Vesktop closed: a new node is not checked", [], net.checks)
 
-done, _, _ = drive([fra, fra], verdicts=["clean"])
-check("a node that passed is not checked again before the re-check is due", ["check"], of(done, "check"))
-done, _, _ = drive([fra, fra], verdicts=["clean", "clean"], times=[0, vpn.RECHECK_SECS + 1])
-check("and is once it is", ["check", "check"], of(done, "check"))
+net = Net(vesktop=False)
+with wired(net):
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    net.vesktop = True
+    vpn.look(w, BASE + 5, True)
+check("Vesktop opening on a node nobody checked checks it", ["de-fra-wg-202"], net.checks)
 
-done, _, _ = drive([fra], verdicts=["blocked"])
-check("a confirmed block moves on", [("recover", "blocked")], of(done, "recover"))
-done, _, _ = drive([fra], verdicts=["unreachable"])
-check("no Discord answer while egress works stays put", [], of(done, "recover"))
-done, _, _ = drive([fra], verdicts=["unreachable"], egress="")
-check("no Discord answer and no egress moves on", [("recover", "offline")], of(done, "recover"))
+net = Net()
+with wired(net):
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    vpn.look(w, BASE + 10, True)
+    early = len(net.checks)
+    vpn.look(w, BASE + 601, True)
+check("a node that passed is not checked again within 600 s", 1, early)
+check("and is after", 2, len(net.checks))
 
-done, _, _ = drive([status("de-fra-wg-202", online=False)], vesktop=False)
-check("a node reporting itself offline moves on, Vesktop or not", [("recover", "offline")], of(done, "recover"))
+# Cloudflare can start blocking a node while Vesktop is closed, and Vesktop
+# opening sends nothing on the bus.
+net = Net()
+with wired(net):
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    net.vesktop = False
+    vpn.look(w, BASE + 5, True)
+    net.vesktop = True
+    vpn.look(w, BASE + 10, True)
+check("Vesktop reopening checks the node again, even one that passed", 2, len(net.checks))
 
-done, _, _ = drive([status(), status()], verdicts=[])
-check("no exit node set: nothing is checked", [], of(done, "check"))
-check("and nothing is moved", [], of(done, "recover"))
+net = Net(blocked={"de-fra-wg-202"})
+with wired(net) as logs:
+    vpn.look(vpn.Watch(), BASE, True)
+check("a 403 is checked a second time before anything moves", ["de-fra-wg-202", "de-fra-wg-202"], net.checks[:2])
+check("a confirmed block moves to the next node in the city, pinned",
+      ("de-fra-wg-401", False), (net.exit, net.automatic))
+check("and records the rotation", ("rotated", "de-fra-wg-202", "de-fra-wg-401"),
+      (logs.last()["event"], logs.last()["node"], logs.last()["rotated_to"]))
 
-done, waits, _ = drive([None])
-check("tailscaled not answering: nothing is acted on", [], of(done, "recover") + of(done, "check"))
-check("and the next look comes on the fallback interval", [vpn.FALLBACK_SECS], waits)
+net = Net(discord=False)
+with wired(net) as logs:
+    vpn.look(vpn.Watch(), BASE, True)
+check("no Discord answer while egress works stays put", ("de-fra-wg-202", []), (net.exit, logs.events()))
 
-done, _, _ = drive([fra], vesktop=False)
-check("the first look records no change: there is no before", [], of(done, "node"))
+net = Net(dead={"de-fra-wg-202"})
+with wired(net) as logs:
+    vpn.look(vpn.Watch(), BASE, True)
+check("no Discord answer and no egress moves on", ("de-fra-wg-401", ["offline"]), (net.exit, logs.events()))
 
-done, _, _ = drive([fra, status("de-fra-wg-401")], vesktop=False)
-check("a change something else made is recorded",
-      [(vpn.NODE_UNIT, "ok", {"event": "changed", "command": "watch", "node": "de-fra-wg-202",
-                              "rotated_to": "de-fra-wg-401", "tried": 0})],
-      of(done, "node"))
+net = Net(online=False, vesktop=False)
+with wired(net) as logs:
+    vpn.look(vpn.Watch(), BASE, True)
+check("a node reporting itself offline moves on, Vesktop closed or not",
+      ("de-fra-wg-401", ["offline"]), (net.exit, logs.events()))
+check("without the Discord check while Vesktop is closed", [], net.checks)
 
-recent = {"ts": datetime.now().astimezone().isoformat(),
-          "stats": {"event": "pinned", "node": "de-fra-wg-202", "rotated_to": "de-fra-wg-401"}}
-done, _, _ = drive([fra, status("de-fra-wg-401")], vesktop=False, record=recent)
-check("a change a vpn line accounts for is not recorded twice", [], of(done, "node"))
+net = Net(online=False, network=False)
+with wired(net) as logs:
+    vpn.look(vpn.Watch(), BASE, True)
+check("with the network down, a recovery gives up after two nodes carry nothing",
+      ["de-fra-wg-401.mullvad.ts.net", "de-fra-wg-001.mullvad.ts.net", "de-fra-wg-202.mullvad.ts.net"], net.sets)
+check("puts the exit node back where it was, pinned", ("de-fra-wg-202", False), (net.exit, net.automatic))
+check("and records the network, not every node, as the problem", ["unreachable"], logs.events())
 
-done, _, _ = drive([fra, status()], vesktop=False)
-check("the exit node turned off from outside is a change to none",
-      [None], [d[2]["rotated_to"] for d in of(done, "node")])
+net = Net(blocked=EVERYTHING)
+with wired(net) as logs:
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    net.vesktop = False
+    vpn.look(w, BASE + 400, True)
+check("when every node tried is blocked, automatic mode", True, net.automatic)
+check("recorded once, and not again as a change outside vpn after the back-off", ["exhausted"], logs.events())
 
-done, waits, w = drive([fra, status("de-fra-wg-401")], vesktop=False, busy=lambda i: i == 1)
-check("a change while a vpn command holds the lock is left to that command", [], of(done, "node"))
-check("and looked at again once it lets go", 1.0, waits[1])
-check("without being taken as seen", "id-de-fra-wg-202", w.node_id)
+net = Net(blocked={"de-fra-wg-202", "de-fra-wg-401"})
+with wired(net) as logs:
+    net.on_sleep = lambda: net.set_exit_node("de-fra-wg-401.mullvad.ts.net")
+    wait = vpn.look(vpn.Watch(), BASE, True)
+check("a 403 confirmed after the node changed moves nothing", ("de-fra-wg-401", []), (net.exit, logs.events()))
+check("and the new node is looked at a second later", 1.0, wait)
 
-done, _, _ = drive([fra, fra, fra], vesktop=False, times=[0, 10, vpn.HEARTBEAT_SECS + 1])
-check("the heartbeat is written on the first look and then hourly", 2, len(of(done, "beat")))
+net = Net(exit_name=None)
+with wired(net) as logs:
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    vpn.look(w, BASE + 700, True)
+check("no exit node set: nothing checked, nothing moved, even past a re-check", ([], [], []),
+      (net.checks, net.sets, logs.events()))
 
-_, waits, _ = drive([fra], vesktop=False, bus_up=False)
-check("with the bus down, the next look is no further off than the fallback", vpn.FALLBACK_SECS, waits[0])
-_, waits, _ = drive([fra], vesktop=False)
-check("Vesktop closed on a node nobody checked: looked at on the fallback interval", vpn.FALLBACK_SECS, waits[0])
-_, waits, _ = drive([fra], verdicts=["clean"])
-check("a checked node with the bus up waits for the re-check", vpn.RECHECK_SECS, waits[0])
+net = Net()
+net.down = True
+with wired(net):
+    wait = vpn.look(vpn.Watch(), BASE, True)
+check("tailscaled not answering: nothing is acted on", ([], []), (net.checks, net.sets))
+check("and the next look comes in 15 s", 15, wait)
+
+net = Net(vesktop=False)
+with wired(net) as logs:
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    first = logs.events()
+    net.set_exit_node("de-fra-wg-401.mullvad.ts.net")
+    vpn.look(w, BASE + 5, True)
+check("the first look records no change: there is no before", [], first)
+check("a change something else made is recorded", [("changed", "de-fra-wg-202", "de-fra-wg-401")],
+      [(r["stats"]["event"], r["stats"]["node"], r["stats"]["rotated_to"]) for r in logs.lines(vpn.NODE_UNIT)])
+
+net = Net(vesktop=False)
+with wired(net) as logs:
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    vpn.next_()
+    vpn.look(w, BASE + 5, True)
+check("a move vpn made is recorded once, by vpn", ["pinned"], logs.events())
+
+net = Net(vesktop=False)
+with wired(net) as logs:
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    net.set_exit_node("")
+    vpn.look(w, BASE + 5, True)
+check("the exit node turned off from outside is a change to none", [("changed", None)],
+      [(r["stats"]["event"], r["stats"]["rotated_to"]) for r in logs.lines(vpn.NODE_UNIT)])
+
+net = Net(vesktop=False)
+with wired(net) as logs:
+    w = vpn.Watch()
+    vpn.look(w, BASE, True)
+    with open(vpn.LOCKFILE, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        net.set_exit_node("de-fra-wg-401.mullvad.ts.net")
+        busy_wait = vpn.look(w, BASE + 5, True)
+        while_held = logs.events()
+        fcntl.flock(held, fcntl.LOCK_UN)
+    vpn.look(w, BASE + 6, True)
+check("a change while a vpn command holds the lock is left to that command", [], while_held)
+check("and looked at again a second later", 1.0, busy_wait)
+check("once the lock is free and no vpn line accounts for it, it is recorded", ["changed"], logs.events())
+
+net = Net(vesktop=False)
+with wired(net) as logs:
+    w = vpn.Watch()
+    for offset in (0, 10, 3601):
+        vpn.look(w, BASE + offset, True)
+check("the heartbeat is written on the first look and then hourly", 2, len(logs.lines(vpn.WATCH_UNIT)))
+
+
+def first_wait(net: Net, bus_up: bool = True) -> float:
+    with wired(net):
+        return vpn.look(vpn.Watch(), BASE, bus_up)
+
+
+check("a checked node, bus up, Vesktop open: the next look is the 600 s re-check", 600, first_wait(Net()))
+check("the same with the bus down: 15 s", 15, first_wait(Net(), bus_up=False))
+check("an exit node set with Vesktop closed: 15 s", 15, first_wait(Net(vesktop=False)))
+check("no exit node, bus up: nothing is due before the hourly heartbeat", 3600, first_wait(Net(exit_name=None)))
+
+# --- the commands
+
+net = Net(blocked={"de-fra-wg-401"})
+with wired(net) as logs:
+    vpn.next_()
+check("vpn next skips a node Cloudflare blocks", "de-fra-wg-001", net.exit)
+check("and records where it went, from where, and how many it tried",
+      {"event": "pinned", "command": "next", "node": "de-fra-wg-202", "rotated_to": "de-fra-wg-001", "tried": 2},
+      logs.last())
+
+net = Net(blocked=EVERYTHING)
+with wired(net) as logs:
+    error = attempt(vpn.next_)
+check("vpn next finding nothing puts the pinned node back", ("de-fra-wg-202", False), (net.exit, net.automatic))
+check("and fails, saying so", ("exhausted", True), (logs.last()["event"], error is not None))
+
+net = Net(blocked=EVERYTHING, automatic=True)
+with wired(net):
+    attempt(vpn.next_)
+check("from automatic mode, it goes back to automatic mode", (True, "auto:any"), (net.automatic, net.sets[-1]))
+
+net = Net(network=False)
+with wired(net) as logs:
+    attempt(vpn.next_)
+check("vpn next with the network down gives up after two silent nodes and puts the node back",
+      (3, "de-fra-wg-202"), (len(net.sets), net.exit))
+check("recording the network as the problem", "unreachable", logs.last()["event"])
+
+net = Net()
+with wired(net) as logs:
+    vpn.to(vpn.ToArgs(place="Berlin"))
+check("vpn to a city pins its node", ("de-ber-wg-001", False, "to"), (net.exit, net.automatic, logs.last()["command"]))
+
+net = Net()
+with wired(net) as logs:
+    error = attempt(vpn.to, vpn.ToArgs(place="Atlantis"))
+check("vpn to a place with no node fails without touching the exit node", (True, [], []),
+      (error is not None, net.sets, logs.events()))
+
+net = Net()
+with wired(net) as logs:
+    vpn.on()
+check("vpn on from a pin records both nodes",
+      {"event": "clean", "command": "on", "node": "de-fra-wg-202", "rotated_to": "de-fra-wg-001", "tried": 0},
+      logs.last())
+
+net = Net(blocked={"de-fra-wg-001"})
+with wired(net) as logs:
+    vpn.on()
+check("vpn on walks off automatic mode's blocked pick to the node next to it",
+      ("de-fra-wg-202", False), (net.exit, net.automatic))
+check("and records the rotation", ("rotated", "de-fra-wg-001", "de-fra-wg-202"),
+      (logs.last()["event"], logs.last()["node"], logs.last()["rotated_to"]))
+
+net = Net()
+with wired(net) as logs:
+    vpn.off()
+check("vpn off drops the exit node and records the node it left",
+      (None, "off", "de-fra-wg-202"), (net.exit, logs.last()["event"], logs.last()["node"]))
 
 print()
 print("FAILED" if failures else "all ok")

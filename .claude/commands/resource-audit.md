@@ -83,4 +83,4 @@ measured value, its floor, and its behavior-preserving flag.
   and kin) are deliberate choices — current values live in the nix modules.
   Cheaper never justifies staler.
 - tailscaled's CPU is exit-node WireGuard crypto, by design; vpn-watch's
-  look intervals are chosen detection latencies.
+  fallback look interval is a chosen detection latency.
