@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["tyro", "httpx"]
 # ///
-"""Public share links for files in the SFTPGo drop on pc.
+"""Uploads to the SFTPGo drop on pc, and public share links for what is there.
 
 A share is a link to one path inside your account. Whoever holds it downloads
 without an account — for people you don't want to mint an account for. Scope is
@@ -20,6 +20,8 @@ an account, and sftpgo-user's admin API key cannot create them.
 
 Examples:
 
+    sftpgo-share upload ~/Videos/trip
+    sftpgo-share upload ~/invoice.pdf --to /2026
     sftpgo-share create /trip.zip
     sftpgo-share create /photos --expires 30d --max-downloads 5
     sftpgo-share create /photos --password soup
@@ -35,6 +37,7 @@ import json as jsonlib
 import os
 import re
 import secrets
+import shlex
 import string
 import subprocess
 import sys
@@ -131,20 +134,25 @@ def parse_duration(spec: str) -> int | None:
 GO_MODE_DIR = 1 << 31
 
 
-def looks_like_dir(c: httpx.Client, path: str) -> bool:
-    """Whether path is a directory, read from its parent's listing.
+def listing_entry(c: httpx.Client, path: str) -> dict | None:
+    """Path's entry in its parent's listing, or None when it does not exist.
 
     Asking /api/v2/user/dirs about the path itself would be the obvious way, but
     SFTPGo drops the connection with no response when that path is an existing
     file (2.7.5) — a nonexistent path 404s correctly, only a real file kills it.
     """
     p = PurePosixPath(path)
-    if str(p) == "/":
-        return True
     r = c.get("/api/v2/user/dirs", params={"path": str(p.parent)})
     if r.status_code != 200:
-        return False
-    return any(e.get("mode", 0) & GO_MODE_DIR for e in r.json() if e.get("name") == p.name)
+        return None
+    return next((e for e in r.json() if e.get("name") == p.name), None)
+
+
+def looks_like_dir(c: httpx.Client, path: str) -> bool:
+    if str(PurePosixPath(path)) == "/":
+        return True
+    entry = listing_entry(c, path)
+    return bool(entry and entry.get("mode", 0) & GO_MODE_DIR)
 
 
 def share_url(share_id: str, is_dir: bool) -> str:
@@ -165,6 +173,73 @@ def zip_url(share_id: str) -> str:
 
 def gen_password() -> str:
     return "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+
+
+# SFTPGo API tokens expire 20 minutes after login (apiTokenDuration) and are
+# checked when a request starts, so a long upload logs in again between files.
+RELOGIN_AFTER_SECONDS = 15 * 60
+
+
+@app.command(name="upload")
+def upload(
+    local: tyro.conf.Positional[str],
+    to: str = "/",
+    overwrite: bool = False,
+) -> None:
+    """Upload a local file or directory into the account.
+
+    It lands at <to>/<name>. SFTPGo records the arrival time as the mtime, so
+    retention counts from the upload. Empty directories are skipped; retention
+    would delete them the next night anyway. Output names no files, only counts.
+
+    Args:
+        local: File or directory on this machine.
+        to: Directory in the account to upload into, created if missing.
+        overwrite: Upload even when <to>/<name> already exists. Files of the
+            same name are replaced; everything else already there stays.
+    """
+    src = Path(local).expanduser().resolve()
+    if not src.exists():
+        die(f"no such file or directory: {src}")
+    dest = PurePosixPath("/", to) / src.name
+    files = sorted(p for p in src.rglob("*") if p.is_file()) if src.is_dir() else [src]
+    if not files:
+        die(f"{src} holds no files")
+    total = sum(p.stat().st_size for p in files)
+    show_progress = sys.stderr.isatty()
+
+    logged_in = time.monotonic()
+    with client() as c:
+        if not overwrite and listing_entry(c, str(dest)):
+            die(f"{dest} already exists; --overwrite uploads into it anyway")
+        sent = 0
+        for n, p in enumerate(files, 1):
+            if time.monotonic() - logged_in > RELOGIN_AFTER_SECONDS:
+                c.headers["Authorization"] = f"Bearer {token()}"
+                logged_in = time.monotonic()
+            remote = dest / p.relative_to(src).as_posix()
+            with p.open("rb") as f:
+                r = c.post(
+                    "/api/v2/user/files/upload",
+                    params={"path": str(remote), "mkdir_parents": "true"},
+                    content=f,
+                )
+            if r.status_code != 201:
+                if show_progress:
+                    print(file=sys.stderr)
+                die(f"upload stopped at file {n}/{len(files)}, {remote}: {r.status_code} {r.text.strip()}")
+            sent += p.stat().st_size
+            if show_progress:
+                print(
+                    f"\r  {n}/{len(files)} files, {sent / 2**20:.0f}/{total / 2**20:.0f} MiB",
+                    end="", file=sys.stderr, flush=True,
+                )
+        if show_progress:
+            print(file=sys.stderr)
+
+    print(f"uploaded {dest}")
+    print(f"  files:  {len(files)}, {total / 2**20:.1f} MiB")
+    print(f"  share:  sftpgo-share create {shlex.quote(str(dest))}")
 
 
 @app.command(name="create")
