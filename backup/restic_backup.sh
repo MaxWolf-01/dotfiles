@@ -383,17 +383,10 @@ ${stats_error:-nothing}" >&2
         check_log="$log_dir/restic_check_${config_name}_$(date +%Y%m%d_%H%M%S).log"
         cp "$check_output" "$check_log"
         echo "Check log saved to: $check_log"
-        # restic's sftp backend never reconnects: once its ssh process has
-        # exited, every remaining read fails and the verdict is "repository is
-        # damaged" for a repository it could no longer reach (2026-09-14: an
-        # exit-node change reset the session seven minutes in). restic 0.19.1
-        # names that state "ssh command exited", and a session that ends
-        # normally never prints it. The run is recorded as if the check had not
-        # happened: the verdict fields stay out of the run log, as the size
-        # does when it could not be read, and the run stays green, a dropped
-        # link being the network's business. Anything this attempt found before
-        # the drop waits for the next run, which reads the structure again and
-        # a fresh sample; the output is kept beside the run log either way.
+        # restic 0.19.1 prints "ssh command exited" when its ssh process died
+        # under the check; it never reconnects, so every read after that fails
+        # and it calls a repository it cannot reach "damaged". Recorded as a
+        # check that did not happen: no verdict, and the run stays green.
         if grep -q 'ssh command exited' "$check_output"; then
             check_status="interrupted"
             check_interrupted=$(grep -m1 'subprocess ssh:' "$check_output" || grep -m1 'ssh command exited' "$check_output")
