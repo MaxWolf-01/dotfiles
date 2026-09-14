@@ -17,6 +17,7 @@ import base64
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import struct
@@ -382,7 +383,10 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     git(repo, "init", "-q", "-b", "main")
     blue, white, red = (40, 70, 160, 255), (240, 240, 240, 255), (220, 40, 40, 255)
     square = lambda x, y: 150 <= x < 170 and 100 <= y < 120   # the one region where shot.png changes
+    noise = lambda x, y: ((x * 7919 + y * 104729) % 251, (x * 31 + y * 17) % 253, (x ^ y) % 256, 255)   # compresses badly
     (repo / "a.txt").write_text("one\n")
+    (repo / "old-name.txt").write_text("renamed, not changed\n")
+    (repo / "run.sh").write_text("#!/bin/sh\n")
     (repo / "shot.png").write_bytes(png(240, 160, lambda x, y: blue))
     (repo / "wide.png").write_bytes(png(900, 60, lambda x, y: white))
     (repo / "gone.png").write_bytes(png(30, 20, lambda x, y: red))
@@ -391,13 +395,15 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     (repo / "logo.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="#3b6"/></svg>\n')
     git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
     (repo / "a.txt").write_text("one\ntwo\n")
+    git(repo, "mv", "old-name.txt", "new-name.txt")
+    (repo / "run.sh").chmod(0o755)
     (repo / "shot.png").write_bytes(png(240, 160, lambda x, y: red if square(x, y) else blue))
-    (repo / "wide.png").write_bytes(png(900, 60, lambda x, y: red if x < 10 else white))
-    (repo / "added.png").write_bytes(png(120, 80, lambda x, y: (2 * x, 3 * y, 200, 255)))
+    (repo / "wide.png").write_bytes(png(960, 60, noise))   # wider, and far heavier than the plain white it replaces
+    (repo / "added.png").write_bytes(png(120, 80, lambda x, y: (2 * x, 3 * y, 200, 0 if x < 30 else 255)))   # its left quarter transparent
     (repo / "gone.png").unlink()
     (repo / "data.bin").write_bytes(bytes(reversed(range(256))))
     (repo / "logo.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40">\n<rect width="40" height="40" fill="#c33"/>\n'
-                                   '<script>window.top.PWNED = 1</script>\n</svg>\n')
+                                   '<script>window.top.postMessage("svg ran", "*")</script>\n</svg>\n')
     git(repo, "add", "-A"); git(repo, "commit", "-qm", "change")
     notes = root / "image-notes.json"
     notes.write_text(json.dumps({"notes": [{"id": 1, "path": "added.png", "text": "a gradient"},
@@ -408,46 +414,64 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
                    check=True, capture_output=True)
 
     page = browser.new_page(viewport={"width": 1280, "height": 1600})
+    # an SVG whose script runs anywhere on the page, frames included, reports it here
+    page.add_init_script('window.svgRan = false; addEventListener("message", e => { if (e.data === "svg ran") window.svgRan = true; });')
     page.goto(f"{base}/{out.name}")
     page.wait_for_selector(".fcard")
     page.evaluate('document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")))')
     page.wait_for_function('[...document.querySelectorAll(".imgblock img")].every(img => img.complete)')
     card = lambda path: page.locator(f'.fcard[data-key="0:{path}"]')
     natural = lambda path, side: card(path).locator(f".imgside.{side} img").evaluate("img => [img.naturalWidth, img.naturalHeight]")
-    header = lambda path: card(path).locator(".fhead").inner_text()
+    dims = lambda path: card(path).locator(".imgdims").inner_text().split(" · ")[0]
 
     check("an added image shows its new version, at its own size", ([120, 80], 0), (natural("added.png", "new"), card("added.png").locator(".imgside.old").count()))
+    checker = pixels(browser, card("added.png").locator(".imgside.new img").screenshot(), [(4, 4), (12, 4)])
+    check("its transparent pixels show a checkerboard", (True, True), (near(checker[0], (36, 38, 45)), near(checker[1], (48, 51, 59))))
     check("a deleted image shows its old version", ([30, 20], 0), (natural("gone.png", "old"), card("gone.png").locator(".imgside.new").count()))
-    check("a modified image shows both, naming dimensions the two share once", ([240, 160], [240, 160], True),
-          (natural("shot.png", "old"), natural("shot.png", "new"), card("shot.png").locator(".imgdims").inner_text().startswith("240×160 · ")))
-    check("its header gives the size change in place of line counts", (True, False), (" B → " in header("shot.png"), "+0" in header("shot.png")))
-    check("an SVG shows its drawings above its text diff", (2, True), (card("logo.svg").locator(".imgblock img").count(), card("logo.svg").locator("tbody.hunk").count() > 0))
-    check("and nothing inside it runs or reaches the page", (None, 0), (page.evaluate("window.PWNED ?? null"), page.locator(".imgblock svg, .imgblock script").count()))
+    check("a modified image names dimensions its versions share once", "240×160", dims("shot.png"))
+    check("and both where they differ, old first", "900×60 → 960×60", dims("wide.png"))
+    check("its header gives the size change, old first, in place of line counts", True,
+          re.fullmatch(r"\d+ B → \d+ KB", card("wide.png").locator(".fhead .mono").inner_text()) is not None)
+    check("an SVG shows its drawings above its text diff", 1, card("logo.svg").locator(".fbody > .imgblock + .diffbody").count())
+    page.wait_for_timeout(300)
+    check("and its script runs nowhere: every image frame holds an img, or the reason it has none", (False, True),
+          (page.evaluate("window.svgRan"),
+           page.evaluate("[...document.querySelectorAll('.imgframe > *')].every(el => el.tagName === 'IMG' || el.classList.contains('imgmiss'))")))
     check("a note on an image outside the diff puts that image on the page", [50, 40], natural("still.png", "new"))
     check("a binary file that is no image says what it is", "binary file", card("data.bin").locator(".binmsg").inner_text())
 
     focused = lambda: page.evaluate("S.focus < 0 ? null : HUNKS[S.focus].x.f.path")
 
+    def walk(key: str) -> list:
+        seen = {focused()}
+        for _ in range(16):
+            page.keyboard.press(key)
+            seen.add(focused())
+        return sorted(seen - {None})
+
     def focus(path: str) -> None:
         page.keyboard.press("g"); page.keyboard.press("g")
-        for _ in range(10):
+        for _ in range(12):
             page.keyboard.press("J")
             if focused() == path:
                 return
 
-    check("the fixture has a card without hunks of every kind", ["added.png", "data.bin", "gone.png", "shot.png", "still.png", "wide.png"],
+    check("the fixture has a card without hunks of every kind", ["added.png", "data.bin", "gone.png", "new-name.txt", "run.sh", "shot.png", "still.png", "wide.png"],
           page.evaluate("ALL.filter(x => !x.f.hunks.length).map(x => x.f.path).sort()"))
+    every = sorted(page.evaluate("ALL.map(x => x.f.path)"))
     page.keyboard.press("g"); page.keyboard.press("g")
-    walked = set()
-    for _ in range(10):
-        page.keyboard.press("J")
-        walked.add(focused())
-    check("J lands on every card, each one without hunks included", sorted(page.evaluate("ALL.map(x => x.f.path)")), sorted(walked))
+    check("J lands on every card, each one without hunks included", every, walk("J"))
+    check("and K on every one back", every, walk("K"))
+    page.keyboard.press("g"); page.keyboard.press("g")
+    check("so does j, a card without hunks being one stop", every, walk("j"))
+    focus("shot.png")
+    check("the focus outlines a card without hunks as a whole", 1, card("shot.png").locator(".fbody.focus").count())
 
     stage = card("shot.png").locator(".imgview")
+    slider = card("shot.png").locator(".imgslider input")
+    view = lambda path: card(path).locator(".imgview").get_attribute("class")
     at = lambda *points: pixels(browser, stage.screenshot(), points)
     inside, outside = (160, 110), (5, 150)
-    focus("shot.png")
     page.keyboard.press("i")                  # 2-up → swipe
     page.keyboard.press("}")
     swiped_new = at(inside)[0]
@@ -455,10 +479,16 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     swiped_old = at(inside)[0]
     check("swipe at its new end shows the new version, at its old end the old one", (True, True), (near(swiped_new, red), near(swiped_old, blue)))
     page.keyboard.press("]")
-    check("] moves the slider one step toward the new version", "10", stage.evaluate("el => el.style.getPropertyValue('--p')"))
-    page.keyboard.press("i")                  # → onion skin, the slider where swipe left it
-    page.keyboard.press("}")
-    check("onion skin at its new end shows the new version", True, near(at(inside)[0], red))
+    check("] moves the slider one step toward the new version", "10", slider.input_value())
+    check("the view is the page's: another image follows it, one with a single version stays 2-up", (True, True),
+          ("swipe" in view("wide.png"), "twoup" in view("added.png")))
+    page.keyboard.press("i")                  # → onion skin
+    check("the slider keeps its place across views", "10", slider.input_value())
+    page.keyboard.press("{")
+    check("onion skin at its old end shows the old version", True, near(at(inside)[0], blue))
+    for _ in range(5):
+        page.keyboard.press("]")
+    check("and halfway, half of each: (red + blue) / 2", True, near(at(inside)[0], (130, 55, 100)))
     page.keyboard.press("i")                  # → difference
     changed_px, unchanged_px = at(inside, outside)
     check("difference: the changed square is |red − blue| per channel, the rest black", (True, True),
@@ -470,38 +500,47 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     wide = card("wide.png").locator(".imgside.new img")
     fitted = wide.evaluate("img => img.getBoundingClientRect().width")
     wide.click()
-    check("an image wider than its column fits it, and a click shows it at actual pixels", (True, 900),
-          (fitted < 900, round(wide.evaluate("img => img.getBoundingClientRect().width"))))
+    check("an image wider than its column fits it, and a click shows it at actual pixels", (True, 960),
+          (fitted < 960, round(wide.evaluate("img => img.getBoundingClientRect().width"))))
 
-    def comments(count: int) -> list:
+    def saved(ready) -> list:
+        held: list = []
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if state.is_file() and len(held := json.loads(state.read_text())["comments"]) == count:
-                return held
+            held = json.loads(state.read_text())["comments"] if state.is_file() else []
+            if ready(held):
+                break
             time.sleep(0.2)
-        return []
+        return held
 
-    focus("shot.png")
+    focus("wide.png")
     page.keyboard.press("c")
-    page.keyboard.type("the red square is new")
+    page.keyboard.type("the strip is new")
     page.keyboard.press("Control+Enter")
-    saved = (comments(1) or [{}])[0]
-    check("c on an image card comments on the whole file, at the card's top", ("file", -1, 1),
-          (saved.get("side"), saved.get("hi"), card("shot.png").locator(".fbody > .cbox.file").count()))
+    first = (saved(lambda cs: len(cs) == 1) or [{}])[0]
+    check("c on an image card comments on the whole file, above the image", ("file", -1, 1),
+          (first.get("side"), first.get("hi"), card("wide.png").locator(".fbody > .cbox.file + .imgblock").count()))
     exported = page.evaluate("commentsMarkdown()")
-    check("the export describes both versions where a line comment quotes lines", True,
-          "**C1** · whole file" in exported and "  old PNG 240×160" in exported and "  new PNG 240×160" in exported)
+    check("the export describes each version where a line comment quotes lines", True,
+          "**C1** · whole file" in exported and "  old PNG 900×60" in exported and "  new PNG 960×60" in exported)
+    page.keyboard.press("e")                  # saving left the focus on C1
+    page.keyboard.press("Control+a")
+    page.keyboard.type("the strip is new, and wanted")
+    page.keyboard.press("Control+Enter")
+    edited = (saved(lambda cs: bool(cs) and cs[0]["text"].endswith("wanted")) or [{}])[0]
+    check("e edits it in place", ("the strip is new, and wanted", 1), (edited.get("text"), card("wide.png").locator(".cbox.file").count()))
+    check("and Y puts it at the top of the file's diff", True, "## C1 · reviewer · whole file\n#  the strip is new, and wanted" in page.evaluate("diffText(true)"))
     card("added.png").locator(".abox button", has_text="reply").click()
     page.keyboard.type("looks right")
     page.keyboard.press("Control+Enter")
-    reply = (comments(2) or [{}, {}])[1]
+    reply = (saved(lambda cs: len(cs) == 2) or [{}])[-1]
     check("a reply to a note on an image lands on the whole file, right under the note", ("file", 1, "c2"),
           (reply.get("side"), reply.get("re"), card("added.png").locator(".fbody > .abox.file + .cbox.file").get_attribute("data-ann")))
 
     focus("gone.png")
     page.keyboard.press(" ")
-    check("Space marks an image card viewed and moves on to the next file", (True, "logo.svg"),
-          (page.evaluate("S.viewed.has('0:gone.png')"), focused()))
+    check("Space marks an image card viewed, folds its image away, and moves on to the next file", (True, False, "logo.svg"),
+          (page.evaluate("S.viewed.has('0:gone.png')"), card("gone.png").locator(".imgblock").is_visible(), focused()))
     page.close()
 
 
