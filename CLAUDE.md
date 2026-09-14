@@ -137,11 +137,11 @@ with `bin/tailscale-dns` from `secrets/tailscale/dns.json`. Servers (pc, jarvis,
 yapit-prod) are opted out. Never add `Domains=~.` to a resolved config — it ties
 with tailscaled's own catch-all and silently defeats filtering. `dns-blocked`
 answers "is this domain blocked, and by which list". Chain, gotchas, and the
-captive-portal escape (`vpn-dns-off`): `docs/dns.md`.
+captive-portal escape (`portal`): `docs/dns.md`.
 
 Mullvad exit node: Cloudflare blocks some node IPs for Chrome-family clients
-(Electron apps break, browsers work) — `vpn-on` (= `bin/vpn-pick`) verifies and
-rotates, a watcher service re-checks; rationale in the script header.
+(Electron apps break, browsers work) — `vpn` (`bin/vpn`) verifies and rotates,
+and its watcher service (`vpn watch`) re-checks; rationale in `vpn --help`.
 
 ## Monitoring
 

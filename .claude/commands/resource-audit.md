@@ -82,5 +82,5 @@ measured value, its floor, and its behavior-preserving flag.
 - History outranks disk: retention windows and save cadences (tmux-resurrect
   and kin) are deliberate choices — current values live in the nix modules.
   Cheaper never justifies staler.
-- tailscaled's CPU is exit-node WireGuard crypto, by design; the
-  vpn-watchdog poll interval is a chosen detection latency.
+- tailscaled's CPU is exit-node WireGuard crypto, by design; vpn-watch's
+  fallback look interval is a chosen detection latency.

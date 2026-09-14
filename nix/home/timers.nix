@@ -29,9 +29,9 @@ let
     bash coreutils jq
   ]);
 
-  # The dns-* scripts and the dashboard collectors are PEP 723 uv scripts, so uv
-  # resolves their deps at run. jq because bin/run-log, which each of them calls
-  # to record its outcome, builds its line with it.
+  # The dns-* scripts, the dashboard collectors and bin/vpn are PEP 723 uv
+  # scripts, so uv resolves their deps at run. jq because bin/run-log, which each
+  # of them calls to record its outcome, builds its line with it.
   uvScriptPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv jq
   ]);
@@ -44,12 +44,6 @@ let
   # them with fd.
   activityPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv jq git fd
-  ]);
-
-  # util-linux for flock (vpn-pick serializes watcher vs. manual runs), jq for
-  # both the tailscale state reads and the run-log lines vpn-pick writes
-  vpnPath = lib.makeBinPath (with pkgs; [
-    bash coreutils util-linux gawk curl jq
   ]);
 
   sshAuthSock = "/run/user/1000/ssh-agent";
@@ -640,25 +634,24 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Exit-node watchdog ---
+  # --- Exit-node watcher ---
   # Cloudflare blocks some Mullvad IPs for Chrome-family clients (Vesktop, any
   # Electron app), invisibly to Tailscale's own failover; and a pinned exit
   # node has no native failover at all. Runs continuously rather than on a
-  # timer: the watcher reacts to exit-node changes and deaths within seconds
-  # by polling local tailscale state, and probing Discord only on those
-  # events — and only while Vesktop is running. Rationale and probe:
-  # bin/vpn-pick.
+  # timer, reacting to tailscaled's event bus. What it watches and when it
+  # acts: `vpn watch --help`.
 
-  systemd.user.services.vpn-watchdog = {
+  systemd.user.services.vpn-watch = {
     Unit = {
-      Description = "Rotate the Mullvad exit node when Cloudflare blocks it or it dies";
+      Description = "Keep the Mullvad exit node working: move off a node Cloudflare blocks or that dies";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
     Service = {
-      # tailscale is the Ubuntu system package in /usr/bin
-      Environment = [ "PATH=${vpnPath}:/usr/bin:/bin" ];
-      ExecStart = "${dotfiles}/bin/vpn-pick --watch";
+      # tailscale is the Ubuntu system package in /usr/bin. Unbuffered, or the
+      # watcher's lines reach the journal only when a buffer fills.
+      Environment = [ "PATH=${uvScriptPath}:/usr/bin:/bin" "PYTHONUNBUFFERED=1" ];
+      ExecStart = "${dotfiles}/bin/vpn watch";
       Restart = "on-failure";
       RestartSec = "30s";
     };
