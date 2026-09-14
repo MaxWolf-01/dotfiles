@@ -32,6 +32,7 @@ Examples:
     diffview 'old-config/=new-config/' --title "config migration"
 """
 
+import fcntl
 import hashlib
 import html
 import json
@@ -363,6 +364,7 @@ IDLE_EXIT_SECONDS = int(os.environ.get("DIFFVIEW_IDLE_SECONDS") or 30 * 60)   # 
 MAX_STATE_BYTES = 4_000_000   # a real state file is under 20 KB; anything near this is not a page saving
 REQUEST_TIMEOUT = 30          # a client that announces a body and never sends it must not hold a thread for good
 SERVE_MARKER = ".serve.json"
+SERVE_LOCK = ".serve.lock"
 CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".json": "application/json", ".png": "image/png",
                  ".svg": "image/svg+xml", ".css": "text/css", ".js": "text/javascript"}
 
@@ -406,19 +408,23 @@ def ensure_server(root: Path) -> int | None:
     if root == home or root in home.parents:
         return None
     marker = root / SERVE_MARKER
-    port = already_serving(root)
-    if port:
-        return port
-
-    # a page left open on the last server still points at its port; answering there again
-    # is what lets that page save without a reload
-    server = bind_server(root, marker_port(marker))
-    port = server.server_address[1]
-    pid = os.fork()
-    if pid:
-        # written here, so the marker exists the moment this command returns
-        marker.write_text(json.dumps({"port": port, "pid": pid, "root": str(root)}))
-        return port
+    # one starter at a time per root: the second finds the first's marker instead of binding a
+    # second server beside it (a lock file of its own, as the marker's inode is replaced on exit)
+    with open(root / SERVE_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        port = already_serving(root)
+        if port:
+            return port
+        # a page left open on the last server still points at its port; answering there again
+        # is what lets that page save without a reload
+        server = bind_server(root, marker_port(marker))
+        port = server.server_address[1]
+        pid = os.fork()
+        if pid:
+            # written here, so the marker exists the moment this command returns
+            marker.write_text(json.dumps({"port": port, "pid": pid, "root": str(root)}))
+            return port
+        lock.close()   # the child inherited the lock; held here, no later starter could ever get in
 
     os.setsid()
     devnull = os.open(os.devnull, os.O_RDWR)
@@ -440,10 +446,9 @@ def ensure_server(root: Path) -> int | None:
 def release_marker(marker: Path, pid: int) -> None:
     """Drop this server's pid from the marker, keeping the port for the next server on this root.
 
-    Only if the marker still names this server. Two --serve started at the same moment on
-    one root both find nothing running, both bind, and both write the marker; the second
-    write wins. The other keeps serving until it goes idle, and its exit must not overwrite
-    the winner's record.
+    Only if the marker still names this server: the lock in ensure_server keeps two servers
+    from starting on one root, but a marker written by hand, or by an older diffview, is not
+    this server's to overwrite.
     """
     try:
         record = json.loads(marker.read_text())
