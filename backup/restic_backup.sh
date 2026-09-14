@@ -386,11 +386,14 @@ ${stats_error:-nothing}" >&2
         # restic's sftp backend never reconnects: once its ssh process has
         # exited, every remaining read fails and the verdict is "repository is
         # damaged" for a repository it could no longer reach (2026-09-14: an
-        # exit-node change reset the session seven minutes in). Nothing was
-        # verified and nothing was found wrong, so the check's fields stay out
-        # of the run log, as the size does when it could not be read, and the
-        # run stays green: a dropped link is the network's business, and the
-        # next run checks again.
+        # exit-node change reset the session seven minutes in). restic 0.19.1
+        # names that state "ssh command exited", and a session that ends
+        # normally never prints it. The run is recorded as if the check had not
+        # happened: the verdict fields stay out of the run log, as the size
+        # does when it could not be read, and the run stays green, a dropped
+        # link being the network's business. Anything this attempt found before
+        # the drop waits for the next run, which reads the structure again and
+        # a fresh sample; the output is kept beside the run log either way.
         if grep -q 'ssh command exited' "$check_output"; then
             check_status="interrupted"
             check_interrupted=$(grep -m1 'subprocess ssh:' "$check_output" || grep -m1 'ssh command exited' "$check_output")

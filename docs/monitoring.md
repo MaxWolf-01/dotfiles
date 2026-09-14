@@ -44,9 +44,10 @@ Everything that can send one, and where it points:
 
 Nothing else sends on its own. A green backup, a skipped one, an integrity
 check whose connection dropped under it, a newly blocked domain, an exit node
-rotation, a routine dependency report: run log and dashboard only. `🔍` in a yapit title means the report had
-no readable status line, so the setup could not tell whether the agent found
-anything and says so rather than staying quiet.
+rotation, a routine dependency report: run log and dashboard only. `🔍` in a
+yapit title means the report had no readable status line, so the setup could
+not tell whether the agent found anything and says so rather than staying
+quiet.
 
 ## Run logs
 
