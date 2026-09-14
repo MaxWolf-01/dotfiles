@@ -128,6 +128,87 @@ printf '\x89PNG\r\n\x1a\n\x00\x02\x03' > "$work/after.png"
 "$diffview" "$work/before.png=$work/after.png" -o "$work/binary-files.html" --no-auto-summary >/dev/null
 check "and a file=file compare of two binaries, under the new side's name" yes "$(grep -q '"path": "after.png"' "$work/binary-files.html" && echo yes)"
 
+# --- images: every version a card shows is baked into the page, byte for byte as the source holds it
+
+# a Python expression over one file of a page's data: f is the file, baked(side) the sha256 of that
+# image version as baked, "none" when the card has no such version, "unbaked SIZE" when it was left out
+field() {
+    python3 - "$@" <<'EOF'
+import base64, hashlib, json, sys
+page, path, expr = sys.argv[1:]
+data = json.loads(open(page).read().split("const DATA = ", 1)[1].split(";\n", 1)[0])
+f = next(f for s in data["sources"] for f in s["files"] if f["path"] == path)
+def baked(side):
+    v = (f.get("image") or {}).get(side)
+    return "none" if v is None else hashlib.sha256(base64.b64decode(v["src"].split(",", 1)[1])).hexdigest() if "src" in v else f"unbaked {v['size']}"
+print(eval(expr))
+EOF
+}
+baked() { field "$1" "$2" "baked('$3') + ' ' + baked('$4')"; }   # page, path, then the two sides to name
+digest() { sha256sum "$1" | cut -d' ' -f1; }
+
+# the expectations are digests of the bytes this test wrote, never of what git or diffview hands back
+check "a file=file compare takes each version from its own file" "$(digest "$work/before.png") $(digest "$work/after.png")" "$(baked "$work/binary-files.html" after.png old new)"
+check "a text file carries no image" False "$(field "$work/range.html" b.txt "'image' in f")"
+
+imgrepo="$work/imgrepo"
+commit() { git -C "$imgrepo" add -A; git -C "$imgrepo" -c user.name=t -c user.email=t@t commit -q -m "$1"; }
+git init -q -b main "$imgrepo"
+mkdir -p "$imgrepo/sub"
+printf '\x89PNG\x00kept one' > "$imgrepo/kept.png"; kept1=$(digest "$imgrepo/kept.png")
+printf '\x89PNG\x00gone' > "$imgrepo/gone.png"; gone=$(digest "$imgrepo/gone.png")
+printf '\x89PNG\x00moving' > "$imgrepo/before.png"; moving=$(digest "$imgrepo/before.png")
+printf '\x89PNG\x00still' > "$imgrepo/sub/still.png"; still=$(digest "$imgrepo/sub/still.png")
+printf '<svg xmlns="http://www.w3.org/2000/svg"/>\n' > "$imgrepo/logo.svg"; svg1=$(digest "$imgrepo/logo.svg")
+commit base
+printf '\x89PNG\x00kept two' > "$imgrepo/kept.png"; kept2=$(digest "$imgrepo/kept.png")
+rm "$imgrepo/gone.png"
+git -C "$imgrepo" mv before.png after.png
+printf '<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>\n' > "$imgrepo/logo.svg"; svg2=$(digest "$imgrepo/logo.svg")
+head -c 5242880 /dev/zero > "$imgrepo/limit.png"; limit=$(digest "$imgrepo/limit.png")   # 5 MiB, the most a page bakes
+head -c 5242881 /dev/zero > "$imgrepo/huge.png"                                           # one byte more
+commit change
+
+"$diffview" "$imgrepo@HEAD~1..HEAD" -o "$work/images.html" --no-auto-summary \
+    --notes <(echo '{"notes": [{"id": 1, "path": "sub/still.png", "text": "left alone"}]}') >/dev/null
+check "a modified image carries both versions as committed" "$kept1 $kept2" "$(baked "$work/images.html" kept.png old new)"
+check "a deleted image its old version only" "$gone none" "$(baked "$work/images.html" gone.png old new)"
+check "a renamed image finds its old version under the old name" "$moving $moving" "$(baked "$work/images.html" after.png old new)"
+check "an SVG carries both versions" "$svg1 $svg2" "$(baked "$work/images.html" logo.svg old new)"
+check "and keeps its text hunks" True "$(field "$work/images.html" logo.svg "bool(f['hunks'])")"
+check "an image of exactly the limit is baked" "none $limit" "$(baked "$work/images.html" limit.png old new)"
+check "one byte over it is left out, its size kept for the card to name" "none unbaked 5242881" "$(baked "$work/images.html" huge.png old new)"
+check "a note on an image outside the diff brings it in whole, with no lines to open" "untouched [] none $still" \
+    "$(field "$work/images.html" sub/still.png "f['status'] + ' ' + str(f['hunks']) + ' ' + baked('old') + ' ' + baked('new')")"
+
+# A...B compares against where the branch forked: main moving on afterwards changes nothing on the page
+git -C "$imgrepo" checkout -q -b feature
+printf '\x89PNG\x00kept on the branch' > "$imgrepo/kept.png"; kept_branch=$(digest "$imgrepo/kept.png")
+commit "branch edit"
+git -C "$imgrepo" checkout -q main
+printf '\x89PNG\x00kept on main later' > "$imgrepo/kept.png"; kept_main=$(digest "$imgrepo/kept.png")
+commit "main moves on"
+"$diffview" "$imgrepo@main...feature" -o "$work/images-fork.html" --no-auto-summary >/dev/null
+check "A...B takes an image's old version from the fork point" "$kept2 $kept_branch" "$(baked "$work/images-fork.html" kept.png old new)"
+"$diffview" "$imgrepo@main..feature" -o "$work/images-tips.html" --no-auto-summary >/dev/null
+check "A..B from A itself" "$kept_main $kept_branch" "$(baked "$work/images-tips.html" kept.png old new)"
+
+# a worktree compare reads the new version off the disk, from the repo's root whichever directory the spec names
+printf '\x89PNG\x00kept on disk' > "$imgrepo/kept.png"; kept_disk=$(digest "$imgrepo/kept.png")
+printf '\x89PNG\x00fresh' > "$imgrepo/fresh.png"; fresh=$(digest "$imgrepo/fresh.png")
+"$diffview" "$imgrepo/sub@HEAD.." -o "$work/images-worktree.html" --no-auto-summary >/dev/null
+check "a worktree compare takes the new version off the disk" "$kept_main $kept_disk" "$(baked "$work/images-worktree.html" kept.png old new)"
+check "an untracked image too" "none $fresh" "$(baked "$work/images-worktree.html" fresh.png old new)"
+git -C "$imgrepo" checkout -q -- kept.png
+rm "$imgrepo/fresh.png"
+
+mkdir -p "$work/imgs-old" "$work/imgs-new"
+printf '\x89PNG\x00old' > "$work/imgs-old/pic.png"
+printf '\x89PNG\x00new' > "$work/imgs-new/pic.png"
+"$diffview" "$work/imgs-old=$work/imgs-new" -o "$work/images-dirs.html" --no-auto-summary >/dev/null
+check "a directory compare takes each version from its own directory" "$(digest "$work/imgs-old/pic.png") $(digest "$work/imgs-new/pic.png")" \
+    "$(baked "$work/images-dirs.html" pic.png old new)"
+
 # --- worktree range: trailing '..' includes uncommitted changes
 
 printf 'four\n' >> "$repo/b.txt"
@@ -453,7 +534,11 @@ if command -v chromium >/dev/null; then
     sed 's#</body>#<script>setTimeout(() => document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render"))), 300)</script></body>#' \
         "$work/binary.html" > "$work/bindom.html"
     bindom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/bindom.html" 2>/dev/null)
-    check "a binary file's card says what it is, having no hunks to show" yes "$(grep -q '>binary file<' <<<"$bindom" && echo yes)"
+    check "an image whose bytes do not decode says so on its card" yes "$(grep -q 'not shown: these bytes do not decode as PNG' <<<"$bindom" && echo yes)"
+    sed 's#</body>#<script>setTimeout(() => document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render"))), 300)</script></body>#' \
+        "$work/images.html" > "$work/imgdom.html"
+    imgdom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/imgdom.html" 2>/dev/null)
+    check "an image too big to bake says so on its card, with its size" yes "$(grep -q 'not shown: 5 MB; an image brings at most 5 MB into the page' <<<"$imgdom" && echo yes)"
 
     # annotations end to end: ids on the boxes, the agent's resolution folding a comment
     # away, m landing on the next unresolved one, and what the copy button would produce
