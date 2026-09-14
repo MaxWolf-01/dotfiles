@@ -1,0 +1,547 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["playwright"]
+# ///
+"""Drive a rendered diffview page in a headless browser and check the contract its
+readers depend on: context opens from the baked file with the right line numbers on
+both sides, survives a reload once served, takes comments like any hunk line, a
+note on a file outside the diff puts that file on the page, and a server that dies
+mid-review loses nothing typed.
+
+Run it directly; no framework. Uses the chromium build playwright keeps in its cache
+(`uv run --with playwright playwright install chromium` once, if it is missing).
+"""
+
+import json
+import os
+import queue
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+DIFFVIEW = Path(__file__).resolve().parent.parent / "bin" / "diffview"
+failures = 0
+
+
+def check(what: str, expected, actual) -> None:
+    global failures
+    if expected == actual:
+        print(f"ok   {what}")
+    else:
+        print(f"FAIL {what}\n       expected: {expected!r}\n       actual:   {actual!r}")
+        failures += 1
+
+
+def git(repo: Path, *args: str) -> None:
+    # a bare identity and no user config, so signing or hooks set up for real repos stay out of the fixture
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                   env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+                        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+
+def fixture(root: Path) -> Path:
+    """Two commits: an 80-line file, then one hunk that grows it by a line and one that does not."""
+    repo = root / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    lines = [f"line {n}" for n in range(1, 81)]
+    (repo / "a.txt").write_text("\n".join(lines) + "\n")
+    (repo / "b.txt").write_text("\n".join(f"other {n}" for n in range(1, 31)) + "\n")
+    git(repo, "add", "."); git(repo, "commit", "-qm", "base"); git(repo, "tag", "base")
+    lines[19] = "line 20 changed"
+    lines.insert(20, "line 20b inserted")
+    lines[60] = "line 60 changed"   # was line 60, shifted by the insert above
+    (repo / "a.txt").write_text("\n".join(lines) + "\n")
+    git(repo, "commit", "-qam", "change")
+    return repo
+
+
+class Watcher:
+    """A --watch process; its stdout lines are the clock the checks wait on."""
+
+    def __init__(self, spec: str, out: Path, *flags: str, env: dict | None = None):
+        self.proc = subprocess.Popen([str(DIFFVIEW), spec, "--watch", "-o", str(out), *flags],
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        self.lines: queue.Queue[str] = queue.Queue()
+        threading.Thread(target=lambda: [self.lines.put(line) for line in self.proc.stdout], daemon=True).start()
+        self.url = ""
+
+    def printed(self, word: str, seconds: float = 15) -> bool:
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                line = self.lines.get(timeout=left)
+            except queue.Empty:
+                break
+            if "live page at " in line:
+                self.url = line.split("live page at ")[1].split()[0]
+            if word in line:
+                return True
+        return False
+
+    def stop(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
+
+
+def watch_case(repo: Path, pages: Path) -> None:
+    """--watch starts on sources with no changes, and an untracked file then shows up as an added one."""
+    out = pages / f"watch-{os.getpid()}.html"
+    spec = f"{repo}@HEAD.."   # the fixture is clean at HEAD: nothing to show until a file appears
+    proc = subprocess.run([str(DIFFVIEW), spec, "--no-auto-summary", "-o", str(out)], capture_output=True, text=True)
+    check("without --watch an empty diff is refused", 1, proc.returncode)
+    check("and no page is written", False, out.exists())
+
+    w = Watcher(spec, out, "--no-auto-summary")
+    try:
+        check("--watch starts on an empty diff", True, w.printed("watching"))
+        check("the empty page is written", True, out.is_file() and '"files": []' in out.read_text())
+        nested = repo / "nested"   # an untracked repository inside the repo: listed by git as a directory, not a file
+        nested.mkdir()
+        git(nested, "init", "-q")
+        (nested / "inner.txt").write_text("theirs\n")
+        (repo / "c.txt").write_text("fresh\n")
+        check("an untracked file regenerates the page", True, w.printed("regenerated"))
+        page = out.read_text()
+        check("and is on it as an added file", True, '"path": "c.txt"' in page and '"status": "added"' in page)
+        check("a nested repository is neither shown nor an error", True, '"path": "nested' not in page and not w.printed("error", seconds=3))
+        status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True).stdout
+        check("the viewer left the index alone", "?? c.txt\n?? nested/\n", status)
+    finally:
+        w.stop()
+        (repo / "c.txt").unlink(missing_ok=True)
+        shutil.rmtree(repo / "nested", ignore_errors=True)
+
+
+def fork_case(root: Path, pages: Path) -> None:
+    """`A..` and `A...` against a working tree once A has moved on: only the three-dot form is the branch's own work."""
+    repo = root / "forked"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "shared.txt").write_text("v1\n")
+    git(repo, "add", "."); git(repo, "commit", "-qm", "base")
+    git(repo, "checkout", "-qb", "feature")
+    (repo / "mine.txt").write_text("committed on the branch\n")
+    git(repo, "add", "."); git(repo, "commit", "-qm", "branch work")
+    git(repo, "checkout", "-q", "main")   # main moves on without the branch
+    (repo / "shared.txt").write_text("v2\n")
+    (repo / "theirs.txt").write_text("landed on main later\n")
+    git(repo, "add", "."); git(repo, "commit", "-qm", "main moved")
+    git(repo, "checkout", "-q", "feature")
+    (repo / "edit.txt").write_text("uncommitted on the branch\n")
+
+    def files(spec: str) -> set[str]:
+        out = pages / f"fork-{os.getpid()}-{spec.count('.')}.html"
+        subprocess.run([str(DIFFVIEW), f"{repo}@{spec}", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
+        return {f["path"] for f in json.loads(out.read_text().split("const DATA = ", 1)[1].split(";\n", 1)[0])["sources"][0]["files"]}
+
+    check("main.. shows what main gained, reversed, as if it were the branch's", {"shared.txt", "theirs.txt", "mine.txt", "edit.txt"}, files("main.."))
+    check("main... shows the branch's commits and uncommitted edits only", {"mine.txt", "edit.txt"}, files("main..."))
+
+
+def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
+    """The summary records the diff it saw; ↻ says how far the diff has moved since and has it written again."""
+    shim = root / "shim"   # stands in for `claude -p`: prints what the mode file says, or fails when it says fail
+    shim.mkdir()
+    mode = root / "summary-mode"
+    mode.write_text("summary one")
+    (shim / "claude").write_text('#!/usr/bin/env bash\nm=$(cat "$MODE_FILE")\n'
+                                 'case "$m" in fail) echo shim refused >&2; exit 1;; slow*) sleep 4; m=${m#slow };; esac\n'
+                                 'cat >/dev/null\necho "$m"\n')
+    (shim / "claude").chmod(0o755)
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "MODE_FILE": str(mode)}
+    out = pages / f"rewrite-{os.getpid()}.html"
+    sidecar = Path(str(out) + ".summary.json")
+    original = (repo / "a.txt").read_text()
+
+    def landed() -> dict:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                return json.loads(sidecar.read_text())
+            except (OSError, ValueError):
+                time.sleep(0.2)
+        return {}
+
+    mode.write_text("fail")   # the first attempt fails: the state that most needs a way to ask again
+    w = Watcher(f"{repo}@base..", out, env=env)
+    title = lambda: page.locator(".summary .rewrite").get_attribute("title")
+    try:
+        check("a watch with a summary starts", True, w.printed("watching"))
+        with urllib.request.urlopen(w.url + ".health", timeout=5) as r:   # the watcher answers the page's heartbeat too
+            check("the watcher answers a heartbeat", str(pages), json.loads(r.read())["root"])
+        failed = landed()
+        check("a failed first summary lands as its reason", ("", True), (failed.get("summary"), bool(failed.get("error"))))
+        page = browser.new_page()
+        page.goto(w.url + out.name)
+        check("a watched page carries the command that started its watcher", True,
+              page.evaluate("DATA.restart").startswith(f"diffview {repo}@base.. --watch -o "))
+        page.wait_for_selector(".summary .rewrite.stale")
+        check("and the page offers to try again", True, "try again" in title())
+        mode.write_text("summary one")
+        page.click(".summary .rewrite")
+        check("↻ has the watcher try again", True, w.printed("summary rewritten", 20))
+        first = landed()
+        check("the summary records the diff it was written for", ("summary one", 3, 2),
+              (first.get("summary"), first.get("for", {}).get("adds"), first.get("for", {}).get("dels")))
+        page.wait_for_selector(".summary .rewrite:not(.stale)")
+        check("↻ on a fresh summary says it is current", True, "for this diff" in title())
+        (repo / "a.txt").write_text(original + "line 81 appended\n")
+        check("more changes regenerate the page", True, w.printed("regenerated"))
+        page.reload()
+        page.wait_for_selector(".summary .rewrite.stale")
+        check("↻ then says how far the diff has moved", True, "the diff is now +4 −2" in title())
+        mode.write_text("slow summary two")   # the model takes a while, and the tree moves on meanwhile
+        page.click(".summary .rewrite")
+        time.sleep(2.5)   # past the watcher's 2 s tick, so the sources are read and the model is "writing"
+        (repo / "a.txt").write_text(original + "line 81 appended\nline 82 appended\n")
+        check("↻ has the watcher write the summary again", True, w.printed("summary rewritten", 20))
+        second = landed()
+        check("the new summary records the diff the model saw, not the one after it", ("summary two", 4), (second.get("summary"), second.get("for", {}).get("adds")))
+        page.wait_for_selector(".summary .rewrite.stale")
+        check("so the page knows the diff moved on during the call", True, "the diff is now +5 −2" in title())
+        check("and shows the new summary", True, "summary two" in page.locator(".summary").inner_text())
+        mode.write_text("fail")
+        page.click(".summary .rewrite")
+        check("a failed rewrite is reported", True, w.printed("not rewritten", 20))
+        third = landed()
+        check("and keeps the old summary, its record and the reason", ("summary two", 4, True),
+              (third.get("summary"), third.get("for", {}).get("adds"), bool(third.get("error"))))
+        page.wait_for_selector(".summary .rewrite")
+        check("the page still shows the old summary", True, "summary two" in page.locator(".summary").inner_text())
+        page.close()
+    finally:
+        w.stop()
+        (repo / "a.txt").write_text(original)
+        for p in pages.glob(f"{out.stem}*"):
+            p.unlink()
+
+
+def outage_case(repo: Path, pages: Path, browser) -> None:
+    """The server dies mid-review: the page says so, keeps what is typed in the browser, and lands it
+    all once a server is back; a file that changed meanwhile is put to the reviewer, never overwritten."""
+    out = pages / f"outage-{os.getpid()}.html"
+    state = Path(str(out) + ".state.json")
+    subprocess.run([str(DIFFVIEW), f"{repo}@base..HEAD", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
+    marker = pages / ".serve.json"
+    served = lambda: json.loads(marker.read_text())
+    on_disk = lambda: [c["text"] for c in json.loads(state.read_text())["comments"]] if state.is_file() else []
+
+    def wait_for(cond, seconds: float = 10) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not cond():
+            time.sleep(0.2)
+        return cond()
+
+    def stop() -> None:
+        pid = served()["pid"]
+        os.kill(pid, signal.SIGTERM)
+        wait_for(lambda: "pid" not in served())
+
+    def restart() -> None:
+        subprocess.run([str(DIFFVIEW), "--serve", str(pages)], check=True, capture_output=True)
+
+    port = served()["port"]
+    context = browser.new_context()   # one context: the local copy lives in it, as it does in a real browser profile
+    page = context.new_page()
+    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.wait_for_selector("tbody.hunk")
+
+    def comment(text: str, line: int) -> None:
+        page.locator(f'tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="{line}"]').click()
+        page.keyboard.type(text)
+        page.keyboard.press("Control+Enter")
+
+    comment("saved while the server lived", 20)
+    check("a comment lands while the server is up", True, wait_for(lambda: on_disk() == ["saved while the server lived"]))
+    stop()
+    comment("typed while it was gone", 21)
+    page.wait_for_selector(".savefail")
+    check("the next save raises the warning", True, "not saving" in page.locator(".savefail").inner_text())
+    check("with the restart command", f"diffview --serve {pages}", page.locator(".savefail code").first.inner_text())
+    check("and the file did not get it", ["saved while the server lived"], on_disk())
+    restart()
+    check("a restarted server gets what was typed meanwhile", True,
+          wait_for(lambda: on_disk() == ["saved while the server lived", "typed while it was gone"]))
+    check("and the warning clears", True, wait_for(lambda: page.locator(".savefail").count() == 0))
+    page.reload()
+    page.wait_for_selector("tbody.hunk")
+    check("a reload shows both, with no warning", (2, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
+
+    # the server dies again, a comment is typed, and the tab goes away as a discarded one would;
+    # the file is then changed by hand, and a tab opened after that holds the local copy: the
+    # reviewer picks which survives, and nothing is overwritten on its own
+    stop()
+    comment("typed during the second outage", 22)
+    page.wait_for_selector(".savefail")
+    page.close()
+    held = json.loads(state.read_text())
+    held["comments"].append({**held["comments"][0], "id": 9, "text": "restored by hand"})
+    held.update(savedAt=held["savedAt"] + 1, writer="hand")
+    state.write_text(json.dumps(held))
+    restart()
+    page = context.new_page()
+    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.wait_for_selector(".savefail button")
+    check("a fresh tab shows the local copy, and says the file moved on", (3, True),
+          (page.locator(".cbox .ctext").count(), "another page saved" in page.locator(".savefail").inner_text()))
+    check("while the file still holds the hand edit", True, "restored by hand" in on_disk())
+    page.locator(".savefail button", has_text="keep this page").click()
+    check("keeping this page lands the local copy over the hand edit", True, wait_for(lambda: on_disk() == [
+        "saved while the server lived", "typed while it was gone", "typed during the second outage"]))
+    page.reload()   # at once: the file holds the write before the page hears so, and must not be asked about it again
+    page.wait_for_selector("tbody.hunk")
+    check("and the next reload reads the file, quietly", (3, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
+
+    # the same again, and this time the reviewer takes the file: the local copy is given up,
+    # and the reload that follows reads the file without asking again
+    stop()
+    comment("typed during the third outage", 23)
+    page.wait_for_selector(".savefail")
+    page.close()
+    held = json.loads(state.read_text())
+    held["comments"].append({**held["comments"][0], "id": 9, "text": "restored by hand again"})
+    held.update(savedAt=held["savedAt"] + 1, writer="hand")
+    state.write_text(json.dumps(held))
+    restart()
+    page = context.new_page()
+    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.wait_for_selector(".savefail button")
+    with page.expect_navigation():
+        page.locator(".savefail button", has_text="take theirs").click()
+    page.wait_for_selector("tbody.hunk")
+    check("taking theirs reads the file, drops the local copy, and asks nothing more", (4, 0, None),
+          (page.locator(".cbox .ctext").count(), page.locator(".savefail").count(), page.evaluate("localStorage.getItem(LOCAL_KEY)")))
+    check("and the file keeps the hand edit", True, "restored by hand again" in on_disk())
+    context.close()
+
+
+def heartbeat_case(url: str, browser) -> None:
+    """An open page beats once a minute, so its server counts it as open; the clock is faked so a minute takes no time."""
+    page = browser.new_page()
+    beats: list[str] = []
+    page.on("request", lambda r: beats.append(r.url) if r.url.endswith("/.health") else None)
+    page.clock.install()
+    page.goto(url)
+    page.wait_for_selector("tbody.hunk")
+    page.clock.run_for(61_000)
+    page.wait_for_timeout(200)
+    check("a page beats within a minute of opening", 1, len(beats))
+    page.clock.run_for(60_000)
+    page.wait_for_timeout(200)
+    check("and once a minute from then on", 2, len(beats))
+    page.close()
+
+
+def main() -> int:
+    root = Path(tempfile.mkdtemp(prefix="diffview-test-"))
+    repo = fixture(root)
+    pages = Path.home() / "Downloads" / "diffview" / "test"   # the served tree must sit below home, not at it
+    pages.mkdir(parents=True, exist_ok=True)
+    out = pages / f"page-{os.getpid()}.html"
+    notes = root / "notes.json"
+    (root / "outside.txt").write_text("not yours\n")
+    notes.write_text(json.dumps({"notes": [
+        {"id": 1, "path": "b.txt", "line": 5, "end": 6, "text": "read this, left it alone"},
+        {"id": 2, "path": "nowhere.txt", "text": "no such file"},
+        {"id": 3, "path": "../outside.txt", "text": "a note must not reach outside the source"},
+    ]}))
+    # `base..` compares against the working tree, so file content comes off the disk: the path
+    # the notes can point anywhere with, and the one a rebuild under --watch reads
+    render = [str(DIFFVIEW), f"{repo}@base..", "--notes", str(notes), "--no-auto-summary", "-o", str(out)]
+    proc = subprocess.run(render, capture_output=True, text=True)
+    check("render exits 0", 0, proc.returncode)
+    check("a note on a missing file is reported, not silently dropped", True, "nowhere.txt" in proc.stderr)
+    check("a note path outside the source is refused the same way", True, "outside.txt" in proc.stderr)
+    check("the file count names changed files only", True, "(1 files," in proc.stdout)
+    check("nothing outside the source got baked in", False, "not yours" in out.read_text())
+
+    watch_case(repo, pages)
+    fork_case(root, pages)
+
+    serve = subprocess.run([str(DIFFVIEW), "--serve", str(pages)], capture_output=True, text=True)
+    url = serve.stdout.split(" at ")[-1].split()[0].rstrip("/") + "/" + out.name
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(viewport={"width": 1280, "height": 2400},   # tall: every hunk fits, so j/k only move
+                                    permissions=["clipboard-read", "clipboard-write"])
+            page.on("dialog", lambda d: d.dismiss())
+            page.goto(url)
+            page.wait_for_selector("tbody.hunk")
+            gaps = lambda: page.locator('.fcard[data-key="0:a.txt"] tr.gap td').evaluate_all("tds => tds.map(td => td.firstChild.textContent)")
+            hunk_nos = lambda hi, side: [int(t) for t in page.locator(f'tbody.hunk[data-key="0:a.txt"][data-hi="{hi}"] td.no[data-side="{side}"][data-no]').all_inner_texts()]
+            original = ["⋯ 16 unchanged lines", "⋯ 33 unchanged lines", "⋯ 17 unchanged lines"]
+            check("gaps before, between and after the hunks", original, gaps())
+            check("no toast on load", "", page.locator("#toast").inner_text())
+            page.wait_for_timeout(50)
+            check("before any scroll, the first file is the current one in the tree", ["0:a.txt"], page.locator(".tree-file.current").evaluate_all("els => els.map(e => e.dataset.key)"))
+            check("and its header names its first hunk", "hunk 1/2 · @@ −17 +17 line 16", page.locator('.fcard[data-key="0:a.txt"] .fhead .pos').inner_text())
+
+            header = lambda hi: page.locator(f'tbody.hunk[data-key="0:a.txt"][data-hi="{hi}"] tr.hunkhdr').inner_text()
+            check("the hunk header is git's, function context included", "@@ −17 +17  line 16", header(0))
+            page.keyboard.press("j")          # focus hunk 0
+            page.keyboard.press("[")          # 20 above, but only 16 exist
+            check("[ opens the whole leading gap when it is under 20 lines", 1, hunk_nos(0, "new")[0])
+            check("leading gap row is gone", 2, len(gaps()))
+            check("a widened hunk keeps the name git gave it", "@@ −17 +17  line 16", header(0))
+            check("lines before the first hunk carry equal old and new numbers", hunk_nos(0, "old")[:16], hunk_nos(0, "new")[:16])
+
+            page.keyboard.press("]")          # 20 below hunk 0, into the middle gap
+            check("] appends 20 lines to the focused hunk", 24 + 20, hunk_nos(0, "new")[-1])
+            check("lines after a hunk that grew by one are offset by one on the old side", hunk_nos(0, "new")[-1] - 1, hunk_nos(0, "old")[-1])
+            check("the middle gap shrank by 20", "⋯ 13 unchanged lines", gaps()[0])
+
+            page.keyboard.press("j")          # focus hunk 1
+            page.keyboard.press("{")          # the rest of the middle gap, into hunk 1
+            check("{ opens the whole gap above", 45, hunk_nos(1, "new")[0])
+            check("only the trailing gap is left", 1, len(gaps()))
+
+            page.keyboard.press("F")
+            check("F opens every gap in the file", 0, len(gaps()))
+            check("F reaches the last line of the file", 81, hunk_nos(1, "new")[-1])
+            page.keyboard.press("F")
+            check("F again folds back to what [ ] { had opened, not further", ["⋯ 17 unchanged lines"], gaps())
+
+            page.wait_for_timeout(300)                            # the state POST is fire-and-forget
+            # a --watch rebuild bakes the saved state back into the page, then the page reloads
+            subprocess.run(render, check=True, capture_output=True)
+            page.reload()
+            page.wait_for_selector("tbody.hunk")
+            check("expansion survives a rebuild and reload", ["⋯ 17 unchanged lines"], gaps())
+            check("expanded lines still carry the right numbers after the round trip", 1, hunk_nos(0, "new")[0])
+
+            page.locator('tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="3"]').click()
+            page.keyboard.type("comment on an expanded line")
+            page.keyboard.press("Control+Enter")
+            md = page.evaluate("commentsMarkdown()")
+            check("a comment on an expanded line exports with its line and text", True, "new line 3" in md and "  line 3" in md)
+            raw = page.evaluate("diffText(false)")
+            check("y copies a patch with git's file and hunk headers", ["diff --git a/a.txt b/a.txt", "--- a/a.txt", "+++ b/a.txt", "@@ -1,43 +1,44 @@ line 16"], raw.splitlines()[:4])
+            check("a hunk widened on the page is counted as shown", True, "@@ -44,20 +45,20 @@ line 56" in raw)
+            check("the untouched file is not part of the plain diff", False, "b.txt" in raw)
+            (root / "copied.patch").write_text(raw)
+            applies = subprocess.run(["git", "-C", str(repo), "apply", "--check", "-R", str(root / "copied.patch")], capture_output=True, text=True)
+            check("and git applies it (in reverse, onto the tree it describes)", "", applies.stderr.strip())
+            ann = page.evaluate("diffText(true)")
+            check("Y puts the comment under its line", True, " line 3\n## C1 · reviewer · new L3\n#  comment on an expanded line\n line 4\n" in ann)
+            check("and an untouched file with a note on it, the note under the note's last line", True,
+                  "diff --git a/b.txt b/b.txt\n# untouched" in ann and " other 6\n## A1 · agent · new L5–6\n#  read this, left it alone\n other 7\n" in ann)
+            page.keyboard.press("a")
+            check("notes hidden with a stay out, and take the untouched file with them", False, "b.txt" in page.evaluate("diffText(true)"))
+            page.keyboard.press("a")
+            page.keyboard.press("y")
+            page.wait_for_timeout(100)
+            check("y says it copied", "copied ✓", page.locator("#diff-btn").inner_text())
+            check("and the clipboard holds the patch", raw, page.evaluate("navigator.clipboard.readText()"))
+            # an added and a deleted file: without their mode lines git reads /dev/null as a path and the patch fails
+            (repo / "c.txt").write_text("fresh\n")
+            (repo / "b.txt").unlink()
+            churn = root / "churn.html"
+            subprocess.run([str(DIFFVIEW), f"{repo}@HEAD..", "--no-auto-summary", "-o", str(churn)], check=True, capture_output=True)
+            other = browser.new_page()
+            other.goto(f"file://{churn}")
+            other.wait_for_selector("tbody.hunk")
+            churned = other.evaluate("diffText(false)")
+            other.close()
+            check("added and deleted files carry their mode lines", True,
+                  "new file mode 100644\n--- /dev/null\n+++ b/c.txt\n" in churned and "deleted file mode 100644\n--- a/b.txt\n+++ /dev/null\n" in churned)
+            (root / "churn.patch").write_text(churned)
+            applies = subprocess.run(["git", "-C", str(repo), "apply", "--check", "-R", str(root / "churn.patch")], capture_output=True, text=True)
+            check("and git applies that patch too", "", applies.stderr.strip())
+            (repo / "c.txt").unlink()
+            git(repo, "checkout", "--", "b.txt")
+            page.wait_for_timeout(300)
+            page.reload()                     # no rebuild this time: the page must read its own state file
+            page.wait_for_selector("tbody.hunk")
+            check("a plain reload of a served page keeps the comment typed since the last render", 1, page.locator(".cbox .ctext", has_text="comment on an expanded line").count())
+
+            check("the untouched file is on the page as its own card", 1, page.locator('.fcard[data-key="0:b.txt"] .st.untouched').count())
+            check("the untouched card opens at the noted lines plus 3", "L2", page.locator('.fcard[data-key="0:b.txt"] tr.hunkhdr').first.inner_text())
+            check("the note anchors inside the untouched card", 1, page.locator('.fcard[data-key="0:b.txt"] .abox').count())
+            check("the untouched card does not count as a file", "1 files", page.locator(".top .dim").first.inner_text())
+            check("the untouched card has no old side to comment on", 0, page.locator('.fcard[data-key="0:b.txt"] td.no[data-side="old"][data-no]').count())
+            check("the untouched card has no viewed box", 0, page.locator('.fcard[data-key="0:b.txt"] .fhead input').count())
+            page.locator('.fcard[data-key="0:b.txt"] tr.gap button', has_text="⇕").last.click()
+            check("⇕ on the untouched card reaches the end of the file", 30, int(page.locator('.fcard[data-key="0:b.txt"] td.no[data-side="new"][data-no]').last.inner_text()))
+
+            # a hunk taller than the screen: j lands on its top, pages through it, then moves on
+            page.set_viewport_size({"width": 1280, "height": 500})
+            page.keyboard.press("F")          # every gap open: a.txt is two tall hunks
+            page.keyboard.press("g"); page.keyboard.press("g")
+            page.keyboard.press("j")
+            focused = lambda: page.evaluate("S.focus")
+            top = lambda: page.evaluate('hunkTbody("0:a.txt", 0).getBoundingClientRect().top - stickyHeight(hunkTbody("0:a.txt", 0))')
+            check("j lands a tall hunk with its first line under the sticky headers", True, focused() == 0 and abs(top()) < 2)
+            y0 = page.evaluate("scrollY")
+            page.keyboard.press("j")
+            check("j inside a tall hunk pages down and keeps the focus", True, focused() == 0 and page.evaluate("scrollY") > y0 + 200)
+            page.keyboard.press("k")
+            check("k pages back up rather than leaving the hunk", True, focused() == 0 and page.evaluate("scrollY") == y0)
+            presses = 0
+            while focused() == 0 and presses < 12:
+                page.keyboard.press("j"); presses += 1
+            check("j moves on once the hunk's bottom has been on screen", True, focused() == 1 and 2 <= presses <= 6)
+
+            # where am I: the sticky file header names the hunk under it, the tree marks the file
+            pos = lambda: page.locator('.fcard[data-key="0:a.txt"] .fhead .pos').inner_text()
+            check("the file header names the hunk under it", "hunk 2/2 · @@ −57 +58 line 56", pos())
+            check("the tree marks the file under the header", ["0:a.txt"], page.locator(".tree-file.current").evaluate_all("els => els.map(e => e.dataset.key)"))
+            page.keyboard.press("k")          # pages up inside hunk 1 until its top shows, then lands on hunk 0
+            while focused() == 1:
+                page.keyboard.press("k")
+            page.wait_for_timeout(50)         # the spy runs on the next frame
+            check("the header follows the keyboard back to hunk 1/2", "hunk 1/2 · @@ −17 +17 line 16", pos())
+            page.mouse.wheel(0, 100000)       # to the bottom by mouse: b.txt is now under the header
+            page.wait_for_timeout(100)
+            check("the tree follows the mouse wheel, not the keyboard focus", ["0:b.txt"], page.locator(".tree-file.current").evaluate_all("els => els.map(e => e.dataset.key)"))
+            # a narrow window: the bar wraps and what sticks below it follows its measured height; the tree hides, b slides it over
+            page.set_viewport_size({"width": 700, "height": 700})
+            page.reload()
+            page.wait_for_selector("tbody.hunk")
+            page.wait_for_timeout(200)
+            no_side = lambda: page.evaluate("document.body.classList.contains('no-side')")
+            check("a narrow window starts unified and without the tree", (False, True), (page.evaluate("S.split"), no_side()))
+            check("the bar wrapped onto more rows", True, page.evaluate("document.querySelector('.top').offsetHeight") > 60)
+            check("and the sticky offset follows its height", page.evaluate("document.querySelector('.top').offsetHeight + 'px'"),
+                  page.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--topbar-h').trim()"))
+            page.keyboard.press("b")
+            page.wait_for_timeout(100)
+            check("b slides the tree over the diff", ("fixed", False), (page.evaluate("getComputedStyle(document.querySelector('.side')).position"), no_side()))
+            page.locator('.tree-file[data-key="0:a.txt"]').click()
+            page.wait_for_timeout(100)
+            check("picking a file closes it again", True, no_side())
+            page.keyboard.press("b")
+            page.keyboard.press("n")           # to the note on b.txt, which the tree would otherwise cover
+            check("so does going to an annotation", (True, "note"), (no_side(), page.evaluate("S.ann && S.ann.kind")))
+            page.keyboard.press("b")
+            page.keyboard.press("Escape")
+            check("Esc closes the tree first, the annotation focus stays", (True, "note"), (no_side(), page.evaluate("S.ann && S.ann.kind")))
+            check("no toast from the resize", "", page.locator("#toast").inner_text())
+            heartbeat_case(url, browser)
+            outage_case(repo, pages, browser)
+            rewrite_case(root, repo, pages, browser)
+            browser.close()
+    finally:
+        try:
+            os.kill(json.loads((pages / ".serve.json").read_text())["pid"], signal.SIGTERM)
+        except (OSError, ValueError, KeyError):
+            pass
+        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*")]:
+            p.unlink()
+        shutil.rmtree(root, ignore_errors=True)
+    print(f"\n{failures} failure(s)")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
