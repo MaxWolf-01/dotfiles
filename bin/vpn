@@ -12,7 +12,9 @@ Tailscale's automatic mode (auto:any) ranks exit nodes by latency and nothing el
 
 Every command that moves the exit node checks the node against Discord's API with a Chrome user agent before keeping it, and `vpn watch` keeps checking. A site that blocks one node for its own reasons (YouTube does, for some Mullvad IPs) is not checked for: `vpn next` is the way off such a node.
 
-Where `vpn next` and the watcher's recovery go: the nodes after the current one in its city, by name and wrapping around, then the rest of its country, then Germany, Austria, Switzerland and the Netherlands. Nodes reporting themselves offline are skipped, and a move tries at most 8 nodes. A recovery keeps the exit node pinned; `vpn on` returns to automatic mode.
+Where `vpn next` goes: the nodes after the current one in its city, by name and wrapping around, then the rest of its country, then Germany, Austria, Switzerland and the Netherlands, skipping nodes that report themselves offline. It tries at most 8 of them. When none works, it undoes itself: the exit node goes back to what it was before the command, whether that was a pinned node, automatic mode or off.
+
+When the watcher has to leave a node, it turns on automatic mode, as `vpn on` does. Only when Cloudflare also blocks Tailscale's pick does it try the nodes next to that pick, in the order above, and pin the first clean one. When none of those works, it stays on automatic mode and tries again 5 minutes later.
 
 Every change a vpn command makes, and every change the watcher sees anything else make, is one line in ~/logs/runs/vpn.jsonl (bin/run-log). The watcher also writes an hourly heartbeat to ~/logs/runs/vpn-watch.jsonl.
 
@@ -63,9 +65,9 @@ EGRESS = ("am.i.mullvad.net", "/json")
 
 FALLBACK_COUNTRIES = ("Germany", "Austria", "Switzerland", "Netherlands")
 MAX_TRIES = 8
-"""Nodes a single move tries before it gives up."""
+"""Nodes a single walk tries before it gives up."""
 SILENT_LIMIT = 2
-"""Nodes in a row that carry no traffic before a move concludes the network is down, not the nodes."""
+"""Nodes in a row that carry no traffic before a walk stops: the network is down, not the nodes."""
 CONFIRM_SECS = 45
 """Wait before the second check that confirms a 403.
 
@@ -76,9 +78,9 @@ triggers its re-login prompts.
 RECHECK_SECS = 600
 """How often the watcher re-checks an unchanged node while Vesktop runs; catches a reputation flipping in place."""
 FALLBACK_SECS = 15
-"""Longest the watcher goes without looking while the event bus cannot tell it
+"""Longest the watcher goes without looking when the event bus cannot tell it
 what it needs: the bus is down, or an exit node is set while Vesktop is closed,
-and Vesktop opening sends nothing on the bus."""
+and Vesktop starting is nothing tailscaled knows about."""
 HEARTBEAT_SECS = 3600
 BACKOFF_SECS = 300
 """Pause after a recovery that did not leave a working node."""
@@ -307,7 +309,7 @@ NOWHERE = "?"
 
 def landed(stats: dict) -> str | None:
     """The node a vpn line left the exit node on: a name, None for no exit node,
-    ANYWHERE when it left the exit node wherever automatic mode or a put-back
+    ANYWHERE when it left the exit node wherever automatic mode or an undo
     left it, and NOWHERE for an event this does not know, which accounts for no
     change at all."""
     event = stats.get("event")
@@ -551,9 +553,8 @@ class Walked:
     """How many of the nodes tried carried traffic. None did means the network is down."""
 
 
-def walk(options: list[Node], discord: bool = True) -> Walked:
-    """Pin the first of `options` that carries traffic and, when `discord`, that
-    Cloudflare does not block.
+def walk(options: list[Node]) -> Walked:
+    """Pin the first of `options` that carries traffic and that Cloudflare does not block.
 
     A Discord check that got no answer says nothing about the node, so a node
     that carries traffic is kept then. SILENT_LIMIT nodes in a row that carry no
@@ -572,8 +573,6 @@ def walk(options: list[Node], discord: bool = True) -> Walked:
             continue
         silent = 0
         carried += 1
-        if not discord:
-            return Walked(node, tried, carried)
         result = check()
         if result == "blocked":
             print(f"  {node.name}: Cloudflare blocks it too")
@@ -584,9 +583,40 @@ def walk(options: list[Node], discord: bool = True) -> Walked:
     return Walked(None, tried, carried)
 
 
-def restore(prefs: dict | None, nodes: list[Node]) -> None:
-    """Put the exit node back the way `prefs` had it. A pinned node outside
-    Mullvad cannot be named back, and gets automatic mode instead."""
+@dataclass(frozen=True)
+class Automatic:
+    picked: str
+    """The node automatic mode picked; empty when no traffic came through it."""
+    verdict: Verdict | None
+    """The Discord check on the pick; None when it was not run."""
+    walked: Walked | None
+    """The walk off a pick Cloudflare blocks; None when no walk was needed."""
+
+
+def automatic(discord: bool) -> Automatic:
+    """Turn on automatic mode and, when `discord`, check Tailscale's pick.
+
+    When Cloudflare blocks the pick, walk the nodes next to it and pin the first
+    clean one; when none is, go back to automatic mode.
+    """
+    set_exit_node("auto:any")
+    if not settle(None):
+        return Automatic("", None, None)
+    picked = egress_node()
+    result = check_confirmed() if discord else None
+    if result != "blocked":
+        return Automatic(picked, result, None)
+    print(f"Tailscale picked {picked} and Cloudflare blocks it — trying nodes next to it")
+    nodes = mullvad_nodes(full_status() or {})
+    walked = walk(candidates(next((n for n in nodes if n.name == picked), None), nodes))
+    if walked.node is None:
+        set_exit_node("auto:any")
+    return Automatic(picked, result, walked)
+
+
+def undo(prefs: dict | None, nodes: list[Node]) -> None:
+    """Put the exit node back the way `prefs` had it before a command started.
+    A pinned node outside Mullvad cannot be named back, and gets automatic mode instead."""
     how = mode(prefs)
     if how == "off":
         set_exit_node("")
@@ -596,17 +626,17 @@ def restore(prefs: dict | None, nodes: list[Node]) -> None:
 
 
 def move(options: list[Node], command: Command, start: Node | None, nodes: list[Node]) -> Node:
-    """Pin the first usable node of `options`, or put the exit node back and fail."""
+    """Pin the first usable node of `options`, or undo the move and fail."""
     if not options:
         raise VpnError("no online node to move to")
     prefs = local_api("prefs")
     walked = walk(options)
     if walked.node is None:
-        restore(prefs, nodes)
+        undo(prefs, nodes)
         if walked.carried:
-            event, reason = "exhausted", f"none of the {walked.tried} nodes tried passed the Discord check; the exit node was put back"
+            event, reason = "exhausted", f"none of the {walked.tried} nodes tried passed the Discord check; the exit node is back to what it was"
         else:
-            event, reason = "unreachable", f"none of the {walked.tried} nodes tried carried traffic — network trouble; the exit node was put back"
+            event, reason = "unreachable", f"none of the {walked.tried} nodes tried carried traffic — network trouble; the exit node is back to what it was"
         log_node("fail", event, command, start.name if start else None, None, walked.tried, reason)
         raise VpnError(reason)
     log_node("ok", "pinned", command, start.name if start else None, walked.node.name, walked.tried)
@@ -615,34 +645,39 @@ def move(options: list[Node], command: Command, start: Node | None, nodes: list[
 
 
 def recover(cause: Cause) -> Node | None:
-    """Move the exit node off a node that is blocked or stopped carrying traffic.
+    """Move the exit node off a node that is blocked or stopped carrying traffic,
+    by turning on automatic mode (see `automatic`).
 
-    Stays pinned: the walk starts next to the node being left, the way `vpn next`
-    does, and skips the Discord check while Vesktop is closed. When no node tried
-    carries traffic the network is down, not the node, and the exit node goes
-    back where it was. Only when nodes carry traffic but none passes does it
-    fall back to automatic mode, which beats a dead pinned node.
+    The Discord check is skipped while Vesktop is closed. Whatever does not end
+    on a working node is logged, and the watcher pauses for BACKOFF_SECS.
+    Returns the node the exit node is left on when the Discord check passed on it.
     """
+    vesktop = vesktop_running()
     try:
         with node_lock():
-            status = full_status()
-            start = current_node(status)
+            start = current_node(full_status())
             if start is None:
                 print("the exit node is not a Mullvad node tailscaled lists; leaving it alone")
                 return None
             print(f"moving off {start.name}: {'Cloudflare blocks it' if cause == 'blocked' else 'it stopped carrying traffic'}")
-            walked = walk(candidates(start, mullvad_nodes(status or {})), discord=vesktop_running())
-            if walked.node is not None:
-                log_node("ok", "rotated" if cause == "blocked" else "offline", "watch", start.name, walked.node.name, walked.tried)
+            result = automatic(discord=vesktop)
+            event: Event = "rotated" if cause == "blocked" else "offline"
+            walked = result.walked
+            if not result.picked:
+                reason = f"left {start.name} for automatic mode, and no traffic came through it — the network is down"
+                log_node("fail", "unreachable", "watch", start.name, None, 0, reason)
+            elif walked is None:
+                log_node("ok", event, "watch", start.name, result.picked)
+                print(f"on automatic mode: {result.picked}")
+                return current_node(full_status()) if result.verdict == "clean" else None
+            elif walked.node is not None:
+                log_node("ok", event, "watch", start.name, walked.node.name, walked.tried)
                 print(f"pinned: {walked.node.name}")
                 return walked.node
-            if walked.carried:
-                set_exit_node("auto:any")
-                event, reason = "exhausted", f"left {start.name} ({cause}) and none of {walked.tried} nodes tried worked; back on automatic mode"
             else:
-                set_exit_node(start.fqdn)
-                event, reason = "unreachable", f"none of the {walked.tried} nodes tried carried traffic — the network is down, not {start.name}; put back on it"
-            log_node("fail", event, "watch", start.name, None, walked.tried, reason)
+                reason = (f"left {start.name}; Cloudflare blocks automatic mode's pick {result.picked} and none of the "
+                          f"{walked.tried} nodes tried next to it worked; left on automatic mode")
+                log_node("fail", "exhausted" if walked.carried else "unreachable", "watch", start.name, None, walked.tried, reason)
             print(reason)
     except VpnError as e:
         print(f"recovery failed: {e}")
@@ -701,7 +736,7 @@ def look(w: Watch, now: float, bus_up: bool) -> float:
         return wait_until_due(w, now, vesktop, bus_up, state)
 
     if state.online is False:
-        recovered(w, recover("offline"), vesktop)
+        recovered(w, recover("offline"))
         return FALLBACK_SECS
 
     if vesktop and (state.id != w.verified_id or now - w.last_check >= RECHECK_SECS):
@@ -712,7 +747,7 @@ def look(w: Watch, now: float, bus_up: bool) -> float:
         elif exit_state(peerless_status()).id != state.id:
             return 1.0  # the node changed during the check, so the verdict is about a node no longer in use
         elif result == "blocked" or not egress_node():
-            recovered(w, recover("blocked" if result == "blocked" else "offline"), vesktop)
+            recovered(w, recover("blocked" if result == "blocked" else "offline"))
             return FALLBACK_SECS
         else:
             print("Discord did not answer but egress is fine — not a node problem, staying")
@@ -720,9 +755,9 @@ def look(w: Watch, now: float, bus_up: bool) -> float:
     return wait_until_due(w, now, vesktop, bus_up, state)
 
 
-def recovered(w: Watch, node: Node | None, vesktop: bool) -> None:
-    """Remember a recovery's node as checked, when the recovery ran the Discord check on it."""
-    if node is not None and vesktop:
+def recovered(w: Watch, node: Node | None) -> None:
+    """Remember the node a recovery checked clean."""
+    if node is not None:
         w.verified_id, w.last_check = node.id, time.time()
 
 
@@ -779,39 +814,34 @@ def on() -> None:
     """Turn on automatic mode, then run the Discord check.
 
     When Cloudflare blocks the node Tailscale picked (confirmed after a second
-    check), walk the nodes next to it and pin the first clean one.
+    check), try the nodes next to it and pin the first clean one. When none of
+    the 8 tried works, it stays on automatic mode and fails.
     """
     with node_lock():
         before = current_node(full_status())
-        set_exit_node("auto:any")
-        if not settle(None):
+        result = automatic(discord=True)
+        if not result.picked:
             reason = "egress never reached Mullvad — tailscale down, or a captive portal"
             log_node("fail", "unreachable", "on", reason=reason)
             raise VpnError(f"{reason} (portal: run `portal`)")
-        picked = egress_node()
-        result = check_confirmed()
-        if result == "clean":
-            if before is not None and before.name == picked:
-                log_node("ok", "clean", "on", picked)
+        walked = result.walked
+        if walked is None and result.verdict == "unreachable":
+            reason = f"the Discord check got no answer through {result.picked} — network trouble, not a blocked node"
+            log_node("skip", "canary-unreachable", "on", result.picked, reason=reason)
+            raise VpnError(reason)
+        if walked is None:
+            if before is not None and before.name == result.picked:
+                log_node("ok", "clean", "on", result.picked)
             else:
-                log_node("ok", "clean", "on", before.name if before else None, picked)
-            print(f"exit node: {picked} (automatic, Discord check clean)")
+                log_node("ok", "clean", "on", before.name if before else None, result.picked)
+            print(f"exit node: {result.picked} (automatic, Discord check clean)")
             return
-        if result == "unreachable":
-            reason = f"the Discord check got no answer through {picked} — network trouble, not a blocked node"
-            log_node("skip", "canary-unreachable", "on", picked, reason=reason)
-            raise VpnError(reason)
-
-        print(f"Tailscale picked {picked} and Cloudflare blocks it — trying nodes next to it")
-        nodes = mullvad_nodes(full_status() or {})
-        start = next((n for n in nodes if n.name == picked), None)
-        walked = walk(candidates(start, nodes))
         if walked.node is None:
-            set_exit_node("auto:any")
-            reason = f"Cloudflare blocks {picked} and none of the {walked.tried} nodes tried worked; left on automatic mode, so Discord and other Electron apps stay broken"
-            log_node("fail", "exhausted", "on", picked, None, walked.tried, reason)
+            reason = (f"Cloudflare blocks {result.picked} and none of the {walked.tried} nodes tried next to it worked; "
+                      f"left on automatic mode, so Discord and other Electron apps stay broken")
+            log_node("fail", "exhausted" if walked.carried else "unreachable", "on", result.picked, None, walked.tried, reason)
             raise VpnError(reason)
-        log_node("ok", "rotated", "on", picked, walked.node.name, walked.tried)
+        log_node("ok", "rotated", "on", result.picked, walked.node.name, walked.tried)
         print(f"pinned: {walked.node.name} (automatic mode off — the watcher is the failover; `vpn on` to return)")
 
 
@@ -825,10 +855,11 @@ class ToArgs:
 def to(args: ToArgs) -> None:
     """Pin a node in a country or city, or one node by name.
 
-    Tries the place's nodes in name order and keeps the first that carries
-    traffic and passes the Discord check. When a country or city is named, the
-    node already in use and offline nodes are skipped. When none works, the exit
-    node goes back to how it was.
+    Tries the place's nodes in name order, at most 8, and keeps the first that
+    carries traffic and passes the Discord check. When a country or city is
+    named, the node already in use and offline nodes are skipped. When none
+    works, it undoes itself: the exit node goes back to what it was before the
+    command, whether that was a pinned node, automatic mode or off.
     """
     with node_lock():
         status = full_status()
@@ -847,9 +878,9 @@ def next_() -> None:
     """Move to the next node, in the order `vpn --help` describes.
 
     For when a site blocks the node in use. Keeps the first node that carries
-    traffic and passes the Discord check; when none works, the exit node goes
-    back to how it was. With no exit node set, starts from the first fallback
-    country.
+    traffic and passes the Discord check, trying at most 8. When none works, it
+    undoes itself: the exit node goes back to what it was before the command.
+    With no exit node set, it starts at the first fallback country.
     """
     with node_lock():
         status = full_status()
@@ -992,18 +1023,17 @@ def list_(args: ListArgs) -> None:
 
 @app.command(name="watch")
 def watch() -> None:
-    """Keep the exit node working.
+    """Keep the exit node working: the long-running watcher, not a one-off check.
 
-    Waits on tailscaled's event bus and looks at the exit node whenever anything
-    changes. While no exit node is set it only watches. When the exit node
-    reports itself offline, or egress stops going through it, it moves to the
-    next node, and puts it back when no node carries traffic. While Vesktop runs
-    it runs the Discord check on every new node and every 10 minutes, and moves
-    on when a 403 persists past the confirmation wait.
+    tailscaled tells the watcher the moment the exit node changes or goes offline, over its event bus. The watcher then reads the exit node's state from tailscaled's local socket, which sends nothing over the network.
 
-    Records every exit-node change something other than vpn made, and an hourly
-    heartbeat. While the bus is down, and while an exit node is set with Vesktop
-    closed, it also looks every 15 seconds.
+    - No exit node set: it only records changes.
+    - The exit node reports itself offline, or no traffic goes through it: it turns on automatic mode, as `vpn --help` describes.
+    - While Vesktop runs: it runs the Discord check on every new node and every 10 minutes, and when a 403 persists past the confirmation wait, it turns on automatic mode.
+
+    It records every exit-node change something other than vpn made, and writes an hourly heartbeat.
+
+    Two things reach it only by looking, so in those cases it also looks every 15 seconds: the event bus itself being down, and Vesktop starting, which tailscaled knows nothing about. The second applies only while an exit node is set and Vesktop is closed.
     """
     events: queue.Queue[str] = queue.Queue()
     threading.Thread(target=follow_bus, args=(events,), daemon=True).start()
