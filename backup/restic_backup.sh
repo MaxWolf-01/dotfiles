@@ -370,6 +370,7 @@ ${stats_error:-nothing}" >&2
     # of what broke.
     echo "Checking repository integrity..."
     check_log=""
+    check_interrupted=""
     # Keep check's throwaway cache off tmpfs. It builds a fresh one per run
     # either way, so nothing is carried between runs and the check still reads
     # everything from the repository; the default places it under /tmp, which is
@@ -379,11 +380,22 @@ ${stats_error:-nothing}" >&2
     if restic check --repo "$repo_path" --password-command "$password_command" --cache-dir "$HOME/.cache/restic-check" $check_args >"$check_output" 2>&1; then
         check_status="passed"
     else
-        check_status="FAILED"
-        backup_success=false
         check_log="$log_dir/restic_check_${config_name}_$(date +%Y%m%d_%H%M%S).log"
         cp "$check_output" "$check_log"
         echo "Check log saved to: $check_log"
+        # restic 0.19.1 prints "ssh command exited" when its ssh process died
+        # under the check; it never reconnects, so every read after that fails
+        # and it calls a repository it cannot reach "damaged". Recorded as a
+        # check that did not happen: no verdict, and the run stays green.
+        if grep -q 'ssh command exited' "$check_output"; then
+            check_status="interrupted"
+            check_interrupted=$(grep -m1 'subprocess ssh:' "$check_output" || grep -m1 'ssh command exited' "$check_output")
+            check_interrupted="${check_interrupted#subprocess ssh: }"
+            echo "Check interrupted: $check_interrupted"
+        else
+            check_status="FAILED"
+            backup_success=false
+        fi
     fi
 
     # Unreadable files are reported as JSON error lines, but other exit-3 causes
@@ -405,6 +417,7 @@ ${stats_error:-nothing}" >&2
         --arg snapshot_id "$snapshot_id" \
         --arg check "${check_status,,}" \
         --arg check_scope "$check_description" \
+        --arg check_interrupted "$check_interrupted" \
         --argjson duration_s "$backup_duration" \
         --argjson total_files_processed "$total_files_processed" \
         --argjson files_new "$files_new" \
@@ -421,6 +434,7 @@ ${stats_error:-nothing}" >&2
         '$ARGS.named
          | if .warning_log == "" then del(.warning_log) else . end
          | if .check_log == "" then del(.check_log) else . end
+         | if .check == "interrupted" then del(.check, .check_scope) else del(.check_interrupted) end
          | if .repo_size == null then del(.repo_size, .repo_snapshots) else . end
          | if .snapshot_id == "" then del(.snapshot_id) else . end')
 

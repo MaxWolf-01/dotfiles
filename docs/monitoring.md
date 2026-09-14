@@ -42,11 +42,12 @@ Everything that can send one, and where it points:
 | `❌ / ✅ yapit deploy: <commit>` | `scripts/deploy.sh`, run by hand from the yapit repo | a production deploy failed partway, or shipped — deploys are rare and hand-run, so completion mails too | the deploy terminal output and `.deploys.log` in the repo |
 | `CF firewall sync failed` | `scripts/sync-cf-firewall.sh`, hourly cron on yapit-prod | the Hetzner firewall could not be updated with current Cloudflare IPs | `/var/log/cf-firewall-sync.log` on the VPS |
 
-Nothing else sends on its own. A green backup, a skipped
-one, a newly blocked domain, an exit node rotation, a routine dependency
-report: run log and dashboard only. `🔍` in a yapit title means the report had
-no readable status line, so the setup could not tell whether the agent found
-anything and says so rather than staying quiet.
+Nothing else sends on its own. A green backup, a skipped one, an integrity
+check whose connection dropped under it, a newly blocked domain, an exit node
+rotation, a routine dependency report: run log and dashboard only. `🔍` in a
+yapit title means the report had no readable status line, so the setup could
+not tell whether the agent found anything and says so rather than staying
+quiet.
 
 ## Run logs
 
