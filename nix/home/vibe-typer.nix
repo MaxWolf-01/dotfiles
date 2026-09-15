@@ -12,11 +12,13 @@
 # NO_CLEANUP: every copy of one AppImage version unpacks into the same directory,
 # named after the file's hash, and without this flag deletes it on exit. A second
 # launch while the app runs would take the running app's files with it. The
-# directories of replaced versions age out of /var/tmp through systemd-tmpfiles
-# (30 days on Ubuntu).
+# trees stay in /var/tmp, where systemd-tmpfiles deletes files unread for 30
+# days (Ubuntu's default): whole trees of replaced versions, and in the current
+# one the files the app never loaded. The next launch unpacks what is missing.
+# A running app that needs such a file later, e.g. for the software GPU
+# fallback, fails; under the unit, Restart=on-failure brings it back.
 #
-# TMPDIR: /tmp is tmpfs here, so the default would hold the unpacked tree in RAM
-# for as long as the app runs.
+# TMPDIR: /tmp is tmpfs here, so the default would hold the unpacked tree in RAM.
 #
 # Startup lives here, not in ~/.config/autostart: the app rewrites its own
 # .desktop file whenever its "start on login" setting changes, which would drop
