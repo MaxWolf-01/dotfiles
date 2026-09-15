@@ -11,6 +11,7 @@ local opts = { -- default options
 -- ====================================================================
 
 map("i", "<C-c>", "<Esc>", opts) -- ctrl+c with the same behavior as <Esc>
+map({ "i", "c" }, "<C-v>", function() vim.paste(vim.fn.getreg("+", 1, true), -1) end, opts) -- paste clipboard like a terminal paste (no auto-indent); normal-mode ctrl+v stays visual block, ctrl+q still inserts the next key literally
 map("n", "<leader><leader>", ":Dashboard<CR>", opts) -- show dashboard: https://github.com/nvimdev/dashboard-nvim
 map("n", "U", "<NOP>", opts) -- disable U (scary behvaior)
 map("n", "<leader>y", ":%y<CR>", opts) -- copy all
