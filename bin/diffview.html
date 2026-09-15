@@ -366,18 +366,22 @@ const AT_ROOT = SERVED && location.pathname === "/";   // only --watch addresses
 const AGENT_RESOLVED = new Set(DATA.agentResolved || []);
 const WRITER = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}`;  // this page, while it is open
 // localStorage is per origin, so per server; the page's path is the review's identity within it
-const LOCAL_KEY = "dv-state:" + DATA.key;
-let SINCE = null;      // the file version this page's next write is based on: what it loaded, then each write of its own that landed
+const LOCAL_KEY = "dv-state:" + DATA.key;       // the local copy: this page's review state, kept until it lands
+const READING_KEY = "dv-reading:" + DATA.key;   // the reading state: the reader's own marks, shared by this browser's tabs, never the file's
+let SINCE = null;      // the file version this page's next write is based on: the one it last loaded, merged or landed
+let LANDED = null;     // the landed state: the review state this page last knew the file to hold; S is that plus its unlanded changes
 let LAST_SAVED = 0;    // savedAt of the last write sent: the next is later, however fast the clock
+let NEWEST = 0;        // savedAt of the newest write of this page's own that landed
 let UNSAVED = false;   // the state loaded is the local copy, holding a write that never landed
+let INFLIGHT = 0;      // writes sent and not yet answered
 let RETRY = null;      // polling a server that stopped answering
-let CONFLICT = false;  // another page owns the state file; saving waits on a human
+let SYNC = null;       // the file being fetched and merged; one at a time
 let S;
-function initState(stored) {
+function initState(stored, reading) {
   S = {
     split: innerWidth >= 1000, wrap: true, filterMode: "path",   // two columns of code need the width; s toggles
     imageView: "2-up",                  // one view for every image on the page; i cycles it
-    viewed: new Set(stored.viewed || []),
+    viewed: new Set(reading.viewed || []),
     comments: stored.comments || [],   // {id, fileKey, hi, side:'old'|'new'|'hunk'|'file', start, end, text, excerpt, re?}; a 'file' comment has hi -1
     focus: -1,                          // index into HUNKS
     ann: null,                          // focused annotation: {kind:'note'|'comment', id}
@@ -386,63 +390,128 @@ function initState(stored) {
     undo: null,                         // last deleted comment, restorable with u (session-only)
     folded: new Map(),                  // foldKey -> {si, changed, dir}: directories folded in the tree and on the page (session-only)
     nextId: stored.nextId || 1,
-    expand: new Map(stored.expand || []),       // fileKey -> {h: {hi: [above, below]}, all}: context opened around hunks
+    expand: new Map(reading.expand || []),      // fileKey -> {h: {hi: [above, below]}, all}: context opened around hunks
   };
-  // the file has no since: the server strips it as it checks; the local copy carries the base it is to be judged against
-  SINCE = "since" in stored ? stored.since : typeof stored.savedAt === "number" ? stored.savedAt : null;
 }
-/* the state baked into the page is as old as the render; the file beside a served page holds
-   everything saved since, so a plain reload reads that -- unless this browser holds a write
-   the file does not, which is then what the page loads, and saves at once: the server's own
-   rule says whether the file moved on meanwhile and a human must pick. The file, not a
-   record the page keeps, says whether a write landed: a reload can beat the acknowledgement. */
-async function savedState() {
-  if (!SERVED) return DATA.saved || {};
-  let file = null;
-  try {
-    const res = await fetch(location.pathname + ".state.json", { cache: "no-store" });
-    if (res.ok) file = await res.json();
-  } catch (e) {}
+/* the review state a blob holds, as this page's own record of it: copies, so what S does next never moves it */
+function reviewOf(blob) {
+  return { comments: structuredClone(blob.comments || []), verdict: new Map(blob.verdict || []),
+           seen: new Map(blob.seen || []), nextId: blob.nextId || 1 };
+}
+
+/* ---- reading state: the reader's own marks, in this browser ----
+   Which files are viewed and what context is open are one reader's progress, not the review's: they
+   stay out of the file a shared page carries, and this browser's tabs on the page share them. A state
+   file may still carry them, written when they were the file's; the first load here with none of its
+   own takes them over, and the next save writes the file without them. */
+function readingState(stored) {
+  const kept = loadReading();
+  if (kept) return kept;
+  const taken = { viewed: stored.viewed || [], expand: stored.expand || [] };
+  if (taken.viewed.length || taken.expand.length) storeReading(taken);
+  return taken;
+}
+function loadReading() {
+  try { const r = JSON.parse(localStorage.getItem(READING_KEY)); return r && typeof r === "object" ? r : null; } catch (e) { return null; }
+}
+function storeReading(r) {
+  try { localStorage.setItem(READING_KEY, JSON.stringify({ viewed: [...r.viewed], expand: [...r.expand] })); } catch (e) {}
+}
+/* read, change, write, so two tabs changing different marks never erase each other's. The viewed marks
+   come back whole, another tab's included; the opened context stays this tab's own, since only this
+   tab's hunks are open the way it recorded */
+function changeReading(change) {
+  const kept = loadReading();
+  const r = { viewed: new Set(kept ? kept.viewed : S.viewed), expand: new Map(kept ? kept.expand : S.expand) };
+  change(r);
+  storeReading(r);
+  S.viewed = r.viewed;
+}
+function syncReading() {
+  const kept = loadReading();
+  if (!kept) return;
+  const viewed = new Set(kept.viewed || []);
+  if (viewed.size === S.viewed.size && [...viewed].every(k => S.viewed.has(k))) return;
+  S.viewed = viewed;
+  showViewed();
+}
+
+/* ---- the state file, and following it ----
+   The state baked into the page is as old as the render; the file beside a served page holds
+   everything saved since, so a plain reload reads that -- unless this browser holds a write the
+   file never got, which is then what the page loads, merged with whatever the file gained meanwhile,
+   and saves at once. The file, not a record the page keeps, says whether a write landed: a reload
+   can beat the acknowledgement. */
+async function loadState() {
+  if (!SERVED) {
+    const stored = DATA.saved || {};
+    initState(stored, readingState(stored));
+    LANDED = reviewOf(stored);
+    return;
+  }
+  const file = await fetchState();
   const local = localCopy();
   if (local && !(file && file.savedAt === local.savedAt)) {
     UNSAVED = true;
-    // the file's last write is this browser's own, so nothing came between: it is the base
-    if (file && file.writer === local.writer) local.since = file.savedAt;
-    return local;
+    initState(local, readingState(file || local));
+    LANDED = reviewOf(local.landed || {});
+    SINCE = local.since ?? null;
+    if (file) mergeFile(file);
+    return;
   }
   if (local) dropLocal();   // landed after all
-  return file || DATA.saved || {};
+  const stored = file || DATA.saved || {};
+  initState(stored, readingState(stored));
+  LANDED = reviewOf(stored);
+  SINCE = file ? file.savedAt ?? null : null;
+}
+async function fetchState() {
+  try {
+    const res = await fetch(location.pathname + ".state.json", { cache: "no-store" });
+    if (res.ok) return await res.json();
+  } catch (e) {}
+  return null;
 }
 function localCopy() {
   try { return JSON.parse(localStorage.getItem(LOCAL_KEY)); } catch (e) { return null; }
 }
+function dropLocal() {
+  try { localStorage.removeItem(LOCAL_KEY); } catch (e) {}
+}
 let copyRefused = false;
 function persist() {
   if (!SERVED) return;
-  // savedAt names this write to whoever loads it next, and writer/since let the server tell
-  // a second page holding this same review from this one writing twice
+  // savedAt names this write to whoever loads it next; writer and since let the server tell a page
+  // that saw the file's current version from one that did not
   LAST_SAVED = Math.max(Date.now(), LAST_SAVED + 1);
-  const blob = { savedAt: LAST_SAVED, writer: WRITER, since: SINCE, viewed: [...S.viewed], comments: S.comments,
-                 nextId: S.nextId, verdict: [...S.verdict], seen: [...S.seen], expand: [...S.expand] };
-  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(blob)); }   // before the send, so the file is never the only copy
+  // every field a copy: the write is what S holds now, and landed() records exactly that, not what S holds at the acknowledgement
+  const blob = { savedAt: LAST_SAVED, writer: WRITER, since: SINCE, comments: structuredClone(S.comments), nextId: S.nextId,
+                 verdict: [...S.verdict], seen: [...S.seen] };
+  // before the send, so the file is never the only copy; with the landed state beside it, so a reload
+  // merges what never landed into whatever the file holds by then
+  const landedState = { ...LANDED, verdict: [...LANDED.verdict], seen: [...LANDED.seen] };
+  try { localStorage.setItem(LOCAL_KEY, JSON.stringify({ ...blob, landed: landedState })); }
   catch (e) { if (!copyRefused) toast("the browser refused to keep a copy of this review (storage full?); the file is the only one"); copyRefused = true; }
-  if (CONFLICT) return;   // the send waits on a human; the copy above does not, so a tab closed meanwhile loses nothing
+  INFLIGHT++;
   // keepalive: a reload right after typing must not cancel the save the reload then reads
   fetch(location.pathname + ".state.json", { method: "POST", body: JSON.stringify(blob), keepalive: true })
     .then(res => {
-      if (res.status === 409) return res.json().then(saveConflict, () => saveConflict({}));
+      if (res.status === 409) return refused();
       if (!res.ok) throw new Error(res.status);
-      landed(blob.savedAt);
+      landed(blob);
       saveWorks();
     })
-    .catch(() => saveBroke());   // a dead server must not look like a saved comment
+    .catch(() => saveBroke())   // a dead server must not look like a saved comment
+    .finally(() => { INFLIGHT--; });
 }
-/* the file holds this write now: it is the base of the next one, and the copy of it here has
-   done its job -- unless a later write has already taken the slot */
-function landed(at) {
-  SINCE = Math.max(SINCE || 0, at);
+/* the file holds this write now: it is the landed state and the base of the next write, and the copy
+   of it here has done its job -- unless a later write has already taken the slot */
+function landed(blob) {
+  if (blob.savedAt < NEWEST) return;   // acknowledged after a later write of this page's own: that one is the landed state
+  NEWEST = SINCE = blob.savedAt;
+  LANDED = reviewOf(blob);
   const held = localCopy();
-  if (held && held.savedAt === at) dropLocal();
+  if (held && held.savedAt === blob.savedAt) dropLocal();
 }
 function saveWorks() {
   if (!RETRY) return;
@@ -464,20 +533,132 @@ function saveBroke() {
     h("button", { cls: "rox", title: "dismiss", onclick: () => bar.remove() }, "×"));
   document.querySelector(".top").after(bar);
 }
-function saveConflict(held) {
-  CONFLICT = true;               // no more writes until a human says whose state survives
-  if (RETRY) { clearInterval(RETRY); RETRY = null; }
-  document.querySelector(".savefail")?.remove();
-  const bar = h("div", "readonly savefail",
-    h("strong", null, "not saving"),
-    " — another page saved this review after this one loaded it. Both write the state whole, so whatever happens next, one of the two loses everything. Close the other page, then pick which:",
-    h("button", { cls: "btn", onclick: () => { SINCE = held.savedAt ?? null; CONFLICT = false; bar.remove(); persist(); } },
-      "keep this page, drop theirs"),
-    h("button", { cls: "btn", onclick: () => { dropLocal(); location.reload(); } }, "take theirs, drop what is unsaved here"));
-  document.querySelector(".top").after(bar);
+/* the file moved between this page's last sync and this write: take the file, keep what this page
+   changed since, send again. Nobody is asked; the merge loses nothing it does not say. A fetch the
+   poll started just before may be the one taken: then its file predates the move, and the resend is
+   refused once more, which comes back here with a fresh fetch */
+function refused() {
+  return takeFile().then(persist);
 }
-function dropLocal() {
-  try { localStorage.removeItem(LOCAL_KEY); } catch (e) {}
+/* the file as it is now, merged in when it is a version this page has not seen. One at a time, since
+   the poll, a refused save and a focus can all ask */
+function takeFile() {
+  if (!SYNC) SYNC = fetchState()
+    .then(file => { if (file && file.savedAt !== SINCE) mergeFile(file); })
+    .finally(() => { SYNC = null; });
+  return SYNC;
+}
+/* the page follows its file: what another page saved is merged in, and the request is the heartbeat a
+   --serve server counts an open tab by. Nothing is merged over a write of this page's own that is still
+   in the air, or waiting on a server that stopped answering: the answer to that write decides, and the
+   poll returns after; so a file the poll finds newer is always another page's */
+function follow() {
+  if (!S) return;   // the state file is still being read
+  syncReading();
+  if (INFLIGHT || RETRY || SYNC) return;
+  takeFile();
+}
+
+/* ---- the merge ----
+   Three ways: the landed state against this page's state against the file. A comment the landed state
+   lacks is this page's addition, a restore of a deleted one included; it keeps its id unless the file
+   holds another comment under it, and then takes the next free one. An edit lands on the file's copy,
+   or is dropped when the file no longer has that comment. A deletion deletes. A verdict or a seen mark
+   this page changed applies. Everything else is the file's. The page's own comment objects stay the
+   objects they were, so an editor open on one, or the undo slot, still points at the right comment.
+   Only the cards whose annotations changed are redrawn, and what the reader is looking at stays put. */
+const sameComment = (a, b) => a.fileKey === b.fileKey && a.hi === b.hi && a.side === b.side && a.start === b.start
+  && a.end === b.end && a.text === b.text && (a.re ?? null) === (b.re ?? null);
+function mergeFile(file) {
+  const theirs = reviewOf(file), landed = LANDED;
+  const landedById = new Map(landed.comments.map(c => [c.id, c]));
+  const mineById = new Map(S.comments.map(c => [c.id, c]));
+  const theirsById = new Map(theirs.comments.map(c => [c.id, c]));
+  const before = annotationSigs();
+  const out = new Map(), renamed = new Map(), dropped = [];
+  let next = Math.max(theirs.nextId, S.nextId);
+  for (const t of theirs.comments) {
+    const mine = mineById.get(t.id), was = landedById.get(t.id);
+    if (was) {
+      if (!mine) continue;                                                     // deleted here since the landed state
+      if (sameComment(mine, was)) out.set(t.id, Object.assign(mine, t));       // untouched here: the file's version
+      else out.set(t.id, Object.assign(mine, t, { text: mine.text, start: mine.start, end: mine.end, excerpt: mine.excerpt }));   // edited here
+    } else if (mine && sameComment(mine, t)) out.set(t.id, Object.assign(mine, t));   // added here, and landed meanwhile after all
+    else out.set(t.id, t);                                                     // the file's own; one added here under this id moves below
+  }
+  for (const c of S.comments) {
+    const was = landedById.get(c.id);
+    if (was) { if (!sameComment(c, was) && !theirsById.has(c.id)) dropped.push(c.id); continue; }   // edited here, deleted there
+    if (out.get(c.id) === c) continue;
+    if (out.has(c.id)) {
+      while (out.has(next)) next++;   // a file edited by hand may hold an id past its own counter
+      renamed.set(c.id, next);
+      c.id = next++;
+    }
+    out.set(c.id, c);
+    next = Math.max(next, c.id + 1);
+  }
+  const marks = (mine, was, held, remap) => {   // a mark this page set or cleared since the landed state wins; the rest is the file's
+    const merged = new Map(held);
+    for (const id of new Set([...mine.keys(), ...was.keys()])) {
+      if (mine.get(id) === was.get(id)) continue;
+      const to = remap && renamed.has(id) ? renamed.get(id) : id;
+      mine.has(id) ? merged.set(to, mine.get(id)) : merged.delete(to);
+    }
+    return merged;
+  };
+  S.comments = [...out.values()];
+  S.verdict = marks(S.verdict, landed.verdict, theirs.verdict, true);
+  S.seen = marks(S.seen, landed.seen, theirs.seen, false);
+  S.nextId = Math.max(next, ...S.comments.map(c => c.id + 1));
+  if (S.ann && S.ann.kind === "comment" && renamed.has(S.ann.id)) S.ann.id = renamed.get(S.ann.id);
+  LANDED = reviewOf(file);
+  SINCE = file.savedAt ?? null;
+  redraw(before, renamed);
+  const said = [];
+  if (renamed.size) said.push([...renamed].map(([from, to]) => `C${from} is now C${to}`).join(", ") + ": another page took the number first");
+  if (dropped.length) said.push(`your edit of ${dropped.map(id => "C" + id).join(", ")} was dropped: another page deleted it`);
+  if (said.length) toast(said.join(". "));
+}
+/* what each card's annotations show, so a merge redraws only the cards where that changed */
+function annotationSigs() {
+  const sigs = new Map();
+  for (const x of ALL) sigs.set(x.f.key, JSON.stringify([
+    S.comments.filter(c => c.fileKey === x.f.key).map(c => [c.id, c.text, c.hi, c.side, c.start, c.end, c.re ?? null, isResolved(c.id)]),
+    (NOTES.get(x.f.key) || []).map(n => isSeen(n))]));
+  return sigs;
+}
+function redraw(before, renamed) {
+  const after = annotationSigs();
+  const dirty = [...after.keys()].filter(k => after.get(k) !== before.get(k));
+  if (!dirty.length) return;
+  const draft = takeDraft();
+  if (draft && draft.existingId && renamed.has(draft.existingId)) draft.existingId = renamed.get(draft.existingId);
+  keepingPlace(() => {
+    for (const key of dirty) refreshAnnotations(key);
+    if (draft && !document.querySelector(".cbox[data-editing]")) restoreDraft(draft);   // its row went with the card's annotations
+  });
+}
+/* what the reader is looking at stays where it is while annotations appear or vanish above it: the
+   first row under the sticky headers is measured before and put back after. The browser's own scroll
+   anchoring does the same, except when the node it anchored on is removed and made again, which a
+   redrawn annotation is; a code row is never redrawn, so it is the one measured */
+function keepingPlace(fn) {
+  const top = document.querySelector(".top"), head = document.querySelector(".fhead"), main = document.querySelector(".main");
+  let el = null, before = 0;
+  if (top && head && main) {
+    const r = main.getBoundingClientRect();
+    // hit testing returns cells, never rows: the row is the cell's ancestor
+    let hit = document.elementsFromPoint(r.left + Math.min(240, r.width / 2), top.offsetHeight + head.offsetHeight + 2)
+      .map(e => e.closest("table.diff tr, .imgblock, .binmsg, .summary, .src-hdr")).find(Boolean);
+    while (hit && hit.matches("tr.crow, tr.arow")) hit = hit.previousElementSibling;   // an annotation may be redrawn; the row above it stays
+    if (hit) { el = hit; before = hit.getBoundingClientRect().top; }
+  }
+  fn();
+  if (el && el.isConnected && el.getClientRects().length) {   // a row whose card just collapsed has no place to be put back to
+    const after = el.getBoundingClientRect().top;
+    if (after !== before) scrollBy(0, after - before);
+  }
 }
 function canEdit() {
   if (SERVED) return true;
@@ -758,7 +939,10 @@ function recordExpand(f, hi, above, below) {
   const cur = e.h[hi] || [0, 0];
   e.h[hi] = [cur[0] + above, cur[1] + below];
   S.expand.set(f.key, e);
-  persist();
+  saveExpand(f.key);
+}
+function saveExpand(key) {   // this tab's opened context for one file, into the reading state
+  changeReading(r => S.expand.has(key) ? r.expand.set(key, S.expand.get(key)) : r.expand.delete(key));
 }
 function toastNoContent(f) {
   toast(!f.hunks.length ? "nothing to expand: this card has no lines"
@@ -782,7 +966,7 @@ function expandHunk(f, hi, dir, n, anchorHi = dir < 0 ? hi : null) {
 function toggleWholeFile(f) {
   if (!f.content) { toastNoContent(f); return; }
   f.before ? closeWholeFile(f) : openWholeFile(f);
-  persist();
+  saveExpand(f.key);
   const card = CARDS.get(f.key);
   openCard(card);
   rerenderCard(f.key);
@@ -978,13 +1162,21 @@ function viewedBox(f) {
   return h("label", null, box, "viewed");
 }
 function setViewed(key, on) {
-  on ? S.viewed.add(key) : S.viewed.delete(key);
-  persist();
-  document.querySelectorAll(`[data-key="${CSS.escape(key)}"]`).forEach(el => {
-    el.classList.toggle("viewed", on);
-    if (el.classList.contains("fcard")) on ? el.classList.add("collapsed") : openCard(el);  // one-time collapse; the file stays openable
-    const box = el.querySelector(".fhead input[type=checkbox]");
-    if (box) box.checked = on;
+  changeReading(r => on ? r.viewed.add(key) : r.viewed.delete(key));
+  showViewed();
+}
+/* the viewed marks as S holds them, on every card and tree row that shows otherwise: this tab's own
+   tick, or another tab's picked up from the reading state */
+function showViewed() {
+  keepingPlace(() => {
+    for (const el of document.querySelectorAll(".main .fcard, .tree-file")) {
+      const on = S.viewed.has(el.dataset.key);
+      if (el.classList.contains("viewed") === on) continue;
+      el.classList.toggle("viewed", on);
+      if (el.classList.contains("fcard")) on ? el.classList.add("collapsed") : openCard(el);  // one-time collapse; the file stays openable
+      const box = el.querySelector(".fhead input[type=checkbox]");
+      if (box) box.checked = on;
+    }
   });
   const c = document.getElementById("viewed-count"); if (c) c.textContent = viewedCount();
 }
@@ -1109,7 +1301,7 @@ function openCommentEditor(ref, existing, draft) {
     const after = parent || [...body.querySelectorAll(":scope > .file")].pop();
     after ? after.insertAdjacentElement("afterend", holder) : body.prepend(holder);
   } else ((parent && parent.closest("tr.arow")) || row).insertAdjacentElement("afterend", holder);
-  ta.focus();
+  ta.focus({ preventScroll: draft != null });   // a draft put back after a redraw stays where it was; a fresh editor is already in view
 }
 function commentRef(f, c) {
   return `C${c.id} · ` + refLabel(f, c.side, c.start, c.end)
@@ -2116,22 +2308,32 @@ function rebuildBody(card) {
   delete body.dataset.done;
   card.dispatchEvent(new Event("render"));
 }
-/* a comment being typed survives a rebuild of the table under it */
+/* a comment being typed survives a rebuild of the table under it, and a merge that redraws its card:
+   text, caret and focus come back as they were */
 function takeDraft() {
   const open = document.querySelector(".cbox[data-editing]");
-  return open ? {
+  if (!open) return null;
+  const ta = open.querySelector("textarea");
+  return {
     ref: { fileKey: open.dataset.fileKey, hi: +open.dataset.hi, side: open.dataset.side,
            start: +open.dataset.start, end: +open.dataset.end,
            ...(open.dataset.re ? { re: +open.dataset.re } : {}) },
-    text: open.querySelector("textarea").value,
+    text: ta.value,
     existingId: open.dataset.existingId ? +open.dataset.existingId : null,
-  } : null;
+    focused: document.activeElement === ta,
+    caret: [ta.selectionStart, ta.selectionEnd],
+  };
 }
 function restoreDraft(draft) {
   if (!draft) return;
   ensureRendered(draft.ref.fileKey);
   const existing = draft.existingId ? S.comments.find(c => c.id === draft.existingId) : null;
+  if (draft.existingId && !existing) toast(`C${draft.existingId} was deleted in another tab; what you are typing goes on as a new comment`);
   openCommentEditor(draft.ref, existing, draft.text);
+  const ta = document.querySelector(".cbox[data-editing] textarea");
+  if (!ta) return;
+  ta.setSelectionRange(...draft.caret);
+  if (!draft.focused) ta.blur();
 }
 /* the summary is written after the page opens, so it arrives into a slot held for it
    here rather than delaying the whole page behind a model call */
@@ -2208,15 +2410,14 @@ function mdInline(s) {
     .replace(/(^|\s)\*([^*\n]+)\*(?=[\s.,;:)]|$)/g, "$1<i>$2</i>")
     .replace(/\n{2,}/g, "</p><p>").replace(/\n/g, " ") + "</p>";
 }
-savedState().then(stored => {
-  initState(stored);
+loadState().then(() => {
   applyStoredExpand();
   render();
   spySoon();
-  if (UNSAVED) persist();   // the local copy held a write the file never got; land it, or hear that the file moved on
+  if (UNSAVED) persist();   // the local copy held a write the file never got: land it, merged with whatever the file gained meanwhile
 });
 
-/* ================= served pages: the heartbeat, and watch mode's live reload ================= */
+/* ================= served pages: following the file, and watch mode's live reload ================= */
 /* file bodies render lazily, so the browser restores a reload into a page that is not
    built yet and lands at the wrong place; carry the offset across ourselves instead */
 addEventListener("pagehide", () => sessionStorage.setItem("dv-scroll", scrollY));
@@ -2226,9 +2427,12 @@ if (savedScroll != null) {
   requestAnimationFrame(() => scrollTo(0, +savedScroll));
 }
 if (SERVED) {
-  // a --serve server exits once no page has been heard from for a while; a hidden tab still
-  // fires this about once a minute, so an open tab, seen or not, keeps its server
-  setInterval(() => fetch("/.health", { cache: "no-store" }).catch(() => {}), 60000);
+  // every 2 seconds in the foreground, at once when the tab comes to the front; a --serve server exits
+  // once no page has been heard from for a while, and a background tab is throttled by the browser to
+  // about one of these a minute, so an open tab, seen or not, keeps its server
+  setInterval(follow, 2000);
+  addEventListener("focus", follow);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") follow(); });
   // only --watch rebuilds a page under you; --serve answers 404 here, and one is enough to stop asking
   const poll = setInterval(async () => {
     try {
@@ -2238,7 +2442,7 @@ if (SERVED) {
       if (k && k !== DATA.key) return;          // a different review took over this port; never reload into it
       if (!g || g === DATA.generated) return;   // compare against THIS page's build, no baseline races
       if (document.querySelector(".cbox[data-editing]") || LINE) return;  // never yank a review mid-comment
-      if (RETRY || CONFLICT) return;   // nor over comments that never reached disk: a restarted --watch rebuilds on sight
+      if (RETRY) return;   // nor over comments that never reached disk: a restarted --watch rebuilds on sight
       location.reload();
     } catch (e) {}
   }, 2000);
