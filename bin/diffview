@@ -12,6 +12,11 @@ copies too, as a patch, with those comments inline or without. Comments are save
 to a file beside the page and read back from it on load; only a served page can
 write it -- see --serve; opened as a plain file the page is read-only and says so.
 
+A changed image shows on its card, both versions side by side or overlaid, baked
+into the page like the text around it; a version too big to bake says so on its
+card. A card without lines (an image, any other binary file) takes a comment on the
+file as a whole, and the export describes the image where a line comment quotes lines.
+
 The page's own path is the review's identity: rendering to the same path again --
 after review fixes, with the new range appended -- finds the comments already
 there. Unnamed output lands in ~/Downloads/diffview under a name derived from the
@@ -32,6 +37,7 @@ Examples:
     diffview 'old-config/=new-config/' --title "config migration"
 """
 
+import base64
 import fcntl
 import hashlib
 import html
@@ -75,7 +81,7 @@ class Args:
     watch: bool = False
     """Regenerate whenever the sources change and serve the page on localhost with live reload; runs until Ctrl-C, so start it as a background task. The summary is written once; the ↻ beside it says how far the diff has moved since and rewrites it on request. Starts fine on sources with no changes yet: the page says so and fills in. The written file stays a plain snapshot you can share."""
     notes: str = ""
-    """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top): the place to say what was read and deliberately left alone. A note with "re": "C4" answers that review comment: it sits under it, indented, and needs no path or line of its own; the thread can go on from there (the reviewer replies to a note with c or its reply button, and the reply carries "re A3"). Answering a comment does not resolve it. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
+    """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top; an image other than SVG, whole): the place to say what was read and deliberately left alone. A note with "re": "C4" answers that review comment: it sits under it, indented, and needs no path or line of its own; the thread can go on from there (the reviewer replies to a note with c or its reply button, and the reply carries "re A3"). Answering a comment does not resolve it. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
     """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own once every page on it has been closed for a grace period: the message it prints says how long, and $DIFFVIEW_IDLE_SECONDS changes it. A page cut off from its server says so and keeps what you type in the browser until the server is back: run this again, and it answers on the port the page knows."""
     context: int = 3
@@ -141,8 +147,9 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
         for f in s["files"]:
             if f["status"] in ("modified", "renamed") and f["hunks"]:   # what a gap between hunks opens from; a card without one shows no gap
                 f["content"] = file_lines(s, f["path"])
-        s.pop("_root", None)
-        s.pop("_rev", None)
+            if image := image_versions(s, f):
+                f["image"] = image
+        s.pop("_sides", None)
 
     langs = {f["lang"] for s in sources for f in s["files"] if f["lang"]}
 
@@ -151,6 +158,7 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
         "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "sources": sources,
         "size": size,
+        "imageLimit": MAX_IMAGE_BYTES,
         "summary": summary,
         "summaryPending": generate or awaiting,
         "notes": notes,
@@ -266,7 +274,7 @@ def git_root(repo: str) -> str:
 def resolved_revs(root: str, range_: str) -> str:
     """The range's endpoints as shas; empty when they don't resolve, which build reports properly."""
     try:
-        revs = [worktree_base(root, range_)] if is_worktree(range_) else [r for r in re.split(r"\.{2,3}", range_) if r]
+        revs = [diff_base(root, range_)] if is_worktree(range_) else [r for r in re.split(r"\.{2,3}", range_) if r]
     except SystemExit:
         return ""
     proc = subprocess.run(["git", "-C", root, "rev-parse", *revs], capture_output=True, text=True)
@@ -823,7 +831,7 @@ def collect_source(spec: str, context: int) -> dict:
         patch = run_git(["diff", "--no-color", "--no-ext-diff", f"-U{context}", "--no-index", "--", old, new], ok_codes=(0, 1))
         files = parse_patch(patch, strip_roots=(old, new))
         return {"label": Path(new).name, "kind": "paths", "detail": f"{old} → {new}", "files": files, "commits": None,
-                "_patch": patch, "_root": new, "_rev": None}
+                "_patch": patch, "_sides": {"old": (old, None), "new": (new, None)}}
 
     if "@" in spec:
         repo, range_ = spec.rsplit("@", 1)
@@ -834,9 +842,10 @@ def collect_source(spec: str, context: int) -> dict:
         sys.exit(f"diffview: bad spec {spec!r}; need REPO@A..B, A..B, or OLD=NEW (see --help)")
 
     patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", *rev_args(repo, range_)])
+    base = diff_base(repo, range_)
     if is_worktree(range_):
         patch += untracked_patch(repo, context)
-        commits = collect_commits(repo, f"{worktree_base(repo, range_)}..HEAD")
+        commits = collect_commits(repo, f"{base}..HEAD")
         detail = f"{worktree_left(range_)}{'...' if range_.endswith('...') else '..'}worktree"
         rev = None
     else:
@@ -844,38 +853,78 @@ def collect_source(spec: str, context: int) -> dict:
         detail = range_
         rev = re.split(r"\.{2,3}", range_)[-1] or "HEAD"
     files = parse_patch(patch)
+    root = git_root(repo)   # the diff's paths are the repo's, whichever directory the spec named
     return {"label": Path(repo).name, "kind": "git", "detail": detail, "files": files, "commits": commits,
-            "_patch": patch, "_root": repo, "_rev": rev}
+            "_patch": patch, "_sides": {"old": (root, base), "new": (root, rev)}}
 
 
 MAX_BAKED_BYTES = 1_000_000   # a lockfile or generated blob in the diff must not turn the page into a copy of it
+MAX_IMAGE_BYTES = 5 * 1024 * 1024   # an image is what is under review, not context around it, so it gets more room than text
+IMAGE_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+    ".avif": "image/avif", ".bmp": "image/bmp", ".ico": "image/x-icon", ".svg": "image/svg+xml",
+}
+
+
+def file_bytes(source: dict, path: str, side: str = "new") -> bytes | None:
+    """One side of a file in this source, whole; None when the source has no such file.
+
+    The new side is the range's right-hand rev, or the disk for a worktree or OLD=NEW compare.
+    The old side is the rev the diff starts from, or the OLD path.
+    """
+    where, rev = source["_sides"][side]
+    root = Path(where).resolve()
+    if rev is not None:
+        # through the filters a checkout runs (a Git LFS smudge, eol conversion), so a rev gives what a disk read would
+        proc = subprocess.run(["git", "-C", str(root), "cat-file", "--filters", f"{rev}:{path}"], capture_output=True)
+        return proc.stdout if proc.returncode == 0 else None
+    if root.is_file():   # file=file compare: each side holds exactly one file
+        target = root if side == "old" or path == root.name else None
+    else:
+        target = (root / path).resolve()
+        if not target.is_relative_to(root):   # a note names a path; it must not pull anything outside the source in
+            target = None
+    try:
+        return target.read_bytes() if target else None
+    except OSError:
+        return None
 
 
 def file_lines(source: dict, path: str) -> list[str] | None:
-    """The new side of a file in this source, whole; None when the source has no such file, or it is too big to bake.
+    """The new side of a file in this source, as lines; None when the source has no such file, or it is too big to bake.
 
     Unchanged regions are identical on both sides, so the new side is enough for the page
     to open any gap between hunks, and the old line numbers follow from the offset.
     """
-    root = Path(source["_root"]).resolve()
-    if source["_rev"] is None:
-        if root.is_file():   # file=file compare: the source holds exactly one file
-            target = root if path == root.name else None
-        else:
-            target = (root / path).resolve()
-            if not target.is_relative_to(root):   # a note names a path; it must not pull anything outside the source in
-                target = None
-        try:
-            raw = target.read_bytes() if target else None
-        except OSError:
-            raw = None
-    else:
-        proc = subprocess.run(["git", "-C", str(root), "show", f"{source['_rev']}:{path}"], capture_output=True)
-        raw = proc.stdout if proc.returncode == 0 else None
+    raw = file_bytes(source, path)
     if raw is None or len(raw) > MAX_BAKED_BYTES:
         return None
     lines = raw.decode(errors="replace").split("\n")   # git counts \n only; splitlines() would also break on \f, \v, U+2028…
     return lines[:-1] if lines and lines[-1] == "" else lines
+
+
+def image_type(path: str) -> str | None:
+    """The MIME type of an image a browser shows, by the path's extension; None for any other file."""
+    return IMAGE_TYPES.get(Path(path).suffix.lower())
+
+
+def image_versions(source: dict, f: dict) -> dict | None:
+    """The versions of an image file its card shows, keyed "old" and "new"; None when neither side is an image.
+
+    A version too big to bake, or one the source cannot give back, still carries its size
+    (None when unreadable), so the card can say why that image is missing.
+    """
+    paths = {"old": None if f["status"] in ("added", "untouched") else f["oldPath"] or f["path"],
+             "new": None if f["status"] == "deleted" else f["path"]}
+    return {side: image_version(source, path, side) for side, path in paths.items() if path and image_type(path)} or None
+
+
+def image_version(source: dict, path: str, side: str) -> dict:
+    raw = file_bytes(source, path, side)
+    version = {"type": image_type(path), "size": None if raw is None else len(raw)}
+    if raw is not None and len(raw) <= MAX_IMAGE_BYTES:
+        version["src"] = f"data:{version['type']};base64,{base64.b64encode(raw).decode()}"
+    return version
 
 
 TOP_WINDOW = 20   # what a line-less note on an untouched file opens: the top of the file, one expansion step's worth
@@ -887,6 +936,7 @@ def attach_untouched(sources: list[dict], notes: list[dict], context: int) -> No
     The file joins the first source that has it, as a card with no changes and one all-context
     hunk per noted window, so the page treats it like any other file: the note anchors to
     its lines, comments attach, and the hunk expands from the baked content like the rest.
+    An image other than SVG has no lines to open at, so it joins with no hunks and its card shows the image.
     """
     changed = {f["path"] for s in sources for f in s["files"]}
     by_path: dict[str, list[dict]] = {}
@@ -896,14 +946,19 @@ def attach_untouched(sources: list[dict], notes: list[dict], context: int) -> No
         by_path.setdefault(n["path"], []).append(n)
     for path, ns in by_path.items():
         for s in sources:
-            lines = file_lines(s, path)
-            if lines is None:
-                continue
-            windows = merge_windows([note_window(n, len(lines), context) for n in ns])
-            # no old side: nothing to compare against, so only the new gutter takes comments
-            hunks = [{"os": a, "ns": a, "header": "", "lines": [[0, None, no, lines[no - 1]] for no in range(a, b + 1)]}
-                     for a, b in windows]
-            f = {"path": path, "oldPath": None, "status": "untouched", "adds": 0, "dels": 0, "binary": False,
+            if image_type(path) not in (None, "image/svg+xml"):
+                if file_bytes(s, path) is None:
+                    continue
+                lines, hunks = None, []
+            else:
+                lines = file_lines(s, path)
+                if lines is None:
+                    continue
+                windows = merge_windows([note_window(n, len(lines), context) for n in ns])
+                # no old side: nothing to compare against, so only the new gutter takes comments
+                hunks = [{"os": a, "ns": a, "header": "", "lines": [[0, None, no, lines[no - 1]] for no in range(a, b + 1)]}
+                         for a, b in windows]
+            f = {"path": path, "oldPath": None, "status": "untouched", "adds": 0, "dels": 0, "binary": lines is None,
                  "lang": None, "hunks": hunks, "content": lines}
             f["lang"] = guess_lang(f)
             s["files"].append(f)
@@ -935,15 +990,18 @@ def is_worktree(range_: str) -> bool:
     return range_.endswith("..")
 
 
-def worktree_base(repo: str, range_: str) -> str:
-    """The commit a worktree compare starts from.
+def diff_base(repo: str, range_: str) -> str:
+    """The commit a range's diff starts from.
 
-    `A..` starts at A itself. `A...` starts where the branch forked from A (the merge-base
-    of A and HEAD), so commits A gained since, which the branch does not have, do not show
-    up as the branch's changes; the base moves only when a rebase or merge takes them in.
+    `A..B` and `A..` start at A itself. `A...B` and `A...` start where the two sides forked
+    (the merge-base of A with B, or with HEAD), so commits A gained since, which the other
+    side does not have, do not show up as its changes; the base moves only when a rebase or
+    merge takes them in.
     """
-    left = worktree_left(range_)
-    return run_git(["-C", repo, "merge-base", left, "HEAD"]).strip() if range_.endswith("...") else left
+    left, right = re.split(r"\.{2,3}", range_, maxsplit=1)
+    if "..." not in range_:
+        return left or "HEAD"
+    return run_git(["-C", repo, "merge-base", left or "HEAD", right or "HEAD"]).strip()
 
 
 def worktree_left(range_: str) -> str:
@@ -977,7 +1035,7 @@ def untracked_patch(repo: str, context: int) -> str:
 
 
 def rev_args(repo: str, range_: str) -> list[str]:
-    return [worktree_base(repo, range_)] if is_worktree(range_) else [range_]
+    return [diff_base(repo, range_)] if is_worktree(range_) else [range_]
 
 
 def collect_commits(repo: str, range_: str) -> list[dict]:
@@ -1016,7 +1074,8 @@ def collect_commits(repo: str, range_: str) -> list[dict]:
 
 
 def run_git(git_args: list[str], ok_codes: tuple[int, ...] = (0,)) -> str:
-    proc = subprocess.run(["git", *git_args], capture_output=True, text=True)
+    # a diff prints file content as git stores it, which need not be UTF-8
+    proc = subprocess.run(["git", *git_args], capture_output=True, text=True, errors="replace")
     if proc.returncode not in ok_codes:
         sys.exit(f"diffview: git {' '.join(git_args[:4])}… failed:\n{proc.stderr.strip()}")
     return proc.stdout

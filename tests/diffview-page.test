@@ -13,17 +13,21 @@ Run it directly; no framework. Uses the chromium build playwright keeps in its c
 (`uv run --with playwright playwright install chromium` once, if it is missing).
 """
 
+import base64
 import json
 import os
 import queue
+import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import urllib.request
+import zlib
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -225,7 +229,7 @@ def fold_case(root: Path, browser) -> None:
     a click on a directory in the tree folds the same way. A folded directory is one stop, and whatever
     opens a card inside it unfolds it, directories folded within it included."""
     files = {"b.txt": "b\n", "Makefile": "m\n", "c/d.txt": "d\n", "c/z.txt": "z\n", "c/e/f.txt": "f\n",
-             "m/img.bin": b"\x89PNG\r\n\x1a\n\x00\x01", "n/y.txt": "y\n"}   # m/ holds no hunks, so nothing in it is a stop
+             "m/img.bin": b"\x89PNG\r\n\x1a\n\x00\x01", "n/y.txt": "y\n"}   # m/ holds no hunks: its one card is a stop of its own
     _, page = tree_page(root, browser, "folded", UNTOUCHED, files, NOTE_ON_UNTOUCHED, 700)
     collapsed = lambda: paths(page, ".main .fcard.collapsed")
     closed = lambda: page.locator(".tree-dir.closed").all_inner_texts()
@@ -234,12 +238,12 @@ def fold_case(root: Path, browser) -> None:
     page.keyboard.press("Control+d"); page.keyboard.press("Control+d")
     page.keyboard.press("z")
     check("z folds the directory of the file you are on, subdirectories included, in the tree and on the page, and moves on",
-          (["c/d.txt", "c/z.txt", "c/e/f.txt"], ["c/"], "n/y.txt"), (collapsed(), closed(), focused(page)))
+          (["c/d.txt", "c/z.txt", "c/e/f.txt"], ["c/"], "m/img.bin"), (collapsed(), closed(), focused(page)))
     page.keyboard.press("K")
     check("K lands on the folded directory once, and the tree marks the directory", ("c/d.txt", ["c/"]),
           (focused(page), page.locator(".side .current").all_inner_texts()))
     check("the stop before it is the file before the directory, and J passes it as one stop",
-          ["Makefile", "c/d.txt", "n/y.txt"], walk(page, "K", 1) + walk(page, "J", 2))
+          ["Makefile", "c/d.txt", "m/img.bin"], walk(page, "K", 1) + walk(page, "J", 2))
     page.keyboard.press("K")
     page.keyboard.press("z")
     check("z on a folded directory unfolds it in both places and stays there", ([], [], "c/d.txt"), (collapsed(), closed(), focused(page)))
@@ -472,6 +476,225 @@ def heartbeat_case(url: str, browser) -> None:
     page.close()
 
 
+def png(width: int, height: int, pixel) -> bytes:
+    """An RGBA PNG whose pixel(x, y) gives each pixel's (r, g, b, a), written with the standard library alone."""
+    rows = b"".join(b"\0" + bytes(c for x in range(width) for c in pixel(x, y)) for y in range(height))
+    chunk = lambda tag, body: struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def pixels(browser, screenshot: bytes, points) -> list[tuple[int, int, int]]:
+    """The RGB at each (x, y) of a PNG screenshot, decoded by the browser, so the suite needs no image library."""
+    page = browser.new_page()
+    try:
+        return [tuple(rgb) for rgb in page.evaluate("""async ([b64, points]) => {
+            const img = new Image();
+            img.src = "data:image/png;base64," + b64;
+            await img.decode();
+            const canvas = document.createElement("canvas");
+            [canvas.width, canvas.height] = [img.width, img.height];
+            const g = canvas.getContext("2d");
+            g.drawImage(img, 0, 0);
+            return points.map(([x, y]) => [...g.getImageData(x, y, 1, 1).data.slice(0, 3)]);
+        }""", [base64.b64encode(screenshot).decode(), points])]
+    finally:
+        page.close()
+
+
+def near(rgb, expected, tolerance: int = 8) -> bool:
+    return all(abs(a - b) <= tolerance for a, b in zip(rgb, expected))
+
+
+def image_case(root: Path, base: str, pages: Path, browser) -> None:
+    """Images on the page: each version shown, compared in four views, reached by the keyboard, commented on as a whole."""
+    repo = root / "images"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    blue, white, red = (40, 70, 160, 255), (240, 240, 240, 255), (220, 40, 40, 255)
+    square = lambda x, y: 150 <= x < 170 and 100 <= y < 120   # the one region where shot.png changes
+    noise = lambda x, y: ((x * 7919 + y * 104729) % 251, (x * 31 + y * 17) % 253, (x ^ y) % 256, 255)   # compresses badly
+    (repo / "a.txt").write_text("one\n")
+    (repo / "old-name.txt").write_text("renamed, not changed\n")
+    (repo / "run.sh").write_text("#!/bin/sh\n")
+    (repo / "shot.png").write_bytes(png(240, 160, lambda x, y: blue))
+    (repo / "wide.png").write_bytes(png(900, 60, lambda x, y: white))
+    (repo / "gone.png").write_bytes(png(30, 20, lambda x, y: red))
+    (repo / "still.png").write_bytes(png(50, 40, lambda x, y: white))
+    (repo / "tall.png").write_bytes(png(80, 1000, lambda x, y: white))
+    (repo / "data.bin").write_bytes(bytes(range(256)))
+    (repo / "logo.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="#3b6"/></svg>\n')
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "base")
+    (repo / "a.txt").write_text("one\ntwo\n")
+    git(repo, "mv", "old-name.txt", "new-name.txt")
+    (repo / "run.sh").chmod(0o755)
+    (repo / "shot.png").write_bytes(png(240, 160, lambda x, y: red if square(x, y) else blue))
+    (repo / "wide.png").write_bytes(png(960, 60, noise))   # wider, and far heavier than the plain white it replaces
+    (repo / "tall.png").write_bytes(png(80, 1000, lambda x, y: red if 400 <= y < 420 else white))
+    (repo / "added.png").write_bytes(png(120, 80, lambda x, y: (2 * x, 3 * y, 200, 0 if x < 30 else 255)))   # its left quarter transparent
+    (repo / "gone.png").unlink()
+    (repo / "data.bin").write_bytes(bytes(reversed(range(256))))
+    (repo / "logo.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40">\n<rect width="40" height="40" fill="#c33"/>\n'
+                                   '<script>window.top.postMessage("svg ran", "*")</script>\n</svg>\n')
+    git(repo, "add", "-A"); git(repo, "commit", "-qm", "change")
+    notes = root / "image-notes.json"
+    notes.write_text(json.dumps({"notes": [{"id": 1, "path": "added.png", "text": "a gradient"},
+                                           {"id": 2, "path": "still.png", "text": "the reference, left alone"}]}))
+    out = pages / f"images-{os.getpid()}.html"
+    state = Path(str(out) + ".state.json")
+    subprocess.run([str(DIFFVIEW), f"{repo}@HEAD~1..HEAD", "--notes", str(notes), "--no-auto-summary", "-o", str(out)],
+                   check=True, capture_output=True)
+
+    page = browser.new_page(viewport={"width": 1280, "height": 1600})
+    # an SVG whose script runs anywhere on the page, frames included, reports it here
+    page.add_init_script('window.svgRan = false; addEventListener("message", e => { if (e.data === "svg ran") window.svgRan = true; });')
+    page.goto(f"{base}/{out.name}")
+    page.wait_for_selector(".fcard")
+    page.evaluate('document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")))')
+    page.wait_for_function('[...document.querySelectorAll(".imgblock img")].every(img => img.complete)')
+    card = lambda path: page.locator(f'.fcard[data-key="0:{path}"]')
+    natural = lambda path, side: card(path).locator(f".imgside.{side} img").evaluate("img => [img.naturalWidth, img.naturalHeight]")
+    dims = lambda path: card(path).locator(".imgdims").inner_text().split(" · ")[0]
+
+    check("an added image shows its new version, at its own size", ([120, 80], 0), (natural("added.png", "new"), card("added.png").locator(".imgside.old").count()))
+    checker = pixels(browser, card("added.png").locator(".imgside.new img").screenshot(), [(4, 4), (12, 4)])
+    check("its transparent pixels show a checkerboard", (True, True), (near(checker[0], (36, 38, 45)), near(checker[1], (48, 51, 59))))
+    check("a deleted image shows its old version", ([30, 20], 0), (natural("gone.png", "old"), card("gone.png").locator(".imgside.new").count()))
+    check("a modified image names dimensions its versions share once", "240×160", dims("shot.png"))
+    check("and both where they differ, old first", "900×60 → 960×60", dims("wide.png"))
+    check("its header gives the size change, old first, in place of line counts", True,
+          re.fullmatch(r"\d+ B → \d+ KB", card("wide.png").locator(".fhead .mono").inner_text()) is not None)
+    check("an SVG shows its drawings above its text diff", 1, card("logo.svg").locator(".fbody > .imgblock + .diffbody").count())
+    page.wait_for_timeout(300)
+    check("and its script runs nowhere: every image frame holds an img, or the reason it has none", (False, True),
+          (page.evaluate("window.svgRan"),
+           page.evaluate("[...document.querySelectorAll('.imgframe > *')].every(el => el.tagName === 'IMG' || el.classList.contains('imgmiss'))")))
+    check("a note on an image outside the diff puts that image on the page", [50, 40], natural("still.png", "new"))
+    check("a binary file that is no image says what it is", "binary file", card("data.bin").locator(".binmsg").inner_text())
+
+    focused = lambda: page.evaluate("S.focus < 0 ? null : HUNKS[S.focus].x.f.path")
+
+    def walk(key: str) -> list:
+        seen = {focused()}
+        for _ in range(16):
+            page.keyboard.press(key)
+            seen.add(focused())
+        return sorted(seen - {None})
+
+    def focus(path: str) -> None:
+        page.keyboard.press("g"); page.keyboard.press("g")
+        for _ in range(12):
+            page.keyboard.press("J")
+            if focused() == path:
+                return
+
+    check("the fixture has a card without hunks of every kind", ["added.png", "data.bin", "gone.png", "new-name.txt", "run.sh", "shot.png", "still.png", "tall.png", "wide.png"],
+          page.evaluate("ALL.filter(x => !x.f.hunks.length).map(x => x.f.path).sort()"))
+    every = sorted(page.evaluate("ALL.map(x => x.f.path)"))
+    page.keyboard.press("g"); page.keyboard.press("g")
+    check("J lands on every card, each one without hunks included", every, walk("J"))
+    check("and K on every one back", every, walk("K"))
+    page.keyboard.press("g"); page.keyboard.press("g")
+    check("so does j, a card without hunks being one stop", every, walk("j"))
+    focus("shot.png")
+    check("the focus outlines a card without hunks as a whole", 1, card("shot.png").locator(".fbody.focus").count())
+
+    stage = card("shot.png").locator(".imgview")
+    slider = card("shot.png").locator(".imgslider input")
+    view = lambda path: card(path).locator(".imgview").get_attribute("class")
+    at = lambda *points: pixels(browser, stage.screenshot(), points)
+    inside, outside = (160, 110), (5, 150)
+    page.keyboard.press("i")                  # 2-up → swipe
+    page.keyboard.press("}")
+    swiped_new = at(inside)[0]
+    page.keyboard.press("{")
+    swiped_old = at(inside)[0]
+    check("swipe at its new end shows the new version, at its old end the old one", (True, True), (near(swiped_new, red), near(swiped_old, blue)))
+    page.keyboard.press("]")
+    check("] moves the slider one step toward the new version", "10", slider.input_value())
+    check("the view is the page's: another image follows it, one with a single version stays 2-up", (True, True),
+          ("swipe" in view("wide.png"), "twoup" in view("added.png")))
+    page.keyboard.press("i")                  # → onion skin
+    check("the slider keeps its place across views", "10", slider.input_value())
+    page.keyboard.press("{")
+    check("onion skin at its old end shows the old version", True, near(at(inside)[0], blue))
+    for _ in range(5):
+        page.keyboard.press("]")
+    check("and halfway, half of each: (red + blue) / 2", True, near(at(inside)[0], (130, 55, 100)))
+    page.keyboard.press("4")                  # → difference, by its own key
+    check("4 picks the difference view, and its button says so", "difference", card("shot.png").locator(".chip.on").get_attribute("data-view"))
+    changed_px, unchanged_px = at(inside, outside)
+    check("difference: the changed square is |red − blue| per channel, the rest black", (True, True),
+          (near(changed_px, (180, 30, 120)), near(unchanged_px, (0, 0, 0))))
+    check("overlaid, a tall pair fits under the 600px height cap", 600,
+          round(card("tall.png").locator(".imgview").evaluate("el => el.getBoundingClientRect().height")))
+    page.keyboard.press("1")                  # → back to 2-up
+    page.keyboard.press("]")
+    check("2-up has no slider, and ] says so", True, "no slider" in page.locator("#toast").inner_text())
+
+    wide = card("wide.png").locator(".imgside.new img")
+    fitted = wide.evaluate("img => img.getBoundingClientRect().width")
+    wide.click()
+    check("an image wider than its column fits it, and a click shows it at actual pixels", (True, 960),
+          (fitted < 960, round(wide.evaluate("img => img.getBoundingClientRect().width"))))
+    tall = card("tall.png").locator(".imgside.new img")
+    height = lambda: round(tall.evaluate("img => img.getBoundingClientRect().height"))
+    capped = height()
+    tall.click()
+    check("side by side, a tall image fits under the cap, and a click shows its natural height", (600, 1000), (capped, height()))
+    tall.click()
+
+    def saved(ready) -> list:
+        held: list = []
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            held = json.loads(state.read_text())["comments"] if state.is_file() else []
+            if ready(held):
+                break
+            time.sleep(0.2)
+        return held
+
+    focus("wide.png")
+    page.keyboard.press("c")
+    page.keyboard.type("the strip is new")
+    page.keyboard.press("Control+Enter")
+    first = (saved(lambda cs: len(cs) == 1) or [{}])[0]
+    check("c on an image card comments on the whole file, above the image", ("file", -1, 1),
+          (first.get("side"), first.get("hi"), card("wide.png").locator(".fbody > .cbox.file + .imgblock").count()))
+    exported = page.evaluate("commentsMarkdown()")
+    check("the export describes each version where a line comment quotes lines", True,
+          "**C1** · whole file" in exported and "  old PNG 900×60" in exported and "  new PNG 960×60" in exported)
+    page.keyboard.press("e")                  # saving left the focus on C1
+    page.keyboard.press("Control+a")
+    page.keyboard.type("the strip is new, and wanted")
+    page.keyboard.press("Control+Enter")
+    edited = (saved(lambda cs: bool(cs) and cs[0]["text"].endswith("wanted")) or [{}])[0]
+    check("e edits it in place", ("the strip is new, and wanted", 1), (edited.get("text"), card("wide.png").locator(".cbox.file").count()))
+    check("and Y puts it at the top of the file's diff", True, "## C1 · reviewer · whole file\n#  the strip is new, and wanted" in page.evaluate("diffText(true)"))
+    card("added.png").locator(".abox button", has_text="reply").click()
+    page.keyboard.type("looks right")
+    page.keyboard.press("Control+Enter")
+    reply = (saved(lambda cs: len(cs) == 2) or [{}])[-1]
+    check("a reply to a note on an image lands on the whole file, right under the note", ("file", 1, "c2"),
+          (reply.get("side"), reply.get("re"), card("added.png").locator(".fbody > .abox.file + .cbox.file").get_attribute("data-ann")))
+
+    focus("gone.png")
+    page.keyboard.press(" ")
+    check("Space marks an image card viewed, folds its image away, and moves on to the next file", (True, False, "logo.svg"),
+          (page.evaluate("S.viewed.has('0:gone.png')"), card("gone.png").locator(".imgblock").is_visible(), focused()))
+    page.close()
+
+    # a zoomed page has more screen pixels per CSS pixel; sizes held in CSS pixels grow with it, as text does
+    zoomed = browser.new_page(viewport={"width": 1280, "height": 1600}, device_scale_factor=2)
+    zoomed.goto(f"{base}/{out.name}")
+    zoomed.wait_for_selector(".fcard")
+    zoomed.evaluate('document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")))')
+    zoomed.wait_for_function('[...document.querySelectorAll(".imgblock img")].every(img => img.complete)')
+    check("an image keeps its CSS size on a zoomed page, so it scales with the text", 120,
+          round(zoomed.locator('.fcard[data-key="0:added.png"] .imgside.new img').evaluate("img => img.getBoundingClientRect().width")))
+    zoomed.close()
+
+
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="diffview-test-"))
     repo = fixture(root)
@@ -660,6 +883,7 @@ def main() -> int:
             order_case(root, browser)
             fold_case(root, browser)
             heartbeat_case(url, browser)
+            image_case(root, url.rsplit("/", 1)[0], pages, browser)
             outage_case(repo, pages, browser)
             rewrite_case(root, repo, pages, browser)
             browser.close()
@@ -668,7 +892,7 @@ def main() -> int:
             os.kill(json.loads((pages / ".serve.json").read_text())["pid"], signal.SIGTERM)
         except (OSError, ValueError, KeyError):
             pass
-        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*")]:
+        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*")]:
             p.unlink()
         shutil.rmtree(root, ignore_errors=True)
     print(f"\n{failures} failure(s)")
