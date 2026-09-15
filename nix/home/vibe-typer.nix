@@ -15,7 +15,23 @@
 # Startup lives here, not in ~/.config/autostart: the app rewrites its own
 # .desktop file whenever its "start on login" setting changes, which would drop
 # the environment above. Leave that setting off in the app.
-{ ... }:
+#
+# GNOME's "Vibe Typer" entry, also the vibetyper:// handler, starts this unit
+# rather than the AppImage, so a launch from the app grid gets the environment
+# too. When the unit already runs, the entry launches the AppImage plainly: that
+# copy only hands its arguments to the running one and quits. An extracted copy
+# would share the running one's directory, named after the AppImage's hash, and
+# delete it on exit.
+{ config, pkgs, ... }:
+let
+  appImage = "${config.home.homeDirectory}/applications/VibeTyper.AppImage";
+  open = pkgs.writeShellScript "vibe-typer-open" ''
+    if systemctl --user is-active --quiet vibe-typer.service; then
+      exec ${appImage} "$@"
+    fi
+    exec systemctl --user start vibe-typer.service
+  '';
+in
 {
   systemd.user.services.vibe-typer = {
     Unit = {
@@ -28,10 +44,25 @@
         "APPIMAGE_EXTRACT_AND_RUN=1"
         "TMPDIR=/var/tmp"
       ];
-      ExecStart = "%h/applications/VibeTyper.AppImage --autostart";
+      ExecStart = "${appImage} --autostart";
       Restart = "on-failure";
       RestartSec = 5;
     };
     Install.WantedBy = [ "graphical-session.target" ];
+  };
+
+  # Not xdg.desktopEntries: that writes into the profile, and a same-named entry
+  # in ~/.local/share/applications outranks it. force replaces such a file.
+  xdg.dataFile."applications/com.vibetyper.app.desktop" = {
+    force = true;
+    text = ''
+      [Desktop Entry]
+      Type=Application
+      Name=Vibe Typer
+      Exec=${open} %u
+      Terminal=false
+      Categories=Utility;AudioVideo;
+      MimeType=x-scheme-handler/vibetyper;
+    '';
   };
 }
