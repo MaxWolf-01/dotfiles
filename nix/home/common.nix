@@ -75,6 +75,7 @@
       "agent/transcripts"
       "agent/handoffs"
       "agent/research"
+      "agent/reviews"
       "agent/diffviews"
       "agent/harden"
       "agent/board.html"
