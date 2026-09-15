@@ -11,12 +11,16 @@
       { id = "jnbbnacmeggbgdjgaoojpmhdlkkpblgi"; } # WakaTime
     ];
     # BraveCommander (Quick commands) owns Ctrl+Space, VibeTyper's dictation key.
+    # Vulkan: Brave's Wayland backend refuses it ("'--ozone-platform=wayland' is
+    # not compatible with Vulkan", logged at every launch), so brave://flags'
+    # enable-vulkan only adds a failed start; a feature disabled here wins over
+    # the flag.
     # Chromium reads only the last --disable-features, and the nixpkgs wrapper
     # passes its own first: its list is repeated here, or this flag erases it.
     # After a flake update, compare with the wrapper's first match in
     # `grep -o -- '--disable-features=[^ ]*' $(which brave)`.
     commandLineArgs = [
-      "--disable-features=OutdatedBuildDetector,UseChromeOSDirectVideoDecoder,BraveCommander"
+      "--disable-features=OutdatedBuildDetector,UseChromeOSDirectVideoDecoder,BraveCommander,Vulkan"
     ];
   };
 
