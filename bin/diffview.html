@@ -402,8 +402,8 @@ function reviewOf(blob) {
 /* ---- reading state: the reader's own marks, in this browser ----
    Which files are viewed and what context is open are one reader's progress, not the review's: they
    stay out of the file a shared page carries, and this browser's tabs on the page share them. A state
-   file from before this split still carries them; the first load here with none of its own takes
-   them over, and the next save writes the file without them. */
+   file may still carry them, written when they were the file's; the first load here with none of its
+   own takes them over, and the next save writes the file without them. */
 function readingState(stored) {
   const kept = loadReading();
   if (kept) return kept;
@@ -484,7 +484,8 @@ function persist() {
   // savedAt names this write to whoever loads it next; writer and since let the server tell a page
   // that saw the file's current version from one that did not
   LAST_SAVED = Math.max(Date.now(), LAST_SAVED + 1);
-  const blob = { savedAt: LAST_SAVED, writer: WRITER, since: SINCE, comments: S.comments, nextId: S.nextId,
+  // every field a copy: the write is what S holds now, and landed() records exactly that, not what S holds at the acknowledgement
+  const blob = { savedAt: LAST_SAVED, writer: WRITER, since: SINCE, comments: structuredClone(S.comments), nextId: S.nextId,
                  verdict: [...S.verdict], seen: [...S.seen] };
   // before the send, so the file is never the only copy; with the landed state beside it, so a reload
   // merges what never landed into whatever the file holds by then
@@ -533,28 +534,29 @@ function saveBroke() {
   document.querySelector(".top").after(bar);
 }
 /* the file moved between this page's last sync and this write: take the file, keep what this page
-   changed since, send again. Nobody is asked; the merge loses nothing it does not say */
+   changed since, send again. Nobody is asked; the merge loses nothing it does not say. A fetch the
+   poll started just before may be the one taken: then its file predates the move, and the resend is
+   refused once more, which comes back here with a fresh fetch */
 function refused() {
-  return takeFile(true).then(persist);
+  return takeFile().then(persist);
 }
 /* the file as it is now, merged in when it is a version this page has not seen. One at a time, since
-   the poll, a refused save and a focus can all ask. A write of this page's own that landed is not
-   news, unless a refusal says the file moved anyway */
-function takeFile(force) {
+   the poll, a refused save and a focus can all ask */
+function takeFile() {
   if (!SYNC) SYNC = fetchState()
-    .then(file => { if (file && file.savedAt !== SINCE && (force || file.writer !== WRITER)) mergeFile(file); })
+    .then(file => { if (file && file.savedAt !== SINCE) mergeFile(file); })
     .finally(() => { SYNC = null; });
   return SYNC;
 }
 /* the page follows its file: what another page saved is merged in, and the request is the heartbeat a
    --serve server counts an open tab by. Nothing is merged over a write of this page's own that is still
    in the air, or waiting on a server that stopped answering: the answer to that write decides, and the
-   poll returns after */
+   poll returns after; so a file the poll finds newer is always another page's */
 function follow() {
   if (!S) return;   // the state file is still being read
   syncReading();
   if (INFLIGHT || RETRY || SYNC) return;
-  takeFile(false);
+  takeFile();
 }
 
 /* ---- the merge ----
@@ -568,15 +570,15 @@ function follow() {
 const sameComment = (a, b) => a.fileKey === b.fileKey && a.hi === b.hi && a.side === b.side && a.start === b.start
   && a.end === b.end && a.text === b.text && (a.re ?? null) === (b.re ?? null);
 function mergeFile(file) {
-  const theirs = reviewOf(file), base = LANDED;
-  const baseById = new Map(base.comments.map(c => [c.id, c]));
+  const theirs = reviewOf(file), landed = LANDED;
+  const landedById = new Map(landed.comments.map(c => [c.id, c]));
   const mineById = new Map(S.comments.map(c => [c.id, c]));
   const theirsById = new Map(theirs.comments.map(c => [c.id, c]));
   const before = annotationSigs();
   const out = new Map(), renamed = new Map(), dropped = [];
   let next = Math.max(theirs.nextId, S.nextId);
   for (const t of theirs.comments) {
-    const mine = mineById.get(t.id), was = baseById.get(t.id);
+    const mine = mineById.get(t.id), was = landedById.get(t.id);
     if (was) {
       if (!mine) continue;                                                     // deleted here since the landed state
       if (sameComment(mine, was)) out.set(t.id, Object.assign(mine, t));       // untouched here: the file's version
@@ -585,10 +587,14 @@ function mergeFile(file) {
     else out.set(t.id, t);                                                     // the file's own; one added here under this id moves below
   }
   for (const c of S.comments) {
-    const was = baseById.get(c.id);
+    const was = landedById.get(c.id);
     if (was) { if (!sameComment(c, was) && !theirsById.has(c.id)) dropped.push(c.id); continue; }   // edited here, deleted there
     if (out.get(c.id) === c) continue;
-    if (out.has(c.id)) { renamed.set(c.id, next); c.id = next++; }
+    if (out.has(c.id)) {
+      while (out.has(next)) next++;   // a file edited by hand may hold an id past its own counter
+      renamed.set(c.id, next);
+      c.id = next++;
+    }
     out.set(c.id, c);
     next = Math.max(next, c.id + 1);
   }
@@ -602,8 +608,8 @@ function mergeFile(file) {
     return merged;
   };
   S.comments = [...out.values()];
-  S.verdict = marks(S.verdict, base.verdict, theirs.verdict, true);
-  S.seen = marks(S.seen, base.seen, theirs.seen, false);
+  S.verdict = marks(S.verdict, landed.verdict, theirs.verdict, true);
+  S.seen = marks(S.seen, landed.seen, theirs.seen, false);
   S.nextId = Math.max(next, ...S.comments.map(c => c.id + 1));
   if (S.ann && S.ann.kind === "comment" && renamed.has(S.ann.id)) S.ann.id = renamed.get(S.ann.id);
   LANDED = reviewOf(file);
@@ -635,20 +641,21 @@ function redraw(before, renamed) {
 }
 /* what the reader is looking at stays where it is while annotations appear or vanish above it: the
    first row under the sticky headers is measured before and put back after. The browser's own scroll
-   anchoring would do this, but not around a node that is removed and made again, which a redrawn
-   annotation is */
+   anchoring does the same, except when the node it anchored on is removed and made again, which a
+   redrawn annotation is; a code row is never redrawn, so it is the one measured */
 function keepingPlace(fn) {
   const top = document.querySelector(".top"), head = document.querySelector(".fhead"), main = document.querySelector(".main");
   let el = null, before = 0;
   if (top && head && main) {
     const r = main.getBoundingClientRect();
+    // hit testing returns cells, never rows: the row is the cell's ancestor
     let hit = document.elementsFromPoint(r.left + Math.min(240, r.width / 2), top.offsetHeight + head.offsetHeight + 2)
-      .find(e => e.matches("table.diff tr, .imgblock, .binmsg, .summary, .src-hdr"));
+      .map(e => e.closest("table.diff tr, .imgblock, .binmsg, .summary, .src-hdr")).find(Boolean);
     while (hit && hit.matches("tr.crow, tr.arow")) hit = hit.previousElementSibling;   // an annotation may be redrawn; the row above it stays
     if (hit) { el = hit; before = hit.getBoundingClientRect().top; }
   }
   fn();
-  if (el && el.isConnected) {
+  if (el && el.isConnected && el.getClientRects().length) {   // a row whose card just collapsed has no place to be put back to
     const after = el.getBoundingClientRect().top;
     if (after !== before) scrollBy(0, after - before);
   }
@@ -2321,6 +2328,7 @@ function restoreDraft(draft) {
   if (!draft) return;
   ensureRendered(draft.ref.fileKey);
   const existing = draft.existingId ? S.comments.find(c => c.id === draft.existingId) : null;
+  if (draft.existingId && !existing) toast(`C${draft.existingId} was deleted in another tab; what you are typing goes on as a new comment`);
   openCommentEditor(draft.ref, existing, draft.text);
   const ta = document.querySelector(".cbox[data-editing] textarea");
   if (!ta) return;
