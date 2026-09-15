@@ -412,8 +412,8 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     check("a reload shows both, with no warning", (2, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
 
     # the server dies again, a comment is typed, and the tab goes away as a discarded one would;
-    # the file is then changed by hand, and a tab opened after that holds the local copy: the
-    # reviewer picks which survives, and nothing is overwritten on its own
+    # the file is then changed by hand, and a tab opened after that holds the local copy: the hand
+    # restore and the comment typed during the outage both land, and nobody is asked
     stop()
     comment("typed during the second outage", 22)
     page.wait_for_selector(".savefail")
@@ -425,54 +425,200 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     restart()
     page = context.new_page()
     page.goto(f"http://127.0.0.1:{port}/{out.name}")
-    page.wait_for_selector(".savefail button")
-    check("a fresh tab shows the local copy, and says the file moved on", (3, True),
-          (page.locator(".cbox .ctext").count(), "another page saved" in page.locator(".savefail").inner_text()))
-    check("while the file still holds the hand edit", True, "restored by hand" in on_disk())
-    page.locator(".savefail button", has_text="keep this page").click()
-    check("keeping this page lands the local copy over the hand edit", True, wait_for(lambda: on_disk() == [
-        "saved while the server lived", "typed while it was gone", "typed during the second outage"]))
-    page.reload()   # at once: the file holds the write before the page hears so, and must not be asked about it again
     page.wait_for_selector("tbody.hunk")
-    check("and the next reload reads the file, quietly", (3, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
+    check("a fresh tab merges the local copy into the file: the hand restore and the outage's comment both land", True,
+          wait_for(lambda: on_disk() == ["saved while the server lived", "typed while it was gone", "restored by hand", "typed during the second outage"]))
+    check("with no bar, and the local copy spent", (4, 0, None),
+          (page.locator(".cbox .ctext").count(), page.locator(".savefail").count(), page.evaluate("localStorage.getItem(LOCAL_KEY)")))
+    page.reload()
+    page.wait_for_selector("tbody.hunk")
+    check("and the next reload reads the file, quietly", (4, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
 
-    # the same again, and this time the reviewer takes the file: the local copy is given up,
-    # and the reload that follows reads the file without asking again
+    # the same again, and this time the hand edit deletes a comment: the deletion holds, and the outage's comment still lands
     stop()
     comment("typed during the third outage", 23)
     page.wait_for_selector(".savefail")
     page.close()
     held = json.loads(state.read_text())
-    held["comments"].append({**held["comments"][0], "id": 9, "text": "restored by hand again"})
+    held["comments"] = [c for c in held["comments"] if c["text"] != "typed while it was gone"]
     held.update(savedAt=held["savedAt"] + 1, writer="hand")
     state.write_text(json.dumps(held))
     restart()
     page = context.new_page()
     page.goto(f"http://127.0.0.1:{port}/{out.name}")
-    page.wait_for_selector(".savefail button")
-    with page.expect_navigation():
-        page.locator(".savefail button", has_text="take theirs").click()
     page.wait_for_selector("tbody.hunk")
-    check("taking theirs reads the file, drops the local copy, and asks nothing more", (4, 0, None),
-          (page.locator(".cbox .ctext").count(), page.locator(".savefail").count(), page.evaluate("localStorage.getItem(LOCAL_KEY)")))
-    check("and the file keeps the hand edit", True, "restored by hand again" in on_disk())
+    check("a comment deleted by hand stays deleted, and the outage's comment lands beside the rest", True,
+          wait_for(lambda: on_disk() == ["saved while the server lived", "restored by hand", "typed during the second outage", "typed during the third outage"]))
+    check("again with no bar", 0, page.locator(".savefail").count())
     context.close()
 
 
+def tabs_case(repo: Path, pages: Path, browser) -> None:
+    """Two pages on one review, in two browsers: each follows the file, a draft survives the other's save, a save
+    that raced the poll is merged instead of asked about, viewed marks stay in the browser that made them, and
+    what the reader is looking at never moves."""
+    out = pages / f"tabs-{os.getpid()}.html"
+    state = Path(str(out) + ".state.json")
+    subprocess.run([str(DIFFVIEW), f"{repo}@base..HEAD", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
+    port = json.loads((pages / ".serve.json").read_text())["port"]
+    origin = f"http://127.0.0.1:{port}"
+    url = f"{origin}/{out.name}"
+    on_disk = lambda: [(c["id"], c["text"]) for c in json.loads(state.read_text())["comments"]] if state.is_file() else []
+    texts = lambda page: page.locator(".cbox .ctext").all_inner_texts()
+    gutter = lambda page, line: page.locator(f'tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="{line}"]')
+
+    def wait_for(cond, seconds: float = 8) -> bool:
+        # the wait runs the browser's event loop: a routed request stays held until Python is inside a playwright call
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not cond():
+            a.wait_for_timeout(200)
+        return cond()
+
+    def comment(page, text: str, line: int) -> None:
+        gutter(page, line).click()
+        page.keyboard.type(text)
+        page.keyboard.press("Control+Enter")
+
+    def open_page(context):
+        page = context.new_page()
+        page.on("pageerror", lambda e: print(f"     page error: {e}"))
+        page.goto(url)
+        page.wait_for_selector(".fcard")   # the card, not its rows: a tab opening on a viewed file has them collapsed
+        return page
+
+    def racer(text: str = "", drop: str = "") -> None:
+        """Another page's write, straight to the server, based on the file as it is this instant."""
+        held = json.loads(state.read_text())
+        if drop:
+            held["comments"] = [c for c in held["comments"] if c["text"] != drop]
+        else:
+            held["comments"].append({**held["comments"][0], "id": held["nextId"], "text": text})
+            held["nextId"] += 1
+        body = json.dumps({**held, "since": held["savedAt"], "savedAt": held["savedAt"] + 1, "writer": "racer"}).encode()
+        urllib.request.urlopen(urllib.request.Request(f"{url}.state.json", data=body, method="POST", headers={"Origin": origin}), timeout=5).close()
+
+    race = {"pending": None}   # a racer's write to slip in ahead of this page's next save, once
+
+    def hold(route):
+        if route.request.method == "POST" and race["pending"]:
+            racer(**race["pending"])
+            race["pending"] = None
+        route.continue_()
+
+    def jump(page, target: str) -> None:
+        page.keyboard.press("Control+k")
+        page.locator("#jump input").fill(target)
+        page.locator("#jump input").press("Enter")
+
+    viewport = {"width": 1280, "height": 720}
+    one, other = browser.new_context(viewport=viewport), browser.new_context(viewport=viewport)   # two browsers: nothing in common but the server
+    a, b = open_page(one), open_page(other)
+    comment(a, "from A", 20)
+    check("a comment typed in one browser shows in the other, with no reload", True, wait_for(lambda: texts(b) == ["from A"]))
+
+    # a draft in A survives B's save, and saves with the next id
+    gutter(a, 21).click()
+    a.keyboard.type("half a thought")
+    comment(b, "from B", 22)
+    check("B's comment reaches A while A types", True, wait_for(lambda: "from B" in texts(a)))
+    draft = a.locator(".cbox[data-editing] textarea")
+    check("the draft A was typing is still open, with its text, the caret at its end, and the focus", ("half a thought", 14, True),
+          (draft.input_value(), draft.evaluate("el => el.selectionStart"), draft.evaluate("el => el === document.activeElement")))
+    a.keyboard.type(", finished")
+    a.keyboard.press("Control+Enter")
+    check("and it saves with the next id, nothing refused", True,
+          wait_for(lambda: on_disk() == [(1, "from A"), (2, "from B"), (3, "half a thought, finished")]))
+    check("neither page shows a bar", (0, 0), (a.locator(".savefail").count(), b.locator(".savefail").count()))
+
+    # a save that raced the poll: A's write is held while another page writes first, so the server refuses
+    # it; A merges the file in and sends again, its comment under the next free number, and says so
+    a.route(f"**/{out.name}.state.json", hold)
+    race["pending"] = {"text": "raced in"}
+    comment(a, "typed as the race ran", 23)
+    check("the refused save is merged and sent again: both comments land, A's renumbered", True,
+          wait_for(lambda: on_disk() == [(1, "from A"), (2, "from B"), (3, "half a thought, finished"), (4, "raced in"), (5, "typed as the race ran")]))
+    check("and A says which number moved", True, "C4 is now C5" in a.locator("#toast").inner_text())
+    check("B follows", True, wait_for(lambda: "raced in" in texts(b) and "typed as the race ran" in texts(b)))
+
+    # the same race against a deletion: A's edit of a comment the other page deleted is dropped, and A says so
+    jump(a, "c2")
+    a.keyboard.press("e")
+    a.keyboard.press("End")
+    a.keyboard.type(", edited here")
+    race["pending"] = {"drop": "from B"}
+    a.keyboard.press("Control+Enter")
+    check("the deletion holds and the edit is dropped", True,
+          wait_for(lambda: on_disk() == [(1, "from A"), (3, "half a thought, finished"), (4, "raced in"), (5, "typed as the race ran")]))
+    check("with a word about it", True, wait_for(lambda: "your edit of C2 was dropped" in a.locator("#toast").inner_text()))
+
+    # a comment restored with u after its deletion landed keeps its number through a merge
+    jump(a, "c1")
+    a.keyboard.press("D")
+    check("the deletion lands", True, wait_for(lambda: (1, "from A") not in on_disk()))
+    race["pending"] = {"text": "meanwhile"}
+    a.keyboard.press("u")
+    check("the restore lands under its old number, beside what the other page wrote meanwhile", True,
+          wait_for(lambda: (1, "from A") in on_disk() and (6, "meanwhile") in on_disk()))
+    a.unroute(f"**/{out.name}.state.json")
+
+    # viewed marks are the reader's: they stay in the browser that made them, shared by its tabs, out of the file
+    a.locator('.fcard[data-key="0:a.txt"] .fhead input').check()
+    a2 = open_page(one)
+    check("a second tab of the same browser opens with the file marked viewed", True, a2.evaluate("S.viewed.has('0:a.txt')"))
+    check("the other browser never sees the mark, and the file does not carry it", (False, False),
+          (b.evaluate("S.viewed.has('0:a.txt')"), "viewed" in json.loads(state.read_text())))
+    a2.locator('.fcard[data-key="0:a.txt"] .fhead input').uncheck()
+    check("unticking it in one tab unticks it in the other within a poll", True,
+          wait_for(lambda: a.evaluate("!S.viewed.has('0:a.txt') && !CARDS.get('0:a.txt').classList.contains('viewed')")))
+    a2.close()
+
+    # a merge changes nothing on screen but the annotation it brought: the row under the header stays the same
+    # element at the same place, and a fetch that finds the file unchanged touches nothing at all
+    a.evaluate("hunkTbody('0:a.txt', 1).scrollIntoView()")
+    a.wait_for_timeout(100)
+    top_before = a.evaluate("""() => {
+      const under = document.querySelector(".top").offsetHeight + document.querySelector(".fhead").offsetHeight;
+      const row = [...hunkTbody("0:a.txt", 1).querySelectorAll("tr")].find(tr => tr.getBoundingClientRect().top >= under);   // the first row fully below the sticky headers
+      row.dataset.probe = "row";
+      hunkTbody("0:a.txt", 0).dataset.probe = "hunk";
+      return row.getBoundingClientRect().top;
+    }""")
+    a.evaluate("""window.mutations = 0;
+      new MutationObserver(ms => window.mutations += ms.length)
+        .observe(document.querySelector(".main"), { subtree: true, childList: true, attributes: true, characterData: true })""")
+    a.wait_for_timeout(4500)   # two polls of a file that did not change
+    check("a fetch that finds the file unchanged touches nothing on the page", 0, a.evaluate("window.mutations"))
+    comment(b, "from B, above what A reads", 18)
+    check("B's comment reaches A", True, wait_for(lambda: "from B, above what A reads" in texts(a)))
+    # to within a pixel: the scroll offset snaps to whole pixels while a row's top is fractional
+    check("the row A was reading is the same element at the same place, and the hunk that took the comment was not rebuilt",
+          (True, True, True),
+          (a.evaluate('!!document.querySelector(\'[data-probe="row"]\')'),
+           abs(a.evaluate('document.querySelector(\'[data-probe="row"]\').getBoundingClientRect().top') - top_before) < 1,
+           a.evaluate('!!document.querySelector(\'tbody[data-probe="hunk"]\')')))
+    one.close()
+    other.close()
+
+
 def heartbeat_case(url: str, browser) -> None:
-    """An open page beats once a minute, so its server counts it as open; the clock is faked so a minute takes no time."""
+    """An open page fetches its state file every two seconds: that is how it follows the file, and the request
+    its server counts it open by. The clock is faked so a minute takes no time; each tick gets a moment for
+    its fetch to return, since a tick finding one in flight leaves it be."""
     page = browser.new_page()
-    beats: list[str] = []
-    page.on("request", lambda r: beats.append(r.url) if r.url.endswith("/.health") else None)
+    fetches: list[str] = []
+    page.on("request", lambda r: fetches.append(r.url) if r.url.endswith(".state.json") and r.method == "GET" else None)
     page.clock.install()
     page.goto(url)
     page.wait_for_selector("tbody.hunk")
-    page.clock.run_for(61_000)
+    at_load = len(fetches)
+    page.clock.run_for(2_100)
     page.wait_for_timeout(200)
-    check("a page beats within a minute of opening", 1, len(beats))
-    page.clock.run_for(60_000)
-    page.wait_for_timeout(200)
-    check("and once a minute from then on", 2, len(beats))
+    check("a page fetches its file within two seconds of opening", True, len(fetches) > at_load)
+    before = len(fetches)
+    for _ in range(30):
+        page.clock.run_for(2_000)
+        page.wait_for_timeout(30)
+    check("and about thirty times a minute from then on", True, 27 <= len(fetches) - before <= 31)
     page.close()
 
 
@@ -885,6 +1031,7 @@ def main() -> int:
             heartbeat_case(url, browser)
             image_case(root, url.rsplit("/", 1)[0], pages, browser)
             outage_case(repo, pages, browser)
+            tabs_case(repo, pages, browser)
             rewrite_case(root, repo, pages, browser)
             browser.close()
     finally:
@@ -892,7 +1039,7 @@ def main() -> int:
             os.kill(json.loads((pages / ".serve.json").read_text())["pid"], signal.SIGTERM)
         except (OSError, ValueError, KeyError):
             pass
-        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*")]:
+        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"tabs-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*")]:
             p.unlink()
         shutil.rmtree(root, ignore_errors=True)
     print(f"\n{failures} failure(s)")
