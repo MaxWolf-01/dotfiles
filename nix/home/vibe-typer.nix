@@ -9,28 +9,32 @@
 # blocked roughly half of all suspend attempts, on six days out of eleven.
 # The flag is undocumented in --appimage-help but present in the runtime.
 #
+# NO_CLEANUP: every copy of one AppImage version unpacks into the same directory,
+# named after the file's hash, and without this flag deletes it on exit. A second
+# launch while the app runs would take the running app's files with it. The
+# directories of replaced versions age out of /var/tmp through systemd-tmpfiles
+# (30 days on Ubuntu).
+#
 # TMPDIR: /tmp is tmpfs here, so the default would hold the unpacked tree in RAM
 # for as long as the app runs.
 #
 # Startup lives here, not in ~/.config/autostart: the app rewrites its own
 # .desktop file whenever its "start on login" setting changes, which would drop
-# the environment above. Leave that setting off in the app.
+# the environment above. Leave that setting off in the app. The app grid entry
+# runs the AppImage with the same environment; launched while the app runs, that
+# copy only brings the running app's window forward and quits.
 #
-# GNOME's "Vibe Typer" entry, also the vibetyper:// handler, starts this unit
-# rather than the AppImage, so a launch from the app grid gets the environment
-# too. When the unit already runs, the entry launches the AppImage plainly: that
-# copy only hands its arguments to the running one and quits. An extracted copy
-# would share the running one's directory, named after the AppImage's hash, and
-# delete it on exit.
-{ config, pkgs, ... }:
+# X-SwitchMethod: the app moves itself out of the unit's cgroup into a scope of
+# its own, so restarting the unit on a switch kills only its helper processes,
+# and the app dies without them. A changed unit applies at the next start.
+{ config, lib, ... }:
 let
   appImage = "${config.home.homeDirectory}/applications/VibeTyper.AppImage";
-  open = pkgs.writeShellScript "vibe-typer-open" ''
-    if systemctl --user is-active --quiet vibe-typer.service; then
-      exec ${appImage} "$@"
-    fi
-    exec systemctl --user start vibe-typer.service
-  '';
+  environment = [
+    "APPIMAGE_EXTRACT_AND_RUN=1"
+    "NO_CLEANUP=1"
+    "TMPDIR=/var/tmp"
+  ];
 in
 {
   systemd.user.services.vibe-typer = {
@@ -38,12 +42,10 @@ in
       Description = "VibeTyper dictation";
       PartOf = [ "graphical-session.target" ];
       After = [ "graphical-session.target" ];
+      X-SwitchMethod = "keep-old";
     };
     Service = {
-      Environment = [
-        "APPIMAGE_EXTRACT_AND_RUN=1"
-        "TMPDIR=/var/tmp"
-      ];
+      Environment = environment;
       ExecStart = "${appImage} --autostart";
       Restart = "on-failure";
       RestartSec = 5;
@@ -51,18 +53,11 @@ in
     Install.WantedBy = [ "graphical-session.target" ];
   };
 
-  # Not xdg.desktopEntries: that writes into the profile, and a same-named entry
-  # in ~/.local/share/applications outranks it. force replaces such a file.
-  xdg.dataFile."applications/com.vibetyper.app.desktop" = {
-    force = true;
-    text = ''
-      [Desktop Entry]
-      Type=Application
-      Name=Vibe Typer
-      Exec=${open} %u
-      Terminal=false
-      Categories=Utility;AudioVideo;
-      MimeType=x-scheme-handler/vibetyper;
-    '';
+  xdg.desktopEntries.vibe-typer = {
+    name = "Vibe Typer";
+    exec = "env ${lib.concatStringsSep " " environment} ${appImage}";
+    type = "Application";
+    categories = [ "Utility" ];
+    terminal = false;
   };
 }
