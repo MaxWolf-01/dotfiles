@@ -14,6 +14,12 @@ let
     bash coreutils util-linux rsync openssh gnugrep jq
   ]);
 
+  # uv runs the script itself (PEP 723 shebang); jq builds bin/run-log's line;
+  # sops and curl are what bin/alert-send needs to mail anything.
+  igSavesPath = lib.makeBinPath (with pkgs; [
+    bash coreutils jq uv sops curl
+  ]);
+
   # systemd for journalctl: the watchdog asks it when units without a run log
   # last finished cleanly, here and (over ssh) on the laptop.
   watchdogPath = "${backupPath}:${lib.makeBinPath [ pkgs.systemd ]}";
@@ -233,6 +239,42 @@ in
         "pcstate-rsyncnet.service"
       ];
     };
+  };
+
+  # --- Instagram saved posts, logged out ---
+  # Instagram blocks this IP for logged-out requests after a few thousand of
+  # them, so the job stops itself and the next hour picks up what is left; the
+  # ledger in ~/instagram-saves decides what that is. The job is finite: its run
+  # log carries `remaining`, and mails once it reaches zero.
+
+  systemd.user.services.instagram-saves = {
+    Unit = {
+      Description = "Download saved Instagram posts, logged out";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # 2 is Instagram refusing this IP and 1 is a post that failed and will be
+      # retried — the expected rhythm, not a broken unit. A run that breaks
+      # outright says so in its run log and by mail.
+      SuccessExitStatus = "1 2";
+      Environment = [
+        "PATH=${igSavesPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+      ];
+      ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/instagram-saves/saved.tsv --dest ${home}/instagram-saves --record";
+    };
+  };
+
+  systemd.user.timers.instagram-saves = {
+    Unit.Description = "Hourly resume of the saved-post download";
+    Timer = {
+      OnCalendar = "hourly";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
+    };
+    Install.WantedBy = [ "timers.target" ];
   };
 
   # --- Overdue watchdog ---
