@@ -17,7 +17,7 @@ let
   # uv runs the script itself (PEP 723 shebang); jq builds bin/run-log's line;
   # sops and curl are what bin/alert-send needs to mail anything.
   igSavesPath = lib.makeBinPath (with pkgs; [
-    bash coreutils gnugrep gnused jq uv sops curl
+    bash coreutils jq uv sops curl
   ]);
 
   # systemd for journalctl: the watchdog asks it when units without a run log
@@ -244,8 +244,8 @@ in
   # --- Instagram saved posts, logged out ---
   # Instagram blocks this IP for logged-out requests after a few thousand of
   # them, so the job stops itself and the next hour picks up what is left; the
-  # ledger in ~/instagram-saves decides what that is. A finite job: when its
-  # run log reports nothing left, this unit and its timer go away again.
+  # ledger in ~/instagram-saves decides what that is. The job is finite: its run
+  # log carries `remaining`, and mails once it reaches zero.
 
   systemd.user.services.instagram-saves = {
     Unit = {
@@ -263,7 +263,7 @@ in
         "PATH=${igSavesPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
       ];
-      ExecStart = "${secrets}/scripts/instagram-saves fetch %h/instagram-saves/saved.tsv --dest %h/instagram-saves --record";
+      ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/instagram-saves/saved.tsv --dest ${home}/instagram-saves --record";
     };
   };
 
