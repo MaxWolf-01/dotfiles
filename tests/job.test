@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Drive bin/job through every way a job can end. Run it directly; no framework.
+#
+# The contract under test is what a caller acts on: one exit code per outcome,
+# a wait that reports without ever touching the job it watched, a name that
+# stays taken until it is given back, and a log holding the command's output
+# and nothing else. The low-level wait form is here too, because dispatch-ctl
+# waits through it on state this script never created.
+
+set -uo pipefail
+
+job="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/job"
+export JOB_STATE_DIR
+JOB_STATE_DIR=$(mktemp -d)
+cleanup() {
+    for s in $(tmux list-sessions -F '#S' 2>/dev/null | grep '^job-jt-' || true); do
+        tmux kill-session -t "=$s" 2>/dev/null
+    done
+    rm -rf "$JOB_STATE_DIR"
+}
+trap cleanup EXIT
+
+failures=0
+
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+# --- the exit code is the outcome
+
+"$job" run jt-ok -- bash -c 'echo hello; exit 0' >/dev/null
+"$job" wait jt-ok --interval 1 >/dev/null
+check "a command that exits 0 waits to 0" 0 $?
+
+"$job" run jt-fail -- bash -c 'echo doomed; exit 7' >/dev/null
+"$job" wait jt-fail --interval 1 >/dev/null
+check "a command that exits non-zero waits to 1" 1 $?
+check "the status line keeps the real exit code" \
+    "7" "$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$JOB_STATE_DIR/jt-fail/status")"
+
+# The log is what a reader consults after the fact, so the wrapper keeps its
+# own noise out of it: systemd-inhibit announces a failing child on stderr, and
+# that line under a status line already naming the code blames the wrapper.
+check "the log holds the command's output alone" \
+    "doomed" "$(cat "$JOB_STATE_DIR/jt-fail/log")"
+
+"$job" run jt-quiet -- sleep 60 >/dev/null
+"$job" wait jt-quiet --stall 2 --interval 1 >/dev/null
+check "a log gone quiet waits to 2" 2 $?
+
+"$job" wait jt-quiet --deadline 2 --interval 1 >/dev/null
+check "a wait past its deadline waits to 5" 5 $?
+
+# Every wait above ended while the job kept running: a wait reports, and
+# killing is a separate decision made after reading the report.
+check "waits that ended left the job running" \
+    "running" "$("$job" probe | awk '$1 == "jt-quiet" { print $2 }')"
+
+"$job" run jt-watch -- bash -c 'echo warming up; sleep 1; echo loss=nan; sleep 60' >/dev/null
+"$job" wait jt-watch --watch 'loss=nan' --interval 1 >/dev/null
+check "a watched pattern waits to 3" 3 $?
+
+kill -9 "$(sed -n 's/^pid=//p' "$JOB_STATE_DIR/jt-quiet/meta")"
+"$job" wait jt-quiet --interval 1 >/dev/null
+check "a runner killed without a status line waits to 4" 4 $?
+
+# --- stop leaves a status line, so a stopped job is `done`, never `gone`
+
+"$job" stop jt-watch >/dev/null
+check "stop exits 0" 0 $?
+check "a stopped job still wrote its status" \
+    "143" "$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$JOB_STATE_DIR/jt-watch/status")"
+
+# --- a name is taken until it is given back
+
+"$job" run jt-ok -- true 2>/dev/null
+check "a name in use is refused" 64 $?
+check "the refused run left the first job's log alone" \
+    "hello" "$(cat "$JOB_STATE_DIR/jt-ok/log")"
+"$job" rm jt-ok >/dev/null
+"$job" run jt-ok -- bash -c 'echo second' >/dev/null
+check "the name is free after rm" 0 $?
+"$job" wait jt-ok --interval 1 >/dev/null
+check "the name now holds the second job" "second" "$(cat "$JOB_STATE_DIR/jt-ok/log")"
+
+# --- arguments reach the command as given
+
+# The command is typed into a tmux pane, so every argument crosses a shell that
+# would otherwise split, glob or swallow it.
+"$job" run jt-args -- bash -c 'printf "%s\n" "$1" "$2"' _ 'a b "c" $HOME *' 'two
+lines' >/dev/null
+"$job" wait jt-args --interval 1 >/dev/null
+check "spaces, quotes, globs and newlines survive the pane" \
+    'a b "c" $HOME *
+two
+lines' "$(cat "$JOB_STATE_DIR/jt-args/log")"
+
+# --- the low-level form, which is how dispatch-ctl waits on its own state
+
+foreign=$(mktemp -d)
+printf 'still going\n' > "$foreign/log"
+sleep 300 &
+foreign_pid=$!
+"$job" wait --status "$foreign/status" --log "$foreign/log" --pid "$foreign_pid" --deadline 2 --interval 1 >/dev/null
+check "a foreign job past its deadline waits to 5" 5 $?
+printf 'exit=0 ended=now secs=1\n' > "$foreign/status"
+"$job" wait --status "$foreign/status" --log "$foreign/log" --pid "$foreign_pid" --interval 1 >/dev/null
+check "a foreign status line ends the wait" 0 $?
+kill "$foreign_pid" 2>/dev/null
+rm -rf "$foreign"
+
+# --- usage errors are refused rather than guessed at
+
+"$job" run "bad/name" -- true 2>/dev/null
+check "a name that is not a directory name is refused" 64 $?
+"$job" run jt-nocmd 2>/dev/null
+check "a run without a command is refused" 64 $?
+"$job" wait jt-nothing --interval 1 2>/dev/null
+check "a wait on an unknown job is refused" 64 $?
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+else
+    echo "$failures check(s) failed"
+fi
+exit $((failures > 0))
