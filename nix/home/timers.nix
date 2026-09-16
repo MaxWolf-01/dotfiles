@@ -18,7 +18,7 @@ let
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
-    bash coreutils gnugrep git gh openssh
+    bash coreutils gnugrep git gh openssh jq # jq: bin/run-log builds its line with it
   ]);
 
   thermalPath = lib.makeBinPath (with pkgs; [
