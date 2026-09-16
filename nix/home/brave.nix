@@ -1,4 +1,45 @@
 { lib, pkgs, ... }:
+let
+  # Settings Brave keeps per profile, seeded by the activation script below.
+  # Key paths are the ones brave-core registers (`strings` on the binary lists
+  # them); the value here wins over whatever the UI last wrote.
+  profilePrefs = {
+    brave = {
+      new_tab_page = {
+        show_background_image = false;
+        show_branded_background_image = false;
+        show_sponsored_sites = false;
+        hide_all_widgets = true;
+        show_stats = false;
+        show_clock = false;
+        show_brave_news = false;
+        show_rewards = false;
+        show_brave_vpn = false;
+      };
+      # Leo's surfaces. The feature itself only goes away through the
+      # BraveAIChatEnabled policy: brave-core ignores an unmanaged
+      # brave.ai_chat.enabled_by_policy (IsDisabledByPolicy in
+      # components/ai_chat/core/browser/utils.cc).
+      ai_chat = {
+        show_toolbar_button = false;
+        context_menu_enabled = false;
+        autocomplete_provider_enabled = false;
+        tab_organization_enabled = false;
+      };
+      rewards = {
+        enabled = false;
+        show_brave_rewards_button_in_location_bar = false;
+      };
+      brave_ads.enabled = false;
+      wallet.show_wallet_icon_on_toolbar = false;
+      # Brave News, under its old name.
+      today = {
+        opted_in = false;
+        should_show_toolbar_button = false;
+      };
+    };
+  };
+in
 {
   programs.brave = {
     enable = true;
@@ -20,27 +61,26 @@
     ];
   };
 
-  # New-tab wallpaper off: the page falls back to the theme's flat background.
-  # Brave ships no policy for it, and Chromium reads policies from /etc only, so
-  # the profile pref is the only lever. Brave holds that file in memory and
-  # rewrites it on exit, hence a seed while Brave is down rather than a managed
-  # file; toggling it back on in the NTP settings lasts until the next switch.
-  home.activation.braveNewTabBackground = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+  # Brave exposes none of the above as policy, and Chromium reads policy files
+  # from /etc only, which standalone Home Manager cannot write here. So the
+  # prefs are merged into each profile's Preferences instead -- while Brave is
+  # down, because a running Brave rewrites that file from memory on exit.
+  home.activation.braveProfilePrefs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
     if ${pkgs.procps}/bin/pgrep -x -u "$USER" 'brave|\.brave-wrapped' > /dev/null; then
-      echo "brave: running, new-tab prefs untouched -- quit it and switch again"
+      echo "brave: running, profile prefs untouched -- quit it and switch again"
     else
       for prefs in "$HOME/.config/BraveSoftware/Brave-Browser"/*/Preferences; do
         [[ -e $prefs ]] || continue
-        if ${pkgs.jq}/bin/jq -e '.brave.new_tab_page.show_background_image == false' "$prefs" > /dev/null; then
+        if ${pkgs.jq}/bin/jq -e --argjson patch '${builtins.toJSON profilePrefs}' '. * $patch == .' "$prefs" > /dev/null; then
           continue
         fi
         if [[ -v DRY_RUN ]]; then
-          echo "would disable new-tab background images in $prefs"
+          echo "would update brave prefs in $prefs"
         else
           tmp=$(mktemp "$prefs.hm-XXXXXX")
-          ${pkgs.jq}/bin/jq -c '.brave.new_tab_page.show_background_image = false' "$prefs" > "$tmp"
+          ${pkgs.jq}/bin/jq -c --argjson patch '${builtins.toJSON profilePrefs}' '. * $patch' "$prefs" > "$tmp"
           mv "$tmp" "$prefs"
-          echo "brave: new-tab background images off in $prefs"
+          echo "brave: prefs applied to $prefs"
         fi
       done
     fi
