@@ -6,7 +6,7 @@
 # about CPU load. A training run in a detached tmux pane looks exactly as idle
 # as an empty desk, and gets suspended on schedule. This takes a block inhibitor
 # for the duration of the command and drops it the moment the command exits,
-# crashes, or is interrupted -- nothing global to remember to switch back.
+# crashes, or is interrupted, so there is nothing global to switch back.
 #
 # The lid switch is inhibited too, so closing the laptop does not stop the job.
 #
@@ -20,15 +20,20 @@
 # runs bare. -b has nothing to detach into there and fails instead.
 #
 # Usage:
-#   nosleep <command> [args...]
+#   nosleep [--why TEXT] <command> [args...]
 #   nosleep uv run train.py
 #   nosleep sleep 2h                keep the machine awake for two hours
 #   nosleep -b sleep 2h             the same, detached and cancellable
+#   nosleep --list                  every hold that can refuse a suspend, and
+#                                   the command that clears each
 #
-#   systemctl --user stop nosleep   cancel a detached hold
-#   journalctl --user -u nosleep    read its output
+#   --why TEXT  what to show for this hold instead of its command line. A
+#               wrapper whose argv says nothing useful passes this; `job` does.
 #
-# See everything currently holding the machine awake: systemd-inhibit --list
+#   systemctl --user stop nosleep   cancel a detached hold. Only a detached
+#                                   one: a foreground hold has no unit, and
+#                                   --list gives it its own cancel command.
+#   journalctl --user -u nosleep    read a detached hold's output
 
 set -euo pipefail
 
@@ -47,18 +52,92 @@ detach() {
     # leaves a failed unit behind unless systemd is told to reap it.
     systemctl --user is-active --quiet "$UNIT" && systemctl --user stop "$UNIT"
     systemd-run --user --quiet --collect --unit="$UNIT" --description="nosleep: $*" \
-        "${INHIBIT[@]}" --why="$*" "$@"
+        "${INHIBIT[@]}" --why="$why" "$@"
     echo "holding: $*  (cancel: systemctl --user stop $UNIT)"
 }
 
-case "${1:-}" in
-    ''|-h|--help) usage; exit 0 ;;
-    -b|--bg) shift; detach "$@"; exit 0 ;;
-esac
+# Seconds as something a person reads at a glance: 2h13m, 14m, 45s.
+age() {
+    s=${1:-0}
+    if [ "$s" -ge 3600 ]; then printf '%dh%dm' $((s / 3600)) $(((s % 3600) / 60))
+    elif [ "$s" -ge 60 ]; then printf '%dm' $((s / 60))
+    else printf '%ds' "$s"; fi
+}
+
+# What a hold is, and how to clear it, derived from the process rather than
+# declared: a hold taken by hand carries no label and still has to be
+# cancellable. Three shapes, in the order they can be told apart.
+identity() { # <pid> -> "<who>\t<cancel>"
+    pid=$1
+    if grep -q 'nosleep\.service' "/proc/$pid/cgroup" 2>/dev/null; then
+        printf 'detached\tsystemctl --user stop %s\n' "$UNIT"
+        return
+    fi
+    # `job` runs its command inside `job __exec <name>`, so the job's name is
+    # up the parent chain from the inhibitor. Walking it costs nothing and
+    # covers a job started before this version of nosleep taught it --why.
+    p=$pid
+    for _ in $(seq 10); do
+        # /proc/PID/status, never /proc/PID/stat: a comm holding a space
+        # shifts every field after it, and ppid is one of them.
+        p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null) || break
+        [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] || break
+        cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || break
+        case $cmd in
+            *"__exec "*)
+                name=${cmd#*__exec }; name=${name%% *}
+                printf 'job %s\tjob stop %s\n' "$name" "$name"
+                return ;;
+        esac
+    done
+    printf 'pid %s\tkill %s\n' "$pid" "$pid"
+}
+
+# logind's own API, never `systemd-inhibit --list`: that is a padded
+# fixed-width table whose WHY column holds arbitrary text, so any column split
+# over it is wrong for exactly the rows that matter.
+list() {
+    has_systemd || { echo "nosleep: no systemd on this host, so nothing can inhibit sleep"; return; }
+    rows=$(busctl --json=short call org.freedesktop.login1 /org/freedesktop/login1 \
+             org.freedesktop.login1.Manager ListInhibitors 2>/dev/null |
+           jq -r '.data[0][] | select(.[3] == "block" and (.[0] | contains("sleep"))) |
+                  [(.[5] | tostring), .[2]] | @tsv')
+    if [ -z "$rows" ]; then
+        echo "nothing is holding sleep open"
+        return
+    fi
+    # Only block mode with sleep in `what` can refuse a suspend. The delay-mode
+    # holds NetworkManager, UPower and GNOME keep are not in this list on
+    # purpose: they postpone a suspend by seconds and never prevent one.
+    {
+        printf 'WHO\tWHAT\tTTY\tHELD\tCANCEL\n'
+        while IFS=$'\t' read -r pid why; do
+            [ -n "$pid" ] || continue
+            IFS=$'\t' read -r who cancel < <(identity "$pid")
+            tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' '); [ "$tty" = "?" ] && tty=-
+            secs=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+            printf '%s\t%s\t%s\t%s\t%s\n' "$who" "${why:0:40}" "${tty:--}" "$(age "${secs:-0}")" "$cancel"
+        done <<< "$rows"
+    } | column -t -s $'\t'
+}
+
+why=
+while [ $# -gt 0 ]; do
+    case $1 in
+        ''|-h|--help) usage; exit 0 ;;
+        --list) list; exit 0 ;;
+        --why) why=${2:-}; shift 2 ;;
+        -b|--bg) shift; why=${why:-$*}; detach "$@"; exit 0 ;;
+        *) break ;;
+    esac
+done
+
+[ $# -gt 0 ] || { usage >&2; exit 1; }
+why=${why:-$*}
 
 if ! has_systemd; then
     echo "nosleep: no systemd on this host, running without an inhibitor" >&2
     exec "$@"
 fi
 
-exec "${INHIBIT[@]}" --why="$*" "$@"
+exec "${INHIBIT[@]}" --why="$why" "$@"
