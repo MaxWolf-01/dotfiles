@@ -15,6 +15,14 @@ For device inventory, infrastructure, and backup architecture: always read `secr
 
 Dotfiles are not exempt from branch discipline: the mechanical-vs-review seam applies here like everywhere — infra-shaped work (timers, backups, notifications, anything with failure modes) is never "just config".
 
+## Credentials
+
+Every SOPS-encrypted credential lives in `secrets/creds/`, split into `env/` (named
+variables, reached by `with-secrets <name> <command>`), `raw/` (one value, printed by
+`sops -d`) and `notes/` (text a human reads). `with-secrets --list` shows every file and
+the variables it defines without decrypting anything. The naming rule and how to add one:
+`secrets/README.md`, under Credentials.
+
 ## Getting Started
 
 ‼️‼️‼️
