@@ -27,7 +27,7 @@ Accounts are credentials, not config, so they are in no repo. Bootstrap once:
    request answers 401, whatever the key's scope.
 4. Mint an API key with admin scope (`Profile` → `API keys`). `sftpgo-user` needs
    it, and an API key bypasses TOTP, which is what makes unattended scripting work.
-5. Store it: `sops ~/.dotfiles/secrets/api_keys/sftpgo`, then commit in the secrets
+5. Store it: `sops ~/.dotfiles/secrets/creds/env/sftpgo-admin.env` as `SFTPGO__API_KEY=…`, then commit in the secrets
    repo. pc needs that commit too — `bin/sftpgo-user dump` runs there for the
    weekly backup and fails without the key.
 
