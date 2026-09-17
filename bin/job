@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# Run a long command in tmux and get told how it ended.
+#
+# A detached tmux pane finishing is invisible to whatever started it: nothing
+# observes a pane. So an agent that wants to be woken when a build lands has to
+# block on something, and a hand-written predicate ("is it still running?") is
+# where the bugs live. `pgrep -f <pattern>` matches the waiting shell's own
+# command line and loops forever. `job wait` is that predicate, written once.
+#
+# Usage: job run  <name> [--cwd DIR] [--awake] -- <command> [args...]
+#        job wait <name> [wait-flags]
+#        job wait --status FILE --log FILE [--pid PID] [wait-flags]
+#        job probe
+#        job log  <name> [lines]
+#        job stop <name>
+#        job rm   <name>
+#   run    starts <command> in a tmux session named job-<name>, with output
+#          going to the job's log, and returns at once. Fails when <name>
+#          already exists, running or done: names are unique until `job rm`,
+#          which is what stops one agent from reading another's build. Name
+#          jobs <project>-<activity> (api-migrate, docs-build); the name is
+#          also what shows up in `tmux ls`.
+#          --awake wraps the command in `nosleep`, for a finite job that has
+#          to survive a closed lid: a laptop measures idleness as no keyboard
+#          input, so a detached pane crunching for an hour gets suspended on
+#          schedule. It is opt-in because the hold lasts as long as the
+#          command does, and a server or a watcher never ends, which is to say
+#          the laptop stops suspending until someone works out why.
+#          `nosleep --list` names every hold and how to clear it.
+#   wait   blocks until the job ends, or until one of the flags below says to
+#          stop waiting. Nothing here ever touches the job: a wait that ends
+#          is a wait that ended, and killing is `job stop` or `job rm`. It
+#          holds no state and registers nothing, so it can be re-run with a
+#          longer window as often as you like. Prints the status line and the
+#          log tail so the answer arrives with the wake-up.
+#          The second form waits on files directly, for callers that keep
+#          their own state (dispatch-ctl); <name> resolves to exactly that.
+#   probe  one line per job: running, done (with its exit code), or gone
+#   stop   TERM the job, which still gets to write its status line
+#   rm     kill the session and forget the job, freeing the name
+#
+# The exit code says how the wait ended, so the wake-up carries the answer.
+#
+#   0  the command exited 0
+#   1  the command exited non-zero
+#   4  the runner died without writing a status line, after a killed pane, a
+#      reboot, or the OOM killer
+#
+# Reach for --deadline first. It asks the one question you can always answer,
+# which is how long you are willing to go without looking:
+#
+#   --deadline SECS   5  SECS have passed since this wait started, whatever the
+#                        job is doing. Nothing outruns it, a job looping
+#                        without progress included.
+#
+# The other two need you to know something about the job, and are sharper when
+# you do:
+#
+#   --stall SECS      2  nothing has been written to the log for SECS. Use it
+#                        when you know how often the job prints. It catches a
+#                        job waiting on a prompt nobody will answer, and misses
+#                        a job looping without progress, whose log stays fresh.
+#   --watch REGEX     3  REGEX is somewhere in the log. An early exit for output
+#                        you can predict exactly, like `loss=nan` or a server's
+#                        ready line. Picking the pattern by guesswork means you
+#                        wanted a deadline.
+#
+#   --interval SECS   how often to poll (default 5)
+#
+# State, plain text under $JOB_STATE_DIR (default ~/.local/state/jobs), one
+# directory per job:
+#   log      the command's stdout and stderr
+#   meta     pid, start time, cwd, command, written by the runner on entry
+#   status   exit code, end time, duration, written by the runner on exit;
+#            its presence is what makes a finished job knowable without
+#            asking the process table anything
+set -uo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+self=$here/$(basename "${BASH_SOURCE[0]}")
+state_root=${JOB_STATE_DIR:-$HOME/.local/state/jobs}
+
+die() { echo "job: $1" >&2; exit 64; }
+now() { date +%s; }
+iso() { date -Iseconds; }
+
+# One place derives everything a name implies, so `wait` and `stop` cannot
+# disagree with `run` about where a job's files are.
+paths() {
+    case $1 in
+        ""|*[!A-Za-z0-9._-]*) die "bad job name '$1': letters, digits, dot, dash and underscore only" ;;
+    esac
+    name=$1
+    dir=$state_root/$name
+    log=$dir/log
+    status=$dir/status
+    meta=$dir/meta
+    session=job-$name
+}
+
+metaval() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -1; }
+
+# running | done | gone. The status file is the runner's last act, which makes
+# it the only authority on a finished job; a live pid is what separates a job
+# still working from one whose runner died before it could say anything.
+job_state() { # <status-file> <pid>
+    [ -f "$1" ] && { echo done; return; }
+    [ -n "${2:-}" ] && kill -0 "$2" 2>/dev/null && { echo running; return; }
+    echo gone
+}
+
+# --- run
+
+cmd_run() {
+    [ $# -ge 1 ] || die "run needs a name"
+    paths "$1"; shift
+    cwd=$PWD awake=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --cwd)       cwd=${2:-} ; shift 2 || die "--cwd needs a directory" ;;
+            --awake)     awake=1; shift ;;
+            --)          shift; break ;;
+            *)           die "run: unexpected argument '$1' (the command goes after --)" ;;
+        esac
+    done
+    [ $# -ge 1 ] || die "run needs a command after --"
+    [ -d "$cwd" ] || die "no such directory: $cwd"
+    command -v tmux >/dev/null || die "tmux is not installed"
+    # Done jobs hold the name as firmly as running ones: the log of a finished
+    # build is the whole point of having run it, and silently rotating it away
+    # would hand the next reader someone else's output under a name they trust.
+    [ -e "$dir" ] && die "job '$name' already exists ($(job_state "$status" "$(metaval pid "$meta")")); read it, then \`job rm $name\`"
+
+    mkdir -p "$dir" || die "cannot create $dir"
+    : > "$log"
+
+    tmux has-session -t "=$session" 2>/dev/null && die "tmux session $session exists but $dir does not; kill the session or pick another name"
+    tmux new-session -d -s "$session" -c "$cwd" || die "could not create tmux session $session"
+    # printf %q quotes every word for the shell that tmux types this into, so
+    # arguments with spaces, quotes or newlines reach the command unchanged.
+    line=$(printf 'JOB_STATE_DIR=%q JOB_AWAKE=%q %q __exec %q ' "$state_root" "$awake" "$self" "$name"; printf '%q ' "$@")
+    tmux send-keys -t "=$session:" -l "$line"
+    tmux send-keys -t "=$session:" Enter
+
+    # The runner writes meta within its first moments; its absence means the
+    # line never ran, after a dead shell, a bad path, or the wrong pane.
+    for _ in $(seq 40); do
+        [ -s "$meta" ] && break
+        sleep 0.25
+    done
+    if [ ! -s "$meta" ]; then
+        tmux capture-pane -p -J -t "=$session:" -S -15 >&2
+        rm -rf "$dir"
+        die "$name wrote no meta in 10s; the pane's last lines are above"
+    fi
+    echo "started $name  pid=$(metaval pid "$meta")  (tmux attach -t $session)"
+}
+
+# The in-pane half of `run`, never typed by hand. It owns the two files that
+# make a job readable afterwards, and writes the status line whatever happens,
+# TERM from `job stop` included. A run that ends without one is the `gone`
+# state, and must mean something really did go wrong.
+cmd_exec() {
+    paths "$1"; shift
+    awake=${JOB_AWAKE:-0}
+    printf 'pid=%s\nstarted=%s\ncwd=%s\nawake=%s\ncmd=%s\n' "$$" "$(iso)" "$PWD" "$awake" "$*" > "$meta"
+    started=$(now)
+    finish() {
+        rc=$1
+        printf 'exit=%s ended=%s secs=%s\n' "$rc" "$(iso)" "$(( $(now) - started ))" > "$status"
+        exit "$rc"
+    }
+    trap 'finish 143' TERM
+    trap 'finish 130' INT
+    # nosleep holds a systemd inhibitor for the command's lifetime and is a
+    # no-op where there is nothing to inhibit, so it costs nothing to always
+    # ask for it and saves the run that would have been suspended mid-flight.
+    # The redirect sits on the command rather than around nosleep, so that
+    # systemd-inhibit's own "<cmd> failed with exit status N" lands in the pane
+    # and not in the log, where it would sit under a status line that already
+    # gives the code, blaming the wrapper for what the command did.
+    export JOB_LOG=$log
+    if [ "$awake" = 1 ] && command -v nosleep >/dev/null; then
+        # --why, because the command line nosleep would otherwise show is this
+        # wrapper plus whatever environment the caller stuffed in: several
+        # hundred characters of PATH in front of the part that identifies it.
+        # `nosleep --list` is where that string is read, when a hold is
+        # refusing a suspend and the question is whose it is.
+        nosleep --why "job $name" bash -c 'exec "$@" >>"$JOB_LOG" 2>&1' job-exec "$@" &
+    else
+        "$@" >> "$log" 2>&1 &
+    fi
+    child=$!
+    wait "$child"
+    finish $?
+}
+
+# --- wait
+
+cmd_wait() {
+    stall= deadline= watch= interval=5 pid= name=
+    status= log=
+    if [ $# -ge 1 ] && [ "${1:0:2}" != "--" ]; then
+        paths "$1"; shift
+        [ -d "$dir" ] || die "no job '$name' under $state_root"
+        pid=$(metaval pid "$meta")
+    fi
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --status)   status=${2:-};   shift 2 ;;
+            --log)      log=${2:-};      shift 2 ;;
+            --pid)      pid=${2:-};      shift 2 ;;
+            --stall)    stall=${2:-};    shift 2 ;;
+            --deadline) deadline=${2:-}; shift 2 ;;
+            --watch)    watch=${2:-};    shift 2 ;;
+            --interval) interval=${2:-}; shift 2 ;;
+            *) die "wait: unknown flag '$1'" ;;
+        esac
+    done
+    [ -n "$status" ] || die "wait needs a job name or --status"
+    [ -n "$log" ] || log=/dev/null
+
+    began=$(now)
+    # The first poll reads the log whole and every later one only the bytes
+    # since the last, so a log growing to gigabytes costs no more per poll than
+    # a small one, and --watch still means "the log contains this" rather than
+    # "this arrives after I asked" -- a server that printed its ready line
+    # before the wait was armed is the common case, not an edge one.
+    offset=0
+
+    while :; do
+        if [ -f "$status" ]; then
+            code=$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$status")
+            verdict "done" "$(cat "$status")" "$log"
+            [ "${code:-1}" = 0 ] && exit 0 || exit 1
+        fi
+        if [ -n "$watch" ]; then
+            size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+            if [ "$size" -gt "$offset" ]; then
+                if tail -c "+$((offset + 1))" "$log" 2>/dev/null | grep -qE "$watch"; then
+                    verdict "watch" "pattern matched: $watch" "$log"
+                    exit 3
+                fi
+                offset=$size
+            fi
+        fi
+        if [ -n "$stall" ]; then
+            quiet=$(( $(now) - $(stat -c %Y "$log" 2>/dev/null || now) ))
+            if [ "$quiet" -ge "$stall" ]; then
+                verdict "stalled" "nothing written to the log for ${quiet}s" "$log"
+                exit 2
+            fi
+        fi
+        if [ -n "$deadline" ] && [ $(( $(now) - began )) -ge "$deadline" ]; then
+            verdict "deadline" "still running ${deadline}s into this wait" "$log"
+            exit 5
+        fi
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            # The runner exits a moment after writing its status file, so one
+            # more look settles whether this is a clean finish or a real death.
+            sleep 2
+            [ -f "$status" ] && continue
+            verdict "gone" "runner $pid died without a status line" "$log"
+            exit 4
+        fi
+        sleep "$interval"
+    done
+}
+
+# The wake-up carries the answer: whoever armed the wait should not need a
+# second command to learn what happened.
+verdict() { # <state> <detail> <log>
+    echo "$1  $2"
+    if [ -s "$3" ]; then
+        echo "-- log tail"
+        tail -n 10 "$3"
+    fi
+}
+
+# --- the rest
+
+cmd_probe() {
+    [ -d "$state_root" ] || { echo "no jobs under $state_root"; return; }
+    shopt -s nullglob
+    found=0
+    for d in "$state_root"/*/; do
+        found=1
+        n=$(basename "$d")
+        paths "$n"
+        case $(job_state "$status" "$(metaval pid "$meta")") in
+            done)    echo "$n done  $(cat "$status")" ;;
+            running) echo "$n running  since $(metaval started "$meta")  log: $(tail -1 "$log" 2>/dev/null || echo -)" ;;
+            gone)    echo "$n gone  (runner died without a status line)" ;;
+        esac
+    done
+    [ "$found" = 1 ] || echo "no jobs under $state_root"
+}
+
+cmd_log() {
+    paths "${1:-}"
+    [ -d "$dir" ] || die "no job '$name'"
+    lines=${2:-20}
+    echo "$name $(job_state "$status" "$(metaval pid "$meta")")  $(metaval cmd "$meta")"
+    [ -f "$status" ] && cat "$status"
+    echo "-- log, last $lines lines"
+    tail -n "$lines" "$log" 2>/dev/null || echo "(no log)"
+}
+
+cmd_stop() {
+    paths "${1:-}"
+    [ -d "$dir" ] || die "no job '$name'"
+    pid=$(metaval pid "$meta")
+    [ "$(job_state "$status" "$pid")" = running ] || die "$name is not running"
+    # The pane shell runs the runner as a job, so the runner leads its own
+    # process group and the command sits in it: one signal reaches both.
+    pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
+    if [ "$pgid" = "$pid" ]; then
+        kill -TERM -- "-$pgid"
+    else
+        pkill -TERM -P "$pid"
+        kill -TERM "$pid"
+    fi
+    for _ in $(seq 60); do
+        [ -f "$status" ] && { echo "stopped $name  $(cat "$status")"; return; }
+        sleep 0.5
+    done
+    die "$name wrote no status line 30s after TERM; \`tmux attach -t $session\` shows what it is doing"
+}
+
+cmd_rm() {
+    paths "${1:-}"
+    [ -d "$dir" ] || die "no job '$name'"
+    tmux has-session -t "=$session" 2>/dev/null && tmux kill-session -t "=$session"
+    rm -rf "$dir"
+    echo "removed $name"
+}
+
+case ${1:-} in
+    run)    shift; cmd_run "$@" ;;
+    wait)   shift; cmd_wait "$@" ;;
+    probe)  shift; cmd_probe "$@" ;;
+    log)    shift; cmd_log "$@" ;;
+    stop)   shift; cmd_stop "$@" ;;
+    rm)     shift; cmd_rm "$@" ;;
+    __exec) shift; cmd_exec "$@" ;;
+    -h|--help|"") sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d' ;;
+    *) die "unknown command: $1" ;;
+esac
