@@ -6,7 +6,16 @@ let
   profilePrefs = {
     brave = {
       new_tab_page = {
-        show_background_image = false;
+        # Black rather than off, because a page with show_background_image
+        # off falls back to a bright gradient. The dict is what the new-tab
+        # settings write for a solid colour; NTPBackgroundPrefs in
+        # browser/ntp_background/ntp_background_prefs.h documents its shape.
+        show_background_image = true;
+        background = {
+          type = "color";
+          selected_value = "#000000";
+          random = false;
+        };
         show_branded_background_image = false;
         show_sponsored_sites = false;
         hide_all_widgets = true;
