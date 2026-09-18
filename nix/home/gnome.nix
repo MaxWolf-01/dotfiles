@@ -9,6 +9,9 @@
     config.lib.file.mkOutOfStoreSymlink
       "${config.home.homeDirectory}/.nix-profile/share/gnome-shell/extensions/tilingshell@ferrarodomenico.com";
 
+  # The VPN state dot. Wayland loads a changed extension only at the next login.
+  xdg.dataFile."gnome-shell/extensions/vpn-dot@maxwolf-01".source = ../../desktop/vpn-dot;
+
   dconf.settings = {
     "org/gnome/shell/keybindings" = {
       screenshot = [ "<Primary><Super>s" ];
@@ -32,6 +35,7 @@
       enabled-extensions = [
         "copyous@boerdereinar.dev"
         "tilingshell@ferrarodomenico.com"
+        "vpn-dot@maxwolf-01"
       ];
     };
 
