@@ -7,7 +7,8 @@
 # where the bugs live. `pgrep -f <pattern>` matches the waiting shell's own
 # command line and loops forever. `job wait` is that predicate, written once.
 #
-# Usage: job run  <name> [--cwd DIR] [--awake] -- <command> [args...]
+# Usage: job run   <name> [--cwd DIR] [--awake] -- <command> [args...]
+#        job stage <name> [--cwd DIR] [--awake] -- <command> [args...]
 #        job wait <name> [wait-flags]
 #        job wait --status FILE --log FILE [--pid PID] [wait-flags]
 #        job probe
@@ -27,6 +28,13 @@
 #          command does, and a server or a watcher never ends, which is to say
 #          the laptop stops suspending until someone works out why.
 #          `nosleep --list` names every hold and how to clear it.
+#   stage  like run, except the command is typed into the session and Enter
+#          is left to whoever attaches: `tmux attach -t job-<name>`, Enter,
+#          and it runs as a job from there, log and status included. For a
+#          command a human starts on their own terms, the demo of a landed
+#          change, say. Until then the job reads as staged; a session gone
+#          before Enter reads as gone; `wait` on a staged job waits for the
+#          human, so give it a deadline. The typed line is `job go <name>`.
 #   wait   blocks until the job ends, or until one of the flags below says to
 #          stop waiting. Nothing here ever touches the job: a wait that ends
 #          is a wait that ended, and killing is `job stop` or `job rm`. It
@@ -95,23 +103,28 @@ paths() {
     log=$dir/log
     status=$dir/status
     meta=$dir/meta
+    staged=$dir/staged
     session=job-$name
 }
 
 metaval() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -1; }
 
-# running | done | gone. The status file is the runner's last act, which makes
-# it the only authority on a finished job; a live pid is what separates a job
-# still working from one whose runner died before it could say anything.
+# staged | running | done | gone. The status file is the runner's last act,
+# which makes it the only authority on a finished job; a live pid is what
+# separates a job still working from one whose runner died before it could say
+# anything; a staged marker with its session still up is a command nobody has
+# started yet.
 job_state() { # <status-file> <pid>
     [ -f "$1" ] && { echo done; return; }
     [ -n "${2:-}" ] && kill -0 "$2" 2>/dev/null && { echo running; return; }
+    [ -f "${staged:-/nonexistent}" ] && tmux has-session -t "=${session:-}" 2>/dev/null && { echo staged; return; }
     echo gone
 }
 
 # --- run
 
 cmd_run() {
+    typed_only=${typed_only:-0}
     [ $# -ge 1 ] || die "run needs a name"
     paths "$1"; shift
     cwd=$PWD awake=0
@@ -138,6 +151,16 @@ cmd_run() {
     tmux new-session -d -s "$session" -c "$cwd" || die "could not create tmux session $session"
     # printf %q quotes every word for the shell that tmux types this into, so
     # arguments with spaces, quotes or newlines reach the command unchanged.
+    if [ "$typed_only" = 1 ]; then
+        # What the human sees typed is `job go <name>`, not the runner line:
+        # the command, its directory and the sleep hold wait in the job's
+        # own files for `go` to pick up.
+        { printf 'cwd=%s\nawake=%s\ncmd=' "$cwd" "$awake"; printf '%q ' "$@"; printf '\n'; } > "$staged"
+        if [ "$state_root" = "$HOME/.local/state/jobs" ]; then line=$(printf '%q go %q' "$self" "$name"); else line=$(printf 'JOB_STATE_DIR=%q %q go %q' "$state_root" "$self" "$name"); fi
+        tmux send-keys -t "=$session:" -l "$line"
+        echo "staged $name  (tmux attach -t $session, then Enter)"
+        return
+    fi
     line=$(printf 'JOB_STATE_DIR=%q JOB_AWAKE=%q %q __exec %q ' "$state_root" "$awake" "$self" "$name"; printf '%q ' "$@")
     tmux send-keys -t "=$session:" -l "$line"
     tmux send-keys -t "=$session:" Enter
@@ -156,6 +179,19 @@ cmd_run() {
     echo "started $name  pid=$(metaval pid "$meta")  (tmux attach -t $session)"
 }
 
+# The in-pane half of `stage`: what the human's Enter runs. It reads the
+# command, directory and sleep hold that `stage` wrote beside the marker and
+# hands them to the runner, so a staged job ends up with the same meta, log
+# and status as one `run` started.
+cmd_go() {
+    paths "${1:-}"
+    [ -f "$staged" ] || die "$name is not staged"
+    cwd=$(metaval cwd "$staged"); awake=$(metaval awake "$staged")
+    eval "set -- $(metaval cmd "$staged")"
+    cd "$cwd" || die "no such directory: $cwd"
+    JOB_STATE_DIR=$state_root JOB_AWAKE=$awake exec "$self" __exec "$name" "$@"
+}
+
 # The in-pane half of `run`, never typed by hand. It owns the two files that
 # make a job readable afterwards, and writes the status line whatever happens,
 # TERM from `job stop` included. A run that ends without one is the `gone`
@@ -164,6 +200,7 @@ cmd_exec() {
     paths "$1"; shift
     awake=${JOB_AWAKE:-0}
     printf 'pid=%s\nstarted=%s\ncwd=%s\nawake=%s\ncmd=%s\n' "$$" "$(iso)" "$PWD" "$awake" "$*" > "$meta"
+    rm -f "$staged"
     started=$(now)
     finish() {
         rc=$1
@@ -252,7 +289,7 @@ cmd_wait() {
             fi
         fi
         if [ -n "$deadline" ] && [ $(( $(now) - began )) -ge "$deadline" ]; then
-            verdict "deadline" "still running ${deadline}s into this wait" "$log"
+            verdict "deadline" "not finished ${deadline}s into this wait" "$log"
             exit 5
         fi
         if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
@@ -290,6 +327,7 @@ cmd_probe() {
         case $(job_state "$status" "$(metaval pid "$meta")") in
             done)    echo "$n done  $(cat "$status")" ;;
             running) echo "$n running  since $(metaval started "$meta")  log: $(tail -1 "$log" 2>/dev/null || echo -)" ;;
+            staged)  echo "$n staged  (typed, not run: tmux attach -t $session)" ;;
             gone)    echo "$n gone  (runner died without a status line)" ;;
         esac
     done
@@ -337,6 +375,8 @@ cmd_rm() {
 
 case ${1:-} in
     run)    shift; cmd_run "$@" ;;
+    stage)  shift; typed_only=1 cmd_run "$@" ;;
+    go)     shift; cmd_go "$@" ;;
     wait)   shift; cmd_wait "$@" ;;
     probe)  shift; cmd_probe "$@" ;;
     log)    shift; cmd_log "$@" ;;
