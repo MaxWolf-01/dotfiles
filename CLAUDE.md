@@ -150,6 +150,8 @@ captive-portal escape (`portal`): `docs/dns.md`.
 Mullvad exit node: Cloudflare blocks some node IPs for Chrome-family clients
 (Electron apps break, browsers work) — `vpn` (`bin/vpn`) verifies and rotates,
 and its watcher service (`vpn watch`) re-checks; rationale in `vpn --help`.
+The watcher also publishes the exit node's state, shown as a dot in the top bar
+by the GNOME extension in `desktop/vpn-dot`.
 
 ## Monitoring
 
