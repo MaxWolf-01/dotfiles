@@ -28,7 +28,7 @@ class Dot extends PanelMenu.Button {
         this._dot = new St.Widget({style_class: 'vpn-dot', y_align: Clutter.ActorAlign.CENTER});
         this.add_child(this._dot);
 
-        this._label = new St.Label({style_class: 'dash-label'});
+        this._label = new St.Label({style_class: 'dash-label vpn-dot-label'});
         this._label.hide();
         Main.layoutManager.addChrome(this._label);
         this.connect('notify::hover', () => this._updateLabel());
@@ -142,12 +142,21 @@ class Dot extends PanelMenu.Button {
     }
 });
 
+const MODES = {
+    automatic: 'automatic (Tailscale picks the node by latency)',
+    pinned: 'pinned (stays on this node)',
+};
+
 function describe({state, reason, mode, node, city, country, since}, running) {
-    const lines = [];
-    if (node)
-        lines.push([node, [city, country].filter(Boolean).join(', '), mode].filter(Boolean).join(' · '));
     const age = since ? ` for ${ago(Date.parse(since))}` : '';
-    lines.push(`${state}${age}${reason ? `: ${reason}` : ''}`);
+    const lines = [`${state}${age}${reason ? `: ${reason}` : ''}`];
+    if (node) {
+        lines.push(`node: ${node}`);
+        const place = [city, country].filter(Boolean).join(', ');
+        if (place)
+            lines.push(`location: ${place}`);
+        lines.push(`mode: ${MODES[mode] ?? mode}`);
+    }
     if (running)
         lines.push(`${running}…`);
     return lines.join('\n');
