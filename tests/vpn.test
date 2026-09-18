@@ -254,15 +254,17 @@ check("tailscaled not answering is unknown, not off",
 # keepalive if it has nothing else to send, and nothing answers a keepalive
 
 
-def silent_after(readings):
-    """Feed one reading of the exit node's counters per look, 10 s apart, each
-    (received, sent) from node a, or a whole (node, received, sent), or None
-    for no exit peer; whether the watcher holds the node silent after each."""
+def silent_after(readings, times=None):
+    """Feed one reading of the exit node's counters per look, 10 s apart unless
+    `times` says otherwise, each (received, sent) from node a, or a whole
+    (node, received, sent), or None for no exit peer; whether the watcher holds
+    the node silent after each."""
     w, seen = vpn.Watch(), []
     for i, reading in enumerate(readings):
-        now = 1_000_000.0 + 10 * i
-        vpn.listen(w, ("id-a", *reading) if reading and len(reading) == 2 else reading, now)
-        seen.append(w.unanswered_since is not None and now - w.unanswered_since >= vpn.SILENT_SECS)
+        now = 1_000_000.0 + (times[i] if times else 10 * i)
+        vpn.listen(w, vpn.Counters("id-a", *reading) if reading and len(reading) == 2
+                   else reading and vpn.Counters(*reading), now)
+        seen.append(vpn.silent(w, now))
     return seen
 
 
@@ -283,7 +285,13 @@ check("a new exit node starts over", [False] * 4,
 check("counters starting again from zero, still with nothing back, keep the silence",
       [False, False, False, True], silent_after([(500, 5000), (500, 6000), (0, 300), (0, 600)]))
 check("and with something back, end it", [False] * 4, silent_after([(500, 5000), (500, 6000), (40, 300), (40, 600)]))
-check("no exit peer in the reading starts over", [False] * 3, silent_after([(100, 1000), (100, 1500), None]))
+check("no exit peer in the reading starts over", [False] * 4,
+      silent_after([(100, 1000), (100, 1500), (100, 1600), None]))
+HOURS_8 = 8 * 3600
+check("a suspend is not time unanswered: the count starts over after it",
+      [False, False, False, False, False, True],
+      silent_after([(100, 1000), (100, 1500), (100, 1600), (100, 1700), (100, 1800), (100, 1900)],
+                   times=[0, 10, HOURS_8, HOURS_8 + 10, HOURS_8 + 20, HOURS_8 + 30]))
 
 # --- which exit-node changes a vpn line accounts for
 
@@ -335,6 +343,7 @@ class Net:
         self.sets = []
         self.on_sleep = None
         self.rx = self.tx = 0  # bytes received from and sent to the exit node, as WireGuard counts them
+        self.running = True  # tailscale up, as prefs' WantRunning says
 
     def full(self):
         if self.down:
@@ -358,8 +367,9 @@ class Net:
         if self.down:
             return None
         if self.exit is None:
-            return {"WantRunning": True, "ExitNodeID": ""}
-        return {"WantRunning": True, "ExitNodeID": f"id-{self.exit}"} | ({"AutoExitNode": "any"} if self.automatic else {})
+            return {"WantRunning": self.running, "ExitNodeID": ""}
+        return ({"WantRunning": self.running, "ExitNodeID": f"id-{self.exit}"}
+                | ({"AutoExitNode": "any"} if self.automatic else {}))
 
     def set_exit_node(self, target):
         """`tailscale set`, whether vpn or something else runs it."""
@@ -651,26 +661,42 @@ with wired(net) as logs:
 check("tailscaled not answering is published unknown", ("unknown", "tailscaled does not answer"),
       (unknown["state"], unknown["reason"]))
 
+def silence_lines(logs):
+    return [(r["outcome"], r["stats"]["event"], r["stats"]["node"], r["stats"]["secs"])
+            for r in logs.lines(vpn.NODE_UNIT)]
+
+
 net = Net(vesktop=False)
 with wired(net) as logs:
     w = vpn.Watch()
     shown = []
-    for offset in (0, 10, 20, 30, 40):
+    for offset in (0, 10, 20, 30, 40, 50, 60):
         vpn.look(w, BASE + offset, True)
         shown.append((logs.shown()["state"], logs.shown()["since"]))
-        net.traffic(sent=500, received=0 if offset < 30 else 700)
+        net.traffic(sent=500, received=0 if offset < 50 else 700)
 check("a node that stops answering goes down 20 s after the look that saw it, and back up once it answers",
-      [("up", since(0)), ("up", since(0)), ("up", since(0)), ("down", since(30)), ("up", since(40))], shown)
-check("the silence is one node-log line saying how long it lasted", [("silent", "de-fra-wg-202", 30)],
-      [(r["stats"]["event"], r["stats"]["node"], r["stats"]["secs"]) for r in logs.lines(vpn.NODE_UNIT)])
+      [("up", since(0))] * 3 + [("down", since(30))] * 3 + [("up", since(60))], shown)
+check("the silence is one node-log line, lasting from that look to the last that found it silent",
+      [("ok", "silent", "de-fra-wg-202", 40)], silence_lines(logs))
 check("and moves nothing", [], net.sets)
+
+net = Net(vesktop=False)
+with wired(net) as logs:
+    w = vpn.Watch()
+    for offset in (0, 10, 20, 30, 30 + HOURS_8):
+        vpn.look(w, BASE + offset, True)
+        net.traffic(sent=500, received=0)
+    resumed = logs.shown()["state"]
+check("a silence the laptop suspended in ends at the last look before the suspend",
+      [("ok", "silent", "de-fra-wg-202", 20)], silence_lines(logs))
+check("and the count starts over after it", "up", resumed)
 
 net = Net(vesktop=False)
 with wired(net) as logs:
     w = vpn.Watch()
     vpn.look(w, BASE, True)
     vpn.next_()
-    vpn.log_node("fail", "silent", "watch", "de-fra-wg-401", reason="de-fra-wg-401 answered nothing for 30 s", secs=30)
+    vpn.log_node("ok", "silent", "watch", "de-fra-wg-401", reason="de-fra-wg-401 answered nothing for at least 30 s", secs=30)
     vpn.look(w, BASE + 5, True)
 check("a silent line written after a move does not hide the move from the watcher", ["pinned", "silent"], logs.events())
 
@@ -776,6 +802,13 @@ net = Net(exit_name=None)
 with wired(net):
     vpn.on()
 check("vpn on from off turns it on", ("de-fra-wg-001", True), (net.exit, net.automatic))
+
+net = Net(exit_name=None)
+net.running = False
+with wired(net) as logs:
+    error = attempt(vpn.on)
+check("vpn on with tailscale stopped changes nothing and says why",
+      ([], [], "tailscale is stopped: `tailscale up` first"), (net.sets, logs.events(), error))
 
 # The dot's click turns the VPN off with a bare `tailscale set`, which does not
 # wait for a vpn command's walk to finish.

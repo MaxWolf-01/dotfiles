@@ -62,14 +62,14 @@ class Dot extends PanelMenu.Button {
         });
     }
 
+    // A click while the dot's own `vpn on` runs turns the VPN off: that walk
+    // stops once it sees the exit node gone, and its failure goes unreported.
     _toggle() {
-        if (this._running)
-            return;
         const {state} = this._shown;
-        if (state === 'off')
-            this._run(ON, 'turning on');
-        else if (state === 'up' || state === 'down')
+        if (this._running?.argv === ON || (!this._running && ['up', 'down'].includes(state)))
             this._run(OFF, 'turning off');
+        else if (!this._running && state === 'off')
+            this._run(ON, 'turning on');
     }
 
     _run(argv, doing) {
@@ -80,7 +80,8 @@ class Dot extends PanelMenu.Button {
             Main.notify('VPN', `${argv.join(' ')}: ${e.message}`);
             return;
         }
-        this._running = doing;
+        const run = {argv, doing};
+        this._running = run;
         this._pulse(true);
         this._updateLabel();
         proc.communicate_utf8_async(null, this._cancellable, (p, result) => {
@@ -92,6 +93,8 @@ class Dot extends PanelMenu.Button {
                     return;
                 output = e.message;
             }
+            if (this._running !== run)
+                return;
             this._running = null;
             this._pulse(false);
             this._updateLabel();
@@ -121,7 +124,7 @@ class Dot extends PanelMenu.Button {
             this._label.hide();
             return;
         }
-        this._label.text = describe(this._shown, this._running);
+        this._label.text = describe(this._shown, this._running?.doing);
         this._label.show();
         const [x, y] = this.get_transformed_position();
         const [width, height] = this.get_transformed_size();

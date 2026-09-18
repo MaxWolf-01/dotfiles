@@ -653,7 +653,7 @@ in
       Environment = [ "PATH=${uvScriptPath}:/usr/bin:/bin" "PYTHONUNBUFFERED=1" ];
       ExecStart = "${dotfiles}/bin/vpn watch";
       # The state the watcher publishes goes with it, so the top-bar dot shows a
-      # watcher that stopped, crashed included, instead of its last word.
+      # watcher that stopped, crashed included, instead of the state it last wrote.
       ExecStopPost = "${pkgs.coreutils}/bin/rm -f %t/vpn-state.json";
       Restart = "on-failure";
       RestartSec = "30s";
