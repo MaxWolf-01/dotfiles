@@ -72,7 +72,9 @@ while IFS='|' read -r url format name; do
 
     # Build yt-dlp command based on format
     if [ "$format" = "audio" ]; then
-        cmd=(yt-dlp -f "ba/b" --extract-audio --audio-format wav --audio-quality 0)
+        # No --embed-thumbnail: WAV has no slot for a picture, and yt-dlp fails
+        # the video instead of skipping, so it never reaches archive.txt.
+        cmd=(yt-dlp -f "ba/b" --extract-audio --audio-format wav --audio-quality 0 --embed-metadata)
     else
         cmd=(yt-dlp --format "bv[height<=720]+ba/b[height<=720]")
     fi
