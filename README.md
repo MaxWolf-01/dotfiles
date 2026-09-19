@@ -108,6 +108,7 @@ All `./setup` functions are idempotent — safe to re-run.
 ./setup nvidia_container_toolkit
 ./setup get_vibetyper
 ./setup hibernation
+./setup asus_kbd_light         # ASUS ROG laptops
 ```
 </details>
 
