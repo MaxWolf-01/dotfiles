@@ -58,6 +58,18 @@ in
 
   xdg.configFile."xdg-terminals.list".text = "com.mitchellh.ghostty.desktop\n";
 
+  # GNOME watches the profile's applications directory through the symlink it
+  # resolved at login, and a switch repoints that symlink, so entries added by
+  # the switch stay out of the app grid and search until the next login. Links
+  # in ~/.local/share/applications, a plain directory, show up at the switch.
+  xdg.dataFile."applications" = {
+    source = pkgs.runCommand "desktop-entries" { } ''
+      mkdir $out
+      ln -s ${config.home.path}/share/applications/*.desktop $out/
+    '';
+    recursive = true;
+  };
+
   xdg.desktopEntries.vesktop = {
     name = "Vesktop";
     genericName = "Discord Client";
