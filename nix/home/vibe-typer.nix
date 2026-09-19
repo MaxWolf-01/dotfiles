@@ -57,6 +57,9 @@ in
 
   xdg.desktopEntries.vibe-typer = {
     name = "Vibe Typer";
+    # Copied out of the AppImage's own icon theme, whose extracted tree is named
+    # after the version's hash and deleted after 30 days unread.
+    icon = toString ../../desktop/icons/vibe-typer.png;
     exec = "env ${lib.concatStringsSep " " environment} ${appImage}";
     type = "Application";
     categories = [ "Utility" ];
