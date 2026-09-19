@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Put the ASUS ROG keyboard's lighting controller back into static mode.
+#
+# After a wake from sleep on AC the controller keeps playing its sleep signal, a
+# double blink every few seconds, and brightness writes do nothing while it
+# does. The kernel restores only the brightness level on wake. A lighting-mode
+# packet ends the signal, and the brightness level applies again after it.
+#
+# `static` sends that packet, then installs a root-owned copy of this script and
+# a unit that runs the copy after every wake. The copy does not follow edits
+# made here: `status` says when the two differ, `static` reinstalls.
+#
+# Packet layout: asusctl, rog-aura/src/builtin_modes.rs and rog-aura/src/usb.rs.
+#
+# Usage:
+#   asus-kbd-light static [rrggbb]   static colour (default ffffff), now and after every wake
+#   asus-kbd-light status            controller node, unit, installed copy
+#   asus-kbd-light reset             remove the unit and the installed copy
+#   asus-kbd-light apply [rrggbb]    send the packets once, as root; what the unit runs
+
+set -euo pipefail
+
+# The three paths are overridable for tests/asus-kbd-light.test.
+SYSFS=${ASUS_KBD_SYSFS:-/sys/bus/hid/devices}
+DEV=${ASUS_KBD_DEV:-/dev}
+LED=${ASUS_KBD_LED:-/sys/class/leds/asus::kbd_backlight/brightness}
+INSTALLED=/usr/local/sbin/asus-kbd-light
+UNIT_NAME=asus-kbd-light.service
+UNIT_PATH=/etc/systemd/system/$UNIT_NAME
+WAKE_TARGETS="suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+
+die() {
+    echo "asus-kbd-light: $*" >&2
+    exit 1
+}
+
+# The lighting reports have ID 0x5d, and of the keyboard's USB interfaces only
+# the control interface declares it: item "85 5d" in its HID report descriptor.
+find_node() {
+    local d descriptor node
+    for d in "$SYSFS"/0003:0B05:*; do
+        [ -r "$d/report_descriptor" ] || continue
+        descriptor=$(od -An -v -tx1 "$d/report_descriptor" | tr -s ' \n' ' ')
+        [[ $descriptor == *' 85 5d '* ]] || continue
+        for node in "$d"/hidraw/hidraw*; do
+            if [ -e "$node" ]; then
+                echo "$DEV/${node##*/}"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# One write of 64 bytes, the size report 0x5d declares. The controller of some
+# models drops shorter writes.
+send() { # node, hex bytes
+    local node=$1
+    shift
+    { printf '%b' "$(printf '\\x%s' "$@")"; head -c $((64 - $#)) /dev/zero; } |
+        dd bs=64 count=1 iflag=fullblock status=none >> "$node"
+}
+
+apply() { # rrggbb
+    local colour=$1 node level
+    [[ $colour =~ ^[0-9a-fA-F]{6}$ ]] || die "colour '$colour' is not six hex digits (rrggbb)"
+    node=$(find_node) || die "no ASUS keyboard control interface: nothing under $SYSFS/0003:0B05:* declares report 0x5d. Check 'lsusb -d 0b05:' and that the hid_asus module is loaded."
+    [ -w "$node" ] || die "$node is not writable. Run as root: sudo $0 apply $colour"
+
+    # Zone 0, mode 0 (static), colour, speed 0xeb. SET makes the mode current.
+    send "$node" 5d b3 00 00 "${colour:0:2}" "${colour:2:2}" "${colour:4:2}" eb
+    send "$node" 5d b5
+
+    # The level the kernel restored on wake arrived while the controller was
+    # still blinking, so write it again.
+    if [ -w "$LED" ]; then
+        level=$(cat "$LED")
+        echo "$level" > "$LED"
+    else
+        echo "asus-kbd-light: $LED is not writable, brightness level not repeated" >&2
+    fi
+}
+
+show() {
+    local node
+    if node=$(find_node); then
+        echo "controller: $node"
+    else
+        echo "controller: not found"
+    fi
+    if systemctl is-enabled --quiet $UNIT_NAME 2>/dev/null; then
+        echo "unit: $UNIT_NAME enabled, colour $(sed -n 's/^ExecStart=.* apply //p' "$UNIT_PATH")"
+    else
+        echo "unit: not installed"
+    fi
+    if [ -f "$INSTALLED" ]; then
+        if cmp -s "$0" "$INSTALLED"; then
+            echo "installed copy: matches this script"
+        else
+            echo "installed copy: differs from this script ('asus-kbd-light static' reinstalls)"
+        fi
+    fi
+}
+
+# The unit runs as root, so it runs a root-owned copy: a script under $HOME is
+# writable by every process of the user.
+install_all() { # rrggbb
+    sudo install -m 755 "$0" "$INSTALLED"
+    sudo tee "$UNIT_PATH" >/dev/null <<EOF
+[Unit]
+Description=Static ASUS keyboard lighting after wake
+After=$WAKE_TARGETS
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALLED apply $1
+
+[Install]
+WantedBy=$WAKE_TARGETS
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet $UNIT_NAME
+}
+
+uninstall() {
+    if [ -f "$UNIT_PATH" ]; then
+        sudo systemctl disable --quiet $UNIT_NAME
+        sudo rm "$UNIT_PATH"
+        sudo systemctl daemon-reload
+    fi
+    [ -f "$INSTALLED" ] && sudo rm "$INSTALLED"
+    return 0
+}
+
+case "${1:-}" in
+    apply)
+        apply "${2:-ffffff}"
+        ;;
+    static)
+        colour=${2:-ffffff}
+        sudo "$0" apply "$colour"
+        install_all "$colour"
+        echo "applied static $colour, installed $UNIT_NAME"
+        show
+        ;;
+    status)
+        show
+        ;;
+    reset)
+        uninstall
+        echo "removed $UNIT_NAME and $INSTALLED"
+        show
+        ;;
+    ''|-h|--help)
+        awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
+        ;;
+    *)
+        die "unknown command '$1' (see --help)"
+        ;;
+esac

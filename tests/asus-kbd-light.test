@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Drive `bin/asus-kbd-light apply` against a fake sysfs tree. Run it directly; no framework.
+#
+# The decisions under test: the packets go to the interface that declares the
+# lighting report and to no other, they carry the bytes asusctl sends, and the
+# brightness level is written again after them. That each packet reaches a real
+# controller as a single 64-byte write shows only on the hardware.
+
+set -uo pipefail
+
+script="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/asus-kbd-light"
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+
+failures=0
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+hex() { od -An -v -tx1 "$1" | tr -d ' \n'; }
+
+# Two interfaces of one keyboard. The typing interface sorts first and holds two
+# near misses: report ID 0x5a, and "08 55 d0", which reads as "855d" once the
+# byte boundaries are gone. The control interface declares report 0x5d with the
+# "85" as the 16th byte, the last one on a line of od output.
+fresh_tree() {
+    rm -rf "${root:?}/sys" "${root:?}/dev" "${root:?}/led"
+    mkdir -p "$root/sys/0003:0B05:19B6.0007/hidraw/hidraw3" \
+             "$root/sys/0003:0B05:19B6.0009/hidraw/hidraw5" "$root/dev"
+    printf '\x05\x01\x09\x06\xa1\x01\x85\x5a\x08\x55\xd0\xc0' \
+        > "$root/sys/0003:0B05:19B6.0007/report_descriptor"
+    printf '\x06\x31\xff\x09\x76\xa1\x01\x19\x00\x2a\xff\x00\x15\x00\x26\x85\x5d\x19\x00\xc0' \
+        > "$root/sys/0003:0B05:19B6.0009/report_descriptor"
+    : > "$root/dev/hidraw3"
+    : > "$root/dev/hidraw5"
+    echo 2 > "$root/led"
+    touch -d '2000-01-01' "$root/led"
+}
+
+run() {
+    ASUS_KBD_SYSFS="$root/sys" ASUS_KBD_DEV="$root/dev" ASUS_KBD_LED="$root/led" "$script" "$@"
+}
+
+# From asusctl's packet table: 5d b3, zone, mode, r, g, b, speed, zero-padded to
+# 64 bytes; then 5d b5, padded the same. The colour's bytes are '%', a newline
+# and a NUL, and all three channels differ.
+mode_packet="5db30000250a00eb$(printf '%0112d' 0)"
+set_packet="5db5$(printf '%0124d' 0)"
+
+# --- the ordinary path
+
+fresh_tree
+run apply 250a00 >/dev/null 2>&1
+check "apply succeeds" 0 $?
+check "the control interface receives the mode packet, then SET" \
+    "$mode_packet$set_packet" "$(hex "$root/dev/hidraw5")"
+check "the typing interface receives nothing" "" "$(hex "$root/dev/hidraw3")"
+check "the brightness level is unchanged" "2" "$(cat "$root/led")"
+check "and was written again" "yes" \
+    "$([ "$(stat -c %Y "$root/led")" -gt "$(date -d '2001-01-01' +%s)" ] && echo yes || echo no)"
+
+# --- nothing to talk to
+
+fresh_tree
+rm -rf "$root/sys/0003:0B05:19B6.0009"
+out=$(run apply 250a00 2>&1)
+check "without a control interface apply fails" 1 $?
+check "and says what to check" "yes" "$(grep -q 'lsusb -d 0b05:' <<<"$out" && echo yes || echo no)"
+check "and the typing interface still receives nothing" "" "$(hex "$root/dev/hidraw3")"
+
+# --- a colour that is not one
+
+fresh_tree
+run apply ff00 >/dev/null 2>&1
+check "a four-digit colour is refused" 1 $?
+check "before anything is sent" "" "$(hex "$root/dev/hidraw5")"
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+else
+    echo "$failures check(s) failed"
+fi
+exit $((failures > 0))
