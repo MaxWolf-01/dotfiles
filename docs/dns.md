@@ -27,7 +27,7 @@ rationale: the comments in `bin/dns-failover-install`.
 
 What follows from the shape:
 
-- A dead tunnel costs ~2 s per uncached lookup instead of an outage. The chain
+- A dead tunnel costs ~3 s per uncached lookup instead of an outage. The chain
   exists because tailnet DNS died three times in one day of tunnel trouble:
   `agent/tickets/dns-fails-closed-on-flaky-link.md`.
 - No failure path reaches a non-Mullvad resolver. Plain 53 is used only on
