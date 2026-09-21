@@ -19,12 +19,13 @@
 # a sleeping GPU, so polling it every sample would keep awake the heat source
 # it is meant to catch.
 #
-# Once a minute it also writes whose memory it is: every cgroup (one per app,
-# tmux pane or service) holding over 512 MB the kernel cannot simply drop
-# (anonymous, shared and swapped), at most ten, then a (rest) row for all the
-# others, so the rows add up to the system's total. Each row names its largest
-# process and that process's working directory, which is what tells one agent
-# pane from another.
+# Once a minute it also writes whose memory and CPU it is, one row per cgroup
+# (one per app, tmux pane or service): every cgroup holding over 512 MB the
+# kernel cannot simply drop (anonymous, shared and swapped), at most ten, and
+# every one that used over 10% of a core in the last minute, at most five. A
+# (rest) row carries everything else, so the rows add up to the system's total.
+# Each row names its largest process and that process's working directory,
+# which is what tells one agent pane from another.
 #
 # The sampling loop is bash-builtin only — no command substitutions, no awk,
 # no date, no children. This runs 17k times a day forever; forks made it cost
@@ -32,8 +33,8 @@
 # the floor set by the sysfs/EC sensor reads themselves.
 #
 # Usage:   thermal-log [interval-seconds]     default 5
-# Output:  ~/.local/state/thermal-log/YYYY-MM-DD.csv, and YYYY-MM-DD.mem.csv for
-#          the memory ranking; both pruned after 14 days
+# Output:  ~/.local/state/thermal-log/YYYY-MM-DD.csv, and YYYY-MM-DD.top.csv for
+#          the per-minute ranking; both pruned after 14 days
 # Read it: column -s, -t ~/.local/state/thermal-log/$(date +%F).csv | less -S
 set -uo pipefail
 shopt -s nullglob
@@ -41,10 +42,20 @@ shopt -s nullglob
 INTERVAL=${1:-5}
 LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/thermal-log"
 KEEP_DAYS=14
-MEM_EVERY=12   # samples between memory rankings: once a minute at 5 s
+TOP_EVERY=12   # samples between rankings: once a minute at 5 s
 MEM_MIN_MB=512
 MEM_ROWS=10
-MEM_HEADER="time,unit,anon_mb,shmem_mb,swap_mb,procs,process,cwd"
+CPU_MIN_PCT=10 # of one core, averaged since the previous ranking
+CPU_ROWS=5
+TOP_HEADER="time,unit,cpu_pct,anon_mb,shmem_mb,swap_mb,procs,process,cwd"
+# cpu.stat usage per cgroup, kept in two tables that swap roles each ranking
+# (the previous one's and this one's), so nothing is copied; plus when the
+# previous ranking ran and the root's usage then.
+# shellcheck disable=SC2034  # used through write_top's namerefs
+declare -A CPU_A=() CPU_B=()
+CPU_FLIP=0
+CPU_PREV_T=0
+ROOT_CPU_PREV=0
 HEADER="time,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,mhz_max,load1,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv,mem_avail_mb,swap_used_mb"
 
 ATTRS=/sys/class/firmware-attributes/asus-armoury/attributes
@@ -63,7 +74,7 @@ main() {
     local n=0
     while :; do
         write_sample
-        ((n++ % MEM_EVERY)) || write_mem_top
+        ((n++ % TOP_EVERY)) || write_top
         read -rt "$INTERVAL" -u "$idle" || :
     done
 }
@@ -123,58 +134,96 @@ memory() {
     SWAP_USED_MB=$(((swap_total - swap_free) / 1024))
 }
 
-# Ranks in two passes because memory.stat costs ~5x a memory.current read:
-# every cgroup by memory.current + swap, which also counts droppable file cache,
-# then the largest few by what memory.stat says cannot be dropped.
-write_mem_top() {
-    local today stamp file d i cur swp v unit line key val out=
-    local listed_anon=0 listed_shmem=0 listed_swap=0 rest_anon=0 rest_shmem=0 rest_swap
+# Memory is ranked in two passes because memory.stat costs ~5x a memory.current
+# read: every cgroup by memory.current + swap, which also counts droppable file
+# cache, then the largest few by what memory.stat says cannot be dropped. CPU is
+# each cgroup's cpu.stat usage since the previous ranking; the first ranking
+# after a start has nothing to compare against and leaves cpu_pct empty.
+write_top() {
+    local today stamp file d cur swp use prev v now elapsed=0 cpu_min unit pct line key val root_use out=
+    local listed_anon=0 listed_shmem=0 listed_swap=0 listed_cpu=0
+    local rest_anon=0 rest_shmem=0 rest_swap rest_cpu=
     local pool_max=$((2 * MEM_ROWS))
-    local -a pool p_anon p_shmem p_swap
+    local -A used=() m_anon=() m_shmem=() m_swap=() listed=()
+    local prev_table=CPU_A next_table=CPU_B
+    ((CPU_FLIP)) && prev_table=CPU_B next_table=CPU_A
+    local -n cpu_prev=$prev_table cpu_next=$next_table
+    cpu_next=()
     printf -v today '%(%F)T' -1
     printf -v stamp '%(%F %T)T' -1
-    file="$LOGDIR/$today.mem.csv"
-    [ -f "$file" ] || echo "$MEM_HEADER" > "$file"
+    file="$LOGDIR/$today.top.csv"
+    [ -f "$file" ] || echo "$TOP_HEADER" > "$file"
 
-    # ~190 cgroups: plain reads and an early size check, since a call to rd or
+    now=${EPOCHREALTIME/[.,]/}
+    ((CPU_PREV_T)) && elapsed=$((now - CPU_PREV_T))
+    cpu_min=$((elapsed * CPU_MIN_PCT / 100))
+
+    # ~190 cgroups: plain reads and early size checks, since a call to rd or
     # insert_top per cgroup costs more than the reads themselves. memory.current
     # + swap bounds what memory.stat can report, so a cgroup under MEM_MIN_MB
     # here cannot make the list and is never read in full.
-    TOP_V=() TOP_I=()
+    POOL_V=() POOL_I=() BURN_V=() BURN_I=()
     for d in /sys/fs/cgroup/system.slice/*/ \
              /sys/fs/cgroup/user.slice/user-*.slice/session-*.scope/ \
              /sys/fs/cgroup/user.slice/user-*.slice/user@*.service/*.slice/*/; do
         read -r cur 2>/dev/null < "${d}memory.current" || continue
         read -r swp 2>/dev/null < "${d}memory.swap.current" || swp=0
+        read -r _ use 2>/dev/null < "${d}cpu.stat" || use=0
+        # shellcheck disable=SC2034  # a nameref: read back next ranking as cpu_prev
+        cpu_next[$d]=$use
+        # A cgroup born or restarted since the last ranking used all of its
+        # time within it.
+        prev=${cpu_prev[$d]:-0}
+        ((use >= prev)) && use=$((use - prev))
+        if ((elapsed && use >= cpu_min)); then
+            used[$d]=$use
+            ((${#BURN_V[@]} < CPU_ROWS || use > BURN_V[CPU_ROWS - 1])) \
+                && insert_top BURN_V BURN_I "$CPU_ROWS" "$use" "$d"
+        fi
         v=$((cur + swp))
         ((v >> 20 >= MEM_MIN_MB)) || continue
-        ((${#TOP_V[@]} < pool_max || v > TOP_V[pool_max - 1])) && insert_top "$pool_max" "$v" "$d"
+        used[$d]=$use
+        ((${#POOL_V[@]} < pool_max || v > POOL_V[pool_max - 1])) \
+            && insert_top POOL_V POOL_I "$pool_max" "$v" "$d"
     done
-    pool=("${TOP_I[@]}")
+    CPU_FLIP=$((!CPU_FLIP)) CPU_PREV_T=$now
 
-    TOP_V=() TOP_I=()
-    for i in "${!pool[@]}"; do
-        mem_stat "${pool[i]}"
-        p_anon[i]=$ANON p_shmem[i]=$SHMEM p_swap[i]=$SWP
+    # shellcheck disable=SC2034  # filled through insert_top's nameref
+    HOLD_V=() HOLD_I=()
+    for d in "${POOL_I[@]}"; do
+        mem_stat "$d"
+        m_anon[$d]=$ANON m_shmem[$d]=$SHMEM m_swap[$d]=$SWP
         v=$((ANON + SHMEM + SWP))
-        ((v >> 20 >= MEM_MIN_MB)) && insert_top "$MEM_ROWS" "$v" "$i"
+        ((v >> 20 >= MEM_MIN_MB)) && insert_top HOLD_V HOLD_I "$MEM_ROWS" "$v" "$d"
     done
 
-    for i in "${TOP_I[@]}"; do
-        d=${pool[i]}
+    # Memory holders first, then the CPU users not already among them.
+    for d in "${HOLD_I[@]}" "${BURN_I[@]}"; do
+        [ -n "${listed[$d]:-}" ] && continue
+        listed[$d]=1
+        if [ -z "${m_anon[$d]:-}" ]; then
+            mem_stat "$d"
+            m_anon[$d]=$ANON m_shmem[$d]=$SHMEM m_swap[$d]=$SWP
+        fi
+        pct=
+        if ((elapsed)); then
+            pct=$((${used[$d]} * 100 / elapsed))
+            listed_cpu=$((listed_cpu + ${used[$d]}))
+        fi
         biggest_process "$d"
         unit=${d%/} unit=${unit##*/}
-        printf -v line '%s,%s,%d,%d,%d,%d,%s,%s\n' "$stamp" "$unit" \
-            $((p_anon[i] >> 20)) $((p_shmem[i] >> 20)) $((p_swap[i] >> 20)) \
+        printf -v line '%s,%s,%s,%d,%d,%d,%d,%s,%s\n' "$stamp" "$unit" "$pct" \
+            $((${m_anon[$d]} >> 20)) $((${m_shmem[$d]} >> 20)) $((${m_swap[$d]} >> 20)) \
             "$PROCS" "$PROC" "$CWD"
         out+=$line
-        listed_anon=$((listed_anon + p_anon[i]))
-        listed_shmem=$((listed_shmem + p_shmem[i]))
-        listed_swap=$((listed_swap + p_swap[i]))
+        listed_anon=$((listed_anon + ${m_anon[$d]}))
+        listed_shmem=$((listed_shmem + ${m_shmem[$d]}))
+        listed_swap=$((listed_swap + ${m_swap[$d]}))
     done
 
     # (rest): the root cgroup's totals, and the system's swap from the sample
-    # written just before, minus the rows above.
+    # written just before, minus the rows above. The root's CPU time also holds
+    # whatever ran in cgroups that ended within the minute.
     while read -r key val; do
         case $key in
             anon)  rest_anon=$((val - listed_anon)) ;;
@@ -182,22 +231,29 @@ write_mem_top() {
         esac
     done < /sys/fs/cgroup/memory.stat
     rest_swap=$(((SWAP_USED_MB << 20) - listed_swap))
-    printf -v line '%s,(rest),%d,%d,%d,,,\n' "$stamp" \
+    read -r _ root_use < /sys/fs/cgroup/cpu.stat
+    if ((elapsed)); then
+        rest_cpu=$(((root_use - ROOT_CPU_PREV - listed_cpu) * 100 / elapsed))
+        ((rest_cpu > 0)) || rest_cpu=0
+    fi
+    ROOT_CPU_PREV=$root_use
+    printf -v line '%s,(rest),%s,%d,%d,%d,,,\n' "$stamp" "$rest_cpu" \
         $((rest_anon >> 20)) $((rest_shmem >> 20)) $((rest_swap > 0 ? rest_swap >> 20 : 0))
     printf '%s' "$out$line" >> "$file"
 }
 
-# insert_top <max> <value> <item>: keeps TOP_V (values) and TOP_I (items)
-# sorted largest first, at most <max> long. A sort would fork.
+# insert_top <values> <items> <max> <value> <item>: keeps the two named arrays
+# sorted by value, largest first, at most <max> long. A sort would fork.
 insert_top() {
-    local i=${#TOP_V[@]}
-    while ((i > 0 && $2 > TOP_V[i - 1])); do
-        TOP_V[i]=${TOP_V[i - 1]} TOP_I[i]=${TOP_I[i - 1]}
+    local -n tv=$1 ti=$2
+    local i=${#tv[@]}
+    while ((i > 0 && $4 > tv[i - 1])); do
+        tv[i]=${tv[i - 1]} ti[i]=${ti[i - 1]}
         ((i--))
     done
-    ((i < $1)) || return 0
-    TOP_V[i]=$2 TOP_I[i]=$3
-    ((${#TOP_V[@]} <= $1)) || unset 'TOP_V[-1]' 'TOP_I[-1]'
+    ((i < $3)) || return 0
+    tv[i]=$4 ti[i]=$5
+    ((${#tv[@]} <= $3)) || unset 'tv[-1]' 'ti[-1]'
 }
 
 # mem_stat <cgroup dir>: ANON, SHMEM and SWP in bytes; 0 for a cgroup that has
