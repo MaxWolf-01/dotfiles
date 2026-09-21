@@ -66,6 +66,30 @@ in
         # Skip save while restore is in progress (session "0" only exists during restore)
         ${tmux} has-session -t 0 2>/dev/null && exit 0
 
+        ${tmuxSave}
+      '');
+    };
+  };
+  systemd.user.timers.tmux-resurrect-save = {
+    Unit.Description = "Auto-save tmux sessions every minute";
+    Timer = {
+      OnBootSec = "1min";
+      # 1min is a deliberate freshness choice. systemd may delay a timer by up to
+      # its AccuracySec to batch wakeups, 1min by default, which stretched the
+      # gaps between saves to 60-120 s.
+      OnUnitActiveSec = "1min";
+      AccuracySec = "1s";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # Hourly, apart from the save: a file can outlive its retention by up to an
+  # hour.
+  systemd.user.services.tmux-resurrect-prune = {
+    Unit.Description = "Prune old tmux saves";
+    Service = {
+      Type = "oneshot";
+      ExecStart = toString (pkgs.writeShellScript "tmux-resurrect-prune" ''
         resurrect_dir="$HOME/.tmux/resurrect"
 
         # Retention: 8 days for the kept pane archives (tmux-save keeps one per
@@ -88,20 +112,14 @@ in
         newest=$(${pkgs.coreutils}/bin/readlink -f "$resurrect_dir/last" 2>/dev/null)
         ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -mtime +14 ! -path "$newest" -delete
         ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/tmux_resurrect_*.txt 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +100001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
-
-        ${tmuxSave}
       '');
     };
   };
-  systemd.user.timers.tmux-resurrect-save = {
-    Unit.Description = "Auto-save tmux sessions every minute";
+  systemd.user.timers.tmux-resurrect-prune = {
+    Unit.Description = "Prune old tmux saves hourly";
     Timer = {
-      OnBootSec = "1min";
-      # 1min is a deliberate freshness choice. systemd may delay a timer by up to
-      # its AccuracySec to batch wakeups, 1min by default, which stretched the
-      # gaps between saves to 60-120 s.
-      OnUnitActiveSec = "1min";
-      AccuracySec = "1s";
+      OnCalendar = "hourly";
+      Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
   };
