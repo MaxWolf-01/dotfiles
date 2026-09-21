@@ -19,10 +19,12 @@
 # a sleeping GPU, so polling it every sample would keep awake the heat source
 # it is meant to catch.
 #
-# Once a minute it also writes the five cgroups (one per app, tmux pane or
-# service) holding the most memory the kernel cannot simply drop: anonymous,
-# shared and swapped. The per-sample totals show that memory ran out; this
-# shows whose it was.
+# Once a minute it also writes whose memory it is: every cgroup (one per app,
+# tmux pane or service) holding over 512 MB the kernel cannot simply drop
+# (anonymous, shared and swapped), at most ten, then a (rest) row for all the
+# others, so the rows add up to the system's total. Each row names its largest
+# process and that process's working directory, which is what tells one agent
+# pane from another.
 #
 # The sampling loop is bash-builtin only — no command substitutions, no awk,
 # no date, no children. This runs 17k times a day forever; forks made it cost
@@ -40,7 +42,9 @@ INTERVAL=${1:-5}
 LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/thermal-log"
 KEEP_DAYS=14
 MEM_EVERY=12   # samples between memory rankings: once a minute at 5 s
-MEM_HEADER="time,unit,anon_mb,shmem_mb,swap_mb,process"
+MEM_MIN_MB=512
+MEM_ROWS=10
+MEM_HEADER="time,unit,anon_mb,shmem_mb,swap_mb,procs,process,cwd"
 HEADER="time,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,mhz_max,load1,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv,mem_avail_mb,swap_used_mb"
 
 ATTRS=/sys/class/firmware-attributes/asus-armoury/attributes
@@ -121,9 +125,11 @@ memory() {
 
 # Ranks in two passes because memory.stat costs ~5x a memory.current read:
 # every cgroup by memory.current + swap, which also counts droppable file cache,
-# then the ten largest by what memory.stat says cannot be dropped.
+# then the largest few by what memory.stat says cannot be dropped.
 write_mem_top() {
-    local today stamp file d i cur swp v unit line out=
+    local today stamp file d i cur swp v unit line key val out=
+    local listed_anon=0 listed_shmem=0 listed_swap=0 rest_anon=0 rest_shmem=0 rest_swap
+    local pool_max=$((2 * MEM_ROWS))
     local -a pool p_anon p_shmem p_swap
     printf -v today '%(%F)T' -1
     printf -v stamp '%(%F %T)T' -1
@@ -131,7 +137,9 @@ write_mem_top() {
     [ -f "$file" ] || echo "$MEM_HEADER" > "$file"
 
     # ~190 cgroups: plain reads and an early size check, since a call to rd or
-    # insert_top per cgroup costs more than the reads themselves.
+    # insert_top per cgroup costs more than the reads themselves. memory.current
+    # + swap bounds what memory.stat can report, so a cgroup under MEM_MIN_MB
+    # here cannot make the list and is never read in full.
     TOP_V=() TOP_I=()
     for d in /sys/fs/cgroup/system.slice/*/ \
              /sys/fs/cgroup/user.slice/user-*.slice/session-*.scope/ \
@@ -139,7 +147,8 @@ write_mem_top() {
         read -r cur 2>/dev/null < "${d}memory.current" || continue
         read -r swp 2>/dev/null < "${d}memory.swap.current" || swp=0
         v=$((cur + swp))
-        ((${#TOP_V[@]} < 10 || v > TOP_V[9])) && insert_top 10 "$v" "$d"
+        ((v >> 20 >= MEM_MIN_MB)) || continue
+        ((${#TOP_V[@]} < pool_max || v > TOP_V[pool_max - 1])) && insert_top "$pool_max" "$v" "$d"
     done
     pool=("${TOP_I[@]}")
 
@@ -147,18 +156,35 @@ write_mem_top() {
     for i in "${!pool[@]}"; do
         mem_stat "${pool[i]}"
         p_anon[i]=$ANON p_shmem[i]=$SHMEM p_swap[i]=$SWP
-        insert_top 5 $((ANON + SHMEM + SWP)) "$i"
+        v=$((ANON + SHMEM + SWP))
+        ((v >> 20 >= MEM_MIN_MB)) && insert_top "$MEM_ROWS" "$v" "$i"
     done
 
     for i in "${TOP_I[@]}"; do
         d=${pool[i]}
         biggest_process "$d"
         unit=${d%/} unit=${unit##*/}
-        printf -v line '%s,%s,%d,%d,%d,%s\n' "$stamp" "$unit" \
-            $((p_anon[i] >> 20)) $((p_shmem[i] >> 20)) $((p_swap[i] >> 20)) "$PROC"
+        printf -v line '%s,%s,%d,%d,%d,%d,%s,%s\n' "$stamp" "$unit" \
+            $((p_anon[i] >> 20)) $((p_shmem[i] >> 20)) $((p_swap[i] >> 20)) \
+            "$PROCS" "$PROC" "$CWD"
         out+=$line
+        listed_anon=$((listed_anon + p_anon[i]))
+        listed_shmem=$((listed_shmem + p_shmem[i]))
+        listed_swap=$((listed_swap + p_swap[i]))
     done
-    printf '%s' "$out" >> "$file"
+
+    # (rest): the root cgroup's totals, and the system's swap from the sample
+    # written just before, minus the rows above.
+    while read -r key val; do
+        case $key in
+            anon)  rest_anon=$((val - listed_anon)) ;;
+            shmem) rest_shmem=$((val - listed_shmem)); break ;;
+        esac
+    done < /sys/fs/cgroup/memory.stat
+    rest_swap=$(((SWAP_USED_MB << 20) - listed_swap))
+    printf -v line '%s,(rest),%d,%d,%d,,,\n' "$stamp" \
+        $((rest_anon >> 20)) $((rest_shmem >> 20)) $((rest_swap > 0 ? rest_swap >> 20 : 0))
+    printf '%s' "$out$line" >> "$file"
 }
 
 # insert_top <max> <value> <item>: keeps TOP_V (values) and TOP_I (items)
@@ -190,18 +216,26 @@ mem_stat() {
     SWP=${SWP:-0}
 }
 
-# PROC: name of the cgroup's process with the largest resident set, which says
-# what a tmux pane or a service was running.
+# biggest_process <cgroup dir>: PROCS, how many processes it holds; PROC, the
+# name of the one with the largest resident set; CWD, that one's working
+# directory. Together they say what a tmux pane or service was running. The
+# pick ignores swap: reading a process's swap (/proc/PID/status) costs 27x its
+# resident set (statm).
 biggest_process() {
     local pid rss best=0 bestpid=
-    PROC=
+    PROCS=0 PROC='' CWD=''
     [ -r "${1}cgroup.procs" ] || return 0
     while read -r pid; do
+        ((++PROCS))
         read -r _ rss _ 2>/dev/null < "/proc/$pid/statm" || continue
         ((rss > best)) && best=$rss bestpid=$pid
     done < "${1}cgroup.procs"
-    [ -n "$bestpid" ] && read -r PROC 2>/dev/null < "/proc/$bestpid/comm"
-    PROC=${PROC//,/ }
+    [ -n "$bestpid" ] || return 0
+    read -r PROC 2>/dev/null < "/proc/$bestpid/comm"
+    # cd resolves the cwd link without forking a readlink.
+    cd -P "/proc/$bestpid/cwd" 2>/dev/null && CWD=${PWD/#"$HOME"/\~}
+    cd / || :
+    PROC=${PROC//,/ } CWD=${CWD//,/ }
 }
 
 # Zone and hwmon numbering is not stable across boots, so match on the names.
