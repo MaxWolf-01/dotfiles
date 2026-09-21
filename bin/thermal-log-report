@@ -1,0 +1,213 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro"]
+# ///
+"""CPU time per unit over the last N hours, every unit down to the smallest.
+
+Two sources, merged: systemd's record of a unit's total CPU time when it stops
+(the journal's "Consumed ... CPU time" lines, user and system), and
+thermal-log's hourly counters for units still running (YYYY-MM-DD.cpu.csv).
+A unit that restarts, or a reboot, starts a new lifetime; each lifetime counts
+only its CPU inside the window. Units that were already running when the
+counters began count only from then. The last partial hour of a unit still
+running is not counted until the next hourly counter.
+
+The total line compares the listed units against the root cgroup's counter,
+which also holds kernel threads and cgroups thermal-log does not scan.
+
+JSON schema (--json):
+
+    {"window_h": float, "total_cpu_s": float | null,
+     "units": [{"unit": "str", "cpu_s": float, "core_pct": float, "lifetimes": int}]}
+
+Examples:
+
+    thermal-log-report
+    thermal-log-report --hours 72 --top 40
+    thermal-log-report --no-group --json | jq '.units[] | select(.cpu_s > 60)'
+"""
+
+import csv
+import json
+import re
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from datetime import date, timedelta
+from pathlib import Path
+
+import tyro
+
+
+@dataclass
+class Args:
+    hours: float = 24
+    """Window length, ending now."""
+    top: int = 25
+    """Units to print, largest first. 0 prints all."""
+    group: bool = True
+    """Sum instances of one kind into a single line: tmux-spawn-*.scope, docker-*.scope, app-*-*.scope,
+    run-*.service."""
+    json: bool = False
+    """Emit JSON to stdout instead of a table."""
+    logdir: Path = Path.home() / ".local/state/thermal-log"
+    """Directory holding thermal-log's YYYY-MM-DD.cpu.csv files."""
+
+
+@dataclass
+class UnitCpu:
+    unit: str
+    cpu_s: float
+    core_pct: float
+    lifetimes: int
+
+
+@dataclass
+class Lifetime:
+    samples: list[tuple[float, int]] = field(default_factory=list)  # (epoch s, usage usec)
+    stop: tuple[float, int] | None = None  # (epoch s, lifetime usage usec) from the journal
+
+
+INSTANCE_PATTERNS = [
+    (re.compile(r"^tmux-spawn-[0-9a-f-]{36}\.scope$"), "tmux-spawn-*.scope"),
+    (re.compile(r"^docker-[0-9a-f]{64}\.scope$"), "docker-*.scope"),
+    (re.compile(r"^run-[0-9a-z]+\.(service|scope)$"), r"run-*.\1"),
+    (re.compile(r"^(.*)-\d+\.scope$"), r"\1-*.scope"),
+]
+
+DURATION = re.compile(r"([\d.]+)(d|h|min|ms|us|s)")
+DURATION_S = {"d": 86400, "h": 3600, "min": 60, "s": 1, "ms": 1e-3, "us": 1e-6}
+STOP_LINE = re.compile(r"^(\S+): Consumed (.+?) CPU time")
+
+
+def group_name(unit: str) -> str:
+    for pattern, replacement in INSTANCE_PATTERNS:
+        if pattern.match(unit):
+            return pattern.sub(replacement, unit)
+    return unit
+
+
+def read_counters(logdir: Path, since: float) -> tuple[dict[str, list[tuple[float, int]]], float | None]:
+    """Every unit's hourly counter samples, from the day before `since` on, and the earliest sample time."""
+    series: dict[str, list[tuple[float, int]]] = defaultdict(list)
+    first_day = date.fromtimestamp(since) - timedelta(days=1)
+    for path in sorted(logdir.glob("*.cpu.csv")):
+        try:
+            if date.fromisoformat(path.name[:10]) < first_day:
+                continue
+        except ValueError:
+            continue
+        with path.open() as f:
+            for row in csv.DictReader(f):
+                t = time.mktime(time.strptime(row["time"], "%Y-%m-%d %H:%M:%S"))
+                series[row["unit"]].append((t, int(row["usage_usec"])))
+    earliest = min((s[0][0] for s in series.values() if s), default=None)
+    return series, earliest
+
+
+def read_stops(since: float) -> dict[str, list[tuple[float, int]]]:
+    """Every unit stop the journal recorded since `since`: (epoch s, lifetime usage usec)."""
+    stops: dict[str, list[tuple[float, int]]] = defaultdict(list)
+    for scope in ("--user", "--system"):
+        result = subprocess.run(
+            ["journalctl", scope, "-o", "json", "--output-fields=MESSAGE", "--since", f"@{int(since)}",
+             "--grep", "Consumed .* CPU time"],
+            capture_output=True, text=True,
+        )
+        if result.returncode not in (0, 1):  # 1: no matching entries
+            print(f"thermal-log-report: journalctl {scope} failed: {result.stderr.strip()}", file=sys.stderr)
+        for line in result.stdout.splitlines():
+            entry = json.loads(line)
+            message = entry.get("MESSAGE")
+            match = STOP_LINE.match(message) if isinstance(message, str) else None
+            if not match:
+                continue
+            usage_s = sum(float(v) * DURATION_S[u] for v, u in DURATION.findall(match.group(2)))
+            stops[match.group(1)].append((int(entry["__REALTIME_TIMESTAMP"]) / 1e6, round(usage_s * 1e6)))
+    return stops
+
+
+def lifetimes(samples: list[tuple[float, int]], stops: list[tuple[float, int]]) -> list[Lifetime]:
+    """A unit's samples and stops in time order: a stop ends the current lifetime, and a sample after a stop,
+    or one whose counter dropped (restart, reboot), begins a new one. A stop with no lifetime open is a unit
+    that lived and ended between two samples."""
+    runs: list[Lifetime] = []
+    events = sorted([(t, 0, u) for t, u in samples] + [(t, 1, u) for t, u in stops])
+    for t, is_stop, usage in events:
+        current = runs[-1] if runs and runs[-1].stop is None else None
+        if is_stop:
+            if current:
+                current.stop = (t, usage)
+            else:
+                runs.append(Lifetime(stop=(t, usage)))
+        else:
+            if current is None or usage < current.samples[-1][1]:
+                current = Lifetime()
+                runs.append(current)
+            current.samples.append((t, usage))
+    return runs
+
+
+def usage_in_window(run: Lifetime, t0: float, t1: float, earliest: float | None) -> int:
+    end_t, end = run.stop if run.stop else run.samples[-1]
+    if end_t < t0:
+        return 0
+    before = [u for t, u in run.samples if t <= t0]
+    if before:
+        start = before[-1]
+    elif run.samples and run.samples[0][0] == earliest:
+        start = run.samples[0][1]  # already running when the counters began: its past is unknown
+    else:
+        start = 0  # born inside the window
+    if not run.stop:
+        inside = [u for t, u in run.samples if t <= t1]
+        end = inside[-1] if inside else start
+    return max(0, end - start)
+
+
+def main(args: Args) -> None:
+    t1 = time.time()
+    t0 = t1 - args.hours * 3600
+    counters, earliest = read_counters(args.logdir, t0)
+    stops = read_stops(t0)
+
+    per_unit: dict[str, int] = defaultdict(int)
+    count: dict[str, int] = defaultdict(int)
+    for unit in set(counters) | set(stops):
+        if unit == "(root)":
+            continue
+        name = group_name(unit) if args.group else unit
+        for run in lifetimes(counters.get(unit, []), stops.get(unit, [])):
+            used = usage_in_window(run, t0, t1, earliest)
+            if used:
+                per_unit[name] += used
+                count[name] += 1
+
+    root = counters.get("(root)", [])
+    root_runs = lifetimes(root, [])
+    total = sum(usage_in_window(r, t0, t1, earliest) for r in root_runs) if root else None
+
+    window_s = t1 - t0
+    rows = sorted(per_unit.items(), key=lambda kv: kv[1], reverse=True)
+    units = [UnitCpu(u, round(us / 1e6, 1), round(us / 1e6 / window_s * 100, 3), count[u]) for u, us in rows]
+    total_s = round(total / 1e6, 1) if total is not None else None
+
+    if args.json:
+        print(json.dumps({"window_h": args.hours, "total_cpu_s": total_s, "units": [asdict(u) for u in units]}))
+        return
+    shown = units[: args.top] if args.top else units
+    print(f"{'cpu_min':>9} {'core_%':>7} {'lives':>6}  unit")
+    for u in shown:
+        print(f"{u.cpu_s / 60:9.1f} {u.core_pct:7.2f} {u.lifetimes:6d}  {u.unit}")
+    listed = sum(u.cpu_s for u in units)
+    hidden = len(units) - len(shown)
+    tail = f", {hidden} smaller units not shown" if hidden else ""
+    system = f" of {total_s / 60:.1f} CPU-min system-wide (root counter)" if total_s else ""
+    print(f"\n{listed / 60:.1f} CPU-min across {len(units)} units{system} over {args.hours:g} h{tail}")
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__, config=(tyro.conf.OmitArgPrefixes,)))
