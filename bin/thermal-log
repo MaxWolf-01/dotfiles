@@ -19,19 +19,32 @@
 # a sleeping GPU, so polling it every sample would keep awake the heat source
 # it is meant to catch.
 #
+# Once a minute it also writes whose memory it is: every cgroup (one per app,
+# tmux pane or service) holding over 512 MB the kernel cannot simply drop
+# (anonymous, shared and swapped), at most ten, then a (rest) row for all the
+# others, so the rows add up to the system's total. Each row names its largest
+# process and that process's working directory, which is what tells one agent
+# pane from another.
+#
 # The sampling loop is bash-builtin only — no command substitutions, no awk,
 # no date, no children. This runs 17k times a day forever; forks made it cost
 # ~1% of a core (measured 49 ms CPU per sample), builtins take it to ~5 ms —
 # the floor set by the sysfs/EC sensor reads themselves.
 #
 # Usage:   thermal-log [interval-seconds]     default 5
-# Output:  ~/.local/state/thermal-log/YYYY-MM-DD.csv, pruned after 14 days
+# Output:  ~/.local/state/thermal-log/YYYY-MM-DD.csv, and YYYY-MM-DD.mem.csv for
+#          the memory ranking; both pruned after 14 days
 # Read it: column -s, -t ~/.local/state/thermal-log/$(date +%F).csv | less -S
 set -uo pipefail
+shopt -s nullglob
 
 INTERVAL=${1:-5}
 LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/thermal-log"
 KEEP_DAYS=14
+MEM_EVERY=12   # samples between memory rankings: once a minute at 5 s
+MEM_MIN_MB=512
+MEM_ROWS=10
+MEM_HEADER="time,unit,anon_mb,shmem_mb,swap_mb,procs,process,cwd"
 HEADER="time,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,mhz_max,load1,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv,mem_avail_mb,swap_used_mb"
 
 ATTRS=/sys/class/firmware-attributes/asus-armoury/attributes
@@ -47,8 +60,10 @@ main() {
     # A pipe nothing ever writes to: read -t on it is a builtin sleep, saving a
     # fork+exec (~4 ms) per sample.
     exec {idle}<> <(:)
+    local n=0
     while :; do
         write_sample
+        ((n++ % MEM_EVERY)) || write_mem_top
         read -rt "$INTERVAL" -u "$idle" || :
     done
 }
@@ -106,6 +121,121 @@ memory() {
     done < /proc/meminfo
     MEM_AVAIL_MB=$((avail / 1024))
     SWAP_USED_MB=$(((swap_total - swap_free) / 1024))
+}
+
+# Ranks in two passes because memory.stat costs ~5x a memory.current read:
+# every cgroup by memory.current + swap, which also counts droppable file cache,
+# then the largest few by what memory.stat says cannot be dropped.
+write_mem_top() {
+    local today stamp file d i cur swp v unit line key val out=
+    local listed_anon=0 listed_shmem=0 listed_swap=0 rest_anon=0 rest_shmem=0 rest_swap
+    local pool_max=$((2 * MEM_ROWS))
+    local -a pool p_anon p_shmem p_swap
+    printf -v today '%(%F)T' -1
+    printf -v stamp '%(%F %T)T' -1
+    file="$LOGDIR/$today.mem.csv"
+    [ -f "$file" ] || echo "$MEM_HEADER" > "$file"
+
+    # ~190 cgroups: plain reads and an early size check, since a call to rd or
+    # insert_top per cgroup costs more than the reads themselves. memory.current
+    # + swap bounds what memory.stat can report, so a cgroup under MEM_MIN_MB
+    # here cannot make the list and is never read in full.
+    TOP_V=() TOP_I=()
+    for d in /sys/fs/cgroup/system.slice/*/ \
+             /sys/fs/cgroup/user.slice/user-*.slice/session-*.scope/ \
+             /sys/fs/cgroup/user.slice/user-*.slice/user@*.service/*.slice/*/; do
+        read -r cur 2>/dev/null < "${d}memory.current" || continue
+        read -r swp 2>/dev/null < "${d}memory.swap.current" || swp=0
+        v=$((cur + swp))
+        ((v >> 20 >= MEM_MIN_MB)) || continue
+        ((${#TOP_V[@]} < pool_max || v > TOP_V[pool_max - 1])) && insert_top "$pool_max" "$v" "$d"
+    done
+    pool=("${TOP_I[@]}")
+
+    TOP_V=() TOP_I=()
+    for i in "${!pool[@]}"; do
+        mem_stat "${pool[i]}"
+        p_anon[i]=$ANON p_shmem[i]=$SHMEM p_swap[i]=$SWP
+        v=$((ANON + SHMEM + SWP))
+        ((v >> 20 >= MEM_MIN_MB)) && insert_top "$MEM_ROWS" "$v" "$i"
+    done
+
+    for i in "${TOP_I[@]}"; do
+        d=${pool[i]}
+        biggest_process "$d"
+        unit=${d%/} unit=${unit##*/}
+        printf -v line '%s,%s,%d,%d,%d,%d,%s,%s\n' "$stamp" "$unit" \
+            $((p_anon[i] >> 20)) $((p_shmem[i] >> 20)) $((p_swap[i] >> 20)) \
+            "$PROCS" "$PROC" "$CWD"
+        out+=$line
+        listed_anon=$((listed_anon + p_anon[i]))
+        listed_shmem=$((listed_shmem + p_shmem[i]))
+        listed_swap=$((listed_swap + p_swap[i]))
+    done
+
+    # (rest): the root cgroup's totals, and the system's swap from the sample
+    # written just before, minus the rows above.
+    while read -r key val; do
+        case $key in
+            anon)  rest_anon=$((val - listed_anon)) ;;
+            shmem) rest_shmem=$((val - listed_shmem)); break ;;
+        esac
+    done < /sys/fs/cgroup/memory.stat
+    rest_swap=$(((SWAP_USED_MB << 20) - listed_swap))
+    printf -v line '%s,(rest),%d,%d,%d,,,\n' "$stamp" \
+        $((rest_anon >> 20)) $((rest_shmem >> 20)) $((rest_swap > 0 ? rest_swap >> 20 : 0))
+    printf '%s' "$out$line" >> "$file"
+}
+
+# insert_top <max> <value> <item>: keeps TOP_V (values) and TOP_I (items)
+# sorted largest first, at most <max> long. A sort would fork.
+insert_top() {
+    local i=${#TOP_V[@]}
+    while ((i > 0 && $2 > TOP_V[i - 1])); do
+        TOP_V[i]=${TOP_V[i - 1]} TOP_I[i]=${TOP_I[i - 1]}
+        ((i--))
+    done
+    ((i < $1)) || return 0
+    TOP_V[i]=$2 TOP_I[i]=$3
+    ((${#TOP_V[@]} <= $1)) || unset 'TOP_V[-1]' 'TOP_I[-1]'
+}
+
+# mem_stat <cgroup dir>: ANON, SHMEM and SWP in bytes; 0 for a cgroup that has
+# gone. memory.stat lists anon first and shmem tenth, so reading stops there.
+mem_stat() {
+    local key val
+    ANON=0 SHMEM=0 SWP=0
+    [ -r "${1}memory.stat" ] || return 0
+    while read -r key val; do
+        case $key in
+            anon)  ANON=$val ;;
+            shmem) SHMEM=$val; break ;;
+        esac
+    done < "${1}memory.stat"
+    rd "${1}memory.swap.current" SWP
+    SWP=${SWP:-0}
+}
+
+# biggest_process <cgroup dir>: PROCS, how many processes it holds; PROC, the
+# name of the one with the largest resident set; CWD, that one's working
+# directory. Together they say what a tmux pane or service was running. The
+# pick ignores swap: reading a process's swap (/proc/PID/status) costs 27x its
+# resident set (statm).
+biggest_process() {
+    local pid rss best=0 bestpid=
+    PROCS=0 PROC='' CWD=''
+    [ -r "${1}cgroup.procs" ] || return 0
+    while read -r pid; do
+        ((++PROCS))
+        read -r _ rss _ 2>/dev/null < "/proc/$pid/statm" || continue
+        ((rss > best)) && best=$rss bestpid=$pid
+    done < "${1}cgroup.procs"
+    [ -n "$bestpid" ] || return 0
+    read -r PROC 2>/dev/null < "/proc/$bestpid/comm"
+    # cd resolves the cwd link without forking a readlink.
+    cd -P "/proc/$bestpid/cwd" 2>/dev/null && CWD=${PWD/#"$HOME"/\~}
+    cd / || :
+    PROC=${PROC//,/ } CWD=${CWD//,/ }
 }
 
 # Zone and hwmon numbering is not stable across boots, so match on the names.
