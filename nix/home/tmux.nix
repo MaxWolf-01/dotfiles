@@ -20,7 +20,8 @@ let
           if [ -s "$f" ]; then
             ln -sfn "$(basename "$f")" "$last"
             ts="$(basename "$f" .txt)"; ts="''${ts#tmux_resurrect_}"
-            [ -s "$resdir/pane_contents_$ts.tar.gz" ] && cp "$resdir/pane_contents_$ts.tar.gz" "$resdir/pane_contents.tar.gz"
+            # A link, not a copy: tmux-save hardlinks the two, and cp refuses one file under two names.
+            [ -s "$resdir/pane_contents_$ts.tar.gz" ] && ln -f "$resdir/pane_contents_$ts.tar.gz" "$resdir/pane_contents.tar.gz"
             echo "tms: 'last' save was empty/missing, restored from $ts" >&2
             break
           fi
@@ -44,6 +45,13 @@ let
   tmuxGuard = lib.hiPrio (pkgs.writeShellScriptBin "tmux" ''
     exec ${pkgs.bash}/bin/bash ${./tmux-guard.sh} ${tmux} "$@"
   '');
+
+  # Saves in tmux-resurrect's format, for its restore; tmux-save.sh says why it
+  # replaces resurrect's own save. Tested by tests/tmux-save.test.
+  tmuxSave = pkgs.writeShellScript "tmux-save" ''
+    PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.procps pkgs.diffutils pkgs.gnutar pkgs.gzip ]}
+    exec ${pkgs.bash}/bin/bash ${./tmux-save.sh} ${tmux} "$HOME/.tmux/resurrect"
+  '';
 in
 {
   # Systemd timer for tmux session auto-save (more reliable than continuum)
@@ -60,8 +68,8 @@ in
 
         resurrect_dir="$HOME/.tmux/resurrect"
 
-        # Rotate pane_contents.tar.gz before save. Retention: 8 days for the
-        # rotated archives, 14 for the state files below. The archives are what
+        # Retention: 8 days for the kept pane archives (tmux-save keeps one per
+        # archive it writes), 14 for the state files below. The archives are what
         # the offsite backup pays for, ~130 MB a day against the state files'
         # ~1 MB, and 8 days still carries each archive to the snapshot that
         # captures it for as long as one snapshot a week survives retention.
@@ -70,12 +78,8 @@ in
         # that cannot bind under real usage (8d of every-minute saves is ~11.5k)
         # and only guards runaway growth. Worst case: tars ~11.5k x ~250 KB =
         # ~2.9 GB, state files ~100 MB.
-        pane_archive="$resurrect_dir/pane_contents.tar.gz"
-        if [ -f "$pane_archive" ]; then
-          ${pkgs.coreutils}/bin/cp "$pane_archive" "$resurrect_dir/pane_contents_$(${pkgs.coreutils}/bin/date +%Y%m%dT%H%M%S).tar.gz"
-          ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'pane_contents_*.tar.gz' -mtime +8 -delete
-          ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/pane_contents_*.tar.gz 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +100001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
-        fi
+        ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'pane_contents_*.tar.gz' -mtime +8 -delete
+        ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/pane_contents_*.tar.gz 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +100001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
 
         # Resurrect dedupes identical consecutive state files but never deletes
         # old distinct ones. The newest is always kept: dedupe means it can
@@ -85,8 +89,7 @@ in
         ${pkgs.findutils}/bin/find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -mtime +14 ! -path "$newest" -delete
         ${pkgs.coreutils}/bin/ls -t "$resurrect_dir"/tmux_resurrect_*.txt 2>/dev/null | ${pkgs.coreutils}/bin/tail -n +100001 | ${pkgs.findutils}/bin/xargs -r ${pkgs.coreutils}/bin/rm
 
-        save_script=$(${tmux} show-options -gqv @resurrect-save-script-path)
-        [ -x "$save_script" ] && "$save_script" quiet 2>/dev/null
+        ${tmuxSave}
       '');
     };
   };
@@ -94,9 +97,11 @@ in
     Unit.Description = "Auto-save tmux sessions every minute";
     Timer = {
       OnBootSec = "1min";
-      # 1min is a deliberate freshness choice (~3 GB/day of write churn, measured
-      # 2026-08: rewritten pane archive + capture staging per save).
+      # 1min is a deliberate freshness choice. systemd may delay a timer by up to
+      # its AccuracySec to batch wakeups, 1min by default, which stretched the
+      # gaps between saves to 60-120 s.
       OnUnitActiveSec = "1min";
+      AccuracySec = "1s";
     };
     Install.WantedBy = [ "timers.target" ];
   };
@@ -212,7 +217,7 @@ in
       bind r source-file ~/.config/tmux/tmux.conf \; display "Config reloaded"
 
       # Ctrl+s to save (no prefix needed!)
-      bind -n C-s run-shell '#{@resurrect-save-script-path}'
+      bind -n C-s run-shell '${tmuxSave}' \; display-message "tmux sessions saved"
 
       # Detach to terminal when session is destroyed (instead of switching to another)
       set -g detach-on-destroy on
