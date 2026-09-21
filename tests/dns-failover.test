@@ -1,0 +1,163 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Does the DNS front keep answering when its upstream connections go silent?
+Run it directly; no framework.
+
+An exit-node change, a suspend or a new network leaves the front holding
+connections that still accept writes and never answer again. docs/dns.md
+promises that a dead tunnel costs about 2 s per lookup, so a lookup that lands
+on such a connection has to come back within the front's --timeout plus a
+reconnect.
+
+dnsproxy runs here with the upstream protocol and the --timeout that
+bin/dns-failover-install gives the front, against a local stand-in for
+Mullvad's resolver: connections opened before the change swallow their
+queries, connections opened after it answer.
+"""
+
+import asyncio
+import base64
+import os
+import re
+import shutil
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+INSTALL = Path(__file__).resolve().parent.parent / "bin/dns-failover-install"
+UPSTREAM_PORT, FALLBACK_PORT, FRONT_PORT = 8853, 5391, 5390
+RECONNECT_SECS = 1.0
+"""What a fresh connection to a local stand-in may cost on top of --timeout."""
+
+silent_since: float | None = None
+fallback_answers = 0
+
+
+def installed_front() -> tuple[str, float]:
+    """The upstream's URL scheme and the front's --timeout, as the install script sets them."""
+    text = INSTALL.read_text()
+    upstream = re.search(r"^MULLVAD=(\w+)://", text, re.MULTILINE)
+    timeout = re.search(r"--cache --timeout=(\d+)s", text)
+    if not upstream or not timeout:
+        sys.exit(f"FAIL {INSTALL.name} no longer sets MULLVAD=<scheme>://... or the front's `--cache --timeout=Ns`")
+    return upstream.group(1), float(timeout.group(1))
+
+
+def answer(query: bytes, ip: bytes) -> bytes:
+    end = 12
+    while query[end]:
+        end += query[end] + 1
+    header = query[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+    return header + query[12 : end + 5] + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x00\x00\x04" + ip
+
+
+def swallows(born: float) -> bool:
+    return silent_since is not None and born < silent_since
+
+
+async def dot_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    born = time.monotonic()
+    try:
+        while True:
+            (length,) = struct.unpack("!H", await reader.readexactly(2))
+            query = await reader.readexactly(length)
+            if not swallows(born):
+                reply = answer(query, bytes([192, 0, 2, 1]))
+                writer.write(struct.pack("!H", len(reply)) + reply)
+                await writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionError):
+        pass
+
+
+async def doh_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    born = time.monotonic()
+    try:
+        while True:
+            head = (await reader.readuntil(b"\r\n\r\n")).decode()
+            param = head.split("dns=", 1)[1].split()[0].split("&")[0]
+            if not swallows(born):
+                reply = answer(base64.urlsafe_b64decode(param + "=" * (-len(param) % 4)), bytes([192, 0, 2, 1]))
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: %d\r\n\r\n" % len(reply) + reply)
+                await writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionError):
+        pass
+
+
+class Fallback(asyncio.DatagramProtocol):
+    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        global fallback_answers
+        fallback_answers += 1
+        self.transport.sendto(answer(data, bytes([192, 0, 2, 2])), addr)
+
+
+async def lookup(name: str) -> tuple[float, str]:
+    started = time.monotonic()
+    proc = await asyncio.create_subprocess_exec(
+        "dig", "@127.0.0.1", "-p", str(FRONT_PORT), "+tries=1", "+time=20", "+short", name, "A",
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )  # fmt: skip
+    lines = (await proc.communicate())[0].decode().split()
+    return time.monotonic() - started, lines[0] if lines else "no answer"
+
+
+async def main() -> int:
+    global silent_since
+    dnsproxy = shutil.which("dnsproxy", path="/usr/local/bin:/usr/bin:" + os.environ.get("PATH", ""))
+    if dnsproxy is None:
+        print("skip dnsproxy is not installed on this machine (bin/dns-failover-install puts it in /usr/local/bin)")
+        return 0
+    scheme, timeout = installed_front()
+    handlers = {"tls": (dot_connection, f"tls://127.0.0.1:{UPSTREAM_PORT}"),
+                "https": (doh_connection, f"https://127.0.0.1:{UPSTREAM_PORT}/dns-query")}  # fmt: skip
+    if scheme not in handlers:
+        print(f"FAIL no stand-in for a {scheme}:// upstream; this test knows {', '.join(handlers)}")
+        return 1
+    handler, upstream = handlers[scheme]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cert, key = Path(tmp, "cert.pem"), Path(tmp, "key.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=localhost",
+                        "-keyout", key, "-out", cert], check=True, capture_output=True)  # fmt: skip
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(cert, key)
+        tls.set_alpn_protocols(["http/1.1", "dot"])
+        await asyncio.start_server(handler, "127.0.0.1", UPSTREAM_PORT, ssl=tls)
+        await asyncio.get_running_loop().create_datagram_endpoint(Fallback, local_addr=("127.0.0.1", FALLBACK_PORT))
+        front = subprocess.Popen(
+            [dnsproxy, "-l", "127.0.0.1", "-p", str(FRONT_PORT), "-u", upstream, "--insecure",
+             "-f", f"127.0.0.1:{FALLBACK_PORT}", "--cache", f"--timeout={timeout:g}s"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )  # fmt: skip
+        try:
+            await asyncio.sleep(0.7)
+            # Several at once, so the front holds several connections, as it does in use.
+            warm = await asyncio.gather(*(lookup(f"warm{i}.test") for i in range(4)))
+            if any(ip != "192.0.2.1" for _, ip in warm):
+                print(f"FAIL the front did not answer through its upstream before the change: {warm}")
+                return 1
+            silent_since = time.monotonic()
+            after = [await lookup(f"after{i}.test") for i in range(6)]
+        finally:
+            front.terminate()
+
+    limit = timeout + RECONNECT_SECS
+    slowest = max(took for took, _ in after)
+    unanswered = [ip for _, ip in after if not ip.startswith("192.0.2.")]
+    ok = slowest <= limit and not unanswered
+    print(f"{'ok  ' if ok else 'FAIL'} a lookup landing on a silent {scheme}:// connection is answered within --timeout + {RECONNECT_SECS:g} s")
+    if not ok:
+        print(f"       expected: every lookup answered within {limit:g} s")
+        print(f"       actual:   slowest {slowest:.2f} s; answers {[ip for _, ip in after]}; fallback asked {fallback_answers}x")
+    return 0 if ok else 1
+
+
+sys.exit(asyncio.run(main()))

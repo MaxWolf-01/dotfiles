@@ -21,17 +21,17 @@ the failover chain names the same resolver in `bin/dns-failover-install`.
 
 systemd-resolved hands every name to a local dnsproxy front
 (`127.0.0.1:5300`), which forwards over a strict three-tier chain — Mullvad
-DoT through the exit node, Mullvad DoT past the tunnel, plain DNS to Mullvad's
+DoH through the exit node, Mullvad DoH past the tunnel, plain DNS to Mullvad's
 IP — each tier tried per query only after the one before fails. Mechanics and
 rationale: the comments in `bin/dns-failover-install`.
 
 What follows from the shape:
 
-- A dead tunnel costs ~2 s per uncached lookup instead of an outage. The chain
+- A dead tunnel costs ~3 s per uncached lookup instead of an outage. The chain
   exists because tailnet DNS died three times in one day of tunnel trouble:
   `agent/tickets/dns-fails-closed-on-flaky-link.md`.
 - No failure path reaches a non-Mullvad resolver. Plain 53 is used only on
-  networks that block both DoT paths.
+  networks that block both DoH paths.
 - Queries carry the real source IP only while the tunnel path is failing.
 - `journalctl -u dnsproxy-direct` shows exactly the queries the tunnel path
   failed — it is the tunnel-outage log.
