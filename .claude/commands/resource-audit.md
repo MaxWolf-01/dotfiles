@@ -45,6 +45,9 @@ measured value, its floor, and its behavior-preserving flag.
 - Per-run outcomes, stats, dashboards: `docs/monitoring.md`.
 - Battery, temperature, power caps: the thermal-log CSVs — path, cadence and
   retention in `bin/thermal-log`'s header.
+- CPU per unit over any window, every unit down to the smallest:
+  `thermal-log-report` (thermal-log's hourly counters plus systemd's stop
+  records). Step 2's ranking for CPU starts there.
 - HDD spin behaviour on pc: `journalctl -u hd-idle` logs every spindown and
   spinup — match each wake against the known timers.
 
