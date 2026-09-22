@@ -234,8 +234,11 @@ in
       # Reload config
       bind r source-file ~/.config/tmux/tmux.conf \; display "Config reloaded"
 
-      # Ctrl+s to save (no prefix needed!)
+      # Ctrl+s to save (no prefix needed!). The prefix binding replaces the
+      # resurrect plugin's, which runs its own save.sh: that writes the archive in
+      # place, through the hardlink tmux-save keeps of it.
       bind -n C-s run-shell '${tmuxSave}' \; display-message "tmux sessions saved"
+      bind C-s run-shell '${tmuxSave}' \; display-message "tmux sessions saved"
 
       # Detach to terminal when session is destroyed (instead of switching to another)
       set -g detach-on-destroy on
