@@ -855,8 +855,8 @@ def collect_source(spec: str, context: int) -> dict:
         untracked = untracked_patch(repo, context)
         patch += untracked
         commits = collect_commits(repo, f"{base}..HEAD", context)
-        pending = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", "HEAD"]) + untracked
-        if files := parse_patch(pending):
+        pending = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "--raw", "-p", "--no-abbrev", "-M", f"-U{context}", "HEAD"]) + untracked
+        if files := with_blobs(pending):
             commits.append(commit_record("worktree", "", "", "uncommitted changes", "", files))
         detail = f"{worktree_left(range_)}{'...' if range_.endswith('...') else '..'}worktree"
         rev = None
@@ -866,7 +866,7 @@ def collect_source(spec: str, context: int) -> dict:
         rev = re.split(r"\.{2,3}", range_)[-1] or "HEAD"
     files = parse_patch(patch)
     return {"label": Path(repo).name, "kind": "git", "detail": detail, "files": files, "commits": commits,
-            "historyBase": history_base(root, commits),
+            "historyBlobs": history_blobs(root, commits),
             "_patch": patch, "_sides": {"old": (root, base), "new": (root, rev)}}
 
 
@@ -1053,16 +1053,31 @@ def rev_args(repo: str, range_: str) -> list[str]:
 def collect_commits(repo: str, range_: str, context: int) -> list[dict]:
     """The range's commits, oldest first with each one after its parents, each carrying its own diff.
     The page's history panel lists them, and selecting some there shows only what they changed."""
-    fmt = "%x1e%h%x1f%an%x1f%aI%x1f%s%x1f%b%x1f"
-    raw = run_git(["-C", repo, "log", "--no-merges", "--topo-order", "--reverse", "-p", "-M", "--no-color", "--no-ext-diff",
-                   f"-U{context}", f"--format={fmt}", range_])
-    commits = []
-    for rec in raw.split("\x1e"):
-        if not rec.strip():
-            continue
-        short, author, date, subject, body, patch = rec.split("\x1f", 5)
-        commits.append(commit_record(short, author, date, subject, body, parse_patch(patch)))
-    return commits
+    fmt = "%x1e%H%x1f%an%x1f%aI%x1f%s%x1f%b%x1f"
+    raw = run_git(["-C", repo, "log", "--no-merges", "--topo-order", "--reverse", "-p", "--raw", "--no-abbrev", "-M", "--no-color",
+                   "--no-ext-diff", f"-U{context}", f"--format={fmt}", range_])
+    records = [rec.split("\x1f", 5) for rec in raw.split("\x1e") if rec.strip()]
+    # --no-abbrev, which the blob ids need, writes %h out in full too
+    short = dict(line.split() for line in run_git(["-C", repo, "log", "--no-merges", "--format=%H %h", range_]).splitlines())
+    return [commit_record(short[sha], author, date, subject, body, with_blobs(patch)) for sha, author, date, subject, body, patch in records]
+
+
+RAW_RE = re.compile(r"^:\d+ \d+ ([0-9a-f]+) ([0-9a-f]+) [A-Z]\d*\t(?:[^\t]*\t)?(.*)$")
+
+
+def with_blobs(patch: str) -> list[dict]:
+    """The files a `--raw -p` diff changes, each with "blobs": the blob ids of its old and new side,
+    None for a side git has no blob for (a file added or deleted, or the working tree's side)."""
+    files = parse_patch(patch)
+    blobs = {}
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            break
+        if m := RAW_RE.match(line):
+            blobs[m[3].strip('"')] = [None if not m[i].strip("0") else m[i] for i in (1, 2)]
+    for f in files:
+        f["blobs"] = blobs.get(f["path"], [None, None])
+    return files
 
 
 def commit_record(short: str, author: str, date: str, subject: str, body: str, files: list[dict]) -> dict:
@@ -1071,34 +1086,29 @@ def commit_record(short: str, author: str, date: str, subject: str, body: str, f
             "adds": sum(f["adds"] for f in files), "dels": sum(f["dels"] for f in files), "files": files}
 
 
-def history_base(root: str, commits: list[dict]) -> dict:
-    """The content of every file the commits change, as it was before the first commit. The page
-    rebuilds each later version from it by applying the commits' diffs in order.
+def history_blobs(root: str, commits: list[dict]) -> dict:
+    """The file versions, by blob id, that the page cannot derive from the commits' own diffs.
 
-    Each value is the file's lines, null where the file did not exist yet, or false where the page
-    carries no text of it because it is binary or over the size limit.
+    A commit's diff turns the version it starts from into the version it ends at, so the page
+    derives every version a commit in the list ends at. What it cannot derive is a version a commit
+    starts from that no earlier commit in the list ended at: the files as they were before the range,
+    and whatever a commit left out of the list brought in, such as a merge. Those are baked here.
+
+    Each value is the file's lines, split as the diffs split them, or false where the page carries no
+    text of it because it is binary or over the size limit.
     """
-    if not commits:
-        return {}
-    first = commits[0]["short"]
-    rev = "HEAD" if first == "worktree" else f"{first}^"
-    exists = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", rev], capture_output=True).returncode == 0
-    base: dict[str, list[str] | None | bool] = {}
+    known: set[str] = set()
+    blobs: dict[str, list[str] | bool] = {}
     for c in commits:
         for f in c["files"]:
-            for path in (f["oldPath"], f["path"]):
-                if not path or path in base:
-                    continue
-                proc = subprocess.run(["git", "-C", root, "cat-file", "--filters", f"{rev}:{path}"], capture_output=True) if exists else None
-                raw = proc.stdout if proc and proc.returncode == 0 else None
-                if raw is None:
-                    base[path] = None
-                elif b"\0" in raw or len(raw) > MAX_BAKED_BYTES:
-                    base[path] = False
-                else:
-                    lines = raw.decode(errors="replace").split("\n")
-                    base[path] = lines[:-1] if lines and lines[-1] == "" else lines
-    return base
+            old, new = f["blobs"]
+            if old and old not in known:
+                raw = subprocess.run(["git", "-C", root, "cat-file", "blob", old], capture_output=True).stdout
+                blobs[old] = False if b"\0" in raw or len(raw) > MAX_BAKED_BYTES else raw.decode(errors="replace").splitlines()
+                known.add(old)
+            if new:
+                known.add(new)
+    return blobs
 
 
 def run_git(git_args: list[str], ok_codes: tuple[int, ...] = (0,)) -> str:
