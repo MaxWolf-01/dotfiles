@@ -158,6 +158,7 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
         "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "sources": sources,
         "size": size,
+        "context": args.context,
         "imageLimit": MAX_IMAGE_BYTES,
         "summary": summary,
         "summaryPending": generate or awaiting,
@@ -812,6 +813,8 @@ def sources_sig(args: Args) -> str:
             repo, range_ = spec.rsplit("@", 1) if "@" in spec else (".", spec)
             repo = str(Path(repo).expanduser().resolve())
             patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", *rev_args(repo, range_)])
+            # a commit that leaves the diff as it was still joins the history the page lists
+            patch += run_git(["-C", repo, "rev-parse", "HEAD" if is_worktree(range_) else re.split(r"\.{2,3}", range_)[-1] or "HEAD"])
             if is_worktree(range_):
                 root, names = untracked_files(repo)
                 for name in names:   # name, size and mtime stand in for the content; cheaper than diffing each file every tick
@@ -847,18 +850,23 @@ def collect_source(spec: str, context: int) -> dict:
 
     patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", *rev_args(repo, range_)])
     base = diff_base(repo, range_)
+    root = git_root(repo)   # the diff's paths are the repo's, whichever directory the spec named
     if is_worktree(range_):
-        patch += untracked_patch(repo, context)
-        commits = collect_commits(repo, f"{base}..HEAD")
+        untracked = untracked_patch(repo, context)
+        patch += untracked
+        commits = collect_commits(repo, f"{base}..HEAD", context)
+        pending = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", "HEAD"]) + untracked
+        if files := parse_patch(pending):
+            commits.append(commit_record("worktree", "", "", "uncommitted changes", "", files))
         detail = f"{worktree_left(range_)}{'...' if range_.endswith('...') else '..'}worktree"
         rev = None
     else:
-        commits = collect_commits(repo, range_)
+        commits = collect_commits(repo, range_, context)
         detail = range_
         rev = re.split(r"\.{2,3}", range_)[-1] or "HEAD"
     files = parse_patch(patch)
-    root = git_root(repo)   # the diff's paths are the repo's, whichever directory the spec named
     return {"label": Path(repo).name, "kind": "git", "detail": detail, "files": files, "commits": commits,
+            "historyBase": history_base(root, commits),
             "_patch": patch, "_sides": {"old": (root, base), "new": (root, rev)}}
 
 
@@ -1042,39 +1050,52 @@ def rev_args(repo: str, range_: str) -> list[str]:
     return [diff_base(repo, range_)] if is_worktree(range_) else [range_]
 
 
-def collect_commits(repo: str, range_: str) -> list[dict]:
-    """Commit metadata + per-file numstat only — the page shows the range diff; commits are context."""
+def collect_commits(repo: str, range_: str, context: int) -> list[dict]:
+    """The range's commits, oldest first and each after its parents, every one with its own diff:
+    the history panel lists them, and a lens on some of them shows what they changed."""
     fmt = "%x1e%h%x1f%an%x1f%aI%x1f%s%x1f%b%x1f"
-    raw = run_git(["-C", repo, "log", "--no-merges", "--reverse", "--numstat", f"--format={fmt}", range_])
+    raw = run_git(["-C", repo, "log", "--no-merges", "--topo-order", "--reverse", "-p", "-M", "--no-color", "--no-ext-diff",
+                   f"-U{context}", f"--format={fmt}", range_])
     commits = []
     for rec in raw.split("\x1e"):
         if not rec.strip():
             continue
-        short, author, date, subject, body, numstat = rec.split("\x1f")
-        body = re.sub(r"^(Co-Authored-By|Signed-off-by|Reviewed-by):.*$", "", body, flags=re.M | re.I).strip()
-        files = []
-        for line in numstat.strip().splitlines():
-            parts = line.split("\t")
-            if len(parts) != 3:
-                continue
-            adds, dels, path = parts
-            path = re.sub(r"\{([^}]*) => ([^}]*)\}", r"\2", path).replace("//", "/")
-            if " => " in path:
-                path = path.split(" => ")[-1]
-            files.append({"path": path, "adds": 0 if adds == "-" else int(adds), "dels": 0 if dels == "-" else int(dels)})
-        commits.append(
-            {
-                "short": short,
-                "author": author,
-                "date": date,
-                "subject": subject,
-                "body": body,
-                "adds": sum(f["adds"] for f in files),
-                "dels": sum(f["dels"] for f in files),
-                "files": files,
-            }
-        )
+        short, author, date, subject, body, patch = rec.split("\x1f", 5)
+        commits.append(commit_record(short, author, date, subject, body, parse_patch(patch)))
     return commits
+
+
+def commit_record(short: str, author: str, date: str, subject: str, body: str, files: list[dict]) -> dict:
+    body = re.sub(r"^(Co-Authored-By|Signed-off-by|Reviewed-by):.*$", "", body, flags=re.M | re.I).strip()
+    return {"short": short, "author": author, "date": date, "subject": subject, "body": body,
+            "adds": sum(f["adds"] for f in files), "dels": sum(f["dels"] for f in files), "files": files}
+
+
+def history_base(root: str, commits: list[dict]) -> dict:
+    """What each file the commits touch held before the first of them, from which the page rebuilds
+    every later version, patch by patch: its lines, null where the file did not exist yet, false
+    where the page gets no text of it (binary, or over the size limit)."""
+    if not commits:
+        return {}
+    first = commits[0]["short"]
+    rev = "HEAD" if first == "worktree" else f"{first}^"
+    exists = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", rev], capture_output=True).returncode == 0
+    base: dict[str, list[str] | None | bool] = {}
+    for c in commits:
+        for f in c["files"]:
+            for path in (f["oldPath"], f["path"]):
+                if not path or path in base:
+                    continue
+                proc = subprocess.run(["git", "-C", root, "cat-file", "--filters", f"{rev}:{path}"], capture_output=True) if exists else None
+                raw = proc.stdout if proc and proc.returncode == 0 else None
+                if raw is None:
+                    base[path] = None
+                elif b"\0" in raw or len(raw) > MAX_BAKED_BYTES:
+                    base[path] = False
+                else:
+                    lines = raw.decode(errors="replace").split("\n")
+                    base[path] = lines[:-1] if lines and lines[-1] == "" else lines
+    return base
 
 
 def run_git(git_args: list[str], ok_codes: tuple[int, ...] = (0,)) -> str:
