@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Drive bin/dgpu against a fake sysfs and /dev tree. Run it directly; no framework.
+#
+# The decisions under test: the dGPU is the display device that is not the
+# boot VGA, and only its device files change; lock takes every bit, unlock
+# gives back what udev sets; auto follows the charger. That a failed open keeps
+# a real dGPU in D3cold shows only on the hardware.
+
+set -uo pipefail
+
+script="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/dgpu"
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+
+failures=0
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+mode() { stat -L -c %a "$1"; }
+
+# An iGPU at 00:02.0 that owns the console, an NVIDIA dGPU at 01:00.0 in
+# D3cold, and the charger plugged in. The by-path links point at the nodes the
+# way udev lays them out.
+fresh_tree() {
+    rm -rf "${root:?}"/{sys,dev,ps}
+    mkdir -p "$root/sys/drm/card0" "$root/sys/drm/card1" \
+             "$root/sys/pci/0000:00:02.0" "$root/sys/pci/0000:01:00.0" \
+             "$root/sys/drivers/i915" "$root/sys/drivers/nvidia" \
+             "$root/dev/dri/by-path" "$root/ps/AC0" "$root/ps/BAT0"
+    echo 0x030000 > "$root/sys/pci/0000:00:02.0/class"
+    echo 1 > "$root/sys/pci/0000:00:02.0/boot_vga"
+    ln -s ../../drivers/i915 "$root/sys/pci/0000:00:02.0/driver"
+    echo 0x030000 > "$root/sys/pci/0000:01:00.0/class"
+    echo 0 > "$root/sys/pci/0000:01:00.0/boot_vga"
+    echo D3cold > "$root/sys/pci/0000:01:00.0/power_state"
+    ln -s ../../drivers/nvidia "$root/sys/pci/0000:01:00.0/driver"
+    ln -s ../../pci/0000:00:02.0 "$root/sys/drm/card0/device"
+    ln -s ../../pci/0000:01:00.0 "$root/sys/drm/card1/device"
+    local n
+    for n in card0 card1 renderD128 renderD129; do
+        : > "$root/dev/dri/$n"; chmod 0660 "$root/dev/dri/$n"
+    done
+    ln -s ../card0 "$root/dev/dri/by-path/pci-0000:00:02.0-card"
+    ln -s ../renderD128 "$root/dev/dri/by-path/pci-0000:00:02.0-render"
+    ln -s ../card1 "$root/dev/dri/by-path/pci-0000:01:00.0-card"
+    ln -s ../renderD129 "$root/dev/dri/by-path/pci-0000:01:00.0-render"
+    for n in nvidia0 nvidiactl nvidia-modeset nvidia-uvm; do
+        : > "$root/dev/$n"; chmod 0666 "$root/dev/$n"
+    done
+    echo Mains > "$root/ps/AC0/type"; echo 1 > "$root/ps/AC0/online"
+    echo Battery > "$root/ps/BAT0/type"
+}
+
+run() {
+    DGPU_SYSFS_DRM="$root/sys/drm" DGPU_DEV="$root/dev" DGPU_POWER_SUPPLY="$root/ps" "$script" "$@"
+}
+
+modes() { # the dGPU's nodes, then the iGPU's
+    echo "$(mode "$root/dev/dri/card1") $(mode "$root/dev/dri/renderD129") $(mode "$root/dev/nvidia0") $(mode "$root/dev/nvidiactl") $(mode "$root/dev/nvidia-modeset") $(mode "$root/dev/nvidia-uvm") / $(mode "$root/dev/dri/card0") $(mode "$root/dev/dri/renderD128")"
+}
+
+# --- lock and unlock
+
+fresh_tree
+run lock
+check "lock succeeds" 0 $?
+check "the dGPU's nodes lose every bit, the iGPU's keep theirs" \
+    "0 0 0 0 0 0 / 660 660" "$(modes)"
+check "status says so" "dgpu: 0000:01:00.0 driver nvidia, D3cold, locked" "$(run status | head -1)"
+
+run unlock
+check "unlock succeeds" 0 $?
+check "and restores udev's modes" "660 660 666 666 666 666 / 660 660" "$(modes)"
+check "status says so" "dgpu: 0000:01:00.0 driver nvidia, D3cold, unlocked" "$(run status | head -1)"
+
+# --- auto follows the charger
+
+fresh_tree
+echo 0 > "$root/ps/AC0/online"
+run auto
+check "on battery auto locks" "0 0 0 0 0 0 / 660 660" "$(modes)"
+check "and status says battery" "power: battery" "$(run status | sed -n 2p)"
+echo 1 > "$root/ps/AC0/online"
+run auto
+check "on AC auto unlocks" "660 660 666 666 666 666 / 660 660" "$(modes)"
+
+# --- a node that is not there is skipped, not an error
+
+fresh_tree
+rm "$root/dev/nvidia-uvm"
+run lock
+check "lock succeeds without the uvm node" 0 $?
+check "and locks the rest" "0 0 0 0 0" \
+    "$(mode "$root/dev/dri/card1") $(mode "$root/dev/dri/renderD129") $(mode "$root/dev/nvidia0") $(mode "$root/dev/nvidiactl") $(mode "$root/dev/nvidia-modeset")"
+
+# --- an AMD dGPU has no /dev/nvidia* to touch
+
+fresh_tree
+rm "$root/sys/pci/0000:01:00.0/driver"
+mkdir -p "$root/sys/drivers/amdgpu"
+ln -s ../../drivers/amdgpu "$root/sys/pci/0000:01:00.0/driver"
+run lock
+check "an amdgpu dGPU locks its dri nodes only" "0 0 666 666 666 666 / 660 660" "$(modes)"
+
+# --- no dGPU on the bus
+
+fresh_tree
+rm -r "$root/sys/drm/card1"
+out=$(run lock 2>&1)
+check "without a dGPU lock fails" 1 $?
+check "and says why" "dgpu: no discrete GPU on the PCI bus" "$out"
+check "status says the same" "dgpu: no discrete GPU on the PCI bus" "$(run status | head -1)"
+run auto 2>/dev/null
+check "auto, what the unit runs, exits 0 instead" 0 $?
+check "and the iGPU is untouched" "660 660" "$(mode "$root/dev/dri/card0") $(mode "$root/dev/dri/renderD128")"
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+else
+    echo "$failures check(s) failed"
+fi
+exit $((failures > 0))
