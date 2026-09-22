@@ -3,18 +3,28 @@
 # requires-python = ">=3.12"
 # dependencies = ["tyro"]
 # ///
-"""CPU time per unit over the last N hours, every unit down to the smallest.
+"""CPU time per unit over the last N hours, largest first, with what no unit accounts for.
 
 Two sources, merged: systemd's record of a unit's total CPU time when it stops
 (the journal's "Consumed ... CPU time" lines, user and system), and
-thermal-log's hourly counters for units still running (YYYY-MM-DD.cpu.csv).
+thermal-log's hourly counters for units still running (YYYY-MM-DD.counters.csv).
+A unit is its name and the systemd manager that owns it: the system bus and the
+session bus are both dbus.service, and a name both managers use is listed with
+the manager beside it.
 A unit that restarts, or a reboot, starts a new lifetime; each lifetime counts
 only its CPU inside the window. Units that were already running when the
-counters began count only from then. The last partial hour of a unit still
+counters began count only from then. A unit known only from its stop record
+(one thermal-log never scanned) whose life began before the window counts the
+window's share of its CPU, by its wall-clock time, as if spent evenly. The last partial hour of a unit still
 running is not counted until the next hourly counter.
 
-The total line compares the listed units against the root cgroup's counter,
-which also holds kernel threads and cgroups thermal-log does not scan.
+systemd writes a stop record only for a run above 1 s of CPU, 64 MB of memory,
+1 MB of disk I/O or any network traffic. A unit that stops, and whose runs all
+stay below those, has no record and is not listed: a frequent cheap timer
+counts only in the unattributed CPU. So does whatever ran in kernel threads
+or in cgroups thermal-log does not scan. The last line gives it, from the root
+cgroup's counter, once the counters span the whole window (total_cpu_s is
+null until then).
 
 JSON schema (--json):
 
@@ -54,7 +64,7 @@ class Args:
     json: bool = False
     """Emit JSON to stdout instead of a table."""
     logdir: Path = Path.home() / ".local/state/thermal-log"
-    """Directory holding thermal-log's YYYY-MM-DD.cpu.csv files."""
+    """Directory holding thermal-log's YYYY-MM-DD.counters.csv files."""
 
 
 @dataclass
@@ -68,7 +78,7 @@ class UnitCpu:
 @dataclass
 class Lifetime:
     samples: list[tuple[float, int]] = field(default_factory=list)  # (epoch s, usage usec)
-    stop: tuple[float, int] | None = None  # (epoch s, lifetime usage usec) from the journal
+    stop: tuple[float, int, float] | None = None  # (epoch s, lifetime usage usec, wall-clock s) from the journal
 
 
 INSTANCE_PATTERNS = [
@@ -81,6 +91,7 @@ INSTANCE_PATTERNS = [
 DURATION = re.compile(r"([\d.]+)(d|h|min|ms|us|s)")
 DURATION_S = {"d": 86400, "h": 3600, "min": 60, "s": 1, "ms": 1e-3, "us": 1e-6}
 STOP_LINE = re.compile(r"^(\S+): Consumed (.+?) CPU time")
+WALL_CLOCK = re.compile(r"over (.+?) wall clock time")
 
 
 def group_name(unit: str) -> str:
@@ -90,11 +101,14 @@ def group_name(unit: str) -> str:
     return unit
 
 
-def read_counters(logdir: Path, since: float) -> tuple[dict[str, list[tuple[float, int]]], float | None]:
+Unit = tuple[str, str]  # (manager, unit name)
+
+
+def read_counters(logdir: Path, since: float) -> tuple[dict[Unit, list[tuple[float, int]]], float | None]:
     """Every unit's hourly counter samples, from the day before `since` on, and the earliest sample time."""
-    series: dict[str, list[tuple[float, int]]] = defaultdict(list)
+    series: dict[Unit, list[tuple[float, int]]] = defaultdict(list)
     first_day = date.fromtimestamp(since) - timedelta(days=1)
-    for path in sorted(logdir.glob("*.cpu.csv")):
+    for path in sorted(logdir.glob("*.counters.csv")):
         try:
             if date.fromisoformat(path.name[:10]) < first_day:
                 continue
@@ -103,15 +117,19 @@ def read_counters(logdir: Path, since: float) -> tuple[dict[str, list[tuple[floa
         with path.open() as f:
             for row in csv.DictReader(f):
                 t = time.mktime(time.strptime(row["time"], "%Y-%m-%d %H:%M:%S"))
-                series[row["unit"]].append((t, int(row["usage_usec"])))
+                series[(row["manager"], row["unit"])].append((t, int(row["usage_usec"])))
     earliest = min((s[0][0] for s in series.values() if s), default=None)
     return series, earliest
 
 
-def read_stops(since: float) -> dict[str, list[tuple[float, int]]]:
-    """Every unit stop the journal recorded since `since`: (epoch s, lifetime usage usec)."""
-    stops: dict[str, list[tuple[float, int]]] = defaultdict(list)
-    for scope in ("--user", "--system"):
+def seconds(duration: str) -> float:
+    return sum(float(v) * DURATION_S[u] for v, u in DURATION.findall(duration))
+
+
+def read_stops(since: float) -> dict[Unit, list[tuple[float, int, float]]]:
+    """Every unit stop the journal recorded since `since`: (epoch s, lifetime usage usec, wall-clock s)."""
+    stops: dict[Unit, list[tuple[float, int, float]]] = defaultdict(list)
+    for manager, scope in (("user", "--user"), ("system", "--system")):
         result = subprocess.run(
             ["journalctl", scope, "-o", "json", "--output-fields=MESSAGE", "--since", f"@{int(since)}",
              "--grep", "Consumed .* CPU time"],
@@ -125,24 +143,26 @@ def read_stops(since: float) -> dict[str, list[tuple[float, int]]]:
             match = STOP_LINE.match(message) if isinstance(message, str) else None
             if not match:
                 continue
-            usage_s = sum(float(v) * DURATION_S[u] for v, u in DURATION.findall(match.group(2)))
-            stops[match.group(1)].append((int(entry["__REALTIME_TIMESTAMP"]) / 1e6, round(usage_s * 1e6)))
+            wall = WALL_CLOCK.search(message)
+            stops[(manager, match.group(1))].append((int(entry["__REALTIME_TIMESTAMP"]) / 1e6,
+                                          round(seconds(match.group(2)) * 1e6),
+                                          seconds(wall.group(1)) if wall else 0.0))
     return stops
 
 
-def lifetimes(samples: list[tuple[float, int]], stops: list[tuple[float, int]]) -> list[Lifetime]:
+def lifetimes(samples: list[tuple[float, int]], stops: list[tuple[float, int, float]]) -> list[Lifetime]:
     """A unit's samples and stops in time order: a stop ends the current lifetime, and a sample after a stop,
     or one whose counter dropped (restart, reboot), begins a new one. A stop with no lifetime open is a unit
     that lived and ended between two samples."""
     runs: list[Lifetime] = []
-    events = sorted([(t, 0, u) for t, u in samples] + [(t, 1, u) for t, u in stops])
-    for t, is_stop, usage in events:
+    events = sorted([(t, 0, u, 0.0) for t, u in samples] + [(t, 1, u, wall) for t, u, wall in stops])
+    for t, is_stop, usage, wall in events:
         current = runs[-1] if runs and runs[-1].stop is None else None
         if is_stop:
             if current:
-                current.stop = (t, usage)
+                current.stop = (t, usage, wall)
             else:
-                runs.append(Lifetime(stop=(t, usage)))
+                runs.append(Lifetime(stop=(t, usage, wall)))
         else:
             if current is None or usage < current.samples[-1][1]:
                 current = Lifetime()
@@ -152,9 +172,14 @@ def lifetimes(samples: list[tuple[float, int]], stops: list[tuple[float, int]]) 
 
 
 def usage_in_window(run: Lifetime, t0: float, t1: float, earliest: float | None) -> int:
-    end_t, end = run.stop if run.stop else run.samples[-1]
+    end_t, end = run.stop[:2] if run.stop else run.samples[-1]
     if end_t < t0:
         return 0
+    if run.stop and not run.samples:
+        # Known only from its stop record, a unit thermal-log never scanned: its wall-clock time says when it
+        # started, and of a life begun before the window only the share inside counts, as if spent evenly.
+        wall = run.stop[2]
+        return round(end * (end_t - t0) / wall) if wall and end_t - wall < t0 else end
     before = [u for t, u in run.samples if t <= t0]
     if before:
         start = before[-1]
@@ -174,25 +199,35 @@ def main(args: Args) -> None:
     counters, earliest = read_counters(args.logdir, t0)
     stops = read_stops(t0)
 
-    per_unit: dict[str, int] = defaultdict(int)
-    count: dict[str, int] = defaultdict(int)
-    for unit in set(counters) | set(stops):
+    per_unit: dict[Unit, int] = defaultdict(int)
+    count: dict[Unit, int] = defaultdict(int)
+    for manager, unit in set(counters) | set(stops):
         if unit == "(root)":
             continue
-        name = group_name(unit) if args.group else unit
-        for run in lifetimes(counters.get(unit, []), stops.get(unit, [])):
+        key = (manager, group_name(unit) if args.group else unit)
+        for run in lifetimes(counters.get((manager, unit), []), stops.get((manager, unit), [])):
             used = usage_in_window(run, t0, t1, earliest)
             if used:
-                per_unit[name] += used
-                count[name] += 1
+                per_unit[key] += used
+                count[key] += 1
+    managers_of: dict[str, set[str]] = defaultdict(set)
+    for manager, name in per_unit:
+        managers_of[name].add(manager)
 
-    root = counters.get("(root)", [])
-    root_runs = lifetimes(root, [])
-    total = sum(usage_in_window(r, t0, t1, earliest) for r in root_runs) if root else None
+    def shown_name(key: Unit) -> str:
+        manager, name = key
+        return f"{name} ({manager})" if len(managers_of[name]) > 1 else name
+
+    # The root counter only means something against the units once it spans the whole window: stop
+    # records reach back to the window's start whether or not the counters do.
+    root = counters.get(("system", "(root)"), [])
+    spans = bool(root) and earliest is not None and earliest <= t0
+    total = sum(usage_in_window(r, t0, t1, earliest) for r in lifetimes(root, [])) if spans else None
 
     window_s = t1 - t0
     rows = sorted(per_unit.items(), key=lambda kv: kv[1], reverse=True)
-    units = [UnitCpu(u, round(us / 1e6, 1), round(us / 1e6 / window_s * 100, 3), count[u]) for u, us in rows]
+    units = [UnitCpu(shown_name(u), round(us / 1e6, 1), round(us / 1e6 / window_s * 100, 3), count[u])
+             for u, us in rows]
     total_s = round(total / 1e6, 1) if total is not None else None
 
     if args.json:
@@ -205,8 +240,14 @@ def main(args: Args) -> None:
     listed = sum(u.cpu_s for u in units)
     hidden = len(units) - len(shown)
     tail = f", {hidden} smaller units not shown" if hidden else ""
-    system = f" of {total_s / 60:.1f} CPU-min system-wide (root counter)" if total_s else ""
-    print(f"\n{listed / 60:.1f} CPU-min across {len(units)} units{system} over {args.hours:g} h{tail}")
+    if total_s is not None:
+        system = f" of {total_s / 60:.1f} system-wide, {(total_s - listed) / 60:.1f} unattributed"
+    elif earliest is not None:
+        started_h = (t1 - earliest) / 3600
+        system = f"; no system-wide total until the counters span the window (they start {started_h:.0f} h ago)"
+    else:
+        system = "; no counters yet, so no system-wide total"
+    print(f"\n{listed / 60:.1f} CPU-min across {len(units)} units over {args.hours:g} h{system}{tail}")
 
 
 if __name__ == "__main__":
