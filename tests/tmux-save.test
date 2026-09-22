@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Drive nix/home/tmux-save.sh against throwaway tmux servers and hold it to
+# tmux-resurrect's own save.sh and restore.sh. Run it directly; no framework.
+#
+# The promises: for the same server it writes the state file and pane archive
+# that save.sh writes, apart from the differences its header names; resurrect's
+# unmodified restore.sh brings them back; a pane is re-captured when its window
+# had output or its shape changed, and when nothing changed nothing is rewritten,
+# empty panes included; panes that close take their files with them.
+#
+# Every server here runs on its own socket under a scratch TMUX_TMPDIR, with
+# TMUX unset and HOME in the scratch dir, so neither save can reach the live
+# server or ~/.tmux/resurrect.
+
+set -uo pipefail
+
+save="$(cd "$(dirname "${BASH_SOURCE[0]}")/../nix/home" && pwd)/tmux-save.sh"
+resurrect=$(sed -n 's|^run-shell \(/nix/store/.*/resurrect\)/resurrect.tmux$|\1|p' ~/.config/tmux/tmux.conf)
+[ -d "$resurrect/scripts" ] || { echo "SKIP: no resurrect plugin found in ~/.config/tmux/tmux.conf"; exit 0; }
+
+work=$(mktemp -d)
+export TMUX_TMPDIR="$work/run" HOME="$work/home" SHELL=/bin/sh
+unset TMUX
+mkdir -p "$TMUX_TMPDIR" "$HOME" "$work/dir with space"
+real_tmux=$(command -v tmux)
+
+# A `tmux` for one throwaway server: first on PATH for save.sh and restore.sh,
+# and the binary handed to tmux-save.sh.
+shim() {  # socket -> path of its shim
+    mkdir -p "$work/shim-$1"
+    printf '#!/usr/bin/env bash\nexec %s -f /dev/null -L %s "$@"\n' "$real_tmux" "$1" >"$work/shim-$1/tmux"
+    chmod +x "$work/shim-$1/tmux"
+    echo "$work/shim-$1/tmux"
+}
+T=$(shim equiv)
+R=$(shim restore)
+trap '"$T" kill-server 2>/dev/null; "$R" kill-server 2>/dev/null; rm -rf "$work"' EXIT
+
+failures=0
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+fast() { bash "$save" "$T" "$work/fast"; }
+stage=$work/fast/save/pane_contents
+# Whole seconds are enough: every save below comes more than a second after the
+# one before, so a rewritten file always shows a new mtime.
+mtimes() { stat -c '%n %Y' "$stage"/pane-* 2>/dev/null; }
+archive_id() { stat -c '%i %Y' "$work/fast/pane_contents.tar.gz"; }
+
+# --- A server with the shapes a save has to get right ---
+# History as deep as the live config's: one pane holds 40,000 lines.
+"$T" start-server \; set -g history-limit 50000 \; new-session -d -s alpha -x 120 -y 30 -c /tmp
+"$T" send-keys -t alpha:0.0 'seq 1 40000; echo "alpha done"' Enter
+"$T" split-window -t alpha:0 -h -c /tmp
+"$T" send-keys -t alpha:0.1 'printf "\033[31mred\033[0m plain\n"' Enter
+"$T" new-window -t alpha -n renamed -c /tmp          # renaming turns automatic-rename off for it
+"$T" send-keys -t alpha:1.0 'less /etc/hostname' Enter
+"$T" new-window -t alpha -c /tmp                     # untouched pane: no content file
+"$T" new-session -d -s beta -x 80 -y 24 -c "$work/dir with space"
+"$T" send-keys -t beta:0.0 'for i in $(seq 1 30); do echo "line $i   "; done; printf "\n\n\n"' Enter
+"$T" split-window -t beta:0 -v -c /tmp
+"$T" new-session -d -t alpha -s alpha-view           # grouped with alpha: saved as a pointer
+"$T" select-window -t alpha:0
+"$T" select-pane -t alpha:0.1
+"$T" set -g @resurrect-dir "$work/up"
+"$T" set -g @resurrect-capture-pane-contents on
+for _ in $(seq 50); do "$T" capture-pane -p -t alpha:0.0 | grep -q '^alpha done$' && break; sleep 0.1; done
+sleep 1.2
+
+# --- Same output as resurrect's save.sh ---
+PATH="$(dirname "$T"):$PATH" bash "$resurrect/scripts/save.sh" quiet
+started=${EPOCHREALTIME/./}
+fast
+elapsed_ms=$(((${EPOCHREALTIME/./} - started) / 1000))
+check "a save with 40,000 lines in one pane takes under 5 s" "under 5 s" \
+    "$([ "$elapsed_ms" -lt 5000 ] && echo "under 5 s" || echo "$elapsed_ms ms")"
+check "state file matches save.sh's" "" "$(diff "$work/up/last" "$work/fast/last")"
+mkdir -p "$work/x-up" "$work/x-fast"
+tar xzf "$work/up/pane_contents.tar.gz" -C "$work/x-up"
+tar xzf "$work/fast/pane_contents.tar.gz" -C "$work/x-fast"
+rm -f "$work/x-up/pane_contents/pane-alpha-view:"*  # save.sh also captures a grouped session's panes; restore never reads them
+check "pane files match save.sh's" "" "$(diff -r "$work/x-up" "$work/x-fast")"
+check "grouped session saved as a pointer" 1 "$(grep -c '^grouped_session	alpha-view	alpha	' "$work/fast/last")"
+check "an untouched pane gets no file" "absent" "$([ -e "$stage/pane-alpha:2.0" ] && echo present || echo absent)"
+check "a new archive is kept under the save's time" 1 "$(find "$work/fast" -name 'pane_contents_*.tar.gz' | wc -l)"
+
+# --- restore.sh brings it back ---
+"$R" new-session -d -s 0 -x 120 -y 30
+"$R" set -g @resurrect-dir "$work/fast"
+"$R" set -g @resurrect-capture-pane-contents on
+"$R" run-shell -t 0:0.0 "$resurrect/scripts/restore.sh"
+for _ in $(seq 50); do "$R" has-session -t beta 2>/dev/null && break; sleep 0.1; done
+sleep 1
+check "restore rebuilds the panes" "alpha:0.0 alpha:0.1 alpha:1.0 alpha:2.0 beta:0.0 beta:0.1" \
+    "$("$R" list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' | grep -v '^0:\|^alpha-view:' | sort | paste -sd' ')"
+check "restore rebuilds the grouped session on alpha" alpha "$("$R" display -p -t alpha-view '#{session_group}' 2>/dev/null)"
+check "restore brings back a pane's text" 1 "$("$R" capture-pane -p -S - -t alpha:0.0 | grep -c '^alpha done$')"
+check "restore keeps the renamed window's name" renamed "$("$R" display -p -t alpha:1 '#{window_name}')"
+"$R" kill-server
+
+# --- Only what changed is captured again ---
+sleep 1.2
+before=$(mtimes) archive_before=$(archive_id)
+fast
+check "nothing changed, empty pane included: no pane file rewritten" "$before" "$(mtimes)"
+# The last save's capture commands stay in save/commands.tmux.
+check "nothing changed, empty pane included: no pane captured" 0 \
+    "$(grep -c capture-pane "$work/fast/save/commands.tmux")"
+check "nothing changed: archive untouched" "$archive_before" "$(archive_id)"
+check "nothing changed: no new archive kept" 1 "$(find "$work/fast" -name 'pane_contents_*.tar.gz' | wc -l)"
+
+"$T" send-keys -t beta:0.1 'echo CHANGED' Enter
+sleep 1.2
+before=$(mtimes)
+fast
+changed=$(diff <(echo "$before") <(mtimes) | sed -n 's|^> .*/pane-\([^ ]*\) .*|\1|p' | paste -sd' ')
+check "output in one window: only its panes captured again" "beta:0.0 beta:0.1" "$changed"
+check "the new text is in the archive" 1 "$(tar xzOf "$work/fast/pane_contents.tar.gz" './pane_contents/pane-beta:0.1' | grep -c '^CHANGED$')"
+
+"$T" set -g renumber-windows on
+"$T" kill-window -t alpha:0
+sleep 1.2
+fast
+check "a closed window's panes leave the archive, shifted ones follow" "pane-alpha:0.0 pane-beta:0.0 pane-beta:0.1" \
+    "$(tar tzf "$work/fast/pane_contents.tar.gz" | sed -n 's|^\./pane_contents/||p' | grep . | sort | paste -sd' ')"
+renumbered=$(tar xzOf "$work/fast/pane_contents.tar.gz" './pane_contents/pane-alpha:0.0')
+check "the renumbered window's pane has its own text, not the closed pane's" "less 0" \
+    "$(grep -q '/etc/hostname' <<<"$renumbered" && echo less) $(grep -c '^alpha done$' <<<"$renumbered")"
+
+# --- Names that need quoting in a tmux command file ---
+"$T" new-session -d -s "it's here" -c /tmp
+"$T" send-keys -t "it's here:0.0" 'echo quoted' Enter
+sleep 1.2
+fast
+check "a session name with a quote and a space is captured" 1 \
+    "$(grep -c 'echo quoted' "$stage/pane-it's here:0.0" 2>/dev/null)"
+
+if [ "$failures" -gt 0 ]; then
+    echo "$failures failed"
+    exit 1
+fi
+echo "all passed"
