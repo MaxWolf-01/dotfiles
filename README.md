@@ -109,7 +109,7 @@ All `./setup` functions are idempotent — safe to re-run.
 ./setup get_vibetyper
 ./setup hibernation
 ./setup asus_kbd_light         # ASUS ROG laptops
-./setup supergfx_asus_hotplug  # ASUS ROG laptops with supergfxctl
+./setup dgpu_runtime_pm        # laptops with a dGPU the driver powers off when idle
 ```
 </details>
 
