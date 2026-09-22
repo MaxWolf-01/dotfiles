@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Keep the discrete GPU powered off: lock its device files on battery, unlock on AC.
+# Keep the discrete GPU powered off. Lock its device files on battery, unlock on AC.
 #
 # The driver powers an idle dGPU down to D3cold on its own (NVIDIA: runtime D3,
 # Ubuntu's on-demand PRIME mode ships it). What wakes it is a program opening
 # its device files: an app enumerating GPUs at start, a Vulkan loader, CUDA.
 # `lock` takes every permission bit off those files, so an open fails before
 # the kernel asks the driver, and the dGPU stays off. Nothing is unloaded or
-# unbound, so `unlock` is instant: no logout, no reboot.
+# unbound, so `unlock` is instant, with no logout and no reboot.
 #
 # The dGPU is the DRM device whose PCI device is not the boot VGA. Locked are
 # its /dev/dri nodes (by PCI path) and, for NVIDIA, /dev/nvidia*. GNOME opens
 # the card node through logind, as root, so the lock does not reach it.
+#
+# GU603ZW: the HDMI port is wired to the dGPU, so HDMI needs it unlocked; USB-C
+# DisplayPort runs off the iGPU.
 #
 # `install` puts a root-owned copy of this script in /usr/local/sbin, a unit
 # that runs `auto` at boot before the display manager and after every wake, and
@@ -37,6 +40,10 @@ UNIT_NAME=dgpu-auto.service
 UNIT_PATH=/etc/systemd/system/$UNIT_NAME
 RULE_PATH=/etc/udev/rules.d/99-dgpu.rules
 WAKE_TARGETS="suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+NO_DGPU="no dGPU with a driver bound (is the card on the bus: lspci -d 10de:; is its driver loaded: lsmod)"
+# How long `auto` waits for the render node after the driver's own event
+# created /dev/nvidia*; the DRM nodes arrive in a later udev event.
+NODE_WAIT=${DGPU_NODE_WAIT:-3}
 
 if [ "$EUID" -eq 0 ]; then
     sudo() { "$@"; }
@@ -56,8 +63,8 @@ find_dgpu() {
         [ "${class:0:4}" = 0x03 ] || continue
         [ "$(cat "$dev/boot_vga" 2>/dev/null)" = 1 ] && continue
         dev=$(readlink -f "$dev")
-        driver=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null || true)
-        echo "$(basename "$dev") ${driver:-none} $dev"
+        driver=$(basename "$(readlink -f "$dev/driver")")
+        echo "$(basename "$dev") $driver $dev"
         return 0
     done
     return 1
@@ -102,26 +109,34 @@ on_ac() {
     return 1
 }
 
-locked() { # addr driver
+locked() { # addr
     local render="$DEV/dri/by-path/pci-$1-render"
     [ -e "$render" ] && [ "$(stat -L -c %a "$render")" = 0 ]
 }
 
-lock() {
+# Sets the mode of every node of the dGPU, and says so when the render node is
+# not there yet: the lock is then only on what exists.
+set_all() { # lock|unlock
     local addr driver dev n
-    read -r addr driver dev < <(find_dgpu) || die "no discrete GPU on the PCI bus"
-    while read -r n; do set_mode 0000 "$n"; done < <(nodes "$addr" "$driver")
+    read -r addr driver dev < <(find_dgpu) || die "$NO_DGPU"
+    while read -r n; do
+        if [ "$1" = lock ]; then set_mode 0000 "$n"; else set_mode "$(default_mode "$n")" "$n"; fi
+    done < <(nodes "$addr" "$driver")
+    [ -e "$DEV/dri/by-path/pci-$addr-render" ] ||
+        echo "dgpu: $addr has no render node under $DEV/dri/by-path yet, $1 applied to the rest" >&2
 }
 
-unlock() {
-    local addr driver dev n
-    read -r addr driver dev < <(find_dgpu) || die "no discrete GPU on the PCI bus"
-    while read -r n; do set_mode "$(default_mode "$n")" "$n"; done < <(nodes "$addr" "$driver")
-}
+lock() { set_all lock; }
+unlock() { set_all unlock; }
 
 # The unit's entry point: a machine without a dGPU has nothing to do, not an error.
 auto() {
-    find_dgpu >/dev/null || { echo "dgpu: no discrete GPU on the PCI bus, nothing to do" >&2; return 0; }
+    local addr driver dev i
+    read -r addr driver dev < <(find_dgpu) || { echo "dgpu: $NO_DGPU, nothing to do" >&2; return 0; }
+    for ((i = 0; i < NODE_WAIT * 10; i++)); do
+        [ -e "$DEV/dri/by-path/pci-$addr-render" ] && break
+        sleep 0.1
+    done
     if on_ac; then unlock; else lock; fi
 }
 
@@ -129,13 +144,13 @@ show() {
     local addr driver dev state
     if read -r addr driver dev < <(find_dgpu); then
         state=$(cat "$dev/power_state" 2>/dev/null || echo unknown)
-        if locked "$addr" "$driver"; then
+        if locked "$addr"; then
             echo "dgpu: $addr driver $driver, $state, locked"
         else
             echo "dgpu: $addr driver $driver, $state, unlocked"
         fi
     else
-        echo "dgpu: no discrete GPU on the PCI bus"
+        echo "dgpu: $NO_DGPU"
     fi
     if on_ac; then echo "power: AC"; else echo "power: battery"; fi
     if systemctl is-enabled --quiet $UNIT_NAME 2>/dev/null; then
@@ -166,6 +181,8 @@ install_all() {
 Description=Lock the dGPU's device files on battery, unlock on AC
 After=$WAKE_TARGETS
 Before=display-manager.service
+# Several udev events start it within seconds of boot; the default burst limit would leave it failed.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -177,8 +194,8 @@ EOF
     sudo systemctl daemon-reload
     sudo systemctl enable --quiet $UNIT_NAME
     # Mains only: the battery emits a change event on every capacity tick. The
-    # driver and render-node events cover the nodes appearing after this unit
-    # has already run at boot, and any later driver reload.
+    # driver's own event is the one that creates /dev/nvidia*; the render-node
+    # event covers a later driver reload.
     sudo tee "$RULE_PATH" >/dev/null <<EOF
 ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
 ACTION=="add", SUBSYSTEM=="drm", KERNEL=="renderD*", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
