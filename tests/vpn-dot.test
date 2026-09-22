@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Drive the VPN dot's click handler inside a headless GNOME Shell. Run it
+# directly; no framework.
+#
+# The shell gets its own session bus, home and runtime directory, so the real
+# session, the real state file and the real exit node are never touched:
+# `tailscale` and `vpn` are stubs that record how they were called. A helper
+# extension switches on the shell's unsafe mode, which is what lets
+# org.gnome.Shell.Eval reach the dot.
+
+set -uo pipefail
+
+# Re-run inside a session bus of its own, with an environment built from
+# nothing: a terminal started from the Nix profile exports GIO_EXTRA_MODULES
+# and GI_TYPELIB_PATH, and the system's gnome-shell aborts on the second GLib
+# those pull in.
+if [ -z "${VPN_DOT_TEST_DIR:-}" ]; then
+    t=$(mktemp -d)
+    trap 'rm -rf "$t"' EXIT
+    mkdir -p "$t/home/bin" "$t/stubs" "$t/run" "$t/config" "$t/cache" "$t/data"
+    chmod 700 "$t/run"
+    env -i VPN_DOT_TEST_DIR="$t" LANG=C.UTF-8 PATH="$t/stubs:/usr/bin:/bin" \
+        HOME="$t/home" XDG_RUNTIME_DIR="$t/run" XDG_CONFIG_HOME="$t/config" \
+        XDG_CACHE_HOME="$t/cache" XDG_DATA_HOME="$t/data" \
+        dbus-run-session -- "${BASH_SOURCE[0]}" 2> "$t/session.log"
+    exit $?
+fi
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+uuid="vpn-dot@maxwolf-01"
+t="$VPN_DOT_TEST_DIR"
+trap 'kill "${shell_pid:-}" 2>/dev/null' EXIT
+
+failures=0
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+mkdir -p "$t/data/gnome-shell/extensions/unsafe@test"
+cp -r "$repo/desktop/vpn-dot" "$t/data/gnome-shell/extensions/$uuid"
+cat > "$t/data/gnome-shell/extensions/unsafe@test/metadata.json" <<JSON
+{"uuid": "unsafe@test", "name": "unsafe", "description": "test helper", "shell-version": ["50"]}
+JSON
+cat > "$t/data/gnome-shell/extensions/unsafe@test/extension.js" <<'JS'
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+export default class Unsafe extends Extension {
+    enable() { global.context.unsafe_mode = true; }
+    disable() {}
+}
+JS
+cat > "$t/stubs/tailscale" <<SH
+#!/bin/sh
+echo "tailscale \$*" >> "$t/calls"
+exit \$(cat "$t/tailscale-exit")
+SH
+cat > "$t/home/bin/vpn" <<SH
+#!/bin/sh
+echo "vpn \$*" >> "$t/calls"
+SH
+chmod +x "$t/stubs/tailscale" "$t/home/bin/vpn"
+echo 0 > "$t/tailscale-exit"
+: > "$t/calls"
+
+publish() { echo "{\"state\": \"$1\", \"reason\": \"\", \"mode\": \"automatic\", \"node\": \"de-fra-wg-202\", \"since\": \"2026-01-01T00:00:00+00:00\"}" > "$t/run/vpn-state.json"; }
+publish up
+
+gsettings set org.gnome.shell disable-user-extensions false
+gsettings set org.gnome.shell enabled-extensions "['unsafe@test', '$uuid']"
+gnome-shell --headless --no-x11 --virtual-monitor 1280x720 > "$t/shell.log" 2>&1 &
+shell_pid=$!
+
+js() {
+    gdbus call --session -d org.gnome.Shell -o /org/gnome/Shell -m org.gnome.Shell.Eval "$1" 2>/dev/null |
+        sed -E "s/^\(true, '\"?//; s/\"?'\)$//"
+}
+dot="Main.panel.statusArea['$uuid']"
+for _ in $(seq 100); do
+    [ "$(js "$dot._shown.state")" = up ] && break
+    sleep 0.2
+done
+check "the dot loads and reads the published state" up "$(js "$dot._shown.state")"
+
+js "$dot._toggle()" > /dev/null
+sleep 0.5
+check "a click on an up dot drops the exit node" "tailscale set --exit-node=" "$(tail -n 1 "$t/calls")"
+check "the dot reads off before the watcher has published it" off "$(js "$dot._shown.state")"
+check "and is drawn off" "vpn-dot vpn-dot-off" "$(js "$dot._dot.style_class")"
+check "the state file had not changed" up "$(grep -o '"state": "[a-z]*"' "$t/run/vpn-state.json" | cut -d'"' -f4)"
+
+js "$dot._toggle()" > /dev/null
+sleep 0.5
+check "the next click turns the VPN on" "vpn on" "$(tail -n 1 "$t/calls")"
+
+publish down
+sleep 0.5
+check "what the watcher publishes replaces what the dot assumed" down "$(js "$dot._shown.state")"
+
+echo 1 > "$t/tailscale-exit"
+js "$dot._toggle()" > /dev/null
+sleep 0.5
+check "a failed off is attempted" "tailscale set --exit-node=" "$(tail -n 1 "$t/calls")"
+check "and leaves the dot as it was" down "$(js "$dot._shown.state")"
+
+[ "$failures" -eq 0 ] || { echo "--- shell log tail:"; tail -n 20 "$t/shell.log"; }
+exit "$failures"

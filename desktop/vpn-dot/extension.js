@@ -50,16 +50,20 @@ class Dot extends PanelMenu.Button {
         this._file.load_contents_async(this._cancellable, (file, result) => {
             try {
                 const [, bytes] = file.load_contents_finish(result);
-                this._shown = JSON.parse(new TextDecoder().decode(bytes));
+                this._show(JSON.parse(new TextDecoder().decode(bytes)));
             } catch (e) {
                 if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                     return;
-                this._shown = NOT_RUNNING;
+                this._show(NOT_RUNNING);
             }
-            const state = STATES.includes(this._shown.state) ? this._shown.state : 'unknown';
-            this._dot.style_class = `vpn-dot vpn-dot-${state}`;
-            this._updateLabel();
         });
+    }
+
+    _show(shown) {
+        this._shown = shown;
+        const state = STATES.includes(shown.state) ? shown.state : 'unknown';
+        this._dot.style_class = `vpn-dot vpn-dot-${state}`;
+        this._updateLabel();
     }
 
     // A click while the dot's own `vpn on` runs turns the VPN off: that walk
@@ -101,6 +105,11 @@ class Dot extends PanelMenu.Button {
             if (!p.get_successful()) {
                 const last = output.trim().split('\n').pop();
                 Main.notify('VPN', last || `${argv.join(' ')} failed`);
+            } else if (argv === OFF) {
+                // The watcher publishes the change about a second later. A
+                // dot still green for that second invites another click, which
+                // lands once the file says "off" and turns the VPN back on.
+                this._show({state: 'off', reason: '', mode: 'off', since: new Date().toISOString()});
             }
         });
     }
