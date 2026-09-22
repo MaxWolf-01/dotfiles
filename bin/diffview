@@ -158,6 +158,7 @@ def build(args: Args, out: Path, summary: str, awaiting: bool = False) -> dict:
         "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "sources": sources,
         "size": size,
+        "context": args.context,
         "imageLimit": MAX_IMAGE_BYTES,
         "summary": summary,
         "summaryPending": generate or awaiting,
@@ -812,6 +813,8 @@ def sources_sig(args: Args) -> str:
             repo, range_ = spec.rsplit("@", 1) if "@" in spec else (".", spec)
             repo = str(Path(repo).expanduser().resolve())
             patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", *rev_args(repo, range_)])
+            # a new commit changes the page's history panel even when the diff stays the same
+            patch += run_git(["-C", repo, "rev-parse", "HEAD" if is_worktree(range_) else re.split(r"\.{2,3}", range_)[-1] or "HEAD"])
             if is_worktree(range_):
                 root, names = untracked_files(repo)
                 for name in names:   # name, size and mtime stand in for the content; cheaper than diffing each file every tick
@@ -847,18 +850,23 @@ def collect_source(spec: str, context: int) -> dict:
 
     patch = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "-M", f"-U{context}", *rev_args(repo, range_)])
     base = diff_base(repo, range_)
+    root = git_root(repo)   # the diff's paths are the repo's, whichever directory the spec named
     if is_worktree(range_):
-        patch += untracked_patch(repo, context)
-        commits = collect_commits(repo, f"{base}..HEAD")
+        untracked = untracked_patch(repo, context)
+        patch += untracked
+        commits = collect_commits(repo, f"{base}..HEAD", context)
+        pending = run_git(["-C", repo, "diff", "--no-color", "--no-ext-diff", "--raw", "-p", "--no-abbrev", "-M", f"-U{context}", "HEAD"]) + untracked
+        if files := with_blobs(pending):
+            commits.append(commit_record("worktree", "", "", "uncommitted changes", "", files))
         detail = f"{worktree_left(range_)}{'...' if range_.endswith('...') else '..'}worktree"
         rev = None
     else:
-        commits = collect_commits(repo, range_)
+        commits = collect_commits(repo, range_, context)
         detail = range_
         rev = re.split(r"\.{2,3}", range_)[-1] or "HEAD"
     files = parse_patch(patch)
-    root = git_root(repo)   # the diff's paths are the repo's, whichever directory the spec named
     return {"label": Path(repo).name, "kind": "git", "detail": detail, "files": files, "commits": commits,
+            "historyBlobs": history_blobs(root, commits),
             "_patch": patch, "_sides": {"old": (root, base), "new": (root, rev)}}
 
 
@@ -1042,39 +1050,65 @@ def rev_args(repo: str, range_: str) -> list[str]:
     return [diff_base(repo, range_)] if is_worktree(range_) else [range_]
 
 
-def collect_commits(repo: str, range_: str) -> list[dict]:
-    """Commit metadata + per-file numstat only — the page shows the range diff; commits are context."""
-    fmt = "%x1e%h%x1f%an%x1f%aI%x1f%s%x1f%b%x1f"
-    raw = run_git(["-C", repo, "log", "--no-merges", "--reverse", "--numstat", f"--format={fmt}", range_])
-    commits = []
-    for rec in raw.split("\x1e"):
-        if not rec.strip():
-            continue
-        short, author, date, subject, body, numstat = rec.split("\x1f")
-        body = re.sub(r"^(Co-Authored-By|Signed-off-by|Reviewed-by):.*$", "", body, flags=re.M | re.I).strip()
-        files = []
-        for line in numstat.strip().splitlines():
-            parts = line.split("\t")
-            if len(parts) != 3:
-                continue
-            adds, dels, path = parts
-            path = re.sub(r"\{([^}]*) => ([^}]*)\}", r"\2", path).replace("//", "/")
-            if " => " in path:
-                path = path.split(" => ")[-1]
-            files.append({"path": path, "adds": 0 if adds == "-" else int(adds), "dels": 0 if dels == "-" else int(dels)})
-        commits.append(
-            {
-                "short": short,
-                "author": author,
-                "date": date,
-                "subject": subject,
-                "body": body,
-                "adds": sum(f["adds"] for f in files),
-                "dels": sum(f["dels"] for f in files),
-                "files": files,
-            }
-        )
-    return commits
+def collect_commits(repo: str, range_: str, context: int) -> list[dict]:
+    """The range's commits, oldest first with each one after its parents, each carrying its own diff.
+    The page's history panel lists them, and selecting some there shows only what they changed."""
+    fmt = "%x1e%H%x1f%an%x1f%aI%x1f%s%x1f%b%x1f"
+    raw = run_git(["-C", repo, "log", "--no-merges", "--topo-order", "--reverse", "-p", "--raw", "--no-abbrev", "-M", "--no-color",
+                   "--no-ext-diff", f"-U{context}", f"--format={fmt}", range_])
+    records = [rec.split("\x1f", 5) for rec in raw.split("\x1e") if rec.strip()]
+    # --no-abbrev, which the blob ids need, writes %h out in full too
+    short = dict(line.split() for line in run_git(["-C", repo, "log", "--no-merges", "--format=%H %h", range_]).splitlines())
+    return [commit_record(short[sha], author, date, subject, body, with_blobs(patch)) for sha, author, date, subject, body, patch in records]
+
+
+RAW_RE = re.compile(r"^:\d+ \d+ ([0-9a-f]+) ([0-9a-f]+) [A-Z]\d*\t(?:[^\t]*\t)?(.*)$")
+
+
+def with_blobs(patch: str) -> list[dict]:
+    """The files a `--raw -p` diff changes, each with "blobs": the blob ids of its old and new side,
+    None for a side git has no blob for (a file added or deleted, or the working tree's side)."""
+    files = parse_patch(patch)
+    blobs = {}
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            break
+        if m := RAW_RE.match(line):
+            blobs[m[3].strip('"')] = [None if not m[i].strip("0") else m[i] for i in (1, 2)]
+    for f in files:
+        f["blobs"] = blobs.get(f["path"], [None, None])
+    return files
+
+
+def commit_record(short: str, author: str, date: str, subject: str, body: str, files: list[dict]) -> dict:
+    body = re.sub(r"^(Co-Authored-By|Signed-off-by|Reviewed-by):.*$", "", body, flags=re.M | re.I).strip()
+    return {"short": short, "author": author, "date": date, "subject": subject, "body": body,
+            "adds": sum(f["adds"] for f in files), "dels": sum(f["dels"] for f in files), "files": files}
+
+
+def history_blobs(root: str, commits: list[dict]) -> dict:
+    """The file versions, by blob id, that the page cannot derive from the commits' own diffs.
+
+    A commit's diff turns the version it starts from into the version it ends at, so the page
+    derives every version a commit in the list ends at. What it cannot derive is a version a commit
+    starts from that no earlier commit in the list ended at: the files as they were before the range,
+    and whatever a commit left out of the list brought in, such as a merge. Those are baked here.
+
+    Each value is the file's lines, split as the diffs split them, or false where the page carries no
+    text of it because it is binary or over the size limit.
+    """
+    known: set[str] = set()
+    blobs: dict[str, list[str] | bool] = {}
+    for c in commits:
+        for f in c["files"]:
+            old, new = f["blobs"]
+            if old and old not in known:
+                raw = subprocess.run(["git", "-C", root, "cat-file", "blob", old], capture_output=True).stdout
+                blobs[old] = False if b"\0" in raw or len(raw) > MAX_BAKED_BYTES else raw.decode(errors="replace").splitlines()
+                known.add(old)
+            if new:
+                known.add(new)
+    return blobs
 
 
 def run_git(git_args: list[str], ok_codes: tuple[int, ...] = (0,)) -> str:
