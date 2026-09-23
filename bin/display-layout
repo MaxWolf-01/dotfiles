@@ -29,18 +29,17 @@ layout. A layout fits when its monitors are exactly the ones connected, where a
 closed laptop lid takes the panel out of the connected set, as it does for
 mutter.
 
-`use` and `save` record the layout they leave on screen, and `show` compares
-the live arrangement with it. The record is $XDG_STATE_HOME/display-layout/recent.
+`use`, `save` and `watch` record the layout they leave on screen, and `show`
+compares the live arrangement with it. The record is $XDG_STATE_HOME/display-layout/recent.
 
 A drawing is to scale, one colour per alias, with ★ on the primary monitor, ↻
 on one turned right (gdctl's transform 90) and ↺ on one turned left (270). It
 is drawn in outline when stdout is not a terminal or NO_COLOR is set.
 
-`watch` puts the layout last used with the connected monitors on screen when
-they change, or the first saved layout that fits them when none of those has
-been used here. Monitors no saved layout fits keep what mutter gives them,
-unless that is mutter's fallback row. GNOME keys the layouts it saves in ~/.config/monitors.xml on
-each monitor's connector name plus its EDID. One monitor reaches a different
+`watch` puts a saved layout back when monitors are plugged in; `display-layout
+watch --help` says which. For monitors no layout fits, it looks after mutter's
+fallback. GNOME keys the layouts it saves in ~/.config/monitors.xml on each
+monitor's connector name plus its EDID. One monitor reaches a different
 connector through a different port: HDMI on the discrete GPU, DP-1 or DP-2 on
 the USB-C ports. A layout GNOME saved on one port is then not found on another,
 and mutter lays the monitors out in a left-to-right row. `watch` recognises
@@ -1053,8 +1052,12 @@ class Fallback:
     """gdctl set arguments."""
 
 
-ConnectedSet = frozenset[tuple[str, str, str, str]]
-"""Each connected monitor's connector, vendor, product and serial."""
+ConnectedSet = frozenset[tuple[str, Model]]
+"""Each connected monitor's connector, and its vendor, product and serial."""
+
+
+def connected_set(monitors: list[Monitor]) -> ConnectedSet:
+    return frozenset((m.connector, Model(m.vendor, m.product, m.serial)) for m in monitors)
 
 
 @dataclass(frozen=True)
@@ -1065,28 +1068,34 @@ class Decision:
     """The connected set dealt with once this is carried out."""
     apply: Recall | Fallback | None
     """None leaves the display alone."""
+    why: str = ""
+    """The rule that chose `apply`, for the run log. Empty when the set did not change."""
 
 
 def decide(
     settled: ConnectedSet | None, state: State, store: Store, recent: list[str], lid_closed: bool = False
 ) -> Decision:
-    """The watcher's choice. `recent` lists layout names, the most recently used first.
+    """The watcher's choice for the display as it is now, by the rule `display-layout watch --help` states.
 
-    Nothing is done unless the connected set differs from `settled`. A set that
-    changed gets the layout last used with it; failing that, the first layout
-    in the file that fits it; failing that, the fallback, and only out of
-    mutter's row.
+    `recent` lists layout names, the most recently used first.
     """
     monitors = connected(state, lid_closed)
-    now = frozenset((m.connector, m.vendor, m.product, m.serial) for m in monitors)
+    now = connected_set(monitors)
     if now == settled:
         return Decision(settled, None)
     fitting = match(store, monitors)
-    name = next((n for n in recent if n in fitting), next(iter(fitting), None))
-    if name:
-        return Decision(now, Recall(name, tuple(layout_args(store.layouts[name], fitting[name]))))
-    argv = plan(state) if is_mutter_row(state) else []
-    return Decision(now, Fallback(tuple(argv)) if argv else None)
+    recall = lambda name: Recall(name, tuple(layout_args(store.layouts[name], fitting[name])))  # noqa: E731
+    last = next((n for n in recent if n in fitting), None)
+    if last:
+        return Decision(now, recall(last), "last used with these monitors")
+    if fitting:
+        return Decision(now, recall(next(iter(fitting))), "saved for these monitors, none used yet")
+    if not is_mutter_row(state):
+        return Decision(now, None, "no saved layout fits, and the layout is not mutter's row")
+    argv = plan(state)
+    if not argv:
+        return Decision(now, None, "no saved layout fits, and nothing to arrange")
+    return Decision(now, Fallback(tuple(argv)), "no saved layout fits; replaced mutter's row")
 
 
 def die_with_parent() -> None:
@@ -1323,19 +1332,24 @@ class WatchArgs:
 
 @app.command(name="watch")
 def watch(args: WatchArgs) -> None:
-    """Put the layout last used with the connected monitors on screen whenever they change.
+    """Put a saved layout on screen whenever the connected monitors change.
 
     Listens for MonitorsChanged on the session bus, and looks once on startup at
-    a display that was already connected. A set of monitors no saved layout
-    fits gets the fallback arrangement when mutter has laid it out as its row.
+    a display that was already connected. When the set of connected monitors
+    has changed, it applies, in this order of preference:
 
-    Acts only when the set of connected monitors has changed. Rearranging
-    monitors by hand leaves that set alone, so an arrangement made during a
-    session stays until a monitor is plugged in or out, or the lid is opened or
-    closed.
+    - the layout last used with these monitors;
+    - the first layout in the layouts file that fits them, when none that fits
+      has been used yet;
+    - the fallback arrangement, when no layout fits and mutter has laid the
+      monitors out in its row.
 
-    Records one line per resolved change via bin/run-log, naming the layout it
-    applied.
+    Opening or closing the lid changes the set too. Rearranging monitors by
+    hand leaves it alone, so an arrangement made during a session stays until
+    the set changes or the watcher starts again.
+
+    Records one line per change of the set via bin/run-log, naming the layout
+    it applied.
     """
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
@@ -1359,7 +1373,7 @@ def follow(stream, settle: float) -> None:
     """Arrange once per change of the connected set.
 
     The display is looked at once on startup too, because monitors plugged in
-    before the session began send no signal about it.
+    before the session began send no signal.
     """
     settled = arrange(None)
     for line in stream:
@@ -1370,48 +1384,61 @@ def follow(stream, settle: float) -> None:
 
 
 def arrange(settled: ConnectedSet | None) -> ConnectedSet | None:
-    """Carry out what `decide` chooses for the display as it is now.
+    """Carry out what `decide` chooses for the display as it is now, and log it in one line.
 
     Takes the connected set this already dealt with, and returns the set it
-    leaves dealt with -- which is the old one whenever nothing was resolved, so
-    a display that could not be read or arranged is tried again on the next
-    signal rather than written off. A layouts file that cannot be read leaves
-    the fallback.
+    leaves dealt with -- which is the old one whenever nothing could be
+    applied, so a display that could not be read or arranged is tried again on
+    the next signal rather than written off. A layout mutter rejects is left
+    out, and the choice made again without it. With a layouts file that cannot
+    be read, only the fallback applies.
     """
     try:
         state = read_state()
     except (ParseError, RuntimeError) as exc:
         log_run("fail", str(exc), {})
         return settled
+    lid = lid_closed()
+    if connected_set(connected(state, lid)) == settled:
+        return settled
+
+    problems = []
     try:
         store = load_store()
     except StoreError as exc:
-        log_run("fail", str(exc), {})
+        problems.append(str(exc))
         store = Store({}, {})
-
     used = recent()
-    decision = decide(settled, state, store, used, lid_closed())
-    if decision.settled == settled:
-        return settled
-    stats: dict = {"monitors": sorted(c for c, *_ in decision.settled or ())}
-
-    match decision.apply:
-        case None:
-            log_run("skip", "no saved layout fits, and " + (
-                "nothing to arrange" if is_mutter_row(state) else "the layout is not mutter's row"), stats)
-            return decision.settled
-        case Recall(layout=name):
-            stats["layout"] = name
-            done = f"applied {name}, " + ("last used with these monitors" if name in used else "saved for these monitors")
-        case Fallback():
-            done = "no saved layout fits; replaced mutter's row"
-    try:
-        run(["gdctl", "set", *decision.apply.argv])
-    except RuntimeError as exc:
-        log_run("fail", str(exc), stats)
-        return settled
-    log_run("ok", done, stats)
-    return decision.settled
+    rejected = False
+    while True:
+        decision = decide(settled, state, store, used, lid)
+        stats: dict = {"monitors": sorted(c for c, _ in decision.settled or ())}
+        match decision.apply:
+            case None:
+                if rejected:
+                    log_run("fail", "; ".join([*problems, decision.why]), stats)
+                    return settled
+                log_run("fail" if problems else "skip", "; ".join([*problems, decision.why]), stats)
+                return decision.settled
+            case Recall(layout=name) as apply:
+                stats["layout"] = name
+                done = f"applied {name}, {decision.why}"
+            case Fallback() as apply:
+                done = decision.why
+        try:
+            run(["gdctl", "set", *apply.argv])
+        except RuntimeError as exc:
+            problems.append(f"{stats.get('layout', 'the fallback')} rejected: {exc}")
+            if not isinstance(apply, Recall):
+                log_run("fail", "; ".join(problems), stats)
+                return settled
+            rejected = True
+            store = Store(store.aliases, {n: lo for n, lo in store.layouts.items() if n != apply.layout})
+            continue
+        if isinstance(apply, Recall):
+            remember(apply.layout)
+        log_run("fail" if problems else "ok", "; ".join([*problems, done]), stats)
+        return decision.settled
 
 
 REFUSALS = (StoreError, LayoutError, ParseError, CommandError)
