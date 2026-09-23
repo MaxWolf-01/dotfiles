@@ -116,10 +116,12 @@
     ];
     includes = [
       { path = "~/.gitconfig_local"; }
-      # work identity: anything under ~/work commits as the Helferline address
+      # anything under ~/work commits as the Helferline address, and without
+      # the Session trailer below: no convention of ours in the team's history
       {
         condition = "gitdir:~/work/";
         contents.user.email = "maximilian.wolf@helferline.at";
+        contents.hook.claude-session.enabled = false;
       }
     ];
     settings = {
@@ -136,6 +138,14 @@
       fetch.fsckobjects = true;
       receive.fsckObjects = true;
       pull.rebase = false;
+      # A config hook runs beside each repo's own .git/hooks rather than
+      # replacing them, as core.hooksPath would. The store copy, not the
+      # checkout's: a dotfiles branch without the file must not fail every
+      # commit on the machine.
+      hook.claude-session = {
+        event = "prepare-commit-msg";
+        command = "${../../git/hooks/claude-session-trailer}";
+      };
     };
   };
 

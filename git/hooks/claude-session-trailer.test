@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Drive claude-session-trailer through real commits and check the Session
+# trailers they end up with. Run it directly; no framework.
+#
+# The hook is wired the way nix/home/common.nix wires it, as a config hook, in a
+# throwaway repo with no global or system config, so a hook already installed on
+# this machine cannot add its own trailer to the result.
+
+set -uo pipefail
+
+hook="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-session-trailer"
+repo=$(mktemp -d)
+trap 'rm -rf "$repo"' EXIT
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+unset CLAUDE_CODE_SESSION_ID
+
+g() { git -C "$repo" "$@"; }
+g init -q -b master
+g config user.name test
+g config user.email test@example.com
+g config hook.claude-session.event prepare-commit-msg
+g config hook.claude-session.command "$hook"
+
+failures=0
+
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+# every Session trailer of a commit, comma-separated
+sessions() { g log -1 --format='%(trailers:key=Session,valueonly,separator=%x2C)' "${1:-HEAD}"; }
+# how many lines of the whole message start with Session:, trailer block or not
+session_lines() { g log -1 --format=%B "${1:-HEAD}" | grep -c '^Session:'; }
+change() { echo "$1" >"$repo/$1"; g add "$1"; }
+
+# --- a commit inside a session carries it; one outside carries nothing
+
+change a
+CLAUDE_CODE_SESSION_ID=s1 g commit -q -m "in a session"
+check "a commit in a session carries its id" s1 "$(sessions)"
+
+change b
+g commit -q -m "outside"
+check "a commit outside a session has no trailer" 0 "$(session_lines)"
+check "and its message is untouched" "outside" "$(g log -1 --format=%B | sed '/^$/d')"
+
+# --- amending never adds a second trailer
+
+CLAUDE_CODE_SESSION_ID=s2 g commit -q --amend -m "outside, amended in a session"
+check "amending an outside commit in a session adds that session" s2 "$(sessions)"
+CLAUDE_CODE_SESSION_ID=s3 g commit -q --amend --no-edit
+check "amending it again in another session keeps one trailer" 1 "$(session_lines)"
+check "the one it keeps is the first" s2 "$(sessions)"
+
+# --- a merge commit gets the merging session; the merged commits keep theirs
+
+g checkout -q -b side
+change c
+CLAUDE_CODE_SESSION_ID=s4 g commit -q -m "on the side"
+g checkout -q master
+change d
+g commit -q -m "on master"
+CLAUDE_CODE_SESSION_ID=s5 g merge -q --no-ff side -m "merge side"
+check "the merge commit carries the merging session" s5 "$(sessions)"
+check "the merged commit keeps its own" s4 "$(sessions side)"
+
+# --- a rebase that rewrites every commit leaves each with the one it had
+
+g checkout -q side
+CLAUDE_CODE_SESSION_ID=s6 g rebase -q --force-rebase master~1
+check "a rebased session commit keeps one trailer" 1 "$(session_lines)"
+check "and it is the original session" s4 "$(sessions)"
+
+# --- the trailer joins a trailer block already there, and survives the editor
+
+change e
+CLAUDE_CODE_SESSION_ID=s7 g commit -q -m "with attribution
+
+Co-Authored-By: Someone <someone@example.com>"
+check "Session joins the existing trailer block" \
+    "Co-Authored-By: Someone <someone@example.com>,Session: s7" \
+    "$(g log -1 --format='%(trailers:only,separator=%x2C)')"
+
+change f
+CLAUDE_CODE_SESSION_ID=s8 GIT_EDITOR=true g commit -q --verbose --edit -m "through the editor"
+check "a commit through the editor, comments and diff stripped, carries it" s8 "$(sessions)"
+check "and nothing of the comment block is left" 0 "$(g log -1 --format=%B | grep -c '^#')"
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+    exit 0
+fi
+echo "$failures check(s) failed"
+exit 1
