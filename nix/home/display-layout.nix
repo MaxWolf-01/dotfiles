@@ -1,8 +1,9 @@
-# display-layout — keep the external monitor above the laptop panel. What it
-# does and why it cannot simply save the layout: bin/display-layout --help.
+# display-layout watch: puts a saved display layout back when monitors are
+# plugged in or the lid opens or closes. What it applies, and why nothing is
+# written to monitors.xml: bin/display-layout --help.
 #
-# A service rather than a timer or a one-off, because the fix does not persist
-# and has to be remade every time mutter falls back.
+# A service rather than a timer or a one-off, because an applied layout does not
+# persist and has to be remade on every change of the connected monitors.
 #
 # The script is a uv PEP 723 script, so uv resolves its deps at run. jq because
 # bin/run-log, which it calls to record each outcome, builds its line with it.
@@ -16,7 +17,7 @@ in
 {
   systemd.user.services.display-layout = {
     Unit = {
-      Description = "Arrange monitors when mutter falls back to its row layout";
+      Description = "Put a saved display layout back when the connected monitors change";
       PartOf = [ "graphical-session.target" ];
       After = [ "graphical-session.target" ];
     };

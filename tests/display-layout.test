@@ -5,15 +5,16 @@
 # ///
 """Drive bin/display-layout's commands over gdctl show fixtures. Run it directly; no framework.
 
-The first half fixes the watcher's two judgements: what counts as the row mutter
-falls back to, and where the panel goes underneath. The second runs save, use,
-list and show against scratch layouts files, and checks the file they write,
-the gdctl set arguments, and what they print. Whether mutter accepts an
-arrangement is mutter's to say, live, through gdctl set --verify.
+The first part fixes the fallback's two judgements: what counts as the row
+mutter falls back to, and where the panel goes underneath. The second runs
+save, use, list and show against scratch layouts files, and checks the file
+they write, the gdctl set arguments, and what they print. The last drives the
+watcher over the same fixtures, files and recent record. Whether mutter accepts
+an arrangement is mutter's to say, live, through gdctl set --verify.
 
 The fixtures are gdctl show output, kept down to the lines the parser reads plus
 the deeper ones it has to walk past. tests/properties/display-layout.test holds
-the properties of matching and drawing.
+the properties of matching, drawing and the watcher's choice.
 """
 
 import contextlib
@@ -256,50 +257,6 @@ try:
 except dl.ParseError:
     check("a monitor without a mode is refused", "ParseError", "ParseError")
 
-# --- the watch loop acts once per change of the connected set, and only out of the row
-#
-# This is the guard that keeps the tool off a hand-made arrangement, and the one
-# thing a forced layout on a live display cannot exercise: forcing a row does not
-# change the connected set, which is exactly why nothing should happen.
-
-
-def drive(startup, *changes, failing=False):
-    """Run follow() over a startup state plus one MonitorsChanged per change.
-
-    Returns the gdctl argument lists it applied, dropping the leading
-    "gdctl set". With failing=True every apply raises, as a rejected
-    configuration does.
-    """
-    applied = []
-    served = iter((startup,) + changes)
-
-    def fake_run(argv):
-        applied.append(argv[2:])
-        if failing:
-            raise RuntimeError("mutter rejected the configuration")
-        return ""
-
-    original = dl.read_state, dl.run, dl.log_run
-    dl.read_state = lambda: dl.parse_show(next(served))
-    dl.run = fake_run
-    dl.log_run = lambda *a, **k: None
-    try:
-        dl.follow(["MonitorsChanged\n"] * len(changes), 0)
-    finally:
-        dl.read_state, dl.run, dl.log_run = original
-    return applied
-
-
-check("a row the set did not change into is left alone", 0, len(drive(STACKED, ROW)))
-check("a row a new monitor brought is arranged", 1, len(drive(PANEL_ONLY, ROW)))
-check("a new monitor already arranged is left alone", 0, len(drive(PANEL_ONLY, STACKED)))
-check("the same row twice is arranged once", 1, len(drive(PANEL_ONLY, ROW, ROW)))
-# Docking before the session starts means the fallback already happened and no
-# signal is coming; the startup look is the only chance to catch it.
-check("a row already on screen at startup is arranged", 1, len(drive(ROW)))
-# Giving up after one rejection would leave the row until the next plug.
-check("a rejected apply is retried on the next signal", 2, len(drive(ROW, ROW, failing=True)))
-
 # --- named layouts: save, use, list and show
 #
 # Each command runs against gdctl show fixtures, with a layouts file and a
@@ -408,18 +365,25 @@ class Session:
     """The display, the lid and the files a command sees, and what it did.
 
     `shows` are the gdctl show outputs the command reads in turn; the last one
-    repeats. `layouts` and `recent` seed the files; None leaves none.
+    repeats. A show may be a function of the session, called when it is read,
+    to change the files between two looks. `lid_closed` is one answer, or a
+    list of them read in turn the same way. `layouts` and `recent` seed the
+    files; None leaves none. mutter rejects the first `rejects` gdctl sets.
     """
 
-    def __init__(self, *shows, lid_closed=False, layouts=None, recent=None, terminal=False, no_color=True):
+    def __init__(self, *shows, lid_closed=False, layouts=None, recent=None, terminal=False, no_color=True, rejects=0):
         self.tmp = Path(tempfile.mkdtemp(prefix="display-layout-test."))
-        self.shows, self.lid, self.terminal, self.no_color = list(shows), lid_closed, terminal, no_color
-        self.applied, self.calls = [], []
+        self.shows, self.terminal, self.no_color, self.rejects = list(shows), terminal, no_color, rejects
+        self.lids = list(lid_closed) if isinstance(lid_closed, list) else [lid_closed]
+        self.applied, self.calls, self.logs = [], [], []
         if layouts is not None:
             self.path.write_text(layouts)
         if recent is not None:
-            self.recent_path.parent.mkdir(parents=True)
-            self.recent_path.write_text("".join(f"{n}\n" for n in recent))
+            self.write_recent(recent)
+
+    def write_recent(self, names):
+        self.recent_path.parent.mkdir(parents=True, exist_ok=True)
+        self.recent_path.write_text("".join(f"{n}\n" for n in names))
 
     path = property(lambda self: self.tmp / "layouts.toml")
     recent_path = property(lambda self: self.tmp / "state" / "display-layout" / "recent")
@@ -428,12 +392,16 @@ class Session:
 
     def run(self, argv):
         if argv[:2] == ["gdctl", "show"]:
-            return self.shows.pop(0) if len(self.shows) > 1 else self.shows[0]
+            show = self.shows.pop(0) if len(self.shows) > 1 else self.shows[0]
+            return show(self) if callable(show) else show
         if argv[:2] == ["gdctl", "set"]:
             self.applied.append(argv[2:])
+            if len(self.applied) <= self.rejects:
+                raise dl.CommandError("mutter rejected the configuration")
             return ""
         if argv[:2] == ["gdbus", "call"] and argv[-1] == "LidIsClosed":
-            return "(<true>,)\n" if self.lid else "(<false>,)\n"
+            lid = self.lids.pop(0) if len(self.lids) > 1 else self.lids[0]
+            return "(<true>,)\n" if lid else "(<false>,)\n"
         raise AssertionError(f"unexpected command {argv}")
 
     def recording(self, name, function):
@@ -454,6 +422,8 @@ class Session:
             stack.enter_context(mock.patch.object(dl, "run", self.run))
             stack.enter_context(mock.patch.object(dl, "cells", self.recording("cells", dl.cells)))
             stack.enter_context(mock.patch.object(dl, "match", self.recording("match", dl.match)))
+            stack.enter_context(mock.patch.object(dl, "decide", self.recording("decide", dl.decide)))
+            stack.enter_context(mock.patch.object(dl, "log_run", lambda *line: self.logs.append(line)))
             stack.enter_context(contextlib.redirect_stdout(out))
             try:
                 try:
@@ -779,6 +749,139 @@ tall = (dl.Screen("arzopa", ARZOPA[5], 0, 0, 1.0, "90"), dl.Screen("laptop", LAP
 check("a tall arrangement stays within MAX_ROWS in a wide terminal", True,
       len(dl.draw(tall, dl.fit_width(tall, 200), None).splitlines()) <= dl.MAX_ROWS)
 check("a wide one within MAX_COLUMNS", dl.MAX_COLUMNS, dl.fit_width((dl.Screen("hp", HP[5], 0, 0, primary=True),), 200))
+
+# --- the watcher
+#
+# follow() runs over a startup look plus one MonitorsChanged per change, in a
+# Session: the gdctl show fixtures, the lid, the layouts file and the recent
+# record. Acting only on a change of the connected set is the guard that keeps
+# it off a hand-made arrangement, and the one thing a forced layout on a live
+# display cannot exercise: forcing a layout does not change the set.
+
+
+def drive(startup, *changes, **session):
+    """The Session the watcher ran in, over `startup` and then each of `changes`."""
+    s = Session(startup, *changes, **session)
+    crashed = s(lambda _: dl.follow(["MonitorsChanged\n"] * len(changes), 0), None)
+    if crashed:
+        check("the watcher ran without crashing", "", crashed)
+    return s
+
+
+# With no layouts file, only mutter's row is replaced.
+check("a row the set did not change into is left alone", 0, len(drive(STACKED, ROW).applied))
+check("a row a new monitor brought is arranged", 1, len(drive(PANEL_ONLY, ROW).applied))
+s = drive(PANEL_ONLY, STACKED)
+check("a new monitor already arranged is left alone, and the log says why",
+      (0, ("skip", "no saved layout fits, and the layout is not mutter's row", {"monitors": ["HDMI-1", "eDP-1"]})),
+      (len(s.applied), s.logs[-1]))
+check("the same row twice is arranged once", 1, len(drive(PANEL_ONLY, ROW, ROW).applied))
+# Docking before the session starts means no signal is coming; the startup look
+# is the only chance to catch it.
+check("a row already on screen at startup is arranged", 1, len(drive(ROW).applied))
+# Giving up after one rejection would leave the row until the next plug.
+check("a rejected apply is retried on the next signal", 2, len(drive(ROW, ROW, rejects=99).applied))
+
+# The desk from the named-layouts part, desk-tall on screen, the ARZOPA on DP-1 at first.
+HP_LAPTOP_ROW = gdctl_show([HP, LAPTOP], [("HDMI-1", 0, 0, 1.0, "normal", False),
+                                          ("eDP-1", 1920, 0, FOUR_THIRDS, "normal", True)])
+TALL_ON = lambda port: {port: (0, 180, FOUR_THIRDS, "90", False, ARZOPA[5]),  # noqa: E731
+                        "HDMI-1": (1200, 0, 1.0, "normal", False, HP[5]),
+                        "eDP-1": (1200, 1080, FOUR_THIRDS, "normal", True, LAPTOP[5])}
+TOP_ON = lambda port: TALL_ON(port) | {port: (0, 0, FOUR_THIRDS, "90", False, ARZOPA[5])}  # noqa: E731
+
+s = drive(DESK, HP_LAPTOP_ROW, DESK_DP2_ROW, layouts=DESK_FILE, recent=["desk-tall", "desk-top"])
+check("the ARZOPA unplugged, then plugged into the other port, lands on its last-used layout",
+      [TALL_ON("DP-1"), {"HDMI-1": (0, 0, 1.0, "normal", False, HP[5]),
+                         "eDP-1": (0, 1080, FOUR_THIRDS, "normal", True, LAPTOP[5])}, TALL_ON("DP-2")],
+      [groups(a) for a in s.applied])
+check("every look goes through decide, and matches through match", (3, True),
+      (s.calls.count("decide"), "match" in s.calls))
+check("one run-log line per change of the set, naming the layout applied",
+      [("ok", "applied desk-tall, last used with these monitors",
+        {"monitors": ["DP-1", "HDMI-1", "eDP-1"], "layout": "desk-tall"}),
+       ("ok", "no saved layout fits; replaced mutter's row", {"monitors": ["HDMI-1", "eDP-1"]}),
+       ("ok", "applied desk-tall, last used with these monitors",
+        {"monitors": ["DP-2", "HDMI-1", "eDP-1"], "layout": "desk-tall"})],
+      s.logs)
+check("the watcher never passes --persistent", [], [a for argv in s.applied for a in argv if a in ("-P", "--persistent")])
+
+# The watcher carries out what decide returns, whatever that is.
+canned = dl.Decision(frozenset({("DP-9", dl.Model("X", "Y"))}), dl.Recall("canned", ("--canned",)), "why not")
+with mock.patch.object(dl, "decide", lambda *a, **k: canned):
+    s = Session(DESK)
+    s(lambda _: dl.follow([], 0), None)
+check("the watcher applies what decide chose, and logs it",
+      ([["--canned"]], [("ok", "applied canned, why not", {"monitors": ["DP-9"], "layout": "canned"})]),
+      (s.applied, s.logs))
+
+moved = desk(arzopa=(0, 100, FOUR_THIRDS, "90"))
+s = drive(DESK, moved, desk(arzopa=(0, 40, FOUR_THIRDS, "90")), layouts=DESK_FILE, recent=["desk-tall"])
+check("an arrangement made during the session is left alone while the set stays, and not logged",
+      ([TALL_ON("DP-1")], 1), ([groups(a) for a in s.applied], len(s.logs)))
+s = drive(DESK, moved, HP_LAPTOP_ROW, moved, layouts=DESK_FILE, recent=["desk-tall"])
+check("and replaced once the set changes", TALL_ON("DP-1"), groups(s.applied[-1]))
+
+
+def used(names, show):
+    """A show read after `use` has put `names` in the recent record."""
+    return lambda session: (session.write_recent(names), show)[1]
+
+
+s = drive(DESK, HP_LAPTOP_ROW, used(["desk-top", "desk-tall"], DESK_DP2_ROW), layouts=DESK_FILE, recent=["desk-tall"])
+check("the recent record is read at each change, so a layout used since is the one put back",
+      TOP_ON("DP-2"), groups(s.applied[-1]))
+
+s = drive(DESK_DP2_ROW, layouts=DESK_FILE, recent=["docked", "desk-top"])
+check("docked before the session starts, the startup look applies the last-used layout",
+      ([TOP_ON("DP-2")], ["applied desk-top, last used with these monitors"]),
+      ([groups(a) for a in s.applied], [log[1] for log in s.logs]))
+
+s = drive(DESK_DP2_ROW, layouts=DESK_FILE)
+check("a set with saved layouts, none used yet, gets the first that fits, which is then the one last used",
+      (["applied desk-tall, saved for these monitors, none used yet"], ["desk-tall"]),
+      ([log[1] for log in s.logs], s.recent))
+s.shows = [desk("DP-2", arzopa=(0, 100, FOUR_THIRDS, "90"))]
+check("so show names it once a monitor is moved", "last used with these monitors: desk-tall; since then arzopa moved",
+      s(dl.show, dl.ShowArgs()).split("\n")[0])
+
+s = drive(DOCKED.replace("DP-1", "DP-2"), layouts=DESK_FILE, recent=["desk-tall", "docked"], lid_closed=True)
+check("with the lid closed, the lid-closed layout", ["docked"], [log[2].get("layout") for log in s.logs])
+s = drive(DESK, DOCKED, layouts=DESK_FILE, recent=["desk-tall", "docked"], lid_closed=[False, True])
+check("closing the lid changes the connected set", ["desk-tall", "docked"], [log[2].get("layout") for log in s.logs])
+
+# Twin ARZOPAs, told apart by serial, swap ports and nothing else changes.
+TWIN_FILE = """
+[aliases]
+laptop = { vendor = "AUO", product = "0xc199" }
+arzopa = { vendor = "GWD", product = "ARZOPA", serial = "0x0000a001" }
+arzopa-2 = { vendor = "GWD", product = "ARZOPA", serial = "0x0000a002" }
+
+[layouts.twins]
+laptop = { x = 0, y = 0, mode = "2560x1600@165.040", primary = true }
+arzopa = { x = 2560, y = 0, mode = "2560x1600@59.997" }
+arzopa-2 = { x = 5120, y = 0, mode = "2560x1600@59.997" }
+"""
+swapped = TWINS.replace("0x0000a001", "SWAP").replace("0x0000a002", "0x0000a001").replace("SWAP", "0x0000a002")
+s = drive(TWINS, swapped, layouts=TWIN_FILE, recent=["twins"])
+check("twins swapping ports is a change of the set, and each goes back to its place",
+      [{"DP-1": 2560, "DP-2": 5120}, {"DP-2": 2560, "DP-1": 5120}],
+      [{c: g[0] for c, g in groups(a).items() if c != "eDP-1"} for a in s.applied])
+
+s = drive(DESK_DP2_ROW, layouts=DESK_FILE, recent=["desk-tall"], rejects=1)
+check("a layout mutter rejects is logged by name, and the next that fits is applied",
+      (TOP_ON("DP-2"), [("fail", "desk-tall rejected: mutter rejected the configuration; "
+                                 "applied desk-top, saved for these monitors, none used yet",
+                         {"monitors": ["DP-2", "HDMI-1", "eDP-1"], "layout": "desk-top"})]),
+      (groups(s.applied[-1]), s.logs))
+s = drive(DESK_DP2_ROW, DESK_DP2_ROW, layouts=DESK_FILE, recent=["desk-tall"], rejects=99)
+check("when every layout and the fallback are rejected, all are tried again on the next signal", 6, len(s.applied))
+
+s = drive(PANEL_ONLY, ROW, ROW, layouts="[layouts.solo]\n")
+check("a broken layouts file is logged once per change of the set, and the fallback still applies",
+      (["fail", "fail"], 1), ([log[0] for log in s.logs], len(s.applied)))
+check("in the same line as what the look did", True,
+      s.logs[-1][1].endswith("layout solo lists no monitors; no saved layout fits; replaced mutter's row"))
 
 print()
 print("FAILED" if failures else "all ok")
