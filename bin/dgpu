@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# Keep the discrete GPU powered off. Lock its device files on battery, unlock on AC.
+#
+# The driver powers an idle dGPU down to D3cold on its own (NVIDIA: runtime D3,
+# Ubuntu's on-demand PRIME mode ships it). What wakes it is a program opening
+# its device files: an app enumerating GPUs at start, a Vulkan loader, CUDA.
+# `lock` takes every permission bit off those files, so an open fails before
+# the kernel asks the driver, and the dGPU stays off. Nothing is unloaded or
+# unbound, so `unlock` is instant, with no logout and no reboot.
+#
+# The dGPU is the DRM device whose PCI device is not the boot VGA. Locked are
+# its /dev/dri nodes (by PCI path) and, for NVIDIA, /dev/nvidia*. GNOME opens
+# the card node through logind, as root, so the lock does not reach it.
+#
+# GU603ZW: the HDMI port is wired to the dGPU, so HDMI needs it unlocked; USB-C
+# DisplayPort runs off the iGPU.
+#
+# `install` puts a root-owned copy of this script in /usr/local/sbin, a unit
+# that runs `auto` at boot before the display manager and after every wake, and
+# a udev rule that runs it when the charger goes in or out and when the dGPU's
+# driver or render node appears. The copy does not follow edits made here:
+# `status` says when the two differ, `install` reinstalls.
+#
+# Usage:
+#   dgpu status     card, driver, power state, lock, power source, installed units
+#   dgpu lock       fail every open of the dGPU's device files
+#   dgpu unlock     restore their permissions
+#   dgpu auto       lock on battery, unlock on AC; what the unit runs
+#   dgpu install    install the copy, the unit and the udev rule, then run auto
+#   dgpu reset      unlock and remove what install put in place
+
+set -euo pipefail
+
+# Overridable for tests/dgpu.test.
+SYSFS_DRM=${DGPU_SYSFS_DRM:-/sys/class/drm}
+DEV=${DGPU_DEV:-/dev}
+POWER_SUPPLY=${DGPU_POWER_SUPPLY:-/sys/class/power_supply}
+INSTALLED=/usr/local/sbin/dgpu
+UNIT_NAME=dgpu-auto.service
+UNIT_PATH=/etc/systemd/system/$UNIT_NAME
+RULE_PATH=/etc/udev/rules.d/99-dgpu.rules
+WAKE_TARGETS="suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+NO_DGPU="no dGPU with a driver bound (is the card on the bus: lspci -d 10de:; is its driver loaded: lsmod)"
+# How long `auto` waits for the render node after the driver's own event
+# created /dev/nvidia*; the DRM nodes arrive in a later udev event.
+NODE_WAIT=${DGPU_NODE_WAIT:-3}
+
+if [ "$EUID" -eq 0 ]; then
+    sudo() { "$@"; }
+fi
+
+die() {
+    echo "dgpu: $*" >&2
+    exit 1
+}
+
+# Prints "<pci address> <driver> <sysfs path>" for the first non-boot display device.
+find_dgpu() {
+    local dev class driver
+    for dev in "$SYSFS_DRM"/card*/device; do
+        [ -r "$dev/class" ] || continue
+        class=$(cat "$dev/class")
+        [ "${class:0:4}" = 0x03 ] || continue
+        [ "$(cat "$dev/boot_vga" 2>/dev/null)" = 1 ] && continue
+        dev=$(readlink -f "$dev")
+        driver=$(basename "$(readlink -f "$dev/driver")")
+        echo "$(basename "$dev") $driver $dev"
+        return 0
+    done
+    return 1
+}
+
+# The device files that exist for the dGPU, one per line.
+nodes() { # addr driver
+    local n
+    for n in "$DEV/dri/by-path/pci-$1-card" "$DEV/dri/by-path/pci-$1-render"; do
+        [ -e "$n" ] && echo "$n"
+    done
+    if [ "$2" = nvidia ]; then
+        for n in "$DEV"/nvidia0 "$DEV"/nvidiactl "$DEV"/nvidia-modeset "$DEV"/nvidia-uvm "$DEV"/nvidia-uvm-tools; do
+            [ -e "$n" ] && echo "$n"
+        done
+    fi
+    return 0
+}
+
+# The mode udev gives the node: 0660 under /dev/dri, 0666 for NVIDIA's own.
+default_mode() { # node
+    case "$1" in
+        */dri/*) echo 0660 ;;
+        *) echo 0666 ;;
+    esac
+}
+
+set_mode() { # mode node...
+    local mode=$1 n
+    shift
+    for n in "$@"; do
+        if [ -O "$n" ]; then chmod "$mode" "$n"; else sudo chmod "$mode" "$n"; fi
+    done
+}
+
+on_ac() {
+    local t
+    for t in "$POWER_SUPPLY"/*/type; do
+        [ -r "$t" ] || continue
+        if [ "$(cat "$t")" = Mains ] && [ "$(cat "${t%/type}/online")" = 1 ]; then return 0; fi
+    done
+    return 1
+}
+
+locked() { # addr
+    local render="$DEV/dri/by-path/pci-$1-render"
+    [ -e "$render" ] && [ "$(stat -L -c %a "$render")" = 0 ]
+}
+
+# Sets the mode of every node of the dGPU, and says so when the render node is
+# not there yet: the lock is then only on what exists.
+set_all() { # lock|unlock
+    local addr driver dev n
+    read -r addr driver dev < <(find_dgpu) || die "$NO_DGPU"
+    while read -r n; do
+        if [ "$1" = lock ]; then set_mode 0000 "$n"; else set_mode "$(default_mode "$n")" "$n"; fi
+    done < <(nodes "$addr" "$driver")
+    [ -e "$DEV/dri/by-path/pci-$addr-render" ] ||
+        echo "dgpu: $addr has no render node under $DEV/dri/by-path yet, $1 applied to the rest" >&2
+}
+
+lock() { set_all lock; }
+unlock() { set_all unlock; }
+
+# The unit's entry point: a machine without a dGPU has nothing to do, not an error.
+auto() {
+    local addr driver dev i
+    read -r addr driver dev < <(find_dgpu) || { echo "dgpu: $NO_DGPU, nothing to do" >&2; return 0; }
+    for ((i = 0; i < NODE_WAIT * 10; i++)); do
+        [ -e "$DEV/dri/by-path/pci-$addr-render" ] && break
+        sleep 0.1
+    done
+    if on_ac; then unlock; else lock; fi
+}
+
+show() {
+    local addr driver dev state
+    if read -r addr driver dev < <(find_dgpu); then
+        state=$(cat "$dev/power_state" 2>/dev/null || echo unknown)
+        if locked "$addr"; then
+            echo "dgpu: $addr driver $driver, $state, locked"
+        else
+            echo "dgpu: $addr driver $driver, $state, unlocked"
+        fi
+    else
+        echo "dgpu: $NO_DGPU"
+    fi
+    if on_ac; then echo "power: AC"; else echo "power: battery"; fi
+    if systemctl is-enabled --quiet $UNIT_NAME 2>/dev/null; then
+        echo "unit: $UNIT_NAME enabled"
+    else
+        echo "unit: not installed"
+    fi
+    if [ -f "$RULE_PATH" ]; then
+        echo "udev: $(basename "$RULE_PATH") installed"
+    else
+        echo "udev: not installed"
+    fi
+    if [ -f "$INSTALLED" ]; then
+        if cmp -s "$0" "$INSTALLED"; then
+            echo "installed copy: matches this script"
+        else
+            echo "installed copy: differs from this script ('dgpu install' reinstalls)"
+        fi
+    fi
+}
+
+# The unit and the rule run as root, so they run a root-owned copy: a script
+# under $HOME is writable by every process of the user.
+install_all() {
+    sudo install -m 755 "$0" "$INSTALLED"
+    sudo tee "$UNIT_PATH" >/dev/null <<EOF
+[Unit]
+Description=Lock the dGPU's device files on battery, unlock on AC
+After=$WAKE_TARGETS
+Before=display-manager.service
+# Several udev events start it within seconds of boot; the default burst limit would leave it failed.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALLED auto
+
+[Install]
+WantedBy=multi-user.target $WAKE_TARGETS
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --quiet $UNIT_NAME
+    # Mains only: the battery emits a change event on every capacity tick. The
+    # driver's own event is the one that creates /dev/nvidia*; the render-node
+    # event covers a later driver reload.
+    sudo tee "$RULE_PATH" >/dev/null <<EOF
+ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="renderD*", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
+ACTION=="add", DEVPATH=="/bus/pci/drivers/nvidia", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
+EOF
+    sudo udevadm control --reload
+}
+
+uninstall() {
+    if [ -f "$UNIT_PATH" ]; then
+        sudo systemctl disable --quiet $UNIT_NAME
+        sudo rm "$UNIT_PATH"
+        sudo systemctl daemon-reload
+    fi
+    if [ -f "$RULE_PATH" ]; then
+        sudo rm "$RULE_PATH"
+        sudo udevadm control --reload
+    fi
+    [ -f "$INSTALLED" ] && sudo rm "$INSTALLED"
+    return 0
+}
+
+case "${1:-}" in
+    status)
+        show
+        ;;
+    lock)
+        lock
+        ;;
+    unlock)
+        unlock
+        ;;
+    auto)
+        auto
+        ;;
+    install)
+        install_all
+        sudo "$INSTALLED" auto
+        echo "installed $UNIT_NAME, $(basename "$RULE_PATH") and $INSTALLED"
+        show
+        ;;
+    reset)
+        find_dgpu >/dev/null && unlock
+        uninstall
+        echo "unlocked, removed $UNIT_NAME, $(basename "$RULE_PATH") and $INSTALLED"
+        show
+        ;;
+    ''|-h|--help)
+        awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
+        ;;
+    *)
+        die "unknown command '$1' (see --help)"
+        ;;
+esac
