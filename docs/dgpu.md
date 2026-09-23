@@ -33,8 +33,10 @@ it holds them:
 - CUDA, a Vulkan or EGL app that picks the dGPU, GNOME's "Launch using
   Graphics Card".
 - A monitor on HDMI, which is wired to the dGPU, for as long as it is
-  connected. GNOME drives it through logind, so this works locked or not.
-  (Inferred from mutter's code, not yet tried with a monitor.)
+  connected. Plugging it into a running session crashes gnome-shell, locked
+  or not, and gdm restarts the session with the monitor working; a session
+  that starts with the cable in works from the start. Save your work before
+  plugging in or out. The bug: `agent/tickets/hdmi-hotplug-crashes-gnome-shell.md`.
 
 Who holds it right now:
 
