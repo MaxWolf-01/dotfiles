@@ -1,16 +1,17 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tyro", "tomlkit"]
+# dependencies = ["tyro>=1.0.14", "tomlkit"]
 # ///
 """Drive bin/display-layout's commands over gdctl show fixtures. Run it directly; no framework.
 
 The first part fixes the fallback's two judgements: what counts as the row
 mutter falls back to, and where the panel goes underneath. The second runs
-save, use, list and show against scratch layouts files, and checks the file
-they write, the gdctl set arguments, and what they print. The last drives the
-watcher over the same fixtures, files and recent record. Whether mutter accepts
-an arrangement is mutter's to say, live, through gdctl set --verify.
+save, use, list, show and the picker against scratch layouts files, and checks
+the file they write, the gdctl set arguments, and what they print. The last
+drives the watcher over the same fixtures, files and recent record. Whether
+mutter accepts an arrangement is mutter's to say, live, through gdctl set
+--verify.
 
 The fixtures are gdctl show output, kept down to the lines the parser reads plus
 the deeper ones it has to walk past. tests/properties/display-layout.test holds
@@ -23,6 +24,8 @@ import io
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -257,7 +260,7 @@ try:
 except dl.ParseError:
     check("a monitor without a mode is refused", "ParseError", "ParseError")
 
-# --- named layouts: save, use, list and show
+# --- named layouts: save, use, list, show and pick
 #
 # Each command runs against gdctl show fixtures, with a layouts file and a
 # recent record in a scratch directory. Only dl.run is replaced: it answers
@@ -638,6 +641,132 @@ check("colour in a terminal, outline with NO_COLOR or out of one", (True, False,
     "\x1b[" in Session(DESK, layouts=DESK_FILE, terminal=terminal, no_color=no_color)(dl.show, dl.ShowArgs())
     for terminal, no_color in ((True, False), (True, True), (False, False))
 ))
+
+# --- pick
+#
+# A fake fzf on PATH takes fzf's place: it records the names it is given and
+# picks one, or exits the way fzf does when left. The preview runs as fzf runs
+# it, with the pane's size in FZF_PREVIEW_COLUMNS and FZF_PREVIEW_LINES.
+
+FAKE_FZF = """\
+#!/bin/sh
+cat > "$FAKE_FZF_DIR/offered"
+printf '%s\\n' "$FAKE_FZF_PICK"
+exit "$FAKE_FZF_STATUS"
+"""
+
+
+def picking(session, pick="", status=0, fzf=True, args=None):
+    """The picker's output in `session`, and the names fzf was given, when fzf prints `pick` and exits `status`.
+
+    `args` runs the command line instead of the command, as the script's own entry does.
+    """
+    bin_dir = session.tmp / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    if fzf:
+        (bin_dir / "fzf").write_text(FAKE_FZF)
+        (bin_dir / "fzf").chmod(0o755)
+    env = {"PATH": str(bin_dir) if not fzf else f"{bin_dir}:{os.environ['PATH']}", "FAKE_FZF_DIR": str(session.tmp),
+           "FAKE_FZF_PICK": pick, "FAKE_FZF_STATUS": str(status)}
+    command = (lambda _: dl.app.cli(args=args, config=(dl.tyro.conf.OmitArgPrefixes,))) if args is not None else dl.pick
+    with mock.patch.dict(os.environ, env), mock.patch.object(dl, "use", session.recording("use", dl.use)):
+        out = session(command, dl.PickArgs())
+    offered = session.tmp / "offered"
+    return out, offered.read_text().splitlines() if offered.exists() else None
+
+
+s = Session(DESK_DP2_ROW, desk("DP-2"), layouts=DESK_FILE, recent=["docked", "desk-top"])
+out, offered = picking(s, "desk-tall")
+check("the picker lists the layouts that fit, whatever the ports, the one used last first, through match",
+      (["desk-top", "desk-tall"], True), (offered, "match" in s.calls))
+u = Session(DESK_DP2_ROW, desk("DP-2"), layouts=DESK_FILE, recent=["docked", "desk-top"])
+check("a pick is put on screen through use: the same gdctl set, recent record and drawing",
+      (True, u(dl.use, dl.UseArgs("desk-tall")), u.applied, u.recent), ("use" in s.calls, out, s.applied, s.recent))
+s = Session(DESK, layouts=DESK_FILE)
+check("bare display-layout opens the picker", ["desk-tall", "desk-top"], picking(s, args=[])[1])
+check("with the lid closed, the lid-closed layout", ["docked"],
+      picking(Session(DOCKED, lid_closed=True, layouts=DESK_FILE))[1])
+
+for what, status in (("with Esc or Ctrl-C", 130), ("with no match", 1)):
+    s = Session(DESK, layouts=DESK_FILE, recent=["desk-top"])
+    check(f"leaving fzf {what} applies nothing, prints nothing and records nothing",
+          ("", [], ["desk-top"]), (picking(s, status=status)[0], s.applied, s.recent))
+check("fzf failing is a refusal naming its status", "exit: display-layout: fzf exited with status 2",
+      picking(Session(DESK, layouts=DESK_FILE), status=2)[0])
+check("without fzf the picker says it needs it", "exit: display-layout: the picker runs fzf, which is not on PATH",
+      picking(Session(DESK, layouts=DESK_FILE), fzf=False)[0])
+check("with nothing saved for the monitors connected, the picker says so, points at save, and opens no fzf",
+      ("exit: display-layout: no saved layout fits the monitors connected now (laptop on eDP-1); "
+       "display-layout save NAME saves the one on screen", None),
+      picking(Session(PANEL_ONLY, layouts=DESK_FILE), "desk-tall"))
+s = Session(DESK)
+check("with nothing saved at all, the same, naming the file",
+      (f"exit: display-layout: no layouts in {s.path}; display-layout save NAME saves the one on screen", None), picking(s))
+
+
+def previewed(name, columns=None, lines=None, layouts=DESK_FILE, **session):
+    """The preview of `name` with desk-tall on screen, in a pane `columns` wide and `lines` tall, and its Session.
+
+    Without a pane size it runs outside fzf, in a terminal 80 columns wide and `lines` tall.
+    """
+    s = Session(DESK, layouts=layouts, **session)
+    pane = {"FZF_PREVIEW_COLUMNS": str(columns), "FZF_PREVIEW_LINES": str(lines)} if columns else {"LINES": str(lines)}
+    with mock.patch.dict(os.environ, pane):
+        return s(dl.pick, dl.PickArgs(preview=name)), s
+
+
+def visible(text):
+    return [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in text.splitlines()]
+
+
+def fills(text):
+    return {"#" + "".join(f"{int(n):02x}" for n in m) for m in re.findall(r"48;2;(\d+);(\d+);(\d+)", text)}
+
+
+# desk-top is 3120 x 2280 logical px. A pane 60 columns wide makes a cell 52 px,
+# so the drawing is 2280 / 52 = 44 cells, 22 lines, tall.
+TOP_SAVED = (replace(TALL[0], y=0), *TALL[1:])
+out, s = previewed("desk-top", 60, 40)
+check("the preview draws the saved layout, not the screen, through cells, at the pane width fzf reports",
+      (dl.draw(TOP_SAVED, 60, None), True, 60),
+      (out.rstrip("\n"), "cells" in s.calls, max(len(line) for line in visible(out))))
+out, _ = previewed("desk-top", 150, 80)
+check("a pane wider than MAX_COLUMNS is filled all the same", 150, max(len(line) for line in visible(out)))
+# 12 lines are 24 cells of 2280 / 24 = 95 px, and 3120 px of those are 32 cells across.
+out, _ = previewed("desk-top", 200, 12)
+check("a pane too short for its width gets the widest drawing that fits its height", (12, 32),
+      (len(visible(out)), max(len(line) for line in visible(out))))
+out, _ = previewed("desk-top", 60, 40, no_color=False)
+check("in colour in fzf's pane, which is no terminal to isatty, and in the earth palette",
+      (True, {dl.EARTH["arzopa"], dl.EARTH["hp"], dl.EARTH["laptop"]}), ("\x1b[" in out, fills(out)))
+spares = ALIASES + 'dell = { vendor = "DEL", product = "U2720Q" }\nbenq = { vendor = "BNQ", product = "GW2480" }\n' + """
+[layouts.benq-only]
+benq = { x = 0, y = 0, mode = "1920x1080@60.000", primary = true }
+"""
+check("a monitor with no colour of its own takes the spare its place in [aliases] gives it, as everywhere",
+      {dl.MORE_EARTH[1]}, fills(previewed("benq-only", 60, 40, layouts=spares, no_color=False)[0]))
+out, _ = previewed("desk-top", lines=50, terminal=True, no_color=False)
+check("outside fzf, the preview fills the terminal, in colour", (80, True),
+      (max(len(line) for line in visible(out)), "\x1b[" in out))
+check("a preview of a name not saved says which are",
+      "exit: display-layout: no layout named nope; saved: desk-tall, desk-top, docked", previewed("nope", 60, 40)[0])
+
+# fzf itself: the options the picker gives it, and the preview command it runs.
+s = Session(DESK, layouts=DESK_FILE)
+bare = {k: v for k, v in os.environ.items() if not k.startswith("FZF_")}
+try:
+    fzf = subprocess.run([*dl.fzf_argv(), "--filter", "top"], input="desk-tall\ndesk-top\n", capture_output=True,
+                         text=True, env=bare)
+    check("fzf accepts the picker's options", ("desk-top\n", ""), (fzf.stdout, fzf.stderr))
+except FileNotFoundError:
+    check("fzf accepts the picker's options", "fzf on PATH", "no fzf")
+command = next(a for a in dl.fzf_argv() if a.startswith("--preview=")).removeprefix("--preview=")
+check("the preview command names this script as one word", str(Path(dl.__file__).resolve()), shlex.split(command)[0])
+ran = subprocess.run(
+    ["sh", "-c", command.replace("{}", "'desk-top'")], capture_output=True, text=True,
+    env=bare | {"DISPLAY_LAYOUTS": str(s.path), "FZF_PREVIEW_COLUMNS": "60", "FZF_PREVIEW_LINES": "40", "NO_COLOR": "1"},
+)
+check("fzf's preview command runs the preview", (previewed("desk-top", 60, 40)[0], ""), (ran.stdout, ran.stderr))
 
 # --- the layouts file
 

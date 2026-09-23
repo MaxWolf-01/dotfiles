@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tyro", "tomlkit"]
+# dependencies = ["tyro>=1.0.14", "tomlkit"]
 # ///
 """Save monitor arrangements under a name, put them back, and draw them in the terminal.
 
@@ -34,7 +34,8 @@ compares the live arrangement with it. The record is $XDG_STATE_HOME/display-lay
 
 A drawing is to scale, one colour per alias, with ★ on the primary monitor, ↻
 on one turned right (gdctl's transform 90) and ↺ on one turned left (270). It
-is drawn in outline when stdout is not a terminal or NO_COLOR is set.
+is drawn in outline when stdout is not a terminal or NO_COLOR is set; fzf's
+preview pane counts as a terminal.
 
 `watch` puts a saved layout back when monitors are plugged in; `display-layout
 watch --help` says which. For monitors no layout fits, it looks after mutter's
@@ -52,10 +53,11 @@ is deliberately left out of every call. mutter makes a person confirm any
 display configuration a D-Bus client saves, so saving one would raise the
 keep-these-settings dialog on every replug. Nothing is written to monitors.xml.
 
-Reads and writes display state through gdctl(1).
+Reads and writes display state through gdctl(1). The picker runs fzf(1).
 
 Examples:
 
+    display-layout
     display-layout save desk-tall
     display-layout use desk-tall
     display-layout list
@@ -70,6 +72,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -126,7 +129,7 @@ class ParseError(Exception):
 
 
 class CommandError(RuntimeError):
-    """gdctl or gdbus exited non-zero."""
+    """A command this script runs exited non-zero, or could not be run."""
 
 
 @dataclass
@@ -557,7 +560,7 @@ def model_word(text: str) -> str:
 
 
 class LayoutError(Exception):
-    """The display cannot be saved as a layout, or a layout cannot be applied to it."""
+    """The display cannot be saved as a layout, or a layout cannot be applied to it or found for it."""
 
 
 def live(state: State, names: dict[str, str]) -> Arrangement:
@@ -903,7 +906,7 @@ SAND = "#ede3d2"
 """Label text on a fill."""
 MAX_COLUMNS = 72
 MAX_ROWS = 22
-"""The largest drawing, in terminal characters, however large the terminal is."""
+"""The largest drawing fit_width allows, in terminal characters, however large the terminal is."""
 
 
 def palette(names: Iterable[str]) -> dict[str, str]:
@@ -917,10 +920,15 @@ def palette(names: Iterable[str]) -> dict[str, str]:
 
 def fit_width(arrangement: Arrangement, columns: int) -> int:
     """Columns for a drawing that fits `columns` and stays within MAX_COLUMNS by MAX_ROWS."""
+    return fit(arrangement, min(columns, MAX_COLUMNS), MAX_ROWS)
+
+
+def fit(arrangement: Arrangement, columns: int, rows: int) -> int:
+    """Columns for a drawing at most `columns` wide and `rows` tall, and at least 8."""
     rects = [bounds(s) for s in arrangement]
     w = max(r[2] for r in rects) - min(r[0] for r in rects)
     h = max(r[3] for r in rects) - min(r[1] for r in rects)
-    return max(8, min(columns, MAX_COLUMNS, math.floor(MAX_ROWS * 2 * w / h)))
+    return max(8, min(columns, math.floor(rows * 2 * w / h)))
 
 
 def draw(arrangement: Arrangement, width: int, colours: dict[str, str] | None) -> str:
@@ -1177,6 +1185,82 @@ def describe_connected(monitors: list[Monitor], store: Store) -> str:
         else f"{m.connector} ({m.vendor} {m.product}, no alias)"
         for m in monitors
     )
+
+
+@dataclass
+class PickArgs:
+    preview: Annotated[str | None, tyro.conf.arg(metavar="NAME")] = None
+    """Draw the saved layout NAME to fill the terminal, and exit. fzf runs this to fill the preview pane."""
+
+
+@app.command(name="pick", is_default=True)
+def pick(args: PickArgs) -> None:
+    """Choose a saved layout by its drawing, and put it on screen as `use` does.
+
+    fzf lists the saved layouts that fit the monitors connected now, the one
+    used most recently first, and draws the highlighted one in its preview pane.
+    """
+    if args.preview is not None:
+        print(preview(args.preview))
+        return
+    store = load_store()
+    state = read_state()
+    monitors = connected(state, lid_closed())
+    if not store.layouts:
+        raise LayoutError(f"no layouts in {layouts_file()}; display-layout save NAME saves the one on screen")
+    names = choices(store, monitors, recent())
+    if not names:
+        raise LayoutError(
+            f"no saved layout fits the monitors connected now ({describe_connected(monitors, store)}); "
+            "display-layout save NAME saves the one on screen"
+        )
+    name = choose(names)
+    if name:
+        use(UseArgs(name))
+
+
+def choices(store: Store, monitors: list[Monitor], recent: list[str]) -> list[str]:
+    """The layouts that fit these monitors, the most recently used first, then in file order."""
+    fitting = match(store, monitors)
+    return [n for n in recent if n in fitting] + [n for n in fitting if n not in recent]
+
+
+def choose(names: list[str]) -> str | None:
+    """The layout picked in fzf. None when fzf is left without a pick."""
+    try:
+        proc = subprocess.run(fzf_argv(), input="\n".join(names), stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        raise CommandError("the picker runs fzf, which is not on PATH") from None
+    if proc.returncode not in (0, 1, 130):  # picked, no match, left with Esc or Ctrl-C
+        raise CommandError(f"fzf exited with status {proc.returncode}")
+    return proc.stdout.strip() or None
+
+
+def fzf_argv() -> list[str]:
+    """fzf over layout names, one per line, with each drawn by `pick --preview`."""
+    this = shlex.quote(str(Path(__file__).resolve()))
+    return [
+        "fzf", "--layout=reverse", "--no-multi", "--prompt=layout> ",
+        "--preview-window=right,80%,noinfo", f"--preview={this} pick --preview={{}}",
+    ]
+
+
+def preview(name: str) -> str:
+    """A saved layout drawn to fill fzf's preview pane, or the terminal outside fzf.
+
+    fzf's preview pane counts as a terminal, so the drawing is in colour there
+    unless NO_COLOR is set.
+    """
+    store = load_store()
+    if name not in store.layouts:
+        raise LayoutError(f"no layout named {name}; saved: {', '.join(store.layouts) or 'none'}")
+    arrangement = store.layouts[name]
+    size = shutil.get_terminal_size((80, 24))
+    columns = int(os.environ.get("FZF_PREVIEW_COLUMNS") or size.columns)
+    lines = int(os.environ.get("FZF_PREVIEW_LINES") or size.lines)
+    colour = (sys.stdout.isatty() or "FZF_PREVIEW_COLUMNS" in os.environ) and not os.environ.get("NO_COLOR")
+    colours = palette([*store.aliases, *(s.name for s in arrangement)]) if colour else None
+    return draw(arrangement, fit(arrangement, columns, lines), colours)
 
 
 @dataclass
