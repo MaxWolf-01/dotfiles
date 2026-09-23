@@ -116,12 +116,10 @@
     ];
     includes = [
       { path = "~/.gitconfig_local"; }
-      # anything under ~/work commits as the Helferline address, and without
-      # the Session trailer below: no convention of ours in the team's history
+      # work identity: anything under ~/work commits as the Helferline address
       {
         condition = "gitdir:~/work/";
         contents.user.email = "maximilian.wolf@helferline.at";
-        contents.hook.claude-session.enabled = false;
       }
     ];
     settings = {
