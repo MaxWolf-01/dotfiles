@@ -32,6 +32,13 @@ mutter.
 `use`, `save` and `watch` record the layout they leave on screen, and `show`
 compares the live arrangement with it. The record is $XDG_STATE_HOME/display-layout/recent.
 
+`rotate`, `place`, `primary` and `scale` each change one thing about the
+arrangement on screen and draw the result; only `save` keeps it. They name a
+monitor by its alias, or by its connector where it has none. When a monitor
+changes size or is placed, the others move as little as they can while the
+monitors stay joined edge to edge, and none crosses to another side of a
+monitor it was beside.
+
 A drawing is to scale, one colour per alias, with ★ on the primary monitor, ↻
 on one turned right (gdctl's transform 90) and ↺ on one turned left (270). It
 is drawn in outline when stdout is not a terminal or NO_COLOR is set; fzf's
@@ -63,6 +70,10 @@ Examples:
     display-layout list
     display-layout show
     display-layout show --json
+    display-layout rotate arzopa left
+    display-layout place arzopa left-of laptop --align top
+    display-layout primary laptop
+    display-layout scale hp 1.25
     display-layout apply --dry-run
     display-layout watch
 """
@@ -81,7 +92,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Annotated, Literal, NoReturn
+from typing import Annotated, Literal, NoReturn, assert_never
 
 import tomlkit
 import tyro
@@ -602,10 +613,29 @@ def layout_args(arrangement: Arrangement, binding: dict[str, str]) -> list[str]:
 
 
 def changes(saved: Arrangement, now: Arrangement) -> list[str]:
-    """How the arrangement on screen differs from a saved one, per monitor. Empty when it does not."""
-    was = {s.name: s for s in at_origin(saved)}
+    """How the arrangement on screen differs from a saved one, per monitor. Empty when it does not.
+
+    A monitor has moved when its place beside the others has. The two
+    arrangements are lined up on the shift shared by the most monitors that kept
+    their size, then by the most monitors, so monitors pushed along together
+    have not moved. A monitor that changed size has not moved while one of its
+    anchors is where it was.
+    """
+    was = {s.name: s for s in saved}
+    shifts = {s.name: (s.x - was[s.name].x, s.y - was[s.name].y) for s in now if s.name in was}
+    same_size = {s.name for s in now if s.name in was and extent(s) == extent(was[s.name])}
+    dx, dy = max(
+        dict.fromkeys(shifts.values()),
+        key=lambda d: (sum(shifts[n] == d for n in same_size), sum(v == d for v in shifts.values())),
+        default=(0, 0),
+    )
+
+    def moved(s: Screen, old: Screen) -> bool:
+        x1, y1, x2, y2 = bounds(old)
+        return not set(anchors((x1 + dx, y1 + dy, x2 + dx, y2 + dy))) & set(anchors(bounds(s)))
+
     out = []
-    for s in at_origin(now):
+    for s in now:
         old = was.get(s.name)
         if old is None:
             out.append(f"{s.name} added")
@@ -613,7 +643,7 @@ def changes(saved: Arrangement, now: Arrangement) -> list[str]:
         what = [
             word
             for word, differs in (
-                ("moved", (s.x, s.y) != (old.x, old.y)),
+                ("moved", moved(s, old)),
                 ("turned", s.transform != old.transform),
                 ("rescaled", not math.isclose(s.scale, old.scale, rel_tol=1e-6)),
                 ("in another mode", s.mode != old.mode),
@@ -816,38 +846,314 @@ def current(state: State, monitors: list[Monitor], store: Store, recent: list[st
     return Current(live(state, known_names(store.aliases, monitors)), None, ())
 
 
+MonitorName = Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="MONITOR")]
+"""An alias from the layouts file, or the connector of a monitor without one."""
+
+
 @dataclass(frozen=True)
 class Rotate:
     """Turn a monitor to landscape, or to what GNOME Settings calls Portrait Left or Right."""
 
-    name: str
-    to: Literal["left", "right", "normal"]
+    name: MonitorName
+    """The monitor to turn: its alias, or its connector where it has none."""
+    to: Annotated[Literal["left", "right", "normal"], tyro.conf.Positional, tyro.conf.arg(metavar="{left,right,normal}")]
+    """left is Portrait Left (gdctl's transform 270), right is Portrait Right (90), normal is landscape."""
 
 
 @dataclass(frozen=True)
 class Place:
-    name: str
-    side: Literal["left-of", "right-of", "above", "below"]
-    other: str
+    """Move a monitor to one side of another, touching it."""
+
+    name: MonitorName
+    """The monitor to move: its alias, or its connector where it has none."""
+    side: Annotated[Literal["left-of", "right-of", "above", "below"], tyro.conf.Positional,
+                    tyro.conf.arg(metavar="{left-of,right-of,above,below}")]
+    """The side of the other monitor it goes to."""
+    other: Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="OTHER")]
+    """The monitor it goes beside: its alias, or its connector where it has none."""
+    align: Literal["top", "center", "bottom", "left", "right"] = "center"
+    """Where along the shared edge: top, center or bottom beside a monitor, left, center or right above or below one."""
 
 
 @dataclass(frozen=True)
 class Primary:
-    name: str
+    """Make a monitor the primary one, where the top bar and notifications go."""
+
+    name: MonitorName
+    """The monitor: its alias, or its connector where it has none."""
 
 
 @dataclass(frozen=True)
 class Scale:
-    name: str
-    factor: float
+    """Set a monitor's scale."""
+
+    name: MonitorName
+    """The monitor: its alias, or its connector where it has none."""
+    factor: Annotated[float, tyro.conf.Positional, tyro.conf.arg(metavar="FACTOR")]
+    """1.25 for 125 %. gdctl show --verbose lists the scales mutter offers for each mode."""
 
 
 Verb = Rotate | Place | Primary | Scale
 
+ROTATIONS = {"left": "270", "right": "90", "normal": "normal"}
+"""gdctl's transform for each Rotate target, named as GNOME Settings names them."""
+
+ALIGNS = {
+    "left-of": ("top", "center", "bottom"),
+    "right-of": ("top", "center", "bottom"),
+    "above": ("left", "center", "right"),
+    "below": ("left", "center", "right"),
+}
+"""The alignments along the edge each side shares."""
+
+Box = tuple[int, int, int, int]
+"""x1, y1, x2, y2 in logical pixels."""
+
+
+def mentioned(verb: Verb) -> list[str]:
+    """The monitors a verb names."""
+    return [verb.name, verb.other] if isinstance(verb, Place) else [verb.name]
+
 
 def edit(arrangement: Arrangement, verb: Verb) -> Arrangement:
-    """The arrangement with the one thing the verb names changed."""
-    raise NotImplementedError(UNBUILT.format("04-edit-verbs"))
+    """The arrangement with the one thing the verb names changed.
+
+    Every monitor keeps its mode, and its scale, transform and primary unless
+    the verb names them. When no monitor changes size and none is placed,
+    nothing moves. Otherwise `settle` lays the monitors out again.
+    """
+    screens = {s.name: s for s in arrangement}
+    for name in mentioned(verb):
+        if name not in screens:
+            raise LayoutError(f"no monitor named {name}; on screen: {', '.join(screens)}")
+    if isinstance(verb, Place):
+        if verb.name == verb.other:
+            raise LayoutError(f"{verb.name} cannot go {verb.side} itself")
+        if verb.align not in ALIGNS[verb.side]:
+            raise LayoutError(f"--align {verb.align}: {verb.side} aligns {', '.join(ALIGNS[verb.side])}")
+    if isinstance(verb, Scale) and not (math.isfinite(verb.factor) and verb.factor > 0):
+        raise LayoutError(f"scale {verb.factor}: a scale is a positive number, 1.25 for 125 %")
+    after = tuple(applied(s, verb) for s in arrangement)
+    resized = any(extent(a) != extent(b) for a, b in zip(arrangement, after))
+    if isinstance(verb, Primary) or not (resized or isinstance(verb, Place)):
+        return after
+    return settle(arrangement, after, verb)
+
+
+def applied(s: Screen, verb: Verb) -> Screen:
+    """The screen with what the verb names applied to it."""
+    if isinstance(verb, Primary):
+        return replace(s, primary=s.name == verb.name)
+    if s.name != verb.name or isinstance(verb, Place):
+        return s
+    if isinstance(verb, Rotate):
+        return replace(s, transform=ROTATIONS[verb.to])
+    if isinstance(verb, Scale):
+        return replace(s, scale=verb.factor)
+    assert_never(verb)
+
+
+def extent(s: Screen) -> tuple[int, int]:
+    """A screen's width and height in logical pixels."""
+    x1, y1, x2, y2 = bounds(s)
+    return x2 - x1, y2 - y1
+
+
+def settle(before: Arrangement, after: Arrangement, verb: Rotate | Scale | Place) -> Arrangement:
+    """Positions for `after`, whose monitors have their new sizes and their old positions.
+
+    The rules:
+    - no two monitors overlap, and every one is reached from every other
+      through monitors sharing a stretch of edge, as mutter requires;
+    - a monitor wholly to one side of another stays on that side, and one
+      diagonal to another keeps at least one of its two sides. A placed
+      monitor is exempt, since leaving its side is what `place` is for;
+    - a placed monitor touches its `other` on the side and at the alignment
+      asked for.
+
+    The layout that moves the other monitors least in total wins. Ties go to
+    the one that leaves one of the edited monitor's anchors where it was, then
+    to the one that moves its centre least. `settle` lays out one monitor at a
+    time, trying each at the spots `spots` lists, and keeps the best layout
+    that meets the rules.
+
+    Raises LayoutError when no layout meets them.
+    """
+    if len(after) == 1:
+        return at_origin(after)
+    old = {s.name: s for s in before}
+    new = {s.name: s for s in after}
+    edited = verb.name
+    was = {n: bounds(s) for n, s in old.items()}
+    before_sides = {(a, b): sides(was[a], was[b]) for a in old for b in old if a != b}
+    best: tuple[tuple, dict[str, Box]] | None = None
+
+    def side_rule_applies(a: str, b: str) -> bool:
+        return not (isinstance(verb, Place) and edited in (a, b))
+
+    def fits(name: str, box: Box, laid: dict[str, Box]) -> bool:
+        return all(
+            not overlaps(box, other)
+            and (not side_rule_applies(name, n) or kept(before_sides[(name, n)], sides(box, other)))
+            for n, other in laid.items()
+        )
+
+    def search(order: list[str], laid: dict[str, Box], moved: int) -> None:
+        nonlocal best
+        if best and moved > best[0][0]:
+            return
+        if not order:
+            if joined(list(laid.values())):
+                cost = (moved, *edited_cost(was[edited], laid[edited]))
+                if best is None or cost < best[0]:
+                    best = (cost, dict(laid))
+            return
+        name, rest = order[0], order[1:]
+        for box in spots(name, new[name], was, laid, verb):
+            if fits(name, box, laid):
+                cost = 0 if name == edited else abs(box[0] - was[name][0]) + abs(box[1] - was[name][1])
+                search(rest, laid | {name: box}, moved + cost)
+
+    for anchor in [n for n in old if n != edited]:
+        search(placement_order(was, anchor, verb)[1:], {anchor: was[anchor]}, 0)
+    if best is None:
+        raise LayoutError(
+            f"no layout keeps every monitor joined edge to edge after this change to {edited}, "
+            f"without one crossing to another side of a monitor it was beside; place can move {edited} first"
+        )
+    boxes = best[1]
+    return at_origin(tuple(replace(s, x=boxes[s.name][0], y=boxes[s.name][1]) for s in after))
+
+
+def placement_order(was: dict[str, Box], anchor: str, verb: Verb) -> list[str]:
+    """The anchor, then the others outward from it through the monitors each touched.
+
+    A placed monitor comes right after the monitor it is placed against, which
+    fixes where it goes.
+    """
+    mover = verb.name if isinstance(verb, Place) else None
+    order, frontier = [anchor], [anchor]
+    while frontier:
+        a = frontier.pop(0)
+        for b in was:
+            if b not in order and b != mover and touching(was[a], was[b]):
+                order.append(b)
+                frontier.append(b)
+    order += [n for n in was if n not in order and n != mover]
+    if isinstance(verb, Place):
+        order.insert(order.index(verb.other) + 1, verb.name)
+    return order
+
+
+def anchors(box: Box) -> list[tuple[int, int]]:
+    """A box's corners, edge midpoints and centre, row by row from the top left. The centre is the fifth."""
+    x1, y1, x2, y2 = box
+    return [(x1 + (x2 - x1) * fx // 2, y1 + (y2 - y1) * fy // 2) for fy in (0, 1, 2) for fx in (0, 1, 2)]
+
+
+def spots(name: str, s: Screen, was: dict[str, Box], laid: dict[str, Box], verb: Verb) -> list[Box]:
+    """Where to try a monitor of the screen's new size, the likeliest first.
+
+    A placed monitor has one spot, set by the verb. The edited monitor is tried
+    with each of its anchors where it was, any other monitor where it was, and
+    moved by as much as each monitor already laid out moved. Both are also
+    tried against each laid-out monitor on each side: aligned with that
+    monitor's start, end or middle; at the offset they had from each other;
+    or level with their own old start, end or middle.
+    """
+    w, h = extent(s)
+    x1, y1, x2, y2 = was[name]
+    if isinstance(verb, Place) and name == verb.name:
+        return [against(laid[verb.other], verb.side, verb.align, w, h)]
+    found: list[Box] = []
+    if name == verb.name:
+        for i, (ax, ay) in enumerate(anchors(was[name])):
+            fx, fy = i % 3, i // 3
+            left, top = ax - w * fx // 2, ay - h * fy // 2
+            found.append((left, top, left + w, top + h))
+    else:
+        found.append((x1, y1, x1 + w, y1 + h))
+        for n, box in laid.items():
+            dx, dy = box[0] - was[n][0], box[1] - was[n][1]
+            found.append((x1 + dx, y1 + dy, x1 + dx + w, y1 + dy + h))
+    for n, other in laid.items():
+        for side in ("left-of", "right-of", "above", "below"):
+            across = side in ("left-of", "right-of")
+            axis = 1 if across else 0  # the coordinate the shared edge runs along
+            length = h if across else w
+            mine_was = (was[name][axis], was[name][axis + 2])
+            its_was = (was[n][axis], was[n][axis + 2])
+            its_now = (other[axis], other[axis + 2])
+            aligned = (its_now[0], its_now[1] - length, (its_now[0] + its_now[1] - length) // 2)
+            offset = tuple(now + mine - its for now, mine, its in zip(its_now, mine_was, its_was))
+            as_before = (offset[0], offset[1] - length, (offset[0] + offset[1] - length) // 2)
+            level = (mine_was[0], mine_was[1] - length, (mine_was[0] + mine_was[1] - length) // 2)
+            found += [beside(other, side, w, h, start) for start in aligned + as_before + level]
+    return list(dict.fromkeys(found))
+
+
+def against(other: Box, side: str, align: str, w: int, h: int) -> Box:
+    """A w by h box touching `other` on `side`, aligned along the edge they share."""
+    o1, o2 = (other[1], other[3]) if side in ("left-of", "right-of") else (other[0], other[2])
+    length = h if side in ("left-of", "right-of") else w
+    start = {"top": o1, "left": o1, "bottom": o2 - length, "right": o2 - length, "center": (o1 + o2 - length) // 2}[align]
+    return beside(other, side, w, h, start)
+
+
+def beside(other: Box, side: str, w: int, h: int, start: int) -> Box:
+    """A w by h box touching `other` on `side`, starting at `start` along the edge they share."""
+    ox1, oy1, ox2, oy2 = other
+    if side in ("left-of", "right-of"):
+        x = ox1 - w if side == "left-of" else ox2
+        return x, start, x + w, start + h
+    y = oy1 - h if side == "above" else oy2
+    return start, y, start + w, y + h
+
+
+def edited_cost(was: Box, now: Box) -> tuple[int, int]:
+    """How far the edited monitor went: the least any of its anchors moved, then how far its centre moved."""
+    moves = [abs(p[0] - q[0]) + abs(p[1] - q[1]) for p, q in zip(anchors(was), anchors(now))]
+    return min(moves), moves[4]
+
+
+def sides(a: Box, b: Box) -> frozenset[str]:
+    """Where a lies wholly to one side of b: left, right, above or below. Two of them when a is diagonal to b.
+
+    These are positions, not the sides `place` takes.
+    """
+    return frozenset(
+        side
+        for side, holds in (("left", a[2] <= b[0]), ("right", a[0] >= b[2]), ("above", a[3] <= b[1]), ("below", a[1] >= b[3]))
+        if holds
+    )
+
+
+def kept(before: frozenset[str], after: frozenset[str]) -> bool:
+    """A monitor wholly to one side of another stays there. One diagonal to it keeps at least one of the two sides."""
+    return before <= after if len(before) < 2 else bool(before & after)
+
+
+def overlaps(a: Box, b: Box) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def touching(a: Box, b: Box) -> bool:
+    """Whether two boxes share a stretch of edge, as mutter counts it. A shared corner is not one."""
+    if (a[0] == b[2] or a[2] == b[0]) and a[1] < b[3] and b[1] < a[3]:
+        return True
+    return (a[1] == b[3] or a[3] == b[1]) and a[0] < b[2] and b[0] < a[2]
+
+
+def joined(boxes: list[Box]) -> bool:
+    """Whether every box is reached from the first through boxes that touch."""
+    reached, frontier = {0}, [0]
+    while frontier:
+        i = frontier.pop()
+        for j, b in enumerate(boxes):
+            if j not in reached and touching(boxes[i], b):
+                reached.add(j)
+                frontier.append(j)
+    return len(reached) == len(boxes)
 
 
 def snap(arrangement: Arrangement, moved: str) -> Arrangement:
@@ -888,8 +1194,8 @@ def cells(arrangement: Arrangement, width: int) -> list[list[str | None]]:
     return grid
 
 
-def bounds(s: Screen) -> tuple[int, int, int, int]:
-    """x1, y1, x2, y2 of a screen in logical pixels."""
+def bounds(s: Screen) -> Box:
+    """A screen's box."""
     w, h = logical_size(Monitor(s.name, s.mode).resolution, s.transform, s.scale)
     return s.x, s.y, s.x + w, s.y + h
 
@@ -1382,6 +1688,51 @@ def show(args: ShowArgs) -> None:
         print(json.dumps(report, indent=2))
         return
     print(picture(now, store))
+
+
+@app.command(name="rotate")
+def rotate(verb: Rotate) -> None:
+    """Turn one monitor on screen, and draw the result."""
+    edit_on_screen(verb)
+
+
+@app.command(name="place")
+def place(verb: Place) -> None:
+    """Move one monitor to a side of another on screen, and draw the result."""
+    edit_on_screen(verb)
+
+
+@app.command(name="primary")
+def primary(verb: Primary) -> None:
+    """Make one monitor on screen the primary one, and draw the result."""
+    edit_on_screen(verb)
+
+
+@app.command(name="scale")
+def scale(verb: Scale) -> None:
+    """Rescale one monitor on screen, and draw the result."""
+    edit_on_screen(verb)
+
+
+def edit_on_screen(verb: Verb) -> None:
+    """Apply the edit to the arrangement on screen, for the session, and draw the result."""
+    store = load_store()
+    state = read_state()
+    for lo in state.logicals:
+        if len(lo.connectors) > 1:
+            raise LayoutError(f"{' and '.join(lo.connectors)} mirror each other; rotate, place, primary and scale "
+                              "move monitors shown on their own")
+    lit = {c for lo in state.logicals for c in lo.connectors}
+    shown = [m for m in state.monitors.values() if m.connector in lit]
+    names = known_names(store.aliases, shown)
+    arrangement = live(state, names)
+    for name in mentioned(verb):
+        if name not in {s.name for s in arrangement}:
+            what = f"{name} is not on screen" if name in store.aliases else f"no monitor named {name}"
+            raise LayoutError(f"{what}; on screen: {describe_connected(shown, store)}")
+    binding = {names.get(c, c): c for lo in state.logicals for c in lo.connectors}
+    run(["gdctl", "set", *layout_args(edit(arrangement, verb), binding)])
+    print(picture(on_screen(store), store))
 
 
 @dataclass
