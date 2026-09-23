@@ -18,18 +18,22 @@ the deeper ones it has to walk past. tests/properties/display-layout.test holds
 the properties of matching, editing, drawing and the watcher's choice.
 """
 
+import atexit
 import contextlib
 import importlib.util
 import io
 import json
 import os
 import re
+import select
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import termios
 import threading
+import time
 import tomllib
 from dataclasses import replace
 from importlib.machinery import SourceFileLoader
@@ -264,6 +268,12 @@ try:
 except dl.ParseError:
     check("a monitor without a mode is refused", "ParseError", "ParseError")
 
+try:
+    dl.run(["/nonexistent/gdctl", "show"])
+    check("a command that cannot be run is refused as one that failed", "CommandError", "no error")
+except dl.CommandError:
+    check("a command that cannot be run is refused as one that failed", "CommandError", "CommandError")
+
 # --- named layouts: save, use, list, show and pick
 #
 # Each command runs against gdctl show fixtures, with a layouts file and a
@@ -380,6 +390,7 @@ class Session:
 
     def __init__(self, *shows, lid_closed=False, layouts=None, recent=None, terminal=False, no_color=True, rejects=0):
         self.tmp = Path(tempfile.mkdtemp(prefix="display-layout-test."))
+        atexit.register(shutil.rmtree, self.tmp, ignore_errors=True)
         self.shows, self.terminal, self.no_color, self.rejects = list(shows), terminal, no_color, rejects
         self.lids = list(lid_closed) if isinstance(lid_closed, list) else [lid_closed]
         self.applied, self.calls, self.logs = [], [], []
@@ -535,6 +546,12 @@ check("twins with one serial get an alias each, and saving again reuses both",
       (["arzopa", "arzopa-2", "laptop"], "saved twins"),
       (sorted(tomllib.loads(s.file).get("layouts", {}).get("twins", {})), again.splitlines()[0].rsplit(" in ", 1)[0]))
 
+bare_twins = dl.Store({"left": dl.Model("GWD", "ARZOPA"), "right": dl.Model("GWD", "ARZOPA")},
+                      {"pair": (dl.Screen("left", ARZOPA[5], 0, 0), dl.Screen("right", ARZOPA[5], 2560, 0, primary=True))})
+check("twins without serials take their monitors in connector order, whatever order gdctl lists them in",
+      {"pair": {"left": "DP-1", "right": "DP-2"}},
+      dl.match(bare_twins, [dl.Monitor("DP-2", ARZOPA[5], "GWD", "ARZOPA", "b"), dl.Monitor("DP-1", ARZOPA[5], "GWD", "ARZOPA", "a")]))
+
 for what, show, lid, message in (
     ("a name gdctl's users could not type", DESK, False, "'desk tall': a layout name is letters, digits, - and _"),
     ("a connected monitor that is off", DOCKED, False,
@@ -590,6 +607,22 @@ for what, show, lid, name, message in (
 
 check("a broken layouts file is named in the refusal", True,
       Session(DESK, layouts=DESK_FILE + "[layouts.docked]\n")(dl.use, dl.UseArgs("docked")).startswith("exit: display-layout: /"))
+
+# --- apply
+
+s = Session(ROW, STACKED)
+out = s(dl.apply, dl.ApplyArgs())
+fallback = dl.plan(dl.parse_show(ROW))
+check("apply puts the fallback on screen, never --persistent, and draws what gdctl shows after it",
+      ([groups(fallback)], [],
+       "gdctl set " + " ".join(fallback) + "\n\nnot a saved layout\n\n" + drawing(dl.live(dl.parse_show(STACKED), {})) + "\n"),
+      ([groups(a) for a in s.applied], [a for argv in s.applied for a in argv if a in ("-P", "--persistent")], out))
+s = Session(ROW)
+check("apply --dry-run prints the gdctl command and applies nothing",
+      ("gdctl set " + " ".join(dl.plan(dl.parse_show(ROW))) + "\n", []), (s(dl.apply, dl.ApplyArgs(dry_run=True)), s.applied))
+s = Session(PANEL_ONLY)
+check("apply with nothing to arrange refuses as every command does", ("exit: display-layout: nothing to arrange", []),
+      (s(dl.apply, dl.ApplyArgs()), s.applied))
 
 # --- list
 
@@ -1079,6 +1112,8 @@ check("left and a move 50 px left, with Shift or A 10",
       [(1250, 0), (1250, 0), (1290, 0), (1290, 0)], [hp_at("right", "right", k) for k in ("left", "a", "shift-left", "A")])
 check("moved off the others' edge or into them, it snaps back where it was", (TALL, TALL),
       (pressed(TALL, "left")[0], pressed(TALL, "right")[0]))
+check("by a Shift step too", (TALL, TALL, TALL, TALL),
+      (pressed(TALL, "shift-left")[0], pressed(TALL, "shift-right")[0], pressed(TALL, "A")[0], pressed(TALL, "D")[0]))
 check("Tab selects the next monitor, in the arrangement's order and round, Shift-Tab the one before",
       ("hp", "arzopa", "laptop"),
       (pressed(TALL, "tab")[1], pressed(TALL, "tab", "tab", "tab")[1], pressed(TALL, "shift-tab")[1]))
@@ -1112,8 +1147,9 @@ def turns(transform, way, times):
 check("quarter turns clockwise run 90, 180, 270 and back to normal, counter-clockwise the other way",
       (["90", "180", "270", "normal"], ["270", "180", "90", "normal"]),
       (turns("normal", "clockwise", 4), turns("normal", "counter-clockwise", 4)))
-check("a flipped monitor turns and stays flipped", (["flipped-180"], ["flipped"]),
-      (turns("flipped-90", "clockwise", 1), turns("flipped-270", "clockwise", 1)))
+check("a flipped monitor turns and stays flipped", (["flipped-180"], ["flipped"], ["flipped-90"], ["flipped-270"]),
+      (turns("flipped-90", "clockwise", 1), turns("flipped-270", "clockwise", 1),
+       turns("flipped", "clockwise", 1), turns("flipped", "counter-clockwise", 1)))
 NAMED = {v: k for k, v in dl.ROTATIONS.items()}
 same = []
 for arrangement in (TALL, tower, hp_and_arzopa, pair):
@@ -1143,6 +1179,8 @@ check("Esc on its own is esc, once no sequence follows it", "esc", keyboard.read
 os.write(typing, b"\x1b[")
 threading.Timer(0.01, os.write, (typing, b"A")).start()
 check("a sequence arriving in two parts is still one key", "up", keyboard.read(0.2))
+with mock.patch.dict(os.environ, {"COLUMNS": str(keyboard.size[0] + 1)}):
+    check("a change of the terminal's size is read as resize", "resize", keyboard.read(0.2))
 os.close(typing)
 os.close(reading)
 
@@ -1151,10 +1189,14 @@ before = termios.tcgetattr(side)
 screen = io.StringIO()
 with contextlib.redirect_stdout(screen), dl.Terminal(side):
     during = termios.tcgetattr(side)
+    os.write(main, b"\r")  # an Enter typed while the session ends
+    time.sleep(0.05)
 check("a session reads keys unechoed and unbuffered on the alternate screen, and restores the terminal after",
       (0, 0, True, True, before),
       (during[3] & termios.ECHO, during[3] & termios.ICANON, screen.getvalue().startswith("\x1b[?1049h"),
        screen.getvalue().endswith("\x1b[?1049l"), termios.tcgetattr(side)))
+check("a key typed ahead is dropped with the session, so it cannot answer the name prompt", [],
+      select.select([side], [], [], 0.05)[0])
 os.close(main)
 os.close(side)
 
@@ -1214,6 +1256,16 @@ script = Script(*presses("down"), (1.0, "q"))
 s, _ = editing(script, DESK, rejects=1)
 check("an apply mutter refuses is shown under the drawing, and q tries it again",
       (True, 2), ("not applied: mutter rejected the configuration" in "".join(script.written), len(s.applied)))
+script = Script(*presses("down"), (1.0, "q"), size=(12, 40))
+editing(script, DESK, rejects=1)
+check("a note takes at most three lines under the drawing",
+      ["not applied:", "mutter", "rejected the"], page(script.written[-1])[-3:])
+# The HP moved 50 px right, past the panel's edge, widens the arrangement from
+# 3120 to 3170 px. The cell stays 3120 / 73 px, so the drawing grows to 74 columns.
+script = Script(*presses("tab", "right"), (1.0, "q"))
+editing(script, DESK)
+check("a cell keeps its size as the arrangement grows, so monitors that stay put are drawn the same",
+      (73, 74), tuple(max(len(line) for line in page(w)[2:-2]) for w in (script.written[0], script.written[-1])))
 
 script = Script(*presses("down", "down", "down", "enter"), answers=[""])
 s, out = editing(script, DESK, recent=("desk-top",))
@@ -1301,6 +1353,14 @@ for what, text, message in (
     ("a table it does not know", commented + "[monitors]\n", "unknown table monitors; there are [aliases] and [layouts.<name>]"),
     ("a position that is not a number", commented.replace("x = 0,", "x = true,"), "layout solo, hp: x = True is not int"),
     ("[aliases] that is not a table", 'aliases = "laptop"\n', "aliases is a table: [aliases]"),
+    ("a layout name save would refuse, which the recent record could not hold", commented.replace("solo", '"solo desk"'),
+     "layout 'solo desk': a layout name is letters, digits, - and _"),
+    ("a scale of 0", commented.replace("primary = true", "primary = true, scale = 0"),
+     "layout solo, laptop: scale = 0.0; a scale is a positive number, 1.25 for 125 %"),
+    ("a scale that is not a number", commented.replace("primary = true", "primary = true, scale = nan"),
+     "layout solo, laptop: scale = nan; a scale is a positive number, 1.25 for 125 %"),
+    ("a mode with no pixels", commented.replace("2560x1600@165.040", "0x1600@165.040"),
+     "layout solo, laptop: mode is WIDTHxHEIGHT@RATE as gdctl show prints it, not '0x1600@165.040'"),
 ):
     check(f"the file is refused for {what}", message, refusal(text))
 check("a layout copied without renaming it is refused", True,
@@ -1328,6 +1388,13 @@ check("labels sit inside: alias, ★ on the primary, logical size, ↻ for turne
       ["┃       laptop ★        ┃│   arzopa    │", "┃       1920×1200       ┃│ 1200×1920 ↻ │"], drawn[5:7])
 check("↺ for turned left", True,
       "1200×1920 ↺" in dl.draw((travel[0], replace(travel[1], transform="270")), 40, None))
+check("↻↻ for upside down", True, "1920×1200 ↻↻" in dl.draw((replace(travel[0], transform="180"), travel[1]), 40, None))
+# The panel moved up to y = 330: its edges fall at 330 / 78 = 4.2 and 1530 / 78 = 19.6
+# cells, so rounding gives it cell rows 4 to 19.
+raised_panel = dl.cells((replace(travel[0], y=330), travel[1]), 40)
+check("a drawn edge is the logical edge over the cell size, rounded", (4, 19),
+      (min(r for r, row in enumerate(raised_panel) if "laptop" in row),
+       max(r for r, row in enumerate(raised_panel) if "laptop" in row)))
 
 
 def styled(line):
@@ -1357,10 +1424,16 @@ check("each alias its own earth colour, the next spare for one the palette lacks
 check("blocks fill each monitor in its colour", (sage, slate, spare),
       (lines[5][10][1], lines[8][30][1], lines[16][10][1]))
 check("a blank column between neighbours", (" ", sage), (lines[5][24][2], lines[5][23][1]))
+check("and a blank half row between stacked ones: the panel's last cells are blank above the dell",
+      ((sage, None, "▀"), (spare, spare)), (lines[9][10], lines[10][10][:2]))
 text = ["".join(c for _, _, c in line) for line in lines]
 row = next((r for r, t in enumerate(text) if "laptop ★" in t), None)
 check("labels in sand on their monitor's fill", (dl.SAND, sage),
       lines[row][text[row].index("laptop")][:2] if row is not None else None)
+
+five = dl.palette(["laptop", "hp", "arzopa", "a", "b", "c", "d", "e"])
+check("once the spares run out, a monitor takes an earth colour no alias here uses", dl.EARTH["lg"], five["e"])
+
 
 def mossy(lines):
     """(text row, column) of each character with MOSS in it."""
@@ -1392,6 +1465,7 @@ tall = (dl.Screen("arzopa", ARZOPA[5], 0, 0, 1.0, "90"), dl.Screen("laptop", LAP
 check("a tall arrangement stays within MAX_ROWS in a wide terminal", True,
       len(dl.draw(tall, dl.fit_width(tall, 200), None).splitlines()) <= dl.MAX_ROWS)
 check("a wide one within MAX_COLUMNS", dl.MAX_COLUMNS, dl.fit_width((dl.Screen("hp", HP[5], 0, 0, primary=True),), 200))
+check("however little room there is, a drawing is 8 columns wide", 8, dl.fit(tall, 40, 1))
 
 # --- the watcher
 #
