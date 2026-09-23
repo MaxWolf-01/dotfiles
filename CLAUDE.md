@@ -153,6 +153,14 @@ and its watcher service (`vpn watch`) re-checks; rationale in `vpn --help`.
 The watcher also publishes the exit node's state, shown as a dot in the top bar
 by the GNOME extension in `desktop/vpn-dot`.
 
+## Discrete GPU
+
+On the Ubuntu laptop the NVIDIA driver powers the idle dGPU down to D3cold,
+and `bin/dgpu` locks its device files on battery so nothing wakes it. Never
+reach for the ASUS firmware switch (`dgpu_disable`) or supergfxctl: the BIOS
+method behind them hangs on this machine. What wakes the card, who holds it,
+and the kernel-upgrade trap: `docs/dgpu.md`.
+
 ## Monitoring
 
 Scheduled jobs record every run in `~/logs/runs/<unit>.jsonl` (`bin/run-log`)
