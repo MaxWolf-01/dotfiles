@@ -1,0 +1,837 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Check the properties of bin/display-layout's named layouts. Run it directly; no framework.
+
+P1 to P6 are the properties of agent/tickets/display-layouts/spec.md in the
+private secrets repo. P3 is checked by review, not here.
+
+Each property feeds in gdctl show output and saved layouts, the way
+tests/display-layout.test does, and checks what comes out. That is the layouts
+matched, the arrangement after an edit or a key press, the drawn cells or the
+watcher's decision. Nothing here touches the display. Arrangements, key presses
+and edits are generated from a seeded random source, so a failure reproduces
+with the seed it prints.
+
+A property whose code has not landed yet is an expected failure, marked with the
+ticket that lifts it. It stays green while the code under it raises the
+NotImplementedError of that ticket's stub, or of a stub it waits on. Once the
+code works and the expected-failure mark is still on, it turns red.
+
+--verify generates a session of key presses and edits on the live arrangement,
+and hands every arrangement it reaches to `gdctl set --verify`. That is
+mutter's own check, and it applies nothing. It needs a GNOME session, so it
+runs by hand.
+
+Examples:
+
+    tests/properties/display-layout.test
+    tests/properties/display-layout.test --seed 7 --examples 2000
+    tests/properties/display-layout.test --verify
+"""
+
+import importlib.util
+import math
+import random
+import sys
+import traceback
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, replace
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+import tyro
+
+
+def load(name: str, path: Path):
+    loader = SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    assert spec
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+dl = load("display_layout", Path(__file__).resolve().parents[2] / "bin" / "display-layout")
+
+
+@dataclass
+class Args:
+    seed: int = 0
+    """Seed for the generated arrangements, edits and key presses."""
+    examples: int = 300
+    """Generated cases per property."""
+    verify: bool = False
+    """Hand a generated session on the live arrangement to `gdctl set --verify` instead of running the properties."""
+    steps: int = 40
+    """Key presses and edits in the --verify session."""
+
+
+# --- the monitors
+
+
+@dataclass(frozen=True)
+class Kind:
+    alias: str
+    vendor: str
+    product: str
+    serial: str
+    mode: str
+    scale: float
+    scales: tuple[float, ...]
+    """Scales mutter supports for the mode, up to 2."""
+    label: str
+    """What gdctl prints beside the connector."""
+
+    @property
+    def model(self):
+        return dl.Model(self.vendor, self.product)
+
+
+# mutter's own spelling of 4/3 and 5/3, as gdctl prints them.
+FOUR_THIRDS = 1.3333333730697632
+FIVE_THIRDS = 1.6666666269302368
+PANEL_SCALES = (1.0, 1.25, FOUR_THIRDS, FIVE_THIRDS, 2.0)
+FHD_SCALES = (1.0, 1.25, FOUR_THIRDS, 1.5, FIVE_THIRDS, 2.0)
+
+# Vendors, products and modes are those in zephylux's ~/.config/monitors.xml,
+# and scales those gdctl show --verbose lists there. The LG's and ASUS's scales
+# are the ones that give a whole-pixel size, which is what mutter offers. The
+# serials are made up. The last two kinds exist so that sharing a vendor, or
+# sharing a product, is never enough to match.
+LAPTOP = Kind("laptop", "AUO", "0xc199", "0x00000000", "2560x1600@165.040", FOUR_THIRDS, PANEL_SCALES, "Built-in display")
+ARZOPA = Kind("arzopa", "GWD", "ARZOPA", "0x0000a001", "2560x1600@59.997", FOUR_THIRDS, PANEL_SCALES, 'GWD 16"')
+HP = Kind("hp", "HPN", "HP M27fwa FHD", "HP0000001", "1920x1080@60.000", 1.0, FHD_SCALES, 'HP Inc. 27"')
+LG = Kind("lg", "GSM", "LG ULTRAWIDE", "LG0000001", "3440x1440@99.997", 1.0, (1.0, 1.25, FOUR_THIRDS, FIVE_THIRDS, 2.0), 'LG Electronics 34"')
+ASUS = Kind("asus", "AUS", "ASUS VP28U", "0x00039bf2", "3840x2160@60.000", 1.5, FHD_SCALES, 'ASUSTek COMPUTER INC 28"')
+OTHER_HP = Kind("hp-24", "HPN", "HP E24 G5", "HP0000002", "1920x1080@60.000", 1.0, FHD_SCALES, 'HP Inc. 24"')
+LOOKALIKE = Kind("lookalike", "XYZ", "ARZOPA", "0x0000b001", "1920x1200@60.000", 1.0, FHD_SCALES, 'XYZ 16"')
+KINDS = (LAPTOP, ARZOPA, HP, LG, ASUS, OTHER_HP, LOOKALIKE)
+KIND_OF = {k.alias: k for k in KINDS}
+EXTERNAL_PORTS = ("DP-1", "DP-2", "HDMI-1", "DP-3", "DP-4", "DP-5")
+AT_ONCE = 3
+"""The most monitors ever connected together, the panel and two externals."""
+
+
+def show_text(entries: list[tuple[str, Kind, "dl.Screen"]]) -> str:
+    """gdctl show output for these monitors, each on its connector and in its place."""
+    lines = ["Monitors:"]
+    for i, (connector, kind, _) in enumerate(entries):
+        head, pad = ("└──", "   ") if i == len(entries) - 1 else ("├──", "│  ")
+        lines += [
+            f"{head}Monitor {connector} ({kind.label})",
+            f"{pad}├──Vendor: {kind.vendor}",
+            f"{pad}├──Product: {kind.product}",
+            f"{pad}├──Serial: {kind.serial}",
+            f"{pad}└──Current mode",
+            f"{pad}    └──{kind.mode}",
+        ]
+    lines += ["", "Logical monitors:"]
+    for i, (connector, kind, s) in enumerate(entries):
+        head, pad = ("└──", "   ") if i == len(entries) - 1 else ("├──", "│  ")
+        lines += [
+            f"{head}Logical monitor #{i + 1}",
+            f"{pad}├──Position: ({s.x}, {s.y})",
+            f"{pad}├──Scale: {s.scale!r}",
+            f"{pad}├──Transform: {s.transform}",
+            f"{pad}├──Primary: {'yes' if s.primary else 'no'}",
+            f"{pad}└──Monitors: (1)",
+            f"{pad}    └──{connector} ({kind.label})",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+# --- geometry, worked out here rather than borrowed from the tool
+
+TURNED = {"90", "270", "flipped-90", "flipped-270"}
+
+
+def rect(s) -> tuple[int, int, int, int]:
+    """x1, y1, x2, y2 in logical pixels."""
+    w, h = (int(n) for n in s.mode.split("@")[0].split("x"))
+    if s.transform in TURNED:
+        w, h = h, w
+    w, h = round(w / s.scale), round(h / s.scale)
+    return s.x, s.y, s.x + w, s.y + h
+
+
+def size(s) -> tuple[int, int]:
+    x1, y1, x2, y2 = rect(s)
+    return x2 - x1, y2 - y1
+
+
+def overlap(a, b) -> bool:
+    ax1, ay1, ax2, ay2 = rect(a)
+    bx1, by1, bx2, by2 = rect(b)
+    return ax1 < bx2 and bx1 < ax2 and ay1 < by2 and by1 < ay2
+
+
+def adjacent(a, b) -> bool:
+    """mtk_rectangle_is_adjacent_to. A shared stretch of edge counts, a shared corner does not."""
+    ax1, ay1, ax2, ay2 = rect(a)
+    bx1, by1, bx2, by2 = rect(b)
+    if (ax1 == bx2 or ax2 == bx1) and not (ay2 <= by1 or ay1 >= by2):
+        return True
+    return (ay1 == by2 or ay2 == by1) and not (ax2 <= bx1 or ax1 >= bx2)
+
+
+def mutter_rejects(arrangement) -> str:
+    """Why meta_verify_logical_monitor_config_list would refuse it, or "" when it would not."""
+    screens = list(arrangement)
+    for i, a in enumerate(screens):
+        for b in screens[i + 1 :]:
+            if overlap(a, b):
+                return f"{a.name} and {b.name} overlap"
+    reached, frontier = {screens[0].name}, [screens[0]]
+    while frontier:
+        a = frontier.pop()
+        for b in screens:
+            if b.name not in reached and adjacent(a, b):
+                reached.add(b.name)
+                frontier.append(b)
+    if len(reached) != len(screens):
+        return f"not adjacent, {sorted(reached)} apart from the rest"
+    if min(s.x for s in screens) != 0 or min(s.y for s in screens) != 0:
+        return "positions are offset from (0, 0)"
+    if sum(s.primary for s in screens) != 1:
+        return "not exactly one primary"
+    return ""
+
+
+def sides(a, b) -> set[str]:
+    """Where a lies wholly to one side of b. Two sides at once when a is diagonal to b."""
+    ax1, ay1, ax2, ay2 = rect(a)
+    bx1, by1, bx2, by2 = rect(b)
+    return {
+        side
+        for side, holds in (
+            ("left", ax2 <= bx1),
+            ("right", ax1 >= bx2),
+            ("above", ay2 <= by1),
+            ("below", ay1 >= by2),
+        )
+        if holds
+    }
+
+
+def at_origin(arrangement):
+    x0, y0 = min(s.x for s in arrangement), min(s.y for s in arrangement)
+    return tuple(replace(s, x=s.x - x0, y=s.y - y0) for s in arrangement)
+
+
+def brief(arrangement) -> str:
+    return "  ".join(
+        f"{s.name}{'★' if s.primary else ''} {s.transform} x{s.scale:g} at ({s.x},{s.y})"
+        for s in arrangement
+    )
+
+
+# --- generators. Whole, valid arrangements, grown one monitor at a time against those placed
+
+
+def arrangement(rng: random.Random, kinds: list[Kind]):
+    """Every monitor touching another, none overlapping, starting at (0, 0), one primary."""
+    screens: list = []
+    for kind in kinds:
+        base = dl.Screen(kind.alias, kind.mode, 0, 0, kind.scale, rng.choice(["normal", "normal", "90", "270", "180"]))
+        w, h = size(base)
+        for _ in range(200):
+            if not screens:
+                placed = base
+                break
+            ax1, ay1, ax2, ay2 = rect(rng.choice(screens))
+            side = rng.choice("LRAB")
+            if side in "LR":
+                x = ax1 - w if side == "L" else ax2
+                y = rng.choice([ay1, ay2 - h, (ay1 + ay2 - h) // 2, rng.randint(ay1 - h + 1, ay2 - 1)])
+            else:
+                y = ay1 - h if side == "A" else ay2
+                x = rng.choice([ax1, ax2 - w, (ax1 + ax2 - w) // 2, rng.randint(ax1 - w + 1, ax2 - 1)])
+            placed = replace(base, x=x, y=y)
+            if not any(overlap(placed, s) for s in screens):
+                break
+        else:
+            raise RuntimeError(f"generator found no place for {kind.alias} beside {brief(screens)}")
+        screens.append(placed)
+    primary = rng.randrange(len(screens))
+    return at_origin([replace(s, primary=i == primary) for i, s in enumerate(screens)])
+
+
+def side_by_side(kinds: list[Kind]):
+    """Untransformed, left to right along y=0, the first one primary."""
+    screens, x = [], 0
+    for kind in kinds:
+        s = dl.Screen(kind.alias, kind.mode, x, 0, kind.scale, primary=kind is kinds[0])
+        screens.append(s)
+        x = rect(s)[2]
+    return tuple(screens)
+
+
+def some(rng: random.Random, pool=KINDS, low: int = 1, high: int | None = None) -> list[Kind]:
+    return rng.sample(pool, rng.randint(low, min(high or len(pool), len(pool))))
+
+
+def on_ports(rng: random.Random, kinds: list[Kind]) -> dict[str, str]:
+    """A connector for each alias. The panel is on eDP-1, externals anywhere else."""
+    ports = rng.sample(EXTERNAL_PORTS, len(EXTERNAL_PORTS))
+    return {k.alias: "eDP-1" if k is LAPTOP else ports.pop() for k in kinds}
+
+
+def connected(kinds: list[Kind], ports: dict[str, str], arr, rng: random.Random | None = None):
+    """Parsed gdctl show output for these monitors, in gdctl's order (shuffled when rng is given)."""
+    entries = [(ports[s.name], KIND_OF[s.name], s) for s in arr]
+    if rng:
+        rng.shuffle(entries)
+    return dl.parse_show(show_text(entries))
+
+
+def store_for(kinds: list[Kind], layouts: dict):
+    return dl.Store(aliases={k.alias: k.model for k in kinds}, layouts=layouts)
+
+
+# --- the harness
+
+
+class Counterexample(AssertionError):
+    pass
+
+
+def expect(holds: bool, what: str) -> None:
+    if not holds:
+        raise Counterexample(what)
+
+
+@dataclass
+class Property:
+    id: str
+    says: str
+    check: Callable[[random.Random, int], None]
+    lifted_by: str | None
+    """The ticket whose stub the check is waiting on."""
+    waits_on: tuple[str, ...]
+    """Tickets whose stubs the check reaches on its way, landing before lifted_by."""
+
+
+PROPERTIES: list[Property] = []
+
+
+def prop(id: str, says: str, lifted_by: str | None = None, waits_on: tuple[str, ...] = ()):
+    def register(check):
+        PROPERTIES.append(Property(id, says, check, lifted_by, waits_on))
+        return check
+
+    return register
+
+
+def run_properties(args: Args) -> int:
+    failures = 0
+    for p in PROPERTIES:
+        rng = random.Random(f"{args.seed}/{p.id}")
+        try:
+            p.check(rng, args.examples)
+        except NotImplementedError as exc:
+            awaited = [t for t in (p.lifted_by, *p.waits_on) if t and str(exc) == dl.UNBUILT.format(t)]
+            if awaited:
+                print(f"xfail {p.id} {p.says}  [lifted by {dl.UNBUILT.format(p.lifted_by)}]")
+                continue
+            failures += 1
+            print(f"FAIL  {p.id} {p.says}\n      not implemented, and not a stub this property waits on: {exc}")
+            continue
+        except Counterexample as exc:
+            failures += 1
+            print(f"FAIL  {p.id} {p.says}  (--seed {args.seed})\n      {exc}")
+            continue
+        except Exception:
+            failures += 1
+            print(f"FAIL  {p.id} {p.says}  (--seed {args.seed})")
+            print("      " + traceback.format_exc().replace("\n", "\n      "))
+            continue
+        if p.lifted_by:
+            failures += 1
+            print(f"FAIL  {p.id} {p.says}\n      holds now, so take off its expected-failure mark for {p.lifted_by}")
+        else:
+            print(f"ok    {p.id} {p.says}")
+    print()
+    print("FAILED" if failures else "all ok")
+    return 1 if failures else 0
+
+
+# --- P1 matching by vendor and model, never by connector
+
+
+def worked_store():
+    """Layouts as they sit on the desks, from zephylux's monitors.xml and a live gdctl show."""
+    s = dl.Screen
+    return store_for(
+        [LAPTOP, ARZOPA, HP, LG],
+        {
+            "desk-wide": (
+                s("arzopa", ARZOPA.mode, 0, 623, FOUR_THIRDS),
+                s("hp", HP.mode, 1920, 0),
+                s("laptop", LAPTOP.mode, 1920, 1080, FOUR_THIRDS, primary=True),
+            ),
+            "desk-tall": (
+                s("arzopa", ARZOPA.mode, 0, 180, FOUR_THIRDS, "90"),
+                s("hp", HP.mode, 1200, 0),
+                s("laptop", LAPTOP.mode, 1200, 1080, FOUR_THIRDS, primary=True),
+            ),
+            "lg": (
+                s("lg", LG.mode, 0, 0),
+                s("laptop", LAPTOP.mode, 759, 1440, FOUR_THIRDS, primary=True),
+            ),
+            "travel": (
+                s("arzopa", ARZOPA.mode, 0, 168, FOUR_THIRDS),
+                s("laptop", LAPTOP.mode, 1920, 0, FOUR_THIRDS, primary=True),
+            ),
+        },
+    )
+
+
+def plugged(*pairs: tuple[Kind, str]) -> list:
+    """Monitors as gdctl show lists them, each kind on the given connector."""
+    arr = side_by_side([kind for kind, _ in pairs])
+    entries = [(port, kind, s) for (kind, port), s in zip(pairs, arr)]
+    return list(dl.parse_show(show_text(entries)).monitors.values())
+
+
+@prop("P1", "a layout matches by vendor and model, never by connector", lifted_by="02-save-use-show")
+def p1(rng: random.Random, examples: int) -> None:
+    store = worked_store()
+    desk = lambda arzopa: {"laptop": "eDP-1", "hp": "HDMI-1", "arzopa": arzopa}  # noqa: E731
+    worked = [
+        ("the desk, ARZOPA on DP-1", [(LAPTOP, "eDP-1"), (HP, "HDMI-1"), (ARZOPA, "DP-1")],
+         {"desk-wide": desk("DP-1"), "desk-tall": desk("DP-1")}),
+        ("the desk, ARZOPA moved to DP-2", [(LAPTOP, "eDP-1"), (ARZOPA, "DP-2"), (HP, "HDMI-1")],
+         {"desk-wide": desk("DP-2"), "desk-tall": desk("DP-2")}),
+        ("the LG on HDMI-1", [(LG, "HDMI-1"), (LAPTOP, "eDP-1")],
+         {"lg": {"lg": "HDMI-1", "laptop": "eDP-1"}}),
+        ("the LG on DP-1", [(LAPTOP, "eDP-1"), (LG, "DP-1")],
+         {"lg": {"lg": "DP-1", "laptop": "eDP-1"}}),
+        ("on the road, ARZOPA on DP-1", [(LAPTOP, "eDP-1"), (ARZOPA, "DP-1")],
+         {"travel": {"arzopa": "DP-1", "laptop": "eDP-1"}}),
+        ("on the road, ARZOPA on DP-2", [(ARZOPA, "DP-2"), (LAPTOP, "eDP-1")],
+         {"travel": {"arzopa": "DP-2", "laptop": "eDP-1"}}),
+        ("the ASUS, which has no alias", [(LAPTOP, "eDP-1"), (ASUS, "DP-1")], {}),
+        ("the panel alone, which no layout is for", [(LAPTOP, "eDP-1")], {}),
+        ("the desk plus the ASUS, a set no layout is for",
+         [(LAPTOP, "eDP-1"), (HP, "HDMI-1"), (ARZOPA, "DP-2"), (ASUS, "DP-1")], {}),
+        ("another HP model in the HP's place", [(LAPTOP, "eDP-1"), (OTHER_HP, "HDMI-1"), (ARZOPA, "DP-1")], {}),
+        ("another vendor's ARZOPA", [(LAPTOP, "eDP-1"), (LOOKALIKE, "DP-1")], {}),
+    ]
+    for what, pairs, expected in worked:
+        got = dl.match(store, plugged(*pairs))
+        expect(got == expected, f"{what}, expected {expected}, got {got}")
+
+    # Two identical monitors, told apart by serial while both are connected.
+    other_arzopa = replace(ARZOPA, serial="0x0000a002")
+    twins = dl.Store(
+        aliases={
+            "laptop": LAPTOP.model,
+            "arzopa-left": dl.Model(ARZOPA.vendor, ARZOPA.product, ARZOPA.serial),
+            "arzopa-right": dl.Model(ARZOPA.vendor, ARZOPA.product, other_arzopa.serial),
+        },
+        layouts={
+            "twins": (
+                dl.Screen("arzopa-left", ARZOPA.mode, 0, 0, FOUR_THIRDS),
+                dl.Screen("laptop", LAPTOP.mode, 1920, 0, FOUR_THIRDS, primary=True),
+                dl.Screen("arzopa-right", ARZOPA.mode, 3840, 0, FOUR_THIRDS),
+            ),
+            "one-arzopa": (
+                dl.Screen("arzopa-left", ARZOPA.mode, 0, 0, FOUR_THIRDS),
+                dl.Screen("laptop", LAPTOP.mode, 1920, 0, FOUR_THIRDS, primary=True),
+            ),
+        },
+    )
+    for left_port, right_port in (("DP-1", "DP-2"), ("DP-2", "DP-1")):
+        pairs = [(LAPTOP, "eDP-1"), (ARZOPA, left_port), (other_arzopa, right_port)]
+        want = {"twins": {"laptop": "eDP-1", "arzopa-left": left_port, "arzopa-right": right_port}}
+        for listed in (pairs, pairs[::-1]):
+            got = dl.match(twins, plugged(*listed))
+            expect(got == want, f"twin ARZOPAs, the left one on {left_port}, listed as "
+                                f"{[p for _, p in listed]}, expected {want}, got {got}")
+    # With one of them connected, its serial is not consulted.
+    got = dl.match(twins, plugged((LAPTOP, "eDP-1"), (other_arzopa, "DP-2")))
+    want = {"one-arzopa": {"arzopa-left": "DP-2", "laptop": "eDP-1"}}
+    expect(got == want, f"one ARZOPA, not the one the alias has the serial of, expected {want}, got {got}")
+
+    # Generated. Aliases for some monitors, layouts over some of those, and any
+    # set connected on any ports. A layout fits exactly when its monitors are the
+    # connected ones, and each alias is bound to wherever its monitor is.
+    for _ in range(examples):
+        aliased = some(rng)
+        layouts = {f"layout-{i}": arrangement(rng, some(rng, aliased)) for i in range(rng.randint(1, 5))}
+        store = store_for(aliased, layouts)
+        kinds = some(rng)
+        ports = on_ports(rng, kinds)
+        state = connected(kinds, ports, arrangement(rng, kinds), rng)
+        expected = {
+            name: {s.name: ports[s.name] for s in arr}
+            for name, arr in layouts.items()
+            if {s.name for s in arr} == {k.alias for k in kinds}
+        }
+        got = dl.match(store, list(state.monitors.values()))
+        expect(got == expected, f"connected {ports}, layouts {sorted(layouts)}, expected {expected}, got {got}")
+
+
+# --- P2 an edit changes only what it names
+
+PORTRAIT = {"left": "270", "right": "90", "normal": "normal"}
+"""gdctl's transform for each Rotate target. GNOME Settings shows 90 as Portrait Right and 270 as Portrait Left."""
+
+
+def random_verb(rng: random.Random, arr, kind: str, scales: dict[str, tuple[float, ...]]):
+    name = rng.choice(arr).name
+    if kind == "rotate":
+        return dl.Rotate(name, rng.choice(["left", "right", "normal"]))
+    if kind == "place":
+        other = rng.choice([s.name for s in arr if s.name != name])
+        return dl.Place(name, rng.choice(["left-of", "right-of", "above", "below"]), other)
+    if kind == "primary":
+        return dl.Primary(name)
+    return dl.Scale(name, rng.choice(scales[name]))
+
+
+def kept(before: set[str], after: set[str]) -> bool:
+    """A monitor wholly to one side of another stays there. One diagonal to it keeps at least one of the two sides."""
+    return before <= after if len(before) < 2 else bool(before & after)
+
+
+def check_edit(before, verb, after) -> None:
+    said = f"{verb} on {brief(before)} gave {brief(after)}"
+    old = {s.name: s for s in before}
+    new = {s.name: s for s in after}
+    expect(sorted(new) == sorted(old) and len(after) == len(before), f"the monitors changed, {said}")
+
+    for name, o in old.items():
+        want = {"mode": o.mode, "scale": o.scale, "transform": o.transform, "primary": o.primary}
+        if isinstance(verb, dl.Primary):
+            want["primary"] = name == verb.name
+        elif name == verb.name and isinstance(verb, dl.Scale):
+            want["scale"] = verb.factor
+        elif name == verb.name and isinstance(verb, dl.Rotate):
+            want["transform"] = PORTRAIT[verb.to]
+        got = {field: getattr(new[name], field) for field in want}
+        expect(got == want, f"{name} should be {want}, is {got}, {said}")
+
+    reason = mutter_rejects(after)
+    expect(not reason, f"mutter would refuse it ({reason}), {said}")
+
+    if isinstance(verb, dl.Primary) or (
+        not isinstance(verb, dl.Place) and all(size(old[n]) == size(new[n]) for n in old)
+    ):
+        moved = sorted(n for n in old if (new[n].x, new[n].y) != (old[n].x, old[n].y))
+        expect(not moved, f"no monitor changed size, yet {moved} moved, {said}")
+        return
+
+    if isinstance(verb, dl.Place):
+        tx1, ty1, tx2, ty2 = rect(new[verb.name])
+        ox1, oy1, ox2, oy2 = rect(new[verb.other])
+        touches = {
+            "left-of": tx2 == ox1 and ty1 < oy2 and oy1 < ty2,
+            "right-of": tx1 == ox2 and ty1 < oy2 and oy1 < ty2,
+            "above": ty2 == oy1 and tx1 < ox2 and ox1 < tx2,
+            "below": ty1 == oy2 and tx1 < ox2 and ox1 < tx2,
+        }[verb.side]
+        expect(touches, f"{verb.name} is not {verb.side} {verb.other} and touching it, {said}")
+
+    # A monitor that changed size may push the others along. Nothing crosses to
+    # another side of a monitor it was wholly beside, apart from the one a
+    # Place moves on purpose.
+    judged = [n for n in old if not (isinstance(verb, dl.Place) and n == verb.name)]
+    for a in judged:
+        for b in judged:
+            if a != b and not kept(sides(old[a], old[b]), sides(new[a], new[b])):
+                expect(False, f"{a} was {sides(old[a], old[b])} of {b}, is {sides(new[a], new[b])}, {said}")
+
+
+@prop("P2", "an edit changes exactly the attribute it names", lifted_by="04-edit-verbs")
+def p2(rng: random.Random, examples: int) -> None:
+    scales = {k.alias: k.scales for k in KINDS}
+
+    # The ARZOPA diagonal to the HP, the laptop between them. Placing the laptop
+    # beside the HP leaves the ARZOPA touching nothing unless it moves.
+    corner = (
+        dl.Screen("arzopa", ARZOPA.mode, 0, 0, FOUR_THIRDS),
+        dl.Screen("laptop", LAPTOP.mode, 1920, 0, FOUR_THIRDS, primary=True),
+        dl.Screen("hp", HP.mode, 1920, 1200),
+    )
+    for side in ("right-of", "below", "left-of"):
+        verb = dl.Place("laptop", side, "hp")
+        check_edit(corner, verb, dl.edit(corner, verb))
+
+    kinds = ["rotate", "place", "primary", "scale"]
+    for i in range(examples):
+        before = arrangement(rng, some(rng, low=2, high=AT_ONCE))
+        verb = random_verb(rng, before, kinds[i % len(kinds)], scales)
+        check_edit(before, verb, dl.edit(before, verb))
+
+
+# --- P4 the watcher leaves a session's arrangement alone, and applies the last-used layout on a set change
+
+
+def mutter_row(kinds: list[Kind], ports: dict[str, str], rng: random.Random):
+    """What mutter falls back to. The monitors run left to right along y=0, in gdctl's order."""
+    return connected(kinds, ports, side_by_side(rng.sample(kinds, len(kinds))))
+
+
+def fits(layouts: dict, kinds: list[Kind]) -> list[str]:
+    return [n for n, arr in layouts.items() if {s.name for s in arr} == {k.alias for k in kinds}]
+
+
+def same_order(state, kinds: list[Kind], ports: dict[str, str], arr):
+    """The monitors in the order gdctl lists them now, rearranged to arr."""
+    by_alias = {s.name: s for s in arr}
+    by_port = {p: a for a, p in ports.items()}
+    return connected(kinds, ports, tuple(by_alias[by_port[c]] for c in state.monitors))
+
+
+def from_argv(argv, ports: dict[str, str]):
+    """The arrangement gdctl set arguments put on screen, each monitor named by its alias."""
+    by_port = {p: a for a, p in ports.items()}
+    groups: list[list[str]] = []
+    for arg in argv:
+        if arg == "--logical-monitor":
+            groups.append([])
+        else:
+            groups[-1].append(arg)
+    value = lambda g, flag: g[g.index(flag) + 1]  # noqa: E731
+    return {
+        dl.Screen(
+            by_port[value(g, "--monitor")], value(g, "--mode"), int(value(g, "--x")), int(value(g, "--y")),
+            float(value(g, "--scale")), value(g, "--transform"), "--primary" in g,
+        )
+        for g in groups
+    }
+
+
+@prop("P4", "the watcher acts only on a change of the connected set, with the layout last used for it",
+      lifted_by="06-watcher-last-used")
+def p4(rng: random.Random, examples: int) -> None:
+    aliased = [LAPTOP, ARZOPA, HP, LG]
+    for _ in range(max(1, examples // 10)):
+        layouts = {
+            f"layout-{i}": arrangement(rng, [LAPTOP] + some(rng, aliased[1:], low=0, high=AT_ONCE - 1))
+            for i in range(rng.randint(2, 8))
+        }
+        store = store_for(aliased, layouts)
+        recent = rng.sample(list(layouts), rng.randint(0, len(layouts)))  # used before this session
+        settled = seen = None
+        kinds = [LAPTOP]
+        ports = on_ports(rng, kinds)
+        state = mutter_row(kinds, ports, rng)
+        story = [f"startup {sorted(ports.items())}"]
+
+        for step in range(12):
+            if step:
+                event = rng.choice(["plug", "plug", "arrange", "use", "nothing"])
+                if event == "plug":
+                    kinds = [LAPTOP] + some(rng, KINDS[1:], low=0, high=AT_ONCE - 1)
+                    ports = on_ports(rng, kinds)
+                    if rng.random() < 0.6:
+                        state = mutter_row(kinds, ports, rng)
+                    else:
+                        state = connected(kinds, ports, arrangement(rng, kinds), rng)
+                elif event == "arrange":
+                    state = same_order(state, kinds, ports, arrangement(rng, kinds))
+                elif event == "use" and fits(layouts, kinds):
+                    name = rng.choice(fits(layouts, kinds))
+                    recent = [name] + [n for n in recent if n != name]
+                    state = same_order(state, kinds, ports, layouts[name])
+                else:
+                    event = "nothing"
+                story.append(f"{event} {sorted(ports.items())}")
+            said = f"after {', then '.join(story)}, with recent {recent}"
+
+            decision = dl.decide(settled, state, store, recent)
+            applied = decision.apply
+            if applied:
+                expect(not {"--persistent", "-P"} & set(applied.argv), f"--persistent passed, {said}")
+            now = frozenset((c, m.vendor, m.product) for c, m in state.monitors.items())
+            changed, seen = now != seen, now
+            plan = dl.plan(state) if dl.is_mutter_row(state) else []
+            fallback = dl.Fallback(tuple(plan)) if plan else None
+
+            if not changed:
+                expect(applied is None, f"the set did not change, yet it applied {applied}, {said}")
+            else:
+                fitting = fits(layouts, kinds)
+                last = next((n for n in recent if n in fitting), None)
+                if last:
+                    expect(isinstance(applied, dl.Recall) and applied.layout == last,
+                           f"expected the last-used {last}, got {applied}, {said}")
+                elif not fitting:
+                    expect(applied == fallback, f"no layout fits, expected {fallback}, got {applied}, {said}")
+                else:
+                    # Saved layouts fit and none has been used yet. The fallback or one of them.
+                    expect(applied == fallback or (isinstance(applied, dl.Recall) and applied.layout in fitting),
+                           f"expected {fallback} or one of {fitting}, got {applied}, {said}")
+            if isinstance(applied, dl.Recall):
+                got = from_argv(applied.argv, ports)
+                expect(got == set(layouts[applied.layout]),
+                       f"{applied.layout} applied as {brief(got)}, saved as {brief(layouts[applied.layout])}, {said}")
+                state = same_order(state, kinds, ports, layouts[applied.layout])
+            elif applied:
+                state = same_order(state, kinds, ports, tuple(from_argv(applied.argv, ports)))
+            settled = decision.settled
+
+
+# --- P5 a drawn layout is to scale
+
+
+@prop("P5", "a drawn layout is to scale, every edge within half a cell", lifted_by="02-save-use-show")
+def p5(rng: random.Random, examples: int) -> None:
+    for _ in range(examples):
+        arr = arrangement(rng, some(rng, high=AT_ONCE + 1))
+        if rng.random() < 0.5:  # a layout hand-edited in the file need not start at the origin
+            dx, dy = rng.randint(-3000, 3000), rng.randint(-3000, 3000)
+            arr = tuple(replace(s, x=s.x + dx, y=s.y + dy) for s in arr)
+        width = rng.randint(20, 160)
+        grid = dl.cells(arr, width)
+        said = f"{brief(arr)} at width {width}"
+
+        x0, y0 = min(rect(s)[0] for s in arr), min(rect(s)[1] for s in arr)
+        x1, y1 = max(rect(s)[2] for s in arr), max(rect(s)[3] for s in arr)
+        cell = (x1 - x0) / width  # square, as wide as a column and half a row tall
+        half = cell / 2
+        expect(all(len(row) == width for row in grid), f"rows are not {width} cells wide, {said}")
+        expect(abs(len(grid) - (y1 - y0) / cell) <= 1,
+               f"{len(grid)} rows of cells for {(y1 - y0) / cell:.1f} cells of height, {said}")
+
+        rects = {s.name: rect(s) for s in arr}
+        owned = {s.name: 0 for s in arr}
+        for r, row in enumerate(grid):
+            cy = y0 + (r + 0.5) * cell
+            for c, owner in enumerate(row):
+                cx = x0 + (c + 0.5) * cell
+                if owner is not None:
+                    expect(owner in rects, f"cell ({c}, {r}) belongs to {owner!r}, which is not in the layout, {said}")
+                    sx1, sy1, sx2, sy2 = rects[owner]
+                    expect(sx1 - half <= cx <= sx2 + half and sy1 - half <= cy <= sy2 + half,
+                           f"cell ({c}, {r}) is drawn as {owner}, more than half a cell outside it, {said}")
+                    owned[owner] += 1
+                for name, (sx1, sy1, sx2, sy2) in rects.items():
+                    if sx1 + half < cx < sx2 - half and sy1 + half < cy < sy2 - half:
+                        expect(owner == name, f"cell ({c}, {r}) lies inside {name} and is drawn as {owner}, {said}")
+        empty = [n for n, count in owned.items() if not count]
+        expect(not empty, f"{empty} not drawn at all, {said}")
+
+
+# --- P6 every arrangement the interactive mode applies is one mutter accepts
+
+MOVES = {"left": (-1, 0), "right": (1, 0), "up": (0, -1), "down": (0, 1)}
+
+
+@dataclass
+class Press:
+    what: str
+    before: tuple
+    after: tuple
+    moved: str = ""
+    """The monitor an arrow key moved; empty for an edit."""
+    nudged: tuple = ()
+    """The arrangement with the moved monitor shifted by the step, before snapping."""
+    step: int = 0
+
+
+def session(rng: random.Random, start, steps: int, scales: dict[str, tuple[float, ...]]) -> Iterator[Press]:
+    """Arrow keys at 50 px or 10 px on a random monitor, and now and then an edit verb."""
+    arr = start
+    for _ in range(steps):
+        if rng.random() < 0.2:
+            verb = random_verb(rng, arr, rng.choice(["rotate", "place", "primary", "scale"]), scales)
+            press = Press(str(verb), arr, dl.edit(arr, verb))
+        else:
+            name = rng.choice(arr).name
+            direction, step = rng.choice(list(MOVES)), rng.choice([50, 50, 10])
+            dx, dy = MOVES[direction]
+            nudged = tuple(replace(s, x=s.x + dx * step, y=s.y + dy * step) if s.name == name else s for s in arr)
+            press = Press(f"{direction} {step} on {name}", arr, dl.snap(nudged, name), name, nudged, step)
+        yield press
+        arr = press.after
+
+
+@prop("P6", "every arrangement the interactive mode reaches is one mutter accepts",
+      lifted_by="05-interactive-mode", waits_on=("04-edit-verbs",))
+def p6(rng: random.Random, examples: int) -> None:
+    scales = {k.alias: k.scales for k in KINDS}
+    for _ in range(max(1, examples // 10)):
+        start = arrangement(rng, some(rng, low=2, high=AT_ONCE))
+        presses = []
+        for press in session(rng, start, 20, scales):
+            presses.append(press.what)
+            said = f"from {brief(start)} by {', then '.join(presses)}, reached {brief(press.after)}"
+            reason = mutter_rejects(press.after)
+            expect(not reason, f"mutter would refuse it ({reason}), {said}")
+            if not press.moved:
+                continue
+            old = {s.name: s for s in press.before}
+            new = {s.name: s for s in press.after}
+            expect(sorted(old) == sorted(new), f"the monitors changed, {said}")
+            for n in old:
+                expect((old[n].mode, old[n].scale, old[n].transform, old[n].primary)
+                       == (new[n].mode, new[n].scale, new[n].transform, new[n].primary),
+                       f"a move changed more than {press.moved}'s place, {said}")
+            shifts = {(new[n].x - old[n].x, new[n].y - old[n].y) for n in old if n != press.moved}
+            expect(len(shifts) <= 1, f"a move of {press.moved} moved the others apart, {said}")
+            dx, dy = shifts.pop() if shifts else (0, 0)
+
+            # The arrangement before the press was valid and one step from the
+            # nudged one, so snapping never needs to go farther than that.
+            pressed = next(s for s in press.nudged if s.name == press.moved)
+            landed = new[press.moved]
+            off = math.hypot(landed.x - dx - pressed.x, landed.y - dy - pressed.y)
+            expect(off <= press.step, f"{press.moved} landed {off:.0f} px from where the press put it, {said}")
+            if not mutter_rejects(at_origin(press.nudged)):
+                expect({(s.name, s.x, s.y) for s in at_origin(press.nudged)} == {(s.name, s.x, s.y) for s in press.after},
+                       f"the press left a layout mutter accepts, and snapping still moved it, {said}")
+
+
+# --- --verify, mutter's own check, live
+
+
+def gdctl_args(arr) -> list[str]:
+    args = []
+    for s in arr:
+        args += ["--logical-monitor", "--x", str(s.x), "--y", str(s.y), "--scale", repr(s.scale), "--transform", s.transform]
+        if s.primary:
+            args.append("--primary")
+        args += ["--monitor", s.name, "--mode", s.mode]
+    return args
+
+
+def verify_live(args: Args) -> int:
+    state = dl.read_state()
+    start = tuple(
+        dl.Screen(lo.connectors[0], state.monitors[lo.connectors[0]].mode, lo.x, lo.y, lo.scale, lo.transform, lo.primary)
+        for lo in state.logicals
+    )
+    known = {(k.vendor, k.product): k.scales for k in KINDS}
+    scales = {c: known.get((m.vendor, m.product), (1.0,)) for c, m in state.monitors.items()}
+    verified = rejected = 0
+
+    def verify(what: str, arr) -> None:
+        nonlocal verified, rejected
+        try:
+            dl.run(["gdctl", "set", "--verify", *gdctl_args(arr)])
+            verified += 1
+            print(f"ok    {what}")
+        except RuntimeError as exc:
+            rejected += 1
+            print(f"FAIL  {what}\n      {brief(arr)}\n      {exc}")
+
+    verify(f"the live arrangement, {brief(start)}", start)
+    stopped = ""
+    try:
+        for press in session(random.Random(args.seed), start, args.steps, scales):
+            verify(press.what, press.after)
+    except NotImplementedError as exc:
+        stopped = f", then stopped at {exc}, which is not built yet"
+    print(f"\n{verified} accepted, {rejected} rejected{stopped}")
+    return 1 if rejected else 0
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args, description=__doc__)
+    sys.exit(verify_live(args) if args.verify else run_properties(args))
