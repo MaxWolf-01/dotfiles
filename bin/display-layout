@@ -6,8 +6,8 @@
 """Save monitor arrangements under a name, put them back, and draw them in the terminal.
 
 A layout is one arrangement of monitors: each monitor's position, mode, scale,
-rotation, and which one is primary. Layouts are kept in
-desktop/display-layouts.toml in the dotfiles, or in the file DISPLAY_LAYOUTS
+rotation, and which one is primary. `save` writes layouts to
+desktop/display-layouts.toml in the dotfiles, or to the file DISPLAY_LAYOUTS
 names. A layout names its monitors by alias, and an alias stands for a vendor
 and product as gdctl show prints them, never for a connector, so a layout is
 found whichever port its monitors are plugged into. An alias carries a serial
@@ -22,11 +22,12 @@ both are connected.
     arzopa = { x = 0, y = 168, mode = "2560x1600@59.997", scale = 1.3333333730697632 }
     laptop = { x = 1920, y = 0, mode = "2560x1600@165.040", scale = 1.3333333730697632, primary = true }
 
-A screen's scale is 1, its transform normal and primary false unless it says
-otherwise. `save` gives a monitor it has not seen an alias named from its model;
-renaming an alias means renaming it in [aliases] and in every layout. A layout
-fits when its monitors are exactly the ones connected, where a closed laptop
-lid takes the panel out of the connected set, as it does for mutter.
+A monitor's entry in a layout has scale 1, transform normal and primary false
+unless it says otherwise. `save` gives a monitor it has not seen an alias named
+from its model; renaming an alias means renaming it in [aliases] and in every
+layout. A layout fits when its monitors are exactly the ones connected, where a
+closed laptop lid takes the panel out of the connected set, as it does for
+mutter.
 
 `use` and `save` record the layout they leave on screen, and `show` compares
 the live arrangement with it. The record is $XDG_STATE_HOME/display-layout/recent.
@@ -37,9 +38,9 @@ is drawn in outline when stdout is not a terminal or NO_COLOR is set.
 
 `watch` looks after monitor sets that have no layout. GNOME keys the layouts it
 saves in ~/.config/monitors.xml on each monitor's connector name plus its EDID.
-One monitor reaches a different connector through a different port -- HDMI on
-the discrete GPU, DP-1 or DP-2 on the USB-C ports -- so a layout saved on one
-port is not found on another. mutter then lays the monitors out in a
+One monitor reaches a different connector through a different port: HDMI on
+the discrete GPU, DP-1 or DP-2 on the USB-C ports. A layout GNOME saved on one
+port is then not found on another, and mutter lays the monitors out in a
 left-to-right row. `watch` recognises that row and replaces it: externals along
 the top in the order mutter lists them, laptop panel centred below it and made
 primary. Modes, scales and transforms are carried over untouched; only
@@ -108,6 +109,9 @@ TREE = re.compile(r"^(?P<prefix>[│ ]*)[├└]──(?P<text>.*)$")
 RESOLUTION = re.compile(r"^(\d+)x(\d+)@")
 POSITION = re.compile(r"^Position: \((-?\d+), (-?\d+)\)$")
 
+TURNED = ("90", "270", "flipped-90", "flipped-270")
+"""Transforms that put the mode's height along the layout's x axis."""
+
 ADJACENCY_TOLERANCE = 2
 """Pixels of slack when testing whether two logical monitors touch.
 
@@ -118,6 +122,10 @@ exact running sum of the widths computed here.
 
 class ParseError(Exception):
     pass
+
+
+class CommandError(RuntimeError):
+    """gdctl or gdbus exited non-zero."""
 
 
 @dataclass
@@ -152,7 +160,7 @@ class Logical:
     @property
     def is_turned(self) -> bool:
         """Whether the transform puts the mode's height along the layout's x axis."""
-        return self.transform in ("90", "270", "flipped-90", "flipped-270")
+        return self.transform in TURNED
 
 
 @dataclass
@@ -166,10 +174,16 @@ class State:
         gdctl rejects a logical monitor whose monitors differ in resolution, so
         the first one speaks for all of them.
         """
-        w, h = self.monitors[logical.connectors[0]].resolution
-        if logical.is_turned:
-            w, h = h, w
-        return round(w / logical.scale), round(h / logical.scale)
+        monitor = self.monitors[logical.connectors[0]]
+        return logical_size(monitor.resolution, logical.transform, logical.scale)
+
+
+def logical_size(resolution: tuple[int, int], transform: str, scale: float) -> tuple[int, int]:
+    """A monitor's width and height in the layout's coordinate space."""
+    w, h = resolution
+    if transform in TURNED:
+        w, h = h, w
+    return round(w / scale), round(h / scale)
 
 
 def read_state() -> State:
@@ -314,20 +328,17 @@ def monitor_args(
     logical = next(
         lo for lo in state.logicals if connector in lo.connectors
     )
-    args = [
-        "--logical-monitor",
-        "--x",
-        str(x),
-        "--y",
-        str(y),
-        "--scale",
-        str(logical.scale),
-        "--transform",
-        logical.transform,
-    ]
-    if primary:
+    screen = Screen(connector, state.monitors[connector].mode, x, y, logical.scale, logical.transform, primary)
+    return group_args(screen, connector)
+
+
+def group_args(s: "Screen", connector: str) -> list[str]:
+    """One --logical-monitor group for gdctl set, the screen on `connector`."""
+    args = ["--logical-monitor", "--x", str(s.x), "--y", str(s.y),
+            "--scale", repr(s.scale), "--transform", s.transform]
+    if s.primary:
         args.append("--primary")
-    return args + ["--monitor", connector, "--mode", state.monitors[connector].mode]
+    return args + ["--monitor", connector, "--mode", s.mode]
 
 
 def describe(state: State) -> dict:
@@ -466,60 +477,70 @@ def connected(state: State, lid_closed: bool) -> list[Monitor]:
 
 
 def name_monitors(
-    aliases: dict[str, Model], monitors: list[Monitor], create: bool = True
+    aliases: dict[str, Model], monitors: list[Monitor]
 ) -> tuple[dict[str, str], dict[str, Model]]:
     """An alias for each monitor's connector, and the aliases once those are added.
 
-    A monitor with no alias gets one named from its model, or keeps its
-    connector as its name when `create` is off. Two or more monitors of one
-    model each get an alias with their serial: an alias of that model without a
-    serial takes the first one's, and the others get new aliases.
+    A monitor alone of its model takes that model's alias. Among several of one
+    model, a monitor takes the alias with its serial; the rest take the model's
+    aliases without a serial, which then get theirs, and after those new ones.
+    A monitor left without an alias gets a new one named from its model. No
+    alias names two monitors.
     """
     aliases = dict(aliases)
     names: dict[str, str] = {}
-
-    def new(mon: Monitor, serial: str = "") -> str:
-        if not create:
-            return mon.connector
-        name = fresh_alias(mon, aliases)
-        aliases[name] = Model(mon.vendor, mon.product, serial)
-        return name
-
     for model, group in by_model(monitors).items():
         known = [a for a, m in aliases.items() if model_of(m) == model]
         if len(group) == 1:
             mon = group[0]
-            names[mon.connector] = next(
-                (a for a in known if aliases[a].serial == mon.serial),
-                next((a for a in known if not aliases[a].serial), None),
-            ) or (known[0] if known else new(mon))
+            names[mon.connector] = alias_of_one(mon, known, aliases) or new_alias(mon, aliases)
             continue
         unnamed = []
         for mon in sorted(group, key=lambda m: m.connector):
-            alias = next((a for a in known if aliases[a].serial == mon.serial), None)
+            alias = next((a for a in known if aliases[a].serial and aliases[a].serial == mon.serial), None)
             if alias:
                 names[mon.connector] = alias
+                known.remove(alias)
             else:
                 unnamed.append(mon)
         bare = [a for a in known if not aliases[a].serial]
         for mon in unnamed:
-            if bare and create:
+            if bare:
                 alias = bare.pop(0)
                 aliases[alias] = replace(aliases[alias], serial=mon.serial)
-                names[mon.connector] = alias
             else:
-                names[mon.connector] = new(mon, mon.serial)
+                alias = new_alias(mon, aliases, mon.serial)
+            names[mon.connector] = alias
     return names, aliases
+
+
+def alias_of_one(mon: Monitor, known: list[str], aliases: dict[str, Model]) -> str | None:
+    """The alias for the one connected monitor of its model, among that model's `known` aliases."""
+    for alias in known:
+        if aliases[alias].serial == mon.serial:
+            return alias
+    for alias in known:
+        if not aliases[alias].serial:
+            return alias
+    return known[0] if known else None
+
+
+def new_alias(mon: Monitor, aliases: dict[str, Model], serial: str = "") -> str:
+    """Add an alias for this monitor to `aliases`, and return its name."""
+    name = fresh_alias(mon, aliases)
+    aliases[name] = Model(mon.vendor, mon.product, serial)
+    return name
+
+
+def known_names(aliases: dict[str, Model], monitors: list[Monitor]) -> dict[str, str]:
+    """Each monitor's alias, or its connector for a monitor no alias stands for."""
+    names, _ = name_monitors(aliases, monitors)
+    return {c: a if a in aliases else c for c, a in names.items()}
 
 
 def fresh_alias(mon: Monitor, taken: Iterable[str]) -> str:
     """A short name from the model: laptop for the built-in panel, else the product's first word."""
-    if mon.is_builtin:
-        base = "laptop"
-    else:
-        word = re.sub(r"[^a-z0-9-]", "", (mon.product.split() or [""])[0].lower())
-        base = word if word[:1].isalpha() and not re.fullmatch(r"0x[0-9a-f]+", word) else ""
-        base = base or re.sub(r"[^a-z0-9-]", "", mon.vendor.lower()) or "monitor"
+    base = "laptop" if mon.is_builtin else model_word(mon.product) or model_word(mon.vendor) or "monitor"
     taken = set(taken)
     name, n = base, 1
     while name in taken:
@@ -528,23 +549,34 @@ def fresh_alias(mon: Monitor, taken: Iterable[str]) -> str:
     return name
 
 
+def model_word(text: str) -> str:
+    """The first word, lowercased and cut to letters, digits and -. Empty for a code such as 0xc199."""
+    word = re.sub(r"[^a-z0-9-]", "", (text.split() or [""])[0].lower())
+    return word if word[:1].isalpha() and not re.fullmatch(r"0x[0-9a-f]+", word) else ""
+
+
 class LayoutError(Exception):
     """The display cannot be saved as a layout, or a layout cannot be applied to it."""
 
 
 def live(state: State, names: dict[str, str]) -> Arrangement:
-    """The arrangement on screen, each monitor named as `names` has its connector."""
+    """The arrangement on screen, each monitor named as `names` has its connector.
+
+    Monitors mirroring each other are one screen, their names joined by +.
+    """
     screens = []
     for lo in state.logicals:
-        if len(lo.connectors) > 1:
-            raise LayoutError(f"{', '.join(lo.connectors)} mirror each other, and a layout cannot hold a mirror")
         c = lo.connectors[0]
-        screens.append(Screen(names.get(c, c), state.monitors[c].mode, lo.x, lo.y, lo.scale, lo.transform, lo.primary))
+        name = "+".join(names.get(m, m) for m in lo.connectors)
+        screens.append(Screen(name, state.monitors[c].mode, lo.x, lo.y, lo.scale, lo.transform, lo.primary))
     return tuple(sorted(screens, key=lambda s: (s.x, s.y)))
 
 
-def savable(state: State, monitors: list[Monitor]) -> None:
-    """Raise LayoutError unless every connected monitor is on screen on its own."""
+def check_savable(state: State, monitors: list[Monitor]) -> None:
+    """Raise LayoutError unless each connected monitor, and only those, is on screen on its own."""
+    for lo in state.logicals:
+        if len(lo.connectors) > 1:
+            raise LayoutError(f"{' and '.join(lo.connectors)} mirror each other, and a layout cannot hold a mirror")
     shown = {c for lo in state.logicals for c in lo.connectors}
     off = [m.connector for m in monitors if m.connector not in shown]
     if off:
@@ -552,6 +584,9 @@ def savable(state: State, monitors: list[Monitor]) -> None:
             f"{', '.join(off)} {'is' if len(off) == 1 else 'are'} connected but off, "
             "and a layout covers every connected monitor"
         )
+    lidded = sorted(shown - {m.connector for m in monitors})
+    if lidded:
+        raise LayoutError(f"{', '.join(lidded)} is on with the lid closed; open the lid, or turn the panel off")
 
 
 def layout_args(arrangement: Arrangement, binding: dict[str, str]) -> list[str]:
@@ -559,16 +594,7 @@ def layout_args(arrangement: Arrangement, binding: dict[str, str]) -> list[str]:
 
     --persistent is left out on purpose; see this module's docstring.
     """
-    x0 = min(s.x for s in arrangement)
-    y0 = min(s.y for s in arrangement)
-    args: list[str] = []
-    for s in arrangement:
-        args += ["--logical-monitor", "--x", str(s.x - x0), "--y", str(s.y - y0),
-                 "--scale", repr(s.scale), "--transform", s.transform]
-        if s.primary:
-            args.append("--primary")
-        args += ["--monitor", binding[s.name], "--mode", s.mode]
-    return args
+    return [arg for s in at_origin(arrangement) for arg in group_args(s, binding[s.name])]
 
 
 def changes(saved: Arrangement, now: Arrangement) -> list[str]:
@@ -611,12 +637,15 @@ def parse_store(text: str) -> Store:
     """Read the layouts file's TOML. The module docstring shows its shape."""
     try:
         data = tomlkit.parse(text).unwrap()
-    except tomlkit.exceptions.ParseError as exc:
+    except tomlkit.exceptions.TOMLKitError as exc:
         raise StoreError(str(exc)) from None
     unknown = set(data) - {"aliases", "layouts"}
     if unknown:
         raise StoreError(f"unknown table {', '.join(sorted(unknown))}; there are [aliases] and [layouts.<name>]")
 
+    for table in ("aliases", "layouts"):
+        if not isinstance(data.get(table, {}), dict):
+            raise StoreError(f"{table} is a table: [{table}]")
     aliases = {}
     for name, entry in data.get("aliases", {}).items():
         where = f"alias {name}"
@@ -706,11 +735,15 @@ def layouts_file() -> Path:
 
 
 def load_store() -> Store:
+    return read_store()[2]
+
+
+def read_store() -> tuple[Path, str, Store]:
+    """The layouts file's path, its text, and the store it holds. Empty when there is no file."""
     path = layouts_file()
-    if not path.exists():
-        return Store({}, {})
+    text = path.read_text() if path.exists() else ""
     try:
-        return parse_store(path.read_text())
+        return path, text, parse_store(text)
     except StoreError as exc:
         raise StoreError(f"{path}: {exc}") from None
 
@@ -740,7 +773,7 @@ def lid_closed() -> bool:
             "--object-path", "/org/freedesktop/UPower",
             "--method", "org.freedesktop.DBus.Properties.Get", "org.freedesktop.UPower", "LidIsClosed",
         ])
-    except (RuntimeError, OSError):
+    except (CommandError, OSError):
         return False
     return "true" in out
 
@@ -763,6 +796,8 @@ def current(state: State, monitors: list[Monitor], store: Store, recent: list[st
     Otherwise the one last used with these monitors is reported with what
     changed since.
     """
+    if any(len(lo.connectors) > 1 for lo in state.logicals):
+        return Current(live(state, known_names(store.aliases, monitors)), None, ())
     fitting = match(store, monitors)
     order = [n for n in recent if n in fitting] + [n for n in fitting if n not in recent]
     seen = {}
@@ -774,8 +809,7 @@ def current(state: State, monitors: list[Monitor], store: Store, recent: list[st
     last = next((n for n in recent if n in fitting), None)
     if last:
         return Current(seen[last], last, tuple(changes(store.layouts[last], seen[last])))
-    names, _ = name_monitors(store.aliases, monitors, create=False)
-    return Current(live(state, names), None, ())
+    return Current(live(state, known_names(store.aliases, monitors)), None, ())
 
 
 @dataclass(frozen=True)
@@ -852,17 +886,10 @@ def cells(arrangement: Arrangement, width: int) -> list[list[str | None]]:
 
 def bounds(s: Screen) -> tuple[int, int, int, int]:
     """x1, y1, x2, y2 of a screen in logical pixels."""
-    m = RESOLUTION.match(s.mode)
-    if not m:
-        raise ParseError(f"{s.name}: unreadable mode {s.mode!r}")
-    w, h = int(m[1]), int(m[2])
-    if s.transform in TURNED:
-        w, h = h, w
-    w, h = round(w / s.scale), round(h / s.scale)
+    w, h = logical_size(Monitor(s.name, s.mode).resolution, s.transform, s.scale)
     return s.x, s.y, s.x + w, s.y + h
 
 
-TURNED = ("90", "270", "flipped-90", "flipped-270")
 TRANSFORMS = ("normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270")
 ARROWS = {"90": "↻", "270": "↺", "180": "↻↻"}
 """The rotation mark in a label. gdctl's 90 is what GNOME Settings calls Portrait Right."""
@@ -881,12 +908,10 @@ MAX_ROWS = 22
 def palette(names: Iterable[str]) -> dict[str, str]:
     """A fill for each name: its own from EARTH, else the next unused one, in the order given."""
     names = list(dict.fromkeys(names))
-    spare = [c for c in MORE_EARTH if c not in {EARTH.get(n) for n in names}]
-    spare += [c for c in EARTH.values() if c not in {EARTH.get(n) for n in names}]
-    out = {}
-    for i, name in enumerate(n for n in names if n not in EARTH):
-        out[name] = spare[i % len(spare)] if spare else MORE_EARTH[i % len(MORE_EARTH)]
-    return {n: EARTH.get(n) or out[n] for n in names}
+    own = {EARTH[n] for n in names if n in EARTH}
+    spare = [*MORE_EARTH, *(c for c in EARTH.values() if c not in own)]
+    others = [n for n in names if n not in EARTH]
+    return {n: EARTH[n] for n in names if n in EARTH} | {n: spare[i % len(spare)] for i, n in enumerate(others)}
 
 
 def fit_width(arrangement: Arrangement, columns: int) -> int:
@@ -1069,7 +1094,7 @@ def run(argv: list[str]) -> str:
     proc = subprocess.run(argv, capture_output=True, text=True, env=system_env())
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip()
-        raise RuntimeError(f"{' '.join(argv)} failed: {detail}")
+        raise CommandError(f"{' '.join(argv)} failed: {detail}")
     return proc.stdout
 
 
@@ -1101,7 +1126,7 @@ def picture(now: Current, store: Store) -> str:
     if now.layout and not now.changed:
         head = f"{now.layout}, as saved"
     elif now.layout:
-        head = f"{now.layout}, changed since: {', '.join(now.changed)}"
+        head = f"last used with these monitors: {now.layout}; since then {', '.join(now.changed)}"
     else:
         head = "not a saved layout"
     colour = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -1115,8 +1140,8 @@ def on_screen(store: Store) -> Current:
     return current(state, connected(state, lid_closed()), store, recent())
 
 
-def who(monitors: list[Monitor], store: Store) -> str:
-    names, _ = name_monitors(store.aliases, monitors, create=False)
+def describe_connected(monitors: list[Monitor], store: Store) -> str:
+    names = known_names(store.aliases, monitors)
     return ", ".join(
         f"{names[m.connector]} on {m.connector}" if names[m.connector] != m.connector
         else f"{m.connector} ({m.vendor} {m.product}, no alias)"
@@ -1138,13 +1163,13 @@ def use(args: UseArgs) -> None:
     """
     store = load_store()
     if args.name not in store.layouts:
-        fail(f"no layout named {args.name}; saved: {', '.join(store.layouts) or 'none'}")
+        raise LayoutError(f"no layout named {args.name}; saved: {', '.join(store.layouts) or 'none'}")
     state = read_state()
     monitors = connected(state, lid_closed())
     binding = match(store, monitors).get(args.name)
     if binding is None:
         wants = ", ".join(s.name for s in store.layouts[args.name])
-        fail(f"{args.name} is for {wants}; connected: {who(monitors, store)}")
+        raise LayoutError(f"{args.name} is for {wants}; connected: {describe_connected(monitors, store)}")
     run(["gdctl", "set", *layout_args(store.layouts[args.name], binding)])
     remember(args.name)
     print(picture(on_screen(store), store))
@@ -1160,13 +1185,11 @@ class SaveArgs:
 def save(args: SaveArgs) -> None:
     """Save the arrangement on screen as a layout in the layouts file, and draw it."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.name):
-        fail(f"{args.name!r}: a layout name is letters, digits, - and _")
-    path = layouts_file()
-    text = path.read_text() if path.exists() else ""
-    store = parse_store(text) if text else Store({}, {})
+        raise LayoutError(f"{args.name!r}: a layout name is letters, digits, - and _")
+    path, text, store = read_store()
     state = read_state()
     monitors = connected(state, lid_closed())
-    savable(state, monitors)
+    check_savable(state, monitors)
     names, aliases = name_monitors(store.aliases, monitors)
     arrangement = at_origin(live(state, names))
     added = {a: m for a, m in aliases.items() if store.aliases.get(a) != m}
@@ -1179,7 +1202,7 @@ def save(args: SaveArgs) -> None:
         print(f"{verb} alias {alias}: {model.vendor} {model.product}" + (f" {model.serial}" if model.serial else ""))
     print(f"saved {args.name} in {path}\n")
     store = parse_store(text)
-    print(picture(on_screen(store), store))
+    print(picture(current(state, monitors, store, recent()), store))
 
 
 @dataclass
@@ -1216,30 +1239,35 @@ def list_(args: ListArgs) -> None:
 @dataclass
 class ShowArgs:
     json: bool = False
-    """Emit what gdctl reports, and what `apply` would do, as JSON instead of the drawing."""
+    """Emit what gdctl reports, the layout on screen, and what `apply` would do, as JSON instead of the drawing."""
 
 
 @app.command(name="show")
 def show(args: ShowArgs) -> None:
     """Draw the arrangement on screen, and say which saved layout it is.
 
-    A layout put on screen by `use` or `save` and changed since is named with
-    what changed.
+    When the screen matches no saved layout, the one last put on screen by
+    `use` or `save` for these monitors is named, with what changed since.
 
-    JSON schema (--json):
+    JSON schema (--json), where layout is null for no saved layout and changed
+    lists what differs from it:
 
         {"monitors": {"<connector>": {"mode": "str", "builtin": bool}},
          "logicals": [{"x": int, "y": int, "scale": float,
                        "primary": bool, "connectors": ["str"]}],
          "is_mutter_row": bool,
-         "plan": ["str"]}
+         "plan": ["str"],
+         "layout": "str|null",
+         "changed": ["str"]}
     """
-    if args.json:
-        state = read_state()
-        print(json.dumps(describe(state) | {"plan": plan(state)}, indent=2))
-        return
     store = load_store()
-    print(picture(on_screen(store), store))
+    state = read_state()
+    now = current(state, connected(state, lid_closed()), store, recent())
+    if args.json:
+        report = describe(state) | {"plan": plan(state), "layout": now.layout, "changed": list(now.changed)}
+        print(json.dumps(report, indent=2))
+        return
+    print(picture(now, store))
 
 
 @dataclass
@@ -1262,6 +1290,8 @@ def apply(args: ApplyArgs) -> None:
     print("gdctl set " + " ".join(argv))
     if not args.dry_run:
         run(["gdctl", "set", *argv])
+        store = load_store()
+        print("\n" + picture(on_screen(store), store))
 
 
 @dataclass
@@ -1357,7 +1387,7 @@ def arrange(settled: tuple[str, ...] | None) -> tuple[str, ...] | None:
     return connectors
 
 
-REFUSALS = (StoreError, LayoutError, ParseError, RuntimeError)
+REFUSALS = (StoreError, LayoutError, ParseError, CommandError)
 """Errors a command ends on with their message alone, no traceback."""
 
 
