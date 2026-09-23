@@ -136,6 +136,14 @@
       fetch.fsckobjects = true;
       receive.fsckObjects = true;
       pull.rebase = false;
+      # A config hook runs beside each repo's own .git/hooks rather than
+      # replacing them, as core.hooksPath would. The store copy, not the
+      # checkout's: a dotfiles branch without the file must not fail every
+      # commit on the machine.
+      hook.claude-session = {
+        event = "prepare-commit-msg";
+        command = "${../../git/hooks/claude-session-trailer}";
+      };
     };
   };
 
