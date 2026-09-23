@@ -37,7 +37,9 @@ arrangement on screen and draw the result; only `save` keeps it. They name a
 monitor by its alias, or by its connector where it has none. When a monitor
 changes size or is placed, the others move as little as they can while the
 monitors stay joined edge to edge, and none crosses to another side of a
-monitor it was beside.
+monitor it was beside. `edit` moves and turns monitors with the keyboard
+instead, drawn to fill the terminal; `display-layout edit --help` lists the
+keys.
 
 A drawing is to scale, one colour per alias, with ★ on the primary monitor, ↻
 on one turned right (gdctl's transform 90) and ↺ on one turned left (270). It
@@ -74,6 +76,7 @@ Examples:
     display-layout place arzopa left-of laptop --align top
     display-layout primary laptop
     display-layout scale hp 1.25
+    display-layout edit
     display-layout apply --dry-run
     display-layout watch
 """
@@ -89,10 +92,10 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Annotated, Literal, NoReturn, assert_never
+from typing import Annotated, Literal, NoReturn, Protocol, assert_never
 
 import tomlkit
 import tyro
@@ -893,7 +896,15 @@ class Scale:
     """1.25 for 125 %. gdctl show --verbose lists the scales mutter offers for each mode."""
 
 
-Verb = Rotate | Place | Primary | Scale
+@dataclass(frozen=True)
+class Turn:
+    """Turn a monitor a quarter clockwise or counter-clockwise from where it is. `edit` turns with r and R."""
+
+    name: str
+    clockwise: bool = True
+
+
+Verb = Rotate | Place | Primary | Scale | Turn
 
 ROTATIONS = {"left": "270", "right": "90", "normal": "normal"}
 """gdctl's transform for each Rotate target, named as GNOME Settings names them."""
@@ -948,9 +959,21 @@ def applied(s: Screen, verb: Verb) -> Screen:
         return s
     if isinstance(verb, Rotate):
         return replace(s, transform=ROTATIONS[verb.to])
+    if isinstance(verb, Turn):
+        return replace(s, transform=quarter_turn(s.transform, verb.clockwise))
     if isinstance(verb, Scale):
         return replace(s, scale=verb.factor)
     assert_never(verb)
+
+
+def quarter_turn(transform: str, clockwise: bool) -> str:
+    """The transform a quarter turn on. gdctl counts clockwise: 90 is turned right. A flip is kept."""
+    flipped = transform.startswith("flipped")
+    angle = transform.removeprefix("flipped").removeprefix("-")
+    turned = ((0 if angle in ("", "normal") else int(angle)) + (90 if clockwise else 270)) % 360
+    if flipped:
+        return f"flipped-{turned}" if turned else "flipped"
+    return str(turned) if turned else "normal"
 
 
 def extent(s: Screen) -> tuple[int, int]:
@@ -959,7 +982,7 @@ def extent(s: Screen) -> tuple[int, int]:
     return x2 - x1, y2 - y1
 
 
-def settle(before: Arrangement, after: Arrangement, verb: Rotate | Scale | Place) -> Arrangement:
+def settle(before: Arrangement, after: Arrangement, verb: Rotate | Turn | Scale | Place) -> Arrangement:
     """Positions for `after`, whose monitors have their new sizes and their old positions.
 
     The rules:
@@ -1157,8 +1180,32 @@ def joined(boxes: list[Box]) -> bool:
 
 
 def snap(arrangement: Arrangement, moved: str) -> Arrangement:
-    """Put the moved screen back against its neighbours, the way GNOME Settings does."""
-    raise NotImplementedError(UNBUILT.format("05-interactive-mode"))
+    """The arrangement with the moved screen put back against its neighbours, as GNOME Settings does while dragging.
+
+    A place mutter accepts is kept as it is. Otherwise the screen goes to the
+    nearest place where it overlaps none of the others and every monitor is
+    reached from every other through shared edges. Nearest is by the distance
+    along x plus the distance along y, and of two places as near, the one
+    reached along a single axis wins. The others stay where they are, and the
+    whole arrangement is moved to start at (0, 0).
+    """
+    me = next(s for s in arrangement if s.name == moved)
+    others = [bounds(s) for s in arrangement if s.name != moved]
+    w, h = extent(me)
+    # Where an edge of the screen meets an edge of another, or passes it by one
+    # pixel: the places where whether it is accepted can change.
+    xs = {me.x, *(x for b in others for x in (b[0] - w, b[2], b[0] - w + 1, b[2] - 1))}
+    ys = {me.y, *(y for b in others for y in (b[1] - h, b[3], b[1] - h + 1, b[3] - 1))}
+    nearest = sorted((abs(x - me.x) + abs(y - me.y), (x != me.x) + (y != me.y), y, x) for x in xs for y in ys)
+    for *_, y, x in nearest:
+        if accepted([(x, y, x + w, y + h), *others]):
+            return at_origin(tuple(replace(s, x=x, y=y) if s.name == moved else s for s in arrangement))
+    raise LayoutError(f"no place for {moved} keeps every monitor joined edge to edge")
+
+
+def accepted(boxes: list[Box]) -> bool:
+    """Whether mutter takes these boxes as a layout: none overlap, and all are joined edge to edge."""
+    return not any(overlaps(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :]) and joined(boxes)
 
 
 def cells(arrangement: Arrangement, width: int) -> list[list[str | None]]:
@@ -1210,6 +1257,8 @@ MORE_EARTH = ("#7a6d48", "#4f6b66", "#7a5550", "#5d5a4c")
 """Fills for the aliases EARTH has no colour for, in turn: ochre, pine, rust, umber."""
 SAND = "#ede3d2"
 """Label text on a fill."""
+MOSS = "#6ea444"
+"""The house accent: the frame around the monitor `edit` has selected."""
 MAX_COLUMNS = 72
 MAX_ROWS = 22
 """The largest drawing fit_width allows, in terminal characters, however large the terminal is."""
@@ -1237,13 +1286,16 @@ def fit(arrangement: Arrangement, columns: int, rows: int) -> int:
     return max(8, min(columns, math.floor(rows * 2 * w / h)))
 
 
-def draw(arrangement: Arrangement, width: int, colours: dict[str, str] | None) -> str:
-    """The arrangement drawn `width` columns wide: filled blocks in `colours`, or outlined when it is None."""
+def draw(arrangement: Arrangement, width: int, colours: dict[str, str] | None, selected: str | None = None) -> str:
+    """The arrangement drawn `width` columns wide: filled blocks in `colours`, or outlined when it is None.
+
+    The `selected` screen is framed in MOSS, or outlined in double lines.
+    """
     grid = cells(arrangement, width)
     screens = {s.name: s for s in arrangement}
     if colours is None:
-        return outline(grid, screens)
-    return blocks(grid, screens, colours)
+        return outline(grid, screens, selected)
+    return blocks(grid, screens, colours, selected)
 
 
 def label(s: Screen) -> list[str]:
@@ -1276,8 +1328,13 @@ def rgb(hex_: str) -> str:
     return ";".join(str(int(hex_[i : i + 2], 16)) for i in (1, 3, 5))
 
 
-def blocks(grid: list[list[str | None]], screens: dict[str, Screen], colours: dict[str, str]) -> str:
-    """Filled rectangles in half-block characters, a blank line of cells between neighbours."""
+def blocks(
+    grid: list[list[str | None]], screens: dict[str, Screen], colours: dict[str, str], selected: str | None = None
+) -> str:
+    """Filled rectangles in half-block characters, a blank line of cells between neighbours.
+
+    The `selected` screen's outermost cells are MOSS, a frame one cell thick.
+    """
     height, width = len(grid), len(grid[0])
     gapped = [row[:] for row in grid]
     for r in range(height):
@@ -1290,11 +1347,27 @@ def blocks(grid: list[list[str | None]], screens: dict[str, Screen], colours: di
     if height % 2:
         gapped.append([None] * width)
 
+    def owner(r: int, c: int) -> str | None:
+        return gapped[r][c] if 0 <= r < len(gapped) and 0 <= c < width else None
+
+    frame = {
+        (r, c)
+        for r in range(len(gapped))
+        for c in range(width)
+        if selected and gapped[r][c] == selected
+        and any(owner(r + dr, c + dc) != selected for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)))
+    }
+
+    def colour(r: int, c: int) -> str:
+        return MOSS if (r, c) in frame else colours[gapped[r][c] or ""]
+
     text: dict[tuple[int, int], tuple[str, str]] = {}
     for name, screen in screens.items():
         if not any(name in row for row in gapped):
             continue
         r0, r1, c0, c1 = span(gapped, name)
+        if name == selected:  # the label stays inside the frame
+            r0, r1, c0, c1 = r0 + 1, r1 - 1, c0 + 1, c1 - 1
         whole = range((r0 + 1) // 2, (r1 + 1) // 2)  # text rows with both halves inside
         for at, ch in place_label(label(screen), whole, c0, c1).items():
             text[at] = (ch, name)
@@ -1309,11 +1382,11 @@ def blocks(grid: list[list[str | None]], screens: dict[str, Screen], colours: di
                 bold = "1;" if screens[name].primary else ""
                 want, glyph = f"{bold}38;2;{rgb(SAND)};48;2;{rgb(colours[name])}", ch
             elif top and bottom:
-                want, glyph = f"38;2;{rgb(colours[top])};48;2;{rgb(colours[bottom])}", "▀"
+                want, glyph = f"38;2;{rgb(colour(2 * tr, c))};48;2;{rgb(colour(2 * tr + 1, c))}", "▀"
             elif top:
-                want, glyph = f"38;2;{rgb(colours[top])}", "▀"
+                want, glyph = f"38;2;{rgb(colour(2 * tr, c))}", "▀"
             elif bottom:
-                want, glyph = f"38;2;{rgb(colours[bottom])}", "▄"
+                want, glyph = f"38;2;{rgb(colour(2 * tr + 1, c))}", "▄"
             else:
                 want, glyph = "", " "
             if want != style:
@@ -1326,8 +1399,8 @@ def blocks(grid: list[list[str | None]], screens: dict[str, Screen], colours: di
     return "\n".join(out)
 
 
-def outline(grid: list[list[str | None]], screens: dict[str, Screen]) -> str:
-    """Box-drawing rectangles, heavy for the primary monitor, one text row per two cells."""
+def outline(grid: list[list[str | None]], screens: dict[str, Screen], selected: str | None = None) -> str:
+    """Box-drawing rectangles, heavy for the primary monitor and double for the selected one, one text row per two cells."""
     height, width = (len(grid) + 1) // 2, len(grid[0])
     chars = [[" "] * width for _ in range(height)]
     for name, s in screens.items():
@@ -1336,7 +1409,11 @@ def outline(grid: list[list[str | None]], screens: dict[str, Screen]) -> str:
         # cell is its own, so two stacked screens never share a row.
         t0 = min((r0 + 1) // 2, height - 1)
         t1 = min(max(t0, (r1 + 2) // 2 - 1), height - 1)
-        h, v, tl, tr, bl, br = ("━", "┃", "┏", "┓", "┗", "┛") if s.primary else ("─", "│", "╭", "╮", "╰", "╯")
+        h, v, tl, tr, bl, br = (
+            ("═", "║", "╔", "╗", "╚", "╝") if name == selected
+            else ("━", "┃", "┏", "┓", "┗", "┛") if s.primary
+            else ("─", "│", "╭", "╮", "╰", "╯")
+        )
         for c in range(c0 + 1, c1):
             chars[t0][c] = h
             chars[t1][c] = h
@@ -1604,23 +1681,31 @@ class SaveArgs:
 @app.command(name="save")
 def save(args: SaveArgs) -> None:
     """Save the arrangement on screen as a layout in the layouts file, and draw it."""
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.name):
-        raise LayoutError(f"{args.name!r}: a layout name is letters, digits, - and _")
-    path, text, store = read_store()
+    check_name(args.name)
     state = read_state()
-    monitors = connected(state, lid_closed())
+    write_layout(args.name, state, connected(state, lid_closed()))
+
+
+def check_name(name: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise LayoutError(f"{name!r}: a layout name is letters, digits, - and _")
+
+
+def write_layout(name: str, state: State, monitors: list[Monitor]) -> None:
+    """Save the arrangement `state` holds as layout `name`, record it as used, and draw it."""
+    path, text, store = read_store()
     check_savable(state, monitors)
     names, aliases = name_monitors(store.aliases, monitors)
     arrangement = at_origin(live(state, names))
     added = {a: m for a, m in aliases.items() if store.aliases.get(a) != m}
-    text = with_layout(text, args.name, arrangement, added)
+    text = with_layout(text, name, arrangement, added)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
-    remember(args.name)
+    remember(name)
     for alias, model in added.items():
         verb = "updated" if alias in store.aliases else "new"
         print(f"{verb} alias {alias}: {model.vendor} {model.product}" + (f" {model.serial}" if model.serial else ""))
-    print(f"saved {args.name} in {path}\n")
+    print(f"saved {name} in {path}\n")
     store = parse_store(text)
     print(picture(current(state, monitors, store, recent()), store))
 
@@ -1718,21 +1803,348 @@ def edit_on_screen(verb: Verb) -> None:
     """Apply the edit to the arrangement on screen, for the session, and draw the result."""
     store = load_store()
     state = read_state()
+    arrangement, binding, shown = editable(state, store)
+    for name in mentioned(verb):
+        if name not in binding:
+            what = f"{name} is not on screen" if name in store.aliases else f"no monitor named {name}"
+            raise LayoutError(f"{what}; on screen: {describe_connected(shown, store)}")
+    run(["gdctl", "set", *layout_args(edit(arrangement, verb), binding)])
+    print(picture(on_screen(store), store))
+
+
+def editable(state: State, store: Store) -> tuple[Arrangement, dict[str, str], list[Monitor]]:
+    """The arrangement on screen named by alias, each name's connector, and the monitors lit.
+
+    Raises LayoutError for a mirror: the edits move monitors shown on their own.
+    """
     for lo in state.logicals:
         if len(lo.connectors) > 1:
-            raise LayoutError(f"{' and '.join(lo.connectors)} mirror each other; rotate, place, primary and scale "
-                              "move monitors shown on their own")
+            raise LayoutError(f"{' and '.join(lo.connectors)} mirror each other; rotate, place, primary, scale "
+                              "and edit move monitors shown on their own")
     lit = {c for lo in state.logicals for c in lo.connectors}
     shown = [m for m in state.monitors.values() if m.connector in lit]
     names = known_names(store.aliases, shown)
-    arrangement = live(state, names)
-    for name in mentioned(verb):
-        if name not in {s.name for s in arrangement}:
-            what = f"{name} is not on screen" if name in store.aliases else f"no monitor named {name}"
-            raise LayoutError(f"{what}; on screen: {describe_connected(shown, store)}")
-    binding = {names.get(c, c): c for lo in state.logicals for c in lo.connectors}
-    run(["gdctl", "set", *layout_args(edit(arrangement, verb), binding)])
-    print(picture(on_screen(store), store))
+    binding = {names.get(c, c): c for c in lit}
+    return live(state, names), binding, shown
+
+
+# --- edit: the arrangement moved with the keyboard, and the display following it
+
+STEP = 50
+FINE_STEP = 10
+"""Logical pixels an arrow or WASD key moves the selected monitor, and with Shift."""
+FOLLOW_DELAY = 0.3
+"""Seconds after the last key press before the display is given the arrangement."""
+
+MOVES: dict[str, tuple[int, int]] = {
+    key: (dx * step, dy * step)
+    for keys, dx, dy in ((("up", "w"), 0, -1), (("down", "s"), 0, 1), (("left", "a"), -1, 0), (("right", "d"), 1, 0))
+    for key, step in ((keys[0], STEP), (keys[1], STEP), (f"shift-{keys[0]}", FINE_STEP), (keys[1].upper(), FINE_STEP))
+}
+"""What each key moves the selected monitor by, in logical pixels."""
+
+KEY_HELP = ("tab next", "arrows or wasd move, shift finer", "r R rotate", "enter save", "q keep", "esc put back")
+"""The keys, under the drawing, as many to a line as fit."""
+
+
+def press(arrangement: Arrangement, selected: str, order: list[str], key: str) -> tuple[Arrangement, str]:
+    """The arrangement and the selected monitor after one key press in `edit`.
+
+    Tab and Shift-Tab select the next or previous monitor in `order`. A move
+    shifts the selected monitor and snaps it; r and R turn it clockwise and
+    counter-clockwise. Any other key changes nothing.
+    """
+    if key in ("tab", "shift-tab"):
+        return arrangement, order[(order.index(selected) + (1 if key == "tab" else -1)) % len(order)]
+    if key in MOVES:
+        dx, dy = MOVES[key]
+        nudged = tuple(replace(s, x=s.x + dx, y=s.y + dy) if s.name == selected else s for s in arrangement)
+        return snap(nudged, selected), selected
+    if key in ("r", "R"):
+        return edit(arrangement, Turn(selected, clockwise=key == "r")), selected
+    return arrangement, selected
+
+
+@dataclass(frozen=True)
+class Ending:
+    """How an `edit` session ended, and the arrangement it left on screen."""
+
+    how: Literal["save", "keep", "put back"]
+    arrangement: Arrangement
+
+
+def interact(
+    start: Arrangement,
+    order: list[str],
+    selected: str,
+    keys: "Keys",
+    show: Callable[[Arrangement, str, str], None],
+    apply: Callable[[Arrangement], None],
+    delay: float = FOLLOW_DELAY,
+) -> Ending:
+    """Run an `edit` session from the arrangement `start` on screen.
+
+    `keys.read(timeout)` gives the next key press, or None once `timeout`
+    seconds pass without one, and `keys.now()` the time. `show(arrangement,
+    selected, note)` draws, and `apply(arrangement)` puts an arrangement on
+    screen. `apply` runs `delay` seconds after the last key press, once per
+    pause, and only for an arrangement not already on screen. Enter and q
+    apply what is drawn and end; Esc and Ctrl-C put `start` back and end.
+    """
+    arrangement, applied, due, note = start, start, None, ""
+
+    def follow(target: Arrangement) -> str:
+        nonlocal applied
+        if target == applied:
+            return ""
+        try:
+            apply(target)
+        except CommandError as exc:
+            return str(exc)
+        applied = target
+        return ""
+
+    try:
+        while True:
+            show(arrangement, selected, note)
+            key = keys.read(None if due is None else max(0.0, due - keys.now()))
+            if key is None:
+                note, due = follow(arrangement), None
+                continue
+            if key == "resize":
+                continue
+            if key in ("enter", "q"):
+                if arrangement != applied:
+                    apply(arrangement)
+                return Ending("save" if key == "enter" else "keep", arrangement)
+            if key == "esc":
+                break
+            note = ""
+            try:
+                arrangement, selected = press(arrangement, selected, order, key)
+            except LayoutError as exc:
+                note = str(exc)
+            if due is not None or arrangement != applied:
+                due = keys.now() + delay
+    except KeyboardInterrupt:
+        pass
+    if applied != start:
+        apply(start)
+    return Ending("put back", start)
+
+
+class Keys(Protocol):
+    """The key presses `interact` reads, by name: up, shift-up, tab, enter, esc, or the character typed."""
+
+    def read(self, timeout: float | None) -> str | None: ...
+
+    def now(self) -> float: ...
+
+
+SEQUENCES = {
+    **{f"\x1b[{c}": d for c, d in zip("ABCD", ("up", "down", "right", "left"))},
+    **{f"\x1bO{c}": d for c, d in zip("ABCD", ("up", "down", "right", "left"))},
+    **{f"\x1b[1;2{c}": f"shift-{d}" for c, d in zip("ABCD", ("up", "down", "right", "left"))},
+    "\x1b[Z": "shift-tab",
+    "\t": "tab",
+    "\r": "enter",
+    "\n": "enter",
+}
+"""The terminal's bytes for the keys `edit` names."""
+
+UNKNOWN = re.compile(r"\x1b\[[0-9;]*[@-~]|\x1bO.|\x1b.", re.DOTALL)
+"""Any escape sequence a terminal sends for a key, Alt with a key included, so one `edit` does not know is skipped whole."""
+
+
+class Terminal:
+    """The keyboard and the whole terminal, for the length of an `edit` session.
+
+    Keys are read unbuffered and unechoed, and the session is drawn on the
+    terminal's alternate screen, so the shell's own scrollback is left as it
+    was when the session ends.
+    """
+
+    ESC_WAIT = 0.05
+    """Seconds to wait after an Esc byte for the rest of a key's sequence."""
+
+    def __init__(self) -> None:
+        self.fd = sys.stdin.fileno()
+        self.pending = ""
+        self.size = self.columns_lines()
+
+    def __enter__(self) -> "Terminal":
+        import termios
+        import tty
+
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self.write("\x1b[?1049h\x1b[?25l")
+        return self
+
+    def __exit__(self, *_) -> None:
+        import termios
+
+        self.write("\x1b[?25h\x1b[?1049l")
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def now(self) -> float:
+        return time.monotonic()
+
+    def columns_lines(self) -> tuple[int, int]:
+        size = shutil.get_terminal_size((80, 24))
+        return size.columns, size.lines
+
+    def write(self, text: str) -> None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def read(self, timeout: float | None) -> str | None:
+        """The next key, None after `timeout` seconds without one, or "resize" when the terminal changed size."""
+        import select
+
+        end = None if timeout is None else self.now() + timeout
+        while not self.pending:
+            if self.columns_lines() != self.size:
+                self.size = self.columns_lines()
+                return "resize"
+            wait = 0.1 if end is None else min(0.1, end - self.now())
+            if wait <= 0:
+                return None
+            if select.select([self.fd], [], [], wait)[0]:
+                self.pending += os.read(self.fd, 1024).decode(errors="replace")
+        if self.pending == "\x1b" and select.select([self.fd], [], [], self.ESC_WAIT)[0]:
+            self.pending += os.read(self.fd, 1024).decode(errors="replace")
+        return self.take()
+
+    def take(self) -> str:
+        """The first key in what has been read, removed from it."""
+        for seq, key in SEQUENCES.items():
+            if self.pending.startswith(seq):
+                self.pending = self.pending[len(seq) :]
+                return key
+        if unknown := UNKNOWN.match(self.pending):
+            self.pending = self.pending[unknown.end() :]
+            return unknown.group()
+        key, self.pending = self.pending[0], self.pending[1:]
+        return "esc" if key == "\x1b" else key
+
+    def ask(self, prompt: str) -> str:
+        return input(prompt)
+
+
+class View:
+    """Draws an `edit` session to fill the terminal.
+
+    A cell keeps its size in logical pixels from one key press to the next,
+    so a monitor that does not move is not redrawn larger or smaller; it is
+    fitted again when the drawing outgrows the terminal or the terminal
+    changes size.
+    """
+
+    ROOM = 0.75
+    """The share of the terminal a fitted drawing takes, leaving room to move monitors out."""
+
+    def __init__(self, terminal: Terminal, colours: dict[str, str] | None) -> None:
+        self.terminal, self.colours = terminal, colours
+        self.cell = 0.0
+        self.fitted_to = (0, 0)
+
+    def __call__(self, arrangement: Arrangement, selected: str, note: str) -> None:
+        columns, lines = self.terminal.columns_lines()
+        below = [note[:columns]] if note else wrap(KEY_HELP, " · ", columns)
+        rows = max(4, lines - 3 - len(below))  # a line above the drawing, and a blank either side
+        rects = [bounds(s) for s in arrangement]
+        w = max(r[2] for r in rects) - min(r[0] for r in rects)
+        h = max(r[3] for r in rects) - min(r[1] for r in rects)
+        width = round(w / self.cell) if self.cell else 0
+        if (columns, lines) != self.fitted_to or not 0 < width <= columns or math.ceil(h / self.cell / 2) > rows:
+            width = fit(arrangement, max(8, int(columns * self.ROOM)), max(2, int(rows * self.ROOM)))
+            self.cell, self.fitted_to = w / width, (columns, lines)
+        drawing = draw(arrangement, width, self.colours, selected).split("\n")
+        page = [f"{selected} selected"[:columns], "", *drawing, "", *below]
+        self.terminal.write("\x1b[H" + "\n".join(line + "\x1b[0m\x1b[K" for line in page) + "\x1b[J")
+
+
+def wrap(parts: Iterable[str], joint: str, columns: int) -> list[str]:
+    """The parts joined by `joint` into lines of at most `columns`, a part too long cut to fit."""
+    lines: list[str] = []
+    for part in parts:
+        if lines and len(lines[-1]) + len(joint) + len(part) <= columns:
+            lines[-1] += joint + part
+        else:
+            lines.append(part[:columns])
+    return lines
+
+
+@dataclass
+class EditArgs:
+    pass
+
+
+@app.command(name="edit")
+def interactive(args: EditArgs) -> None:
+    """Move the monitors on screen with the keyboard, drawn to fill the terminal.
+
+    The selected monitor is framed in moss green, or in double lines without colour.
+
+        tab, shift-tab       select the next or previous monitor
+        arrows or w a s d    move it 50 logical px; with shift, 10
+        r, R                 turn it clockwise, counter-clockwise
+        enter                save the arrangement, asking for a name
+        q                    quit, keeping the arrangement on screen
+        esc                  put back the arrangement from the start, and quit
+
+    A moved monitor snaps back against the others, so they stay joined edge to
+    edge. The display follows 0.3 s after the last key press, for the session
+    only; only enter keeps the arrangement as a layout. The name enter offers
+    is that of the layout on screen at the start.
+    """
+    store = load_store()
+    state = read_state()
+    start, binding, shown = editable(state, store)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise LayoutError("edit reads keys from a terminal and draws in it; stdin or stdout is not one")
+    was = current(state, connected(state, lid_closed()), store, recent()).layout
+    order = [s.name for s in start]
+    selected = next((s.name for s in start if not s.primary), order[0])
+    colours = None if os.environ.get("NO_COLOR") else palette([*store.aliases, *order])
+
+    def apply(arrangement: Arrangement) -> None:
+        run(["gdctl", "set", *layout_args(arrangement, binding)])
+
+    terminal = Terminal()
+    with terminal:
+        ending = interact(at_origin(start), order, selected, terminal, View(terminal, colours), apply)
+    if ending.how == "put back":
+        print("put back the arrangement edit started from\n")
+    if ending.how != "save":
+        print(picture(on_screen(store), store))
+        return
+    name = ask_name(terminal, was)
+    if name is None:
+        print("not saved; the arrangement stays on screen for the session")
+        return
+    after = State(state.monitors, [
+        Logical(s.x, s.y, s.scale, s.transform, s.primary, [binding[s.name]]) for s in ending.arrangement
+    ])
+    write_layout(name, after, connected(after, lid_closed()))
+
+
+def ask_name(terminal: Terminal, default: str | None) -> str | None:
+    """A layout name typed at the terminal: `default` for an empty answer, None for none at all."""
+    while True:
+        try:
+            name = terminal.ask(f"save as{f' ({default})' if default else ''}: ").strip() or default
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not name:
+            return None
+        try:
+            check_name(name)
+            return name
+        except LayoutError as exc:
+            print(exc)
 
 
 @dataclass
