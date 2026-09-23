@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tyro"]
+# dependencies = ["tyro", "tomlkit"]
 # ///
 """Drive bin/display-layout's parsing and its arrangement. Run it directly; no framework.
 
@@ -14,8 +14,13 @@ The fixtures are gdctl show output, kept down to the lines the parser reads plus
 the deeper ones it has to walk past.
 """
 
+import contextlib
 import importlib.util
+import io
+import os
 import sys
+import tempfile
+from dataclasses import replace
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -288,6 +293,283 @@ check("the same row twice is arranged once", 1, len(drive(PANEL_ONLY, ROW, ROW))
 check("a row already on screen at startup is arranged", 1, len(drive(ROW)))
 # Giving up after one rejection would leave the row until the next plug.
 check("a rejected apply is retried on the next signal", 2, len(drive(ROW, ROW, failing=True)))
+
+# --- named layouts: the layouts file, save, use, list and show
+#
+# The desk from a live gdctl show on zephylux: the ARZOPA turned to portrait on
+# the left, the HP above the panel. Serials are made up.
+
+LAPTOP = ("eDP-1", "Built-in display", "AUO", "0xc199", "0x00000000", "2560x1600@165.040")
+HP = ("HDMI-1", 'HP Inc. 27"', "HPN", "HP M27fwa FHD", "HP0000001", "1920x1080@60.000")
+ARZOPA = ("DP-1", 'GWD 16"', "GWD", "ARZOPA", "0x0000a001", "2560x1600@59.997")
+THIRDS = 1.3333333730697632
+
+
+def on(port, monitor):
+    return (port,) + monitor[1:]
+
+
+def gdctl_show(monitors, logicals, off=()):
+    """gdctl show output. logicals are (connector, x, y, scale, transform, primary).
+
+    A connector in `off` is listed with its preferred mode and has no logical
+    monitor, the way gdctl shows a closed laptop panel.
+    """
+    lines = ["Monitors:"]
+    for i, (connector, label, vendor, product, serial, mode) in enumerate(monitors):
+        head, pad = ("└──", "   ") if i == len(monitors) - 1 else ("├──", "│  ")
+        lines += [
+            f"{head}Monitor {connector} ({label})",
+            f"{pad}├──Vendor: {vendor}",
+            f"{pad}├──Product: {product}",
+            f"{pad}├──Serial: {serial}",
+            f"{pad}├──{'Preferred' if connector in off else 'Current'} mode",
+            f"{pad}│   └──{mode}",
+            f"{pad}└──Preferences",
+            f"{pad}    └──Backlight: None",
+        ]
+    lines += ["", "Logical monitors:"]
+    for i, (connector, x, y, scale, transform, primary) in enumerate(logicals):
+        head, pad = ("└──", "   ") if i == len(logicals) - 1 else ("├──", "│  ")
+        lines += [
+            f"{head}Logical monitor #{i + 1}",
+            f"{pad}├──Position: ({x}, {y})",
+            f"{pad}├──Scale: {scale}",
+            f"{pad}├──Transform: {transform}",
+            f"{pad}├──Primary: {'yes' if primary else 'no'}",
+            f"{pad}└──Monitors: (1)",
+            f"{pad}    └──{connector} (label)",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+DESK = gdctl_show(
+    [HP, LAPTOP, ARZOPA],
+    [("DP-1", 0, 180, THIRDS, "90", False), ("HDMI-1", 1200, 0, 1.0, "normal", False),
+     ("eDP-1", 1200, 1080, THIRDS, "normal", True)],
+)
+# The same desk with the ARZOPA in the other USB-C port, mutter's row on screen.
+DESK_DP2_ROW = gdctl_show(
+    [HP, LAPTOP, on("DP-2", ARZOPA)],
+    [("HDMI-1", 0, 0, 1.0, "normal", False), ("eDP-1", 1920, 0, THIRDS, "normal", True),
+     ("DP-2", 3840, 0, THIRDS, "normal", False)],
+)
+# Lid closed at the desk: the panel is listed, off, and the HP is primary.
+DOCKED = gdctl_show(
+    [HP, LAPTOP, ARZOPA],
+    [("DP-1", 0, 0, THIRDS, "90", False), ("HDMI-1", 1200, 0, 1.0, "normal", True)],
+    off=("eDP-1",),
+)
+
+
+class Session:
+    """Stands in for the display, the lid and the files, and runs a command.
+
+    `shows` are the gdctl show outputs read in turn; the last one repeats.
+    """
+
+    def __init__(self, tmp, *shows, lid_closed=False):
+        self.tmp, self.shows, self.lid = Path(tmp), list(shows), lid_closed
+        self.applied = []
+
+    def read(self):
+        return dl.parse_show(self.shows.pop(0) if len(self.shows) > 1 else self.shows[0])
+
+    def run(self, argv):
+        assert argv[:2] == ["gdctl", "set"], argv
+        self.applied.append(argv[2:])
+        return ""
+
+    def __call__(self, command, *args):
+        out = io.StringIO()
+        saved = dl.read_state, dl.run, dl.lid_closed
+        dl.read_state, dl.run, dl.lid_closed = self.read, self.run, lambda: self.lid
+        env = {"DISPLAY_LAYOUTS": str(self.tmp / "layouts.toml"), "XDG_STATE_HOME": str(self.tmp / "state"),
+               "NO_COLOR": "1"}
+        before = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            with contextlib.redirect_stdout(out):
+                command(*args)
+            return out.getvalue()
+        except SystemExit as exc:
+            return f"exit: {exc}"
+        except dl.REFUSALS as exc:
+            return f"exit: display-layout: {exc}"
+        finally:
+            dl.read_state, dl.run, dl.lid_closed = saved
+            for k, v in before.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    @property
+    def file(self):
+        return (self.tmp / "layouts.toml").read_text()
+
+    @property
+    def recent(self):
+        return (self.tmp / "state" / "display-layout" / "recent").read_text().split()
+
+
+def groups(argv):
+    """gdctl set arguments as {connector: (x, y, scale, transform, primary, mode)}."""
+    out, current = {}, []
+    for arg in argv + ["--logical-monitor"]:
+        if arg == "--logical-monitor" and current:
+            value = lambda flag: current[current.index(flag) + 1]  # noqa: E731
+            out[value("--monitor")] = (int(value("--x")), int(value("--y")), float(value("--scale")),
+                                       value("--transform"), "--primary" in current, value("--mode"))
+            current = []
+        elif arg != "--logical-monitor":
+            current.append(arg)
+    return out
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    desk = Session(tmp, DESK)
+    out = desk(dl.save, dl.SaveArgs("desk-tall"))
+    store = dl.parse_store(desk.file)
+    check("save names new monitors from their model", ["hp", "laptop", "arzopa"], list(store.aliases))
+    check("an alias is vendor and product, no serial for a single monitor",
+          dl.Model("GWD", "ARZOPA"), store.aliases["arzopa"])
+    check(
+        "save records the arrangement on screen, by alias",
+        (dl.Screen("arzopa", ARZOPA[5], 0, 180, THIRDS, "90"), dl.Screen("hp", HP[5], 1200, 0),
+         dl.Screen("laptop", LAPTOP[5], 1200, 1080, THIRDS, primary=True)),
+        store.layouts["desk-tall"],
+    )
+    check("save reports the aliases it made", True, "new alias arzopa: GWD ARZOPA" in out)
+    check("save draws the result through cells, in outline without colour", True,
+          "desk-tall, as saved" in out and "╭" in out and "laptop ★" in out)
+    check("save puts the layout first in recent", ["desk-tall"], desk.recent)
+
+    # The ARZOPA moves to DP-2, and mutter falls back to its row.
+    moved = Session(tmp, DESK_DP2_ROW, DESK.replace("DP-1", "DP-2"))
+    out = moved(dl.use, dl.UseArgs("desk-tall"))
+    check("use applies once", 1, len(moved.applied))
+    check(
+        "use binds each alias to the port its monitor is on now",
+        {"DP-2": (0, 180, THIRDS, "90", False, ARZOPA[5]), "HDMI-1": (1200, 0, 1.0, "normal", False, HP[5]),
+         "eDP-1": (1200, 1080, THIRDS, "normal", True, LAPTOP[5])},
+        groups(moved.applied[0]),
+    )
+    check("use never passes --persistent", [], [a for a in moved.applied[0] if a in ("-P", "--persistent")])
+    check("use draws the result and names it", True, out.startswith("desk-tall, as saved"))
+
+    # A second layout saved, then the screen changed by hand.
+    Session(tmp, DESK.replace("Position: (0, 180)", "Position: (0, 0)"))(dl.save, dl.SaveArgs("desk-top"))
+    check("listing marks what fits", "fits  desk-tall  arzopa, hp, laptop\nfits  desk-top   arzopa, hp, laptop\n",
+          Session(tmp, DESK)(dl.list_, dl.ListArgs()))
+    check("a layout for other monitors does not fit", "      desk-tall  arzopa, hp, laptop\n      desk-top   arzopa, hp, laptop\n",
+          Session(tmp, PANEL_ONLY)(dl.list_, dl.ListArgs()))
+    check("show names a layout on screen as saved, recent or not", "desk-tall, as saved",
+          Session(tmp, DESK)(dl.show, dl.ShowArgs()).splitlines()[0])
+    nudged = DESK.replace("Position: (0, 180)", "Position: (0, 100)")
+    check("show names what changed since the layout last put on screen", "desk-top, changed since: arzopa moved",
+          Session(tmp, nudged)(dl.show, dl.ShowArgs()).splitlines()[0])
+    check("show says so when the screen is no saved layout", "not a saved layout",
+          Session(tmp, ROW)(dl.show, dl.ShowArgs()).splitlines()[0])
+
+    refused = Session(tmp, PANEL_ONLY)
+    out = refused(dl.use, dl.UseArgs("desk-tall"))
+    check("use refuses a layout for other monitors, and says which are connected",
+          "exit: display-layout: desk-tall is for arzopa, hp, laptop; connected: laptop on eDP-1", out)
+    check("and applies nothing", [], refused.applied)
+    check("use names the saved layouts when it does not know the name", True,
+          "saved: desk-tall, desk-top" in Session(tmp, DESK)(dl.use, dl.UseArgs("nope")))
+
+    # With the lid closed the panel is not part of the set.
+    docked = Session(tmp, DOCKED, lid_closed=True)
+    docked(dl.save, dl.SaveArgs("docked"))
+    check("a layout saved with the lid closed leaves the panel out",
+          ["arzopa", "hp"], [s.name for s in dl.parse_store(docked.file).layouts["docked"]])
+    docked_dp2 = Session(tmp, DOCKED.replace("DP-1", "DP-2"), lid_closed=True)
+    docked_dp2(dl.use, dl.UseArgs("docked"))
+    check("and is applied, on other ports, with the panel left off",
+          {"DP-2": (0, 0, THIRDS, "90", False, ARZOPA[5]), "HDMI-1": (1200, 0, 1.0, "normal", True, HP[5])},
+          groups(docked_dp2.applied[0]))
+    check("with the lid open the same set is a different one", "exit: display-layout: docked is for arzopa, hp; "
+          "connected: hp on HDMI-1, laptop on eDP-1, arzopa on DP-1", Session(tmp, DESK)(dl.use, dl.UseArgs("docked")))
+    check("use puts the layout first in recent", ["docked", "desk-top", "desk-tall"], docked_dp2.recent)
+
+    # The panel switched off with the lid open cannot be saved: no layout would fit that set.
+    check("save refuses a connected monitor that is off",
+          "exit: display-layout: eDP-1 is connected but off, and a layout covers every connected monitor",
+          Session(tmp, DOCKED)(dl.save, dl.SaveArgs("x")))
+
+# --- the layouts file
+
+commented = """\
+# my desks
+[aliases]
+laptop = { vendor = "AUO", product = "0xc199" }  # the panel
+
+[layouts.solo]
+laptop = { x = 0, y = 0, mode = "2560x1600@165.040", primary = true }
+"""
+solo = dl.parse_store(commented)
+check("a screen's scale, transform and primary default", dl.Screen("laptop", LAPTOP[5], 0, 0),
+      dl.replace(solo.layouts["solo"][0], primary=False))
+rewritten = dl.with_layout(commented, "solo-big", (dl.Screen("laptop", LAPTOP[5], 0, 0, 2.0, "180", True),), {})
+check("saving keeps the file's comments", True, "# my desks" in rewritten and "# the panel" in rewritten)
+check("and reads back as written", (dl.Screen("laptop", LAPTOP[5], 0, 0, 2.0, "180", True),),
+      dl.parse_store(rewritten).layouts["solo-big"])
+
+
+def refusal(text):
+    try:
+        dl.parse_store(text)
+        return "accepted"
+    except dl.StoreError as exc:
+        return str(exc)
+
+
+check("a layout naming an unknown alias is refused", "layout solo, hp: no such alias in [aliases]",
+      refusal(commented + 'hp = { x = 1600, y = 0, mode = "1920x1080@60.000" }\n'))
+check("a layout needs exactly one primary", "layout solo: exactly one monitor has primary = true",
+      refusal(commented.replace(", primary = true", "")))
+check("a misspelt key is refused", True, refusal(commented.replace("primary", "primay")).startswith(
+      "layout solo, laptop: unknown key primay"))
+
+# --- naming monitors
+
+named, aliases = dl.name_monitors({}, list(dl.parse_show(gdctl_show(
+    [LAPTOP, HP, ("DP-3", "x", "GSM", "LG ULTRAWIDE", "1", "3440x1440@99.997"),
+     ("DP-4", "x", "ABC", "0x1234", "2", "1920x1080@60.000"), ("DP-5", "x", "HPN", "HP E24 G5", "3", "1920x1080@60.000")],
+    [("eDP-1", 0, 0, 1.0, "normal", True)])).monitors.values()))
+check("aliases come from the product's first word, the vendor when that is a code, laptop for the panel",
+      {"eDP-1": "laptop", "HDMI-1": "hp", "DP-3": "lg", "DP-4": "abc", "DP-5": "hp-2"}, named)
+
+twins = dl.parse_show(gdctl_show(
+    [LAPTOP, on("DP-2", ARZOPA)[:4] + ("0x0000a002",) + ARZOPA[5:], ARZOPA],
+    [("eDP-1", 0, 0, 1.0, "normal", True)])).monitors
+named, aliases = dl.name_monitors({"arzopa": dl.Model("GWD", "ARZOPA")}, list(twins.values()))
+check("two monitors of one model each get an alias with their serial",
+      ({"eDP-1": "laptop", "DP-1": "arzopa", "DP-2": "arzopa-2"},
+       dl.Model("GWD", "ARZOPA", "0x0000a001"), dl.Model("GWD", "ARZOPA", "0x0000a002")),
+      (named, aliases["arzopa"], aliases["arzopa-2"]))
+
+# --- the drawing without colour, a worked example
+#
+# The laptop left of a turned ARZOPA, 40 columns across 1920 + 1200 logical px,
+# so a cell is 78 px. The panel's columns are those whose centre lies left of
+# 1920: 0 to 24. Its rows of cells run from 360 / 78 to 1560 / 78, cells 5 to 19,
+# and a text row holds two cells, so its box takes the text rows whose top cell
+# is its own: 3 to 9.
+
+travel = (dl.Screen("laptop", LAPTOP[5], 0, 360, THIRDS, primary=True), dl.Screen("arzopa", ARZOPA[5], 1920, 0, THIRDS, "90"))
+drawn = dl.draw(travel, 40, None).splitlines()
+check("an outline to scale, heavy for the primary", (3, 9, 0, 24), (
+    next(r for r, line in enumerate(drawn) if line.startswith("┏")),
+    next(r for r, line in enumerate(drawn) if line.startswith("┗")),
+    drawn[3].index("┏"), drawn[3].index("┓"),
+))
+check("the turned monitor spans the height, 15 columns", ("╭" + "─" * 13 + "╮", "╰" + "─" * 13 + "╯"),
+      (drawn[0][25:], drawn[-1][25:]))
+check("labels sit inside, with the rotation mark", True,
+      any("laptop ★" in line for line in drawn) and any("1200×1920 ↻" in line for line in drawn))
 
 print()
 print("FAILED" if failures else "all ok")
