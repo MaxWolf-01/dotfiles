@@ -30,7 +30,8 @@ closed laptop lid takes the panel out of the connected set, as it does for
 mutter.
 
 Every command that puts a saved layout on screen, or saves one, records it,
-and `show` compares the live arrangement with it. The record is $XDG_STATE_HOME/display-layout/recent.
+and `show` compares the live arrangement with it. The record is
+$XDG_STATE_HOME/display-layout/recent.
 
 `rotate`, `place`, `primary` and `scale` each change one thing about the
 arrangement on screen and draw the result; only `save` keeps it. They name a
@@ -96,7 +97,7 @@ import termios
 import textwrap
 import time
 import tty
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Annotated, Literal, NoReturn, Protocol, assert_never
@@ -131,6 +132,8 @@ TREE = re.compile(r"^(?P<prefix>[│ ]*)[├└]──(?P<text>.*)$")
 RESOLUTION = re.compile(r"^(\d+)x(\d+)@")
 POSITION = re.compile(r"^Position: \((-?\d+), (-?\d+)\)$")
 
+TRANSFORMS = ("normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270")
+"""Every transform gdctl takes."""
 TURNED = ("90", "270", "flipped-90", "flipped-270")
 """Transforms that put the mode's height along the layout's x axis."""
 
@@ -169,10 +172,15 @@ class Monitor:
 
     @property
     def resolution(self) -> tuple[int, int]:
-        m = RESOLUTION.match(self.mode)
-        if not m:
-            raise ParseError(f"{self.connector}: unreadable mode {self.mode!r}")
-        return int(m[1]), int(m[2])
+        return resolution(self.mode, self.connector)
+
+
+def resolution(mode: str, who: str) -> tuple[int, int]:
+    """Width and height in pixels of a mode as gdctl spells it. `who` names the monitor in the error."""
+    m = RESOLUTION.match(mode)
+    if not m:
+        raise ParseError(f"{who}: unreadable mode {mode!r}")
+    return int(m[1]), int(m[2])
 
 
 @dataclass
@@ -285,6 +293,11 @@ def parse_show(out: str) -> State:
     return State(monitors=monitors, logicals=logicals)
 
 
+def mirrored(state: State) -> list[str]:
+    """The connectors of the first logical monitor that shows more than one monitor. Empty when none does."""
+    return next((lo.connectors for lo in state.logicals if len(lo.connectors) > 1), [])
+
+
 def is_mutter_row(state: State) -> bool:
     """True when the layout is what mutter's create_linear() emits.
 
@@ -308,7 +321,7 @@ def plan(state: State) -> list[str]:
     Empty when there is nothing to arrange: no external, no built-in panel, or a
     mirrored logical monitor, which is always deliberate.
     """
-    if any(len(logical.connectors) > 1 for logical in state.logicals):
+    if mirrored(state):
         return []
 
     by_connector = {
@@ -601,9 +614,8 @@ def live(state: State, names: dict[str, str]) -> Arrangement:
 
 def check_savable(state: State, monitors: list[Monitor]) -> None:
     """Raise LayoutError unless each connected monitor, and only those, is on screen on its own."""
-    for lo in state.logicals:
-        if len(lo.connectors) > 1:
-            raise LayoutError(f"{' and '.join(lo.connectors)} mirror each other, and a layout cannot hold a mirror")
+    if mirror := mirrored(state):
+        raise LayoutError(f"{' and '.join(mirror)} mirror each other, and a layout cannot hold a mirror")
     shown = {c for lo in state.logicals for c in lo.connectors}
     off = [m.connector for m in monitors if m.connector not in shown]
     if off:
@@ -794,6 +806,12 @@ def layouts_file() -> Path:
     return Path(os.environ.get("DISPLAY_LAYOUTS") or Path(__file__).resolve().parents[1] / "desktop" / "display-layouts.toml")
 
 
+def layout_named(store: Store, name: str) -> Arrangement:
+    if name not in store.layouts:
+        raise LayoutError(f"no layout named {name}; saved: {', '.join(store.layouts) or 'none'}")
+    return store.layouts[name]
+
+
 def load_store() -> Store:
     return read_store()[2]
 
@@ -833,7 +851,7 @@ def lid_closed() -> bool:
             "--object-path", "/org/freedesktop/UPower",
             "--method", "org.freedesktop.DBus.Properties.Get", "org.freedesktop.UPower", "LidIsClosed",
         ])
-    except (CommandError, OSError):
+    except CommandError:
         return False
     return "true" in out
 
@@ -849,6 +867,17 @@ class Current:
     """What differs from that layout. Empty when it is on screen as saved."""
 
 
+def used_first(names: Iterable[str], recent: list[str]) -> list[str]:
+    """The names, those in `recent` first and in its order, then the rest in their own."""
+    names = list(names)
+    return [n for n in recent if n in names] + [n for n in names if n not in recent]
+
+
+def last_used(names: Collection[str], recent: list[str]) -> str | None:
+    """The name among these that `recent` lists first. None when it lists none of them."""
+    return next((n for n in recent if n in names), None)
+
+
 def current(state: State, monitors: list[Monitor], store: Store, recent: list[str]) -> Current:
     """Name the monitors on screen and find the layout it came from.
 
@@ -856,17 +885,16 @@ def current(state: State, monitors: list[Monitor], store: Store, recent: list[st
     Otherwise the one last used with these monitors is reported with what
     changed since.
     """
-    if any(len(lo.connectors) > 1 for lo in state.logicals):
+    if mirrored(state):
         return Current(live(state, known_names(store.aliases, monitors)), None, ())
     fitting = match(store, monitors)
-    order = [n for n in recent if n in fitting] + [n for n in fitting if n not in recent]
     seen = {}
-    for name in order:
+    for name in used_first(fitting, recent):
         now = live(state, {c: a for a, c in fitting[name].items()})
         seen[name] = now
         if not changes(store.layouts[name], now):
             return Current(now, name, ())
-    last = next((n for n in recent if n in fitting), None)
+    last = last_used(fitting, recent)
     if last:
         return Current(seen[last], last, tuple(changes(store.layouts[last], seen[last])))
     return Current(live(state, known_names(store.aliases, monitors)), None, ())
@@ -1267,13 +1295,12 @@ def cells(arrangement: Arrangement, width: int) -> list[list[str | None]]:
 
 def bounds(s: Screen) -> Box:
     """A screen's box."""
-    w, h = logical_size(Monitor(s.name, s.mode).resolution, s.transform, s.scale)
+    w, h = logical_size(resolution(s.mode, s.name), s.transform, s.scale)
     return s.x, s.y, s.x + w, s.y + h
 
 
-TRANSFORMS = ("normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270")
 ARROWS = {"90": "↻", "270": "↺", "180": "↻↻"}
-"""The rotation mark in a label. gdctl's 90 is what GNOME Settings calls Portrait Right."""
+"""The rotation mark in a label, by gdctl transform."""
 
 EARTH = {"laptop": "#5f6f52", "hp": "#8a6a52", "lg": "#6f5e70", "arzopa": "#56657a"}
 """Fill colour per alias: sage, clay, mauve, slate."""
@@ -1282,14 +1309,18 @@ MORE_EARTH = ("#7a6d48", "#4f6b66", "#7a5550", "#5d5a4c")
 SAND = "#ede3d2"
 """Label text on a fill."""
 MOSS = "#6ea444"
-"""The house accent, framing the monitor `edit` has selected."""
+"""Moss green, the one accent beside the earth fills, framing the monitor `edit` has selected."""
 MAX_COLUMNS = 72
 MAX_ROWS = 22
 """The largest drawing fit_width allows, in terminal characters, however large the terminal is."""
 
 
-def colours_for(names: Iterable[str], terminal: bool) -> dict[str, str] | None:
-    """The palette for these names when drawing in a `terminal`, None for an outline. NO_COLOR asks for the outline."""
+def colours_for(store: Store, arrangement: Arrangement, terminal: bool) -> dict[str, str] | None:
+    """Fills for the store's aliases and the arrangement's names, or None for an outline.
+
+    The outline is for a drawing outside a `terminal`, or when NO_COLOR is set.
+    """
+    names = [*store.aliases, *(s.name for s in arrangement)]
     return palette(names) if terminal and not os.environ.get("NO_COLOR") else None
 
 
@@ -1508,8 +1539,11 @@ def decide(
     if now == settled:
         return Decision(settled, None)
     fitting = match(store, monitors)
-    recall = lambda name: Recall(name, tuple(layout_args(store.layouts[name], fitting[name])))  # noqa: E731
-    last = next((n for n in recent if n in fitting), None)
+
+    def recall(name: str) -> Recall:
+        return Recall(name, tuple(layout_args(store.layouts[name], fitting[name])))
+
+    last = last_used(fitting, recent)
     if last:
         return Decision(now, recall(last), "last used with these monitors")
     if fitting:
@@ -1545,7 +1579,10 @@ def system_env() -> dict[str, str]:
 
 
 def run(argv: list[str]) -> str:
-    proc = subprocess.run(argv, capture_output=True, text=True, env=system_env())
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, env=system_env())
+    except OSError as exc:
+        raise CommandError(f"{argv[0]} could not be run: {exc}") from None
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip()
         raise CommandError(f"{' '.join(argv)} failed: {detail}", detail)
@@ -1571,6 +1608,9 @@ def log_run(outcome: str, reason: str, stats: dict) -> None:
         print(f"display-layout: run-log failed: {proc.stderr.strip()}", file=sys.stderr)
 
 
+SAVE_HINT = "display-layout save NAME saves the one on screen"
+
+
 def fail(message: str) -> NoReturn:
     raise SystemExit(f"display-layout: {message}")
 
@@ -1583,7 +1623,7 @@ def picture(now: Current, store: Store) -> str:
         head = f"last used with these monitors: {now.layout}; since then {', '.join(now.changed)}"
     else:
         head = "not a saved layout"
-    colours = colours_for([*store.aliases, *(s.name for s in now.arrangement)], sys.stdout.isatty())
+    colours = colours_for(store, now.arrangement, sys.stdout.isatty())
     width = fit_width(now.arrangement, shutil.get_terminal_size((80, 24)).columns)
     return head + "\n\n" + draw(now.arrangement, width, colours)
 
@@ -1622,12 +1662,11 @@ def pick(args: PickArgs) -> None:
     state = read_state()
     monitors = connected(state, lid_closed())
     if not store.layouts:
-        raise LayoutError(f"no layouts in {layouts_file()}; display-layout save NAME saves the one on screen")
+        raise LayoutError(f"no layouts in {layouts_file()}; {SAVE_HINT}")
     names = choices(store, monitors, recent())
     if not names:
         raise LayoutError(
-            f"no saved layout fits the monitors connected now ({describe_connected(monitors, store)}); "
-            "display-layout save NAME saves the one on screen"
+            f"no saved layout fits the monitors connected now ({describe_connected(monitors, store)}); {SAVE_HINT}"
         )
     name = choose(names)
     if name:
@@ -1636,8 +1675,7 @@ def pick(args: PickArgs) -> None:
 
 def choices(store: Store, monitors: list[Monitor], recent: list[str]) -> list[str]:
     """The layouts that fit these monitors, the most recently used first, then in file order."""
-    fitting = match(store, monitors)
-    return [n for n in recent if n in fitting] + [n for n in fitting if n not in recent]
+    return used_first(match(store, monitors), recent)
 
 
 def choose(names: list[str]) -> str | None:
@@ -1667,14 +1705,11 @@ def preview(name: str) -> str:
     unless NO_COLOR is set.
     """
     store = load_store()
-    if name not in store.layouts:
-        raise LayoutError(f"no layout named {name}; saved: {', '.join(store.layouts) or 'none'}")
-    arrangement = store.layouts[name]
+    arrangement = layout_named(store, name)
     size = shutil.get_terminal_size((80, 24))
     columns = int(os.environ.get("FZF_PREVIEW_COLUMNS") or size.columns)
     lines = int(os.environ.get("FZF_PREVIEW_LINES") or size.lines)
-    colours = colours_for([*store.aliases, *(s.name for s in arrangement)],
-                          sys.stdout.isatty() or "FZF_PREVIEW_COLUMNS" in os.environ)
+    colours = colours_for(store, arrangement, sys.stdout.isatty() or "FZF_PREVIEW_COLUMNS" in os.environ)
     return draw(arrangement, fit(arrangement, columns, lines), colours)
 
 
@@ -1691,15 +1726,14 @@ def use(args: UseArgs) -> None:
     The layout's monitors have to be the ones connected, on whichever ports.
     """
     store = load_store()
-    if args.name not in store.layouts:
-        raise LayoutError(f"no layout named {args.name}; saved: {', '.join(store.layouts) or 'none'}")
+    layout = layout_named(store, args.name)
     state = read_state()
     monitors = connected(state, lid_closed())
     binding = match(store, monitors).get(args.name)
     if binding is None:
-        wants = ", ".join(s.name for s in store.layouts[args.name])
+        wants = ", ".join(s.name for s in layout)
         raise LayoutError(f"{args.name} is for {wants}; connected: {describe_connected(monitors, store)}")
-    run(["gdctl", "set", *layout_args(store.layouts[args.name], binding)])
+    run(["gdctl", "set", *layout_args(layout, binding)])
     remember(args.name)
     print(picture(on_screen(store), store))
 
@@ -1766,7 +1800,7 @@ def list_(args: ListArgs) -> None:
         ], indent=2))
         return
     if not store.layouts:
-        print(f"no layouts in {layouts_file()}; display-layout save NAME saves the one on screen")
+        print(f"no layouts in {layouts_file()}; {SAVE_HINT}")
         return
     wide = max(len(name) for name in store.layouts)
     for name, layout in store.layouts.items():
@@ -1849,10 +1883,9 @@ def editable(state: State, store: Store) -> tuple[Arrangement, dict[str, str], l
 
     Raises LayoutError for a mirror, since the edits move only monitors shown on their own.
     """
-    for lo in state.logicals:
-        if len(lo.connectors) > 1:
-            raise LayoutError(f"{' and '.join(lo.connectors)} mirror each other; rotate, place, primary, scale "
-                              "and edit move monitors shown on their own")
+    if mirror := mirrored(state):
+        raise LayoutError(f"{' and '.join(mirror)} mirror each other; rotate, place, primary, scale "
+                          "and edit move monitors shown on their own")
     lit = {c for lo in state.logicals for c in lo.connectors}
     shown = [m for m in state.monitors.values() if m.connector in lit]
     names = known_names(store.aliases, shown)
@@ -2145,7 +2178,7 @@ def edit_(args: EditArgs) -> None:
     A moved monitor snaps back against the others, so they stay joined edge to
     edge. The display follows 0.3 s after the last key press, for the session
     only; only enter keeps the arrangement as a layout. The name enter offers
-    is that of the layout on screen at the start.
+    is the layout `show` names at the start.
     """
     store = load_store()
     state = read_state()
@@ -2161,7 +2194,7 @@ def edit_(args: EditArgs) -> None:
 
     terminal = Terminal()
     with terminal:
-        view = View(terminal, colours_for([*store.aliases, *(s.name for s in start)], terminal=True))
+        view = View(terminal, colours_for(store, start, terminal=True))
         ending = interact(at_origin(start), selected, terminal, view, apply)
     if ending.how == "put-back":
         print("put back the arrangement edit started from\n")
@@ -2196,8 +2229,6 @@ def ask_name(terminal: Terminal, default: str | None) -> str | None:
             print(exc)
 
 
-
-
 @dataclass
 class ApplyArgs:
     dry_run: bool = False
@@ -2213,8 +2244,7 @@ def apply(args: ApplyArgs) -> None:
     state = read_state()
     argv = plan(state)
     if not argv:
-        print("nothing to arrange", file=sys.stderr)
-        raise SystemExit(1)
+        raise LayoutError("nothing to arrange")
     print("gdctl set " + " ".join(argv))
     if not args.dry_run:
         run(["gdctl", "set", *argv])
@@ -2285,15 +2315,15 @@ def arrange(settled: ConnectedSet | None) -> ConnectedSet | None:
     """Carry out what `decide` chooses for the display as it is now, and log it in one line.
 
     Takes the connected set this already dealt with, and returns the set it
-    leaves dealt with -- which is the old one whenever nothing could be
-    applied, so a display that could not be read or arranged is tried again on
-    the next signal rather than written off. A layout mutter rejects is left
-    out, and the choice made again without it. With a layouts file that cannot
-    be read, only the fallback applies.
+    leaves dealt with. That is the old one whenever nothing could be applied,
+    so a display that could not be read or arranged is tried again on the next
+    signal rather than written off. A layout mutter rejects is left out, and
+    the choice made again without it. With a layouts file that cannot be read,
+    only the fallback applies.
     """
     try:
         state = read_state()
-    except (ParseError, RuntimeError) as exc:
+    except (ParseError, CommandError) as exc:
         log_run("fail", str(exc), {})
         return settled
     lid = lid_closed()
@@ -2325,7 +2355,7 @@ def arrange(settled: ConnectedSet | None) -> ConnectedSet | None:
                 done = decision.why
         try:
             run(["gdctl", "set", *apply.argv])
-        except RuntimeError as exc:
+        except CommandError as exc:
             problems.append(f"{stats.get('layout', 'the fallback')} rejected: {exc}")
             if not isinstance(apply, Recall):
                 log_run("fail", "; ".join(problems), stats)
