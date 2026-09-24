@@ -1,49 +1,65 @@
 """The world bin/vpn reaches through its ports, faked, and the ways a test drives bin/vpn in it.
 
 A World is tailscaled, the network, the clock and Vesktop as one simulation,
-in tailscaled's own shapes: full status and prefs, a Prefs bus message for
-every change of preferences, and an engine update every 2 s carrying each live
-peer's byte counters and last handshake. Its Mullvad nodes are Hosts, each
-answering handshakes or not, carrying traffic or not, and blocked by Cloudflare
-or not. Time is the World's own: waiting advances it, and nothing sleeps.
+in tailscaled's own shapes. It serves full status and prefs, sends a Prefs bus
+message for every change of preferences, and pushes an engine update every
+2 s with each live peer's byte counters and last handshake. Its Mullvad nodes
+are Hosts. Each answers handshakes or not, carries traffic or not, and is
+blocked by Cloudflare or not. Time is the World's own. Waiting advances it,
+and nothing sleeps.
 
-The World records what happens in it as Entries, in order: every step the
-watcher takes through a port that acts (a probe, a `tailscale set`, a
-connect, a Discord check), every change from outside, and every request's
-sending, disconnection and final line.
+The World records what happens in it as Entries, in order. There is one for
+every step the watcher takes through a port that acts (a probe, a `tailscale
+set`, a connect, a Discord check), for every change from outside, and for
+each request's sending, disconnection and final line.
 
-The drivers at the bottom are the one place that knows how bin/vpn's functions
-are called; a test states what happens, and they call.
+The World's port wiring and the drivers at the bottom are the only code here
+that calls into bin/vpn. A test states what happens, and they call.
+
+Loading this module points bin/vpn at a scratch directory for its runtime
+files, at no tailscaled socket, and at a `tailscale` that fails, so code
+that bypasses the ports fails instead of reaching the real VPN.
 """
 
+import atexit
 import hashlib
 import heapq
 import importlib.util
 import itertools
 import json
 import os
+import shutil
 import tempfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-# bin/vpn fixes its state file and lock under XDG_RUNTIME_DIR when it loads.
-os.environ["XDG_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="vpn-fakes-")
+SCRATCH = Path(tempfile.mkdtemp(prefix="vpn-fakes-"))
+atexit.register(shutil.rmtree, SCRATCH, ignore_errors=True)
+(SCRATCH / "run").mkdir()
+(SCRATCH / "bin").mkdir()
+(SCRATCH / "bin" / "tailscale").write_text(
+    "#!/bin/sh\necho 'vpn_fakes: bin/vpn ran the real tailscale instead of its Tailscaled port' >&2\nexit 1\n")
+(SCRATCH / "bin" / "tailscale").chmod(0o755)
+os.environ["XDG_RUNTIME_DIR"] = str(SCRATCH / "run")
+os.environ["VPN_TAILSCALED_SOCKET"] = str(SCRATCH / "no-tailscaled.sock")
+os.environ["PATH"] = f"{SCRATCH / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
 
 
-def _load(path: Path):
-    loader = SourceFileLoader("vpn", str(path))
-    spec = importlib.util.spec_from_loader("vpn", loader)
+def load(name: str, path: Path):
+    loader = SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
     assert spec
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
 
 
-vpn = _load(Path(__file__).resolve().parent.parent / "bin" / "vpn")
+vpn = load("vpn", Path(__file__).resolve().parent.parent / "bin" / "vpn")
 
 T0 = 1_800_000_000.0
 ENGINE_SECS = 2.0
@@ -51,9 +67,10 @@ ENGINE_SECS = 2.0
 RTT = 0.05
 """One round trip to any node that answers."""
 DEMAND = 1500
-"""Bytes this machine's applications send through the exit node between two engine updates; a node that carries answers twice that."""
-SETTLE_SECS = 120.0
-"""How long a run goes on after its last event."""
+"""Bytes this machine's applications send through the exit node between two engine updates. A node that
+carries traffic answers with twice that."""
+AFTER_SECS = 120.0
+"""How long a run goes on after its last timed event."""
 HANG_SECS = 1800.0
 """How far past a run's end the watcher may keep the World busy before it counts as hung."""
 
@@ -86,38 +103,50 @@ class Host:
     answers: bool = True
     """Completes a WireGuard handshake."""
     carries: bool = True
-    """Forwards traffic to the internet; only a node that answers can."""
+    """Forwards traffic to the internet. Only a node that answers can."""
     blocked: bool = False
     """Cloudflare answers the Discord check through it with a 403."""
+    handshook: bool = False
+    """Completed a handshake before the World's first moment, whatever it does now."""
+    leaks: bool = False
+    """A connect through it answers although it carries nothing, as when the switch to it has not taken effect.
+    Its own counters stay still."""
+    discord_silent: bool = False
+    """Discord does not answer through it, though it carries traffic and Cloudflare does not block it."""
 
     @property
     def fqdn(self) -> str:
         return f"{self.name}.mullvad.ts.net"
 
 
-State = tuple[str, str | None]
-"""How the exit node is set: ("pinned", node), ("automatic", its pick) or ("off", None)."""
+Setting = tuple[str, str | None]
+"""How the exit node is set, as ("pinned", node), ("automatic", its pick) or ("off", None)."""
+
+StepKind = Literal["set", "probe", "connect", "discord"]
+Kind = Literal["send", "disconnect", "finish", "outside", "auto-move", "set", "probe", "connect", "discord"]
+STEPS = ("set", "probe", "connect", "discord")
 
 
 @dataclass(frozen=True)
 class Entry:
-    kind: str
-    """send, disconnect, finish: a request's; outside, auto-move: a change from outside;
-    set, probe, connect, discord: a step the watcher took."""
+    kind: Kind
+    """send, disconnect and finish are a request's. outside and auto-move are changes from outside. set, probe,
+    connect and discord are steps the watcher took."""
     t: float
-    before: State
-    state: State
-    """The exit node after the entry."""
+    before: Setting
+    state: Setting
+    """The exit node after the entry. For a connect or a Discord check, which take time, the exit node as the
+    step began."""
     req: int | None = None
     """The request a send, disconnect or finish is about."""
-    logged: int | None = None
-    """outside, auto-move: how many node-log lines there were when it happened."""
     what: Any = None
-    """send: the request; set, outside: the target; probe: the node; connect: whether it answered;
-    discord: the verdict; finish: (ok, message); auto-move: the new pick."""
+    """For a send, the Ask. For a set or outside, the target. For a probe, the node. For a connect, whether it
+    answered. For a discord, the verdict. For a finish, (ok, message). For an auto-move, the new pick."""
+    logged: int | None = None
+    """For outside and auto-move, how many node-log lines there were when it happened."""
 
 
-# Things that happen in a World, at a time or after a step.
+# What happens in a World, at a time or after a step.
 
 
 @dataclass(frozen=True)
@@ -130,7 +159,7 @@ class Ask:
 
 @dataclass(frozen=True)
 class Outside:
-    """A bare `tailscale set --exit-node=<target>`: an escape hatch, or max by hand."""
+    """A bare `tailscale set --exit-node=<target>`, run by an escape hatch or by max by hand."""
 
     target: str
 
@@ -155,7 +184,7 @@ class Revives:
 
 
 @dataclass(frozen=True)
-class Offline:
+class Online:
     """The control server changes a node's online flag."""
 
     name: str
@@ -164,7 +193,7 @@ class Offline:
 
 @dataclass(frozen=True)
 class Disconnect:
-    """The command whose request is running goes away (Ctrl-C)."""
+    """The command whose request is running goes away, as on Ctrl-C."""
 
 
 @dataclass(frozen=True)
@@ -181,20 +210,20 @@ class Quiet:
 
 @dataclass(frozen=True)
 class BusGap:
-    """The event bus carries nothing for a while, then reconnects; what changed meanwhile arrives as one change."""
+    """The event bus carries nothing for a while, then reconnects. What changed meanwhile arrives as one change."""
 
     secs: float
 
 
-Event = Ask | Outside | AutoMoves | Dies | Revives | Offline | Disconnect | Vesktop | Quiet | BusGap
+Happening = Ask | Outside | AutoMoves | Dies | Revives | Online | Disconnect | Vesktop | Quiet | BusGap
 
 
 @dataclass(frozen=True)
 class AfterStep:
-    """When the n-th step the watcher takes returns, counting from 1; with `kind`, the n-th step of that kind."""
+    """When the n-th step the watcher takes returns, counting from 1. With `kind`, the n-th step of that kind."""
 
     n: int
-    kind: str | None = None
+    kind: StepKind | None = None
 
 
 @dataclass(frozen=True)
@@ -224,13 +253,13 @@ def iso(t: float | None) -> str:
 
 
 @dataclass
-class Client:
+class Caller:
     """The command at the other end of one request."""
 
     world: "World"
     id: int
     lines: list[str] = field(default_factory=list)
-    result: tuple[bool, str] | None = None
+    finishes: list[tuple[bool, str]] = field(default_factory=list)
     here: bool = True
 
     def say(self, line: str) -> None:
@@ -238,7 +267,7 @@ class Client:
             self.lines.append(line)
 
     def finish(self, ok: bool, message: str) -> None:
-        self.result = (ok, message)
+        self.finishes.append((ok, message))
         self.world.note("finish", req=self.id, what=(ok, message))
 
     def connected(self) -> bool:
@@ -246,20 +275,20 @@ class Client:
 
 
 class World:
-    def __init__(self, hosts: list[Host], state: State = ("off", None), *, auto_pick: str | None = None,
+    def __init__(self, hosts: list[Host], setting: Setting = ("off", None), *, auto_pick: str | None = None,
                  vesktop: bool = False):
         self.hosts = {h.name: h for h in hosts}
-        self.mode, self.exit = state
-        self.auto_pick = auto_pick or (state[1] if state[0] == "automatic" else None) or hosts[0].name
+        self.mode, self.exit = setting
+        self.auto_pick = auto_pick or (setting[1] if setting[0] == "automatic" else None) or hosts[0].name
         self.vesktop = vesktop
         self.now = T0
         self.rx: dict[str, int] = {}
         self.tx: dict[str, int] = {}
-        self.handshake: dict[str, float] = {}
+        self.handshake = {h.name: T0 - 90 for h in hosts if h.handshook}
         self.entries: list[Entry] = []
-        self.clients: list[Client] = []
+        self.callers: list[Caller] = []
         self.steps: dict[str | None, int] = {}
-        self.after_step: dict[tuple[int, str | None], list[Event]] = {}
+        self.after_step: dict[tuple[int, str | None], list[Happening]] = {}
         self.ready: list[object] = []
         self.schedule: list[tuple[float, int, Callable[[], None]]] = []
         self.seq = itertools.count()
@@ -267,8 +296,9 @@ class World:
         self.quiet_until = 0.0
         self.last_at = 0.0
         self.end = float("inf")
-        self.top = False
-        self.runs = Path(tempfile.mkdtemp(prefix="vpn-fakes-runs-"))
+        self.idle = False
+        """Whether the watcher is waiting at its top level, between two things it handles."""
+        self._runs: Path | None = None
         self.at(self.now, self.engine_update)
         if self.exit is not None and self.answers(self.exit):
             self.handshake[self.exit] = self.now - 30
@@ -280,9 +310,16 @@ class World:
             vesktop=lambda: self.vesktop,
         )
 
+    @property
+    def runs(self) -> Path:
+        """The run-log directory the watcher writes this World's node log to."""
+        if self._runs is None:
+            self._runs = Path(tempfile.mkdtemp(prefix="runs-", dir=SCRATCH))
+        return self._runs
+
     # --- what the World is
 
-    def state(self) -> State:
+    def setting(self) -> Setting:
         return (self.mode, self.exit)
 
     def answers(self, name: str) -> bool:
@@ -330,30 +367,33 @@ class World:
             prefs["AutoExitNode"] = "any"
         return prefs
 
-    def resolve(self, target: str) -> State:
+    def resolve(self, target: str) -> Setting:
         """What `tailscale set --exit-node=<target>` sets."""
         if target == "":
             return ("off", None)
         if target == "auto:any":
             return ("automatic", self.auto_pick)
         want = target.removesuffix(".")
-        for name, peer in self.peers().items():
-            host = peer["HostName"]
-            if want in (host, peer["DNSName"].removesuffix("."), peer["ID"], *peer["TailscaleIPs"]):
-                return ("pinned", host)
+        for peer in self.peers().values():
+            if want in (peer["HostName"], peer["DNSName"].removesuffix("."), peer["ID"], *peer["TailscaleIPs"]):
+                return ("pinned", peer["HostName"])
         raise vpn.VpnError(f"tailscale set {target} failed: invalid value")
 
     # --- changes
 
-    def note(self, kind: str, before: State | None = None, *, began: tuple[float, int] | None = None,
+    def note(self, kind: Kind, before: Setting | None = None, *, began: tuple[float, int] | None = None,
              **fields) -> Entry:
-        """Record an entry; `began` places a step that took time where it started: its time and the entry index."""
+        """Record an entry. `began`, the time and entry index a step started at, files a step that took time
+        where it started."""
+        if before is None:
+            before = self.setting()
         t, at = began or (self.now, len(self.entries))
-        entry = Entry(kind, t, before or self.state(), before or self.state() if began else self.state(), **fields)
+        after = before if began else self.setting()
+        entry = Entry(kind, t, before, after, **fields)
         self.entries.insert(at, entry)
         return entry
 
-    def change(self, new: State) -> None:
+    def change(self, new: Setting) -> None:
         """Set the exit node as tailscaled does, and tell the bus."""
         old = self.exit
         self.mode, self.exit = new
@@ -363,20 +403,20 @@ class World:
 
     def watcher_sets(self, target: str) -> None:
         new = self.resolve(target)
-        before = self.state()
+        before = self.setting()
         self.change(new)
         self.step("set", before, what=target)
 
-    def happen(self, event: Event) -> None:
-        before = self.state()
-        match event:
+    def happen(self, happening: Happening) -> None:
+        before = self.setting()
+        match happening:
             case Ask(request, place):
-                client = Client(self, len(self.clients))
-                self.clients.append(client)
-                self.note("send", req=client.id, what=event)
+                caller = Caller(self, len(self.callers))
+                self.callers.append(caller)
+                self.note("send", req=caller.id, what=happening)
                 self.arrive(vpn.Request(request=request, place=place,
-                                        client=vpn.Client(say=client.say, finish=client.finish,
-                                                          connected=client.connected)))
+                                        client=vpn.Client(say=caller.say, finish=caller.finish,
+                                                          connected=caller.connected)))
             case Outside(target):
                 new = self.resolve(target)
                 if new != before:
@@ -391,11 +431,11 @@ class World:
                 self.hosts[name] = replace(self.hosts[name], answers=False, carries=False)
             case Revives(name):
                 self.hosts[name] = replace(self.hosts[name], answers=True, carries=True)
-            case Offline(name, online):
+            case Online(name, online):
                 self.hosts[name] = replace(self.hosts[name], online=online)
                 self.arrive({"PeerChanges": [{"NodeID": int(stable_id(name)[1:7], 16), "Online": online}]})
             case Disconnect():
-                running = next((c for c in self.clients if c.result is None and c.here), None)
+                running = next((c for c in self.callers if not c.finishes and c.here), None)
                 if running is not None:
                     running.here = False
                     self.note("disconnect", req=running.id)
@@ -407,20 +447,20 @@ class World:
                 self.bus_down_until = self.now + secs
                 self.at(self.bus_down_until, lambda: self.arrive({"Prefs": self.prefs()}))
 
-    def when(self, trigger: AfterStep | At, event: Event) -> None:
+    def when(self, trigger: AfterStep | At, happening: Happening) -> None:
         match trigger:
             case AfterStep(n, kind):
-                self.after_step.setdefault((n, kind), []).append(event)
+                self.after_step.setdefault((n, kind), []).append(happening)
             case At(secs):
-                self.at(T0 + secs, lambda: self.happen(event))
+                self.at(T0 + secs, lambda: self.happen(happening))
                 self.last_at = max(self.last_at, secs)
 
-    def step(self, kind: str, before: State | None = None, **fields) -> None:
+    def step(self, kind: StepKind, before: Setting | None = None, **fields) -> None:
         self.note(kind, before, **fields)
         for counted in (None, kind):
             self.steps[counted] = self.steps.get(counted, 0) + 1
-            for event in self.after_step.pop((self.steps[counted], counted), []):
-                self.happen(event)
+            for happening in self.after_step.pop((self.steps[counted], counted), []):
+                self.happen(happening)
 
     # --- the network
 
@@ -434,22 +474,24 @@ class World:
         self.step("probe", what=name or ip)
 
     def connect(self, timeout: float) -> bool:
-        began, before = (self.now, len(self.entries)), self.state()
+        began, before = (self.now, len(self.entries)), self.setting()
         through = self.exit
-        ok = self.carries(through)
+        carries = self.carries(through)
+        ok = carries or (through in self.hosts and self.hosts[through].leaks)
         if through is not None:
             self.tx[through] = self.tx.get(through, 0) + 120
-            if ok:
+            if carries:
                 self.rx[through] = self.rx.get(through, 0) + 120
         self.advance(self.now + (3 * RTT if ok else timeout))
         self.step("connect", before, began=began, what=ok)
         return ok
 
     def discord(self) -> str:
-        began, before = (self.now, len(self.entries)), self.state()
-        if not self.carries(self.exit):
+        began, before = (self.now, len(self.entries)), self.setting()
+        host = self.hosts.get(self.exit or "")
+        if not self.carries(self.exit) or (host and host.discord_silent):
             verdict = "unreachable"
-        elif self.exit in self.hosts and self.hosts[self.exit].blocked:
+        elif host and host.blocked:
             verdict = "blocked"
         else:
             verdict = "clean"
@@ -460,9 +502,8 @@ class World:
     def egress(self) -> dict:
         if not self.carries(self.exit):
             return {}
-        mullvad = self.exit in self.hosts
         return {"ip": "185.0.0.1", "country": "", "city": "",
-                "mullvad_exit_ip_hostname": self.exit if mullvad else None}
+                "mullvad_exit_ip_hostname": self.exit if self.exit in self.hosts else None}
 
     # --- time
 
@@ -493,12 +534,12 @@ class World:
             self.now = max(self.now, t)
             fn()
         self.now = max(self.now, until)
-        if not self.top and self.now > self.end + HANG_SECS:
+        if not self.idle and self.now > self.end + HANG_SECS:
             raise Hang(f"the watcher was still busy {HANG_SECS:.0f} s after the run's last event")
 
     def wait(self, secs: float):
         """The Clock port's wait: the next arrival within `secs`, or None."""
-        if self.top and self.now >= self.end and not self.ready:
+        if self.idle and self.now >= self.end and not self.ready:
             raise Over
         deadline = self.now + max(secs, 0.0)
         while not self.ready:
@@ -536,11 +577,11 @@ class Line:
 
 
 def line(stats: dict) -> Line:
-    """Read a line in either vocabulary: `by`, `from` and `to`, or the older `command`, `node` and `rotated_to`."""
+    """Read a line in either vocabulary: `by`, `from` and `to`, or today's `command`, `node` and `rotated_to`."""
     event = stats.get("event", "")
     if "by" in stats:
-        change = event in ("moved", "on", "off", "changed")
-        return Line(event, change, stats["by"] == "outside", stats.get("from"), stats.get("to"))
+        frm, to = stats.get("from"), stats.get("to")
+        return Line(event, event != "silent" and frm != to, stats["by"] == "outside", frm, to)
     node, to = stats.get("node"), stats.get("rotated_to")
     if event in ("pinned", "rotated", "offline", "changed"):
         return Line(event, True, event == "changed", node, to)
@@ -556,69 +597,81 @@ def line(stats: dict) -> Line:
 # --------------------------------------------------------------------------
 
 
-def nodes(world: World) -> dict[str, object]:
+def nodes(world: World) -> dict[str, Any]:
     return {n.name: n for n in vpn.mullvad_nodes(world.status())}
 
 
-def walk(hosts: list[Host], current: str | None) -> list[str]:
+def next_order(hosts: list[Host], current: str | None) -> list[str]:
     """Where `vpn next` goes from `current`, in walk order."""
-    world = World(hosts)
-    by_name = nodes(world)
+    by_name = nodes(World(hosts))
     return [n.name for n in vpn.candidates(by_name.get(current), list(by_name.values()))]
 
 
-def walk_to(hosts: list[Host], place: str, current: str | None) -> list[str]:
+def to_order(hosts: list[Host], place: str, current: str | None) -> list[str]:
     """Where `vpn to <place>` goes from `current`, in walk order."""
-    world = World(hosts)
-    by_name = nodes(world)
+    by_name = nodes(World(hosts))
     everything = list(by_name.values())
     return [n.name for n in vpn.destinations(place, vpn.resolve(place, everything), by_name.get(current))]
 
 
-def liveness(world: World):
+def liveness(world: World) -> Any:
     live = vpn.Liveness(clock=world.ports.clock)
     live.learn(world.status())
     return live
 
 
 def probe(world: World, names: list[str]) -> list[str]:
-    """Handshake-probe the nodes named: the ones that answered."""
+    """Handshake-probe the nodes named. Returns the ones that answered."""
     by_name = nodes(world)
     return [n.name for n in vpn.probe([by_name[n] for n in names], liveness(world), world.ports)]
 
 
-def start(world: World):
+def start(world: World) -> Any:
     by_name = nodes(world)
     return vpn.Start(mode=world.mode, node=by_name.get(world.exit) if world.exit else None)
 
 
-def move(world: World, names: list[str], why: str, discord: bool) -> tuple[str, str | None, list[str]]:
-    """One move from where the exit node is now, through the nodes named: the
-    Outcome's kind, the node it pinned, and the lines it said."""
+@contextmanager
+def logging_to(world: World):
+    before = os.environ.get("RUN_LOG_DIR")
+    os.environ["RUN_LOG_DIR"] = str(world.runs)
+    try:
+        yield
+    finally:
+        if before is None:
+            del os.environ["RUN_LOG_DIR"]
+        else:
+            os.environ["RUN_LOG_DIR"] = before
+
+
+def move(world: World, names: list[str], why: str, discord: bool) -> tuple[str, str | None]:
+    """One move from where the exit node is now, through the nodes named. Returns the Outcome's kind and the
+    node it pinned."""
     by_name = nodes(world)
-    said: list[str] = []
-    os.environ["RUN_LOG_DIR"] = str(world.runs)
-    outcome = vpn.move(start(world), [by_name[n] for n in names], why, discord, said.append, lambda: None,
-                       liveness(world), world.ports)
-    return outcome.kind, outcome.node.name if outcome.node else None, said
+    with logging_to(world):
+        outcome = vpn.move(start(world), [by_name[n] for n in names], why, discord, lambda line: None,
+                           lambda: None, liveness(world), world.ports)
+    return outcome.kind, outcome.node.name if outcome.node else None
 
 
-def run(world: World, script: list[tuple[AfterStep | At, Event]]) -> World:
-    """The watcher, started at the World's first moment, through everything
-    the script makes happen and SETTLE_SECS after, stopping only while idle."""
-    for trigger, event in script:
-        world.when(trigger, event)
-    world.end = T0 + world.last_at + SETTLE_SECS
-    os.environ["RUN_LOG_DIR"] = str(world.runs)
+def run(world: World, script: list[tuple[AfterStep | At, Happening]]) -> World:
+    """The watcher, started at the World's first moment, through everything the script makes happen and
+    AFTER_SECS past its last timed event, stopping only while idle. Every request must have finished, once."""
+    for trigger, happening in script:
+        world.when(trigger, happening)
+    world.end = T0 + world.last_at + AFTER_SECS
     world.arrive({"Prefs": world.prefs()})
     w = vpn.Watch()
     due = 0.0
-    try:
-        while True:
-            world.top = True
-            arrival = world.wait(due)
-            world.top = False
-            due = vpn.handle(w, arrival, world.ports)
-    except Over:
-        pass
+    with logging_to(world):
+        try:
+            while True:
+                world.idle = True
+                arrival = world.wait(due)
+                world.idle = False
+                due = vpn.handle(w, arrival, world.ports)
+        except Over:
+            pass
+    unfinished = {c.id: len(c.finishes) for c in world.callers if len(c.finishes) != 1}
+    assert not unfinished, f"requests that did not finish exactly once, with their final lines counted: {unfinished}"
     return world
