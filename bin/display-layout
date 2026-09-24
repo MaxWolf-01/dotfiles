@@ -1,48 +1,108 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tyro"]
+# dependencies = ["tyro>=1.0.14", "tomlkit"]
 # ///
-"""Put the external monitors above the laptop panel when mutter falls back to its row.
+"""Save monitor arrangements under a name, put them back, and draw them in the terminal.
 
-GNOME keys saved layouts in ~/.config/monitors.xml on each monitor's connector
-name plus its EDID. One monitor reaches a different connector through a
-different port -- HDMI on the discrete GPU, DP-1 or DP-2 on the USB-C ports --
-so a layout saved on one port is not found on another. mutter then lays the
-monitors out in a left-to-right row.
+A layout is one arrangement of monitors: each monitor's position, mode, scale,
+rotation, and which one is primary. `save` and `edit` write layouts to
+desktop/display-layouts.toml in the dotfiles, or to the file DISPLAY_LAYOUTS
+names. A layout names its monitors by alias, and an alias stands for a vendor
+and product as gdctl show prints them, never for a connector, so a layout is
+found whichever port its monitors are plugged into. An alias carries a serial
+only to tell two monitors of one model apart, and the serial counts only while
+both are connected.
 
-This recognises that row and replaces it: externals along the top in the order
-mutter lists them, laptop panel centred below it and made primary. Modes,
-scales and transforms are carried over untouched; only positions change.
+    [aliases]
+    laptop = { vendor = "AUO", product = "0xc199" }
+    arzopa = { vendor = "GWD", product = "ARZOPA" }
 
-The arrangement lasts for the session, and gdctl's --persistent is deliberately
-left out of every call here. mutter makes a person confirm any display
-configuration a D-Bus client saves, so saving this one would raise the
-keep-these-settings dialog on every replug. Nothing is written to
-monitors.xml, and the arrangement is remade on each fallback instead.
+    [layouts.travel]
+    arzopa = { x = 0, y = 168, mode = "2560x1600@59.997", scale = 1.3333333730697632 }
+    laptop = { x = 1920, y = 0, mode = "2560x1600@165.040", scale = 1.3333333730697632, primary = true }
 
-Reads and writes display state through gdctl(1).
+A monitor's entry in a layout has scale 1, transform normal and primary false
+unless it says otherwise. `save` gives a monitor it has not seen an alias named
+from its model; renaming an alias means renaming it in [aliases] and in every
+layout. A layout fits when its monitors are exactly the ones connected, where a
+closed laptop lid takes the panel out of the connected set, as it does for
+mutter.
+
+Every command that puts a saved layout on screen, or saves one, records it,
+and `show` compares the live arrangement with it. The record is
+$XDG_STATE_HOME/display-layout/recent.
+
+`rotate`, `place`, `primary` and `scale` each change one thing about the
+arrangement on screen and draw the result; only `save` keeps it. They name a
+monitor by its alias, or by its connector where it has none. When a monitor
+changes size or is placed, the others move as little as they can while the
+monitors stay joined edge to edge, and none crosses to another side of a
+monitor it was beside. `edit` moves and turns monitors with the keyboard
+instead, drawn to fill the terminal; `display-layout edit --help` lists the
+keys.
+
+A drawing is to scale, one colour per alias, with ★ on the primary monitor, ↻
+on one turned right (gdctl's transform 90), ↺ on one turned left (270) and ↻↻
+on one upside down (180). It is drawn in outline when stdout is not a terminal
+or NO_COLOR is set; fzf's preview pane counts as a terminal.
+
+`watch` puts a saved layout back when monitors are plugged in; `display-layout
+watch --help` says which. For monitors no layout fits, it looks after mutter's
+fallback. GNOME keys the layouts it saves in ~/.config/monitors.xml on each
+monitor's connector name plus its EDID. One monitor reaches a different
+connector through a different port: HDMI on the discrete GPU, DP-1 or DP-2 on
+the USB-C ports. A layout GNOME saved on one port is then not found on another,
+and mutter lays the monitors out in a left-to-right row. `watch` recognises
+that row and replaces it: externals along the top in the order mutter lists
+them, laptop panel centred below it and made primary. Modes, scales and
+transforms are carried over untouched; only positions change.
+
+Every arrangement applied here lasts for the session, and gdctl's --persistent
+is deliberately left out of every call. mutter makes a person confirm any
+display configuration a D-Bus client saves, so saving one would raise the
+keep-these-settings dialog on every replug. Nothing is written to monitors.xml.
+
+Reads and writes display state through gdctl(1). The picker runs fzf(1).
 
 Examples:
 
+    display-layout
+    display-layout save desk-tall
+    display-layout use desk-tall
+    display-layout list
     display-layout show
     display-layout show --json
+    display-layout rotate arzopa left
+    display-layout place arzopa left-of laptop --align top
+    display-layout primary laptop
+    display-layout scale hp 1.25
+    display-layout edit
     display-layout apply --dry-run
-    display-layout apply
     display-layout watch
 """
 
 import ctypes
 import json
+import math
 import os
 import re
+import select
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import termios
+import textwrap
 import time
-from dataclasses import dataclass, field
+import tty
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Annotated, Literal, NoReturn, Protocol, assert_never
 
+import tomlkit
 import tyro
 from tyro.extras import SubcommandApp
 
@@ -72,6 +132,11 @@ TREE = re.compile(r"^(?P<prefix>[│ ]*)[├└]──(?P<text>.*)$")
 RESOLUTION = re.compile(r"^(\d+)x(\d+)@")
 POSITION = re.compile(r"^Position: \((-?\d+), (-?\d+)\)$")
 
+TRANSFORMS = ("normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270")
+"""Every transform gdctl takes."""
+TURNED = ("90", "270", "flipped-90", "flipped-270")
+"""Transforms that put the mode's height along the layout's x axis."""
+
 ADJACENCY_TOLERANCE = 2
 """Pixels of slack when testing whether two logical monitors touch.
 
@@ -84,10 +149,22 @@ class ParseError(Exception):
     pass
 
 
+class CommandError(RuntimeError):
+    """A command this script runs exited non-zero, or could not be run."""
+
+    def __init__(self, message: str, detail: str = "") -> None:
+        super().__init__(message)
+        self.detail = detail or message
+        """What the command said about it, without the command line."""
+
+
 @dataclass
 class Monitor:
     connector: str
     mode: str = ""
+    vendor: str = ""
+    product: str = ""
+    serial: str = ""
 
     @property
     def is_builtin(self) -> bool:
@@ -95,10 +172,15 @@ class Monitor:
 
     @property
     def resolution(self) -> tuple[int, int]:
-        m = RESOLUTION.match(self.mode)
-        if not m:
-            raise ParseError(f"{self.connector}: unreadable mode {self.mode!r}")
-        return int(m[1]), int(m[2])
+        return resolution(self.mode, self.connector)
+
+
+def resolution(mode: str, who: str) -> tuple[int, int]:
+    """Width and height in pixels of a mode as gdctl spells it. `who` names the monitor in the error."""
+    m = RESOLUTION.match(mode)
+    if not m:
+        raise ParseError(f"{who}: unreadable mode {mode!r}")
+    return int(m[1]), int(m[2])
 
 
 @dataclass
@@ -113,7 +195,7 @@ class Logical:
     @property
     def is_turned(self) -> bool:
         """Whether the transform puts the mode's height along the layout's x axis."""
-        return self.transform in ("90", "270", "flipped-90", "flipped-270")
+        return self.transform in TURNED
 
 
 @dataclass
@@ -127,10 +209,16 @@ class State:
         gdctl rejects a logical monitor whose monitors differ in resolution, so
         the first one speaks for all of them.
         """
-        w, h = self.monitors[logical.connectors[0]].resolution
-        if logical.is_turned:
-            w, h = h, w
-        return round(w / logical.scale), round(h / logical.scale)
+        monitor = self.monitors[logical.connectors[0]]
+        return logical_size(monitor.resolution, logical.transform, logical.scale)
+
+
+def logical_size(resolution: tuple[int, int], transform: str, scale: float) -> tuple[int, int]:
+    """A monitor's width and height in the layout's coordinate space."""
+    w, h = resolution
+    if transform in TURNED:
+        w, h = h, w
+    return round(w / scale), round(h / scale)
 
 
 def read_state() -> State:
@@ -168,6 +256,12 @@ def parse_show(out: str) -> State:
                 monitors[monitor.connector] = monitor
             elif level == 1 and text in ("Current mode", "Preferred mode"):
                 expect = "mode"
+            elif level == 1 and monitor and text.startswith("Vendor: "):
+                monitor.vendor = text.removeprefix("Vendor: ")
+            elif level == 1 and monitor and text.startswith("Product: "):
+                monitor.product = text.removeprefix("Product: ")
+            elif level == 1 and monitor and text.startswith("Serial: "):
+                monitor.serial = text.removeprefix("Serial: ")
             elif level == 2 and expect == "mode" and monitor:
                 monitor.mode = text
                 expect = ""
@@ -199,6 +293,11 @@ def parse_show(out: str) -> State:
     return State(monitors=monitors, logicals=logicals)
 
 
+def mirrored(state: State) -> list[str]:
+    """The connectors of the first logical monitor that shows more than one monitor. Empty when none does."""
+    return next((lo.connectors for lo in state.logicals if len(lo.connectors) > 1), [])
+
+
 def is_mutter_row(state: State) -> bool:
     """True when the layout is what mutter's create_linear() emits.
 
@@ -222,7 +321,7 @@ def plan(state: State) -> list[str]:
     Empty when there is nothing to arrange: no external, no built-in panel, or a
     mirrored logical monitor, which is always deliberate.
     """
-    if any(len(logical.connectors) > 1 for logical in state.logicals):
+    if mirrored(state):
         return []
 
     by_connector = {
@@ -269,20 +368,17 @@ def monitor_args(
     logical = next(
         lo for lo in state.logicals if connector in lo.connectors
     )
-    args = [
-        "--logical-monitor",
-        "--x",
-        str(x),
-        "--y",
-        str(y),
-        "--scale",
-        str(logical.scale),
-        "--transform",
-        logical.transform,
-    ]
-    if primary:
+    screen = Screen(connector, state.monitors[connector].mode, x, y, logical.scale, logical.transform, primary)
+    return group_args(screen, connector)
+
+
+def group_args(s: "Screen", connector: str) -> list[str]:
+    """One --logical-monitor group for gdctl set, the screen on `connector`."""
+    args = ["--logical-monitor", "--x", str(s.x), "--y", str(s.y),
+            "--scale", repr(s.scale), "--transform", s.transform]
+    if s.primary:
         args.append("--primary")
-    return args + ["--monitor", connector, "--mode", state.monitors[connector].mode]
+    return args + ["--monitor", connector, "--mode", s.mode]
 
 
 def describe(state: State) -> dict:
@@ -305,13 +401,1165 @@ def describe(state: State) -> dict:
     }
 
 
+# --- named layouts
+#
+# tests/properties/display-layout.test holds the properties these have to meet.
+
+
+@dataclass(frozen=True)
+class Model:
+    """What an alias recognises a monitor by. Never its connector."""
+
+    vendor: str
+    product: str
+    serial: str = ""
+    """Set only to tell two identical monitors apart."""
+
+
+@dataclass(frozen=True)
+class Screen:
+    """One monitor's place in an arrangement."""
+
+    name: str
+    """The monitor's alias, or its connector where no layouts file is involved."""
+    mode: str
+    """As gdctl spells it, refresh rate included: 2560x1600@59.997."""
+    x: int
+    y: int
+    scale: float = 1.0
+    transform: str = "normal"
+    primary: bool = False
+
+
+Arrangement = tuple[Screen, ...]
+
+
+@dataclass
+class Store:
+    """The layouts file, read."""
+
+    aliases: dict[str, Model]
+    layouts: dict[str, Arrangement]
+    """Each layout's screens are named by alias."""
+
+
+def match(store: Store, monitors: list[Monitor]) -> dict[str, dict[str, str]]:
+    """The layouts that fit these monitors, each with its aliases bound to connectors.
+
+    A layout fits when its aliases and the monitors pair up one to one by vendor
+    and product. An alias's serial counts only while two monitors of its model
+    are connected.
+    """
+    fitting = {}
+    for name, layout in store.layouts.items():
+        binding = bind([s.name for s in layout], store.aliases, monitors)
+        if binding is not None:
+            fitting[name] = binding
+    return fitting
+
+
+def bind(
+    aliases: list[str], models: dict[str, Model], monitors: list[Monitor]
+) -> dict[str, str] | None:
+    """Each alias's connector, or None when the aliases and monitors do not pair up.
+
+    Among several monitors of one model, an alias with a serial takes the monitor
+    with that serial, and aliases without one take the rest in connector order.
+    """
+    if len(aliases) != len(monitors):
+        return None
+    binding: dict[str, str] = {}
+    for model, group in by_model(monitors).items():
+        wanting = [a for a in aliases if model_of(models[a]) == model]
+        if len(wanting) != len(group):
+            return None
+        if len(group) == 1:
+            binding[wanting[0]] = group[0].connector
+            continue
+        left = sorted(group, key=lambda m: m.connector)
+        for alias in [a for a in wanting if models[a].serial]:
+            mon = next((m for m in left if m.serial == models[alias].serial), None)
+            if mon is None:
+                return None
+            binding[alias] = mon.connector
+            left.remove(mon)
+        for alias, mon in zip([a for a in wanting if not models[a].serial], left):
+            binding[alias] = mon.connector
+    return binding if len(binding) == len(aliases) else None
+
+
+def model_of(m: Model | Monitor) -> tuple[str, str]:
+    return m.vendor, m.product
+
+
+def by_model(monitors: list[Monitor]) -> dict[tuple[str, str], list[Monitor]]:
+    groups: dict[tuple[str, str], list[Monitor]] = {}
+    for mon in monitors:
+        groups.setdefault(model_of(mon), []).append(mon)
+    return groups
+
+
+def connected(state: State, lid_closed: bool) -> list[Monitor]:
+    """The monitors a layout has to cover.
+
+    A closed lid takes the built-in panel out, unless it is the only monitor,
+    which is how mutter keys its own saved configurations
+    (meta_create_monitors_config_key_for_current_state).
+    """
+    monitors = list(state.monitors.values())
+    if not lid_closed:
+        return monitors
+    externals = [m for m in monitors if not m.is_builtin]
+    return externals or monitors
+
+
+def name_monitors(
+    aliases: dict[str, Model], monitors: list[Monitor]
+) -> tuple[dict[str, str], dict[str, Model]]:
+    """An alias for each monitor's connector, and the aliases once those are added.
+
+    A monitor alone of its model takes that model's alias. Among several of one
+    model, a monitor takes the alias with its serial; the rest take the model's
+    aliases without a serial, which then get theirs, and after those new ones.
+    A monitor left without an alias gets a new one named from its model. No
+    alias names two monitors.
+    """
+    aliases = dict(aliases)
+    names: dict[str, str] = {}
+    for model, group in by_model(monitors).items():
+        known = [a for a, m in aliases.items() if model_of(m) == model]
+        if len(group) == 1:
+            mon = group[0]
+            names[mon.connector] = alias_of_one(mon, known, aliases) or new_alias(mon, aliases)
+            continue
+        unnamed = []
+        for mon in sorted(group, key=lambda m: m.connector):
+            alias = next((a for a in known if aliases[a].serial and aliases[a].serial == mon.serial), None)
+            if alias:
+                names[mon.connector] = alias
+                known.remove(alias)
+            else:
+                unnamed.append(mon)
+        bare = [a for a in known if not aliases[a].serial]
+        for mon in unnamed:
+            if bare:
+                alias = bare.pop(0)
+                aliases[alias] = replace(aliases[alias], serial=mon.serial)
+            else:
+                alias = new_alias(mon, aliases, mon.serial)
+            names[mon.connector] = alias
+    return names, aliases
+
+
+def alias_of_one(mon: Monitor, known: list[str], aliases: dict[str, Model]) -> str | None:
+    """The alias for the one connected monitor of its model, among that model's `known` aliases."""
+    for alias in known:
+        if aliases[alias].serial == mon.serial:
+            return alias
+    for alias in known:
+        if not aliases[alias].serial:
+            return alias
+    return known[0] if known else None
+
+
+def new_alias(mon: Monitor, aliases: dict[str, Model], serial: str = "") -> str:
+    """Add an alias for this monitor to `aliases`, and return its name."""
+    name = fresh_alias(mon, aliases)
+    aliases[name] = Model(mon.vendor, mon.product, serial)
+    return name
+
+
+def known_names(aliases: dict[str, Model], monitors: list[Monitor]) -> dict[str, str]:
+    """Each monitor's alias, or its connector for a monitor no alias stands for."""
+    names, _ = name_monitors(aliases, monitors)
+    return {c: a if a in aliases else c for c, a in names.items()}
+
+
+def fresh_alias(mon: Monitor, taken: Iterable[str]) -> str:
+    """A short name from the model: laptop for the built-in panel, else the product's first word."""
+    base = "laptop" if mon.is_builtin else model_word(mon.product) or model_word(mon.vendor) or "monitor"
+    taken = set(taken)
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = f"{base}-{n}"
+    return name
+
+
+def model_word(text: str) -> str:
+    """The first word, lowercased and cut to letters, digits and -. Empty for a code such as 0xc199."""
+    word = re.sub(r"[^a-z0-9-]", "", (text.split() or [""])[0].lower())
+    return word if word[:1].isalpha() and not re.fullmatch(r"0x[0-9a-f]+", word) else ""
+
+
+class LayoutError(Exception):
+    """The display cannot be saved as a layout, or a layout cannot be applied to it or found for it."""
+
+
+def live(state: State, names: dict[str, str]) -> Arrangement:
+    """The arrangement on screen, each monitor named as `names` has its connector.
+
+    Monitors mirroring each other are one screen, their names joined by +.
+    """
+    screens = []
+    for lo in state.logicals:
+        c = lo.connectors[0]
+        name = "+".join(names.get(m, m) for m in lo.connectors)
+        screens.append(Screen(name, state.monitors[c].mode, lo.x, lo.y, lo.scale, lo.transform, lo.primary))
+    return tuple(sorted(screens, key=lambda s: (s.x, s.y)))
+
+
+def check_savable(state: State, monitors: list[Monitor]) -> None:
+    """Raise LayoutError unless each connected monitor, and only those, is on screen on its own."""
+    if mirror := mirrored(state):
+        raise LayoutError(f"{' and '.join(mirror)} mirror each other, and a layout cannot hold a mirror")
+    shown = {c for lo in state.logicals for c in lo.connectors}
+    off = [m.connector for m in monitors if m.connector not in shown]
+    if off:
+        raise LayoutError(
+            f"{', '.join(off)} {'is' if len(off) == 1 else 'are'} connected but off, "
+            "and a layout covers every connected monitor"
+        )
+    lidded = sorted(shown - {m.connector for m in monitors})
+    if lidded:
+        raise LayoutError(f"{', '.join(lidded)} is on with the lid closed; open the lid, or turn the panel off")
+
+
+def layout_args(arrangement: Arrangement, binding: dict[str, str]) -> list[str]:
+    """gdctl set arguments for a layout, its aliases bound to connectors, moved to start at (0, 0).
+
+    --persistent is left out on purpose; see this module's docstring.
+    """
+    return [arg for s in at_origin(arrangement) for arg in group_args(s, binding[s.name])]
+
+
+def changes(saved: Arrangement, now: Arrangement) -> list[str]:
+    """How the arrangement on screen differs from a saved one, per monitor. Empty when it does not.
+
+    A monitor has moved when its place beside the others has. The two
+    arrangements are lined up on the shift shared by the most monitors that kept
+    their size, then by the most monitors, so monitors pushed along together
+    have not moved. A monitor that changed size has not moved while one of its
+    anchors is where it was.
+    """
+    was = {s.name: s for s in saved}
+    shifts = {s.name: (s.x - was[s.name].x, s.y - was[s.name].y) for s in now if s.name in was}
+    same_size = {s.name for s in now if s.name in was and extent(s) == extent(was[s.name])}
+    dx, dy = max(
+        dict.fromkeys(shifts.values()),
+        key=lambda d: (sum(shifts[n] == d for n in same_size), sum(v == d for v in shifts.values())),
+        default=(0, 0),
+    )
+
+    def moved(s: Screen, old: Screen) -> bool:
+        x1, y1, x2, y2 = bounds(old)
+        return not set(anchors((x1 + dx, y1 + dy, x2 + dx, y2 + dy))) & set(anchors(bounds(s)))
+
+    out = []
+    for s in now:
+        old = was.get(s.name)
+        if old is None:
+            out.append(f"{s.name} added")
+            continue
+        what = [
+            word
+            for word, differs in (
+                ("moved", moved(s, old)),
+                ("turned", s.transform != old.transform),
+                ("rescaled", not math.isclose(s.scale, old.scale, rel_tol=1e-6)),
+                ("in another mode", s.mode != old.mode),
+                ("made primary", s.primary and not old.primary),
+            )
+            if differs
+        ]
+        if what:
+            out.append(f"{s.name} {' and '.join(what)}")
+    out += [f"{name} gone" for name in was if name not in {s.name for s in now}]
+    return out
+
+
+def at_origin(arrangement: Arrangement) -> Arrangement:
+    x0 = min(s.x for s in arrangement)
+    y0 = min(s.y for s in arrangement)
+    return tuple(replace(s, x=s.x - x0, y=s.y - y0) for s in arrangement)
+
+
+class StoreError(Exception):
+    """The layouts file does not say what a layout needs."""
+
+
+LAYOUT_NAME = re.compile(r"[A-Za-z0-9_-]+")
+NAME_RULE = "a layout name is letters, digits, - and _"
+SCALE_RULE = "a scale is a positive number, 1.25 for 125 %"
+
+
+def is_scale(factor: float) -> bool:
+    return math.isfinite(factor) and factor > 0
+
+
+def parse_store(text: str) -> Store:
+    """Read the layouts file's TOML. The module docstring shows its shape."""
+    try:
+        data = tomlkit.parse(text).unwrap()
+    except tomlkit.exceptions.TOMLKitError as exc:
+        raise StoreError(str(exc)) from None
+    unknown = set(data) - {"aliases", "layouts"}
+    if unknown:
+        raise StoreError(f"unknown table {', '.join(sorted(unknown))}; there are [aliases] and [layouts.<name>]")
+
+    for table in ("aliases", "layouts"):
+        if not isinstance(data.get(table, {}), dict):
+            raise StoreError(f"{table} is a table: [{table}]")
+    aliases = {}
+    for name, entry in data.get("aliases", {}).items():
+        where = f"alias {name}"
+        entry = fields(where, entry, required={"vendor": str, "product": str}, optional={"serial": str})
+        aliases[name] = Model(entry["vendor"], entry["product"], entry.get("serial", ""))
+
+    layouts = {}
+    for name, screens in data.get("layouts", {}).items():
+        if not LAYOUT_NAME.fullmatch(name):
+            raise StoreError(f"layout {name!r}: {NAME_RULE}")
+        if not isinstance(screens, dict) or not screens:
+            raise StoreError(f"layout {name} lists no monitors")
+        arrangement = []
+        for alias, entry in screens.items():
+            where = f"layout {name}, {alias}"
+            if alias not in aliases:
+                raise StoreError(f"{where}: no such alias in [aliases]")
+            entry = fields(
+                where, entry,
+                required={"x": int, "y": int, "mode": str},
+                optional={"scale": (int, float), "transform": str, "primary": bool},
+            )
+            if entry.get("transform", "normal") not in TRANSFORMS:
+                raise StoreError(f"{where}: transform is one of {', '.join(TRANSFORMS)}")
+            screen = Screen(alias, entry["mode"], entry["x"], entry["y"], float(entry.get("scale", 1.0)),
+                            entry.get("transform", "normal"), entry.get("primary", False))
+            size = RESOLUTION.match(screen.mode)
+            if not size or 0 in (int(size[1]), int(size[2])):
+                raise StoreError(f"{where}: mode is WIDTHxHEIGHT@RATE as gdctl show prints it, not {screen.mode!r}")
+            if not is_scale(screen.scale):
+                raise StoreError(f"{where}: scale = {screen.scale}; {SCALE_RULE}")
+            arrangement.append(screen)
+        if sum(s.primary for s in arrangement) != 1:
+            raise StoreError(f"layout {name}: exactly one monitor has primary = true")
+        layouts[name] = tuple(arrangement)
+    return Store(aliases, layouts)
+
+
+def fields(where: str, entry: object, required: dict, optional: dict) -> dict:
+    if not isinstance(entry, dict):
+        raise StoreError(f"{where}: expected a table, got {entry!r}")
+    extra = sorted(set(entry) - set(required) - set(optional))
+    if extra:
+        raise StoreError(f"{where}: unknown key {extra[0]}; keys are {', '.join([*required, *optional])}")
+    for key in required:
+        if key not in entry:
+            raise StoreError(f"{where}: {key} is missing")
+    for key, kind in (required | optional).items():
+        if key in entry and (not isinstance(entry[key], kind) or (kind is int and isinstance(entry[key], bool))):
+            raise StoreError(f"{where}: {key} = {entry[key]!r} is not {getattr(kind, '__name__', 'a number')}")
+    return entry
+
+
+def with_layout(text: str, name: str, arrangement: Arrangement, aliases: dict[str, Model]) -> str:
+    """The layouts file's text with `name` set to `arrangement` and `aliases` added or updated.
+
+    Everything else in the file, comments included, is kept as it was.
+    """
+    doc = tomlkit.parse(text) if text.strip() else tomlkit.document()
+    if not text.strip():
+        doc.add(tomlkit.comment("Named display layouts. Format and commands: display-layout --help"))
+    if "aliases" not in doc:
+        doc.add("aliases", tomlkit.table())
+    if "layouts" not in doc:
+        doc.add("layouts", tomlkit.table(is_super_table=True))
+    for alias, model in aliases.items():
+        entry = {"vendor": model.vendor, "product": model.product} | ({"serial": model.serial} if model.serial else {})
+        if doc["aliases"].get(alias) != entry:
+            doc["aliases"][alias] = inline(entry)
+    table = tomlkit.table()
+    for s in arrangement:
+        entry: dict = {"x": s.x, "y": s.y, "mode": s.mode}
+        if s.scale != 1.0:
+            entry["scale"] = s.scale
+        if s.transform != "normal":
+            entry["transform"] = s.transform
+        if s.primary:
+            entry["primary"] = True
+        table.add(s.name, inline(entry))
+    doc["layouts"][name] = table
+    return tomlkit.dumps(doc)
+
+
+def inline(entry: dict):
+    table = tomlkit.inline_table()
+    table.update(entry)
+    return table
+
+
+def layouts_file() -> Path:
+    return Path(os.environ.get("DISPLAY_LAYOUTS") or Path(__file__).resolve().parents[1] / "desktop" / "display-layouts.toml")
+
+
+def layout_named(store: Store, name: str) -> Arrangement:
+    if name not in store.layouts:
+        raise LayoutError(f"no layout named {name}; saved: {', '.join(store.layouts) or 'none'}")
+    return store.layouts[name]
+
+
+def load_store() -> Store:
+    return read_store()[2]
+
+
+def read_store() -> tuple[Path, str, Store]:
+    """The layouts file's path, its text, and the store it holds. Empty when there is no file."""
+    path = layouts_file()
+    text = path.read_text() if path.exists() else ""
+    try:
+        return path, text, parse_store(text)
+    except StoreError as exc:
+        raise StoreError(f"{path}: {exc}") from None
+
+
+def recent_file() -> Path:
+    state = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(state) / "display-layout" / "recent"
+
+
+def recent() -> list[str]:
+    """Layout names, the one most recently put on screen first."""
+    path = recent_file()
+    return path.read_text().split() if path.exists() else []
+
+
+def remember(name: str) -> None:
+    path = recent_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{n}\n" for n in [name, *(n for n in recent() if n != name)]))
+
+
+def lid_closed() -> bool:
+    """UPower's LidIsClosed, which mutter follows too. False where there is no lid or no answer."""
+    try:
+        out = run([
+            "gdbus", "call", "--system", "--dest", "org.freedesktop.UPower",
+            "--object-path", "/org/freedesktop/UPower",
+            "--method", "org.freedesktop.DBus.Properties.Get", "org.freedesktop.UPower", "LidIsClosed",
+        ])
+    except CommandError:
+        return False
+    return "true" in out
+
+
+@dataclass(frozen=True)
+class Current:
+    """The arrangement on screen, named by alias, and which saved layout it is."""
+
+    arrangement: Arrangement
+    layout: str | None
+    """The saved layout it matches, else the one it was last put on screen as."""
+    changed: tuple[str, ...]
+    """What differs from that layout. Empty when it is on screen as saved."""
+
+
+def used_first(names: Iterable[str], recent: list[str]) -> list[str]:
+    """The names, those in `recent` first and in its order, then the rest in their own."""
+    names = list(names)
+    return [n for n in recent if n in names] + [n for n in names if n not in recent]
+
+
+def last_used(names: Collection[str], recent: list[str]) -> str | None:
+    """The name among these that `recent` lists first. None when it lists none of them."""
+    return next((n for n in recent if n in names), None)
+
+
+def current(state: State, monitors: list[Monitor], store: Store, recent: list[str]) -> Current:
+    """Name the monitors on screen and find the layout it came from.
+
+    A fitting layout identical to the screen wins, the most recently used first.
+    Otherwise the one last used with these monitors is reported with what
+    changed since.
+    """
+    if mirrored(state):
+        return Current(live(state, known_names(store.aliases, monitors)), None, ())
+    fitting = match(store, monitors)
+    seen = {}
+    for name in used_first(fitting, recent):
+        now = live(state, {c: a for a, c in fitting[name].items()})
+        seen[name] = now
+        if not changes(store.layouts[name], now):
+            return Current(now, name, ())
+    last = last_used(fitting, recent)
+    if last:
+        return Current(seen[last], last, tuple(changes(store.layouts[last], seen[last])))
+    return Current(live(state, known_names(store.aliases, monitors)), None, ())
+
+
+MonitorName = Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="MONITOR")]
+"""An alias from the layouts file, or the connector of a monitor without one."""
+
+
+@dataclass(frozen=True)
+class Rotate:
+    """Turn a monitor to landscape, or to what GNOME Settings calls Portrait Left or Right."""
+
+    name: MonitorName
+    """The monitor to turn: its alias, or its connector where it has none."""
+    to: Annotated[Literal["left", "right", "normal"], tyro.conf.Positional, tyro.conf.arg(metavar="{left,right,normal}")]
+    """left is Portrait Left (gdctl's transform 270), right is Portrait Right (90), normal is landscape."""
+
+
+@dataclass(frozen=True)
+class Place:
+    """Move a monitor to one side of another, touching it."""
+
+    name: MonitorName
+    """The monitor to move: its alias, or its connector where it has none."""
+    side: Annotated[Literal["left-of", "right-of", "above", "below"], tyro.conf.Positional,
+                    tyro.conf.arg(metavar="{left-of,right-of,above,below}")]
+    """The side of the other monitor it goes to."""
+    other: Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="OTHER")]
+    """The monitor it goes beside: its alias, or its connector where it has none."""
+    align: Literal["top", "center", "bottom", "left", "right"] = "center"
+    """Where along the shared edge: top, center or bottom beside a monitor, left, center or right above or below one."""
+
+
+@dataclass(frozen=True)
+class Primary:
+    """Make a monitor the primary one, where the top bar and notifications go."""
+
+    name: MonitorName
+    """The monitor: its alias, or its connector where it has none."""
+
+
+@dataclass(frozen=True)
+class Scale:
+    """Set a monitor's scale."""
+
+    name: MonitorName
+    """The monitor: its alias, or its connector where it has none."""
+    factor: Annotated[float, tyro.conf.Positional, tyro.conf.arg(metavar="FACTOR")]
+    """1.25 for 125 %. gdctl show --verbose lists the scales mutter offers for each mode."""
+
+
+@dataclass(frozen=True)
+class Turn:
+    """Turn a monitor a quarter turn from where it is."""
+
+    name: str
+    """The monitor to turn: its alias, or its connector where it has none."""
+    way: Literal["clockwise", "counter-clockwise"]
+
+
+Verb = Rotate | Place | Primary | Scale | Turn
+
+ROTATIONS = {"left": "270", "right": "90", "normal": "normal"}
+"""gdctl's transform for each Rotate target, named as GNOME Settings names them."""
+
+ALIGNS = {
+    "left-of": ("top", "center", "bottom"),
+    "right-of": ("top", "center", "bottom"),
+    "above": ("left", "center", "right"),
+    "below": ("left", "center", "right"),
+}
+"""The alignments along the edge each side shares."""
+
+Box = tuple[int, int, int, int]
+"""x1, y1, x2, y2 in logical pixels."""
+
+
+def mentioned(verb: Verb) -> list[str]:
+    """The monitors a verb names."""
+    return [verb.name, verb.other] if isinstance(verb, Place) else [verb.name]
+
+
+def edit(arrangement: Arrangement, verb: Verb) -> Arrangement:
+    """The arrangement with the one thing the verb names changed.
+
+    Every monitor keeps its mode, and its scale, transform and primary unless
+    the verb names them. When no monitor changes size and none is placed,
+    nothing moves. Otherwise `settle` lays the monitors out again.
+    """
+    screens = {s.name: s for s in arrangement}
+    for name in mentioned(verb):
+        if name not in screens:
+            raise LayoutError(f"no monitor named {name}; on screen: {', '.join(screens)}")
+    if isinstance(verb, Place):
+        if verb.name == verb.other:
+            raise LayoutError(f"{verb.name} cannot go {verb.side} itself")
+        if verb.align not in ALIGNS[verb.side]:
+            raise LayoutError(f"--align {verb.align}: {verb.side} aligns {', '.join(ALIGNS[verb.side])}")
+    if isinstance(verb, Scale) and not is_scale(verb.factor):
+        raise LayoutError(f"scale {verb.factor}: {SCALE_RULE}")
+    after = tuple(applied(s, verb) for s in arrangement)
+    resized = any(extent(a) != extent(b) for a, b in zip(arrangement, after))
+    if isinstance(verb, Primary) or not (resized or isinstance(verb, Place)):
+        return after
+    return settle(arrangement, after, verb)
+
+
+def applied(s: Screen, verb: Verb) -> Screen:
+    """The screen with what the verb names applied to it."""
+    if isinstance(verb, Primary):
+        return replace(s, primary=s.name == verb.name)
+    if s.name != verb.name or isinstance(verb, Place):
+        return s
+    if isinstance(verb, Rotate):
+        return replace(s, transform=ROTATIONS[verb.to])
+    if isinstance(verb, Turn):
+        return replace(s, transform=quarter_turn(s.transform, verb.way))
+    if isinstance(verb, Scale):
+        return replace(s, scale=verb.factor)
+    assert_never(verb)
+
+
+def quarter_turn(transform: str, way: Literal["clockwise", "counter-clockwise"]) -> str:
+    """The transform a quarter turn on, keeping a flip. gdctl counts clockwise, so 90 is turned right."""
+    flipped = transform.startswith("flipped")
+    angle = transform.removeprefix("flipped").removeprefix("-")
+    turned = ((0 if angle in ("", "normal") else int(angle)) + (90 if way == "clockwise" else 270)) % 360
+    if flipped:
+        return f"flipped-{turned}" if turned else "flipped"
+    return str(turned) if turned else "normal"
+
+
+def extent(s: Screen) -> tuple[int, int]:
+    """A screen's width and height in logical pixels."""
+    x1, y1, x2, y2 = bounds(s)
+    return x2 - x1, y2 - y1
+
+
+def settle(before: Arrangement, after: Arrangement, verb: Rotate | Turn | Scale | Place) -> Arrangement:
+    """Positions for `after`, whose monitors have their new sizes and their old positions.
+
+    The rules:
+    - no two monitors overlap, and every one is reached from every other
+      through monitors sharing a stretch of edge, as mutter requires;
+    - a monitor wholly to one side of another stays on that side, and one
+      diagonal to another keeps at least one of its two sides. A placed
+      monitor is exempt, since leaving its side is what `place` is for;
+    - a placed monitor touches its `other` on the side and at the alignment
+      asked for.
+
+    The layout that moves the other monitors least in total wins. Ties go to
+    the one that leaves one of the edited monitor's anchors where it was, then
+    to the one that moves its centre least. `settle` lays out one monitor at a
+    time, trying each at the spots `spots` lists, and keeps the best layout
+    that meets the rules.
+
+    Raises LayoutError when no layout meets them.
+    """
+    if len(after) == 1:
+        return at_origin(after)
+    old = {s.name: s for s in before}
+    new = {s.name: s for s in after}
+    edited = verb.name
+    was = {n: bounds(s) for n, s in old.items()}
+    before_sides = {(a, b): sides(was[a], was[b]) for a in old for b in old if a != b}
+    best: tuple[tuple, dict[str, Box]] | None = None
+
+    def side_rule_applies(a: str, b: str) -> bool:
+        return not (isinstance(verb, Place) and edited in (a, b))
+
+    def fits(name: str, box: Box, laid: dict[str, Box]) -> bool:
+        return all(
+            not overlaps(box, other)
+            and (not side_rule_applies(name, n) or kept(before_sides[(name, n)], sides(box, other)))
+            for n, other in laid.items()
+        )
+
+    def search(order: list[str], laid: dict[str, Box], moved: int) -> None:
+        nonlocal best
+        if best and moved > best[0][0]:
+            return
+        if not order:
+            if joined(list(laid.values())):
+                cost = (moved, *edited_cost(was[edited], laid[edited]))
+                if best is None or cost < best[0]:
+                    best = (cost, dict(laid))
+            return
+        name, rest = order[0], order[1:]
+        for box in spots(name, new[name], was, laid, verb):
+            if fits(name, box, laid):
+                cost = 0 if name == edited else abs(box[0] - was[name][0]) + abs(box[1] - was[name][1])
+                search(rest, laid | {name: box}, moved + cost)
+
+    for anchor in [n for n in old if n != edited]:
+        search(placement_order(was, anchor, verb)[1:], {anchor: was[anchor]}, 0)
+    if best is None:
+        raise LayoutError(
+            f"no layout keeps every monitor joined edge to edge after this change to {edited}, "
+            f"without one crossing to another side of a monitor it was beside; place can move {edited} first"
+        )
+    boxes = best[1]
+    return at_origin(tuple(replace(s, x=boxes[s.name][0], y=boxes[s.name][1]) for s in after))
+
+
+def placement_order(was: dict[str, Box], anchor: str, verb: Verb) -> list[str]:
+    """The anchor, then the others outward from it through the monitors each touched.
+
+    A placed monitor comes right after the monitor it is placed against, which
+    fixes where it goes.
+    """
+    mover = verb.name if isinstance(verb, Place) else None
+    order, frontier = [anchor], [anchor]
+    while frontier:
+        a = frontier.pop(0)
+        for b in was:
+            if b not in order and b != mover and touching(was[a], was[b]):
+                order.append(b)
+                frontier.append(b)
+    order += [n for n in was if n not in order and n != mover]
+    if isinstance(verb, Place):
+        order.insert(order.index(verb.other) + 1, verb.name)
+    return order
+
+
+def anchors(box: Box) -> list[tuple[int, int]]:
+    """A box's corners, edge midpoints and centre, row by row from the top left. The centre is the fifth."""
+    x1, y1, x2, y2 = box
+    return [(x1 + (x2 - x1) * fx // 2, y1 + (y2 - y1) * fy // 2) for fy in (0, 1, 2) for fx in (0, 1, 2)]
+
+
+def spots(name: str, s: Screen, was: dict[str, Box], laid: dict[str, Box], verb: Verb) -> list[Box]:
+    """Where to try a monitor of the screen's new size, the likeliest first.
+
+    A placed monitor has one spot, set by the verb. The edited monitor is tried
+    with each of its anchors where it was, any other monitor where it was, and
+    moved by as much as each monitor already laid out moved. Both are also
+    tried against each laid-out monitor on each side: aligned with that
+    monitor's start, end or middle; at the offset they had from each other;
+    or level with their own old start, end or middle.
+    """
+    w, h = extent(s)
+    x1, y1, x2, y2 = was[name]
+    if isinstance(verb, Place) and name == verb.name:
+        return [against(laid[verb.other], verb.side, verb.align, w, h)]
+    found: list[Box] = []
+    if name == verb.name:
+        for i, (ax, ay) in enumerate(anchors(was[name])):
+            fx, fy = i % 3, i // 3
+            left, top = ax - w * fx // 2, ay - h * fy // 2
+            found.append((left, top, left + w, top + h))
+    else:
+        found.append((x1, y1, x1 + w, y1 + h))
+        for n, box in laid.items():
+            dx, dy = box[0] - was[n][0], box[1] - was[n][1]
+            found.append((x1 + dx, y1 + dy, x1 + dx + w, y1 + dy + h))
+    for n, other in laid.items():
+        for side in ("left-of", "right-of", "above", "below"):
+            across = side in ("left-of", "right-of")
+            axis = 1 if across else 0  # the coordinate the shared edge runs along
+            length = h if across else w
+            mine_was = (was[name][axis], was[name][axis + 2])
+            its_was = (was[n][axis], was[n][axis + 2])
+            its_now = (other[axis], other[axis + 2])
+            aligned = (its_now[0], its_now[1] - length, (its_now[0] + its_now[1] - length) // 2)
+            offset = tuple(now + mine - its for now, mine, its in zip(its_now, mine_was, its_was))
+            as_before = (offset[0], offset[1] - length, (offset[0] + offset[1] - length) // 2)
+            level = (mine_was[0], mine_was[1] - length, (mine_was[0] + mine_was[1] - length) // 2)
+            found += [beside(other, side, w, h, start) for start in aligned + as_before + level]
+    return list(dict.fromkeys(found))
+
+
+def against(other: Box, side: str, align: str, w: int, h: int) -> Box:
+    """A w by h box touching `other` on `side`, aligned along the edge they share."""
+    o1, o2 = (other[1], other[3]) if side in ("left-of", "right-of") else (other[0], other[2])
+    length = h if side in ("left-of", "right-of") else w
+    start = {"top": o1, "left": o1, "bottom": o2 - length, "right": o2 - length, "center": (o1 + o2 - length) // 2}[align]
+    return beside(other, side, w, h, start)
+
+
+def beside(other: Box, side: str, w: int, h: int, start: int) -> Box:
+    """A w by h box touching `other` on `side`, starting at `start` along the edge they share."""
+    ox1, oy1, ox2, oy2 = other
+    if side in ("left-of", "right-of"):
+        x = ox1 - w if side == "left-of" else ox2
+        return x, start, x + w, start + h
+    y = oy1 - h if side == "above" else oy2
+    return start, y, start + w, y + h
+
+
+def edited_cost(was: Box, now: Box) -> tuple[int, int]:
+    """How far the edited monitor went: the least any of its anchors moved, then how far its centre moved."""
+    moves = [abs(p[0] - q[0]) + abs(p[1] - q[1]) for p, q in zip(anchors(was), anchors(now))]
+    return min(moves), moves[4]
+
+
+def sides(a: Box, b: Box) -> frozenset[str]:
+    """Where a lies wholly to one side of b: left, right, above or below. Two of them when a is diagonal to b.
+
+    These are positions, not the sides `place` takes.
+    """
+    return frozenset(
+        side
+        for side, holds in (("left", a[2] <= b[0]), ("right", a[0] >= b[2]), ("above", a[3] <= b[1]), ("below", a[1] >= b[3]))
+        if holds
+    )
+
+
+def kept(before: frozenset[str], after: frozenset[str]) -> bool:
+    """A monitor wholly to one side of another stays there. One diagonal to it keeps at least one of the two sides."""
+    return before <= after if len(before) < 2 else bool(before & after)
+
+
+def overlaps(a: Box, b: Box) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def touching(a: Box, b: Box) -> bool:
+    """Whether two boxes share a stretch of edge, as mutter counts it. A shared corner is not one."""
+    if (a[0] == b[2] or a[2] == b[0]) and a[1] < b[3] and b[1] < a[3]:
+        return True
+    return (a[1] == b[3] or a[3] == b[1]) and a[0] < b[2] and b[0] < a[2]
+
+
+def joined(boxes: list[Box]) -> bool:
+    """Whether every box is reached from the first through boxes that touch."""
+    reached, frontier = {0}, [0]
+    while frontier:
+        i = frontier.pop()
+        for j, b in enumerate(boxes):
+            if j not in reached and touching(boxes[i], b):
+                reached.add(j)
+                frontier.append(j)
+    return len(reached) == len(boxes)
+
+
+def snap(arrangement: Arrangement, moved: str) -> Arrangement:
+    """The arrangement with the moved screen put back against its neighbours, as GNOME Settings does while dragging.
+
+    A place mutter accepts is kept as it is. Otherwise the screen goes to the
+    nearest place where it overlaps none of the others and every monitor is
+    reached from every other through shared edges. Nearest is by the distance
+    along x plus the distance along y, and of two places as near, the one
+    reached along a single axis wins. The others stay where they are, and the
+    whole arrangement is moved to start at (0, 0).
+    """
+    me = next(s for s in arrangement if s.name == moved)
+    others = [bounds(s) for s in arrangement if s.name != moved]
+    w, h = extent(me)
+    # Where an edge of the screen meets an edge of another, or passes it by one
+    # pixel. Only there can moving it change whether it is accepted.
+    xs = {me.x, *(x for b in others for x in (b[0] - w, b[2], b[0] - w + 1, b[2] - 1))}
+    ys = {me.y, *(y for b in others for y in (b[1] - h, b[3], b[1] - h + 1, b[3] - 1))}
+    nearest = sorted((abs(x - me.x) + abs(y - me.y), (x != me.x) + (y != me.y), y, x) for x in xs for y in ys)
+    for *_, y, x in nearest:
+        if accepted([(x, y, x + w, y + h), *others]):
+            return at_origin(tuple(replace(s, x=x, y=y) if s.name == moved else s for s in arrangement))
+    raise LayoutError(f"no place for {moved} keeps every monitor joined edge to edge")
+
+
+def accepted(boxes: list[Box]) -> bool:
+    """Whether mutter takes these boxes as a layout: none overlap, and all are joined edge to edge."""
+    return not any(overlaps(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :]) and joined(boxes)
+
+
+def cells(arrangement: Arrangement, width: int) -> list[list[str | None]]:
+    """Which screen each cell of the arrangement's terminal drawing belongs to.
+
+    The drawing is `width` cells across and made of half-block characters (▀),
+    two cells to a character, one above the other, so a cell is as tall as it
+    is wide. A cell belongs to the screen its centre lies in. A screen too small
+    to hold any centre still gets the cell nearest its own.
+    """
+    rects = {s.name: bounds(s) for s in arrangement}
+    x0 = min(r[0] for r in rects.values())
+    y0 = min(r[1] for r in rects.values())
+    x1 = max(r[2] for r in rects.values())
+    y1 = max(r[3] for r in rects.values())
+    cell = (x1 - x0) / width
+    rows = max(1, round((y1 - y0) / cell))
+    grid: list[list[str | None]] = [[None] * width for _ in range(rows)]
+    for r in range(rows):
+        cy = y0 + (r + 0.5) * cell
+        for c in range(width):
+            cx = x0 + (c + 0.5) * cell
+            grid[r][c] = next(
+                (n for n, (sx1, sy1, sx2, sy2) in rects.items() if sx1 <= cx < sx2 and sy1 <= cy < sy2),
+                None,
+            )
+    drawn = {n for row in grid for n in row}
+    for name, (sx1, sy1, sx2, sy2) in rects.items():
+        if name not in drawn:
+            c = min(width - 1, int(((sx1 + sx2) / 2 - x0) / cell))
+            r = min(rows - 1, int(((sy1 + sy2) / 2 - y0) / cell))
+            grid[r][c] = name
+    return grid
+
+
+def bounds(s: Screen) -> Box:
+    """A screen's box."""
+    w, h = logical_size(resolution(s.mode, s.name), s.transform, s.scale)
+    return s.x, s.y, s.x + w, s.y + h
+
+
+ARROWS = {"90": "↻", "270": "↺", "180": "↻↻"}
+"""The rotation mark in a label, by gdctl transform."""
+
+EARTH = {"laptop": "#5f6f52", "hp": "#8a6a52", "lg": "#6f5e70", "arzopa": "#56657a"}
+"""Fill colour per alias: sage, clay, mauve, slate."""
+MORE_EARTH = ("#7a6d48", "#4f6b66", "#7a5550", "#5d5a4c")
+"""Fills for the aliases EARTH has no colour for, in turn: ochre, pine, rust, umber."""
+SAND = "#ede3d2"
+"""Label text on a fill."""
+MOSS = "#6ea444"
+"""Moss green, the one accent beside the earth fills, framing the monitor `edit` has selected."""
+MAX_COLUMNS = 72
+MAX_ROWS = 22
+"""The largest drawing fit_width allows, in terminal characters, however large the terminal is."""
+
+
+def colours_for(store: Store, arrangement: Arrangement, terminal: bool) -> dict[str, str] | None:
+    """Fills for the store's aliases and the arrangement's names, or None for an outline.
+
+    The outline is for a drawing outside a `terminal`, or when NO_COLOR is set.
+    """
+    names = [*store.aliases, *(s.name for s in arrangement)]
+    return palette(names) if terminal and not os.environ.get("NO_COLOR") else None
+
+
+def palette(names: Iterable[str]) -> dict[str, str]:
+    """A fill for each name: its own from EARTH, else the next unused one, in the order given."""
+    names = list(dict.fromkeys(names))
+    own = {EARTH[n] for n in names if n in EARTH}
+    spare = [*MORE_EARTH, *(c for c in EARTH.values() if c not in own)]
+    others = [n for n in names if n not in EARTH]
+    return {n: EARTH[n] for n in names if n in EARTH} | {n: spare[i % len(spare)] for i, n in enumerate(others)}
+
+
+def fit_width(arrangement: Arrangement, columns: int) -> int:
+    """Columns for a drawing that fits `columns` and stays within MAX_COLUMNS by MAX_ROWS."""
+    return fit(arrangement, min(columns, MAX_COLUMNS), MAX_ROWS)
+
+
+def fit(arrangement: Arrangement, columns: int, rows: int) -> int:
+    """Columns for a drawing at most `columns` wide and `rows` tall, and at least 8."""
+    w, h = outer(arrangement)
+    return max(8, min(columns, math.floor(rows * 2 * w / h)))
+
+
+def outer(arrangement: Arrangement) -> tuple[int, int]:
+    """The width and height of the box around all the screens, in logical pixels."""
+    rects = [bounds(s) for s in arrangement]
+    return max(r[2] for r in rects) - min(r[0] for r in rects), max(r[3] for r in rects) - min(r[1] for r in rects)
+
+
+def draw(arrangement: Arrangement, width: int, colours: dict[str, str] | None, selected: str | None = None) -> str:
+    """The arrangement drawn `width` columns wide: filled blocks in `colours`, or outlined when it is None.
+
+    The `selected` screen is framed in MOSS, or outlined in double lines.
+    """
+    grid = cells(arrangement, width)
+    screens = {s.name: s for s in arrangement}
+    if colours is None:
+        return outline(grid, screens, selected)
+    return blocks(grid, screens, colours, selected)
+
+
+def label(s: Screen) -> list[str]:
+    x1, y1, x2, y2 = bounds(s)
+    turn = ARROWS.get(s.transform, "" if s.transform == "normal" else s.transform)
+    return [s.name + (" ★" if s.primary else ""), f"{x2 - x1}×{y2 - y1}" + (f" {turn}" if turn else "")]
+
+
+def span(grid: list[list[str | None]], name: str) -> tuple[int, int, int, int]:
+    """First and last row, first and last column of the cells a screen owns."""
+    rows = [r for r, row in enumerate(grid) if name in row]
+    cols = [c for row in grid for c, owner in enumerate(row) if owner == name]
+    return rows[0], rows[-1], min(cols), max(cols)
+
+
+def place_label(lines: list[str], rows: range, c0: int, c1: int) -> dict[tuple[int, int], str]:
+    """Label characters by (text row, column), centred in the rows and columns given, cut to fit."""
+    room = c1 - c0 + 1
+    lines = [t if len(t) <= room else t[: max(0, room - 1)] + "…" for t in lines][: len(rows)]
+    top = rows.start + (len(rows) - len(lines)) // 2
+    out = {}
+    for i, text in enumerate(lines):
+        start = c0 + (room - len(text)) // 2
+        for j, ch in enumerate(text):
+            out[(top + i, start + j)] = ch
+    return out
+
+
+def rgb(hex_: str) -> str:
+    return ";".join(str(int(hex_[i : i + 2], 16)) for i in (1, 3, 5))
+
+
+def blocks(
+    grid: list[list[str | None]], screens: dict[str, Screen], colours: dict[str, str], selected: str | None = None
+) -> str:
+    """Filled rectangles in half-block characters, a blank line of cells between neighbours.
+
+    The `selected` screen's outermost cells are MOSS, a frame one cell thick.
+    """
+    height, width = len(grid), len(grid[0])
+    gapped = [row[:] for row in grid]
+    for r in range(height):
+        for c in range(width):
+            o = grid[r][c]
+            right = grid[r][c + 1] if c + 1 < width else None
+            below = grid[r + 1][c] if r + 1 < height else None
+            if o and ((right and right != o) or (below and below != o)):
+                gapped[r][c] = None
+    if height % 2:
+        gapped.append([None] * width)
+
+    def owner(r: int, c: int) -> str | None:
+        return gapped[r][c] if 0 <= r < len(gapped) and 0 <= c < width else None
+
+    frame = set() if selected is None else {
+        (r, c)
+        for r in range(len(gapped))
+        for c in range(width)
+        if gapped[r][c] == selected
+        and any(owner(r + dr, c + dc) != selected for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)))
+    }
+
+    def colour(name: str, r: int, c: int) -> str:
+        return MOSS if (r, c) in frame else colours[name]
+
+    text: dict[tuple[int, int], tuple[str, str]] = {}
+    for name, screen in screens.items():
+        if not any(name in row for row in gapped):
+            continue
+        r0, r1, c0, c1 = span(gapped, name)
+        if name == selected:  # the label stays inside the frame
+            r0, r1, c0, c1 = r0 + 1, r1 - 1, c0 + 1, c1 - 1
+        whole = range((r0 + 1) // 2, (r1 + 1) // 2)  # text rows with both halves inside
+        for at, ch in place_label(label(screen), whole, c0, c1).items():
+            text[at] = (ch, name)
+
+    out = []
+    for tr in range(len(gapped) // 2):
+        line, style = [], ""
+        for c in range(width):
+            top, bottom = gapped[2 * tr][c], gapped[2 * tr + 1][c]
+            if (tr, c) in text:
+                ch, name = text[(tr, c)]
+                bold = "1;" if screens[name].primary else ""
+                want, glyph = f"{bold}38;2;{rgb(SAND)};48;2;{rgb(colours[name])}", ch
+            elif top and bottom:
+                want, glyph = f"38;2;{rgb(colour(top, 2 * tr, c))};48;2;{rgb(colour(bottom, 2 * tr + 1, c))}", "▀"
+            elif top:
+                want, glyph = f"38;2;{rgb(colour(top, 2 * tr, c))}", "▀"
+            elif bottom:
+                want, glyph = f"38;2;{rgb(colour(bottom, 2 * tr + 1, c))}", "▄"
+            else:
+                want, glyph = "", " "
+            if want != style:
+                line.append(f"\x1b[0m\x1b[{want}m" if want else "\x1b[0m")
+                style = want
+            line.append(glyph)
+        if style:
+            line.append("\x1b[0m")
+        out.append("".join(line).rstrip())
+    return "\n".join(out)
+
+
+def outline(grid: list[list[str | None]], screens: dict[str, Screen], selected: str | None = None) -> str:
+    """Box-drawing rectangles, heavy for the primary monitor and double for the selected one, one text row per two cells."""
+    height, width = (len(grid) + 1) // 2, len(grid[0])
+    chars = [[" "] * width for _ in range(height)]
+    for name, s in screens.items():
+        r0, r1, c0, c1 = span(grid, name)
+        # Text row t holds cells 2t and 2t+1. A screen takes the rows whose top
+        # cell is its own, so two stacked screens never share a row.
+        t0 = min((r0 + 1) // 2, height - 1)
+        t1 = min(max(t0, (r1 + 2) // 2 - 1), height - 1)
+        h, v, tl, tr, bl, br = (
+            ("═", "║", "╔", "╗", "╚", "╝") if name == selected
+            else ("━", "┃", "┏", "┓", "┗", "┛") if s.primary
+            else ("─", "│", "╭", "╮", "╰", "╯")
+        )
+        for c in range(c0 + 1, c1):
+            chars[t0][c] = h
+            chars[t1][c] = h
+        for r in range(t0 + 1, t1):
+            chars[r][c0] = v
+            chars[r][c1] = v
+        chars[t0][c0], chars[t0][c1], chars[t1][c0], chars[t1][c1] = tl, tr, bl, br
+        for (r, c), ch in place_label(label(s), range(t0 + 1, t1), c0 + 1, c1 - 1).items():
+            chars[r][c] = ch
+    return "\n".join("".join(row).rstrip() for row in chars)
+
+
+@dataclass(frozen=True)
+class Recall:
+    """Apply a saved layout."""
+
+    layout: str
+    argv: tuple[str, ...]
+    """gdctl set arguments."""
+
+
+@dataclass(frozen=True)
+class Fallback:
+    """Apply the arrangement for a set with no layout: externals on top, panel below."""
+
+    argv: tuple[str, ...]
+    """gdctl set arguments."""
+
+
+ConnectedSet = frozenset[tuple[str, Model]]
+"""Each connected monitor's connector, and its vendor, product and serial."""
+
+
+def connected_set(monitors: list[Monitor]) -> ConnectedSet:
+    return frozenset((m.connector, Model(m.vendor, m.product, m.serial)) for m in monitors)
+
+
+@dataclass(frozen=True)
+class Decision:
+    """What the watcher does about one look at the display."""
+
+    settled: ConnectedSet | None
+    """The connected set dealt with once this is carried out."""
+    apply: Recall | Fallback | None
+    """None leaves the display alone."""
+    why: str = ""
+    """The rule that chose `apply`, for the run log. Empty when the set did not change."""
+
+
+def decide(
+    settled: ConnectedSet | None, state: State, store: Store, recent: list[str], lid_closed: bool = False
+) -> Decision:
+    """The watcher's choice for the display as it is now, by the rule `display-layout watch --help` states.
+
+    `recent` lists layout names, the most recently used first.
+    """
+    monitors = connected(state, lid_closed)
+    now = connected_set(monitors)
+    if now == settled:
+        return Decision(settled, None)
+    fitting = match(store, monitors)
+
+    def recall(name: str) -> Recall:
+        return Recall(name, tuple(layout_args(store.layouts[name], fitting[name])))
+
+    last = last_used(fitting, recent)
+    if last:
+        return Decision(now, recall(last), "last used with these monitors")
+    if fitting:
+        return Decision(now, recall(next(iter(fitting))), "saved for these monitors, none used yet")
+    if not is_mutter_row(state):
+        return Decision(now, None, "no saved layout fits, and the layout is not mutter's row")
+    argv = plan(state)
+    if not argv:
+        return Decision(now, None, "no saved layout fits, and nothing to arrange")
+    return Decision(now, Fallback(tuple(argv)), "no saved layout fits; replaced mutter's row")
+
+
 def die_with_parent() -> None:
     """Ask the kernel to kill this child when its parent goes (PR_SET_PDEATHSIG).
 
     The `finally` around the watch loop covers the orderly exits. This covers the
-    rest -- SIGKILL, a crash, a signal arriving inside a syscall -- where the
-    parent never runs another line and gdbus would otherwise be left reparented
-    to the session manager, holding a bus connection nobody reads.
+    rest, where the parent never runs another line: SIGKILL, a crash, a signal
+    arriving inside a syscall. gdbus would otherwise be left reparented to the
+    session manager, holding a bus connection nobody reads.
     """
     ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
@@ -328,10 +1576,13 @@ def system_env() -> dict[str, str]:
 
 
 def run(argv: list[str]) -> str:
-    proc = subprocess.run(argv, capture_output=True, text=True, env=system_env())
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, env=system_env())
+    except OSError as exc:
+        raise CommandError(f"{argv[0]} could not be run: {exc}") from None
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip()
-        raise RuntimeError(f"{' '.join(argv)} failed: {detail}")
+        raise CommandError(f"{' '.join(argv)} failed: {detail}", detail)
     return proc.stdout
 
 
@@ -354,46 +1605,608 @@ def log_run(outcome: str, reason: str, stats: dict) -> None:
         print(f"display-layout: run-log failed: {proc.stderr.strip()}", file=sys.stderr)
 
 
+SAVE_HINT = "display-layout save NAME saves the one on screen"
+
+
+def fail(message: str) -> NoReturn:
+    raise SystemExit(f"display-layout: {message}")
+
+
+def picture(now: Current, store: Store) -> str:
+    """The drawing of what is on screen, under a line naming the layout it is."""
+    if now.layout and not now.changed:
+        head = f"{now.layout}, as saved"
+    elif now.layout:
+        head = f"last used with these monitors: {now.layout}; since then {', '.join(now.changed)}"
+    else:
+        head = "not a saved layout"
+    colours = colours_for(store, now.arrangement, sys.stdout.isatty())
+    width = fit_width(now.arrangement, shutil.get_terminal_size((80, 24)).columns)
+    return head + "\n\n" + draw(now.arrangement, width, colours)
+
+
+def on_screen(store: Store) -> Current:
+    state = read_state()
+    return current(state, connected(state, lid_closed()), store, recent())
+
+
+def describe_connected(monitors: list[Monitor], store: Store) -> str:
+    names = known_names(store.aliases, monitors)
+    return ", ".join(
+        f"{names[m.connector]} on {m.connector}" if names[m.connector] != m.connector
+        else f"{m.connector} ({m.vendor} {m.product}, no alias)"
+        for m in monitors
+    )
+
+
+@dataclass
+class PickArgs:
+    preview: Annotated[str | None, tyro.conf.arg(metavar="NAME")] = None
+    """Draw the saved layout NAME to fill the terminal, and exit. fzf runs this to fill the preview pane."""
+
+
+@app.command(name="pick", is_default=True)
+def pick(args: PickArgs) -> None:
+    """Choose a saved layout by its drawing, and put it on screen as `use` does.
+
+    fzf lists the saved layouts that fit the monitors connected now, the one
+    used most recently first, and draws the highlighted one in its preview pane.
+    """
+    if args.preview is not None:
+        print(preview(args.preview))
+        return
+    store = load_store()
+    state = read_state()
+    monitors = connected(state, lid_closed())
+    if not store.layouts:
+        raise LayoutError(f"no layouts in {layouts_file()}; {SAVE_HINT}")
+    names = choices(store, monitors, recent())
+    if not names:
+        raise LayoutError(
+            f"no saved layout fits the monitors connected now ({describe_connected(monitors, store)}); {SAVE_HINT}"
+        )
+    name = choose(names)
+    if name:
+        use(UseArgs(name))
+
+
+def choices(store: Store, monitors: list[Monitor], recent: list[str]) -> list[str]:
+    """The layouts that fit these monitors, the most recently used first, then in file order."""
+    return used_first(match(store, monitors), recent)
+
+
+def choose(names: list[str]) -> str | None:
+    """The layout picked in fzf. None when fzf is left without a pick."""
+    try:
+        proc = subprocess.run(fzf_argv(), input="\n".join(names), stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        raise CommandError("the picker runs fzf, which is not on PATH") from None
+    if proc.returncode not in (0, 1, 130):  # picked, no match, left with Esc or Ctrl-C
+        raise CommandError(f"fzf exited with status {proc.returncode}")
+    return proc.stdout.strip() or None
+
+
+def fzf_argv() -> list[str]:
+    """fzf over layout names, one per line, with each drawn by `pick --preview`."""
+    this = shlex.quote(str(Path(__file__).resolve()))
+    return [
+        "fzf", "--layout=reverse", "--no-multi", "--prompt=layout> ",
+        "--preview-window=right,80%,noinfo", f"--preview={this} pick --preview={{}}",
+    ]
+
+
+def preview(name: str) -> str:
+    """A saved layout drawn to fill fzf's preview pane, or the terminal outside fzf.
+
+    fzf's preview pane counts as a terminal, so the drawing is in colour there
+    unless NO_COLOR is set.
+    """
+    store = load_store()
+    arrangement = layout_named(store, name)
+    size = shutil.get_terminal_size((80, 24))
+    columns = int(os.environ.get("FZF_PREVIEW_COLUMNS") or size.columns)
+    lines = int(os.environ.get("FZF_PREVIEW_LINES") or size.lines)
+    colours = colours_for(store, arrangement, sys.stdout.isatty() or "FZF_PREVIEW_COLUMNS" in os.environ)
+    return draw(arrangement, fit(arrangement, columns, lines), colours)
+
+
+@dataclass
+class UseArgs:
+    name: Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="NAME")]
+    """The layout to put on screen."""
+
+
+@app.command(name="use")
+def use(args: UseArgs) -> None:
+    """Put a saved layout on screen, and draw it.
+
+    The layout's monitors have to be the ones connected, on whichever ports.
+    """
+    store = load_store()
+    layout = layout_named(store, args.name)
+    state = read_state()
+    monitors = connected(state, lid_closed())
+    binding = match(store, monitors).get(args.name)
+    if binding is None:
+        wants = ", ".join(s.name for s in layout)
+        raise LayoutError(f"{args.name} is for {wants}; connected: {describe_connected(monitors, store)}")
+    run(["gdctl", "set", *layout_args(layout, binding)])
+    remember(args.name)
+    print(picture(on_screen(store), store))
+
+
+@dataclass
+class SaveArgs:
+    name: Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="NAME")]
+    """The layout's name. Saving under a name already taken replaces that layout."""
+
+
+@app.command(name="save")
+def save(args: SaveArgs) -> None:
+    """Save the arrangement on screen as a layout in the layouts file, and draw it."""
+    check_name(args.name)
+    state = read_state()
+    write_layout(args.name, state, connected(state, lid_closed()))
+
+
+def check_name(name: str) -> None:
+    if not LAYOUT_NAME.fullmatch(name):
+        raise LayoutError(f"{name!r}: {NAME_RULE}")
+
+
+def write_layout(name: str, state: State, monitors: list[Monitor]) -> None:
+    """Save the arrangement `state` holds as layout `name`, record it as used, and draw it."""
+    path, text, store = read_store()
+    check_savable(state, monitors)
+    names, aliases = name_monitors(store.aliases, monitors)
+    arrangement = at_origin(live(state, names))
+    added = {a: m for a, m in aliases.items() if store.aliases.get(a) != m}
+    text = with_layout(text, name, arrangement, added)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    remember(name)
+    for alias, model in added.items():
+        verb = "updated" if alias in store.aliases else "new"
+        print(f"{verb} alias {alias}: {model.vendor} {model.product}" + (f" {model.serial}" if model.serial else ""))
+    print(f"saved {name} in {path}\n")
+    store = parse_store(text)
+    print(picture(current(state, monitors, store, recent()), store))
+
+
+@dataclass
+class ListArgs:
+    json: bool = False
+    """Emit JSON instead of text."""
+
+
+@app.command(name="list")
+def list_(args: ListArgs) -> None:
+    """List the saved layouts, marking those that fit the monitors connected now.
+
+    JSON schema (--json):
+
+        [{"name": "str", "fits": bool, "monitors": ["alias"]}]
+    """
+    store = load_store()
+    state = read_state()
+    fitting = match(store, connected(state, lid_closed()))
+    if args.json:
+        print(json.dumps([
+            {"name": name, "fits": name in fitting, "monitors": [s.name for s in layout]}
+            for name, layout in store.layouts.items()
+        ], indent=2))
+        return
+    if not store.layouts:
+        print(f"no layouts in {layouts_file()}; {SAVE_HINT}")
+        return
+    wide = max(len(name) for name in store.layouts)
+    for name, layout in store.layouts.items():
+        print(f"{'fits' if name in fitting else '':4}  {name:{wide}}  {', '.join(s.name for s in layout)}")
+
+
 @dataclass
 class ShowArgs:
     json: bool = False
-    """Emit the parsed state as JSON instead of prose."""
+    """Emit what gdctl reports, the layout on screen, and what `apply` would do, as JSON instead of the drawing."""
 
 
 @app.command(name="show")
 def show(args: ShowArgs) -> None:
-    """Report what gdctl sees, whether it is mutter's row, and what apply would do.
+    """Draw the arrangement on screen, and say which saved layout it is.
 
-    JSON schema (--json):
+    When the screen matches no saved layout, the one last put on screen or
+    saved with these monitors is named, with what changed since.
+
+    JSON schema (--json), where layout is null for no saved layout and changed
+    lists what differs from it:
 
         {"monitors": {"<connector>": {"mode": "str", "builtin": bool}},
          "logicals": [{"x": int, "y": int, "scale": float,
                        "primary": bool, "connectors": ["str"]}],
          "is_mutter_row": bool,
-         "plan": ["str"]}
+         "plan": ["str"],
+         "layout": "str|null",
+         "changed": ["str"]}
     """
+    store = load_store()
     state = read_state()
-    report = describe(state) | {"plan": plan(state)}
+    now = current(state, connected(state, lid_closed()), store, recent())
     if args.json:
+        report = describe(state) | {"plan": plan(state), "layout": now.layout, "changed": list(now.changed)}
         print(json.dumps(report, indent=2))
         return
-    for connector, monitor in state.monitors.items():
-        kind = "built-in" if monitor.is_builtin else "external"
-        print(f"{connector:10s} {monitor.mode:22s} {kind}")
-    print()
-    for logical in state.logicals:
-        w, h = state.size_of(logical)
-        star = " *primary" if logical.primary else ""
-        print(
-            f"{','.join(logical.connectors):10s} "
-            f"{w}x{h} at ({logical.x}, {logical.y}) scale {logical.scale:g}{star}"
-        )
-    print()
-    print(f"mutter's row: {'yes' if report['is_mutter_row'] else 'no'}")
-    if report["plan"]:
-        print("plan: gdctl set " + " ".join(report["plan"]))
-    else:
-        print("plan: nothing to arrange")
+    print(picture(now, store))
+
+
+@app.command(name="rotate")
+def rotate(verb: Rotate) -> None:
+    """Turn one monitor on screen, and draw the result."""
+    edit_on_screen(verb)
+
+
+@app.command(name="place")
+def place(verb: Place) -> None:
+    """Move one monitor to a side of another on screen, and draw the result."""
+    edit_on_screen(verb)
+
+
+@app.command(name="primary")
+def primary(verb: Primary) -> None:
+    """Make one monitor on screen the primary one, and draw the result."""
+    edit_on_screen(verb)
+
+
+@app.command(name="scale")
+def scale(verb: Scale) -> None:
+    """Rescale one monitor on screen, and draw the result."""
+    edit_on_screen(verb)
+
+
+def edit_on_screen(verb: Verb) -> None:
+    """Apply the edit to the arrangement on screen, for the session, and draw the result."""
+    store = load_store()
+    state = read_state()
+    arrangement, binding, shown = editable(state, store)
+    for name in mentioned(verb):
+        if name not in binding:
+            what = f"{name} is not on screen" if name in store.aliases else f"no monitor named {name}"
+            raise LayoutError(f"{what}; on screen: {describe_connected(shown, store)}")
+    run(["gdctl", "set", *layout_args(edit(arrangement, verb), binding)])
+    print(picture(on_screen(store), store))
+
+
+def editable(state: State, store: Store) -> tuple[Arrangement, dict[str, str], list[Monitor]]:
+    """The arrangement on screen named by alias, each name's connector, and the monitors lit.
+
+    Raises LayoutError for a mirror, since the edits move only monitors shown on their own.
+    """
+    if mirror := mirrored(state):
+        raise LayoutError(f"{' and '.join(mirror)} mirror each other; rotate, place, primary, scale "
+                          "and edit move monitors shown on their own")
+    lit = {c for lo in state.logicals for c in lo.connectors}
+    shown = [m for m in state.monitors.values() if m.connector in lit]
+    names = known_names(store.aliases, shown)
+    binding = {names.get(c, c): c for c in lit}
+    return live(state, names), binding, shown
+
+
+# --- edit: the arrangement moved with the keyboard, and put on screen on Space
+
+STEP = 50
+FINE_STEP = 10
+"""Logical pixels an arrow or WASD key moves the selected monitor, and with Shift."""
+
+MOVES = {
+    "up": (0, -STEP), "w": (0, -STEP), "shift-up": (0, -FINE_STEP), "W": (0, -FINE_STEP),
+    "down": (0, STEP), "s": (0, STEP), "shift-down": (0, FINE_STEP), "S": (0, FINE_STEP),
+    "left": (-STEP, 0), "a": (-STEP, 0), "shift-left": (-FINE_STEP, 0), "A": (-FINE_STEP, 0),
+    "right": (STEP, 0), "d": (STEP, 0), "shift-right": (FINE_STEP, 0), "D": (FINE_STEP, 0),
+}
+"""What each key moves the selected monitor by, in logical pixels."""
+
+KEY_HELP = ("tab next", "arrows or wasd move, shift finer", "r R turn", "space apply", "enter save",
+            "q apply and quit", "esc put back")
+"""The keys, under the drawing, as many to a line as fit."""
+
+
+def press(arrangement: Arrangement, selected: str, key: str) -> tuple[Arrangement, str]:
+    """The arrangement and the selected monitor after one key press in `edit`.
+
+    Tab and Shift-Tab select the next or previous monitor, in the order the
+    arrangement lists them. A move shifts the selected monitor and snaps it;
+    r and R turn it clockwise and counter-clockwise. Any other key changes
+    nothing.
+    """
+    if key in ("tab", "shift-tab"):
+        order = [s.name for s in arrangement]
+        return arrangement, order[(order.index(selected) + (1 if key == "tab" else -1)) % len(order)]
+    if key in MOVES:
+        dx, dy = MOVES[key]
+        nudged = tuple(replace(s, x=s.x + dx, y=s.y + dy) if s.name == selected else s for s in arrangement)
+        return snap(nudged, selected), selected
+    if key in ("r", "R"):
+        return edit(arrangement, Turn(selected, "clockwise" if key == "r" else "counter-clockwise")), selected
+    return arrangement, selected
+
+
+@dataclass(frozen=True)
+class Ending:
+    """How an `edit` session ended, and the arrangement it left on screen."""
+
+    how: Literal["save", "keep", "put-back"]
+    arrangement: Arrangement
+
+
+class Keys(Protocol):
+    """Where `interact` reads key presses."""
+
+    def read(self) -> str:
+        """The next key by name, waiting for it.
+
+        A name is up, shift-up (and so on for the other arrows), tab,
+        shift-tab, space, enter, esc, or the character typed; resize says the
+        terminal changed size.
+        """
+        ...
+
+
+def interact(
+    start: Arrangement,
+    selected: str,
+    keys: Keys,
+    show: Callable[[Arrangement, str, str, bool], None],
+    apply: Callable[[Arrangement], None],
+) -> Ending:
+    """Run an `edit` session from the arrangement `start` on screen.
+
+    `show(arrangement, selected, note, pending)` draws after every key, where
+    `pending` says the arrangement drawn is not the one on screen, and
+    `apply(arrangement)` puts an arrangement on screen. Space applies what is
+    drawn; a refusal is noted and the session goes on. Enter and q apply it
+    and end; Esc and Ctrl-C put `start` back and end. Every other key changes
+    only what is drawn, and no key applies an arrangement already on screen.
+    """
+    arrangement, applied, note = start, start, ""
+
+    try:
+        while True:
+            show(arrangement, selected, note, arrangement != applied)
+            key = keys.read()
+            if key == "resize":
+                continue
+            if key in ("enter", "q"):
+                if arrangement != applied:
+                    apply(arrangement)
+                return Ending("save" if key == "enter" else "keep", arrangement)
+            if key == "esc":
+                break
+            note = ""
+            if key == "space":
+                if arrangement != applied:
+                    try:
+                        apply(arrangement)
+                        applied = arrangement
+                    except CommandError as exc:
+                        note = f"not applied: {' '.join(exc.detail.split())}"
+                continue
+            try:
+                arrangement, selected = press(arrangement, selected, key)
+            except LayoutError as exc:
+                note = str(exc)
+    except KeyboardInterrupt:
+        pass
+    if applied != start:
+        apply(start)
+    return Ending("put-back", start)
+
+
+SEQUENCES = {
+    "\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left",
+    "\x1bOA": "up", "\x1bOB": "down", "\x1bOC": "right", "\x1bOD": "left",
+    "\x1b[1;2A": "shift-up", "\x1b[1;2B": "shift-down", "\x1b[1;2C": "shift-right", "\x1b[1;2D": "shift-left",
+    "\x1b[Z": "shift-tab", "\t": "tab", "\r": "enter", "\n": "enter", " ": "space",
+}
+"""The terminal's bytes for the keys `edit` names."""
+
+UNKNOWN = re.compile(r"\x1b\[[0-9;]*[@-~]|\x1bO.|\x1b[^\[O]|\x1b\[[0-9;]*\Z|\x1bO\Z", re.DOTALL)
+"""An escape sequence `edit` has no name for, Alt with a key included, or the start of one that never finished."""
+
+UNFINISHED = re.compile(r"\x1b(\[[0-9;]*|O)?\Z")
+"""Bytes that may be the start of a longer key sequence still on its way."""
+
+
+def next_key(pending: str) -> tuple[str, str]:
+    """The first key in the bytes read so far, and the bytes after it.
+
+    A key `edit` has no name for comes back as its bytes, which no key
+    binding matches.
+    """
+    for sequence, key in SEQUENCES.items():
+        if pending.startswith(sequence):
+            return key, pending[len(sequence) :]
+    if pending == "\x1b":
+        return "esc", ""
+    if unknown := UNKNOWN.match(pending):
+        return unknown.group(), pending[unknown.end() :]
+    return pending[0], pending[1:]
+
+
+class Terminal:
+    """The keyboard and the whole terminal, for the length of an `edit` session.
+
+    Keys are read unbuffered and unechoed from `fd`, and the session is drawn
+    on the terminal's alternate screen, so the shell's scrollback is as it
+    was when the session ends.
+    """
+
+    ESC_WAIT = 0.05
+    """Seconds to wait after the start of an escape sequence for the rest of it."""
+
+    def __init__(self, fd: int | None = None) -> None:
+        self.fd = sys.stdin.fileno() if fd is None else fd
+        self.pending = ""
+        self.size = self.columns_lines()
+
+    def __enter__(self) -> "Terminal":
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self.write("\x1b[?1049h\x1b[?25l")
+        return self
+
+    def __exit__(self, *_) -> None:
+        """Restore the terminal, dropping keys typed ahead so that none answers a prompt that comes after."""
+        self.write("\x1b[?25h\x1b[?1049l")
+        termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.saved)
+
+    def columns_lines(self) -> tuple[int, int]:
+        size = shutil.get_terminal_size((80, 24))
+        return size.columns, size.lines
+
+    def write(self, text: str) -> None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def read(self) -> str:
+        """As `Keys.read`. The terminal's size is looked at every 0.1 s while no key comes."""
+        while not self.pending:
+            if self.columns_lines() != self.size:
+                self.size = self.columns_lines()
+                return "resize"
+            self.take_in(0.1)
+        while UNFINISHED.match(self.pending) and self.take_in(self.ESC_WAIT):
+            pass
+        key, self.pending = next_key(self.pending)
+        return key
+
+    def take_in(self, wait: float) -> bool:
+        """Add what arrives on the terminal within `wait` seconds to what is pending. False when nothing did."""
+        if not select.select([self.fd], [], [], wait)[0]:
+            return False
+        self.pending += os.read(self.fd, 1024).decode(errors="replace")
+        return True
+
+    def ask(self, prompt: str) -> str:
+        return input(prompt)
+
+
+class View:
+    """Draws an `edit` session to fill the terminal.
+
+    A cell keeps its size in logical pixels from one key press to the next,
+    so a monitor that does not move is not drawn larger or smaller. The
+    drawing is fitted again when it outgrows the terminal, or the terminal
+    changes size.
+    """
+
+    ROOM = 0.75
+    """The share of the terminal a fitted drawing takes, leaving room to move monitors out."""
+    NOTE_LINES = 3
+    """The most lines a note takes under the drawing."""
+
+    def __init__(self, terminal: Terminal, colours: dict[str, str] | None) -> None:
+        self.terminal, self.colours = terminal, colours
+        self.cell: float | None = None
+        """Logical pixels per cell, None until the first drawing is fitted."""
+        self.fitted_to = (0, 0)
+
+    def __call__(self, arrangement: Arrangement, selected: str, note: str, pending: bool) -> None:
+        columns, lines = self.terminal.columns_lines()
+        above = wrap([f"{selected} selected", *(["not applied yet, space applies"] if pending else [])], " · ", columns)
+        below = textwrap.wrap(note, columns)[: self.NOTE_LINES] if note else wrap(KEY_HELP, " · ", columns)
+        rows = max(4, lines - 2 - len(above) - len(below))  # a blank either side of the drawing
+        w, h = outer(arrangement)
+        width = round(w / self.cell) if self.cell else 0
+        if (columns, lines) != self.fitted_to or not 0 < width <= columns or math.ceil(h / w * width / 2) > rows:
+            width = fit(arrangement, int(columns * self.ROOM), max(2, int(rows * self.ROOM)))
+            self.cell, self.fitted_to = w / width, (columns, lines)
+        drawing = draw(arrangement, width, self.colours, selected).split("\n")
+        page = [*above, "", *drawing, "", *below]
+        self.terminal.write("\x1b[H" + "\n".join(line + "\x1b[0m\x1b[K" for line in page) + "\x1b[J")
+
+
+def wrap(parts: Iterable[str], joint: str, columns: int) -> list[str]:
+    """The parts joined by `joint` into lines of at most `columns`, a part too long cut to fit."""
+    lines: list[str] = []
+    for part in parts:
+        if lines and len(lines[-1]) + len(joint) + len(part) <= columns:
+            lines[-1] += joint + part
+        else:
+            lines.append(part[:columns])
+    return lines
+
+
+@dataclass
+class EditArgs:
+    pass
+
+
+@app.command(name="edit")
+def edit_(args: EditArgs) -> None:
+    """Move the monitors on screen with the keyboard, drawn to fill the terminal.
+
+    The selected monitor is framed in moss green, or in double lines without colour.
+
+        tab, shift-tab       select the next or previous monitor
+        arrows or w a s d    move it 50 logical px; with shift, 10
+        r, R                 turn it clockwise, counter-clockwise
+        space                apply the arrangement drawn to the display
+        enter                apply it and save it, asking for a name
+        q                    apply it and quit
+        esc                  put back the arrangement from the start, and quit
+
+    A moved monitor snaps back against the others, so they stay joined edge to
+    edge. The line above the drawing says when the drawing is not on the
+    display yet. An apply lasts for the session only; only enter keeps the
+    arrangement as a layout. The name enter offers is the layout `show` names
+    at the start.
+    """
+    store = load_store()
+    state = read_state()
+    start, binding, _ = editable(state, store)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise LayoutError("edit reads keys from a terminal and draws in it; stdin or stdout is not one")
+    lid = lid_closed()
+    was = current(state, connected(state, lid), store, recent()).layout
+    selected = next((s.name for s in start if not s.primary), start[0].name)
+
+    def apply(arrangement: Arrangement) -> None:
+        run(["gdctl", "set", *layout_args(arrangement, binding)])
+
+    terminal = Terminal()
+    with terminal:
+        view = View(terminal, colours_for(store, start, terminal=True))
+        ending = interact(at_origin(start), selected, terminal, view, apply)
+    if ending.how == "put-back":
+        print("put back the arrangement edit started from\n")
+    if ending.how != "save":
+        print(picture(on_screen(store), store))
+        return
+    after = State(state.monitors, [
+        Logical(s.x, s.y, s.scale, s.transform, s.primary, [binding[s.name]]) for s in ending.arrangement
+    ])
+    check_savable(after, connected(after, lid))
+    name = ask_name(terminal, was)
+    if name is None:
+        print("not saved; the arrangement stays on screen for the session")
+        return
+    write_layout(name, after, connected(after, lid))
+
+
+def ask_name(terminal: Terminal, default: str | None) -> str | None:
+    """A layout name typed at the terminal: `default` for an empty answer, None for none at all."""
+    while True:
+        try:
+            name = terminal.ask(f"save as{f' ({default})' if default else ''}: ").strip() or default
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not name:
+            return None
+        try:
+            check_name(name)
+            return name
+        except LayoutError as exc:
+            print(exc)
 
 
 @dataclass
@@ -406,17 +2219,17 @@ class ApplyArgs:
 def apply(args: ApplyArgs) -> None:
     """Arrange the current monitors now, whatever the layout already is.
 
-    For the session only. An arrangement that should outlive the session goes
-    through GNOME Settings, which saves it against the connectors it was made on.
+    For the session only. `save` keeps an arrangement for `use` to put back.
     """
     state = read_state()
     argv = plan(state)
     if not argv:
-        print("nothing to arrange", file=sys.stderr)
-        raise SystemExit(1)
+        raise LayoutError("nothing to arrange")
     print("gdctl set " + " ".join(argv))
     if not args.dry_run:
         run(["gdctl", "set", *argv])
+        store = load_store()
+        print("\n" + picture(on_screen(store), store))
 
 
 @dataclass
@@ -427,18 +2240,24 @@ class WatchArgs:
 
 @app.command(name="watch")
 def watch(args: WatchArgs) -> None:
-    """Replace mutter's row with the arrangement whenever mutter falls back to it.
+    """Put a saved layout on screen whenever the connected monitors change.
 
     Listens for MonitorsChanged on the session bus, and looks once on startup at
-    a display that was already connected.
+    a display that was already connected. When the set of connected monitors
+    has changed, it applies, in this order of preference:
 
-    Arranges only when the set of connected monitors has changed, which is the
-    only way mutter reaches the row. Rearranging monitors by hand leaves that set
-    alone, so an arrangement made during a session is never overwritten -- a
-    deliberate side-by-side one is indistinguishable from the row, and survives
-    on that rule alone.
+    - the layout last used with these monitors;
+    - the first layout in the layouts file that fits them, when none that fits
+      has been used yet;
+    - the fallback arrangement, when no layout fits and mutter has laid the
+      monitors out in its row.
 
-    Records one line per resolved change via bin/run-log.
+    Opening or closing the lid changes the set too. Rearranging monitors by
+    hand leaves it alone, so an arrangement made during a session stays until
+    the set changes or the watcher starts again.
+
+    Records one line per change of the set via bin/run-log, naming the layout
+    it applied.
     """
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
@@ -459,11 +2278,10 @@ def watch(args: WatchArgs) -> None:
 
 
 def follow(stream, settle: float) -> None:
-    """Arrange once per change of the connected set, and only out of the row.
+    """Arrange once per change of the connected set.
 
-    The display is looked at once on startup too, because a monitor plugged in
-    before the session began has already had its fallback and will send no
-    signal about it.
+    The display is looked at once on startup too, because monitors plugged in
+    before the session began send no signal.
     """
     settled = arrange(None)
     for line in stream:
@@ -473,44 +2291,70 @@ def follow(stream, settle: float) -> None:
         settled = arrange(settled)
 
 
-def arrange(settled: tuple[str, ...] | None) -> tuple[str, ...] | None:
-    """Replace the row if mutter has just fallen back into it.
+def arrange(settled: ConnectedSet | None) -> ConnectedSet | None:
+    """Carry out what `decide` chooses for the display as it is now, and log it in one line.
 
     Takes the connected set this already dealt with, and returns the set it
-    leaves dealt with -- which is the old one whenever nothing was resolved, so
-    a display that could not be read or arranged is tried again on the next
-    signal rather than written off.
-
-    Acting only on a change of the set is what keeps this off an arrangement
-    made by hand: mutter reaches the row by falling back, which follows a plug
-    or an unplug, and rearranging monitors never touches the set.
+    leaves dealt with. That is the old one whenever nothing could be applied,
+    so a display that could not be read or arranged is tried again on the next
+    signal rather than written off. A layout mutter rejects is left out, and
+    the choice made again without it. With a layouts file that cannot be read,
+    only the fallback applies.
     """
     try:
         state = read_state()
-    except (ParseError, RuntimeError) as exc:
+    except (ParseError, CommandError) as exc:
         log_run("fail", str(exc), {})
         return settled
-
-    connectors = tuple(state.monitors)
-    if connectors == settled:
+    lid = lid_closed()
+    if connected_set(connected(state, lid)) == settled:
         return settled
-    stats = {"monitors": list(connectors)}
 
-    if not is_mutter_row(state):
-        log_run("skip", "layout is not the row", stats)
-        return connectors
-    argv = plan(state)
-    if not argv:
-        log_run("skip", "nothing to arrange", stats)
-        return connectors
+    problems = []
     try:
-        run(["gdctl", "set", *argv])
-    except RuntimeError as exc:
-        log_run("fail", str(exc), stats)
-        return settled
-    log_run("ok", "replaced mutter's row", stats)
-    return connectors
+        store = load_store()
+    except StoreError as exc:
+        problems.append(str(exc))
+        store = Store({}, {})
+    used = recent()
+    rejected = False
+    while True:
+        decision = decide(settled, state, store, used, lid)
+        stats: dict = {"monitors": sorted(c for c, _ in decision.settled or ())}
+        match decision.apply:
+            case None:
+                if rejected:
+                    log_run("fail", "; ".join([*problems, decision.why]), stats)
+                    return settled
+                log_run("fail" if problems else "skip", "; ".join([*problems, decision.why]), stats)
+                return decision.settled
+            case Recall(layout=name) as apply:
+                stats["layout"] = name
+                done = f"applied {name}, {decision.why}"
+            case Fallback() as apply:
+                done = decision.why
+        try:
+            run(["gdctl", "set", *apply.argv])
+        except CommandError as exc:
+            problems.append(f"{stats.get('layout', 'the fallback')} rejected: {exc}")
+            if not isinstance(apply, Recall):
+                log_run("fail", "; ".join(problems), stats)
+                return settled
+            rejected = True
+            store = Store(store.aliases, {n: lo for n, lo in store.layouts.items() if n != apply.layout})
+            continue
+        if isinstance(apply, Recall):
+            remember(apply.layout)
+        log_run("fail" if problems else "ok", "; ".join([*problems, done]), stats)
+        return decision.settled
+
+
+REFUSALS = (StoreError, LayoutError, ParseError, CommandError)
+"""Errors a command ends on with their message alone, no traceback."""
 
 
 if __name__ == "__main__":
-    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
+    try:
+        app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
+    except REFUSALS as exc:
+        fail(str(exc))

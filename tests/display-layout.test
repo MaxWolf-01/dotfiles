@@ -1,23 +1,47 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tyro"]
+# dependencies = ["tyro>=1.0.14", "tomlkit"]
 # ///
-"""Drive bin/display-layout's parsing and its arrangement. Run it directly; no framework.
+"""Drive bin/display-layout's commands over gdctl show fixtures. Run it directly; no framework.
 
-The cases fix the two judgements the tool rests on: what counts as the row
-mutter falls back to, and where the panel goes underneath. Everything else it
-does is one gdctl call away from mutter's own API, and gdctl -V verifies that
-live in a way a fixture cannot.
+The first part fixes the fallback's two judgements: what counts as the row
+mutter falls back to, and where the panel goes underneath. The second runs
+save, use, list, show, the picker, the edit verbs and the interactive edit
+against scratch layouts files, and checks the file save writes, the gdctl set
+arguments, and what each prints or draws. The last drives the watcher over the same fixtures, files and recent
+record. Whether mutter accepts an arrangement is mutter's to say, live, through
+gdctl set --verify.
 
 The fixtures are gdctl show output, kept down to the lines the parser reads plus
-the deeper ones it has to walk past.
+the deeper ones it has to walk past. tests/properties/display-layout.test holds
+the properties of matching, editing, drawing and the watcher's choice.
 """
 
+import atexit
+import contextlib
 import importlib.util
+import io
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
 import sys
+import tempfile
+import termios
+import threading
+import time
+import tomllib
+from dataclasses import replace
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
+
+import tyro
 
 
 def load(name: str, path: Path):
@@ -150,6 +174,11 @@ check("connectors, not the display names beside them", ["HDMI-1"], row.logicals[
 # Backlight sits two levels under the monitor, where a mode name sits under
 # "Current mode". Reading it as one would give an unparseable resolution.
 check("Preferences are not mistaken for a mode", "2560x1600@165.040", row.monitors["eDP-1"].mode)
+check(
+    "vendor, product and serial, which name a monitor on any port",
+    ("AUS", "ASUS VP28U", "0x00039bf2"),
+    (row.monitors["HDMI-1"].vendor, row.monitors["HDMI-1"].product, row.monitors["HDMI-1"].serial),
+)
 
 check("logical size is the mode over the scale", (2560, 1440), row.size_of(row.logicals[1]))
 
@@ -240,49 +269,1341 @@ try:
 except dl.ParseError:
     check("a monitor without a mode is refused", "ParseError", "ParseError")
 
-# --- the watch loop acts once per change of the connected set, and only out of the row
+try:
+    dl.run(["/nonexistent/gdctl", "show"])
+    check("a command that cannot be run is refused as one that failed", "CommandError", "no error")
+except dl.CommandError:
+    check("a command that cannot be run is refused as one that failed", "CommandError", "CommandError")
+
+# --- named layouts: save, use, list, show and pick
 #
-# This is the guard that keeps the tool off a hand-made arrangement, and the one
-# thing a forced layout on a live display cannot exercise: forcing a row does not
-# change the connected set, which is exactly why nothing should happen.
+# Each command runs against gdctl show fixtures, with a layouts file and a
+# recent record in a scratch directory. Only dl.run is replaced: it answers
+# `gdctl show` from the fixtures, answers UPower's lid query, and records
+# `gdctl set`. The monitors are the desk on zephylux (the ARZOPA turned to
+# portrait on the left, the HP above the panel); the serials are made up.
+
+LAPTOP = ("eDP-1", "Built-in display", "AUO", "0xc199", "0x00000000", "2560x1600@165.040")
+HP = ("HDMI-1", 'HP Inc. 27"', "HPN", "HP M27fwa FHD", "HP0000001", "1920x1080@60.000")
+ARZOPA = ("DP-1", 'GWD 16"', "GWD", "ARZOPA", "0x0000a001", "2560x1600@59.997")
+ASUS = ("HDMI-1", 'ASUSTek COMPUTER INC 28"', "AUS", "ASUS VP28U", "0x00039bf2", "3840x2160@60.000")
+FOUR_THIRDS = 1.3333333730697632
 
 
-def drive(startup, *changes, failing=False):
-    """Run follow() over a startup state plus one MonitorsChanged per change.
+def on(port, monitor, serial=None):
+    return (port, *monitor[1:4], serial or monitor[4], monitor[5])
 
-    Returns the gdctl argument lists it applied, dropping the leading
-    "gdctl set". With failing=True every apply raises, as a rejected
-    configuration does.
+
+def gdctl_show(monitors, logicals, off=()):
+    """gdctl show output. A logical is (connectors, x, y, scale, transform, primary).
+
+    A connector in `off` is listed with its preferred mode and has no logical
+    monitor, the way gdctl shows a closed laptop panel.
     """
-    applied = []
-    served = iter((startup,) + changes)
+    lines = ["Monitors:"]
+    for i, (connector, label, vendor, product, serial, mode) in enumerate(monitors):
+        head, pad = ("└──", "   ") if i == len(monitors) - 1 else ("├──", "│  ")
+        lines += [
+            f"{head}Monitor {connector} ({label})",
+            f"{pad}├──Vendor: {vendor}",
+            f"{pad}├──Product: {product}",
+            f"{pad}├──Serial: {serial}",
+            f"{pad}├──{'Preferred' if connector in off else 'Current'} mode",
+            f"{pad}│   └──{mode}",
+            f"{pad}└──Preferences",
+            f"{pad}    └──Backlight: None",
+        ]
+    lines += ["", "Logical monitors:"]
+    for i, (connectors, x, y, scale, transform, primary) in enumerate(logicals):
+        head, pad = ("└──", "   ") if i == len(logicals) - 1 else ("├──", "│  ")
+        connectors = connectors.split("+")
+        lines += [
+            f"{head}Logical monitor #{i + 1}",
+            f"{pad}├──Position: ({x}, {y})",
+            f"{pad}├──Scale: {scale}",
+            f"{pad}├──Transform: {transform}",
+            f"{pad}├──Primary: {'yes' if primary else 'no'}",
+            f"{pad}└──Monitors: ({len(connectors)})",
+        ]
+        lines += [f"{pad}    {'└' if j == len(connectors) - 1 else '├'}──{c} (label)" for j, c in enumerate(connectors)]
+    return "\n".join(lines) + "\n"
 
-    def fake_run(argv):
-        applied.append(argv[2:])
-        if failing:
-            raise RuntimeError("mutter rejected the configuration")
-        return ""
 
-    original = dl.read_state, dl.run, dl.log_run
-    dl.read_state = lambda: dl.parse_show(next(served))
-    dl.run = fake_run
-    dl.log_run = lambda *a, **k: None
+def desk(arzopa_port="DP-1", arzopa=(0, 180, FOUR_THIRDS, "90"), hp=(1200, 0, 1.0, "normal"),
+         laptop=(1200, 1080, FOUR_THIRDS, "normal"), primary="eDP-1", laptop_mode=LAPTOP[5]):
+    """The desk as gdctl shows it, in gdctl's order, with any monitor's place, scale or turn changed."""
+    return gdctl_show(
+        [HP, LAPTOP[:5] + (laptop_mode,), on(arzopa_port, ARZOPA)],
+        [(arzopa_port, *arzopa, primary == arzopa_port), ("HDMI-1", *hp, primary == "HDMI-1"),
+         ("eDP-1", *laptop, primary == "eDP-1")],
+    )
+
+
+DESK = desk()
+# The same monitors with the ARZOPA in the other USB-C port, mutter's row on screen.
+DESK_DP2_ROW = gdctl_show(
+    [HP, LAPTOP, on("DP-2", ARZOPA)],
+    [("HDMI-1", 0, 0, 1.0, "normal", False), ("eDP-1", 1920, 0, FOUR_THIRDS, "normal", True),
+     ("DP-2", 3840, 0, FOUR_THIRDS, "normal", False)],
+)
+# The lid closed at the desk: the panel is listed, off, and the HP is primary.
+DOCKED = gdctl_show(
+    [HP, LAPTOP, ARZOPA],
+    [("DP-1", 0, 0, FOUR_THIRDS, "90", False), ("HDMI-1", 1200, 0, 1.0, "normal", True)],
+    off=("eDP-1",),
+)
+
+ALIASES = """\
+[aliases]
+hp = { vendor = "HPN", product = "HP M27fwa FHD" }
+laptop = { vendor = "AUO", product = "0xc199" }
+arzopa = { vendor = "GWD", product = "ARZOPA" }
+"""
+DESK_TALL = """
+[layouts.desk-tall]
+arzopa = { x = 0, y = 180, mode = "2560x1600@59.997", scale = 1.3333333730697632, transform = "90" }
+hp = { x = 1200, y = 0, mode = "1920x1080@60.000" }
+laptop = { x = 1200, y = 1080, mode = "2560x1600@165.040", scale = 1.3333333730697632, primary = true }
+"""
+DESK_TOP = DESK_TALL.replace("desk-tall", "desk-top").replace("y = 180", "y = 0")
+DOCKED_LAYOUT = """
+[layouts.docked]
+arzopa = { x = 0, y = 0, mode = "2560x1600@59.997", scale = 1.3333333730697632, transform = "90" }
+hp = { x = 1200, y = 0, mode = "1920x1080@60.000", primary = true }
+"""
+DESK_FILE = ALIASES + DESK_TALL + DESK_TOP + DOCKED_LAYOUT
+
+
+class TtyStringIO(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class Session:
+    """The display, the lid and the files a command sees, and what it did.
+
+    `shows` are the gdctl show outputs the command reads in turn; the last one
+    repeats. A show may be a function of the session, called when it is read,
+    to change the files between two looks. `lid_closed` is one answer, or a
+    list of them read in turn the same way. `layouts` and `recent` seed the
+    files; None leaves none. mutter rejects the first `rejects` gdctl sets.
+    """
+
+    def __init__(self, *shows, lid_closed=False, layouts=None, recent=None, terminal=False, no_color=True, rejects=0):
+        self.tmp = Path(tempfile.mkdtemp(prefix="display-layout-test."))
+        atexit.register(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.shows, self.terminal, self.no_color, self.rejects = list(shows), terminal, no_color, rejects
+        self.lids = list(lid_closed) if isinstance(lid_closed, list) else [lid_closed]
+        self.applied, self.calls, self.logs = [], [], []
+        if layouts is not None:
+            self.path.write_text(layouts)
+        if recent is not None:
+            self.write_recent(recent)
+
+    def write_recent(self, names):
+        self.recent_path.parent.mkdir(parents=True, exist_ok=True)
+        self.recent_path.write_text("".join(f"{n}\n" for n in names))
+
+    path = property(lambda self: self.tmp / "layouts.toml")
+    recent_path = property(lambda self: self.tmp / "state" / "display-layout" / "recent")
+    file = property(lambda self: self.path.read_text() if self.path.exists() else "")
+    recent = property(lambda self: self.recent_path.read_text().split() if self.recent_path.exists() else [])
+
+    def run(self, argv):
+        if argv[:2] == ["gdctl", "show"]:
+            show = self.shows.pop(0) if len(self.shows) > 1 else self.shows[0]
+            return show(self) if callable(show) else show
+        if argv[:2] == ["gdctl", "set"]:
+            self.applied.append(argv[2:])
+            if len(self.applied) <= self.rejects:
+                raise dl.CommandError("mutter rejected the configuration")
+            return ""
+        if argv[:2] == ["gdbus", "call"] and argv[-1] == "LidIsClosed":
+            lid = self.lids.pop(0) if len(self.lids) > 1 else self.lids[0]
+            return "(<true>,)\n" if lid else "(<false>,)\n"
+        raise AssertionError(f"unexpected command {argv}")
+
+    def recording(self, name, function):
+        def recorded(*args, **kwargs):
+            self.calls.append(name)
+            return function(*args, **kwargs)
+        return recorded
+
+    def __call__(self, command, args):
+        out = TtyStringIO() if self.terminal else io.StringIO()
+        env = {"DISPLAY_LAYOUTS": str(self.path), "XDG_STATE_HOME": str(self.tmp / "state"), "COLUMNS": "80"}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, env))
+            if self.no_color:
+                os.environ["NO_COLOR"] = "1"
+            else:
+                os.environ.pop("NO_COLOR", None)
+            stack.enter_context(mock.patch.object(dl, "run", self.run))
+            stack.enter_context(mock.patch.object(dl, "cells", self.recording("cells", dl.cells)))
+            stack.enter_context(mock.patch.object(dl, "snap", self.recording("snap", dl.snap)))
+            stack.enter_context(mock.patch.object(dl, "match", self.recording("match", dl.match)))
+            stack.enter_context(mock.patch.object(dl, "decide", self.recording("decide", dl.decide)))
+            stack.enter_context(mock.patch.object(dl, "log_run", lambda *line: self.logs.append(line)))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            try:
+                try:
+                    command(args)
+                except dl.REFUSALS as exc:
+                    dl.fail(str(exc))
+            except SystemExit as exc:
+                return f"exit: {exc}"
+            except Exception as exc:  # noqa: BLE001  reported as a failed check, so the checks after it still run
+                return f"crash: {type(exc).__name__}: {exc}"
+        return out.getvalue()
+
+
+def groups(argv):
+    """gdctl set arguments as {connector: (x, y, scale, transform, primary, mode)}."""
+    out, group = {}, []
+    for arg in argv + ["--logical-monitor"]:
+        if arg == "--logical-monitor" and group:
+            pairs = [a for a in group if a != "--primary"]
+            flags = dict(zip(pairs[::2], pairs[1::2]))
+            out[flags["--monitor"]] = (int(flags["--x"]), int(flags["--y"]), float(flags["--scale"]),
+                                       flags["--transform"], "--primary" in group, flags["--mode"])
+            group = []
+        elif arg != "--logical-monitor":
+            group.append(arg)
+    return out
+
+
+def drawing(arrangement):
+    """How a command draws an arrangement at 80 columns without colour."""
+    return dl.draw(arrangement, dl.fit_width(arrangement, 80), None)
+
+
+TALL = (
+    dl.Screen("arzopa", ARZOPA[5], 0, 180, FOUR_THIRDS, "90"),
+    dl.Screen("hp", HP[5], 1200, 0),
+    dl.Screen("laptop", LAPTOP[5], 1200, 1080, FOUR_THIRDS, primary=True),
+)
+
+# --- save
+
+s = Session(DESK)
+out = s(dl.save, dl.SaveArgs("desk-tall"))
+check("save writes the arrangement on screen into the file, by alias, in the documented shape",
+      tomllib.loads(ALIASES + DESK_TALL), tomllib.loads(s.file))
+check("save names each new alias from its model, and says so",
+      ["new alias hp: HPN HP M27fwa FHD", "new alias laptop: AUO 0xc199", "new alias arzopa: GWD ARZOPA",
+       f"saved desk-tall in {s.path}", "", "desk-tall, as saved"],
+      out.splitlines()[:6])
+check("save draws what it saved through cells", (True, drawing(TALL)), ("cells" in s.calls, out.split("\n\n", 2)[-1].rstrip("\n")))
+check("save puts the layout first in recent", ["desk-tall"], s.recent)
+
+s = Session(DESK, layouts="# my desks\n" + ALIASES + DESK_TOP, recent=["desk-top"])
+s(dl.save, dl.SaveArgs("desk-tall"))
+check("saving into an existing file keeps its comments and layouts, and adds no alias twice",
+      (True, tomllib.loads(ALIASES + DESK_TOP + DESK_TALL)), (s.file.startswith("# my desks\n"), tomllib.loads(s.file)))
+check("and puts the saved layout first in recent", ["desk-tall", "desk-top"], s.recent)
+
+# Lid closed, and the panel the only monitor: mutter keeps it in the set, so does a layout.
+s = Session(PANEL_ONLY, lid_closed=True)
+s(dl.save, dl.SaveArgs("solo"))
+check("with the lid closed and only the panel, the panel is saved", ["laptop"],
+      list(tomllib.loads(s.file).get("layouts", {}).get("solo", {})))
+
+s = Session(DOCKED, lid_closed=True)
+s(dl.save, dl.SaveArgs("docked"))
+check("a layout saved with the lid closed leaves the panel out",
+      tomllib.loads(ALIASES.replace('laptop = { vendor = "AUO", product = "0xc199" }\n', "") + DOCKED_LAYOUT),
+      tomllib.loads(s.file))
+
+FIVE = gdctl_show(
+    [LAPTOP, HP, ("DP-3", "x", "GSM", "LG ULTRAWIDE", "1", "3440x1440@99.997"),
+     ("DP-4", "x", "ABC", "0x1234", "2", "1920x1080@60.000"), ("DP-5", "x", "HPN", "HP E24 G5", "3", "1920x1080@60.000")],
+    [("eDP-1", 0, 0, 1.0, "normal", True), ("HDMI-1", 2560, 0, 1.0, "normal", False),
+     ("DP-3", 4480, 0, 1.0, "normal", False), ("DP-4", 7920, 0, 1.0, "normal", False),
+     ("DP-5", 9840, 0, 1.0, "normal", False)],
+)
+s = Session(FIVE)
+s(dl.save, dl.SaveArgs("wall"))
+check("an alias is the product's first word, the vendor's when the product is a code, laptop for the panel",
+      {"laptop": "0xc199", "hp": "HP M27fwa FHD", "lg": "LG ULTRAWIDE", "abc": "0x1234", "hp-2": "HP E24 G5"},
+      {a: m["product"] for a, m in tomllib.loads(s.file).get("aliases", {}).items()})
+
+TWINS = gdctl_show(
+    [LAPTOP, ARZOPA, on("DP-2", ARZOPA, "0x0000a002")],
+    [("eDP-1", 0, 0, 1.0, "normal", True), ("DP-1", 2560, 0, 1.0, "normal", False),
+     ("DP-2", 5120, 0, 1.0, "normal", False)],
+)
+s = Session(TWINS, layouts='[aliases]\narzopa = { vendor = "GWD", product = "ARZOPA" }\n')
+out = s(dl.save, dl.SaveArgs("twins"))
+check("of two monitors of one model, the first takes the alias without a serial and gets its serial",
+      sorted(["updated alias arzopa: GWD ARZOPA 0x0000a001", "new alias laptop: AUO 0xc199",
+              "new alias arzopa-2: GWD ARZOPA 0x0000a002"]), sorted(out.splitlines()[:3]))
+
+# Cheap portable monitors often report one serial for every unit.
+same = TWINS.replace("0x0000a002", "0x0000a001")
+s = Session(same)
+first = s(dl.save, dl.SaveArgs("twins"))
+again = s(dl.save, dl.SaveArgs("twins"))
+check("twins with one serial get an alias each, and saving again reuses both",
+      (["arzopa", "arzopa-2", "laptop"], "saved twins"),
+      (sorted(tomllib.loads(s.file).get("layouts", {}).get("twins", {})), again.splitlines()[0].rsplit(" in ", 1)[0]))
+
+bare_twins = dl.Store({"left": dl.Model("GWD", "ARZOPA"), "right": dl.Model("GWD", "ARZOPA")},
+                      {"pair": (dl.Screen("left", ARZOPA[5], 0, 0), dl.Screen("right", ARZOPA[5], 2560, 0, primary=True))})
+check("twins without serials take their monitors in connector order, whatever order gdctl lists them in",
+      {"pair": {"left": "DP-1", "right": "DP-2"}},
+      dl.match(bare_twins, [dl.Monitor("DP-2", ARZOPA[5], "GWD", "ARZOPA", "b"), dl.Monitor("DP-1", ARZOPA[5], "GWD", "ARZOPA", "a")]))
+
+for what, show, lid, message in (
+    ("a name gdctl's users could not type", DESK, False, "'desk tall': a layout name is letters, digits, - and _"),
+    ("a connected monitor that is off", DOCKED, False,
+     "eDP-1 is connected but off, and a layout covers every connected monitor"),
+    ("a mirror", gdctl_show([LAPTOP, HP], [("eDP-1+HDMI-1", 0, 0, 1.0, "normal", True)]), False,
+     "eDP-1 and HDMI-1 mirror each other, and a layout cannot hold a mirror"),
+    ("the panel on with the lid closed", DESK, True,
+     "eDP-1 is on with the lid closed; open the lid, or turn the panel off"),
+):
+    s = Session(show, lid_closed=lid)
+    check(f"save refuses {what}, and writes nothing",
+          (f"exit: display-layout: {message}", False),
+          (s(dl.save, dl.SaveArgs("desk tall" if "name" in what else "x")), s.path.exists()))
+
+# --- use
+
+s = Session(DESK_DP2_ROW, desk("DP-2"), layouts=DESK_FILE, recent=["desk-top", "desk-tall"])
+out = s(dl.use, dl.UseArgs("desk-tall"))
+check("use binds each alias to the port its monitor is on now, through match",
+      ([{"DP-2": (0, 180, FOUR_THIRDS, "90", False, ARZOPA[5]), "HDMI-1": (1200, 0, 1.0, "normal", False, HP[5]),
+         "eDP-1": (1200, 1080, FOUR_THIRDS, "normal", True, LAPTOP[5])}], True),
+      ([groups(a) for a in s.applied], "match" in s.calls))
+check("use never passes --persistent", [], [a for a in s.applied[0] if a in ("-P", "--persistent")])
+check("use moves the layout to the front of recent", ["desk-tall", "desk-top"], s.recent)
+check("use draws the result as it reads back from gdctl", "desk-tall, as saved\n\n" + drawing(TALL) + "\n", out)
+
+s = Session(DOCKED.replace("DP-1", "DP-2"), lid_closed=True, layouts=DESK_FILE)
+s(dl.use, dl.UseArgs("docked"))
+check("a layout saved with the lid closed is applied, on other ports, with the panel left off",
+      [{"DP-2": (0, 0, FOUR_THIRDS, "90", False, ARZOPA[5]), "HDMI-1": (1200, 0, 1.0, "normal", True, HP[5])}],
+      [groups(a) for a in s.applied])
+
+# A layout edited by hand need not start at (0, 0); mutter refuses one that does not.
+s = Session(DESK, layouts=ALIASES + DESK_TALL.replace("x = 0, y = 180", "x = 100, y = 230")
+            .replace("x = 1200, y = 0,", "x = 1300, y = 50,").replace("x = 1200, y = 1080", "x = 1300, y = 1130"))
+s(dl.use, dl.UseArgs("desk-tall"))
+check("use moves a layout to start at (0, 0)", {"DP-1": (0, 180), "HDMI-1": (1200, 0), "eDP-1": (1200, 1080)},
+      {c: g[:2] for c, g in groups(s.applied[0]).items()})
+
+for what, show, lid, name, message in (
+    ("a layout for other monitors, naming those connected", PANEL_ONLY, False, "desk-tall",
+     "desk-tall is for arzopa, hp, laptop; connected: laptop on eDP-1"),
+    ("a monitor no alias stands for", ROW, False, "desk-tall",
+     "desk-tall is for arzopa, hp, laptop; connected: laptop on eDP-1, HDMI-1 (AUS ASUS VP28U, no alias)"),
+    ("the lid-closed layout with the lid open", DESK, False, "docked",
+     "docked is for arzopa, hp; connected: hp on HDMI-1, laptop on eDP-1, arzopa on DP-1"),
+    ("a name it does not know, listing those saved", DESK, False, "nope",
+     "no layout named nope; saved: desk-tall, desk-top, docked"),
+):
+    s = Session(show, lid_closed=lid, layouts=DESK_FILE)
+    check(f"use refuses {what}, and applies nothing",
+          (f"exit: display-layout: {message}", []), (s(dl.use, dl.UseArgs(name)), s.applied))
+
+check("a broken layouts file is named in the refusal", True,
+      Session(DESK, layouts=DESK_FILE + "[layouts.docked]\n")(dl.use, dl.UseArgs("docked")).startswith("exit: display-layout: /"))
+
+# --- apply
+
+s = Session(ROW, STACKED)
+out = s(dl.apply, dl.ApplyArgs())
+fallback = dl.plan(dl.parse_show(ROW))
+check("apply puts the fallback on screen, never --persistent, and draws what gdctl shows after it",
+      ([groups(fallback)], [],
+       "gdctl set " + " ".join(fallback) + "\n\nnot a saved layout\n\n" + drawing(dl.live(dl.parse_show(STACKED), {})) + "\n"),
+      ([groups(a) for a in s.applied], [a for argv in s.applied for a in argv if a in ("-P", "--persistent")], out))
+s = Session(ROW)
+check("apply --dry-run prints the gdctl command and applies nothing",
+      ("gdctl set " + " ".join(dl.plan(dl.parse_show(ROW))) + "\n", []), (s(dl.apply, dl.ApplyArgs(dry_run=True)), s.applied))
+s = Session(PANEL_ONLY)
+check("apply with nothing to arrange refuses as every command does", ("exit: display-layout: nothing to arrange", []),
+      (s(dl.apply, dl.ApplyArgs()), s.applied))
+
+# --- list
+
+s = Session(DESK_DP2_ROW, layouts=DESK_FILE)
+check("list marks the layouts that fit, whatever the ports, through match",
+      ("fits  desk-tall  arzopa, hp, laptop\nfits  desk-top   arzopa, hp, laptop\n      docked     arzopa, hp\n", True),
+      (s(dl.list_, dl.ListArgs()), "match" in s.calls))
+check("with the lid closed the panel is not part of the set",
+      "      desk-tall  arzopa, hp, laptop\n      desk-top   arzopa, hp, laptop\nfits  docked     arzopa, hp\n",
+      Session(DOCKED, lid_closed=True, layouts=DESK_FILE)(dl.list_, dl.ListArgs()))
+check("list --json", [{"name": "desk-tall", "fits": False, "monitors": ["arzopa", "hp", "laptop"]},
+                      {"name": "desk-top", "fits": False, "monitors": ["arzopa", "hp", "laptop"]},
+                      {"name": "docked", "fits": True, "monitors": ["arzopa", "hp"]}],
+      json.loads(Session(DOCKED, lid_closed=True, layouts=DESK_FILE)(dl.list_, dl.ListArgs(json=True))))
+s = Session(DESK)
+check("list with nothing saved says how to save", f"no layouts in {s.path}; display-layout save NAME saves the one on screen\n",
+      s(dl.list_, dl.ListArgs()))
+
+# --- show
+
+
+def head(show, lid_closed=False, layouts=DESK_FILE, recent=()):
+    return Session(show, lid_closed=lid_closed, layouts=layouts, recent=list(recent))(dl.show, dl.ShowArgs()).split("\n")[0]
+
+
+check("show names the layout on screen, used or not", "desk-tall, as saved", head(DESK))
+check("of two identical layouts, the one used last",
+      "desk-copy, as saved", head(DESK, layouts=DESK_FILE + DESK_TALL.replace("desk-tall", "desk-copy"),
+                                   recent=["desk-copy"]))
+check("with the lid closed", "docked, as saved", head(DOCKED, lid_closed=True))
+check("a screen no layout matches, with none used, is not a saved layout", "not a saved layout", head(ROW))
+TOP = (0, 0, FOUR_THIRDS, "90")  # the ARZOPA in desk-top
+for what, show, changed in (
+    ("a monitor moved", desk(arzopa=(0, 100, FOUR_THIRDS, "90")), "arzopa moved"),
+    ("a monitor turned", desk(arzopa=(0, 0, FOUR_THIRDS, "270")), "arzopa turned"),
+    ("a monitor rescaled", desk(arzopa=TOP, hp=(1200, 0, 1.25, "normal"), laptop=(1200, 864, FOUR_THIRDS, "normal")),
+     "hp rescaled, laptop moved"),
+    # Turned to landscape, the ARZOPA keeps its top right corner against the HP,
+    # and pushes the HP and the panel 720 px right together.
+    ("a monitor turned, the others pushed along together",
+     desk(arzopa=(0, 0, FOUR_THIRDS, "normal"), hp=(1920, 0, 1.0, "normal"), laptop=(1920, 1080, FOUR_THIRDS, "normal")),
+     "arzopa turned"),
+    # At scale 2 the ARZOPA is 800 px wide, level with the HP's top; the HP and the panel come 400 px left.
+    ("a monitor rescaled, the others pulled along together",
+     desk(arzopa=(0, 0, 2.0, "90"), hp=(800, 0, 1.0, "normal"), laptop=(800, 1080, FOUR_THIRDS, "normal")),
+     "arzopa rescaled"),
+    ("a monitor turned and moved down the others' side",
+     desk(arzopa=(0, 540, FOUR_THIRDS, "normal"), hp=(1920, 0, 1.0, "normal"), laptop=(1920, 1080, FOUR_THIRDS, "normal")),
+     "arzopa moved and turned"),
+    ("another primary", desk(arzopa=TOP, primary="HDMI-1"), "hp made primary"),
+    ("another mode", desk(arzopa=TOP, laptop_mode="2560x1600@60.000"), "laptop in another mode"),
+):
+    check(f"show names what changed since the layout last used: {what}",
+          f"last used with these monitors: desk-top; since then {changed}", head(show, recent=["desk-top"]))
+
+# Two monitors, the one that changed size listed first: the one that kept its
+# size is the one that stayed.
+portrait = (dl.Screen("arzopa", ARZOPA[5], 0, 0, FOUR_THIRDS, "90"), dl.Screen("laptop", LAPTOP[5], 1200, 0, FOUR_THIRDS, primary=True))
+landscape_pair = (dl.Screen("arzopa", ARZOPA[5], 0, 0, FOUR_THIRDS), dl.Screen("laptop", LAPTOP[5], 1920, 0, FOUR_THIRDS, primary=True))
+check("of two monitors, the one that changed size is measured against the one that kept it",
+      ["arzopa turned"], dl.changes(portrait, landscape_pair))
+
+s = Session(DESK, layouts=DESK_FILE)
+out = s(dl.show, dl.ShowArgs())
+check("show draws through cells", (True, drawing(TALL)), ("cells" in s.calls, out.split("\n\n", 1)[1].rstrip("\n")))
+check("show draws a mirror as one screen", "not a saved layout",
+      head(gdctl_show([LAPTOP, HP], [("eDP-1+HDMI-1", 0, 0, 1.0, "normal", True)])))
+report = json.loads(Session(desk(arzopa=(0, 100, FOUR_THIRDS, "90")), layouts=DESK_FILE, recent=["desk-top"])(
+    dl.show, dl.ShowArgs(json=True)))
+check("show --json names the layout and what changed", ("desk-top", ["arzopa moved"], False),
+      (report["layout"], report["changed"], report["is_mutter_row"]))
+check("colour in a terminal, outline with NO_COLOR or out of one", (True, False, False), tuple(
+    "\x1b[" in Session(DESK, layouts=DESK_FILE, terminal=terminal, no_color=no_color)(dl.show, dl.ShowArgs())
+    for terminal, no_color in ((True, False), (True, True), (False, False))
+))
+
+# --- pick
+#
+# A fake fzf on PATH takes fzf's place: it records the names it is given and
+# picks one, or exits the way fzf does when left. The preview runs as fzf runs
+# it, with the pane's size in FZF_PREVIEW_COLUMNS and FZF_PREVIEW_LINES.
+
+FAKE_FZF = """\
+#!/bin/sh
+cat > "$FAKE_FZF_DIR/offered"
+printf '%s\\n' "$FAKE_FZF_PICK"
+exit "$FAKE_FZF_STATUS"
+"""
+
+
+def picking(session, pick="", status=0, fzf=True, args=None):
+    """The picker's output in `session`, and the names fzf was given, when fzf prints `pick` and exits `status`.
+
+    `args` runs the command line instead of the command, as the script's own entry does.
+    """
+    bin_dir = session.tmp / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    if fzf:
+        (bin_dir / "fzf").write_text(FAKE_FZF)
+        (bin_dir / "fzf").chmod(0o755)
+    env = {"PATH": str(bin_dir) if not fzf else f"{bin_dir}:{os.environ['PATH']}", "FAKE_FZF_DIR": str(session.tmp),
+           "FAKE_FZF_PICK": pick, "FAKE_FZF_STATUS": str(status)}
+    command = (lambda _: dl.app.cli(args=args, config=(dl.tyro.conf.OmitArgPrefixes,))) if args is not None else dl.pick
+    with mock.patch.dict(os.environ, env), mock.patch.object(dl, "use", session.recording("use", dl.use)):
+        out = session(command, dl.PickArgs())
+    offered = session.tmp / "offered"
+    return out, offered.read_text().splitlines() if offered.exists() else None
+
+
+s = Session(DESK_DP2_ROW, desk("DP-2"), layouts=DESK_FILE, recent=["docked", "desk-top"])
+out, offered = picking(s, "desk-tall")
+check("the picker lists the layouts that fit, whatever the ports, the one used last first, through match",
+      (["desk-top", "desk-tall"], True), (offered, "match" in s.calls))
+u = Session(DESK_DP2_ROW, desk("DP-2"), layouts=DESK_FILE, recent=["docked", "desk-top"])
+check("a pick is put on screen through use: the same gdctl set, recent record and drawing",
+      (True, u(dl.use, dl.UseArgs("desk-tall")), u.applied, u.recent), ("use" in s.calls, out, s.applied, s.recent))
+s = Session(DESK, layouts=DESK_FILE)
+check("bare display-layout opens the picker", ["desk-tall", "desk-top"], picking(s, args=[])[1])
+check("with the lid closed, the lid-closed layout", ["docked"],
+      picking(Session(DOCKED, lid_closed=True, layouts=DESK_FILE))[1])
+
+for what, status in (("with Esc or Ctrl-C", 130), ("with no match", 1)):
+    s = Session(DESK, layouts=DESK_FILE, recent=["desk-top"])
+    check(f"leaving fzf {what} applies nothing, prints nothing and records nothing",
+          ("", [], ["desk-top"]), (picking(s, status=status)[0], s.applied, s.recent))
+check("fzf failing is a refusal naming its status", "exit: display-layout: fzf exited with status 2",
+      picking(Session(DESK, layouts=DESK_FILE), status=2)[0])
+check("without fzf the picker says it needs it", "exit: display-layout: the picker runs fzf, which is not on PATH",
+      picking(Session(DESK, layouts=DESK_FILE), fzf=False)[0])
+check("with nothing saved for the monitors connected, the picker says so, points at save, and opens no fzf",
+      ("exit: display-layout: no saved layout fits the monitors connected now (laptop on eDP-1); "
+       "display-layout save NAME saves the one on screen", None),
+      picking(Session(PANEL_ONLY, layouts=DESK_FILE), "desk-tall"))
+s = Session(DESK)
+check("with nothing saved at all, the same, naming the file",
+      (f"exit: display-layout: no layouts in {s.path}; display-layout save NAME saves the one on screen", None), picking(s))
+
+
+def previewed(name, columns=None, lines=None, layouts=DESK_FILE, **session):
+    """The preview of `name` with desk-tall on screen, in a pane `columns` wide and `lines` tall, and its Session.
+
+    Without a pane size it runs outside fzf, in a terminal 80 columns wide and `lines` tall.
+    """
+    s = Session(DESK, layouts=layouts, **session)
+    pane = {"FZF_PREVIEW_COLUMNS": str(columns), "FZF_PREVIEW_LINES": str(lines)} if columns else {"LINES": str(lines)}
+    with mock.patch.dict(os.environ, pane):
+        return s(dl.pick, dl.PickArgs(preview=name)), s
+
+
+def visible(text):
+    return [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in text.splitlines()]
+
+
+def fills(text):
+    return {"#" + "".join(f"{int(n):02x}" for n in m) for m in re.findall(r"48;2;(\d+);(\d+);(\d+)", text)}
+
+
+# desk-top is 3120 x 2280 logical px. A pane 60 columns wide makes a cell 52 px,
+# so the drawing is 2280 / 52 = 44 cells, 22 lines, tall.
+TOP_SAVED = (replace(TALL[0], y=0), *TALL[1:])
+out, s = previewed("desk-top", 60, 40)
+check("the preview draws the saved layout, not the screen, through cells, at the pane width fzf reports",
+      (dl.draw(TOP_SAVED, 60, None), True, 60),
+      (out.rstrip("\n"), "cells" in s.calls, max(len(line) for line in visible(out))))
+out, _ = previewed("desk-top", 150, 80)
+check("a pane wider than MAX_COLUMNS is filled all the same", 150, max(len(line) for line in visible(out)))
+# 12 lines are 24 cells of 2280 / 24 = 95 px, and 3120 px of those are 32 cells across.
+out, _ = previewed("desk-top", 200, 12)
+check("a pane too short for its width gets the widest drawing that fits its height", (12, 32),
+      (len(visible(out)), max(len(line) for line in visible(out))))
+out, _ = previewed("desk-top", 60, 40, no_color=False)
+check("in colour in fzf's pane, which is no terminal to isatty, and in the earth palette",
+      (True, {dl.EARTH["arzopa"], dl.EARTH["hp"], dl.EARTH["laptop"]}), ("\x1b[" in out, fills(out)))
+spares = ALIASES + 'dell = { vendor = "DEL", product = "U2720Q" }\nbenq = { vendor = "BNQ", product = "GW2480" }\n' + """
+[layouts.benq-only]
+benq = { x = 0, y = 0, mode = "1920x1080@60.000", primary = true }
+"""
+check("a monitor with no colour of its own takes the spare its place in [aliases] gives it, as everywhere",
+      {dl.MORE_EARTH[1]}, fills(previewed("benq-only", 60, 40, layouts=spares, no_color=False)[0]))
+out, _ = previewed("desk-top", lines=50, terminal=True, no_color=False)
+check("outside fzf, the preview fills the terminal, in colour", (80, True),
+      (max(len(line) for line in visible(out)), "\x1b[" in out))
+check("a preview of a name not saved says which are",
+      "exit: display-layout: no layout named nope; saved: desk-tall, desk-top, docked", previewed("nope", 60, 40)[0])
+
+# fzf itself: the options the picker gives it, and the preview command it runs.
+s = Session(DESK, layouts=DESK_FILE)
+bare = {k: v for k, v in os.environ.items() if not k.startswith("FZF_")}
+try:
+    fzf = subprocess.run([*dl.fzf_argv(), "--filter", "top"], input="desk-tall\ndesk-top\n", capture_output=True,
+                         text=True, env=bare)
+    check("fzf accepts the picker's options", ("desk-top\n", ""), (fzf.stdout, fzf.stderr))
+except FileNotFoundError:
+    check("fzf accepts the picker's options", "fzf on PATH", "no fzf")
+command = next(a for a in dl.fzf_argv() if a.startswith("--preview=")).removeprefix("--preview=")
+check("the preview command names this script as one word", str(Path(dl.__file__).resolve()), shlex.split(command)[0])
+ran = subprocess.run(
+    ["sh", "-c", command.replace("{}", "'desk-top'")], capture_output=True, text=True,
+    env=bare | {"DISPLAY_LAYOUTS": str(s.path), "FZF_PREVIEW_COLUMNS": "60", "FZF_PREVIEW_LINES": "40", "NO_COLOR": "1"},
+)
+check("fzf's preview command runs the preview", (previewed("desk-top", 60, 40)[0], ""), (ran.stdout, ran.stderr))
+
+# --- the edit verbs: rotate, place, primary, scale
+#
+# The desk as above: the ARZOPA turned on the left, beside both the HP and the
+# panel below it. Each command reads the screen, applies one gdctl set, and
+# draws what gdctl shows afterwards: the second fixture passed to edited(), or
+# the first again when there is none.
+
+
+def edited(command, verb, *shows, layouts=DESK_FILE, lid_closed=False):
+    """Run an edit command. The session (its calls say whether edit() ran), the output, and the gdctl set arguments applied."""
+    s = Session(*shows, layouts=layouts, recent=["desk-tall"], lid_closed=lid_closed)
+    with mock.patch.object(dl, "edit", s.recording("edit", dl.edit)):
+        out = s(command, verb)
+    return s, out, [groups(a) for a in s.applied]
+
+
+COMMANDS = {dl.Rotate: dl.rotate, dl.Place: dl.place, dl.Primary: dl.primary, dl.Scale: dl.scale}
+
+
+def gdctl_set(arzopa, hp, laptop, primary="eDP-1", arzopa_port="DP-1"):
+    """What a command should apply, each monitor as (x, y, scale, transform)."""
+    return [{arzopa_port: (*arzopa, primary == arzopa_port, ARZOPA[5]), "HDMI-1": (*hp, primary == "HDMI-1", HP[5]),
+             "eDP-1": (*laptop, primary == "eDP-1", LAPTOP[5])}]
+
+
+# The ARZOPA turned to landscape, 1920x1200. The HP and the panel stay; it keeps
+# its right edge against them and its middle level with theirs, 1140 px down.
+LANDSCAPE = dict(arzopa=(0, 540, FOUR_THIRDS, "normal"), hp=(1920, 0, 1.0, "normal"), laptop=(1920, 1080, FOUR_THIRDS, "normal"))
+# gdctl reads back the ARZOPA level with the HP's top, not where edit() put it,
+# as it would if mutter had placed it differently: the drawing shows mutter's.
+READ_BACK = LANDSCAPE | {"arzopa": (0, 0, FOUR_THIRDS, "normal")}
+s, out, applied = edited(dl.rotate, dl.Rotate("arzopa", "normal"), DESK, desk(**READ_BACK))
+check("rotate turns the monitor, and the others stay where they were beside it", gdctl_set(**LANDSCAPE), applied)
+check("rotate never passes --persistent", [], [a for a in s.applied[0] if a in ("-P", "--persistent")])
+check("an edit writes no layout and records none as used", (DESK_FILE, ["desk-tall"]), (s.file, s.recent))
+read_back = (dl.Screen("arzopa", ARZOPA[5], 0, 0, FOUR_THIRDS), dl.Screen("hp", HP[5], 1920, 0),
+             dl.Screen("laptop", LAPTOP[5], 1920, 1080, FOUR_THIRDS, primary=True))
+check("rotate draws the result as it reads back from gdctl, which is no longer desk-tall",
+      ("last used with these monitors: desk-tall; since then arzopa moved and turned",
+       drawing(read_back)),
+      (out.split("\n")[0], out.split("\n\n", 1)[-1].rstrip("\n")))
+check("rotate names a monitor without an alias by its connector", gdctl_set(**LANDSCAPE),
+      edited(dl.rotate, dl.Rotate("DP-1", "normal"), DESK, layouts=None)[2])
+check("rotate between left and right moves nothing", gdctl_set((0, 180, FOUR_THIRDS, "270"), (1200, 0, 1.0, "normal"),
+                                                              (1200, 1080, FOUR_THIRDS, "normal")),
+      edited(dl.rotate, dl.Rotate("arzopa", "left"), DESK)[2])
+
+# The HP at 1.25 is 1536x864. It stays on the panel, centred where it was, and
+# nothing else moves.
+check("scale rescales the monitor, which keeps its place against its neighbours",
+      gdctl_set((0, 0, FOUR_THIRDS, "90"), (1392, 36, 1.25, "normal"), (1200, 900, FOUR_THIRDS, "normal")),
+      edited(dl.scale, dl.Scale("hp", 1.25), DESK)[2])
+
+check("primary moves the primary and nothing else",
+      gdctl_set((0, 180, FOUR_THIRDS, "90"), (1200, 0, 1.0, "normal"), (1200, 1080, FOUR_THIRDS, "normal"), primary="HDMI-1"),
+      edited(dl.primary, dl.Primary("hp"), DESK)[2])
+
+# The ARZOPA to the right of the panel, level with its top. The HP and the panel stay.
+check("place moves the monitor beside the other, aligned as asked",
+      gdctl_set((1920, 1080, FOUR_THIRDS, "90"), (0, 0, 1.0, "normal"), (0, 1080, FOUR_THIRDS, "normal")),
+      edited(dl.place, dl.Place("arzopa", "right-of", "laptop", "top"), DESK)[2])
+
+for what, verb, layouts, message in (
+    ("a name it does not know, listing those on screen", dl.Rotate("lgg", "left"), DESK_FILE,
+     "no monitor named lgg; on screen: hp on HDMI-1, laptop on eDP-1, arzopa on DP-1"),
+    ("an alias whose monitor is not connected", dl.Scale("lg", 1.25), ALIASES + 'lg = { vendor = "GSM", product = "LG ULTRAWIDE" }\n' + DESK_TALL,
+     "lg is not on screen; on screen: hp on HDMI-1, laptop on eDP-1, arzopa on DP-1"),
+    ("an alias when there is no layouts file, listing connectors", dl.Primary("hp"), None,
+     "no monitor named hp; on screen: HDMI-1 (HPN HP M27fwa FHD, no alias), eDP-1 (AUO 0xc199, no alias), "
+     "DP-1 (GWD ARZOPA, no alias)"),
+    ("a place beside a monitor not on screen", dl.Place("arzopa", "left-of", "nope"), DESK_FILE,
+     "no monitor named nope; on screen: hp on HDMI-1, laptop on eDP-1, arzopa on DP-1"),
+    ("an alignment across the shared edge", dl.Place("arzopa", "above", "hp", "top"), DESK_FILE,
+     "--align top: above aligns left, center, right"),
+    ("a monitor placed beside itself", dl.Place("hp", "below", "hp"), DESK_FILE, "hp cannot go below itself"),
+    ("a scale of 0", dl.Scale("hp", 0.0), DESK_FILE, "scale 0.0: a scale is a positive number, 1.25 for 125 %"),
+    ("a scale that is not a number", dl.Scale("hp", float("nan")), DESK_FILE,
+     "scale nan: a scale is a positive number, 1.25 for 125 %"),
+):
+    s, out, applied = edited(COMMANDS[type(verb)], verb, DESK, layouts=layouts)
+    check(f"an edit refuses {what}, and applies nothing", (f"exit: display-layout: {message}", []), (out, applied))
+check("a panel that is connected but off is not on screen, and is not listed as on it",
+      "exit: display-layout: laptop is not on screen; on screen: hp on HDMI-1, arzopa on DP-1",
+      edited(dl.rotate, dl.Rotate("laptop", "left"), DOCKED)[1])
+check("a panel lit with the lid closed is on screen, by its alias", [{"DP-1": False, "HDMI-1": False, "eDP-1": True}],
+      [{c: g[4] for c, g in a.items()} for a in edited(dl.primary, dl.Primary("laptop"), DESK, lid_closed=True)[2]])
+check("an edit refuses a mirror", "exit: display-layout: eDP-1 and HDMI-1 mirror each other; rotate, place, primary, "
+      "scale and edit move monitors shown on their own", edited(dl.primary, dl.Primary("laptop"), gdctl_show([LAPTOP, HP], [("eDP-1+HDMI-1", 0, 0, 1.0, "normal", True)]))[1])
+
+check("rotate with the panel alone turns it where it is", [{"eDP-1": (0, 0, FOUR_THIRDS, "270", True, LAPTOP[5])}],
+      edited(dl.rotate, dl.Rotate("eDP-1", "left"), PANEL_ONLY, layouts=None)[2])
+
+# The documented command lines, parsed the way a shell hands them over.
+for argv, verb in (
+    (["rotate", "arzopa", "left"], dl.Rotate("arzopa", "left")),
+    (["place", "arzopa", "left-of", "laptop", "--align", "top"], dl.Place("arzopa", "left-of", "laptop", "top")),
+    (["place", "hp", "below", "laptop"], dl.Place("hp", "below", "laptop")),
+    (["primary", "laptop"], dl.Primary("laptop")),
+    (["scale", "hp", "1.25"], dl.Scale("hp", 1.25)),
+):
+    typed = edited(lambda _: dl.app.cli(args=argv, config=(tyro.conf.OmitArgPrefixes,)), None, DESK)[2]
+    check(f"display-layout {' '.join(argv)}", edited(COMMANDS[type(verb)], verb, DESK)[2], typed)
+
+check("every edit command goes through edit", {"rotate": True, "place": True, "primary": True, "scale": True}, {
+    command.__name__: "edit" in edited(command, verb, DESK)[0].calls
+    for command, verb in ((dl.rotate, dl.Rotate("hp", "left")), (dl.place, dl.Place("hp", "below", "laptop")),
+                          (dl.primary, dl.Primary("hp")), (dl.scale, dl.Scale("hp", 2.0)))
+})
+
+# Alignment along the shared edge, worked out by hand. The HP (1920x1080) is
+# placed against the ARZOPA turned (1200x1920 at 4/3), and the ARZOPA against the HP.
+# The HP starts below the ARZOPA, so every case has to move it.
+hp_and_arzopa = (dl.Screen("hp", HP[5], 0, 1920, primary=True), dl.Screen("arzopa", ARZOPA[5], 0, 0, FOUR_THIRDS, "90"))
+for side, align, want in (
+    ("left-of", "top", {"hp": (0, 0), "arzopa": (1920, 0)}),
+    ("left-of", "center", {"hp": (0, 420), "arzopa": (1920, 0)}),
+    ("left-of", "bottom", {"hp": (0, 840), "arzopa": (1920, 0)}),
+    ("right-of", "bottom", {"hp": (1200, 840), "arzopa": (0, 0)}),
+    ("above", "left", {"hp": (0, 0), "arzopa": (0, 1080)}),
+    ("above", "center", {"hp": (0, 0), "arzopa": (360, 1080)}),
+    ("above", "right", {"hp": (0, 0), "arzopa": (720, 1080)}),
+    ("below", "right", {"hp": (0, 1920), "arzopa": (720, 0)}),
+):
+    got = dl.edit(hp_and_arzopa, dl.Place("hp", side, "arzopa", align))
+    check(f"place hp {side} arzopa --align {align}", want, {s.name: (s.x, s.y) for s in got})
+
+# A turned HP 24 below a turned ASUS, the ARZOPA turned beside it, turned back
+# to landscape. Nothing else has to move, so nothing does, and of the HP 24's
+# corners and midpoints the one that can stay put does: its top right corner,
+# 1080 px right of the ASUS's left edge.
+tower = (dl.Screen("asus", ASUS[5], 0, 0, 1.5, "90"), dl.Screen("hp-24", HP[5], 0, 2560, 1.0, "90", True),
+         dl.Screen("arzopa", ARZOPA[5], 1440, 2348, FOUR_THIRDS, "270"))
+check("a resized monitor keeps one of its corners where it was when one can stay",
+      {"asus": (840, 0), "hp-24": (0, 2560), "arzopa": (2280, 2348)},
+      {s.name: (s.x, s.y) for s in dl.edit(tower, dl.Rotate("hp-24", "normal"))})
+try:
+    dl.edit(tower, dl.Scale("lg", 1.25))
+    check("edit refuses a monitor the arrangement lacks", "LayoutError", "no error")
+except dl.LayoutError as exc:
+    check("edit refuses a monitor the arrangement lacks", "no monitor named lg; on screen: asus, hp-24, arzopa", str(exc))
+
+# --- edit, the interactive mode
+#
+# interact() runs a session over scripted key presses and hands what it would
+# put on screen to a recorder. The command runs the same way inside a Session,
+# where the recorder is the Session's gdctl set, and the script stands in for
+# the terminal.
+
+
+class Script:
+    """Key presses for interact to read, and a terminal for edit to draw on.
+
+    "ctrl-c" interrupts the way Ctrl-C does. `answers` are typed at the name
+    prompt in turn; an exception among them is raised there instead.
+    """
+
+    def __init__(self, *keys, answers=(), size=(100, 40)):
+        self.keys, self.answers, self.size = list(keys), list(answers), size
+        self.written, self.asked = [], []
+
+    def read(self):
+        if not self.keys:
+            raise AssertionError("the script ran out of keys")
+        key = self.keys.pop(0)
+        if key == "ctrl-c":
+            raise KeyboardInterrupt
+        return key
+
+    def columns_lines(self):
+        return self.size
+
+    def write(self, text):
+        self.written.append(text)
+
+    def ask(self, prompt):
+        self.asked.append(prompt)
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+
+def interacted(*keys, start=TALL, selected="arzopa", fail=0):
+    """The Ending, what was applied, and what was shown as (arrangement, selected, note, pending).
+
+    The first `fail` applies are refused the way mutter refuses one.
+    """
+    script, applied, shown = Script(*keys), [], []
+
+    def apply(arrangement):
+        applied.append(arrangement)
+        if len(applied) <= fail:
+            raise dl.CommandError("gdctl set --logical-monitor ... failed: mutter said no\nat all", "mutter said no\nat all")
+
+    ending = dl.interact(start, selected, script, lambda *frame: shown.append(frame), apply)
+    return ending, applied, shown
+
+
+def with_arzopa(y, arrangement=TALL):
+    return tuple(replace(s, y=y) if s.name == "arzopa" else s for s in arrangement)
+
+
+# Every key but Space, Enter, q and Esc, then one pressed twenty times the way a
+# held key repeats, and then Ctrl-C. Ctrl-C puts the start back only when
+# something was applied.
+others = [*dl.MOVES, "r", "R", "tab", "shift-tab", "resize", "x", "\x1b[5~", *["down"] * 20]
+ending, applied, shown = interacted(*others, "ctrl-c")
+check("no key but Space, Enter, q and Esc applies anything", ([], len(others) + 1), (applied, len(shown)))
+check("and each is drawn as it comes, marked not applied whenever it differs from the start",
+      [a != TALL for a, _, _, _ in shown], [pending for _, _, _, pending in shown])
+ending, applied, shown = interacted("down", "down", "space", "down", "space", "q")
+check("Space applies what is drawn, and q with nothing pending applies nothing more",
+      (dl.Ending("keep", with_arzopa(330)), [with_arzopa(280), with_arzopa(330)]), (ending, applied))
+check("a drawing Space applied is no longer marked", [False, True, True, False, True, False],
+      [pending for _, _, _, pending in shown])
+check("Space with nothing pending applies nothing, from the start or after an apply",
+      [with_arzopa(230)], interacted("space", "down", "up", "space", "down", "space", "space", "tab", "space", "q")[1])
+ending, applied, shown = interacted("down", "space", "up", "q")
+check("moving back to the start after an apply is pending, since the display shows the apply",
+      ([with_arzopa(230), TALL], True), (applied, shown[-1][3]))
+check("q applies what is pending, then ends", (dl.Ending("keep", with_arzopa(230)), [with_arzopa(230)]),
+      interacted("down", "q")[:2])
+check("a resize redraws and applies nothing", ([], 3), (lambda r: (r[1], len(r[2])))(interacted("down", "resize", "esc")))
+ending, _, shown = interacted("tab", "q")
+check("the selection Tab moves to is drawn", ["arzopa", "hp"], [sel for _, sel, _, _ in shown])
+
+ending, applied, _ = interacted("down", "space", "down", "space", "r", "space", "esc")
+check("Esc puts back the arrangement from the start after several applies, and ends there",
+      (dl.Ending("put-back", TALL), 4, TALL), (ending, len(applied), applied[-1]))
+check("Esc with nothing applied applies nothing, pending or not", (dl.Ending("put-back", TALL), []),
+      interacted("down", "esc")[:2])
+ending, applied, _ = interacted("down", "space", "ctrl-c")
+check("Ctrl-C puts back the arrangement from the start too", (dl.Ending("put-back", TALL), TALL), (ending, applied[-1]))
+check("Enter applies what is drawn and ends in a save", (dl.Ending("save", with_arzopa(230)), [with_arzopa(230)]),
+      interacted("down", "enter")[:2])
+ending, applied, shown = interacted("down", "space", "resize", "q", fail=1)
+check("a refused apply is shown as what mutter said, on one line, through the next redraw, still pending, "
+      "and q tries again", ([("not applied: mutter said no at all", True)] * 2, 2),
+      ([(note, pending) for _, _, note, pending in shown[-2:]], len(applied)))
+try:
+    interacted("down", "enter", fail=1)
+    check("an apply refused on Enter ends the session in a refusal", "CommandError", "no error")
+except dl.CommandError:
+    check("an apply refused on Enter ends the session in a refusal", "CommandError", "CommandError")
+with mock.patch.object(dl, "press", mock.Mock(side_effect=[dl.LayoutError("no place for arzopa"), (with_arzopa(230), "arzopa")])):
+    ending, applied, shown = interacted("down", "down", "q")
+check("a key edit cannot carry out is shown, and the session goes on",
+      ("no place for arzopa", [with_arzopa(230)]), (shown[1][2], applied))
+
+
+def pressed(arrangement, *keys, selected="arzopa"):
+    for key in keys:
+        arrangement, selected = dl.press(arrangement, selected, key)
+    return arrangement, selected
+
+
+def places(arrangement):
+    return {s.name: (s.x, s.y) for s in arrangement}
+
+
+# The desk: the ARZOPA turned on the left, touching the HP (y 0 to 1080) and the panel (1080 to 2280).
+check("an arrow moves the selected monitor 50 px, kept where it lands when mutter accepts that",
+      (with_arzopa(130), with_arzopa(230)), (pressed(TALL, "up")[0], pressed(TALL, "down")[0]))
+check("w and s move as up and down do", (with_arzopa(130), with_arzopa(230)), (pressed(TALL, "w")[0], pressed(TALL, "s")[0]))
+check("with Shift, 10 px", (with_arzopa(170), with_arzopa(190), with_arzopa(170), with_arzopa(190)),
+      (pressed(TALL, "shift-up")[0], pressed(TALL, "shift-down")[0], pressed(TALL, "W")[0], pressed(TALL, "S")[0]))
+# The HP sits on the panel, clear of the ARZOPA, so it can slide right and back.
+hp_at = lambda *keys: places(pressed(TALL, *keys, selected="hp")[0])["hp"]  # noqa: E731
+check("right and d move 50 px right, with Shift or D 10",
+      [(1250, 0), (1250, 0), (1210, 0), (1210, 0)], [hp_at(k) for k in ("right", "d", "shift-right", "D")])
+check("left and a move 50 px left, with Shift or A 10",
+      [(1250, 0), (1250, 0), (1290, 0), (1290, 0)], [hp_at("right", "right", k) for k in ("left", "a", "shift-left", "A")])
+check("moved off the others' edge or into them, it snaps back where it was", (TALL, TALL),
+      (pressed(TALL, "left")[0], pressed(TALL, "right")[0]))
+check("by a Shift step too", (TALL, TALL, TALL, TALL),
+      (pressed(TALL, "shift-left")[0], pressed(TALL, "shift-right")[0], pressed(TALL, "A")[0], pressed(TALL, "D")[0]))
+check("Tab selects the next monitor, in the arrangement's order and round, Shift-Tab the one before",
+      ("hp", "arzopa", "laptop"),
+      (pressed(TALL, "tab")[1], pressed(TALL, "tab", "tab", "tab")[1], pressed(TALL, "shift-tab")[1]))
+check("moving the ARZOPA above the HP's top moves the whole arrangement down, to start at (0, 0)",
+      {"arzopa": (0, 0), "hp": (1200, 20), "laptop": (1200, 1100)}, places(pressed(TALL, "up", "up", "up", "up")[0]))
+
+# The panel (1920 x 1200) with the HP (1920 x 1080) to its right, sharing 20 px of edge.
+pair = (dl.Screen("laptop", LAPTOP[5], 0, 0, FOUR_THIRDS, primary=True), dl.Screen("hp", HP[5], 1920, 1180))
+check("slid past the end of the edge it shares, a monitor stops with one pixel of it still shared",
+      {"laptop": (0, 0), "hp": (1920, 1199)}, places(pressed(pair, "down", selected="hp")[0]))
+# The same pair with the shared 20 px at the HP's bottom. Going round the
+# corner onto the panel's top is as near (1 px across, 30 up) as stopping on
+# its side (31 px up); the move along one axis wins.
+raised = (dl.Screen("laptop", LAPTOP[5], 0, 1060, FOUR_THIRDS, primary=True), dl.Screen("hp", HP[5], 1920, 0))
+check("of two places as near, the one along a single axis",
+      {"laptop": (0, 1079), "hp": (1920, 0)}, places(pressed(raised, "up", selected="hp")[0]))
+check("pushed into a monitor it barely overlaps, it goes the nearer way round, below it",
+      {"laptop": (0, 0), "hp": (1870, 1200)}, places(pressed(pair, "left", selected="hp")[0]))
+
+panel = (dl.Screen("laptop", LAPTOP[5], 0, 0, FOUR_THIRDS, primary=True),)
+
+
+def turns(transform, way, times):
+    arrangement, out = (replace(panel[0], transform=transform),), []
+    for _ in range(times):
+        arrangement = dl.edit(arrangement, dl.Turn("laptop", way))
+        out.append(arrangement[0].transform)
+    return out
+
+
+check("quarter turns clockwise run 90, 180, 270 and back to normal, counter-clockwise the other way",
+      (["90", "180", "270", "normal"], ["270", "180", "90", "normal"]),
+      (turns("normal", "clockwise", 4), turns("normal", "counter-clockwise", 4)))
+check("a flipped monitor turns and stays flipped", (["flipped-180"], ["flipped"], ["flipped-90"], ["flipped-270"]),
+      (turns("flipped-90", "clockwise", 1), turns("flipped-270", "clockwise", 1),
+       turns("flipped", "clockwise", 1), turns("flipped", "counter-clockwise", 1)))
+NAMED = {v: k for k, v in dl.ROTATIONS.items()}
+same = []
+for arrangement in (TALL, tower, hp_and_arzopa, pair):
+    for s in arrangement:
+        for way in ("clockwise", "counter-clockwise"):
+            target = dl.quarter_turn(s.transform, way)
+            if target in NAMED:
+                same.append(dl.edit(arrangement, dl.Turn(s.name, way)) == dl.edit(arrangement, dl.Rotate(s.name, NAMED[target])))
+check("a quarter turn to landscape or portrait is the rotate to it", [True] * 15, same)
+upside = pressed(TALL, "r")[0]
+# 180 has landscape's size, so the ARZOPA goes where rotate normal puts it, LANDSCAPE above.
+check("r turns the ARZOPA from 90 to 180, placed as landscape is",
+      ("180", {"arzopa": (0, 540), "hp": (1920, 0), "laptop": (1920, 1080)}), (upside[0].transform, places(upside)))
+check("R turns it back to landscape", ("normal", {"arzopa": (0, 540), "hp": (1920, 0), "laptop": (1920, 1080)}),
+      (pressed(TALL, "R")[0][0].transform, places(pressed(TALL, "R")[0])))
+
+# The terminal, over a pipe standing in for the keyboard. A read waits for a
+# key, so a key lost by the parser would hang the run; the alarm ends it instead.
+signal.alarm(10)
+reading, typing = os.pipe()
+keyboard = dl.Terminal(reading)
+os.write(typing, b"\x1b[A\x1bOB\x1b[1;2D\x1b[1;2C\x1b[Z\t\n\rWq \x1b[5~r\x1bxR")
+check("the terminal's bytes, read as keys; one edit has no name for comes whole and matches nothing",
+      ["up", "down", "shift-left", "shift-right", "shift-tab", "tab", "enter", "enter", "W", "q", "space", "\x1b[5~", "r",
+       "\x1bx", "R"],
+      [keyboard.read() for _ in range(15)])
+os.write(typing, b"\x1b")
+check("Esc on its own is esc, once no sequence follows it", "esc", keyboard.read())
+os.write(typing, b"\x1b[")
+threading.Timer(0.01, os.write, (typing, b"A")).start()
+check("a sequence arriving in two parts is still one key", "up", keyboard.read())
+with mock.patch.dict(os.environ, {"COLUMNS": str(keyboard.size[0] + 1)}):
+    check("a change of the terminal's size is read as resize", "resize", keyboard.read())
+os.close(typing)
+os.close(reading)
+signal.alarm(0)
+
+main, side = os.openpty()
+before = termios.tcgetattr(side)
+screen = io.StringIO()
+with contextlib.redirect_stdout(screen), dl.Terminal(side):
+    during = termios.tcgetattr(side)
+    os.write(main, b"\r")  # an Enter typed while the session ends
+    time.sleep(0.05)
+check("a session reads keys unechoed and unbuffered on the alternate screen, and restores the terminal after",
+      (0, 0, True, True, before),
+      (during[3] & termios.ECHO, during[3] & termios.ICANON, screen.getvalue().startswith("\x1b[?1049h"),
+       screen.getvalue().endswith("\x1b[?1049l"), termios.tcgetattr(side)))
+check("a key typed ahead is dropped with the session, so it cannot answer the name prompt", [],
+      select.select([side], [], [], 0.05)[0])
+os.close(main)
+os.close(side)
+
+
+def editing(script, *shows, layouts=DESK_FILE, recent=("desk-tall",), stdin_tty=True, terminal=True, **session):
+    """Run `display-layout edit` with `script` for the keys and terminal. The Session and the output."""
+    s = Session(*shows, layouts=layouts, recent=list(recent), terminal=terminal, **session)
+    with mock.patch.object(dl, "Terminal", lambda: script), \
+            mock.patch.object(dl, "edit", s.recording("edit", dl.edit)), \
+            mock.patch.object(sys, "stdin", TtyStringIO() if stdin_tty else io.StringIO()):
+        out = s(dl.edit_, dl.EditArgs())
+    return s, out
+
+
+def page(written):
+    """The lines of one frame edit wrote, as they show."""
+    return visible(written.replace("\x1b[K", "").replace("\x1b[H", "").replace("\x1b[J", ""))
+
+
+ARZOPA_LOWER = gdctl_set((0, 330, FOUR_THIRDS, "90"), (1200, 0, 1.0, "normal"), (1200, 1080, FOUR_THIRDS, "normal"))
+script = Script("down", "down", "down", "q")
+s, out = editing(script, DESK)
+check("edit selects the first monitor that is not primary, snaps its moves, and q applies them, never --persistent",
+      (ARZOPA_LOWER, True, []),
+      ([groups(a) for a in s.applied], "snap" in s.calls, [a for argv in s.applied for a in argv if a in ("-P", "--persistent")]))
+check("q keeps it, writes no layout and records none as used, and draws what gdctl shows",
+      (DESK_FILE, ["desk-tall"], "desk-tall, as saved"), (s.file, s.recent, out.split("\n")[0]))
+# 100 x 40, less a line above, a blank either side and two of keys: 35 rows, and
+# three quarters of that is 26 rows, 52 cells. desk-tall is 3120 x 2280, so 52
+# cells high makes it 71 wide.
+first = page(script.written[0])
+check("the full screen is drawn through draw, three quarters of the terminal, in double lines without colour",
+      ("arzopa selected", dl.draw(TALL, 71, None, "arzopa").split("\n")), (first[0], first[2:-3]))
+check("the keys are listed under the drawing",
+      ["tab next · arrows or wasd move, shift finer · r R turn · space apply · enter save · q apply and quit",
+       "esc put back"],
+      first[-2:])
+check("the drawing follows the presses, and the line above it says it is not applied yet",
+      (dl.draw(with_arzopa(330), 71, None, "arzopa").split("\n"), "arzopa selected · not applied yet, space applies"),
+      (page(script.written[-1])[2:-3], page(script.written[-1])[0]))
+narrow = Script("q", size=(32, 40))
+editing(narrow, DESK)
+check("in a narrow terminal, the keys take as many lines as they need",
+      ["tab next", "arrows or wasd move, shift finer", "r R turn · space apply", "enter save · q apply and quit",
+       "esc put back"],
+      page(narrow.written[0])[-5:])
+narrow = Script("down", "q", size=(32, 40))
+editing(narrow, DESK)
+check("and the line above the drawing wraps rather than losing that the drawing is not applied",
+      ["arzopa selected", "not applied yet, space applies", ""], page(narrow.written[-1])[:3])
+coloured = Script("q")
+editing(coloured, DESK, no_color=False)
+check("in colour, the selected monitor is framed in moss", True, "38;2;110;164;68" in coloured.written[0])
+
+# The ARZOPA to the right of the HP and the panel, so left to right they go HP and panel, then ARZOPA.
+script = Script("tab", "tab", "q")
+editing(script, desk(arzopa=(3120, 180, FOUR_THIRDS, "90")))
+check("Tab goes through the monitors left to right, from the first that is not primary",
+      ["hp selected", "laptop selected", "arzopa selected"], [page(w)[0] for w in script.written])
+script = Script("q")
+editing(script, desk(primary="DP-1"))
+check("with the ARZOPA primary, the HP is selected first", "hp selected", page(script.written[0])[0])
+
+script = Script("down", "space", "q")
+s, _ = editing(script, DESK, rejects=1)
+check("an apply mutter refuses on Space is shown under the drawing, and q tries it again",
+      (True, 2), ("not applied: mutter rejected the configuration" in "".join(script.written), len(s.applied)))
+script = Script("down", "space", "q", size=(12, 40))
+editing(script, DESK, rejects=1)
+check("a note takes at most three lines under the drawing",
+      ["not applied:", "mutter", "rejected the"], page(script.written[-1])[-3:])
+# The HP moved 50 px right, past the panel's edge, widens the arrangement from
+# 3120 to 3170 px. The cell stays 3120 / 71 px, so the drawing grows to 72 columns.
+script = Script("tab", "right", "q")
+editing(script, DESK)
+check("a cell keeps its size as the arrangement grows, so monitors that stay put are drawn the same",
+      (71, 72), tuple(max(len(line) for line in page(w)[2:-3]) for w in (script.written[0], script.written[-1])))
+
+script = Script("down", "down", "down", "enter", answers=[""])
+s, out = editing(script, DESK, recent=("desk-top",))
+check("Enter applies, asks for a name offering the layout the session started from, and saves under it",
+      (["save as (desk-tall): "], ARZOPA_LOWER, 330, ["desk-tall", "desk-top"]),
+      (script.asked, [groups(a) for a in s.applied], tomllib.loads(s.file)["layouts"]["desk-tall"]["arzopa"]["y"], s.recent))
+check("and draws what it saved", True, "saved desk-tall in" in out)
+script = Script("r", "enter", answers=["turned"])
+s, _ = editing(script, DESK)
+check("a turn is saved as turned, through edit, every monitor where it was drawn",
+      (True, {"arzopa": {"x": 0, "y": 540, "mode": ARZOPA[5], "scale": FOUR_THIRDS, "transform": "180"},
+              "hp": {"x": 1920, "y": 0, "mode": HP[5]},
+              "laptop": {"x": 1920, "y": 1080, "mode": LAPTOP[5], "scale": FOUR_THIRDS, "primary": True}}),
+      ("edit" in s.calls, tomllib.loads(s.file)["layouts"].get("turned")))
+script = Script("down", "enter", answers=["desk low", "desk-low"])
+s, out = editing(script, DESK, layouts=None, recent=())
+check("with no layout to offer, a name is asked for until it is one, and new aliases are made as save makes them",
+      (["save as: ", "save as: "], True, ["arzopa", "hp", "laptop"]),
+      (script.asked, "'desk low': a layout name is letters, digits, - and _" in out,
+       sorted(tomllib.loads(s.file)["layouts"]["desk-low"])))
+for what, answer in (("an empty answer with nothing to offer", ""), ("Ctrl-D at the prompt", EOFError())):
+    s, out = editing(Script("down", "enter", answers=[answer]), DESK, layouts=None, recent=())
+    check(f"{what} saves nothing, and the arrangement stays on screen",
+          (False, 1, "not saved; the arrangement stays on screen for the session"),
+          (s.path.exists(), len(s.applied), out.strip().split("\n")[-1]))
+script = Script("down", "enter", answers=["docked"])
+s, out = editing(script, DOCKED, lid_closed=False)
+check("Enter says why the arrangement cannot be saved before asking for a name",
+      ("exit: display-layout: eDP-1 is connected but off, and a layout covers every connected monitor", []),
+      (out, script.asked))
+
+s, out = editing(Script("down", "space", "down", "space", "esc"), DESK)
+check("Esc puts the arrangement from the start back on screen",
+      [3, *gdctl_set((0, 180, FOUR_THIRDS, "90"), (1200, 0, 1.0, "normal"), (1200, 1080, FOUR_THIRDS, "normal"))],
+      [len(s.applied), groups(s.applied[-1])])
+check("and says so", "put back the arrangement edit started from", out.split("\n")[0])
+for what, stdin_tty, terminal in (("stdin", False, True), ("stdout", True, False)):
+    s, out = editing(Script(), DESK, stdin_tty=stdin_tty, terminal=terminal)
+    check(f"edit refuses when {what} is not a terminal, and applies nothing",
+          ("exit: display-layout: edit reads keys from a terminal and draws in it; stdin or stdout is not one", []),
+          (out, s.applied))
+
+# --- the layouts file
+
+commented = """\
+# my desks
+[aliases]
+laptop = { vendor = "AUO", product = "0xc199" }  # the panel
+hp = { vendor = "HPN", product = "HP M27fwa FHD" }
+
+[layouts.solo]
+laptop = { x = 1600, y = 180, mode = "2560x1600@165.040", primary = true }
+hp = { x = 0, y = 0, mode = "1920x1080@60.000" }
+"""
+check("a monitor's entry reads with its defaults: scale 1, transform normal, not primary",
+      (dl.Screen("laptop", LAPTOP[5], 1600, 180, primary=True), dl.Screen("hp", HP[5], 0, 0)),
+      dl.parse_store(commented).layouts["solo"])
+big = (dl.Screen("laptop", LAPTOP[5], 1600, 180, 2.0, "180", True),)
+rewritten = dl.with_layout(commented, "solo-big", big, {})
+check("writing a layout keeps the file's comments", (True, True), ("# my desks" in rewritten, "# the panel" in rewritten))
+check("and reads back as written", big, dl.parse_store(rewritten).layouts["solo-big"])
+
+
+def refusal(text):
     try:
-        dl.follow(["MonitorsChanged\n"] * len(changes), 0)
-    finally:
-        dl.read_state, dl.run, dl.log_run = original
-    return applied
+        dl.parse_store(text)
+        return "accepted"
+    except dl.StoreError as exc:
+        return str(exc)
+    except Exception as exc:  # noqa: BLE001  reported as a failed check
+        return f"crash: {type(exc).__name__}: {exc}"
 
 
-check("a row the set did not change into is left alone", 0, len(drive(STACKED, ROW)))
-check("a row a new monitor brought is arranged", 1, len(drive(PANEL_ONLY, ROW)))
-check("a new monitor already arranged is left alone", 0, len(drive(PANEL_ONLY, STACKED)))
-check("the same row twice is arranged once", 1, len(drive(PANEL_ONLY, ROW, ROW)))
-# Docking before the session starts means the fallback already happened and no
-# signal is coming; the startup look is the only chance to catch it.
-check("a row already on screen at startup is arranged", 1, len(drive(ROW)))
+for what, text, message in (
+    ("an alias no [aliases] entry defines", commented.replace('hp = { vendor = "HPN", product = "HP M27fwa FHD" }\n', ""),
+     "layout solo, hp: no such alias in [aliases]"),
+    ("a layout without a primary", commented.replace(", primary = true", ""),
+     "layout solo: exactly one monitor has primary = true"),
+    ("a misspelt key", commented.replace("primary", "primay"),
+     "layout solo, laptop: unknown key primay; keys are x, y, mode, scale, transform, primary"),
+    ("a transform gdctl does not know", commented.replace("primary = true", 'primary = true, transform = "sideways"'),
+     "layout solo, laptop: transform is one of normal, 90, 180, 270, flipped, flipped-90, flipped-180, flipped-270"),
+    ("a mode that is not one", commented.replace("2560x1600@165.040", "2560x1600"),
+     "layout solo, laptop: mode is WIDTHxHEIGHT@RATE as gdctl show prints it, not '2560x1600'"),
+    ("a table it does not know", commented + "[monitors]\n", "unknown table monitors; there are [aliases] and [layouts.<name>]"),
+    ("a position that is not a number", commented.replace("x = 0,", "x = true,"), "layout solo, hp: x = True is not int"),
+    ("[aliases] that is not a table", 'aliases = "laptop"\n', "aliases is a table: [aliases]"),
+    ("a layout name save would refuse, which the recent record could not hold", commented.replace("solo", '"solo desk"'),
+     "layout 'solo desk': a layout name is letters, digits, - and _"),
+    ("a scale of 0", commented.replace("primary = true", "primary = true, scale = 0"),
+     "layout solo, laptop: scale = 0.0; a scale is a positive number, 1.25 for 125 %"),
+    ("a scale that is not a number", commented.replace("primary = true", "primary = true, scale = nan"),
+     "layout solo, laptop: scale = nan; a scale is a positive number, 1.25 for 125 %"),
+    ("a mode with no pixels", commented.replace("2560x1600@165.040", "0x1600@165.040"),
+     "layout solo, laptop: mode is WIDTHxHEIGHT@RATE as gdctl show prints it, not '0x1600@165.040'"),
+):
+    check(f"the file is refused for {what}", message, refusal(text))
+check("a layout copied without renaming it is refused", True,
+      refusal(commented + commented[commented.index("[layouts.solo]"):]) != "accepted")
+
+# --- the drawing
+#
+# The laptop left of a turned ARZOPA, 40 columns across 1920 + 1200 logical px,
+# so a cell is 78 px. The panel's columns are those whose centre lies left of
+# 1920: 0 to 24. Its rows of cells run from 360 / 78 to 1560 / 78, cells 5 to 19,
+# and a text row holds two cells, so its box takes the text rows whose top cell
+# is its own: 3 to 9.
+
+travel = (dl.Screen("laptop", LAPTOP[5], 0, 360, FOUR_THIRDS, primary=True),
+          dl.Screen("arzopa", ARZOPA[5], 1920, 0, FOUR_THIRDS, "90"))
+drawn = dl.draw(travel, 40, None).splitlines()
+check("an outline to scale, heavy for the primary", (3, 9, 0, 24), (
+    next((r for r, line in enumerate(drawn) if line.startswith("┏")), None),
+    next((r for r, line in enumerate(drawn) if line.startswith("┗")), None),
+    drawn[3].find("┏"), drawn[3].find("┓"),
+))
+check("the turned monitor spans the height, 15 columns", ("╭" + "─" * 13 + "╮", "╰" + "─" * 13 + "╯"),
+      (drawn[0][25:], drawn[-1][25:]))
+check("labels sit inside: alias, ★ on the primary, logical size, ↻ for turned right",
+      ["┃       laptop ★        ┃│   arzopa    │", "┃       1920×1200       ┃│ 1200×1920 ↻ │"], drawn[5:7])
+check("↺ for turned left", True,
+      "1200×1920 ↺" in dl.draw((travel[0], replace(travel[1], transform="270")), 40, None))
+check("↻↻ for upside down", True, "1920×1200 ↻↻" in dl.draw((replace(travel[0], transform="180"), travel[1]), 40, None))
+# The panel moved up to y = 330: its edges fall at 330 / 78 = 4.2 and 1530 / 78 = 19.6
+# cells, so rounding gives it cell rows 4 to 19.
+raised_panel = dl.cells((replace(travel[0], y=330), travel[1]), 40)
+check("a drawn edge is the logical edge over the cell size, rounded", (4, 19),
+      (min(r for r, row in enumerate(raised_panel) if "laptop" in row),
+       max(r for r, row in enumerate(raised_panel) if "laptop" in row)))
+
+
+def styled(line):
+    """(foreground, background, character) for each character of a line of coloured drawing."""
+    out, fg, bg = [], None, None
+    for code, text in re.findall(r"\x1b\[([0-9;]*)m|(.)", line):
+        if text:
+            out.append((fg, bg, text))
+            continue
+        fields = [int(f) for f in code.split(";") if f] or [0]
+        if fields == [0]:
+            fg = bg = None
+        for i, f in enumerate(fields):
+            if f in (38, 48) and fields[i + 1] == 2:
+                colour = "#" + "".join(f"{n:02x}" for n in fields[i + 2 : i + 5])
+                fg, bg = (colour, bg) if f == 38 else (fg, colour)
+    return out
+
+
+# The same two, and a monitor with no colour of its own below the laptop.
+three = travel + (dl.Screen("dell", HP[5], 0, 1560),)
+colours = dl.palette(["laptop", "arzopa", "dell"])
+lines = [styled(line) for line in dl.draw(three, 40, colours).splitlines()]
+sage, slate, spare = dl.EARTH["laptop"], dl.EARTH["arzopa"], dl.MORE_EARTH[0]
+check("each alias its own earth colour, the next spare for one the palette lacks",
+      {"laptop": sage, "arzopa": slate, "dell": spare}, colours)
+check("blocks fill each monitor in its colour", (sage, slate, spare),
+      (lines[5][10][1], lines[8][30][1], lines[16][10][1]))
+check("a blank column between neighbours", (" ", sage), (lines[5][24][2], lines[5][23][1]))
+check("and a blank half row between stacked ones: the panel's last cells are blank above the dell",
+      ((sage, None, "▀"), (spare, spare)), (lines[9][10], lines[10][10][:2]))
+text = ["".join(c for _, _, c in line) for line in lines]
+row = next((r for r, t in enumerate(text) if "laptop ★" in t), None)
+check("labels in sand on their monitor's fill", (dl.SAND, sage),
+      lines[row][text[row].index("laptop")][:2] if row is not None else None)
+
+five = dl.palette(["laptop", "hp", "arzopa", "a", "b", "c", "d", "e"])
+check("once the spares run out, a monitor takes an earth colour no alias here uses", dl.EARTH["lg"], five["e"])
+
+
+def mossy(lines):
+    """(text row, column) of each character with MOSS in it."""
+    return {(r, c) for r, line in enumerate(lines) for c, (fg, bg, _) in enumerate(line) if dl.MOSS in (fg, bg)}
+
+
+framed = [styled(line) for line in dl.draw(three, 40, colours, "laptop").splitlines()]
+text = ["".join(c for _, _, c in line) for line in framed]
+row = next((r for r, t in enumerate(text) if "laptop ★" in t), None)
+check("the selected monitor is framed in moss: its left and right columns, a half row at top and bottom",
+      (True, True, "▄", "▀"),
+      ({(r, 0) for r in range(3, 9)} | {(r, 23) for r in range(3, 9)} <= mossy(framed),
+       all(c <= 23 for _, c in mossy(framed)),
+       framed[2][10][2] if (2, 10) in mossy(framed) else None,
+       framed[9][10][2] if (9, 10) in mossy(framed) else None))
+check("inside the frame its own fill, its label in sand on it", ((sage, sage), (dl.SAND, sage)),
+      (framed[4][10][:2], framed[row][text[row].index("laptop")][:2] if row is not None else None))
+# At 16 columns the laptop has 9 columns and one text row inside its frame: the
+# label is cut to fit between the frame's sides, which stay moss.
+small = [styled(line) for line in dl.draw(three, 16, colours, "laptop").splitlines()]
+check("a label never covers the frame", ("laptop…", True, True),
+      ("".join(c for _, _, c in small[2][1:8]), (2, 0) in mossy(small), (2, 8) in mossy(small)))
+check("no moss without a selection", set(), mossy(lines))
+outlined = dl.draw(travel, 40, None, "laptop").splitlines()
+check("without colour, the selected monitor in double lines", ("╔", "╚", "╭"),
+      (outlined[3][0], outlined[9][0], outlined[0][25]))
+
+tall = (dl.Screen("arzopa", ARZOPA[5], 0, 0, 1.0, "90"), dl.Screen("laptop", LAPTOP[5], 0, 2560, 1.0, primary=True))
+check("a tall arrangement stays within MAX_ROWS in a wide terminal", True,
+      len(dl.draw(tall, dl.fit_width(tall, 200), None).splitlines()) <= dl.MAX_ROWS)
+check("a wide one within MAX_COLUMNS", dl.MAX_COLUMNS, dl.fit_width((dl.Screen("hp", HP[5], 0, 0, primary=True),), 200))
+check("however little room there is, a drawing is 8 columns wide", 8, dl.fit(tall, 40, 1))
+
+# --- the watcher
+#
+# follow() runs over a startup look plus one MonitorsChanged per change, in a
+# Session: the gdctl show fixtures, the lid, the layouts file and the recent
+# record. Acting only on a change of the connected set is the guard that keeps
+# it off a hand-made arrangement, and the one thing a forced layout on a live
+# display cannot exercise: forcing a layout does not change the set.
+
+
+def drive(startup, *changes, **session):
+    """The Session the watcher ran in, over `startup` and then each of `changes`."""
+    s = Session(startup, *changes, **session)
+    crashed = s(lambda _: dl.follow(["MonitorsChanged\n"] * len(changes), 0), None)
+    if crashed:
+        check("the watcher ran without crashing", "", crashed)
+    return s
+
+
+# With no layouts file, only mutter's row is replaced.
+check("a row the set did not change into is left alone", 0, len(drive(STACKED, ROW).applied))
+check("a row a new monitor brought is arranged", 1, len(drive(PANEL_ONLY, ROW).applied))
+s = drive(PANEL_ONLY, STACKED)
+check("a new monitor already arranged is left alone, and the log says why",
+      (0, ("skip", "no saved layout fits, and the layout is not mutter's row", {"monitors": ["HDMI-1", "eDP-1"]})),
+      (len(s.applied), s.logs[-1]))
+check("the same row twice is arranged once", 1, len(drive(PANEL_ONLY, ROW, ROW).applied))
+# Docking before the session starts means no signal is coming; the startup look
+# is the only chance to catch it.
+check("a row already on screen at startup is arranged", 1, len(drive(ROW).applied))
 # Giving up after one rejection would leave the row until the next plug.
-check("a rejected apply is retried on the next signal", 2, len(drive(ROW, ROW, failing=True)))
+check("a rejected apply is retried on the next signal", 2, len(drive(ROW, ROW, rejects=99).applied))
+
+# The desk from the named-layouts part, desk-tall on screen, the ARZOPA on DP-1 at first.
+HP_LAPTOP_ROW = gdctl_show([HP, LAPTOP], [("HDMI-1", 0, 0, 1.0, "normal", False),
+                                          ("eDP-1", 1920, 0, FOUR_THIRDS, "normal", True)])
+TALL_ON = lambda port: {port: (0, 180, FOUR_THIRDS, "90", False, ARZOPA[5]),  # noqa: E731
+                        "HDMI-1": (1200, 0, 1.0, "normal", False, HP[5]),
+                        "eDP-1": (1200, 1080, FOUR_THIRDS, "normal", True, LAPTOP[5])}
+TOP_ON = lambda port: TALL_ON(port) | {port: (0, 0, FOUR_THIRDS, "90", False, ARZOPA[5])}  # noqa: E731
+
+s = drive(DESK, HP_LAPTOP_ROW, DESK_DP2_ROW, layouts=DESK_FILE, recent=["desk-tall", "desk-top"])
+check("the ARZOPA unplugged, then plugged into the other port, lands on its last-used layout",
+      [TALL_ON("DP-1"), {"HDMI-1": (0, 0, 1.0, "normal", False, HP[5]),
+                         "eDP-1": (0, 1080, FOUR_THIRDS, "normal", True, LAPTOP[5])}, TALL_ON("DP-2")],
+      [groups(a) for a in s.applied])
+check("every look goes through decide, and matches through match", (3, True),
+      (s.calls.count("decide"), "match" in s.calls))
+check("one run-log line per change of the set, naming the layout applied",
+      [("ok", "applied desk-tall, last used with these monitors",
+        {"monitors": ["DP-1", "HDMI-1", "eDP-1"], "layout": "desk-tall"}),
+       ("ok", "no saved layout fits; replaced mutter's row", {"monitors": ["HDMI-1", "eDP-1"]}),
+       ("ok", "applied desk-tall, last used with these monitors",
+        {"monitors": ["DP-2", "HDMI-1", "eDP-1"], "layout": "desk-tall"})],
+      s.logs)
+check("the watcher never passes --persistent", [], [a for argv in s.applied for a in argv if a in ("-P", "--persistent")])
+
+# The watcher carries out what decide returns, whatever that is.
+canned = dl.Decision(frozenset({("DP-9", dl.Model("X", "Y"))}), dl.Recall("canned", ("--canned",)), "why not")
+with mock.patch.object(dl, "decide", lambda *a, **k: canned):
+    s = Session(DESK)
+    s(lambda _: dl.follow([], 0), None)
+check("the watcher applies what decide chose, and logs it",
+      ([["--canned"]], [("ok", "applied canned, why not", {"monitors": ["DP-9"], "layout": "canned"})]),
+      (s.applied, s.logs))
+
+moved = desk(arzopa=(0, 100, FOUR_THIRDS, "90"))
+s = drive(DESK, moved, desk(arzopa=(0, 40, FOUR_THIRDS, "90")), layouts=DESK_FILE, recent=["desk-tall"])
+check("an arrangement made during the session is left alone while the set stays, and not logged",
+      ([TALL_ON("DP-1")], 1), ([groups(a) for a in s.applied], len(s.logs)))
+s = drive(DESK, moved, HP_LAPTOP_ROW, moved, layouts=DESK_FILE, recent=["desk-tall"])
+check("and replaced once the set changes", TALL_ON("DP-1"), groups(s.applied[-1]))
+
+
+def used(names, show):
+    """A show read after `use` has put `names` in the recent record."""
+    return lambda session: (session.write_recent(names), show)[1]
+
+
+s = drive(DESK, HP_LAPTOP_ROW, used(["desk-top", "desk-tall"], DESK_DP2_ROW), layouts=DESK_FILE, recent=["desk-tall"])
+check("the recent record is read at each change, so a layout used since is the one put back",
+      TOP_ON("DP-2"), groups(s.applied[-1]))
+
+s = drive(DESK_DP2_ROW, layouts=DESK_FILE, recent=["docked", "desk-top"])
+check("docked before the session starts, the startup look applies the last-used layout",
+      ([TOP_ON("DP-2")], ["applied desk-top, last used with these monitors"]),
+      ([groups(a) for a in s.applied], [log[1] for log in s.logs]))
+
+s = drive(DESK_DP2_ROW, layouts=DESK_FILE)
+check("a set with saved layouts, none used yet, gets the first that fits, which is then the one last used",
+      (["applied desk-tall, saved for these monitors, none used yet"], ["desk-tall"]),
+      ([log[1] for log in s.logs], s.recent))
+s.shows = [desk("DP-2", arzopa=(0, 100, FOUR_THIRDS, "90"))]
+check("so show names it once a monitor is moved", "last used with these monitors: desk-tall; since then arzopa moved",
+      s(dl.show, dl.ShowArgs()).split("\n")[0])
+
+s = drive(DOCKED.replace("DP-1", "DP-2"), layouts=DESK_FILE, recent=["desk-tall", "docked"], lid_closed=True)
+check("with the lid closed, the lid-closed layout", ["docked"], [log[2].get("layout") for log in s.logs])
+s = drive(DESK, DOCKED, layouts=DESK_FILE, recent=["desk-tall", "docked"], lid_closed=[False, True])
+check("closing the lid changes the connected set", ["desk-tall", "docked"], [log[2].get("layout") for log in s.logs])
+
+# Twin ARZOPAs, told apart by serial, swap ports and nothing else changes.
+TWIN_FILE = """
+[aliases]
+laptop = { vendor = "AUO", product = "0xc199" }
+arzopa = { vendor = "GWD", product = "ARZOPA", serial = "0x0000a001" }
+arzopa-2 = { vendor = "GWD", product = "ARZOPA", serial = "0x0000a002" }
+
+[layouts.twins]
+laptop = { x = 0, y = 0, mode = "2560x1600@165.040", primary = true }
+arzopa = { x = 2560, y = 0, mode = "2560x1600@59.997" }
+arzopa-2 = { x = 5120, y = 0, mode = "2560x1600@59.997" }
+"""
+swapped = TWINS.replace("0x0000a001", "SWAP").replace("0x0000a002", "0x0000a001").replace("SWAP", "0x0000a002")
+s = drive(TWINS, swapped, layouts=TWIN_FILE, recent=["twins"])
+check("twins swapping ports is a change of the set, and each goes back to its place",
+      [{"DP-1": 2560, "DP-2": 5120}, {"DP-2": 2560, "DP-1": 5120}],
+      [{c: g[0] for c, g in groups(a).items() if c != "eDP-1"} for a in s.applied])
+
+s = drive(DESK_DP2_ROW, layouts=DESK_FILE, recent=["desk-tall"], rejects=1)
+check("a layout mutter rejects is logged by name, and the next that fits is applied",
+      (TOP_ON("DP-2"), [("fail", "desk-tall rejected: mutter rejected the configuration; "
+                                 "applied desk-top, saved for these monitors, none used yet",
+                         {"monitors": ["DP-2", "HDMI-1", "eDP-1"], "layout": "desk-top"})]),
+      (groups(s.applied[-1]), s.logs))
+s = drive(DESK_DP2_ROW, DESK_DP2_ROW, layouts=DESK_FILE, recent=["desk-tall"], rejects=99)
+check("when every layout and the fallback are rejected, all are tried again on the next signal", 6, len(s.applied))
+
+s = drive(PANEL_ONLY, ROW, ROW, layouts="[layouts.solo]\n")
+check("a broken layouts file is logged once per change of the set, and the fallback still applies",
+      (["fail", "fail"], 1), ([log[0] for log in s.logs], len(s.applied)))
+check("in the same line as what the look did", True,
+      s.logs[-1][1].endswith("layout solo lists no monitors; no saved layout fits; replaced mutter's row"))
 
 print()
 print("FAILED" if failures else "all ok")
