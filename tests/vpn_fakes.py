@@ -14,7 +14,9 @@ set`, a connect, a Discord check), for every change from outside, and for
 each request's sending, disconnection and final line.
 
 The World's port wiring and the drivers at the bottom are the only code here
-that calls into bin/vpn. A test states what happens, and they call.
+that calls into bin/vpn. A test states what happens, and they call. The ports
+also count the full status readings bin/vpn takes and record when it looks,
+and can play tailscaled not answering or tailscale stopped.
 
 Loading this module points bin/vpn at a scratch directory for its runtime
 files and its run log, at a tailscaled socket that hangs up, and at a
@@ -34,6 +36,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -83,7 +86,9 @@ def load(name: str, path: Path):
 
 vpn = load("vpn", Path(__file__).resolve().parent.parent / "bin" / "vpn")
 
-T0 = 1_800_000_000.0
+T0 = float(int(time.time()))
+"""The World's first moment. Near the wall clock, because bin/run-log stamps node-log lines with it and the
+watcher's readback of the node log compares those stamps with the time its own clock gives."""
 ENGINE_SECS = 2.0
 """How often tailscaled pushes an engine update."""
 RTT = 0.05
@@ -320,13 +325,21 @@ class World:
         self.end = float("inf")
         self.idle = False
         """Whether the watcher is waiting at its top level, between two things it handles."""
+        self.down = False
+        """tailscaled does not answer."""
+        self.running = True
+        """tailscale is up, as prefs' WantRunning says."""
+        self.status_reads = 0
+        """Full status readings bin/vpn took through its port."""
+        self.looked: list[float] = []
+        """When bin/vpn read the status without peers, in seconds after the first moment: when the watcher looked."""
         self._runs: Path | None = None
         self.at(self.now, self.engine_update)
         if self.exit is not None and self.answers(self.exit):
             self.handshake[self.exit] = self.now - 30
         self.ports = vpn.Ports(
-            tailscaled=vpn.Tailscaled(status=self.status, prefs=self.prefs, set_exit_node=self.watcher_sets,
-                                      bus=lambda mask: iter(())),
+            tailscaled=vpn.Tailscaled(status=self.read_status, peerless=self.peerless, prefs=self.read_prefs,
+                                      set_exit_node=self.watcher_sets, bus=lambda mask: iter(())),
             network=vpn.Network(probe=self.probe, connect=self.connect, discord=self.discord, egress=self.egress),
             clock=vpn.Clock(now=lambda: self.now, wait=self.wait),
             vesktop=lambda: self.vesktop,
@@ -382,8 +395,20 @@ class World:
                                "TailscaleIPs": exit_peer["TailscaleIPs"]} if exit_peer else None,
         }
 
+    def read_status(self) -> dict | None:
+        """The Tailscaled port's full status reading, counted."""
+        self.status_reads += 1
+        return None if self.down else self.status()
+
+    def peerless(self) -> dict | None:
+        self.looked.append(round(self.now - T0, 2))
+        return None if self.down else self.status() | {"Peer": None}
+
+    def read_prefs(self) -> dict | None:
+        return None if self.down else self.prefs()
+
     def prefs(self) -> dict:
-        prefs = {"WantRunning": True, "ExitNodeID": stable_id(self.exit) if self.exit else "", "ExitNodeIP": "",
+        prefs = {"WantRunning": self.running, "ExitNodeID": stable_id(self.exit) if self.exit else "", "ExitNodeIP": "",
                  "ExitNodeAllowLANAccess": self.exit is not None}
         if self.mode == "automatic":
             prefs["AutoExitNode"] = "any"
@@ -424,6 +449,8 @@ class World:
         self.arrive({"Prefs": self.prefs()})
 
     def watcher_sets(self, target: str) -> None:
+        if self.down:
+            raise vpn.VpnError(f"tailscale set {target or '(none)'} failed: tailscaled does not answer")
         new = self.resolve(target)
         before = self.setting()
         self.change(new)
@@ -709,3 +736,31 @@ def run(world: World, script: list[tuple[AfterStep | At, Happening]]) -> World:
     unfinished = {c.id: len(c.finishes) for c in world.callers if len(c.finishes) != 1}
     assert not unfinished, f"requests that did not finish exactly once, with their final lines counted: {unfinished}"
     return world
+
+
+@dataclass
+class Watcher:
+    """The watcher as it runs until it serves requests, `vpn.observe` over and over, in a World. `until`
+    runs it to a moment of the World's time and leaves it idle there, so a test can look, change the World
+    and run it on."""
+
+    world: World
+    w: Any = field(default_factory=lambda: vpn.Watch())
+    due: float = 0.0
+
+    def until(self, secs: float) -> "Watcher":
+        """Run the watcher until `secs` after the World's first moment, stopping only while idle."""
+        world = self.world
+        world.end = T0 + secs
+        with driving(world):
+            try:
+                while True:
+                    world.idle = True
+                    arrival = world.wait(self.due)
+                    world.idle = False
+                    self.due = vpn.observe(self.w, arrival, world.ports)
+            except Over:
+                pass
+            finally:
+                world.idle = False
+        return self
