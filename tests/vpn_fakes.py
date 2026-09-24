@@ -17,12 +17,16 @@ The World's port wiring and the drivers at the bottom are the only code here
 that calls into bin/vpn. A test states what happens, and they call.
 
 Loading this module points bin/vpn at a scratch directory for its runtime
-files, at no tailscaled socket, and at a `tailscale` that fails, so code
-that bypasses the ports fails instead of reaching the real VPN.
+files and its run log, at a tailscaled socket that hangs up, and at a
+`tailscale` that fails. Both record being reached, and every driver fails
+when either was, so code that bypasses the ports cannot reach the real VPN
+unnoticed.
 """
 
 import atexit
 import hashlib
+import socket
+import threading
 import heapq
 import importlib.util
 import itertools
@@ -42,11 +46,29 @@ SCRATCH = Path(tempfile.mkdtemp(prefix="vpn-fakes-"))
 atexit.register(shutil.rmtree, SCRATCH, ignore_errors=True)
 (SCRATCH / "run").mkdir()
 (SCRATCH / "bin").mkdir()
+TAILSCALE_CALLS = SCRATCH / "tailscale-calls"
 (SCRATCH / "bin" / "tailscale").write_text(
-    "#!/bin/sh\necho 'vpn_fakes: bin/vpn ran the real tailscale instead of its Tailscaled port' >&2\nexit 1\n")
+    f"#!/bin/sh\necho \"$*\" >> '{TAILSCALE_CALLS}'\n"
+    "echo 'vpn_fakes: bin/vpn ran tailscale instead of its Tailscaled port' >&2\nexit 1\n")
 (SCRATCH / "bin" / "tailscale").chmod(0o755)
+TAILSCALED_HITS: list[int] = [0]
+"""Connections to the socket where bin/vpn looks for tailscaled. It hangs each up at once."""
+
+
+def _hang_up(listener: socket.socket) -> None:
+    while True:
+        conn, _ = listener.accept()
+        TAILSCALED_HITS[0] += 1
+        conn.close()
+
+
+_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+_listener.bind(str(SCRATCH / "tailscaled.sock"))
+_listener.listen(128)
+threading.Thread(target=_hang_up, args=(_listener,), daemon=True).start()
 os.environ["XDG_RUNTIME_DIR"] = str(SCRATCH / "run")
-os.environ["VPN_TAILSCALED_SOCKET"] = str(SCRATCH / "no-tailscaled.sock")
+os.environ["RUN_LOG_DIR"] = str(SCRATCH / "runs")
+os.environ["VPN_TAILSCALED_SOCKET"] = str(SCRATCH / "tailscaled.sock")
 os.environ["PATH"] = f"{SCRATCH / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
 
 
@@ -623,7 +645,8 @@ def liveness(world: World) -> Any:
 def probe(world: World, names: list[str]) -> list[str]:
     """Handshake-probe the nodes named. Returns the ones that answered."""
     by_name = nodes(world)
-    return [n.name for n in vpn.probe([by_name[n] for n in names], liveness(world), world.ports)]
+    with driving(world):
+        return [n.name for n in vpn.probe([by_name[n] for n in names], liveness(world), world.ports)]
 
 
 def start(world: World) -> Any:
@@ -631,24 +654,35 @@ def start(world: World) -> Any:
     return vpn.Start(mode=world.mode, node=by_name.get(world.exit) if world.exit else None)
 
 
+def bypassed() -> list[str]:
+    """What reached tailscaled or `tailscale` other than through the ports, since the last look."""
+    found = [f"{TAILSCALED_HITS[0]} connections to tailscaled's socket"] if TAILSCALED_HITS[0] else []
+    TAILSCALED_HITS[0] = 0
+    if TAILSCALE_CALLS.exists():
+        found += [f"tailscale {call}" for call in TAILSCALE_CALLS.read_text().splitlines()]
+        TAILSCALE_CALLS.unlink()
+    return found
+
+
 @contextmanager
-def logging_to(world: World):
-    before = os.environ.get("RUN_LOG_DIR")
+def driving(world: World):
+    """Log to this World's run-log directory, and fail if bin/vpn went around its ports meanwhile."""
+    before = os.environ["RUN_LOG_DIR"]
     os.environ["RUN_LOG_DIR"] = str(world.runs)
+    bypassed()
     try:
         yield
     finally:
-        if before is None:
-            del os.environ["RUN_LOG_DIR"]
-        else:
-            os.environ["RUN_LOG_DIR"] = before
+        os.environ["RUN_LOG_DIR"] = before
+    around = bypassed()
+    assert not around, f"bin/vpn went around its ports: {around}"
 
 
 def move(world: World, names: list[str], why: str, discord: bool) -> tuple[str, str | None]:
     """One move from where the exit node is now, through the nodes named. Returns the Outcome's kind and the
     node it pinned."""
     by_name = nodes(world)
-    with logging_to(world):
+    with driving(world):
         outcome = vpn.move(start(world), [by_name[n] for n in names], why, discord, lambda line: None,
                            lambda: None, liveness(world), world.ports)
     return outcome.kind, outcome.node.name if outcome.node else None
@@ -663,7 +697,7 @@ def run(world: World, script: list[tuple[AfterStep | At, Happening]]) -> World:
     world.arrive({"Prefs": world.prefs()})
     w = vpn.Watch()
     due = 0.0
-    with logging_to(world):
+    with driving(world):
         try:
             while True:
                 world.idle = True

@@ -21,7 +21,7 @@ import re
 import sys
 import traceback
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -34,7 +34,8 @@ from hypothesis.database import DirectoryBasedExampleDatabase  # noqa: E402
 PROBES = 8
 """The number of candidates a move probes at once, which bounds the nodes one walk tries."""
 
-STUBS = {"learn", "feed", "wait", "silent", "handshake_since", "received_since", "probe", "move", "handle"}
+STUBS = {"Liveness.learn", "Liveness.feed", "Liveness.wait", "Liveness.silent", "Liveness.handshake_since",
+         "Liveness.received_since", "probe", "move", "handle"}
 """bin/vpn's functions that raise NotImplementedError until a ticket fills them in."""
 
 CITIES = [
@@ -299,16 +300,17 @@ def p2(data):
 
 @st.composite
 def move_through(draw):
-    """A World, and the online nodes other than the exit node, in some order, for a move to go through. Some
-    of the time only one of them would pass, often the last one probed or the first one not."""
+    """A World, its exit node maybe outside Mullvad, and the online nodes other than the exit node, in some
+    order, for a move to go through. Some of the time only one of them carries traffic, often the last one
+    probed or the first one not."""
     hosts = draw(network())
-    setting = draw(exit_node(hosts))
+    setting = draw(exit_node(hosts) | st.just((("pinned", fakes.PC), None)))
     others = [h.name for h in hosts if h.online and h.name != setting[0][1]]
     names = draw(st.permutations(others))[:draw(st.just(len(others)) | st.integers(0, len(others)))]
     if names and draw(st.booleans()):
         edges = sorted({min(k, len(names) - 1) for k in (PROBES - 1, PROBES)})
         only = names[draw(st.sampled_from(edges) | st.integers(0, len(names) - 1))]
-        hosts = [fakes.Host(h.name, h.country, h.city, answers=h.name == only, carries=h.name == only)
+        hosts = [replace(h, answers=h.name == only, carries=h.name == only, leaks=False)
                  if h.name in names else h for h in hosts]
     return world(hosts, setting), names
 
@@ -321,8 +323,9 @@ def p3(through, why, discord):
     """P3 A node a move pins has passed the traffic proof, and has passed the Discord check whenever the move
     ran one.
 
-    Checked alongside the rest of how a move may end. A move that stayed put the exit node back as it was, and
-    one whose first PROBES candidates include a node that would pass pins one of those. The traffic proof is
+    Checked alongside the rest of how a move may end. A move that stayed put the exit node back as it was, or
+    on automatic mode where it had moved it off a node outside Mullvad. One whose first PROBES candidates include a node
+    that would pass pins one of those. The traffic proof is
     a connect that answered and received bytes that grew. A Discord check that got no answer does not fail
     the node."""
     w, names = through
@@ -342,7 +345,9 @@ def p3(through, why, discord):
             f"pinned without a Discord check: {told}")
     else:
         assert kind == "stayed", f"nothing stopped the move: {told}"
-        assert w.setting() == before, f"a move that stayed did not put the exit node back: {told}"
+        moved_it = any(e.kind == "set" for e in w.entries)
+        back = ("automatic", w.auto_pick) if before == ("pinned", fakes.PC) and moved_it else before
+        assert w.setting() == back, f"a move that stayed did not put the exit node back: {told}"
     passes = [n for n in names[:PROBES] if w.hosts[n].carries and not (discord and w.hosts[n].blocked)]
     assert not passes or kind == "moved", f"{passes} would pass, yet {told}"
 
@@ -384,7 +389,7 @@ def happenings(draw, gaps: bool):
 
 @prop
 @expected_failure("04-one-controller")
-@checked(200)
+@checked(300)
 @given(happenings(gaps=True))
 def p1(happening):
     """P1 The watcher never sets the exit node to none, and never to a node outside Mullvad.
@@ -405,7 +410,9 @@ def p1(happening):
 
         def putting_back(q: Sent) -> bool:
             later = w.entries[i + 1:q.finished] if q.finished is not None else w.entries[i + 1:]
-            return q.start[0] == "off" and not any(x.kind == "set" for x in later)
+            started_off = q.start[0] == "off" or not q.known and any(
+                x.kind in ("outside", "auto-move") and x.state[0] == "off" for x in w.entries[q.sent:i])
+            return started_off and not any(x.kind == "set" for x in later)
 
         asking = [r for r, q in reqs.items() if q.running_at(i) and (q.kind == "off" or putting_back(q))]
         assert asking, f"the watcher turned the exit node off at {e.t - fakes.T0:.2f}s, unasked:\n{history(w)}"
@@ -413,7 +420,7 @@ def p1(happening):
 
 @prop
 @expected_failure("04-one-controller")
-@checked(100)
+@checked(300)
 @given(happenings(gaps=False))
 def p4(happening):
     """P4 Every change of exit node is exactly one node-log line; a change the watcher did not make is logged
@@ -470,10 +477,12 @@ def step_or_time(draw):
 def interruptions(draw):
     """A request whose move is interrupted once or twice, in a World where nothing else goes wrong. The
     interruption is a newer request, its client going, or a change from outside. It lands after one of the
-    watcher's steps, or a few seconds in."""
+    watcher's steps, or a few seconds in. Every node the exit node can end up on works, so the watcher has
+    no move of its own to make."""
     hosts = draw(network())
     good = [h for h in hosts if healthy(h)]
     to = places(hosts) + [h.name for h in hosts if h.online]
+    targets = ["", "auto:any", *[h.fqdn for h in good]] if good else [""]
     ask = st.just(fakes.Ask("next")) | st.builds(fakes.Ask, st.just("to"), st.sampled_from(to))
     script = [(fakes.At(0), draw(ask))]
     for _ in range(draw(st.integers(1, 2))):
@@ -483,14 +492,15 @@ def interruptions(draw):
         elif by == "disconnect":
             interruption = fakes.Disconnect()
         else:
-            interruption = fakes.Outside(draw(st.sampled_from(["", "auto:any", *[h.fqdn for h in good]])))
+            interruption = fakes.Outside(draw(st.sampled_from(targets)))
         script.append((step_or_time(draw), interruption))
-    return world(hosts, draw(exit_node(hosts, among=good))), script
+    setting, pick = draw(exit_node(hosts, among=good))
+    return world(hosts, (setting, pick or (good[0].name if good else None))), script
 
 
 @prop
 @expected_failure("04-one-controller")
-@checked(100)
+@checked(200)
 @given(interruptions())
 def p9(interrupted):
     """P9 A newer request, a disconnected client or an outside change stops a running move before its next step.
@@ -505,6 +515,8 @@ def p9(interrupted):
     w, script = interrupted
     fakes.run(w, script)
     reqs = requests(w)
+    unknown = [r for r, q in reqs.items() if not q.known]
+    assert not unknown, f"requests {unknown} came while the watcher was on a move nothing asked for:\n{history(w)}"
     stopped = set()
     for i, e in enumerate(w.entries):
         if e.kind == "send":
@@ -515,7 +527,7 @@ def p9(interrupted):
             r = running(reqs, i)
         else:
             continue
-        if r is None or r in stopped or reqs[r].kind in ("on", "off") or not reqs[r].known:
+        if r is None or r in stopped or reqs[r].kind in ("on", "off"):
             continue
         stopped.add(r)
         LANDED["p9"] += 1
@@ -565,33 +577,44 @@ def recoveries(draw):
 
 @prop
 @expected_failure("04-one-controller")
-@checked(100)
+@checked(200)
 @given(recoveries())
 def p9_own(recovering):
     """P9 An outside change stops a running move before its next step, and leaves the outside change in place,
     on the watcher's own moves.
 
-    After a change from outside, the watcher's next step, if it takes one, begins a new move with a probe.
-    It never goes on with the move it was in, or sets the exit node back, before that."""
+    After a change from outside to no exit node or to a node that works, the watcher takes no step until the
+    next change. After one to a node that does not work, its next step begins a new move with a probe. It
+    never goes on with the move it was in, or sets the exit node back."""
     w, script = recovering
     fakes.run(w, script)
     changes = [i for i, e in enumerate(w.entries) if e.kind in ("outside", "auto-move")]
     for n, i in enumerate(changes):
+        e = w.entries[i]
         until = changes[n + 1] if n + 1 < len(changes) else len(w.entries)
-        if any(x.kind in fakes.STEPS for x in w.entries[:i]):
+        before = [x for x in w.entries[:i] if x.kind in fakes.STEPS]
+        if before and e.t - before[-1].t <= 7:
             LANDED["p9_own"] += 1
         steps = later_steps(w, i, until)
-        assert not steps or steps[0].kind == "probe", (
-            f"after the change from outside at {w.entries[i].t - fakes.T0:.2f}s, the watcher's next step was a "
-            f"{steps[0].kind}:\n{history(w)}")
+        node = e.state[1]
+        works = node is None or (node in w.hosts and healthy(w.hosts[node]))
+        at = f"after the change from outside to {node} at {e.t - fakes.T0:.2f}s"
+        if works:
+            assert not steps, f"{at}, the watcher took a {steps[0].kind if steps else ''} step:\n{history(w)}"
+        else:
+            assert not steps or steps[0].kind == "probe", (
+                f"{at}, the watcher's next step was a {steps[0].kind}:\n{history(w)}")
 
 
 # --------------------------------------------------------------------------
 
 
 def at_a_stub(e: BaseException) -> bool:
-    last = traceback.extract_tb(e.__traceback__)[-1]
-    return Path(last.filename).name == "vpn" and last.name in STUBS
+    tb = e.__traceback__
+    while tb and tb.tb_next:
+        tb = tb.tb_next
+    code = tb.tb_frame.f_code if tb else None
+    return code is not None and Path(code.co_filename).name == "vpn" and code.co_qualname in STUBS
 
 
 def number(p) -> tuple[int, str]:
