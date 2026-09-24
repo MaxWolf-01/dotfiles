@@ -43,7 +43,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections import deque
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -100,7 +101,8 @@ BUS_DEBOUNCE_SECS = 1.0
 """A switch arrives as a burst of bus messages; one look after the burst is enough."""
 BUS_RETRY_SECS = 5
 
-SOCKET = "/var/run/tailscale/tailscaled.sock"
+SOCKET = os.environ.get("VPN_TAILSCALED_SOCKET", "/var/run/tailscale/tailscaled.sock")
+"""tailscaled's LocalAPI. The tests point it at nothing, so a test that reaches it fails instead of reaching the real one."""
 BUS_MASK = 1 << 15
 """NotifyPeerPatches: per-peer Online changes, and (implied) peers added and removed.
 Preference changes, the exit node among them, arrive whatever the mask."""
@@ -623,8 +625,151 @@ def last_node_record() -> dict | None:
 
 
 # --------------------------------------------------------------------------
+# the ports: what the watcher reaches and does not own
+# --------------------------------------------------------------------------
+#
+# The watcher is to reach tailscaled, the network, the clock and Vesktop only
+# through these. The fakes are in tests/vpn_fakes.py.
+
+
+@dataclass(frozen=True)
+class Tailscaled:
+    status: Callable[[], dict | None]
+    """A full status reading; None when tailscaled does not answer."""
+    prefs: Callable[[], dict | None]
+    set_exit_node: Callable[[str], None]
+    """`tailscale set`, with a node's full name, "auto:any", or "" for none. Raises VpnError when it fails."""
+    bus: Callable[[int], Iterator[dict]]
+    """The event bus under a mask of NotifyWatchOpt bits, one message per item, until the stream closes.
+    It is read on a thread of its own that only hands each message to the queue `Clock.wait` takes from."""
+
+
+@dataclass(frozen=True)
+class Network:
+    probe: Callable[[str], None]
+    """Send one UDP datagram to a tailnet IPv4 address's discard port, which makes tailscaled handshake with that node."""
+    connect: Callable[[float], bool]
+    """The traffic proof's TCP connect, to 1.1.1.1:443 and else 8.8.8.8:443. Returns whether one answered
+    within the seconds given."""
+    discord: Callable[[], Verdict]
+    egress: Callable[[], dict]
+
+
+@dataclass(frozen=True)
+class Clock:
+    now: Callable[[], float]
+    wait: Callable[[float], "Arrival"]
+    """Wait up to the seconds given for the next bus message or request, and return it, or None once they pass
+    with nothing arriving. This is how the watcher waits for anything."""
+
+
+@dataclass(frozen=True)
+class Ports:
+    tailscaled: Tailscaled
+    network: Network
+    clock: Clock
+    vesktop: Callable[[], bool]
+
+
+# --------------------------------------------------------------------------
+# liveness: what tailscaled's engine updates say
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Liveness:
+    """Each peer's traffic and handshakes, from the engine updates tailscaled
+    pushes every 2 s, and from them whether the exit node is silent.
+
+    Engine updates name peers by node key; a full status reading maps the keys
+    to nodes.
+    """
+
+    clock: Clock
+    arrived: deque = field(default_factory=deque)
+    """The bus messages and requests `wait` took in that were not engine updates, in arrival order, for the watcher."""
+
+    def learn(self, status: dict) -> None:
+        """Take the key-to-node map and the exit node from a full status reading."""
+        raise NotImplementedError
+
+    def feed(self, message: dict) -> None:
+        """Take in one bus message. Only engine updates change anything."""
+        raise NotImplementedError
+
+    def wait(self, secs: float, until: Callable[[], bool] = lambda: False) -> None:
+        """Wait up to `secs`, or until `until()` holds, feeding what arrives meanwhile."""
+        raise NotImplementedError
+
+    def silent(self) -> bool:
+        """Whether the exit node is silent."""
+        raise NotImplementedError
+
+    def handshake_since(self, node: Node, since: float) -> bool:
+        """Whether `node` completed a handshake after `since`."""
+        raise NotImplementedError
+
+    def received_since(self, node: Node, since: float) -> bool:
+        """Whether `node`'s received bytes grew after `since`."""
+        raise NotImplementedError
+
+
+def probe(nodes: list[Node], liveness: Liveness, ports: Ports) -> list[Node]:
+    """Handshake-probe `nodes` at once and wait for their handshakes. Returns
+    the nodes that answered, in the order given. Changes no exit node."""
+    raise NotImplementedError
+
+
+# --------------------------------------------------------------------------
 # moving the exit node
 # --------------------------------------------------------------------------
+
+
+Why = Literal["asked", "blocked", "offline", "silent"]
+Stop = Literal["superseded", "cancelled", "outside"]
+"""Why a running move must stop: a newer request, its client gone, an outside change."""
+
+
+@dataclass(frozen=True)
+class Start:
+    """The exit node as it was before a move."""
+
+    mode: Literal["pinned", "automatic", "off"]
+    node: Node | None
+    """The node in use, pinned or automatic mode's pick. None when off, and when the pinned node is outside
+    Mullvad. A move that has moved the exit node off such a node cannot name it back, and puts automatic mode
+    on instead."""
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """How a move ended."""
+
+    kind: Literal["moved", "stayed", "superseded"]
+    """moved: `node` is now pinned. stayed: the exit node is as the move's start had it, or on automatic mode
+    where the move had moved it off a node outside Mullvad. superseded: an outside change stopped the move,
+    and nothing was undone."""
+    node: Node | None
+    because: Literal["unanswered", "failed", "cancelled", "superseded"] | None
+    """Why a move stayed: no candidate answered, none passed, its client went, or a newer request came."""
+    tried: int
+    reason: str
+
+
+def move(
+    start: Start,
+    candidates: list[Node],
+    why: Why,
+    discord: bool,
+    say: Callable[[str], None],
+    stop: Callable[[], Stop | None],
+    liveness: Liveness,
+    ports: Ports,
+) -> Outcome:
+    """Move the exit node off `start` to the first of `candidates`, in walk
+    order, that answers the handshake probe, carries traffic, and passes the
+    Discord check when `discord` is set; or put it back as `start` had it."""
+    raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -708,7 +853,7 @@ def undo(prefs: dict | None, nodes: list[Node]) -> None:
     set_exit_node(pinned.fqdn if pinned else "auto:any")
 
 
-def move(options: list[Node], command: Command, start: Node | None, nodes: list[Node]) -> Node:
+def pin_first(options: list[Node], command: Command, start: Node | None, nodes: list[Node]) -> Node:
     """Pin the first usable node of `options`, or undo the move and fail."""
     if not options:
         raise VpnError("no online node to move to")
@@ -767,6 +912,36 @@ class Watch:
     shown: dict = field(default_factory=dict)
     """What STATE_FILE says, apart from since when."""
     shown_since: float = 0.0
+
+
+@dataclass(frozen=True)
+class Client:
+    """The command that sent a request, at the other end of the request socket."""
+
+    say: Callable[[str], None]
+    """Stream one line of progress."""
+    finish: Callable[[bool, str], None]
+    """The request's final line, called exactly once per request, whether or not the client is still there."""
+    connected: Callable[[], bool]
+
+
+@dataclass(frozen=True)
+class Request:
+    request: Literal["on", "off", "next", "to"]
+    place: str
+    """Where `to` goes; empty for the others."""
+    client: Client
+
+
+Arrival = dict | Request | None
+"""What the watcher handles: a bus message, a request, or None for a tick, time passing with nothing arriving."""
+
+
+def handle(w: Watch, arrival: Arrival, ports: Ports) -> float:
+    """Act on one bus message, request or tick. A request runs to its end here,
+    and so does whatever arrived while it ran. Returns the seconds until the
+    next tick is due."""
+    raise NotImplementedError
 
 
 def recover(w: Watch, cause: Cause) -> None:
@@ -1059,7 +1234,7 @@ def to(args: ToArgs) -> None:
         if not matched:
             raise VpnError(f'no exit node matches "{args.place}" — see `vpn list`')
         start = current_node(status)
-        move(destinations(args.place, matched, start), "to", start, nodes)
+        pin_first(destinations(args.place, matched, start), "to", start, nodes)
 
 
 @app.command(name="next")
@@ -1077,7 +1252,7 @@ def next_() -> None:
             raise VpnError("tailscaled did not answer")
         start = current_node(status)
         nodes = mullvad_nodes(status)
-        move(candidates(start, nodes), "next", start, nodes)
+        pin_first(candidates(start, nodes), "next", start, nodes)
 
 
 @app.command(name="off")
