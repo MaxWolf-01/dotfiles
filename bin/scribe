@@ -528,6 +528,179 @@ def build_conversation(folder: Path, log: Log) -> dict:
     }
 
 
+# ---------------------------------------------------------------- claude
+
+
+def claude(system: str, prompt: str, schema: dict, model: str, progress: Progress, what: str) -> dict:
+    """One `claude -p` call returning structured output. --safe-mode keeps max's CLAUDE.md, hooks,
+    skills, plugins and output style out of it (P9)."""
+    cmd = [
+        "claude", "-p", "--safe-mode", "--model", model, "--tools", "", "--no-session-persistence",
+        "--output-format", "json", "--json-schema", json.dumps(schema), "--system-prompt", system,
+    ]
+    progress.log.write(f"claude: {what}, model {model}, prompt {len(prompt)} characters")
+    started = time.monotonic()
+    result: dict = {}
+
+    def call():
+        try:
+            result["r"] = subprocess.run(cmd, input=prompt, capture_output=True, text=True)
+        except FileNotFoundError:
+            result["missing"] = True
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        progress.update(f"{what}, {hms(time.monotonic() - started)}")
+        worker.join(0.5)
+    if result.get("missing"):
+        raise Failed("`claude` is not on PATH; Claude Code writes the names and the notes.")
+    r = result["r"]
+    if r.returncode:
+        raise Failed(f"claude -p ({what}) exited {r.returncode}: {(r.stderr or r.stdout).strip()[-1500:]}")
+    try:
+        events = json.loads(r.stdout)
+    except ValueError:
+        raise Failed(f"claude -p ({what}) answered with something other than JSON: {r.stdout[-800:]}")
+    res = events[-1] if isinstance(events, list) else events
+    if res.get("is_error") or "structured_output" not in res:
+        raise Failed(f"claude -p ({what}) returned no structured output: {json.dumps(res)[:1500]}")
+    progress.log.write(f"claude: {what} done in {time.monotonic() - started:.1f} s, session {res.get('session_id', '?')}")
+    if res.get("total_cost_usd") is not None:
+        progress.cost(what, float(res["total_cost_usd"]), "Claude Code's figure: list price, not a charge on a subscription")
+    return res["structured_output"]
+
+
+def transcript_lines(conv: dict, label=None) -> str:
+    """The transcript as Claude reads it: "<turn id> [<time>] <speaker>: <text>" per turn."""
+    names = {sp["id"]: sp["name"] for sp in conv["speakers"]}
+    label = label or (lambda t: names.get(t["spk"], t["spk"]))
+    return "\n".join(f"{t['id']} [{hms(t['s'])}] {label(t)}: {t['text']}" for t in conv["turns"])
+
+
+# ---------------------------------------------------------------- speaker names
+
+NAMES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "voices": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "voice": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["person", "not-a-person"]},
+                    "name": {"type": "string", "description": "The person's name, or empty when unknown"},
+                    "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"turn": {"type": "string"}, "why": {"type": "string"}},
+                            "required": ["turn", "why"],
+                        },
+                    },
+                },
+                "required": ["voice", "kind", "name", "confidence", "evidence"],
+            },
+        }
+    },
+    "required": ["voices"],
+}
+
+NAMES_SYSTEM = """You name the speakers in an automatic transcript of a recorded conversation.
+The transcription model told the voices apart and labelled each turn with a voice label such as
+speaker_0. For every voice, work out who it is from what is said: self-introductions, being
+addressed by name (the person addressed usually speaks next), others talking about them, what
+they say about themselves. The transcription may misspell names; give the spelling from the list
+of expected people when one of them is meant.
+A voice can also be something other than a person in the room: a video or ad playing aloud, or
+fragments of crosstalk. Mark those kind "not-a-person".
+Cite the turn ids your answer rests on, and say why. Leave the name empty and the confidence low
+rather than guess."""
+
+
+def voice_talk(words: list[dict]) -> dict[str, dict]:
+    talk: dict[str, dict] = {}
+    for st in runs(words, key="voice"):
+        d = talk.setdefault(st["spk"], {"sec": 0.0, "words": 0})
+        d["sec"] += st["e"] - st["s"]
+        d["words"] += len(st["words"])
+    return talk
+
+
+def name_speakers(folder: Path, src: Source, model: str, ask: bool, progress: Progress) -> str:
+    """cache/names.json: per voice, a name or none, whether it is a person, and who decided."""
+    response = read_json(folder / "cache" / "scribe.json")
+    words = words_of(response)
+    for w in words:
+        w["spk"] = w["voice"]
+    conv = {"speakers": [], "turns": build_turns(words)}
+    talk = voice_talk(words)
+    total = sum(d["sec"] for d in talk.values()) or 1.0
+    voices = sorted(talk, key=lambda v: -talk[v]["sec"])
+    info = "\n".join(f"- {v}: {talk[v]['sec'] / 60:.1f} min of speech, {talk[v]['words']} words" for v in voices)
+    prompt = (
+        (f"People expected in this conversation (may be incomplete): {', '.join(src.names)}\n\n" if src.names else "")
+        + f"Voices:\n{info}\n\nTranscript:\n{transcript_lines(conv, lambda t: t['spk'])}"
+    )
+    answer = claude(NAMES_SYSTEM, prompt, NAMES_SCHEMA, model, progress, "naming the voices")
+    proposals = {p["voice"]: p for p in answer["voices"]}
+
+    decisions = []
+    for v in voices:
+        p = proposals.get(v, {})
+        kind = p.get("kind", "person")
+        tiny = talk[v]["sec"] / total < 0.02 or talk[v]["words"] < 25
+        decisions.append({
+            "voice": v,
+            "name": p.get("name", "") if kind == "person" else "",
+            "kind": kind,
+            "method": "claude",
+            "confidence": p.get("confidence", "low"),
+            "evidence": p.get("evidence", []),
+            "sec": round(talk[v]["sec"], 1),
+            "words": talk[v]["words"],
+            "tiny": tiny,
+        })
+    unsure = [d for d in decisions if not (d["confidence"] == "high" and (d["name"] or d["kind"] != "person"))
+              and not (d["tiny"] and d["kind"] != "person")]
+    if unsure and ask:
+        progress.say("")
+        confirm(unsure, conv["turns"])
+    for d in decisions:
+        d.pop("tiny")
+    write_json(folder / "cache" / "names.json", decisions)
+    named = [d["name"] or ("not a person" if d["kind"] != "person" else "no name") for d in decisions]
+    how = f", {len(unsure)} confirmed by you" if unsure and ask else ""
+    return ", ".join(named) + how
+
+
+def confirm(unsure: list[dict], turns: list[dict]) -> None:
+    """Ask in the terminal about each voice Claude was not sure of."""
+    print("Who is this? Enter keeps the proposal, a name replaces it, - marks the voice as not a person.\n", file=sys.stderr)
+    by_id = {t["id"]: t for t in turns}
+    for d in unsure:
+        own = sorted((t for t in turns if t["spk"] == d["voice"]), key=lambda t: -(t["e"] - t["s"]))[:3]
+        guess = d["name"] or ("-" if d["kind"] != "person" else "")
+        shown = guess or "no name"
+        print(f"{d['voice']}: {d['sec'] / 60:.1f} min, {d['words']} words. Claude proposes {shown}, "
+              f"{d['confidence']} confidence.", file=sys.stderr)
+        for ev in d["evidence"][:3]:
+            t = by_id.get(ev["turn"])
+            print(f"    because at {hms(t['s']) if t else ev['turn']}: {ev['why']}", file=sys.stderr)
+        for t in own:
+            print(f"    [{hms(t['s'])}] {t['text'][:160]}", file=sys.stderr)
+        answer = input(f"  name [{shown}]: ").strip()
+        if answer == "-":
+            d.update(kind="not-a-person", name="", method="you")
+        elif answer:
+            d.update(kind="person", name=answer, method="you")
+        elif guess:
+            d["method"] = "you"
+        print(file=sys.stderr)
+
+
 # ---------------------------------------------------------------- statistics, all computed here
 
 
@@ -739,6 +912,10 @@ class Run:
     """Language code (en, de, ...). auto lets the transcription model detect it."""
     date: str = ""
     """Recording date, YYYY-MM-DD. Default: the file's creation tag, else its modification time."""
+    yes: bool = False
+    """Accept Claude's names without asking. Without a terminal, they are accepted anyway."""
+    model: str = "opus"
+    """Claude model for naming the speakers and writing the notes."""
 
 
 @app.command(name="run")
@@ -775,7 +952,7 @@ def run(a: Run, log: Log) -> None:
     log.move(folder)
     cached = (folder / "cache" / "scribe.json").exists()
 
-    stages = ["preparing audio", "transcribing", "rendering"]
+    stages = ["preparing audio", "transcribing", "naming speakers", "rendering"]
     progress = Progress(stages, log)
     progress.say(f"{recording.name} ({hms(src.duration)}) -> {folder}")
 
@@ -791,6 +968,12 @@ def run(a: Run, log: Log) -> None:
         transcribe(recording, folder, src, progress, log)
         n = sum(1 for x in read_json(folder / "cache" / "scribe.json")["words"] if x["type"] == "word")
         progress.done(f"{n:,} words")
+
+    progress.start("naming speakers")
+    if (folder / "cache" / "names.json").exists():
+        progress.done("decided before, in cache/names.json")
+    else:
+        progress.done(name_speakers(folder, src, a.model, sys.stdin.isatty() and not a.yes, progress))
 
     progress.start("rendering")
     progress.update("waiting for audio.opus")
@@ -824,6 +1007,76 @@ def cmd_render(options: Render) -> None:
         print(folder)
 
     guarded(body, log)
+
+
+@dataclass
+class Rename:
+    """Rename speakers in a conversation's folder and rebuild it. Calls no model and no network.
+
+    The spoken words stay as said; the speaker labels, the notes' prose and the outputs change."""
+
+    folder: Annotated[Path, tyro.conf.Positional]
+    """A conversation's folder."""
+    pairs: Annotated[list[str], tyro.conf.Positional]
+    """OLD=NEW pairs, e.g. Parzival=Levi "Speaker C=Andres". Giving two speakers one name makes them one speaker."""
+
+
+@app.command(name="rename")
+def cmd_rename(options: Rename) -> None:
+    log = Log()
+    log.write(f"command: {shlex.join(sys.argv)}")
+
+    def body():
+        folder = folder_arg(options.folder)
+        log.move(folder)
+        rename(folder, options.pairs, log)
+        print(folder)
+
+    guarded(body, log)
+
+
+def rename(folder: Path, pairs: list[str], log: Log) -> None:
+    bad = [p for p in pairs if "=" not in p or not p.split("=", 1)[0] or not p.split("=", 1)[1]]
+    if bad or not pairs:
+        raise Failed(f"expected OLD=NEW pairs, got {bad or 'none'}")
+    to = dict(p.split("=", 1) for p in pairs)
+    conv = read_json(folder / "conversation.json")
+    known = {sp["name"] for sp in conv["speakers"]}
+    missing = [old for old in to if old not in known]
+    if missing:
+        raise Failed(f"no speaker called {', '.join(missing)} in {folder.name}; the speakers are {', '.join(sorted(known))}")
+    names_path = folder / "cache" / "names.json"
+    decisions = {d["voice"]: d for d in read_json(names_path)} if names_path.exists() else {}
+    for sp in conv["speakers"]:
+        if sp["name"] in to:
+            for v in sp["voices"]:
+                d = decisions.setdefault(v, {"voice": v, "confidence": "", "evidence": []})
+                d.update(name=to[sp["name"]], kind="person", method="you")
+    write_json(names_path, list(decisions.values()))
+    conv = build_conversation(folder, log)
+    write_json(folder / "conversation.json", conv)
+    rename_notes(folder, to)
+    render(folder, log)
+    log.write("renamed " + ", ".join(f"{o} to {n}" for o, n in to.items()))
+
+
+def rename_notes(folder: Path, to: dict[str, str]) -> None:
+    """The names in the notes' prose, whole words only. Quotes stay as spoken (P1)."""
+    path = folder / "analysis.json"
+    if not path.exists():
+        return
+    pattern = re.compile(r"(?<!\w)(" + "|".join(re.escape(o) for o in sorted(to, key=len, reverse=True)) + r")(?!\w)")
+
+    def swap(value, key=""):
+        if isinstance(value, str):
+            return value if key == "quote" else pattern.sub(lambda m: to[m.group(1)], value)
+        if isinstance(value, list):
+            return [swap(v, key) for v in value]
+        if isinstance(value, dict):
+            return {k: swap(v, "quote" if key == "quotes" and k == "text" else k) for k, v in value.items()}
+        return value
+
+    write_json(path, swap(read_json(path)))
 
 
 if __name__ == "__main__":
