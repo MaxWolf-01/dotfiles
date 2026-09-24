@@ -1,0 +1,830 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro>=1.0.14", "httpx"]
+# ///
+"""Turn a recorded conversation into a transcript, notes and a report.
+
+`run` makes one folder per recording, under $SCRIBE_DIR (default
+~/Documents/scribe/), holding:
+
+- the original recording, copied in unchanged
+- transcript.md: statistics and the full transcript with speakers and times
+- conversation.json: words, turns and speakers; everything else is derived from it
+- audio.opus: the audio the report plays
+- scribe.log: what each run did, with timings, request ids and costs
+- cache/: the transcription response and intermediate files
+
+ElevenLabs Scribe v2 transcribes and separates the voices in one request, which
+needs ELEVENLABS_API_KEY (`with-secrets elevenlabs scribe run ...`). The
+response is kept in cache/, and every later run reuses it.
+
+Examples:
+
+    with-secrets elevenlabs scribe run talk.m4a --names Max Levi --me Max
+    scribe run talk.m4a --out ~/talks/2026-09-20-meetup
+    scribe render ~/Documents/scribe/2026-09-20-talk
+"""
+
+import atexit
+import datetime as dt
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Annotated
+
+import tyro
+from tyro.extras import SubcommandApp
+
+app = SubcommandApp()
+
+SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+MODEL = "ElevenLabs Scribe v2"
+
+
+def base_dir() -> Path:
+    return Path(os.environ.get("SCRIBE_DIR") or Path.home() / "Documents" / "scribe").expanduser()
+
+
+def hms(t: float) -> str:
+    t = int(t)
+    h, m, s = t // 3600, t % 3600 // 60, t % 60
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60].strip("-") or "conversation"
+
+
+def read_json(p: Path):
+    return json.loads(p.read_text())
+
+
+def write_json(p: Path, data) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+    tmp.replace(p)
+
+
+def sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------- terminal and log
+
+
+class Failed(Exception):
+    """A failure the user can act on; its message says what failed and what to do."""
+
+
+class Log:
+    """scribe.log in the conversation's folder, appended by every run."""
+
+    def __init__(self, folder: Path | None = None):
+        self.path = folder / "scribe.log" if folder else None
+        self.pending: list[str] = []
+
+    def move(self, folder: Path) -> None:
+        self.path = folder / "scribe.log"
+        for line in self.pending:
+            self.write(line)
+        self.pending = []
+
+    def write(self, line: str) -> None:
+        stamped = f"{dt.datetime.now().isoformat(timespec='seconds')}  {line}"
+        if not self.path:
+            self.pending.append(line)
+            return
+        with self.path.open("a") as f:
+            f.write(stamped + "\n")
+
+
+class Progress:
+    """One line per stage on stderr. A running stage rewrites its line in place on a terminal."""
+
+    def __init__(self, stages: list[str], log: Log):
+        self.stages, self.log = stages, log
+        self.tty = sys.stderr.isatty()
+        self.n = 0
+        self.started = 0.0
+        self.live = False
+        self.costs: list[tuple[str, float, str]] = []
+        if stages:
+            self.say(f"stages: {', '.join(stages)}")
+
+    def say(self, text: str) -> None:
+        if self.live:
+            print(file=sys.stderr)
+            self.live = False
+        print(text, file=sys.stderr, flush=True)
+
+    def start(self, stage: str) -> None:
+        self.n = self.stages.index(stage) + 1 if stage in self.stages else self.n
+        self.stage, self.started = stage, time.monotonic()
+        self.log.write(f"stage {stage}: start")
+        self.update("")
+
+    def prefix(self) -> str:
+        return f"[{self.n}/{len(self.stages)}] {self.stage}"
+
+    def update(self, detail: str) -> None:
+        """Rewrite the running stage's line; only on a terminal, where it costs no lines."""
+        if not self.tty:
+            return
+        print(f"\r\033[K{self.prefix()}{': ' + detail if detail else ' ...'}", end="", file=sys.stderr, flush=True)
+        self.live = True
+
+    def done(self, outcome: str) -> None:
+        took = time.monotonic() - self.started
+        self.log.write(f"stage {self.stage}: done in {took:.1f} s, {outcome}")
+        if self.live:
+            print("\r\033[K", end="", file=sys.stderr)
+            self.live = False
+        print(f"{self.prefix()}: {outcome} ({took:.1f} s)", file=sys.stderr, flush=True)
+
+    def cost(self, what: str, usd: float, source: str) -> None:
+        self.costs.append((what, usd, source))
+        self.log.write(f"cost {what}: ${usd:.4f} ({source})")
+
+    def summary(self) -> None:
+        if not self.costs:
+            return
+        lines = [f"  {what}: ${usd:.4f}, {source}" for what, usd, source in self.costs]
+        self.say("cost of this run:\n" + "\n".join(lines))
+
+
+def run_cmd(cmd: list[str], what: str) -> str:
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise Failed(f"{what} failed ({' '.join(cmd[:1])} exited {r.returncode}): {r.stderr.strip()[-800:]}")
+    return r.stdout
+
+
+# ---------------------------------------------------------------- the folder
+
+
+@dataclass
+class Source:
+    """cache/source.json: the recording a folder belongs to, and how its run was asked for."""
+
+    name: str
+    sha256: str
+    duration: float
+    date: str
+    names: list[str] = field(default_factory=list)
+    hotwords: list[str] = field(default_factory=list)
+    language: str = "auto"
+    me: str = ""
+    titled: bool = False
+    """The folder carries the conversation's title in its name, and keeps it from then on."""
+    placed: bool = False
+    """The folder was placed by --out, and keeps the name it was given."""
+
+
+def load_source(folder: Path) -> Source | None:
+    p = folder / "cache" / "source.json"
+    return Source(**read_json(p)) if p.exists() else None
+
+
+def save_source(folder: Path, src: Source) -> None:
+    write_json(folder / "cache" / "source.json", src.__dict__)
+
+
+def recording_date(audio: Path) -> str:
+    tag = run_cmd(
+        ["ffprobe", "-v", "error", "-show_entries", "format_tags=creation_time", "-of", "csv=p=0", str(audio)],
+        "reading the recording's date",
+    ).strip()
+    if re.match(r"\d{4}-\d{2}-\d{2}", tag):
+        return tag[:10]
+    return dt.date.fromtimestamp(audio.stat().st_mtime).isoformat()
+
+
+def duration_of(audio: Path) -> float:
+    out = run_cmd(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio)],
+        f"reading the length of {audio.name}",
+    ).strip()
+    try:
+        return float(out)
+    except ValueError:
+        raise Failed(f"ffprobe gives no length for {audio}; is it an audio file?")
+
+
+def find_folder(digest: str) -> Path | None:
+    """The folder an earlier run made for the same recording, under the default place."""
+    base = base_dir()
+    if not base.is_dir():
+        return None
+    for p in sorted(base.glob("*/cache/source.json")):
+        try:
+            if read_json(p).get("sha256") == digest:
+                return p.parent.parent
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def free_name(parent: Path, name: str, keep: Path | None = None) -> Path:
+    """parent/name, or parent/name-2, -3 ... when the name is taken by another folder."""
+    candidate, n = parent / name, 1
+    while candidate.exists() and candidate != keep:
+        n += 1
+        candidate = parent / f"{name}-{n}"
+    return candidate
+
+
+# ---------------------------------------------------------------- audio
+
+
+class Encoding:
+    """audio.opus, the compressed audio the page plays, encoded in the background while the run goes on."""
+
+    def __init__(self, recording: Path, folder: Path):
+        self.opus = folder / "audio.opus"
+        self.proc = None
+        if not self.opus.exists():
+            self.part = folder / "cache" / "audio.opus.part"
+            self.proc = subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-y", "-i", str(recording), "-map", "0:a:0", "-vn", "-ac", "1",
+                 "-c:a", "libopus", "-b:a", "24k", "-application", "voip", "-f", "opus", str(self.part)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+            atexit.register(self.stop)
+
+    def stop(self) -> None:
+        """A run that fails before rendering leaves no encoder behind."""
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def wait(self) -> None:
+        if not self.proc:
+            return
+        _, err = self.proc.communicate()
+        if self.proc.returncode:
+            raise Failed(f"making audio.opus failed (ffmpeg exited {self.proc.returncode}): {err.strip()[-800:]}")
+        self.part.replace(self.opus)
+        self.proc = None
+
+
+def copy_recording(recording: Path, folder: Path) -> None:
+    """The recording, copied into the folder unchanged (P14 keeps the original as it is)."""
+    copy = folder / recording.name
+    if copy.resolve() != recording.resolve() and not copy.exists():
+        part = folder / "cache" / (recording.name + ".part")
+        shutil.copyfile(recording, part)
+        part.replace(copy)
+
+
+class Counting(io.FileIO):
+    """A file that reports how many bytes have been read from it."""
+
+    sent = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = super().read(size)
+        self.sent += len(chunk)
+        return chunk
+
+
+def transcribe(recording: Path, folder: Path, src: Source, progress: Progress, log: Log) -> None:
+    """One ElevenLabs Scribe v2 request; the raw response goes to cache/scribe.json."""
+    import httpx
+
+    key = os.environ.get("ELEVENLABS_API_KEY")
+    if not key:
+        raise Failed("ELEVENLABS_API_KEY is not set. Run it as `with-secrets elevenlabs scribe run ...`.")
+    flac = folder / "cache" / "audio.flac"
+    run_cmd(
+        ["ffmpeg", "-v", "error", "-y", "-i", str(recording), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+         "-sample_fmt", "s16", "-c:a", "flac", str(flac)],
+        "making the audio to upload",
+    )
+    terms = [t for t in src.names + src.hotwords if t]
+    data = {"model_id": "scribe_v2", "diarize": "true", "timestamps_granularity": "word", "tag_audio_events": "true"}
+    if src.language != "auto":
+        data["language_code"] = src.language
+    fields = [*data.items(), *(("keyterms", t) for t in terms)]
+    total = flac.stat().st_size
+    log.write(f"request: POST {SCRIBE_URL}, {total} bytes, fields {json.dumps(fields)}")
+
+    result: dict = {}
+    started = time.monotonic()
+
+    def send():
+        try:
+            with Counting(flac) as f, httpx.Client(timeout=httpx.Timeout(60, read=3 * 3600, write=600)) as c:
+                result["file"] = f
+                result["response"] = c.post(SCRIBE_URL, headers={"xi-api-key": key}, data=fields,
+                                             files={"file": (flac.name, f, "audio/flac")})
+        except Exception as exc:  # reported below, in the main thread
+            result["error"] = exc
+
+    worker = threading.Thread(target=send, daemon=True)
+    worker.start()
+    uploaded_at = None
+    while worker.is_alive():
+        sent = getattr(result.get("file"), "sent", 0)
+        if sent < total:
+            progress.update(f"uploading {sent / 1e6:.1f} of {total / 1e6:.1f} MB, {hms(time.monotonic() - started)}")
+        else:
+            uploaded_at = uploaded_at or time.monotonic()
+            progress.update(f"uploaded {total / 1e6:.1f} MB, waiting for the transcription {hms(time.monotonic() - uploaded_at)}")
+        worker.join(0.5)
+    if "error" in result:
+        raise Failed(f"the request to ElevenLabs failed: {result['error']!r}. Check the network and run again; nothing is cached yet.")
+    r = result["response"]
+    headers = {k: v for k, v in r.headers.items() if k in ("x-trace-id", "request-id", "character-cost", "fiat-cost-before-overages", "fiat-currency")}
+    log.write(f"response: {r.status_code} after {time.monotonic() - started:.1f} s, headers {json.dumps(headers)}")
+    if r.status_code == 401:
+        raise Failed(f"ElevenLabs rejected the key (401): {r.text[:300]}. Check the key in `with-secrets elevenlabs`.")
+    if r.status_code != 200:
+        raise Failed(f"ElevenLabs answered {r.status_code}: {r.text[:800]}")
+    body = r.json()
+    write_json(folder / "cache" / "scribe.json", body)
+    write_json(folder / "cache" / "scribe-request.json", {
+        "transcription_id": body.get("transcription_id"), "bytes": total, "seconds": round(time.monotonic() - started, 1),
+        "keyterms": terms, "headers": headers,
+    })
+    log.write(f"transcription {body.get('transcription_id')}, request {headers.get('x-trace-id') or headers.get('request-id')}")
+    flac.unlink()
+    if "fiat-cost-before-overages" in headers:
+        progress.cost("transcription", float(headers["fiat-cost-before-overages"]),
+                      f"reported by ElevenLabs ({headers.get('character-cost', '?')} credits)")
+    else:
+        log.write("ElevenLabs reported no cost for this request")
+
+
+# ---------------------------------------------------------------- conversation.json
+
+
+def words_of(response: dict) -> list[dict]:
+    """Words in the order spoken, each with its voice, times and a leading space where one was heard.
+    A word's index in this list is its identity: turn ids name the turn's first word."""
+    words, gap = [], ""
+    for x in response["words"]:
+        if x["type"] == "spacing":
+            gap = " "
+            continue
+        words.append({
+            "w": (gap if words else "") + x["text"],
+            "s": round(x["start"], 3),
+            "e": round(x["end"], 3),
+            "voice": x.get("speaker_id") or "unknown",
+            **({"event": True} if x["type"] == "audio_event" else {}),
+        })
+        gap = ""
+    return words
+
+
+def runs(words: list[dict], key: str = "spk", max_gap: float = 1.0) -> list[dict]:
+    """Stretches of speech, one speaker each: words of the same speaker less than max_gap apart."""
+    out: list[dict] = []
+    for i, w in enumerate(words):
+        if w.get("event"):
+            continue
+        if out and out[-1]["spk"] == w[key] and w["s"] - out[-1]["e"] <= max_gap:
+            out[-1]["e"] = max(out[-1]["e"], w["e"])
+            out[-1]["words"].append(i)
+        else:
+            out.append({"s": w["s"], "e": w["e"], "spk": w[key], "words": [i]})
+    return out
+
+
+STRAY_LONGEST = 5.0
+STRAY_WINDOW = 90.0
+STRAY_TALKER = 120.0
+
+
+def fix_strays(words: list[dict]) -> int:
+    """P10. A stretch of at most 5 s from a speaker who says nothing else for 90 s either side,
+    but talks more than 2 min in all, goes to the nearest other speaker, and so do its words.
+    Someone who only ever speaks briefly, a waiter say, keeps their own label."""
+    stretches = runs(words)
+    total: dict[str, float] = {}
+    for s in stretches:
+        total[s["spk"]] = total.get(s["spk"], 0.0) + s["e"] - s["s"]
+    moved = 0
+    for i, st in enumerate(stretches):
+        spk, s, e = st["spk"], st["s"], st["e"]
+        if e - s > STRAY_LONGEST or total.get(spk, 0.0) <= STRAY_TALKER:
+            continue
+        if any(o["spk"] == spk and o["e"] > s - STRAY_WINDOW and o["s"] < e + STRAY_WINDOW for j, o in enumerate(stretches) if j != i):
+            continue
+        others = [o for o in stretches if o["spk"] != spk]
+        if not others:
+            continue
+        to = min(others, key=lambda o: max(0.0, o["s"] - e, s - o["e"]))["spk"]
+        for k in st["words"]:
+            words[k]["spk"] = to
+            moved += 1
+        # the events inside the stretch go with it
+        for w in words:
+            if w.get("event") and w["spk"] == spk and s <= w["s"] <= e:
+                w["spk"] = to
+        st["spk"] = to
+    return moved
+
+
+def build_turns(words: list[dict]) -> list[dict]:
+    turns: list[dict] = []
+    for i, w in enumerate(words):
+        if turns and turns[-1]["spk"] == w["spk"]:
+            turns[-1]["e"] = max(turns[-1]["e"], w["e"])
+            turns[-1]["w1"] = i + 1
+        else:
+            turns.append({"id": f"t{i}", "spk": w["spk"], "s": w["s"], "e": w["e"], "w0": i, "w1": i + 1})
+    for t in turns:
+        t["text"] = "".join(w["w"] for w in words[t["w0"] : t["w1"]]).strip()
+    return turns
+
+
+def speakers_of(words: list[dict], names: dict[str, dict]) -> tuple[list[dict], dict[str, str]]:
+    """The people and other sources in the recording, and each voice's speaker id.
+
+    A speaker's id is its first voice's label, so it survives renames. Voices given one name
+    become one speaker. People come first, by talking time; unnamed people are Speaker A, B, ...
+    """
+    air: dict[str, float] = {}
+    for st in runs(words, key="voice"):
+        air[st["spk"]] = air.get(st["spk"], 0.0) + st["e"] - st["s"]
+    voices = sorted({w["voice"] for w in words}, key=lambda v: -air.get(v, 0.0))
+    by_name: dict[str, dict] = {}
+    speakers: list[dict] = []
+    voice_to: dict[str, str] = {}
+    for v in voices:
+        d = names.get(v, {})
+        kind = d.get("kind", "person")
+        name = d.get("name", "") if kind == "person" else ""
+        if name and name in by_name:
+            sp = by_name[name]
+        else:
+            sp = {"id": v, "name": name, "kind": kind, "voices": [], "method": d.get("method", "")}
+            speakers.append(sp)
+            if name:
+                by_name[name] = sp
+        sp["voices"].append(v)
+        voice_to[v] = sp["id"]
+    unnamed = 0
+    for sp in speakers:
+        if sp["kind"] == "person" and not sp["name"]:
+            sp["name"] = f"Speaker {chr(65 + unnamed)}"
+            unnamed += 1
+        elif sp["kind"] != "person":
+            sp["name"] = "Not a person"
+    return speakers, voice_to
+
+
+def build_conversation(folder: Path, log: Log) -> dict:
+    """conversation.json, rebuilt from the cached response and the speaker decisions."""
+    src = load_source(folder)
+    response = read_json(folder / "cache" / "scribe.json")
+    names_path = folder / "cache" / "names.json"
+    names = {d["voice"]: d for d in read_json(names_path)} if names_path.exists() else {}
+    words = words_of(response)
+    speakers, voice_to = speakers_of(words, names)
+    for w in words:
+        w["spk"] = voice_to[w["voice"]]
+    moved = fix_strays(words)
+    log.write(f"{moved} words moved off a speaker silent for {STRAY_WINDOW:.0f} s either side (P10)")
+    turns = build_turns(words)
+    # talking time orders the people again: strays and merged voices changed it
+    air: dict[str, float] = {}
+    for st in runs(words):
+        air[st["spk"]] = air.get(st["spk"], 0.0) + st["e"] - st["s"]
+    speakers.sort(key=lambda sp: (sp["kind"] != "person", -air.get(sp["id"], 0.0)))
+    return {
+        "meta": {
+            "source": src.name,
+            "sha256": src.sha256,
+            "date": src.date,
+            "duration": round(src.duration, 2),
+            "language": response.get("language_code"),
+            "me": src.me,
+            "transcription": MODEL,
+            "built": dt.datetime.now().isoformat(timespec="seconds"),
+        },
+        "speakers": speakers,
+        "words": words,
+        "turns": turns,
+    }
+
+
+# ---------------------------------------------------------------- statistics, all computed here
+
+
+def union_len(iv: list[tuple[float, float]]) -> float:
+    total, end = 0.0, -1.0
+    for s, e in sorted(iv):
+        if e <= end:
+            continue
+        total += e - max(s, end)
+        end = e
+    return total
+
+
+def compute_stats(conv: dict, bin_s: int = 10) -> dict:
+    """Every number the markdown and the page show (P3)."""
+    people = [sp["id"] for sp in conv["speakers"] if sp["kind"] == "person"]
+    dur = conv["meta"]["duration"]
+    stretches = [s for s in runs(conv["words"]) if s["spk"] in people]
+    turns = [t for t in conv["turns"] if t["spk"] in people]
+    by = {p: [(s["s"], s["e"]) for s in stretches if s["spk"] == p] for p in people}
+    air = {p: union_len(by[p]) for p in people}
+    air_sum = sum(air.values()) or 1.0
+    words_n = {p: 0 for p in people}
+    for w in conv["words"]:
+        if w["spk"] in words_n and not w.get("event"):
+            words_n[w["spk"]] += 1
+
+    handover = {a: {b: 0 for b in people} for a in people}
+    gaps: dict[str, list[float]] = {p: [] for p in people}
+    nmin = max(1, math.ceil(dur / 60))
+    per_minute = [0] * nmin
+    for prev, cur in zip(turns, turns[1:]):
+        if prev["spk"] != cur["spk"]:
+            handover[prev["spk"]][cur["spk"]] += 1
+            gaps[cur["spk"]].append(cur["s"] - prev["e"])
+            per_minute[min(nmin - 1, int(cur["s"] // 60))] += 1
+
+    per = {}
+    for p in people:
+        own = [t for t in turns if t["spk"] == p]
+        longest = max(own, key=lambda t: t["e"] - t["s"], default=None)
+        per[p] = {
+            "airtime": round(air[p], 1),
+            "share": round(100 * air[p] / air_sum, 1),
+            "words": words_n[p],
+            "wpm": round(words_n[p] / (air[p] / 60)) if air[p] else 0,
+            "turns": len(own),
+            "avg_turn": round(statistics.mean(t["e"] - t["s"] for t in own), 1) if own else 0,
+            "longest_turn": round(longest["e"] - longest["s"], 1) if longest else 0,
+            "longest_turn_id": longest["id"] if longest else None,
+            "median_gap": round(statistics.median(gaps[p]), 2) if gaps[p] else None,
+        }
+
+    nbins = max(1, math.ceil(dur / bin_s))
+    lanes = {}
+    for p in people:
+        lane = [0.0] * nbins
+        for s, e in by[p]:
+            b = int(s // bin_s)
+            while b < nbins and b * bin_s < e:
+                lane[b] += max(0.0, min(e, (b + 1) * bin_s) - max(s, b * bin_s)) / bin_s
+                b += 1
+        lanes[p] = [round(min(1.0, x), 2) for x in lane]
+    cumulative = {}
+    for p in people:
+        acc, line = 0.0, []
+        for m in range(nmin):
+            acc += sum(max(0.0, min(e, (m + 1) * 60) - max(s, m * 60)) for s, e in by[p])
+            line.append(round(acc / 60, 2))
+        cumulative[p] = line
+
+    silences, end = [], 0.0
+    for s, e in sorted(iv for p in people for iv in by[p]):
+        if s - end >= 2.0:
+            silences.append((round(end, 1), round(s - end, 1)))
+        end = max(end, e)
+    longest_silence = max(silences, key=lambda x: x[1], default=(0.0, 0.0))
+    busiest = max(range(nmin), key=lambda m: per_minute[m])
+    changes = sum(per_minute)
+    return {
+        "people": people,
+        "speech": round(union_len([iv for p in people for iv in by[p]]), 1),
+        "words": sum(words_n.values()),
+        "turn_changes": changes,
+        "changes_per_minute": round(changes / (dur / 60), 1) if dur else 0,
+        "per_person": per,
+        "handover": handover,
+        "bin": bin_s,
+        "lanes": lanes,
+        "per_minute": per_minute,
+        "cumulative": cumulative,
+        "longest_silence": {"at": longest_silence[0], "sec": longest_silence[1]},
+        "busiest_minute": {"minute": busiest, "changes": per_minute[busiest]},
+    }
+
+
+# ---------------------------------------------------------------- transcript.md
+
+
+def to_markdown(conv: dict, st: dict) -> str:
+    meta = conv["meta"]
+    names = {sp["id"]: sp["name"] for sp in conv["speakers"]}
+    people = [sp for sp in conv["speakers"] if sp["kind"] == "person"]
+    title = Path(meta["source"]).stem
+    L = [
+        "---",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
+        f"date: {meta['date']}",
+        f'duration: "{hms(meta["duration"])}"',
+        f"speakers: [{', '.join(sp['name'] for sp in people)}]",
+        f"source: {json.dumps(meta['source'], ensure_ascii=False)}",
+        f"transcription: {meta['transcription']}",
+        "---",
+        "",
+        f"# {title}",
+        "",
+    ]
+    L += statistics_md(people, st)
+    L += ["## Transcript", ""]
+    for t in conv["turns"]:
+        L += [f"[{hms(t['s'])}] **{names.get(t['spk'], t['spk'])}:** {t['text']}", ""]
+    return "\n".join(L).rstrip() + "\n"
+
+
+def statistics_md(people: list[dict], st: dict) -> list[str]:
+    pp = st["per_person"]
+    rows = [
+        ("Talking time", lambda p: hms(p["airtime"])),
+        ("Share of talking time", lambda p: f"{p['share']}%"),
+        ("Words", lambda p: f"{p['words']:,}"),
+        ("Words per minute", lambda p: p["wpm"]),
+        ("Turns", lambda p: p["turns"]),
+        ("Average turn", lambda p: f"{p['avg_turn']} s"),
+        ("Longest turn", lambda p: f"{p['longest_turn']} s"),
+        ("Median pause before speaking", lambda p: "" if p["median_gap"] is None else f"{p['median_gap']} s"),
+    ]
+    L = ["## Statistics", "", "Computed from the times of the transcript's words.", ""]
+    L.append("| | " + " | ".join(sp["name"] for sp in people) + " |")
+    L.append("|---|" + "---|" * len(people))
+    for label, f in rows:
+        L.append(f"| {label} | " + " | ".join(str(f(pp[sp["id"]])) for sp in people) + " |")
+    L += ["", "Handovers: how often the row's speaker was followed directly by the column's.", ""]
+    L.append("| | " + " | ".join(sp["name"] for sp in people) + " |")
+    L.append("|---|" + "---|" * len(people))
+    for a in people:
+        L.append(f"| {a['name']} | " + " | ".join(str(st["handover"][a["id"]][b["id"]]) for b in people) + " |")
+    L += [
+        "",
+        f"The floor changed hands {st['turn_changes']:,} times, {st['changes_per_minute']} times a minute on average, "
+        f"and most often at {hms(st['busiest_minute']['minute'] * 60)}, {st['busiest_minute']['changes']} times in that minute. "
+        f"The longest silence is {st['longest_silence']['sec']} s, at {hms(st['longest_silence']['at'])}.",
+        "",
+    ]
+    return L
+
+
+def render(folder: Path, log: Log) -> None:
+    """transcript.md from conversation.json alone; no network."""
+    conv = read_json(folder / "conversation.json")
+    st = compute_stats(conv)
+    (folder / "transcript.md").write_text(to_markdown(conv, st))
+    log.write("wrote transcript.md")
+
+
+# ---------------------------------------------------------------- commands
+
+
+def folder_arg(folder: Path) -> Path:
+    folder = folder.expanduser().resolve()
+    if not (folder / "cache" / "scribe.json").exists():
+        raise Failed(f"{folder} is not a conversation folder: it has no cache/scribe.json. Make one with `scribe run`.")
+    return folder
+
+
+def guarded(body, log: Log) -> None:
+    """Runs a command; a failure is logged in full and reported in one line."""
+    try:
+        body()
+    except Failed as exc:
+        log.write(f"failed: {exc}")
+        print(f"scribe: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        log.write("interrupted")
+        print("\nscribe: interrupted", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception:
+        log.write("failed:\n" + traceback.format_exc())
+        where = f" The traceback is in {log.path}." if log.path else ""
+        print(f"scribe: {traceback.format_exc().strip().splitlines()[-1]}.{where}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+@dataclass
+class Run:
+    """Transcribe a recording into its conversation's folder, or rebuild the folder from its cache."""
+
+    audio: Annotated[Path, tyro.conf.Positional]
+    """The recording; anything ffmpeg reads."""
+    out: str = ""
+    """The conversation's folder. Default: a folder under $SCRIBE_DIR (~/Documents/scribe/) named after the date and the recording, or the folder an earlier run made for the same recording."""
+    names: list[str] = field(default_factory=list)
+    """People likely present. The transcription model gets them as keyterms, so spell them right."""
+    hotwords: list[str] = field(default_factory=list)
+    """Other words the transcription should expect: jargon, product names. Keyterms add 20% to the price."""
+    me: str = os.environ.get("SCRIBE_ME", "")
+    """Your name as it will appear among the speakers. Default: $SCRIBE_ME."""
+    language: str = "auto"
+    """Language code (en, de, ...). auto lets the transcription model detect it."""
+    date: str = ""
+    """Recording date, YYYY-MM-DD. Default: the file's creation tag, else its modification time."""
+
+
+@app.command(name="run")
+def cmd_run(options: Run) -> None:
+    log = Log()
+    log.write(f"command: {shlex.join(sys.argv)}")
+    guarded(lambda: run(options, log), log)
+
+
+def run(a: Run, log: Log) -> None:
+    recording = a.audio.expanduser().resolve()
+    if not recording.is_file():
+        raise Failed(f"no such file: {recording}")
+    digest = sha256(recording)
+    if a.out:
+        folder = Path(a.out).expanduser().resolve()
+        src = load_source(folder)
+        if src and src.sha256 != digest:
+            raise Failed(f"{folder} belongs to another recording, {src.name}. Pick another --out.")
+    else:
+        folder = find_folder(digest)
+        src = load_source(folder) if folder else None
+    if not src:
+        date = a.date or recording_date(recording)
+        if not folder:
+            folder = free_name(base_dir(), f"{date}-{slug(recording.stem)}")
+        src = Source(name=recording.name, sha256=digest, duration=duration_of(recording), date=date,
+                     names=a.names, hotwords=a.hotwords, language=a.language, me=a.me, placed=bool(a.out))
+    elif a.names or a.hotwords or a.me or a.date:
+        src.names, src.hotwords = a.names or src.names, a.hotwords or src.hotwords
+        src.me, src.date = a.me or src.me, a.date or src.date
+    folder.mkdir(parents=True, exist_ok=True)
+    save_source(folder, src)
+    log.move(folder)
+    cached = (folder / "cache" / "scribe.json").exists()
+
+    stages = ["preparing audio", "transcribing", "rendering"]
+    progress = Progress(stages, log)
+    progress.say(f"{recording.name} ({hms(src.duration)}) -> {folder}")
+
+    progress.start("preparing audio")
+    copy_recording(recording, folder)
+    encoding = Encoding(recording, folder)
+    progress.done(f"{recording.name} is in the folder" + (", audio.opus encoding alongside" if encoding.proc else ""))
+
+    progress.start("transcribing")
+    if cached:
+        progress.done("cached in cache/scribe.json, not sent again")
+    else:
+        transcribe(recording, folder, src, progress, log)
+        n = sum(1 for x in read_json(folder / "cache" / "scribe.json")["words"] if x["type"] == "word")
+        progress.done(f"{n:,} words")
+
+    progress.start("rendering")
+    progress.update("waiting for audio.opus")
+    encoding.wait()
+    conv = build_conversation(folder, log)
+    write_json(folder / "conversation.json", conv)
+    render(folder, log)
+    progress.done("conversation.json, transcript.md")
+    progress.summary()
+    log.write("run done")
+    print(folder)
+
+
+@dataclass
+class Render:
+    """Rebuild transcript.md from the folder's conversation.json, without any network request."""
+
+    folder: Annotated[Path, tyro.conf.Positional]
+    """A conversation's folder."""
+
+
+@app.command(name="render")
+def cmd_render(options: Render) -> None:
+    log = Log()
+    log.write(f"command: {shlex.join(sys.argv)}")
+
+    def body():
+        folder = folder_arg(options.folder)
+        log.move(folder)
+        render(folder, log)
+        print(folder)
+
+    guarded(body, log)
+
+
+if __name__ == "__main__":
+    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
