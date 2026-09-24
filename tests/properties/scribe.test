@@ -1,0 +1,464 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro>=1.0.14", "playwright"]
+# ///
+"""Check the properties of bin/scribe. Run it directly; no framework.
+
+P1 to P15 are the properties of agent/tickets/scribe/spec.md in the private
+secrets repo. The executable ones are checked here; the rest by review.
+
+Every check drives the command end to end, as a user would, on a fixture. The
+fixture is the first ten minutes of NASA's Houston We Have a Podcast, episode
+421, "Artemis II: Backup Crew": Leah Cheshire, Andre Douglas and Jenni Gibbons.
+It is a US government work, so public domain. tests/fixtures/scribe/ holds:
+
+- scribe.json.gz: ElevenLabs Scribe v2's response for the clip, with
+  diarization, word timestamps and audio events, fetched once
+- analysis.json: the notes a stub answers with in place of Claude. It has two
+  quotes that are not in their turn, citations to a turn that does not exist
+  (t99999), and bare turn ids in its prose.
+
+The recording handed to `scribe run` is a tone of the clip's length. The
+checks never transcribe, so its sound does not matter.
+
+Every command runs without a network (unshare -rn), with stubs for `claude`
+and `sftpgo-share` first on PATH, so a check that makes a request fails, and
+no check pays anything.
+
+A check whose property waits on an unbuilt ticket is an expected failure: it
+names that ticket, and it fails the run once it passes. The page checks need
+chromium on PATH.
+
+Examples:
+
+    tests/properties/scribe.test
+    tests/properties/scribe.test --only P7 P10 --keep
+"""
+
+import functools
+import gzip
+import hashlib
+import http.server
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import traceback
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import tyro
+
+REPO = Path(__file__).resolve().parents[2]
+SCRIBE = REPO / "bin" / "scribe"
+FIXTURE = REPO / "tests" / "fixtures" / "scribe"
+WIDTHS = (360, 700, 1080, 1440)
+MISSING_TURN = "t99999"
+"""The turn the fixture's notes cite that does not exist."""
+PLANTED = (179.8, 181.0)
+"""Seconds of Andre's turn at 2:58, "I mean, I'll never forget.", that the planted
+copy gives to Jenni. Jenni says nothing from 84.9 s to 274.3 s, more than 90 s
+either side of it, and talks 139 s in all."""
+
+
+@dataclass
+class Args:
+    only: list[str] = field(default_factory=list)
+    """Run only these properties, by id, e.g. P7 P10."""
+    keep: bool = False
+    """Keep the work directory and print where it is."""
+
+
+# --- the harness
+
+
+class Counterexample(AssertionError):
+    pass
+
+
+def expect(holds: bool, what: str) -> None:
+    if not holds:
+        raise Counterexample(what)
+
+
+class Skip(Exception):
+    pass
+
+
+@dataclass
+class Property:
+    id: str
+    says: str
+    waits_on: str
+    """The ticket that makes the property hold, while it is unbuilt; empty once it holds."""
+    check: Callable[["Work"], None]
+
+
+PROPERTIES: list[Property] = []
+
+
+def prop(id: str, says: str, waits_on: str = ""):
+    def register(check):
+        PROPERTIES.append(Property(id, says, waits_on, check))
+        return check
+
+    return register
+
+
+def run_properties(args: Args) -> int:
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="scribe-test-", delete=not args.keep) as tmp:
+        work = Work(Path(tmp))
+        for p in PROPERTIES:
+            if args.only and p.id.split()[0] not in args.only and p.id not in args.only:
+                continue
+            try:
+                p.check(work)
+            except Skip as exc:
+                print(f"skip  {p.id} {p.says}: {exc}")
+                continue
+            except Exception as exc:
+                why = str(exc) if isinstance(exc, Counterexample) else traceback.format_exc()
+                if p.waits_on:
+                    print(f"xfail {p.id} {p.says}  (waits on {p.waits_on})\n      {why.strip().splitlines()[-1]}")
+                    continue
+                failures += 1
+                print(f"FAIL  {p.id} {p.says}\n      " + why.replace("\n", "\n      "))
+                continue
+            if p.waits_on:
+                failures += 1
+                print(f"XPASS {p.id} {p.says}: holds, yet is marked as waiting on {p.waits_on}; remove the mark")
+                continue
+            print(f"ok    {p.id} {p.says}")
+        for pw in PLAYWRIGHT:
+            pw.stop()
+        if args.keep:
+            print(f"\nkept {tmp}")
+    print()
+    print("FAILED" if failures else "all ok")
+    return 1 if failures else 0
+
+
+# --- the fixture and the command
+
+CLAUDE_STUB = r"""#!/usr/bin/env bash
+# Stands in for Claude: answers from the fixture by the JSON schema it is asked for, and logs the call.
+echo "claude $*" >> "$SCRIBE_TEST_CALLS"
+cat > /dev/null
+schema=""
+while [ $# -gt 0 ]; do
+    [ "$1" = --json-schema ] && schema="$2"
+    shift
+done
+case "$schema" in
+    *'"quotes"'*) answer="$SCRIBE_TEST_FIXTURE/analysis.json" ;;
+    *) echo "stub claude: the fixture has no answer for this schema: $schema" >&2; exit 1 ;;
+esac
+printf '[{"type":"result","is_error":false,"total_cost_usd":0,"structured_output":%s}]\n' "$(cat "$answer")"
+"""
+
+SFTPGO_STUB = r"""#!/usr/bin/env bash
+# Stands in for sftpgo-share: uploads nothing, and links to $SCRIBE_TEST_SHARE_URL.
+echo "sftpgo-share $*" >> "$SCRIBE_TEST_CALLS"
+case "$1" in
+    upload) ;;
+    create) printf '{"id":"fixture","url":"%s","expires":null}\n' "$SCRIBE_TEST_SHARE_URL" ;;
+    *) echo "stub sftpgo-share: unexpected command: $*" >&2; exit 1 ;;
+esac
+"""
+
+
+class Work:
+    """A work directory with the stubs, the recording, and conversation folders made from the fixture."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.stubs = root / "stubs"
+        self.stubs.mkdir()
+        for name, text in (("claude", CLAUDE_STUB), ("sftpgo-share", SFTPGO_STUB)):
+            (self.stubs / name).write_text(text)
+            (self.stubs / name).chmod(0o755)
+        self.calls = root / "calls.log"
+        self.calls.touch()
+        self.response = json.loads(gzip.decompress((FIXTURE / "scribe.json.gz").read_bytes()))
+        self.recording = root / "Artemis II backup crew.flac"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"sine=frequency=220:duration={self.response['audio_duration_secs']}",
+             "-ac", "1", "-ar", "16000", "-c:a", "flac", str(self.recording)],
+            check=True,
+        )
+        os.utime(self.recording, ns=(1_778_000_000_000_000_000, 1_778_000_000_000_000_000))
+        self.share_url = "http://127.0.0.1:9/unreachable.opus"
+        self.warmed = False
+
+    def env(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "PATH": f"{self.stubs}:{os.environ['PATH']}",
+            "SCRIBE_DIR": str(self.root / "scribe"),
+            "ELEVENLABS_API_KEY": "fixture-no-key",
+            "UV_OFFLINE": "1",
+            "SCRIBE_TEST_CALLS": str(self.calls),
+            "SCRIBE_TEST_FIXTURE": str(FIXTURE),
+            "SCRIBE_TEST_SHARE_URL": self.share_url,
+        }
+
+    def folder(self, name: str, response: dict | None = None) -> Path:
+        """A conversation folder holding only a cached transcription response."""
+        out = self.root / name
+        shutil.rmtree(out, ignore_errors=True)
+        (out / "cache").mkdir(parents=True)
+        (out / "cache" / "scribe.json").write_text(json.dumps(response or self.response))
+        return out
+
+    def scribe(self, *args: str) -> subprocess.CompletedProcess:
+        """`scribe` with no network. Fails the check unless it exits 0."""
+        expect(SCRIBE.exists(), f"{SCRIBE} does not exist")
+        if not self.warmed:
+            # uv resolves the script's dependencies once, with the network; every run after is offline
+            subprocess.run([str(SCRIBE), "--help"], capture_output=True, timeout=600)
+            self.warmed = True
+        r = subprocess.run(
+            ["unshare", "-rn", str(SCRIBE), *args],
+            env=self.env(), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600,
+        )
+        expect(r.returncode == 0, f"scribe {' '.join(args)} exited {r.returncode}: {(r.stderr or r.stdout)[-1500:]}")
+        return r
+
+    def call_count(self) -> int:
+        return len(self.calls.read_text().splitlines())
+
+    @functools.cached_property
+    def base(self) -> Path:
+        """The fixture folder after one `run`, for the checks that only read it."""
+        out = self.folder("base")
+        self.scribe("run", str(self.recording), "--out", str(out))
+        return out
+
+
+def read(path: Path) -> str:
+    expect(path.exists(), f"{path.name} was not written")
+    return path.read_text()
+
+
+def transcript_turns(md: str) -> list[str]:
+    """The turn lines of transcript.md's transcript, each '[m:ss] **Speaker:** text'."""
+    return [line for line in md.splitlines() if re.match(r"\[\d+:\d{2}(:\d{2})?\] \*\*[^*]+:\*\* ", line)]
+
+
+def text_between(response: dict, start: float, end: float) -> str:
+    """The words the response has from start to end seconds, spaced as spoken."""
+    out = ""
+    for w in response["words"]:
+        if w["type"] == "spacing":
+            if out and start <= w["start"] <= end:
+                out += " "
+        elif start <= w["start"] <= end:
+            out += w["text"]
+    return out.strip()
+
+
+# --- the page, in headless chromium
+
+
+PLAYWRIGHT = []
+
+
+@functools.cache
+def browser():
+    exe = shutil.which("chromium")
+    if not exe:
+        raise Skip("chromium not found")
+    from playwright.sync_api import sync_playwright
+
+    PLAYWRIGHT.append(sync_playwright().start())
+    return PLAYWRIGHT[0].chromium.launch(executable_path=exe, args=["--autoplay-policy=no-user-gesture-required"])
+
+
+def open_page(path: Path, width: int = 1440):
+    """The page at this width once loaded, and the script errors it raised."""
+    expect(path.exists(), f"{path.name} was not written")
+    page = browser().new_page(viewport={"width": width, "height": 900})
+    errors: list[str] = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(path.as_uri(), wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
+    return page, errors
+
+
+VISIBLE_PLAYER = """() => [...document.querySelectorAll("audio, button, input")].filter((el) => {
+  const r = el.getBoundingClientRect(), s = getComputedStyle(el)
+  const named = (el.getAttribute("aria-label") || "") + " " + (el.title || "")
+  return r.width > 0 && r.height > 0 && s.visibility !== "hidden"
+    && (el.tagName === "AUDIO" || /play|pause|back \\d|forward \\d|seek|position|speed/i.test(named))
+}).map((el) => el.outerHTML.slice(0, 100))"""
+
+EDGES = """() => {
+  const left = (el) => { const r = el.getBoundingClientRect(), s = getComputedStyle(el); return r.left + parseFloat(s.paddingLeft) + parseFloat(s.borderLeftWidth) }
+  const name = (el) => el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + (el.className ? "." + String(el.className).split(" ")[0] : "")
+  return { scroll: document.documentElement.scrollWidth, width: innerWidth,
+    edges: [...document.querySelectorAll("body > header, main > section, body > footer")].map((el) => [name(el), Math.round(left(el) * 10) / 10]) }
+}"""
+
+
+def player_shown(path: Path) -> list[str]:
+    page, errors = open_page(path)
+    try:
+        expect(not errors, f"{path} raised script errors: {errors}")
+        return page.evaluate(VISIBLE_PLAYER)
+    finally:
+        page.close()
+
+
+def alone(page: Path, where: Path) -> Path:
+    """A copy of the page in a folder of its own, with nothing beside it."""
+    where.mkdir()
+    return Path(shutil.copy(page, where / page.name))
+
+
+@functools.cache
+def audio_server(folder: Path) -> tuple[http.server.ThreadingHTTPServer, str]:
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(folder))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}/audio.opus"
+
+
+# --- the properties
+
+
+@prop("P1", "a quote is always a verbatim substring of the one turn it cites", waits_on="Notes")
+def p1(w: Work) -> None:
+    out = w.folder("p1")
+    w.scribe("run", str(w.recording), "--out", str(out))
+    w.scribe("regen", str(out))
+    turns = {t["id"]: t["text"] for t in json.loads(read(out / "conversation.json"))["turns"]}
+    quotes = json.loads(read(out / "analysis.json"))["quotes"]
+    expect(quotes, "no quote survived, so nothing was checked")
+    for q in quotes:
+        expect(q["turn"] in turns, f"a quote cites {q['turn']}, which is not a turn: {q['text']!r}")
+        expect(q["text"] in turns[q["turn"]], f"{q['text']!r} is not in {q['turn']}: {turns[q['turn']]!r}")
+    md = read(out / "transcript.md")
+    spoken = "\n".join(transcript_turns(md))
+    for block in re.findall(r"(?m)^> (.+)$\n>$", md):
+        expect(block.strip('"') in spoken, f"transcript.md quotes {block!r}, which no turn in its transcript holds")
+
+
+@prop("P2 markdown", "a citation to a missing turn does not reach transcript.md", waits_on="Notes")
+def p2_markdown(w: Work) -> None:
+    md = read(w.base / "transcript.md")
+    expect(MISSING_TURN not in md, f"transcript.md mentions {MISSING_TURN}")
+
+
+@prop("P2 page", "a citation to a missing turn does not reach report.html", waits_on="Report page")
+def p2_page(w: Work) -> None:
+    page = read(w.base / "report.html")
+    expect(MISSING_TURN not in page, f"report.html carries {MISSING_TURN}")
+
+
+@prop("P5", "a second run on a cached transcription makes no network request", waits_on="Recording to transcript")
+def p5(w: Work) -> None:
+    out = w.folder("p5")
+    cached = (out / "cache" / "scribe.json").read_bytes()
+    w.scribe("run", str(w.recording), "--out", str(out))
+    before = w.call_count()
+    w.scribe("run", str(w.recording), "--out", str(out))
+    expect(w.call_count() == before, f"the second run called {w.calls.read_text().splitlines()[before:]}")
+    expect((out / "cache" / "scribe.json").read_bytes() == cached, "the cached response was rewritten")
+    expect((out / "transcript.md").exists(), "the run wrote no transcript.md")
+
+
+@prop("P6", "with no audio beside it, the page loads and shows no player", waits_on="Report page")
+def p6_no_audio(w: Work) -> None:
+    page = w.base / "report.html"
+    shown = player_shown(page)
+    expect(shown, "the page shows no player even with audio.opus beside it, so this check cannot tell")
+    shown = player_shown(alone(page, w.root / "p6-alone"))
+    expect(not shown, f"alone, the page still shows {shown}")
+
+
+@prop("P6 link", "with no audio beside it and its share link unreachable, the page shows no player", waits_on="Share audio")
+def p6_link(w: Work) -> None:
+    out = w.folder("p6-link")
+    w.scribe("run", str(w.recording), "--out", str(out))
+    server, w.share_url = audio_server(out)
+    w.scribe("share", str(out))
+    page = alone(out / "report.html", w.root / "p6-link-alone")
+    shown = player_shown(page)
+    expect(shown, "the page shows no player while its share link works, so this check cannot tell")
+    server.shutdown()
+    server.server_close()
+    shown = player_shown(page)
+    expect(not shown, f"with the link unreachable, the page still shows {shown}")
+
+
+@prop("P7", "every section keeps one side margin and nothing scrolls sideways, 360 px up", waits_on="Report page")
+def p7(w: Work) -> None:
+    for width in WIDTHS:
+        page, errors = open_page(w.base / "report.html", width)
+        try:
+            expect(not errors, f"at {width} px the page raised {errors}")
+            got = page.evaluate(EDGES)
+        finally:
+            page.close()
+        edges = got["edges"]
+        expect(len(edges) >= 3, f"at {width} px found only {edges} of the header, sections and footer")
+        xs = [x for _, x in edges]
+        expect(max(xs) - min(xs) <= 1, f"at {width} px the sections start at different x: {edges}")
+        expect(got["scroll"] <= got["width"], f"at {width} px the page is {got['scroll']} px wide, and scrolls sideways")
+
+
+@prop("P10", "a short stretch from a speaker silent 90 s either side goes to its neighbour", waits_on="Recording to transcript")
+def p10(w: Work) -> None:
+    planted = json.loads(json.dumps(w.response))
+    for x in planted["words"]:
+        if PLANTED[0] <= x["start"] <= PLANTED[1] and x["type"] != "spacing":
+            expect(x["speaker_id"] == "speaker_1", f"the fixture changed: {x} is not Andre's")
+            x["speaker_id"] = "speaker_2"
+    out = w.folder("p10", planted)
+    w.scribe("run", str(w.recording), "--out", str(out))
+    stray = text_between(w.response, *PLANTED)
+    before = text_between(w.response, PLANTED[0] - 1.2, PLANTED[0] - 0.01)
+    after = text_between(w.response, PLANTED[1] + 0.01, PLANTED[1] + 1.2)
+    lines = [t for t in transcript_turns(read(out / "transcript.md")) if stray in t]
+    expect(len(lines) == 1, f"{stray!r} is in {len(lines)} turns of transcript.md")
+    expect(before in lines[0] and after in lines[0], f"{stray!r} is not in one turn with {before!r} and {after!r}: {lines[0]!r}")
+
+
+@prop("P12 markdown", "no raw turn id reaches the prose of transcript.md", waits_on="Notes")
+def p12_markdown(w: Work) -> None:
+    ids = re.findall(r"\bt\d+\b", read(w.base / "transcript.md"))
+    expect(not ids, f"transcript.md shows turn ids {sorted(set(ids))}")
+
+
+@prop("P12 page", "no raw turn id reaches the text of report.html", waits_on="Report page")
+def p12_page(w: Work) -> None:
+    page, errors = open_page(w.base / "report.html")
+    try:
+        expect(not errors, f"the page raised {errors}")
+        ids = re.findall(r"\bt\d+\b", page.evaluate("document.body.innerText"))
+    finally:
+        page.close()
+    expect(not ids, f"the page shows turn ids {sorted(set(ids))}")
+
+
+@prop("P14", "run never moves, changes or deletes the recording it was given", waits_on="Recording to transcript")
+def p14(w: Work) -> None:
+    def seen():
+        st = w.recording.stat()
+        return hashlib.sha256(w.recording.read_bytes()).hexdigest(), st.st_mtime_ns
+
+    before = seen()
+    w.scribe("run", str(w.recording), "--out", str(w.folder("p14")))
+    expect(w.recording.exists(), "the recording is gone")
+    expect(seen() == before, f"the recording was {before}, is {seen()}")
+
+
+if __name__ == "__main__":
+    sys.exit(run_properties(tyro.cli(Args, description=__doc__)))
