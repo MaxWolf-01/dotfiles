@@ -191,9 +191,10 @@ Event = Ask | Outside | AutoMoves | Dies | Revives | Offline | Disconnect | Vesk
 
 @dataclass(frozen=True)
 class AfterStep:
-    """When the n-th step the watcher takes returns, counting from 1."""
+    """When the n-th step the watcher takes returns, counting from 1; with `kind`, the n-th step of that kind."""
 
     n: int
+    kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -257,8 +258,8 @@ class World:
         self.handshake: dict[str, float] = {}
         self.entries: list[Entry] = []
         self.clients: list[Client] = []
-        self.steps = 0
-        self.after_step: dict[int, list[Event]] = {}
+        self.steps: dict[str | None, int] = {}
+        self.after_step: dict[tuple[int, str | None], list[Event]] = {}
         self.ready: list[object] = []
         self.schedule: list[tuple[float, int, Callable[[], None]]] = []
         self.seq = itertools.count()
@@ -408,17 +409,18 @@ class World:
 
     def when(self, trigger: AfterStep | At, event: Event) -> None:
         match trigger:
-            case AfterStep(n):
-                self.after_step.setdefault(n, []).append(event)
+            case AfterStep(n, kind):
+                self.after_step.setdefault((n, kind), []).append(event)
             case At(secs):
                 self.at(T0 + secs, lambda: self.happen(event))
                 self.last_at = max(self.last_at, secs)
 
     def step(self, kind: str, before: State | None = None, **fields) -> None:
         self.note(kind, before, **fields)
-        self.steps += 1
-        for event in self.after_step.pop(self.steps, []):
-            self.happen(event)
+        for counted in (None, kind):
+            self.steps[counted] = self.steps.get(counted, 0) + 1
+            for event in self.after_step.pop((self.steps[counted], counted), []):
+                self.happen(event)
 
     # --- the network
 
