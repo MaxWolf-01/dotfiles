@@ -6,24 +6,31 @@
 """Turn a recorded conversation into a transcript, notes and a report.
 
 `run` makes one folder per recording, under $SCRIBE_DIR (default
-~/Documents/scribe/), holding:
+~/Documents/scribe/), named after the date and, once the notes exist, the
+conversation's title. It holds:
 
 - the original recording, copied in unchanged
-- transcript.md: statistics and the full transcript with speakers and times
+- transcript.md: summary, people, chapters, follow-ups, open threads, mentions,
+  quotes, statistics and the full transcript with speakers and times
+- report.html: the same as one self-contained page, with charts and a player
 - conversation.json: words, turns and speakers; everything else is derived from it
+- analysis.json: Claude's notes, which `regen` writes again
 - audio.opus: the audio the report plays
 - scribe.log: what each run did, with timings, request ids and costs
-- cache/: the transcription response and intermediate files
+- cache/: the transcription response, the speaker names and intermediate files
 
 ElevenLabs Scribe v2 transcribes and separates the voices in one request, which
 needs ELEVENLABS_API_KEY (`with-secrets elevenlabs scribe run ...`). The
-response is kept in cache/, and every later run reuses it.
+response is kept in cache/, and every later run reuses it. Claude Code
+(`claude -p`) names the speakers and writes the notes.
 
 Examples:
 
     with-secrets elevenlabs scribe run talk.m4a --names Max Levi --me Max
     scribe run talk.m4a --out ~/talks/2026-09-20-meetup
-    scribe render ~/Documents/scribe/2026-09-20-talk
+    scribe rename ~/Documents/scribe/2026-09-20-agent-swarms Parzival=Levi
+    scribe regen ~/Documents/scribe/2026-09-20-agent-swarms
+    scribe share ~/Documents/scribe/2026-09-20-agent-swarms
 """
 
 import atexit
@@ -512,8 +519,11 @@ def build_conversation(folder: Path, log: Log) -> dict:
     for st in runs(words):
         air[st["spk"]] = air.get(st["spk"], 0.0) + st["e"] - st["s"]
     speakers.sort(key=lambda sp: (sp["kind"] != "person", -air.get(sp["id"], 0.0)))
+    shared = folder / "cache" / "share.json"
+    audio_link = read_json(shared).get("audio") if shared.exists() else None
     return {
         "meta": {
+            **({"share": {"url": audio_link["url"], "until": audio_link["until"]}} if audio_link else {}),
             "source": src.name,
             "sha256": src.sha256,
             "date": src.date,
@@ -1477,6 +1487,101 @@ def rename_notes(folder: Path, to: dict[str, str]) -> None:
     write_json(path, swap(read_json(path)))
 
 
+# ---------------------------------------------------------------- sharing
+
+RETENTION_MONTHS = 9
+"""How long the drop keeps a file after its upload: retentionMonths in nix/nixos/pc/sftpgo.nix."""
+
+
+def months_later(day: dt.date, months: int) -> dt.date:
+    y, m = divmod(day.month - 1 + months, 12)
+    year, month = day.year + y, m + 1
+    for d in range(day.day, 0, -1):
+        try:
+            return dt.date(year, month, d)
+        except ValueError:
+            continue
+    raise ValueError(day)
+
+
+def drop(args: list[str], what: str) -> str:
+    try:
+        return run_cmd(["sftpgo-share", *args], what)
+    except FileNotFoundError:
+        raise Failed("`sftpgo-share` is not on PATH; it lives in dotfiles bin/.")
+
+
+def share(folder: Path, log: Log) -> dict:
+    """audio.opus on the drop behind an open link, the report rebuilt to play from it, and the
+    report uploaded beside it behind a link of its own. The only command that uploads (P15)."""
+    record_path = folder / "cache" / "share.json"
+    record = read_json(record_path) if record_path.exists() else {}
+    remote = f"/scribe/{folder.name}"
+    live = {s["id"] for s in json.loads(drop(["list", "--json"], "listing the drop's links") or "[]")}
+
+    def link(local: Path, name: str, key: str, reuse: bool) -> dict:
+        upload = local
+        if local.name != name:
+            upload = folder / "cache" / name
+            shutil.copyfile(local, upload)
+        old = record.get(key)
+        if reuse and old and old["id"] in live:
+            log.write(f"share: {name} is on the drop already, behind {old['url']}")
+            return old
+        drop(["upload", str(upload), "--to", remote, "--overwrite"], f"uploading {name} to the drop")
+        log.write(f"share: uploaded {upload.stat().st_size} bytes to {remote}/{name}")
+        if old and old["id"] in live:
+            return {**old, "uploaded": dt.date.today().isoformat(),
+                    "until": months_later(dt.date.today(), RETENTION_MONTHS).isoformat()}
+        made = json.loads(drop(["create", f"{remote}/{name}", "--open", "--expires", "never", "--json"],
+                               f"making a link to {name}"))
+        log.write(f"share: link {made['id']} to {remote}/{name}")
+        today = dt.date.today()
+        return {"id": made["id"], "url": made["url"], "path": f"{remote}/{name}", "uploaded": today.isoformat(),
+                "until": months_later(today, RETENTION_MONTHS).isoformat()}
+
+    if not (folder / "audio.opus").exists():
+        raise Failed(f"{folder} has no audio.opus to share; `scribe run` makes it.")
+    record["audio"] = link(folder / "audio.opus", "audio.opus", "audio", reuse=True)
+    write_json(record_path, record)
+    write_json(folder / "conversation.json", build_conversation(folder, log))
+    render(folder, log)
+    record["report"] = link(folder / "report.html", f"{folder.name}.html", "report", reuse=False)
+    write_json(record_path, record)
+    return record
+
+
+@dataclass
+class Share:
+    """Put a conversation's audio and report on the SFTPGo drop on pc, behind links anyone can open.
+
+    The report is rebuilt to play from the audio's link, so the page works on its own wherever it
+    goes. The drop keeps both files for 9 months after their upload. A second share uploads the
+    report again and keeps the links. Anyone holding a link can download the file."""
+
+    folder: Annotated[Path, tyro.conf.Positional]
+    """A conversation's folder."""
+
+
+@app.command(name="share")
+def cmd_share(options: Share) -> None:
+    log = Log()
+    log.write(f"command: {shlex.join(sys.argv)}")
+
+    def body():
+        folder = folder_arg(options.folder)
+        log.move(folder)
+        record = share(folder, log)
+        audio, report = record["audio"], record["report"]
+        print(f"report: {report['url']}")
+        print("        send this link: it downloads the page, which then plays from the audio link")
+        print(f"audio:  {audio['url']}")
+        print(f"        the drop keeps it until {audio['until']}")
+        print(f"revoke: sftpgo-share revoke {audio['id']}; sftpgo-share revoke {report['id']}")
+
+    guarded(body, log)
+
+
 PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -1803,7 +1908,7 @@ const tryNext = () => {
   const src = sources.shift()
   if (!src) return noAudio()
   audio.src = src
-  $("#plays").textContent = src === D.share?.url && D.share.until ? `the audio plays from pc's file drop until ${D.share.until}` : ""
+  $("#plays").textContent = src === D.share?.url && D.share.until ? `the audio plays from a shared link until ${D.share.until}` : ""
 }
 audio.addEventListener("error", tryNext)
 if (hasAudio) { document.body.classList.add("hasaudio"); tryNext() } else noAudio()
