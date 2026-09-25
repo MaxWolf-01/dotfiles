@@ -1107,9 +1107,9 @@ wd = world(blocked={"de-fra-wg-001"}, vesktop=False)
 command(wd, "on")
 check("vpn on moves off automatic mode's blocked pick to the node after it",
       ("pinned", "de-fra-wg-202"), wd.setting())
-check("and records it as the pin vpn on made, saying why",
-      (("pinned", "on"), "Cloudflare blocks de-fra-wg-001; moving off it"),
-      ((last(wd)["event"], last(wd)["command"]), records(wd)[-1]["reason"]))
+check("and records it as the pin vpn on made, from where the request found the exit node, saying why",
+      (("pinned", "on", "de-fra-wg-202", "de-fra-wg-202"), "Cloudflare blocks de-fra-wg-001; moving off it"),
+      (moved(wd)[-1], records(wd)[-1]["reason"]))
 wd = world(blocked={"de-fra-wg-001", "de-fra-wg-202"}, vesktop=False)
 command(wd, "on")
 check("running the Discord check on each node it tries", ("pinned", "de-fra-wg-401"), wd.setting())
@@ -1213,10 +1213,63 @@ check("of requests that came together, the newest runs and the others are supers
 # The watcher moves off a node that reports itself offline, and a request comes while it tries the first.
 wd = world(offline={"de-fra-wg-202"}, inert={"de-fra-wg-401"}, vesktop=False)
 wd.when(fakes.AfterStep(1, "connect"), fakes.Ask("to", "Berlin"))
+at(wd, 40, fakes.Online("de-ber-wg-001", False))
 run_to(fakes.Watcher(wd), 60)
 check("a request during the watcher's own move stops it, and runs from where the move put the exit node back",
-      ([("cancelled", "watch", "de-fra-wg-202", None), ("pinned", "to", "de-fra-wg-202", "de-ber-wg-001")],
-       ("pinned", "de-ber-wg-001")), (moved(wd), wd.setting()))
+      [("cancelled", "watch", "de-fra-wg-202", None), ("pinned", "to", "de-fra-wg-202", "de-ber-wg-001")],
+      moved(wd)[:2])
+check("and starts no back-off: the node the request pinned going offline is moved off at once",
+      [("offline", "watch", "de-ber-wg-001", "de-dus-wg-101")], moved(wd)[2:])
+
+# The off click's report is still on its way when the Ctrl-C stops the move and it would put 202 back.
+wd = world(inert={"de-fra-wg-401"}, vesktop=False)
+wd.report_delay = 0.01
+wd.when(fakes.AfterStep(1, "connect"), fakes.Disconnect())
+wd.when(fakes.AfterStep(1, "connect"), fakes.Outside(""))
+error = command(wd, "next")
+check("an off click that comes with a Ctrl-C is never undone, whenever the bus reports it",
+      (None, ["de-fra-wg-401.mullvad.ts.net"], True,
+       [("cancelled", "next", "de-fra-wg-202", "de-fra-wg-401"), ("changed", "watch", "de-fra-wg-401", None)]),
+      (wd.exit, sets(wd), "changed outside vpn" in (error or ""), moved(wd)))
+
+wd = world(inert={"de-fra-wg-401"}, vesktop=False)
+wd.when(fakes.AfterStep(1, "connect"), fakes.Disconnect())
+wd.when(fakes.AfterStep(1, "connect"), fakes.Outside(""))
+error = command(wd, "next")
+check("of a Ctrl-C and an off click at once, the off click is what ended the request", True,
+      (error or "").startswith("superseded by a change of exit node outside vpn"))
+
+for kind in ("on", "off"):
+    wd = world(vesktop=False)
+    watching = run_to(fakes.Watcher(wd), 1)
+    wd.happen(fakes.Ask(kind))
+    wd.happen(fakes.Disconnect())
+    run_to(watching, wd.now - fakes.T0)
+    check(f"vpn {kind} whose command went away before the watcher took it up changes nothing",
+          ([], [], (False, "cancelled; nothing changed")), (sets(wd), events(wd), wd.callers[0].finishes[0]))
+
+wd = world(vesktop=False)
+wd.report_delay = 0.01
+wd.when(fakes.AfterStep(1, "set"), fakes.Ask("next"))
+command(wd, "off")
+check("vpn off's own change is not taken for one from outside, which would end the request queued behind it",
+      ((True, "exit node off"), True, ["off", "pinned"]),
+      (wd.callers[0].finishes[0], wd.callers[1].finishes[0][0], events(wd)))
+
+wd = world("de-fra-wg-001", auto_pick="de-fra-wg-001", vesktop=False)
+at(wd, 5, fakes.Outside("auto:any"))
+run_to(fakes.Watcher(wd), 20)
+check("automatic mode turned on from outside, on the node already pinned, changes no node and writes no line",
+      (("automatic", "de-fra-wg-001"), []), (wd.setting(), events(wd)))
+
+# A change from outside leaves the flag that stops a move set; the look's own check starts clean.
+wd = world(blocked={"de-fra-wg-401"})
+at(wd, 5, fakes.Outside("de-fra-wg-401.mullvad.ts.net"))
+run_to(fakes.Watcher(wd), 120)
+check("a node pinned from outside that Cloudflare blocks is checked, confirmed and moved off",
+      (("pinned", "de-fra-wg-001"), [("changed", "watch", "de-fra-wg-202", "de-fra-wg-401"),
+                                     ("rotated", "watch", "de-fra-wg-401", "de-fra-wg-001")], 2),
+      (wd.setting(), moved(wd), sum(node == "de-fra-wg-401" for _, node in discords(wd))))
 
 wd = world(blocked={"de-fra-wg-202"})
 at(wd, 10, fakes.Ask("to", "Berlin"))
@@ -1234,19 +1287,23 @@ class Stopped(Exception):
 
 
 class Paced:
-    """The watcher of a World on a thread of its own, taking requests over a real unix socket in a scratch
-    directory. The World's time passes at `scale` real seconds per second, so that a command started or
-    interrupted meanwhile finds a move under way."""
+    """bin/vpn's watcher (`run_watcher`) over a World, on a thread of its own, taking requests over a real unix
+    socket in a scratch directory. The World's time passes at `scale` real seconds per second, so that a
+    command started or interrupted meanwhile finds a move under way."""
 
     def __init__(self, wd, scale=0.05):
         self.wd, self.scale = wd, scale
         self.dir = Path(tempfile.mkdtemp(prefix="run-", dir=fakes.SCRATCH))
+        self.socket = self.dir / "vpn.sock"
         self.arrivals = queue.Queue()
-        self.server = vpn.listen(self.dir / "vpn.sock", self.arrivals.put)
         self.stopping = threading.Event()
+        self.failed = None
         self.ports = replace(wd.ports, clock=vpn.Clock(now=wd.ports.clock.now, wait=self.wait))
         self.thread = threading.Thread(target=self.watch, daemon=True)
         self.thread.start()
+        deadline = time.monotonic() + 10
+        while not self.socket.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
 
     def wait(self, secs):
         """The Clock port's wait: what the socket delivered, else the World's next arrival within `secs`."""
@@ -1266,13 +1323,14 @@ class Paced:
         raise Stopped
 
     def watch(self):
-        w, due = vpn.Watch(live=vpn.Liveness(self.ports.clock)), 0.0
         try:
             with fakes.driving(self.wd), contextlib.redirect_stdout(io.StringIO()):
-                while True:
-                    due = vpn.handle(w, self.wait(due), self.ports)
-        except Stopped:
-            pass
+                try:
+                    vpn.run_watcher(self.ports, self.arrivals.put, self.socket)
+                except Stopped:
+                    pass
+        except AssertionError as e:  # the watcher, or a command meanwhile, went around the ports
+            self.failed = e
 
     def command(self, *args):
         """bin/vpn, run as a command whose runtime directory is this watcher's. It runs under this suite's own
@@ -1282,9 +1340,11 @@ class Paced:
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def stop(self):
+        """Stop the watcher. Raises what `fakes.driving` found gone around the ports meanwhile."""
         self.stopping.set()
         self.thread.join(30)
-        self.server.close()
+        if self.failed:
+            raise self.failed
 
 
 def read_until(proc, prefix):
@@ -1365,8 +1425,9 @@ check("Ctrl-C at a command cancels its request, and the command prints where the
 
 
 def ask_pressing(presses, answer_after=0.5):
-    """`vpn.ask` in this process against a watcher that answers `answer_after` seconds after the command hung
-    up, with Ctrl-C pressed at each of `presses` seconds. How it ended, and whether the watcher saw it hang up."""
+    """`vpn.ask` in this process against a stand-in watcher that answers `answer_after` seconds after the command
+    hung up, with Ctrl-C pressed at each of `presses` seconds. How it ended, and whether the watcher saw it hang
+    up. The stand-in is what lets a case time its answer against the presses."""
     path = Path(tempfile.mkdtemp(prefix="run-", dir=fakes.SCRATCH)) / "vpn.sock"
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
@@ -1409,6 +1470,28 @@ check("a second Ctrl-C leaves at once", ("exit 130", True),
       ask_pressing([0.1, 0.1 + 2 * vpn.CTRL_C_ECHO_SECS], answer_after=5))
 check("and gives Ctrl-C back when it ends", held_before, signal.getsignal(signal.SIGINT))
 
+mute_path = Path(tempfile.mkdtemp(prefix="run-", dir=fakes.SCRATCH)) / "vpn.sock"
+mute = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+mute.bind(str(mute_path))
+mute.listen(1)
+
+
+def hang_up():
+    conn, _ = mute.accept()
+    with conn:
+        conn.makefile("rb").readline()
+
+
+threading.Thread(target=hang_up, daemon=True).start()
+try:
+    vpn.ask("next", path=mute_path)
+    how = "ok"
+except vpn.VpnError as e:
+    how = str(e)
+mute.close()
+check("a watcher that hangs up without a final line fails the command, saying where to look",
+      "vpn-watch hung up without an answer; `journalctl --user -u vpn-watch` says why", how)
+
 wd = world(inert={"de-fra-wg-401", "de-fra-wg-001"}, vesktop=False)
 paced = Paced(wd, scale=0.2)
 proc = paced.command("next")
@@ -1438,6 +1521,31 @@ check("a request the watcher does not understand gets a final line saying so", (
       (answer["ok"], answer["message"].startswith("not a request vpn understands")))
 check("and a second watcher refuses to take over a socket the first still answers on", True,
       (second_watcher or "").startswith("another vpn watch already takes requests"))
+check("the watcher stopping takes its socket with it", False, paced.socket.exists())
+
+left = Path(tempfile.mkdtemp(prefix="run-", dir=fakes.SCRATCH)) / "vpn.sock"
+stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+stale.bind(str(left))
+stale.close()
+server = vpn.listen(left, lambda arrival: None)
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+    reached = probe.connect_ex(str(left)) == 0
+server.close()
+check("a watcher starting where a dead one left its socket takes it over", True, reached)
+
+
+
+def parsed(raw):
+    try:
+        return vpn.parse_request(raw)
+    except ValueError:
+        return "refused"
+
+
+check("a request is `on`, `off` or `next` without a place, or `to` with one",
+      [("to", "Berlin"), ("next", ""), "refused", "refused", "refused"],
+      [parsed(raw) for raw in (b'{"request": "to", "place": "Berlin"}', b'{"request": "next"}', b'{"request": "to"}',
+                               b'{"request": "next", "place": "Berlin"}', b'{"request": "up"}')])
 
 check("no move and no look asks am.i.mullvad.net", 0, sum(w.egress_asks for w in WORLDS))
 

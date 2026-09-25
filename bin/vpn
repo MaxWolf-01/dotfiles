@@ -148,6 +148,8 @@ REQUEST_SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "vpn.sock"
 REQUEST_READ_SECS = 5
 """How long the watcher waits for a client that connected to send its request."""
 CTRL_C_ECHO_SECS = 0.5
+REPORT_WAIT_SECS = 1.0
+"""How long the watcher, about to set the exit node, waits for the bus to report a change prefs already show."""
 STATE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "vpn-state.json"
 """What the top-bar dot shows (desktop/vpn-dot). The vpn-watch unit deletes it when the watcher stops."""
 VESKTOP_LOCK = Path.home() / ".config/vesktop/SingletonLock"
@@ -1211,7 +1213,7 @@ def own(w: Watch, ports: Ports) -> Ports:
     tailscaled = ports.tailscaled
 
     def set_exit_node(target: str) -> None:
-        if interrupted(w, ports) == "outside":
+        if changed_outside(w, ports):
             raise VpnError("the exit node was changed outside vpn; leaving it as it is")
         want = wanted(w, target)
         tailscaled.set_exit_node(target)
@@ -1220,6 +1222,20 @@ def own(w: Watch, ports: Ports) -> Ports:
             w.mine.append(want)
 
     return replace(ports, tailscaled=replace(tailscaled, set_exit_node=set_exit_node))
+
+
+def changed_outside(w: Watch, ports: Ports) -> bool:
+    """Whether an outside change came since the move began. Before a `tailscale set`, the bus alone is not
+    enough: its report of an off click can still be on its way, and the set would undo the click. So prefs
+    that differ from what the watcher last set or was last told count too, and the watcher waits up to
+    REPORT_WAIT_SECS for their report, which `take` logs."""
+    drain(w, ports)
+    prefs = None if w.outside else ports.tailscaled.prefs()
+    expected = w.mine[-1] if w.mine else w.at
+    if prefs is not None and expected is not None and not reported(expected, setting(w, prefs)):
+        w.live.wait(REPORT_WAIT_SECS, until=lambda: drain(w, ports) and w.outside)
+        w.outside = True
+    return w.outside
 
 
 def interrupted(w: Watch, ports: Ports, client: Client | None = None) -> Stop | None:
@@ -2142,8 +2158,13 @@ def watch() -> None:
     off: no exit node set, or tailscale stopped. down: an exit node is set, and tailscale is not running, or the node is missing from its status, reports itself offline, or is silent. unknown: tailscaled does not answer. Nothing is published while a move runs.
     """
     arrivals: queue.Queue[Arrival] = queue.Queue()
-    ports = real_ports(WATCH_MASK, arrivals)
-    server = listen(REQUEST_SOCKET, arrivals.put)
+    run_watcher(real_ports(WATCH_MASK, arrivals), arrivals.put, REQUEST_SOCKET)
+
+
+def run_watcher(ports: Ports, hand: Callable[[Arrival], None], path: Path) -> None:
+    """The watcher: take requests on a socket at `path`, handing them to `hand` for `ports.clock.wait` to
+    deliver, and handle whatever arrives, until something raises. The socket goes with it."""
+    server = listen(path, hand)
     w = Watch(live=Liveness(ports.clock))
     due = 0.0
     try:
@@ -2151,7 +2172,7 @@ def watch() -> None:
             due = handle(w, ports.clock.wait(due), ports)
     finally:
         server.close()
-        REQUEST_SOCKET.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
