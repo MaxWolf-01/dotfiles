@@ -32,6 +32,7 @@ import socket
 import threading
 import heapq
 import importlib.util
+import io
 import itertools
 import json
 import os
@@ -39,7 +40,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
@@ -88,8 +89,7 @@ def load(name: str, path: Path):
 vpn = load("vpn", Path(__file__).resolve().parent.parent / "bin" / "vpn")
 
 T0 = float(int(time.time()))
-"""The World's first moment. Near the wall clock, because bin/run-log stamps node-log lines with it and the
-watcher's readback of the node log compares those stamps with the time its own clock gives."""
+"""The World's first moment: the wall clock when this module loads."""
 ENGINE_SECS = 2.0
 """How often tailscaled pushes an engine update."""
 RTT = 0.05
@@ -351,6 +351,8 @@ class World:
         """Bytes this machine's applications send through the exit node between two engine updates."""
         self.pick_delay = 0.0
         """How long automatic mode, once turned on, takes to pick a node, with no exit node in the status meanwhile."""
+        self.report_delay = 0.0
+        """How long the bus takes to report a change of prefs, which `tailscale set` has made by the time it returns."""
         self.status_reads = 0
         """Full status readings bin/vpn took through its port."""
         self.peerless_reads: list[float] = []
@@ -499,7 +501,11 @@ class World:
             self.handshake[self.exit] = self.now + self.handshake_secs(self.exit)
             self.tx[self.exit] = self.tx.get(self.exit, 0) + 148
             self.rx[self.exit] = self.rx.get(self.exit, 0) + 92
-        self.arrive(notify(Prefs=self.prefs()))
+        report = notify(Prefs=self.prefs())
+        if self.report_delay:
+            self.at(self.now + self.report_delay, lambda: self.arrive(report))
+        else:
+            self.arrive(report)
 
     def watcher_sets(self, target: str) -> None:
         if self.down:
@@ -685,7 +691,8 @@ class Line:
 
 
 def line(stats: dict) -> Line:
-    """Read a line in either vocabulary: `by`, `from` and `to`, or today's `command`, `node` and `rotated_to`."""
+    """Read a line in either vocabulary: `by`, `from` and `to`, or today's `command`, `node` and `rotated_to`. A
+    move that stayed names in `rotated_to` where the exit node landed, when that is not where it started."""
     event = stats.get("event", "")
     if "by" in stats:
         frm, to = stats.get("from"), stats.get("to")
@@ -697,6 +704,8 @@ def line(stats: dict) -> Line:
         return Line(event, True, False, node, to)
     if event == "off":
         return Line(event, True, False, node, None)
+    if event in ("exhausted", "unreachable", "cancelled") and to:
+        return Line(event, True, False, node, to)
     return Line(event, False, False, node, to)
 
 
@@ -788,8 +797,9 @@ def run(world: World, script: list[tuple[AfterStep | At, Happening]]) -> World:
 
 def watching(world: World, step: Callable[[Any, Any, Any], float], w: Any, due: float) -> float:
     """The watcher's loop. It waits for what arrives and hands it to `step`, until the World's end finds the
-    watcher idle, and returns the seconds the last step asked to wait."""
-    with driving(world):
+    watcher idle, and returns the seconds the last step asked to wait. What the watcher prints to its journal is
+    dropped."""
+    with driving(world), redirect_stdout(io.StringIO()):
         try:
             while True:
                 world.idle = True
@@ -805,8 +815,8 @@ def watching(world: World, step: Callable[[Any, Any, Any], float], w: Any, due: 
 
 @dataclass
 class Watcher:
-    """The watcher as `vpn.observe` runs it, on bus messages and ticks only, in a World. `until` runs it to a
-    moment of the World's time and leaves it idle there, so a test can look, change the World and run it on."""
+    """The watcher in a World. `until` runs it to a moment of the World's time and leaves it idle there, so a test
+    can look, change the World and run it on."""
 
     world: World
     w: Any = field(init=False)
@@ -818,5 +828,5 @@ class Watcher:
     def until(self, secs: float) -> "Watcher":
         """Run the watcher until `secs` after the World's first moment, stopping only while idle."""
         self.world.end = T0 + secs
-        self.due = watching(self.world, vpn.observe, self.w, self.due)
+        self.due = watching(self.world, vpn.handle, self.w, self.due)
         return self
