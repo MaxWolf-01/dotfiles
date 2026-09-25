@@ -14,7 +14,10 @@ set`, a connect, a Discord check), for every change from outside, and for
 each request's sending, disconnection and final line.
 
 The World's port wiring and the drivers at the bottom are the only code here
-that calls into bin/vpn. A test states what happens, and they call.
+that calls into bin/vpn. A test states what happens, and they call. The ports
+also count what bin/vpn reads through them, and can play tailscaled not
+answering, tailscale stopped, automatic mode slow to pick, and engine updates
+out of phase with the first moment.
 
 Loading this module points bin/vpn at a scratch directory for its runtime
 files and its run log, at a tailscaled socket that hangs up, and at a
@@ -34,6 +37,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -83,14 +87,18 @@ def load(name: str, path: Path):
 
 vpn = load("vpn", Path(__file__).resolve().parent.parent / "bin" / "vpn")
 
-T0 = 1_800_000_000.0
+T0 = float(int(time.time()))
+"""The World's first moment. Near the wall clock, because bin/run-log stamps node-log lines with it and the
+watcher's readback of the node log compares those stamps with the time its own clock gives."""
 ENGINE_SECS = 2.0
 """How often tailscaled pushes an engine update."""
 RTT = 0.05
 """One round trip to any node that answers."""
+CONNECT_SECS = 3 * RTT
+"""How long a TCP connect that succeeds takes."""
 DEMAND = 1500
-"""Bytes this machine's applications send through the exit node between two engine updates. A node that
-carries traffic answers with twice that."""
+"""Bytes this machine's applications send through the exit node between two engine updates, unless a World
+says otherwise. A node that carries traffic answers with twice that."""
 AFTER_SECS = 120.0
 """How long a run goes on after its last timed event."""
 HANG_SECS = 1800.0
@@ -263,6 +271,12 @@ def stable_id(name: str) -> str:
     return "n" + hashlib.sha256(b"id" + name.encode()).hexdigest()[:12].upper() + "CNTRL"
 
 
+def notify(**fields) -> dict:
+    """A bus message as tailscaled sends it, with every field there and null where the message has nothing to say."""
+    return {"Version": "1.102.4", "ErrMessage": None, "LoginFinished": None, "State": None, "Prefs": None,
+            "NetMap": None, "Engine": None, "BrowseToURL": None, "PeerChangedPatch": None} | fields
+
+
 def iso(t: float | None) -> str:
     if t is None:
         return "0001-01-01T00:00:00Z"
@@ -298,7 +312,8 @@ class Caller:
 
 class World:
     def __init__(self, hosts: list[Host], setting: Setting = ("off", None), *, auto_pick: str | None = None,
-                 vesktop: bool = False):
+                 vesktop: bool = False, phase: float = 0.0):
+        """`phase`: how long after the first moment tailscaled pushes its first engine update."""
         self.hosts = {h.name: h for h in hosts}
         self.mode, self.exit = setting
         self.auto_pick = auto_pick or (setting[1] if setting[0] == "automatic" else None) or hosts[0].name
@@ -320,13 +335,28 @@ class World:
         self.end = float("inf")
         self.idle = False
         """Whether the watcher is waiting at its top level, between two things it handles."""
+        self.down = False
+        """tailscaled does not answer."""
+        self.running = True
+        """tailscale is up, as prefs' WantRunning says."""
+        self.demand = DEMAND
+        """Bytes this machine's applications send through the exit node between two engine updates."""
+        self.pick_delay = 0.0
+        """How long automatic mode, once turned on, takes to pick a node, with no exit node in the status meanwhile."""
+        self.status_reads = 0
+        """Full status readings bin/vpn took through its port."""
+        self.peerless_reads: list[float] = []
+        """When bin/vpn read the status without peers, in seconds after the first moment. The watcher reads it once
+        per look, and a move asking which node automatic mode picked reads it too."""
+        self.egress_asks = 0
+        """How often bin/vpn asked am.i.mullvad.net."""
         self._runs: Path | None = None
-        self.at(self.now, self.engine_update)
+        self.at(self.now + phase, self.engine_update)
         if self.exit is not None and self.answers(self.exit):
             self.handshake[self.exit] = self.now - 30
         self.ports = vpn.Ports(
-            tailscaled=vpn.Tailscaled(status=self.status, prefs=self.prefs, set_exit_node=self.watcher_sets,
-                                      bus=lambda mask: iter(())),
+            tailscaled=vpn.Tailscaled(status=self.read_status, peerless=self.peerless, prefs=self.read_prefs,
+                                      set_exit_node=self.watcher_sets, bus=self.bus),
             network=vpn.Network(probe=self.probe, connect=self.connect, discord=self.discord, egress=self.egress),
             clock=vpn.Clock(now=lambda: self.now, wait=self.wait),
             vesktop=lambda: self.vesktop,
@@ -353,9 +383,10 @@ class World:
     def peers(self) -> dict[str, dict]:
         peers = {}
         for i, h in enumerate(self.hosts.values()):
+            ips = [f"100.64.{i // 250}.{i % 250 + 1}", f"fd7a:115c:a1e0::{i + 1:x}"]
             peers[key(h.name)] = {
                 "ID": stable_id(h.name), "PublicKey": key(h.name), "HostName": h.name,
-                "DNSName": f"{h.fqdn}.", "TailscaleIPs": [f"100.64.{i // 250}.{i % 250 + 1}", f"fd7a:115c:a1e0::{i + 1:x}"],
+                "DNSName": f"{h.fqdn}.", "TailscaleIPs": ips if i % 2 else ips[::-1],
                 "Online": h.online, "ExitNode": h.name == self.exit, "ExitNodeOption": True,
                 "Location": {"Country": h.country, "CountryCode": h.name[:2].upper(), "City": h.city,
                              "CityCode": h.name.split("-")[1]},
@@ -382,8 +413,24 @@ class World:
                                "TailscaleIPs": exit_peer["TailscaleIPs"]} if exit_peer else None,
         }
 
+    def read_status(self) -> dict | None:
+        """The Tailscaled port's full status reading, counted."""
+        self.status_reads += 1
+        return None if self.down else self.status()
+
+    def bus(self, mask: int):
+        """The Tailscaled port's event bus, which carries nothing. The World hands its messages to `wait` instead."""
+        yield from ()
+
+    def peerless(self) -> dict | None:
+        self.peerless_reads.append(round(self.now - T0, 2))
+        return None if self.down else self.status() | {"Peer": None}
+
+    def read_prefs(self) -> dict | None:
+        return None if self.down else self.prefs()
+
     def prefs(self) -> dict:
-        prefs = {"WantRunning": True, "ExitNodeID": stable_id(self.exit) if self.exit else "", "ExitNodeIP": "",
+        prefs = {"WantRunning": self.running, "ExitNodeID": stable_id(self.exit) if self.exit else "", "ExitNodeIP": "",
                  "ExitNodeAllowLANAccess": self.exit is not None}
         if self.mode == "automatic":
             prefs["AutoExitNode"] = "any"
@@ -416,14 +463,29 @@ class World:
         return entry
 
     def change(self, new: Setting) -> None:
-        """Set the exit node as tailscaled does, and tell the bus."""
-        old = self.exit
+        """Set the exit node as tailscaled does, and tell the bus. A new exit node that answers completes a
+        handshake, whose initiation and response its counters count, unless the switch to it never takes effect
+        (it leaks). Automatic mode picks its node `pick_delay` after it is turned on."""
+        old, was = self.exit, self.mode
+        if new[0] == "automatic" and was != "automatic" and self.pick_delay and new[1] is not None:
+            pick, new = new[1], ("automatic", None)
+
+            def picks() -> None:
+                if self.mode == "automatic" and self.exit is None:
+                    self.change(("automatic", pick))
+
+            self.at(self.now + self.pick_delay, picks)
         self.mode, self.exit = new
-        if self.exit is not None and self.exit != old and self.answers(self.exit):
+        host = self.hosts.get(self.exit or "")
+        if self.exit is not None and self.exit != old and self.answers(self.exit) and not (host and host.leaks):
             self.handshake[self.exit] = self.now + RTT
-        self.arrive({"Prefs": self.prefs()})
+            self.tx[self.exit] = self.tx.get(self.exit, 0) + 148
+            self.rx[self.exit] = self.rx.get(self.exit, 0) + 92
+        self.arrive(notify(Prefs=self.prefs()))
 
     def watcher_sets(self, target: str) -> None:
+        if self.down:
+            raise vpn.VpnError(f"tailscale set {target or '(none)'} failed: tailscaled does not answer")
         new = self.resolve(target)
         before = self.setting()
         self.change(new)
@@ -455,7 +517,7 @@ class World:
                 self.hosts[name] = replace(self.hosts[name], answers=True, carries=True)
             case Online(name, online):
                 self.hosts[name] = replace(self.hosts[name], online=online)
-                self.arrive({"PeerChanges": [{"NodeID": int(stable_id(name)[1:7], 16), "Online": online}]})
+                self.arrive(notify(PeerChangedPatch=[{"NodeID": int(stable_id(name)[1:7], 16), "Online": online}]))
             case Disconnect():
                 running = next((c for c in self.callers if not c.finishes and c.here), None)
                 if running is not None:
@@ -467,7 +529,7 @@ class World:
                 self.quiet_until = self.now + secs
             case BusGap(secs):
                 self.bus_down_until = self.now + secs
-                self.at(self.bus_down_until, lambda: self.arrive({"Prefs": self.prefs()}))
+                self.at(self.bus_down_until, lambda: self.arrive(notify(Prefs=self.prefs())))
 
     def when(self, trigger: AfterStep | At, happening: Happening) -> None:
         match trigger:
@@ -487,7 +549,8 @@ class World:
     # --- the network
 
     def probe(self, ip: str) -> None:
-        name = next((p["HostName"] for p in self.peers().values() if ip in p["TailscaleIPs"]), None)
+        """The Network port's probe, which takes a tailnet IPv4 address; an IPv6 one reaches nothing."""
+        name = next((p["HostName"] for p in self.peers().values() if "." in ip and ip in p["TailscaleIPs"]), None)
         if name is not None:
             self.tx[name] = self.tx.get(name, 0) + 180
             if self.answers(name):
@@ -499,12 +562,13 @@ class World:
         began, before = (self.now, len(self.entries)), self.setting()
         through = self.exit
         carries = self.carries(through)
-        ok = carries or (through in self.hosts and self.hosts[through].leaks)
-        if through is not None:
+        leaks = through in self.hosts and self.hosts[through].leaks
+        ok = carries or leaks
+        if through is not None and not leaks:
             self.tx[through] = self.tx.get(through, 0) + 120
             if carries:
                 self.rx[through] = self.rx.get(through, 0) + 120
-        self.advance(self.now + (3 * RTT if ok else timeout))
+        self.advance(self.now + (CONNECT_SECS if ok else timeout))
         self.step("connect", before, began=began, what=ok)
         return ok
 
@@ -522,6 +586,7 @@ class World:
         return verdict
 
     def egress(self) -> dict:
+        self.egress_asks += 1
         if not self.carries(self.exit):
             return {}
         return {"ip": "185.0.0.1", "country": "", "city": "",
@@ -537,18 +602,18 @@ class World:
             self.ready.append(arrival)
 
     def engine_update(self) -> None:
-        if self.exit is not None:
-            self.tx[self.exit] = self.tx.get(self.exit, 0) + DEMAND
+        if self.exit is not None and self.demand:
+            self.tx[self.exit] = self.tx.get(self.exit, 0) + self.demand
             if self.carries(self.exit):
-                self.rx[self.exit] = self.rx.get(self.exit, 0) + 2 * DEMAND
+                self.rx[self.exit] = self.rx.get(self.exit, 0) + 2 * self.demand
         self.at(self.now + ENGINE_SECS, self.engine_update)
         if self.now < self.quiet_until:
             return
         live = {key(n): {"NodeKey": key(n), "TxBytes": self.tx.get(n, 0), "RxBytes": self.rx.get(n, 0),
                          "LastHandshake": iso(t)}
                 for n, t in self.handshake.items() if t <= self.now}
-        self.arrive({"Engine": {"RBytes": sum(self.rx.values()), "WBytes": sum(self.tx.values()),
-                                "NumLive": len(live), "LiveDERPs": 1, "LivePeers": live}})
+        self.arrive(notify(Engine={"RBytes": sum(self.rx.values()), "WBytes": sum(self.tx.values()),
+                                   "NumLive": len(live), "LiveDERPs": 1, "LivePeers": live}))
 
     def advance(self, until: float) -> None:
         while self.schedule and self.schedule[0][0] <= until:
@@ -694,18 +759,44 @@ def run(world: World, script: list[tuple[AfterStep | At, Happening]]) -> World:
     for trigger, happening in script:
         world.when(trigger, happening)
     world.end = T0 + world.last_at + AFTER_SECS
-    world.arrive({"Prefs": world.prefs()})
-    w = vpn.Watch()
-    due = 0.0
+    world.arrive(notify(Prefs=world.prefs()))
+    watching(world, vpn.handle, vpn.Watch(live=vpn.Liveness(world.ports.clock)), 0.0)
+    unfinished = {c.id: len(c.finishes) for c in world.callers if len(c.finishes) != 1}
+    assert not unfinished, f"requests that did not finish exactly once, with their final lines counted: {unfinished}"
+    return world
+
+
+def watching(world: World, step: Callable[[Any, Any, Any], float], w: Any, due: float) -> float:
+    """The watcher's loop. It waits for what arrives and hands it to `step`, until the World's end finds the
+    watcher idle, and returns the seconds the last step asked to wait."""
     with driving(world):
         try:
             while True:
                 world.idle = True
                 arrival = world.wait(due)
                 world.idle = False
-                due = vpn.handle(w, arrival, world.ports)
+                due = step(w, arrival, world.ports)
         except Over:
             pass
-    unfinished = {c.id: len(c.finishes) for c in world.callers if len(c.finishes) != 1}
-    assert not unfinished, f"requests that did not finish exactly once, with their final lines counted: {unfinished}"
-    return world
+        finally:
+            world.idle = False
+    return due
+
+
+@dataclass
+class Watcher:
+    """The watcher as `vpn.observe` runs it, on bus messages and ticks only, in a World. `until` runs it to a
+    moment of the World's time and leaves it idle there, so a test can look, change the World and run it on."""
+
+    world: World
+    w: Any = field(init=False)
+    due: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.w = vpn.Watch(live=vpn.Liveness(self.world.ports.clock))
+
+    def until(self, secs: float) -> "Watcher":
+        """Run the watcher until `secs` after the World's first moment, stopping only while idle."""
+        self.world.end = T0 + secs
+        self.due = watching(self.world, vpn.observe, self.w, self.due)
+        return self

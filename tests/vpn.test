@@ -7,40 +7,34 @@
 
 The cases fix what the tool decides from what tailscaled, the internet and
 Vesktop tell it: what a status reading names, where a move goes, what a Discord
-answer means, what the watcher does on each look, and which exit-node changes
-end up in the node log.
+answer means, what tailscaled's engine updates say about a node, what the
+watcher does on each look, and which exit-node changes end up in the node log.
 
-Only the boundaries are faked: tailscaled's readings, `tailscale set`, egress,
-the Discord check, Vesktop and sleeping. The node lock, the run log and the
-state file are the real ones, in a scratch directory. The fake network is a
-handful of Mullvad peers in tailscaled's shape, kept down to the fields bin/vpn
-reads.
+Everything bin/vpn does not own reaches it through its ports. The pure functions
+are called directly; the watcher, the moves and the commands run in the fake
+World of tests/vpn_fakes.py, over a handful of Mullvad peers in tailscaled's
+shape. The node lock, the run log and the state file are the real ones, in the
+fakes' scratch directory.
 """
 
 import contextlib
 import fcntl
-import importlib.util
 import io
 import json
 import os
 import sys
 import tempfile
-import time
+from dataclasses import replace
 from datetime import datetime
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-def load(name: str, path: Path):
-    loader = SourceFileLoader(name, str(path))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+import vpn_fakes as fakes  # noqa: E402  (loads bin/vpn with its runtime files in a scratch directory)
 
-
-vpn = load("vpn", Path(__file__).resolve().parent.parent / "bin" / "vpn")
+vpn = fakes.vpn
+OUT = sys.stdout
+"""Where the checks report; what bin/vpn prints while a case runs is swallowed."""
 
 failures = 0
 
@@ -48,11 +42,11 @@ failures = 0
 def check(what, expected, actual):
     global failures
     if expected == actual:
-        print(f"ok   {what}")
+        print(f"ok   {what}", file=OUT)
     else:
-        print(f"FAIL {what}")
-        print(f"       expected: {expected}")
-        print(f"       actual:   {actual}")
+        print(f"FAIL {what}", file=OUT)
+        print(f"       expected: {expected}", file=OUT)
+        print(f"       actual:   {actual}", file=OUT)
         failures += 1
 
 
@@ -216,16 +210,16 @@ with tempfile.TemporaryDirectory() as gate:
 guarding = status("de-fra-wg-202")
 check("guarding a live node is ok and names it",
       ("ok", "", {"state": "guarding", "exit_node": "de-fra-wg-202", "vesktop": True, "bus": True}),
-      vpn.heartbeat(guarding, guarding, True, True))
-check("without the full reading it still guards, unnamed", ("ok", "guarding", None),
-      (lambda o, _, s: (o, s["state"], s["exit_node"]))(*vpn.heartbeat(guarding, None, True, True)))
-check("the VPN off is ok", "no-exit-node", vpn.heartbeat(status(), status(), False, True)[2]["state"])
+      vpn.heartbeat(guarding, "de-fra-wg-202", 2, True, True))
+check("the VPN off is ok", "no-exit-node", vpn.heartbeat(status(), None, 2, False, True)[2]["state"])
+check("and stays ok with no engine update for hours", "ok", vpn.heartbeat(status(), None, 7200, False, False)[0])
 check("tailscaled down is ok", ("ok", "tailscale-down"),
-      (lambda o, _, s: (o, s["state"]))(*vpn.heartbeat(None, None, False, False)))
-# The regression this exists for: the peerless reading saw no exit node, but the
-# peer list says one is in use.
-check("a watcher blind to a live exit node fails",
-      "fail", vpn.heartbeat({"ExitNodeStatus": None}, guarding, True, True)[0])
+      (lambda o, _, s: (o, s["state"]))(*vpn.heartbeat(None, None, 7200, False, False)))
+# The failure only this line can show: an exit node set and no engine update,
+# so the watcher sees none of its traffic and can call nothing silent.
+check("an exit node set with no engine update for 60 s fails, as blind",
+      ("ok", "fail"), (vpn.heartbeat(guarding, "de-fra-wg-202", 60, True, True)[0],
+                       vpn.heartbeat(guarding, "de-fra-wg-202", 61, True, False)[0]))
 
 # --- what the dot shows: what prefs ask for against what status delivers
 
@@ -250,48 +244,109 @@ check("tailscaled not answering is unknown, not off",
       [("unknown", "tailscaled does not answer")] * 2, [vpn.vpn_state(None, None, False),
                                                         vpn.vpn_state(ON, None, False)])
 
-# --- silence: a live WireGuard peer answers any data within 10 s, with an empty
-# keepalive if it has nothing else to send, and nothing answers a keepalive
+# --- silence, on engine updates 2 s apart: a live WireGuard peer answers any
+# data within 10 s, with an empty keepalive if it has nothing else to send, and
+# nothing answers a keepalive
+
+EXIT = {
+    "Peer": {
+        "id-a": {"ID": "id-a", "PublicKey": "nodekey:a", "HostName": "a", "ExitNode": True},
+        "id-b": {"ID": "id-b", "PublicKey": "nodekey:b", "HostName": "b", "ExitNode": False},
+    },
+    "ExitNodeStatus": {"ID": "id-a", "Online": True},
+}
+
+
+def engine(peers):
+    """An engine update with these (key, received, sent)."""
+    return fakes.notify(Engine={"LivePeers": {k: {"NodeKey": k, "RxBytes": rx, "TxBytes": tx,
+                                                  "LastHandshake": "2026-09-24T12:00:00+02:00"}
+                                              for k, rx, tx in peers}})
 
 
 def silent_after(readings, times=None):
-    """Feed one reading of the exit node's counters per look, 10 s apart unless
-    `times` says otherwise, each (received, sent) from node a, or a whole
-    (node, received, sent), or None for no exit peer; whether the watcher holds
-    the node silent after each."""
-    w, seen = vpn.Watch(), []
+    """Feed one engine update per reading, 2 s apart unless `times` says otherwise:
+    (received, sent) from the exit node a, ("b", received, sent) with b as the
+    exit node from then on, or None for an update the exit node is missing
+    from. Whether the exit node counts as silent after each."""
+    now = [1_000_000.0]
+    live = vpn.Liveness(vpn.Clock(now=lambda: now[0], wait=lambda secs: None))
+    live.learn(EXIT)
+    seen = []
     for i, reading in enumerate(readings):
-        now = 1_000_000.0 + (times[i] if times else 10 * i)
-        vpn.listen(w, vpn.Counters("id-a", *reading) if reading and len(reading) == 2
-                   else reading and vpn.Counters(*reading), now)
-        seen.append(vpn.silent(w, now))
+        now[0] = 1_000_000.0 + (times[i] if times else 2 * i)
+        if reading and reading[0] == "b":
+            b = json.loads(json.dumps(EXIT))
+            b["Peer"]["id-a"]["ExitNode"], b["Peer"]["id-b"]["ExitNode"] = False, True
+            b["ExitNodeStatus"]["ID"] = "id-b"
+            live.learn(b)
+            live.feed(engine([("nodekey:b", *reading[1:])]))
+        else:
+            live.feed(engine([("nodekey:a", *reading)] if reading else []))
+        seen.append(live.silent())
     return seen
 
 
-check("traffic in with nothing back turns silent 20 s after the look that first saw it",
-      [False, False, False, True], silent_after([(100, 1000), (100, 1500), (100, 1600), (100, 1700)]))
-check("anything coming back ends it", [False, False, False, True, False],
-      silent_after([(100, 1000), (100, 1500), (100, 1600), (100, 1700), (132, 1800)]))
-check("a reply within the 10 s WireGuard allows is never silence", [False] * 4,
-      silent_after([(100, 1000), (100, 1500), (700, 1600), (800, 1700)]))
-check("keepalives alone, one or two a look, are never silence", [False] * 4,
-      silent_after([(100, 1000), (100, 1032), (100, 1096), (100, 1128)]))
-check("but three in one look is traffic", [False, False, False, True],
-      silent_after([(100, 1000), (100, 1096), (100, 1096), (100, 1096)]))
-check("an idle tunnel is not silent", [False] * 4, silent_after([(100, 1000)] * 4))
-check("a new exit node starts over", [False] * 4,
-      silent_after([(100, 1000), (100, 1500), ("id-b", 0, 900), ("id-b", 0, 900)]))
+rising = [(100, 1000 + 100 * i) for i in range(12)]
+check("traffic in with nothing back turns silent 20 s after the update that first saw it",
+      [False] * 11 + [True], silent_after(rising))
+check("anything coming back ends it", [False] * 11 + [True, False], silent_after(rising + [(132, 2300)]))
+check("a reply within the 10 s WireGuard allows is never silence", [False] * 21,
+      silent_after([(100 + 700 * (i // 5), 1000 + 100 * i) for i in range(21)]))
+check("keepalives alone, two an update at most, are never silence", [False] * 16,
+      silent_after([(100, 1000 + 64 * i) for i in range(16)]))
+check("but three in one update is traffic", [False] * 11 + [True],
+      silent_after([(100, 1000)] + [(100, 1096)] * 11))
+check("an idle tunnel is not silent", [False] * 16, silent_after([(100, 1000)] * 16))
+check("a new exit node starts over", [False] * 13,
+      silent_after(rising[:10] + [("b", 0, 900), ("b", 0, 1000), ("b", 0, 1100)]))
 # tailscaled drops a peer that went idle and adds it back with fresh counters.
 check("counters starting again from zero, still with nothing back, keep the silence",
-      [False, False, False, True], silent_after([(500, 5000), (500, 6000), (0, 300), (0, 600)]))
-check("and with something back, end it", [False] * 4, silent_after([(500, 5000), (500, 6000), (40, 300), (40, 600)]))
-check("no exit peer in the reading starts over", [False] * 4,
-      silent_after([(100, 1000), (100, 1500), (100, 1600), None]))
+      [False] * 11 + [True], silent_after([(500, 5000), (500, 6000)] + [(0, 300 * i) for i in range(1, 11)]))
+check("and with something back, end it", [False] * 12,
+      silent_after([(500, 5000), (500, 6000)] + [(40, 300 * i) for i in range(1, 11)]))
+check("an exit node missing from an update sent and received nothing, so the count goes on",
+      [False] * 11 + [True], silent_after([(100, 1000), (100, 1500)] + [None] * 10))
+check("one missing from the start is never silent", [False] * 12, silent_after([None] * 12))
 HOURS_8 = 8 * 3600
 check("a suspend is not time unanswered: the count starts over after it",
-      [False, False, False, False, False, True],
-      silent_after([(100, 1000), (100, 1500), (100, 1600), (100, 1700), (100, 1800), (100, 1900)],
-                   times=[0, 10, HOURS_8, HOURS_8 + 10, HOURS_8 + 20, HOURS_8 + 30]))
+      [False] * 4 + [False] * 11 + [True],
+      silent_after([(100, 1000 + 100 * i) for i in range(4)] + [(100, 2000 + 100 * i) for i in range(12)],
+                   times=[0, 2, 4, 6] + [HOURS_8 + 2 * i for i in range(12)]))
+
+now = [1_000_000.0]
+live = vpn.Liveness(vpn.Clock(now=lambda: now[0], wait=lambda secs: None))
+live.learn(EXIT)
+verdicts = []
+for i, t in enumerate([*range(0, 24, 2), 33, 34]):
+    now[0] = 1_000_000.0 + t
+    if t != 33:
+        live.feed(engine([("nodekey:a", 100, 1000 + 100 * i)]))
+    verdicts.append(live.silent())
+check("with no engine update for 10 s there is no verdict, and the count goes on once they come back",
+      [False] * 11 + [True, False, True], verdicts)
+
+
+def grew_since(samples, since, counter="received"):
+    """Feed engine updates of node a's (at, received, sent), then whether its bytes received (or sent) grew
+    after `since`."""
+    now = [0.0]
+    live = vpn.Liveness(vpn.Clock(now=lambda: now[0], wait=lambda secs: None))
+    live.learn(EXIT)
+    for at, received, sent in samples:
+        now[0] = at
+        live.feed(engine([("nodekey:a", received, sent)]))
+    node = vpn.Node("id-a", "a", "", "", True)
+    return (live.received_since if counter == "received" else live.sent_since)(node, since)
+
+
+check("bytes received count from the last update at or before the moment, not from the start",
+      (False, True), (grew_since([(0, 0, 0), (2, 500, 0), (4, 500, 0)], 3),
+                      grew_since([(0, 0, 0), (2, 500, 0), (4, 500, 0), (6, 600, 0)], 3)))
+check("with no update before the moment, growth counts from the first one after it, never from nothing",
+      (False, True), (grew_since([(4, 500, 0)], 3), grew_since([(4, 500, 0), (6, 501, 0)], 3)))
+check("and bytes sent are measured the same way", (False, True),
+      (grew_since([(0, 0, 100), (4, 50, 100)], 3, "sent"), grew_since([(0, 0, 100), (4, 50, 148)], 3, "sent")))
 
 # --- which exit-node changes a vpn line accounts for
 
@@ -326,509 +381,575 @@ check("no line accounts for nothing", False, accounts(None, "b"))
 check("nor does one with an unreadable time", False, accounts({"ts": "yesterday", "stats": {}}, "b"))
 
 
-# --- the watcher and the commands, against a fake network
+# --- the bus reader: it hands every message over, opens a closed stream again
+# every 5 s, and closes one that carries no engine update for 10 s
+
+E = fakes.notify(Engine={"LivePeers": {}})
+P = fakes.notify(Prefs={"ExitNodeID": ""})
 
 
-class Net:
-    """tailscaled, egress, Discord, Vesktop and sleeping, as bin/vpn reaches them."""
-
-    def __init__(self, exit_name="de-fra-wg-202", *, online=True, automatic=False, blocked=(), dead=(),
-                 network=True, discord=True, vesktop=True, auto_pick="de-fra-wg-001"):
-        self.exit, self.online, self.automatic = exit_name, online, automatic
-        self.blocked, self.dead = set(blocked), set(dead)
-        self.network, self.discord, self.vesktop = network, discord, vesktop
-        self.auto_pick = auto_pick
-        self.down = False
-        self.checks = []
-        self.sets = []
-        self.on_sleep = None
-        self.rx = self.tx = 0  # bytes received from and sent to the exit node, as WireGuard counts them
-        self.running = True  # tailscale up, as prefs' WantRunning says
-
-    def full(self):
-        if self.down:
-            return None
-        reading = status(self.exit, self.online)
-        if self.exit is not None:
-            reading["Peer"][f"id-{self.exit}"] |= {"RxBytes": self.rx, "TxBytes": self.tx}
-        return reading
-
-    def traffic(self, sent, received):
-        self.tx += sent
-        self.rx += received
-
-    def peerless(self):
-        reading = self.full()
-        if reading is not None:
-            reading["Peer"] = None
-        return reading
-
-    def prefs(self, _path):
-        if self.down:
-            return None
-        if self.exit is None:
-            return {"WantRunning": self.running, "ExitNodeID": ""}
-        return ({"WantRunning": self.running, "ExitNodeID": f"id-{self.exit}"}
-                | ({"AutoExitNode": "any"} if self.automatic else {}))
-
-    def set_exit_node(self, target):
-        """`tailscale set`, whether vpn or something else runs it."""
-        self.sets.append(target)
-        self.online = True
-        if target == "":
-            self.exit, self.automatic = None, False
-        elif target == "auto:any":
-            self.exit, self.automatic = self.auto_pick, True
-        else:
-            self.exit, self.automatic = target.split(".")[0], False
-
-    def carries(self):
-        return self.network and self.exit is not None and self.exit not in self.dead
-
-    def settle(self, want):
-        return self.carries() and want in (None, self.exit)
-
-    def egress_node(self):
-        return self.exit if self.carries() else ""
-
-    def check(self):
-        self.checks.append(self.exit)
-        if not self.carries() or not self.discord:
-            return "unreachable"
-        return "blocked" if self.exit in self.blocked else "clean"
-
-    def sleep(self, _secs):
-        if self.on_sleep:
-            hook, self.on_sleep = self.on_sleep, None
-            hook()
+class Done(Exception):
+    pass
 
 
-class Logs:
-    def __init__(self, runs: Path):
-        self.runs = runs
+def follow(streams):
+    """follow_bus over one stream per opening, each (messages, end): the
+    messages as (seconds after the one before, message), and how the stream
+    ends, None for closing or an exception it raises. Returns the messages
+    handed over, the sleeps, the openings closed again, and what it printed."""
+    t = [0.0]
+    handed, sleeps, closed = [], [], []
 
-    def lines(self, unit):
-        path = self.runs / f"{unit}.jsonl"
-        return [json.loads(text) for text in path.read_text().splitlines()] if path.exists() else []
+    def bus(mask):
+        i = len(sleeps)
+        if i >= len(streams):
+            raise Done
+        items, end = streams[i]
+        try:
+            for secs, message in items:
+                t[0] += secs
+                yield message
+            if end is not None:
+                raise end
+        finally:
+            closed.append(i)
 
-    def events(self):
-        return [record["stats"]["event"] for record in self.lines(vpn.NODE_UNIT)]
-
-    def last(self):
-        return self.lines(vpn.NODE_UNIT)[-1]["stats"]
-
-    def shown(self):
-        """What the dot would show: the state file, or None where there is none."""
-        return json.loads(vpn.STATE_FILE.read_text()) if vpn.STATE_FILE.exists() else None
-
-
-@contextlib.contextmanager
-def wired(net: Net):
-    """bin/vpn with its boundaries pointed at `net`, its lock, run log and state file in a scratch directory."""
-    scratch = Path(tempfile.mkdtemp())
-    fakes = {
-        "peerless_status": net.peerless, "full_status": net.full, "local_api": net.prefs,
-        "tailscale_set": net.set_exit_node, "settle": net.settle, "egress_node": net.egress_node,
-        "check": net.check, "vesktop_running": lambda: net.vesktop, "LOCKFILE": scratch / "vpn.lock",
-        "STATE_FILE": scratch / "vpn-state.json", "set_by_us": "",
-    }
-    original = {name: getattr(vpn, name) for name in fakes}
-    real_sleep = vpn.time.sleep
-    for name, fake in fakes.items():
-        setattr(vpn, name, fake)
-    vpn.time.sleep = net.sleep
-    os.environ["RUN_LOG_DIR"] = str(scratch / "runs")
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            yield Logs(scratch / "runs")
-    finally:
-        for name, fn in original.items():
-            setattr(vpn, name, fn)
-        vpn.time.sleep = real_sleep
-        del os.environ["RUN_LOG_DIR"]
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        try:
+            vpn.follow_bus(bus, vpn.WATCH_MASK, handed.append, sleeps.append, lambda: t[0])
+        except Done:
+            pass
+    return handed, sleeps, closed, printed.getvalue().splitlines()
 
 
-def attempt(command, *args):
-    """Run a command; its error message, or None when it succeeded."""
-    try:
-        command(*args)
-    except vpn.VpnError as e:
-        return str(e)
+handed, sleeps, closed, _ = follow([([(0, E), (2, P), (2, E)], None), ([(2, E)], None)])
+check("the bus reader hands every message over, in order", [E, P, E, E], handed)
+check("and opens a closed stream again 5 s later, every time", ([5, 5], [0, 1]), (sleeps, closed))
+handed, sleeps, closed, _ = follow([([(0, E), (4, P), (4, P), (4, P), (4, E)], None)])
+check("a stream that carries no engine update for 10 s is closed, and opened again 5 s later",
+      ([E, P, P, P], [0], [5]), (handed, closed, sleeps))
+handed, sleeps, closed, printed = follow([([(0, E)], TimeoutError("timed out")), ([], OSError("refused")),
+                                          ([(0, E)], None)])
+check("so is one that sends nothing for 10 s, which tailscaled's socket reports as a timeout", [5, 5, 5], sleeps)
+check("losing the bus is printed once per outage, getting it back once",
+      (2, 1), (sum("event bus lost" in line for line in printed), sum("connected again" in line for line in printed)))
+
+
+# --- the watcher, the moves and the commands, in a fake World
+
+
+HOSTS = [fakes.Host(p["HostName"], p["Location"]["Country"], p["Location"]["City"], online=p["Online"])
+         for p in PEERS]
+EVERYTHING = frozenset(h.name for h in HOSTS)
+WORLDS: list[fakes.World] = []
+"""Every World the cases below build, for the check at the end that none of them asked am.i.mullvad.net."""
+
+
+def world(exit_name="de-fra-wg-202", *, automatic=False, blocked=(), dead=(), offline=(), mute=(), inert=(),
+          vesktop=True, auto_pick="de-fra-wg-001", phase=0.0):
+    """The fake network of PEERS, the exit node pinned to `exit_name` (or on automatic mode, or off for
+    None). `dead` nodes answer nothing, `inert` ones answer handshakes and carry nothing, `mute` ones carry
+    traffic but Discord does not answer through them. The dot's state file starts out absent."""
+    hosts = [replace(h, blocked=h.name in blocked, answers=h.name not in dead,
+                     carries=h.name not in dead and h.name not in inert,
+                     online=h.online and h.name not in offline, discord_silent=h.name in mute) for h in HOSTS]
+    setting = ("off", None) if exit_name is None else ("automatic" if automatic else "pinned", exit_name)
+    wd = fakes.World(hosts, setting, auto_pick=auto_pick, vesktop=vesktop, phase=phase)
+    vpn.STATE_FILE.unlink(missing_ok=True)
+    WORLDS.append(wd)
+    return wd
+
+
+def run_to(watching, secs):
+    """Run the watcher to `secs` into its World, to the first moment it is idle at or after `secs`. With engine
+    updates every 2 s, that is `secs` itself when it is even."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        watching.until(secs)
+    return watching
+
+
+def command(wd, fn, *args):
+    """Run a command's body in the World; its error message, or None when it succeeded."""
+    with contextlib.redirect_stdout(io.StringIO()), fakes.driving(wd):
+        try:
+            fn(*args, wd.ports)
+        except vpn.VpnError as e:
+            return str(e)
     return None
 
 
-BASE = time.time()
-EVERYTHING = {n.name for n in NODES}
+def at(wd, secs, happening):
+    wd.when(fakes.At(secs), happening)
+
+
+def lines(wd, unit):
+    path = wd.runs / f"{unit}.jsonl"
+    return [json.loads(text) for text in path.read_text().splitlines()] if path.exists() else []
+
+
+def records(wd):
+    return lines(wd, vpn.NODE_UNIT)
+
+
+def events(wd):
+    return [r["stats"]["event"] for r in records(wd)]
+
+
+def last(wd):
+    return records(wd)[-1]["stats"]
+
+
+def beats(wd):
+    return lines(wd, vpn.WATCH_UNIT)
+
+
+def sets(wd):
+    return [e.what for e in wd.entries if e.kind == "set"]
+
+
+def discords(wd):
+    """The Discord checks run: (seconds in, the node they went through)."""
+    return [(round(e.t - fakes.T0, 2), e.state[1]) for e in wd.entries if e.kind == "discord"]
+
+
+def shown():
+    """What the dot would show: the state file, or None where there is none."""
+    return json.loads(vpn.STATE_FILE.read_text()) if vpn.STATE_FILE.exists() else None
+
+
+def since(secs):
+    return datetime.fromtimestamp(fakes.T0 + secs).astimezone().isoformat(timespec="seconds")
+
 
 # --- the watcher's looks
 
-net = Net(vesktop=False)
-with wired(net):
-    vpn.look(vpn.Watch(), BASE, True)
-check("Vesktop closed: a new node is not checked", [], net.checks)
+wd = world(vesktop=False)
+run_to(fakes.Watcher(wd), 5)
+check("Vesktop closed: a new node is not checked", [], discords(wd))
 
-net = Net(vesktop=False)
-with wired(net):
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    net.vesktop = True
-    vpn.look(w, BASE + 5, True)
-check("Vesktop opening on a node nobody checked checks it", ["de-fra-wg-202"], net.checks)
+wd = world(vesktop=False)
+watching = run_to(fakes.Watcher(wd), 5)
+wd.vesktop = True
+run_to(watching, 20)
+check("Vesktop opening on a node nobody checked checks it at the next look, 10 s at most",
+      [(10.0, "de-fra-wg-202")], discords(wd))
 
-net = Net()
-with wired(net):
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    vpn.look(w, BASE + 10, True)
-    early = len(net.checks)
-    vpn.look(w, BASE + 601, True)
+wd = world()
+watching = run_to(fakes.Watcher(wd), 590)
+early = len(discords(wd))
+run_to(watching, 615)
 check("a node that passed is not checked again within 600 s", 1, early)
-check("and is after", 2, len(net.checks))
+check("and is after", 2, len(discords(wd)))
 
 # Cloudflare can start blocking a node while Vesktop is closed, and Vesktop
 # opening sends nothing on the bus.
-net = Net()
-with wired(net):
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    net.vesktop = False
-    vpn.look(w, BASE + 5, True)
-    net.vesktop = True
-    vpn.look(w, BASE + 10, True)
-check("Vesktop reopening checks the node again, even one that passed", 2, len(net.checks))
+wd = world()
+watching = run_to(fakes.Watcher(wd), 5)
+wd.vesktop = False
+run_to(watching, 15)
+wd.vesktop = True
+run_to(watching, 30)
+check("Vesktop reopening checks the node again, even one that passed", 2, len(discords(wd)))
 
-net = Net(blocked={"de-fra-wg-202"})
-with wired(net) as logs:
-    vpn.look(vpn.Watch(), BASE, True)
-check("a 403 is checked a second time before anything moves", ["de-fra-wg-202", "de-fra-wg-202"], net.checks[:2])
-check("a confirmed block turns on automatic mode", ("de-fra-wg-001", True), (net.exit, net.automatic))
-check("and checks Tailscale's pick", "de-fra-wg-001", net.checks[-1])
+wd = world(blocked={"de-fra-wg-202"})
+run_to(fakes.Watcher(wd), 100)
+check("a 403 is checked a second time, 45 s later, before anything moves",
+      [(0.0, "de-fra-wg-202"), (45.2, "de-fra-wg-202")], [(round(t, 1), n) for t, n in discords(wd)[:2]])
+check("a confirmed block turns on automatic mode", ("automatic", "de-fra-wg-001"), wd.setting())
+check("and checks Tailscale's pick", "de-fra-wg-001", discords(wd)[-1][1])
 check("and records the rotation", ("rotated", "de-fra-wg-202", "de-fra-wg-001"),
-      (logs.last()["event"], logs.last()["node"], logs.last()["rotated_to"]))
+      (last(wd)["event"], last(wd)["node"], last(wd)["rotated_to"]))
 
-net = Net(blocked={"de-fra-wg-202"}, auto_pick="de-fra-wg-202")
-with wired(net) as logs:
-    vpn.look(vpn.Watch(), BASE, True)
+wd = world(blocked={"de-fra-wg-202"}, auto_pick="de-fra-wg-202")
+run_to(fakes.Watcher(wd), 200)
 check("when automatic mode picks the blocked node again, the clean node next to it is pinned",
-      ("de-fra-wg-401", False), (net.exit, net.automatic))
+      ("pinned", "de-fra-wg-401"), wd.setting())
 check("and recorded as the rotation", ("rotated", "de-fra-wg-202", "de-fra-wg-401"),
-      (logs.last()["event"], logs.last()["node"], logs.last()["rotated_to"]))
+      (last(wd)["event"], last(wd)["node"], last(wd)["rotated_to"]))
 
-net = Net(discord=False)
-with wired(net) as logs:
-    vpn.look(vpn.Watch(), BASE, True)
-check("no Discord answer while egress works stays put", ("de-fra-wg-202", []), (net.exit, logs.events()))
+wd = world(mute={"de-fra-wg-202"})
+run_to(fakes.Watcher(wd), 30)
+check("no Discord answer while the node carries traffic stays put", (("pinned", "de-fra-wg-202"), []),
+      (wd.setting(), events(wd)))
 
-net = Net(dead={"de-fra-wg-202"})
-with wired(net) as logs:
-    vpn.look(vpn.Watch(), BASE, True)
-check("no Discord answer and no egress turns on automatic mode",
-      ("de-fra-wg-001", True, ["offline"]), (net.exit, net.automatic, logs.events()))
+wd = world(dead={"de-fra-wg-202"})
+run_to(fakes.Watcher(wd), 30)
+check("no Discord answer and no traffic through the node turns on automatic mode",
+      (("automatic", "de-fra-wg-001"), ["offline"]), (wd.setting(), events(wd)))
 
-net = Net(online=False, vesktop=False)
-with wired(net) as logs:
-    vpn.look(vpn.Watch(), BASE, True)
+wd = world(offline={"de-fra-wg-202"}, vesktop=False)
+run_to(fakes.Watcher(wd), 30)
 check("a node reporting itself offline turns on automatic mode, Vesktop closed or not",
-      ("de-fra-wg-001", True, ["offline"]), (net.exit, net.automatic, logs.events()))
-check("without the Discord check while Vesktop is closed", [], net.checks)
+      (("automatic", "de-fra-wg-001"), ["offline"]), (wd.setting(), events(wd)))
+check("without the Discord check while Vesktop is closed", [], discords(wd))
 
-net = Net(online=False, network=False)
-with wired(net) as logs:
-    vpn.look(vpn.Watch(), BASE, True)
-check("with the network down, a recovery stops at automatic mode and tries no nodes", ["auto:any"], net.sets)
-check("and records the network as the problem", ["unreachable"], logs.events())
+wd = world(offline={"de-fra-wg-202"}, dead=EVERYTHING)
+run_to(fakes.Watcher(wd), 30)
+check("with the network down, a recovery stops at automatic mode and tries no nodes", ["auto:any"], sets(wd))
+check("and records the network as the problem", ["unreachable"], events(wd))
 
-net = Net(blocked=EVERYTHING)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    net.vesktop = False
-    vpn.look(w, BASE + 400, True)
-check("when every node tried is blocked, automatic mode", True, net.automatic)
-check("recorded once, and not again as a change outside vpn after the back-off", ["exhausted"], logs.events())
+wd = world(blocked=EVERYTHING)
+watching = run_to(fakes.Watcher(wd), 5)
+wd.vesktop = False
+run_to(watching, 700)
+check("when every node tried is blocked, automatic mode", "automatic", wd.mode)
+check("recorded once, and not again as a change outside vpn after the back-off", ["exhausted"], events(wd))
 
-net = Net(blocked={"de-fra-wg-202", "de-fra-wg-401"})
-with wired(net) as logs:
-    net.on_sleep = lambda: net.set_exit_node("de-fra-wg-401.mullvad.ts.net")
-    wait = vpn.look(vpn.Watch(), BASE, True)
-check("a 403 confirmed after the node changed moves nothing", ("de-fra-wg-401", []), (net.exit, logs.events()))
-check("and the new node is looked at a second later", 1.0, wait)
+wd = world(blocked={"de-fra-wg-202"})
+at(wd, 10, fakes.Outside("de-fra-wg-401.mullvad.ts.net"))
+run_to(fakes.Watcher(wd), 60)
+check("a 403 confirmed after the node changed moves nothing: the change is recorded as made outside",
+      (("pinned", "de-fra-wg-401"), ["changed"]), (wd.setting(), events(wd)))
+check("and the new node is checked a second later", ("de-fra-wg-401", True),
+      (discords(wd)[2][1], discords(wd)[2][0] - discords(wd)[1][0] <= 1.5))
 
-net = Net(exit_name=None)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    vpn.look(w, BASE + 700, True)
+wd = world(None)
+run_to(fakes.Watcher(wd), 700)
 check("no exit node set: nothing checked, nothing moved, even past a re-check", ([], [], []),
-      (net.checks, net.sets, logs.events()))
+      (discords(wd), sets(wd), events(wd)))
 
-net = Net()
-net.down = True
-with wired(net):
-    wait = vpn.look(vpn.Watch(), BASE, True)
-check("tailscaled not answering: nothing is acted on", ([], []), (net.checks, net.sets))
-check("and the next look comes in 15 s", 15, wait)
+wd = world()
+wd.down = True
+run_to(fakes.Watcher(wd), 40)
+check("tailscaled not answering: nothing is acted on", ([], []), (discords(wd), sets(wd)))
+check("and it looks every 15 s", [0, 15, 30], wd.peerless_reads)
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    first = logs.events()
-    net.set_exit_node("de-fra-wg-401.mullvad.ts.net")
-    vpn.look(w, BASE + 5, True)
+wd = world(vesktop=False)
+at(wd, 5, fakes.Outside("de-fra-wg-401.mullvad.ts.net"))
+watching = run_to(fakes.Watcher(wd), 4)
+first = events(wd)
+run_to(watching, 20)
 check("the first look records no change: there is no before", [], first)
 check("a change something else made is recorded", [("changed", "de-fra-wg-202", "de-fra-wg-401")],
-      [(r["stats"]["event"], r["stats"]["node"], r["stats"]["rotated_to"]) for r in logs.lines(vpn.NODE_UNIT)])
+      [(r["stats"]["event"], r["stats"]["node"], r["stats"]["rotated_to"]) for r in records(wd)])
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    vpn.next_()
-    vpn.look(w, BASE + 5, True)
-check("a move vpn made is recorded once, by vpn", ["pinned"], logs.events())
+wd = world(vesktop=False)
+watching = run_to(fakes.Watcher(wd), 1)
+command(wd, vpn.go_next)
+run_to(watching, 30)
+check("a move vpn made is recorded once, by vpn", ["pinned"], events(wd))
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    net.set_exit_node("")
-    vpn.look(w, BASE + 5, True)
+wd = world(vesktop=False)
+at(wd, 5, fakes.Outside(""))
+run_to(fakes.Watcher(wd), 20)
 check("the exit node turned off from outside is a change to none", [("changed", None)],
-      [(r["stats"]["event"], r["stats"]["rotated_to"]) for r in logs.lines(vpn.NODE_UNIT)])
+      [(r["stats"]["event"], r["stats"]["rotated_to"]) for r in records(wd)])
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    with open(vpn.LOCKFILE, "a") as held:
-        fcntl.flock(held, fcntl.LOCK_EX)
-        net.set_exit_node("de-fra-wg-401.mullvad.ts.net")
-        busy_wait = vpn.look(w, BASE + 5, True)
-        while_held = logs.events()
-        fcntl.flock(held, fcntl.LOCK_UN)
-    vpn.look(w, BASE + 6, True)
+wd = world(vesktop=False)
+at(wd, 5, fakes.Outside("de-fra-wg-401.mullvad.ts.net"))
+watching = run_to(fakes.Watcher(wd), 1)
+with open(vpn.LOCKFILE, "a") as held:
+    fcntl.flock(held, fcntl.LOCK_EX)
+    looks_before = len(wd.peerless_reads)
+    run_to(watching, 8)
+    while_held = events(wd)
+    looks_while = [t for t in wd.peerless_reads[looks_before:] if t > 5]
+    fcntl.flock(held, fcntl.LOCK_UN)
+run_to(watching, 20)
 check("a change while a vpn command holds the lock is left to that command", [], while_held)
-check("and looked at again a second later", 1.0, busy_wait)
-check("once the lock is free and no vpn line accounts for it, it is recorded", ["changed"], logs.events())
+check("and looked at again a second later", [6.0, 7.0], looks_while[:2])
+check("once the lock is free and no vpn line accounts for it, it is recorded", ["changed"], events(wd))
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    for offset in (0, 10, 3601):
-        vpn.look(w, BASE + offset, True)
-check("the heartbeat is written on the first look and then hourly", 2, len(logs.lines(vpn.WATCH_UNIT)))
+wd = world(vesktop=False)
+run_to(fakes.Watcher(wd), 3605)
+check("the heartbeat is written on the first look and then hourly", ["ok", "ok"], [b["outcome"] for b in beats(wd)])
+
+wd = world(vesktop=False)
+at(wd, 3500, fakes.Quiet(200))
+run_to(fakes.Watcher(wd), 3605)
+check("the heartbeat fails when an exit node is set and no engine update came for over 60 s",
+      ["ok", "fail"], [b["outcome"] for b in beats(wd)])
+
+# --- what the watcher reads
+
+wd = world()
+watching = run_to(fakes.Watcher(wd), 700)
+check("the watcher reads the full status once, at start, however long the exit node stays", 1, wd.status_reads)
+
+wd = world()
+at(wd, 100, fakes.Outside("de-fra-wg-401.mullvad.ts.net"))
+run_to(fakes.Watcher(wd), 700)
+check("and again when the exit node changes", 2, wd.status_reads)
+
+wd = world(vesktop=False)
+watching = run_to(fakes.Watcher(wd), 100)
+newcomer = fakes.Host("de-fra-wg-999", "Germany", "Frankfurt")
+wd.hosts[newcomer.name] = newcomer
+wd.handshake[newcomer.name] = wd.now
+run_to(watching, 200)
+after_newcomer = wd.status_reads
+wd.handshake["stranger"] = wd.now
+run_to(watching, 400)
+check("and when an engine update carries a peer it does not know", 2, after_newcomer)
+check("once only, even for a peer no status reading lists", 3, wd.status_reads)
 
 # --- what the watcher publishes for the dot
 
-
-def since(offset):
-    return datetime.fromtimestamp(BASE + offset).astimezone().isoformat(timespec="seconds")
-
-
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    net.traffic(sent=500, received=900)
-    vpn.look(w, BASE + 10, True)
-    up = logs.shown()
+wd = world(vesktop=False)
+run_to(fakes.Watcher(wd), 12)
 check("a working node is published up, with where it is and how it was chosen",
       {"state": "up", "reason": "", "mode": "pinned", "node": "de-fra-wg-202", "city": "Frankfurt",
-       "country": "Germany", "since": since(0)}, up)
+       "country": "Germany", "since": since(0)}, shown())
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    net.set_exit_node("de-ber-wg-001.mullvad.ts.net")
-    vpn.look(w, BASE + 10, True)
-    moved = logs.shown()
+wd = world(vesktop=False)
+at(wd, 5, fakes.Outside("de-ber-wg-001.mullvad.ts.net"))
+run_to(fakes.Watcher(wd), 12)
 check("a move from one working node to another keeps the time it has been up",
-      ("de-ber-wg-001", "Berlin", since(0)), (moved["node"], moved["city"], moved["since"]))
+      ("de-ber-wg-001", "Berlin", since(0)), (shown()["node"], shown()["city"], shown()["since"]))
 
-net = Net(exit_name=None)
-with wired(net) as logs:
-    vpn.look(vpn.Watch(), BASE, True)
-    off = logs.shown()
-check("no exit node is published off", ("off", None, "off"), (off["state"], off["node"], off["mode"]))
+wd = world(None)
+run_to(fakes.Watcher(wd), 5)
+check("no exit node is published off", ("off", None, "off"), (shown()["state"], shown()["node"], shown()["mode"]))
 
-net = Net()
-net.down = True
-with wired(net) as logs:
-    vpn.look(vpn.Watch(), BASE, True)
-    unknown = logs.shown()
+wd = world()
+wd.down = True
+run_to(fakes.Watcher(wd), 5)
 check("tailscaled not answering is published unknown", ("unknown", "tailscaled does not answer"),
-      (unknown["state"], unknown["reason"]))
-
-def silence_lines(logs):
-    return [(r["outcome"], r["stats"]["event"], r["stats"]["node"], r["stats"]["secs"])
-            for r in logs.lines(vpn.NODE_UNIT)]
+      (shown()["state"], shown()["reason"]))
 
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    shown = []
-    for offset in (0, 10, 20, 30, 40, 50, 60):
-        vpn.look(w, BASE + offset, True)
-        shown.append((logs.shown()["state"], logs.shown()["since"]))
-        net.traffic(sent=500, received=0 if offset < 50 else 700)
-check("a node that stops answering goes down 20 s after the look that saw it, and back up once it answers",
-      [("up", since(0))] * 3 + [("down", since(30))] * 3 + [("up", since(60))], shown)
-check("the silence is one node-log line, lasting from that look to the last that found it silent",
-      [("ok", "silent", "de-fra-wg-202", 40)], silence_lines(logs))
-check("and moves nothing", [], net.sets)
+def silence_lines(wd):
+    return [(r["outcome"], r["stats"]["event"], r["stats"]["node"], r["stats"]["secs"]) for r in records(wd)]
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    for offset in (0, 10, 20, 30, 30 + HOURS_8):
-        vpn.look(w, BASE + offset, True)
-        net.traffic(sent=500, received=0)
-    resumed = logs.shown()["state"]
-check("a silence the laptop suspended in ends at the last look before the suspend",
-      [("ok", "silent", "de-fra-wg-202", 20)], silence_lines(logs))
-check("and the count starts over after it", "up", resumed)
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    vpn.next_()
+def dot():
+    return shown()["state"], shown()["reason"], shown()["since"]
+
+
+# 202 dies at 5 s. The update at 6 s is the first to see traffic go in with
+# nothing back; 20 s later, at 26 s, the node is silent. It comes back at 51 s,
+# and the update at 52 s carries its reply.
+wd = world(vesktop=False)
+at(wd, 5, fakes.Dies("de-fra-wg-202"))
+at(wd, 51, fakes.Revives("de-fra-wg-202"))
+watching = fakes.Watcher(wd)
+seen = [dot() for secs in (24, 28, 50, 54) if run_to(watching, secs)]
+check("a node that stops answering goes down 20 s after the update that saw it, and back up once it answers",
+      [("up", "", since(0)), ("down", "the node stopped answering", since(26)),
+       ("down", "the node stopped answering", since(26)), ("up", "", since(52))], seen)
+check("the silence is one node-log line, lasting from that update to the last that found it silent",
+      [("ok", "silent", "de-fra-wg-202", 44)], silence_lines(wd))
+check("and moves nothing", [], sets(wd))
+
+# The same, with tailscaled pushing nothing from 31 s to 71 s, as across a
+# suspend: the stream counts as closed from 40 s, and the first update after
+# the gap, at 72 s, starts the count over.
+wd = world(vesktop=False)
+at(wd, 5, fakes.Dies("de-fra-wg-202"))
+at(wd, 31, fakes.Quiet(40))
+watching = fakes.Watcher(wd)
+seen = [dot()[0] for secs in (44, 74, 92, 96) if run_to(watching, secs)]
+check("no silence verdict is published while the stream is closed", "up", seen[0])
+check("a silence the stream went quiet in ends at the last update before the gap",
+      [("ok", "silent", "de-fra-wg-202", 24)], silence_lines(wd)[:1])
+check("and the count starts over after it", ["up", "up", "up", "down"], seen)
+
+wd = world(vesktop=False)
+watching = run_to(fakes.Watcher(wd), 1)
+command(wd, vpn.go_next)
+with fakes.driving(wd):
     vpn.log_node("ok", "silent", "watch", "de-fra-wg-401", reason="de-fra-wg-401 answered nothing for at least 30 s", secs=30)
-    vpn.look(w, BASE + 5, True)
-check("a silent line written after a move does not hide the move from the watcher", ["pinned", "silent"], logs.events())
+run_to(watching, 20)
+check("a silent line written after a move does not hide the move from the watcher", ["pinned", "silent"], events(wd))
 
-net = Net(vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    with open(vpn.LOCKFILE, "a") as held:
-        fcntl.flock(held, fcntl.LOCK_EX)
-        net.set_exit_node("auto:any")
-        net.online = False
-        vpn.look(w, BASE + 5, True)
-        while_held = logs.shown()["state"]
-        fcntl.flock(held, fcntl.LOCK_UN)
+wd = world(vesktop=False, offline={"de-fra-wg-001"})
+at(wd, 5, fakes.Outside("auto:any"))
+watching = run_to(fakes.Watcher(wd), 1)
+with open(vpn.LOCKFILE, "a") as held:
+    fcntl.flock(held, fcntl.LOCK_EX)
+    run_to(watching, 8)
+    while_held = shown()["state"]
+    fcntl.flock(held, fcntl.LOCK_UN)
 check("nothing is published while a vpn command is changing the exit node", "up", while_held)
 
 # The recovery that fails, then looks during its back-off.
-net = Net(online=False, network=False, vesktop=False)
-with wired(net) as logs:
-    w = vpn.Watch()
-    vpn.look(w, BASE, True)
-    after_first = list(net.sets)
-    net.online = False
-    vpn.look(w, BASE + 60, True)
-    during = (list(net.sets), logs.shown()["state"])
-    vpn.look(w, BASE + 400, True)
+wd = world(offline=EVERYTHING, dead=EVERYTHING, vesktop=False)
+watching = run_to(fakes.Watcher(wd), 10)
+after_first = sets(wd)
+run_to(watching, 60)
+during = (sets(wd), shown()["state"])
+run_to(watching, 320)
 check("after a failed recovery, no other starts for 5 minutes", (["auto:any"], ["auto:any"]), (after_first, during[0]))
 check("while the dot keeps following", "down", during[1])
-check("and one starts after", ["auto:any", "auto:any"], net.sets)
+check("and one starts after", ["auto:any", "auto:any"], sets(wd))
+
+wd = world(vesktop=False)
+run_to(fakes.Watcher(wd), 31)
+check("an exit node set: the watcher looks every 10 s, and in between only takes in engine updates",
+      [0, 10, 20, 30], wd.peerless_reads)
+wd = world(None)
+run_to(fakes.Watcher(wd), 100)
+check("no exit node and the engine updates coming: nothing is due before the hourly heartbeat", [0], wd.peerless_reads)
+wd = world(None, phase=1000)
+run_to(fakes.Watcher(wd), 50)
+check("no engine update: it looks every 15 s", [0, 15, 30, 45], wd.peerless_reads[:4])
+wd = world(None)
+at(wd, 21, fakes.Quiet(1000))
+run_to(fakes.Watcher(wd), 50)
+check("and notices a stream going quiet 10 s after its last update, at 20 s", [0, 30.1, 45.1], wd.peerless_reads[:3])
+# With Vesktop open, the Discord check at the first look takes 0.2 s.
+for vesktop, looks in ((False, [0, 10, 20, 30]), (True, [0, 10.2, 20.2, 30.2])):
+    wd = world(vesktop=vesktop, phase=1000)
+    run_to(fakes.Watcher(wd), 31)
+    check(f"an exit node set and no engine update, with Vesktop {'open' if vesktop else 'closed'}, still looks every 10 s",
+          looks, wd.peerless_reads[:4])
+
+wd = world(vesktop=False)
+for i in range(3):
+    at(wd, 7 + 0.2 * i, fakes.Online("de-ber-wg-001", i % 2 == 0))
+run_to(fakes.Watcher(wd), 12)
+check("a burst of bus messages brings one look, a second after the first of them", [0, 8.0], wd.peerless_reads)
+
+# --- the traffic proof and the handshake probe, as a move uses them
 
 
-def first_wait(net: Net, bus_up: bool = True) -> float:
-    with wired(net):
-        return vpn.look(vpn.Watch(), BASE, bus_up)
+def proof(wd, name, connects=(), after=0.0):
+    """Set the exit node to `name`, `after` seconds past an engine update, and run the traffic proof on it.
+    `connects` stand in for the proof's first connects before the World's own take over: True for one that
+    answered through the old route, False for one that failed. Whether the proof passed, and how long it took."""
+    by_name = fakes.nodes(wd)
+    queue, connect = list(connects), wd.ports.network.connect
+    wd.ports = replace(wd.ports, network=replace(wd.ports.network,
+                                                 connect=lambda timeout: queue.pop(0) if queue else connect(timeout)))
+    with fakes.driving(wd):
+        live = vpn.Liveness(wd.ports.clock)
+        vpn.await_update(live, wd.status())
+        live.wait(after)
+        wd.ports.tailscaled.set_exit_node(by_name[name].fqdn)
+        began = wd.now
+        passed = vpn.traffic_proof(by_name[name], live, wd.ports)
+    return passed, round(wd.now - began, 2)
 
 
-check("an exit node set: the next look reads its counters in 10 s, Vesktop open or closed, bus up or down",
-      [10, 10, 10], [first_wait(Net()), first_wait(Net(vesktop=False)), first_wait(Net(), bus_up=False)])
-check("no exit node, bus up: nothing is due before the hourly heartbeat", 3600, first_wait(Net(exit_name=None)))
-check("no exit node, bus down: 15 s", 15, first_wait(Net(exit_name=None), bus_up=False))
+# A connect through the new node counts once an engine update shows bytes
+# going to it, which is the first one after the switch. The connect under way
+# when it arrives began before it, so the proof takes that and one more.
+passed, secs = proof(world(None), "de-ber-wg-001")
+check("the traffic proof confirms a node that carries traffic at the next engine update, two connects later",
+      (True, True), (passed, secs <= vpn.ENGINE_SECS + 2 * fakes.CONNECT_SECS))
+passed, secs = proof(world(None), "de-ber-wg-001", after=1.5)
+check("and sooner when the switch comes just before an update", (True, True),
+      (passed, secs <= 0.5 + 2 * fakes.CONNECT_SECS))
+# A command starts at no particular phase of the updates, and waits for the
+# first before its first switch, so the proof has an update to measure from.
+passed, secs = proof(world(None, phase=1.5), "de-ber-wg-001")
+check("a command whose first engine update comes 1.5 s in still has the proof end at the next one",
+      (True, True), (passed, secs <= vpn.ENGINE_SECS + 2 * fakes.CONNECT_SECS))
+check("it fails a node that answers nothing, in 5 s", (False, 5.0),
+      proof(world(None, dead={"de-ber-wg-001"}), "de-ber-wg-001"))
+# Right after a switch a connect can still leave through the old route, and
+# with no application sending anything, nothing else reaches the new node.
+switching = world(None)
+switching.demand = 0
+passed, secs = proof(switching, "de-ber-wg-001", [True])
+check("a first connect that left through the old route does not fail a node that carries", (True, True),
+      (passed, secs < vpn.PROOF_SECS))
+check("nor pass one that answers handshakes and carries nothing, whose handshake bytes come back", (False, 5.0),
+      proof(world(None, inert={"de-ber-wg-001"}), "de-ber-wg-001", [True]))
+check("bytes back from a node with no connect through it are no proof", (False, 5.0),
+      proof(world(None), "de-ber-wg-001", [False] * 50))
+leaky = world(None)
+leaky.hosts["de-ber-wg-001"] = replace(leaky.hosts["de-ber-wg-001"], carries=False, leaks=True)
+check("nor is a connect that answers when the switch never took effect", (False, 5.0), proof(leaky, "de-ber-wg-001"))
+
+wd = world(vesktop=False)
+answered = fakes.probe(wd, ["de-fra-wg-001", "de-ber-wg-001"])
+check("the handshake probe returns at the first engine update that carries every handshake",
+      (["de-fra-wg-001", "de-ber-wg-001"], 2.0), (answered, wd.now - fakes.T0))
+wd = world(vesktop=False, dead={"de-fra-wg-401"})
+fakes.probe(wd, ["de-fra-wg-001", "de-fra-wg-401"])
+check("and waits out its window for a node that does not answer", vpn.PROBE_SECS, wd.now - fakes.T0)
 
 # --- the commands
 
-net = Net(blocked={"de-fra-wg-401"})
-with wired(net) as logs:
-    vpn.next_()
-check("vpn next skips a node Cloudflare blocks", "de-fra-wg-001", net.exit)
+wd = world(blocked={"de-fra-wg-401"})
+command(wd, vpn.go_next)
+check("vpn next skips a node Cloudflare blocks", "de-fra-wg-001", wd.exit)
 check("and records where it went, from where, and how many it tried",
       {"event": "pinned", "command": "next", "node": "de-fra-wg-202", "rotated_to": "de-fra-wg-001", "tried": 2},
-      logs.last())
+      last(wd))
 
-net = Net(blocked=EVERYTHING)
-with wired(net) as logs:
-    error = attempt(vpn.next_)
-check("vpn next finding nothing puts the pinned node back", ("de-fra-wg-202", False), (net.exit, net.automatic))
-check("and fails, saying so", ("exhausted", True), (logs.last()["event"], error is not None))
+wd = world(blocked=EVERYTHING)
+error = command(wd, vpn.go_next)
+check("vpn next finding nothing puts the pinned node back", ("pinned", "de-fra-wg-202"), wd.setting())
+check("and fails, saying so", ("exhausted", True), (last(wd)["event"], error is not None))
 
-net = Net(blocked=EVERYTHING, automatic=True)
-with wired(net):
-    attempt(vpn.next_)
-check("from automatic mode, it goes back to automatic mode", (True, "auto:any"), (net.automatic, net.sets[-1]))
+wd = world(blocked=EVERYTHING, automatic=True)
+command(wd, vpn.go_next)
+check("from automatic mode, it goes back to automatic mode", ("automatic", "auto:any"), (wd.mode, sets(wd)[-1]))
 
-net = Net(network=False)
-with wired(net) as logs:
-    attempt(vpn.next_)
+wd = world(dead=EVERYTHING)
+command(wd, vpn.go_next)
 check("vpn next with the network down gives up after two silent nodes and puts the node back",
-      (3, "de-fra-wg-202"), (len(net.sets), net.exit))
-check("recording the network as the problem", "unreachable", logs.last()["event"])
+      (3, ("pinned", "de-fra-wg-202")), (len(sets(wd)), wd.setting()))
+check("recording the network as the problem", "unreachable", last(wd)["event"])
 
-net = Net()
-with wired(net) as logs:
-    vpn.to(vpn.ToArgs(place="Berlin"))
-check("vpn to a city pins its node", ("de-ber-wg-001", False, "to"), (net.exit, net.automatic, logs.last()["command"]))
+wd = world()
+command(wd, vpn.go_to, "Berlin")
+check("vpn to a city pins its node", (("pinned", "de-ber-wg-001"), "to"), (wd.setting(), last(wd)["command"]))
 
-net = Net()
-with wired(net) as logs:
-    error = attempt(vpn.to, vpn.ToArgs(place="Atlantis"))
+wd = world()
+error = command(wd, vpn.go_to, "Atlantis")
 check("vpn to a place with no node fails without touching the exit node", (True, [], []),
-      (error is not None, net.sets, logs.events()))
+      (error is not None, sets(wd), events(wd)))
 
-net = Net()
-with wired(net) as logs:
-    vpn.on()
+wd = world()
+command(wd, vpn.turn_on)
 check("vpn on from a pin records both nodes",
       {"event": "clean", "command": "on", "node": "de-fra-wg-202", "rotated_to": "de-fra-wg-001", "tried": 0},
-      logs.last())
+      last(wd))
 
-net = Net(blocked={"de-fra-wg-001"})
-with wired(net) as logs:
-    vpn.on()
+wd = world(blocked={"de-fra-wg-001"})
+command(wd, vpn.turn_on)
 check("vpn on walks off automatic mode's blocked pick to the node next to it",
-      ("de-fra-wg-202", False), (net.exit, net.automatic))
+      ("pinned", "de-fra-wg-202"), wd.setting())
 check("and records the rotation", ("rotated", "de-fra-wg-001", "de-fra-wg-202"),
-      (logs.last()["event"], logs.last()["node"], logs.last()["rotated_to"]))
+      (last(wd)["event"], last(wd)["node"], last(wd)["rotated_to"]))
 
-net = Net()
-with wired(net) as logs:
-    vpn.off()
+wd = world(dead={"de-fra-wg-001"})
+error = command(wd, vpn.turn_on)
+check("vpn on whose pick carries nothing fails, saying egress never reached Mullvad",
+      (True, "unreachable"), (bool(error) and "never reached Mullvad" in error, last(wd)["event"]))
+
+wd = world()
+command(wd, vpn.turn_off)
 check("vpn off drops the exit node and records the node it left",
-      (None, "off", "de-fra-wg-202"), (net.exit, logs.last()["event"], logs.last()["node"]))
+      (None, "off", "de-fra-wg-202"), (wd.exit, last(wd)["event"], last(wd)["node"]))
 
-net = Net(exit_name=None)
-with wired(net):
-    vpn.on()
-check("vpn on from off turns it on", ("de-fra-wg-001", True), (net.exit, net.automatic))
+wd = world(None)
+command(wd, vpn.turn_on)
+check("vpn on from off turns it on", ("automatic", "de-fra-wg-001"), wd.setting())
 
-net = Net(exit_name=None)
-net.running = False
-with wired(net) as logs:
-    error = attempt(vpn.on)
+wd = world(None)
+wd.pick_delay = 3
+error = command(wd, vpn.turn_on)
+check("vpn on waits for automatic mode to pick a node", (None, ("automatic", "de-fra-wg-001")), (error, wd.setting()))
+
+wd = world(None)
+wd.pick_delay = 60
+began = wd.now
+error = command(wd, vpn.turn_on)
+check("and fails when none is picked within 5 s", (True, True),
+      (bool(error) and "never reached Mullvad" in error, wd.now - began <= 5 + vpn.PICK_POLL_SECS))
+
+wd = world(None)
+wd.running = False
+error = command(wd, vpn.turn_on)
 check("vpn on with tailscale stopped changes nothing and says why",
-      ([], [], "tailscale is stopped: `tailscale up` first"), (net.sets, logs.events(), error))
+      ([], [], "tailscale is stopped: `tailscale up` first"), (sets(wd), events(wd), error))
 
 # The dot's click turns the VPN off with a bare `tailscale set`, which does not
 # wait for a vpn command's walk to finish.
-net = Net(blocked={"de-fra-wg-401"})
-checked_by_vpn = net.check
-
-
-def blocked_then_turned_off():
-    verdict = checked_by_vpn()
-    net.set_exit_node("")
-    return verdict
-
-
-net.check = blocked_then_turned_off
-with wired(net) as logs:
-    error = attempt(vpn.next_)
-check("a walk that finds the VPN turned off under it leaves it off", (None, ["de-fra-wg-401.mullvad.ts.net", ""]),
-      (net.exit, net.sets))
+wd = world(blocked={"de-fra-wg-401"})
+wd.when(fakes.AfterStep(1, "discord"), fakes.Outside(""))
+error = command(wd, vpn.go_next)
+check("a walk that finds the VPN turned off under it leaves it off", (None, ["de-fra-wg-401.mullvad.ts.net"]),
+      (wd.exit, sets(wd)))
 check("and fails saying so", True, bool(error) and "turned off" in error)
 
-print()
-print("FAILED" if failures else "all ok")
+check("no move and no look asks am.i.mullvad.net", 0, sum(w.egress_asks for w in WORLDS))
+
+print(file=OUT)
+print("FAILED" if failures else "all ok", file=OUT)
 sys.exit(1 if failures else 0)
