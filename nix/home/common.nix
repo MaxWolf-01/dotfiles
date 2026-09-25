@@ -1,6 +1,7 @@
 { config, pkgs, lib, rime, system, ... }:
 {
   imports = [
+    ./terminal-colors.nix
     ./tmux.nix
   ];
 
@@ -423,7 +424,6 @@
     openssh
     poppler-utils
     python3Packages.ipdb
-    pywal
     restic
     ripgrep
     rsync
