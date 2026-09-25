@@ -1,0 +1,682 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro>=1.0.14", "playwright"]
+# ///
+"""Check the properties of bin/scribe. Run it directly; no framework.
+
+P1 to P15 are the properties of agent/tickets/scribe/spec.md in the private
+secrets repo. The executable ones are checked here, with a few the spec leaves
+to review where a check is cheap (P3, P4, P9); the rest are checked by review.
+
+Every check drives the command end to end, as a user would, on a fixture. The
+fixture is the first ten minutes of NASA's Houston We Have a Podcast, episode
+421, "Artemis II: Backup Crew": Leah Cheshire, Andre Douglas and Jenni Gibbons.
+It is a US government work, so public domain. tests/fixtures/scribe/ holds:
+
+- scribe.json.gz: ElevenLabs Scribe v2's response for the clip, with
+  diarization, word timestamps and audio events, fetched once
+- names.json: the names a stub answers with in place of Claude
+- analysis.json: the notes a stub answers with in place of Claude. It has a
+  quote with words dropped, an invented quote, citations to and a chapter at
+  a turn that does not exist (t99999), and turn ids in its prose and in a
+  chapter title.
+
+The recording handed to `scribe run` is a tone of the clip's length. The
+checks never transcribe, so its sound does not matter.
+
+Every command runs without a network (unshare -rn), with stubs for `claude`
+and `sftpgo-share` first on PATH, so a check that makes a request fails, and
+no check pays anything. The page checks need chromium on PATH.
+
+Examples:
+
+    tests/properties/scribe.test
+    tests/properties/scribe.test --only P7 P10 --keep
+"""
+
+import datetime as dt
+import email.parser
+import functools
+import gzip
+import hashlib
+import http.server
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import traceback
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import tyro
+
+REPO = Path(__file__).resolve().parents[2]
+SCRIBE = REPO / "bin" / "scribe"
+FIXTURE = REPO / "tests" / "fixtures" / "scribe"
+WIDTHS = (360, 700, 1080, 1440)
+MISSING_TURN = "t99999"
+"""The turn the fixture's notes cite that does not exist."""
+NOTES_MARK = "the Canadian selection runs about a year"
+"""Words of the fixture's summary. Where they are missing, the notes never arrived, and a check on them cannot tell."""
+RETENTION_DAYS = 270
+"""How long the drop keeps a file: nix/nixos/pc/sftpgo.nix, 9 months of 30 days."""
+
+PLANTED = (179.8, 181.0)
+"""Seconds of Andre's turn at 2:58, "I mean, I'll never forget.", that the planted
+copy gives to Jenni. Jenni says nothing from 84.9 s to 274.3 s, more than 90 s
+either side of it, and talks 139 s in all, so the stretch must go to Andre."""
+NEAR = (199.0, 200.5)
+"""Seconds of Andre's turn given to Jenni in another copy. Jenni speaks again at
+274.3 s, 74 s later, so the stretch must stay hers."""
+BRIEF = (179.8, 181.0)
+"""The same seconds given, in a third copy, to a voice heard nowhere else: a speaker
+who talks less than 2 minutes in all keeps what is theirs."""
+
+
+@dataclass
+class Args:
+    only: list[str] = field(default_factory=list)
+    """Run only these properties, by id, e.g. P7 P10."""
+    keep: bool = False
+    """Keep the work directory and print where it is."""
+
+
+# --- the harness
+
+
+class Counterexample(AssertionError):
+    pass
+
+
+def expect(holds: bool, what: str) -> None:
+    if not holds:
+        raise Counterexample(what)
+
+
+class Skip(Exception):
+    pass
+
+
+@dataclass
+class Property:
+    id: str
+    says: str
+    check: Callable[["Work"], None]
+
+
+PROPERTIES: list[Property] = []
+
+
+def prop(id: str, says: str):
+    def register(check):
+        PROPERTIES.append(Property(id, says, check))
+        return check
+
+    return register
+
+
+def run_properties(args: Args) -> int:
+    failures = skipped = 0
+    with tempfile.TemporaryDirectory(prefix="scribe-test-", delete=not args.keep) as tmp:
+        work = Work(Path(tmp))
+        for p in PROPERTIES:
+            if args.only and p.id.split()[0] not in args.only and p.id not in args.only:
+                continue
+            try:
+                p.check(work)
+            except Skip as exc:
+                skipped += 1
+                print(f"skip  {p.id} {p.says}: {exc}")
+                continue
+            except Exception as exc:
+                failures += 1
+                why = str(exc) if isinstance(exc, Counterexample) else traceback.format_exc()
+                print(f"FAIL  {p.id} {p.says}\n      " + why.replace("\n", "\n      "))
+                continue
+            print(f"ok    {p.id} {p.says}")
+        for pw in PLAYWRIGHT:
+            pw.stop()
+        if args.keep:
+            print(f"\nkept {tmp}")
+    print()
+    print("FAILED" if failures else f"all ok{f', {skipped} skipped' if skipped else ''}")
+    return 1 if failures else 0
+
+
+# --- the fixture and the command
+
+CLAUDE_STUB = r"""#!/usr/bin/env bash
+# Stands in for Claude: answers from the fixture by the JSON schema it is asked for,
+# and logs each call with the isolation it was started with.
+safe=no tools=unset schema=""
+args=("$@")
+for i in "${!args[@]}"; do
+    case "${args[$i]}" in
+        --safe-mode) safe=yes ;;
+        --tools) tools="[${args[$((i + 1))]}]" ;;
+        --json-schema) schema="${args[$((i + 1))]}" ;;
+    esac
+done
+echo "claude safe-mode=$safe tools=$tools" >> "$SCRIBE_TEST_CALLS"
+cat > /dev/null
+case "$schema" in
+    *'"quotes"'*) answer="${SCRIBE_TEST_NOTES:-$SCRIBE_TEST_FIXTURE/analysis.json}" ;;
+    *'"voices"'*) answer="$SCRIBE_TEST_FIXTURE/names.json" ;;
+    *) echo "stub claude: the fixture has no answer for this schema: $schema" >&2; exit 1 ;;
+esac
+printf '[{"type":"result","is_error":false,"total_cost_usd":0,"structured_output":%s}]\n' "$(cat "$answer")"
+"""
+
+SFTPGO_STUB = r"""#!/usr/bin/env bash
+# Stands in for sftpgo-share: uploads nothing, keeps the links it makes in $SCRIBE_TEST_DROP,
+# and links an .opus file to $SCRIBE_TEST_SHARE_URL. Logs every call.
+echo "sftpgo-share $*" >> "$SCRIBE_TEST_CALLS"
+touch "$SCRIBE_TEST_DROP"
+case "$1" in
+    upload) ;;
+    list) printf '[%s]\n' "$(paste -sd, "$SCRIBE_TEST_DROP")" ;;
+    create)
+        id="link$(wc -l < "$SCRIBE_TEST_DROP")"
+        case "$2" in *.opus) url="$SCRIBE_TEST_SHARE_URL" ;; *) url="http://127.0.0.1:9/$id" ;; esac
+        echo "{\"id\":\"$id\"}" >> "$SCRIBE_TEST_DROP"
+        printf '{"id":"%s","url":"%s","path":"%s","expires":"never","secret":null}\n' "$id" "$url" "$2" ;;
+    *) echo "stub sftpgo-share: unexpected command: $*" >&2; exit 1 ;;
+esac
+"""
+
+
+class Work:
+    """A work directory with the stubs, the recording, and conversation folders made from the fixture."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.stubs = root / "stubs"
+        self.stubs.mkdir()
+        for name, text in (("claude", CLAUDE_STUB), ("sftpgo-share", SFTPGO_STUB)):
+            (self.stubs / name).write_text(text)
+            (self.stubs / name).chmod(0o755)
+        self.calls = root / "calls.log"
+        self.calls.touch()
+        self.response = json.loads(gzip.decompress((FIXTURE / "scribe.json.gz").read_bytes()))
+        self.recording = root / "Artemis II backup crew.flac"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"sine=frequency=220:duration={self.response['audio_duration_secs']}",
+             "-ac", "1", "-ar", "16000", "-c:a", "flac", str(self.recording)],
+            check=True,
+        )
+        os.utime(self.recording, ns=(1_778_000_000_000_000_000, 1_778_000_000_000_000_000))
+        self.warmed = False
+
+    def env(self, **extra: str) -> dict[str, str]:
+        return {
+            **os.environ,
+            "PATH": f"{self.stubs}:{os.environ['PATH']}",
+            "SCRIBE_DIR": str(self.root / "scribe"),
+            "XDG_STATE_HOME": str(self.root / "state"),
+            "ELEVENLABS_API_KEY": "fixture-no-key",
+            "UV_OFFLINE": "1",
+            "SCRIBE_TEST_CALLS": str(self.calls),
+            "SCRIBE_TEST_FIXTURE": str(FIXTURE),
+            "SCRIBE_TEST_DROP": str(self.root / "drop.jsonl"),
+            "SCRIBE_TEST_SHARE_URL": "http://127.0.0.1:9/unreachable.opus",
+            **extra,
+        }
+
+    def folder(self, name: str, response: dict | None = None) -> Path:
+        """A conversation folder holding only a cached transcription response."""
+        out = self.root / name
+        shutil.rmtree(out, ignore_errors=True)
+        (out / "cache").mkdir(parents=True)
+        (out / "cache" / "scribe.json").write_text(json.dumps(response or self.response))
+        return out
+
+    def scribe(self, *args: str, env: dict[str, str] | None = None, offline: bool = True) -> subprocess.CompletedProcess:
+        """`scribe`, with no network unless offline is off. Fails the check unless it exits 0."""
+        if not self.warmed:
+            # uv resolves the script's dependencies once, with the network; every run after is offline
+            subprocess.run([str(SCRIBE), "--help"], capture_output=True, timeout=600)
+            self.warmed = True
+        r = subprocess.run(
+            [*(["unshare", "-rn"] if offline else []), str(SCRIBE), *args],
+            env=self.env(**(env or {})), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600,
+        )
+        expect(r.returncode == 0, f"scribe {' '.join(args)} exited {r.returncode}: {(r.stderr or r.stdout)[-1500:]}")
+        return r
+
+    def run(self, out: Path) -> Path:
+        self.scribe("run", str(self.recording), "--out", str(out))
+        return out
+
+    def calls_since(self, mark: int) -> list[str]:
+        return self.calls.read_text().splitlines()[mark:]
+
+    def mark(self) -> int:
+        return len(self.calls.read_text().splitlines())
+
+    @functools.cached_property
+    def base(self) -> Path:
+        """The fixture folder after one `run`, for the checks that only read it."""
+        return self.run(self.folder("base"))
+
+
+def read(path: Path) -> str:
+    expect(path.exists(), f"{path.name} was not written")
+    return path.read_text()
+
+
+def transcript_turns(md: str) -> list[str]:
+    """The turn lines of transcript.md's transcript, each '[m:ss] **Speaker:** text'."""
+    return [line for line in md.splitlines() if re.match(r"\[\d+:\d{2}(:\d{2})?\] \*\*[^*]+:\*\* ", line)]
+
+
+def transcript_part(md: str) -> str:
+    return md[md.index("## Transcript") :]
+
+
+def text_between(response: dict, start: float, end: float) -> str:
+    """The words the response has from start to end seconds, spaced as spoken."""
+    out = ""
+    for w in response["words"]:
+        if w["type"] == "spacing":
+            if out and start <= w["start"] <= end:
+                out += " "
+        elif start <= w["start"] <= end:
+            out += w["text"]
+    return out.strip()
+
+
+def relabelled(response: dict, span: tuple[float, float], to: str) -> dict:
+    """A copy of the response with the words in span given to another voice; they must be Andre's."""
+    copy = json.loads(json.dumps(response))
+    for x in copy["words"]:
+        if span[0] <= x["start"] <= span[1] and x["type"] != "spacing":
+            expect(x["speaker_id"] == "speaker_1", f"the fixture changed: {x} is not Andre's")
+            x["speaker_id"] = to
+    return copy
+
+
+def sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# --- the page, in headless chromium
+
+PLAYWRIGHT = []
+
+
+@functools.cache
+def browser():
+    exe = shutil.which("chromium")
+    if not exe:
+        raise Skip("chromium not found")
+    from playwright.sync_api import sync_playwright
+
+    PLAYWRIGHT.append(sync_playwright().start())
+    return PLAYWRIGHT[0].chromium.launch(executable_path=exe, args=["--autoplay-policy=no-user-gesture-required"])
+
+
+def open_page(path: Path, width: int = 1440):
+    """The page at this width once loaded, and the script errors it raised."""
+    expect(path.exists(), f"{path.name} was not written")
+    page = browser().new_page(viewport={"width": width, "height": 900})
+    errors: list[str] = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(path.as_uri(), wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
+    return page, errors
+
+
+def on_page(path: Path, script: str, width: int = 1440):
+    page, errors = open_page(path, width)
+    try:
+        expect(not errors, f"{path} raised script errors: {errors}")
+        return page.evaluate(script)
+    finally:
+        page.close()
+
+
+VISIBLE_PLAYER = """() => [...document.querySelectorAll("audio, button, input")].filter((el) => {
+  const r = el.getBoundingClientRect(), s = getComputedStyle(el)
+  const named = (el.getAttribute("aria-label") || "") + " " + (el.title || "")
+  return r.width > 0 && r.height > 0 && s.visibility !== "hidden"
+    && (el.tagName === "AUDIO" || /play|pause|back \\d|forward \\d|seek|position|speed/i.test(named))
+}).map((el) => el.outerHTML.slice(0, 100))"""
+
+EDGES = """() => {
+  const left = (el) => { const r = el.getBoundingClientRect(), s = getComputedStyle(el); return r.left + parseFloat(s.paddingLeft) + parseFloat(s.borderLeftWidth) }
+  const name = (el) => el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + (el.className ? "." + String(el.className).split(" ")[0] : "")
+  const shown = [...document.querySelectorAll("body > header, main > section, body > footer")].filter((el) => getComputedStyle(el).display !== "none")
+  return { scroll: document.documentElement.scrollWidth, width: innerWidth, edges: shown.map((el) => [name(el), Math.round(left(el) * 10) / 10]) }
+}"""
+
+
+def alone(page: Path, where: Path) -> Path:
+    """A copy of the page in a folder of its own, with nothing beside it."""
+    where.mkdir()
+    return Path(shutil.copy(page, where / page.name))
+
+
+def audio_server(folder: Path) -> tuple[http.server.ThreadingHTTPServer, str]:
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=str(folder)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}/audio.opus"
+
+
+class FakeElevenLabs(http.server.ThreadingHTTPServer):
+    """Answers a transcription request with the fixture's response and ElevenLabs' cost headers,
+    and keeps each request's key, form fields and file."""
+
+    def __init__(self, response: dict):
+        self.response, self.requests = response, []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(handler) -> None:
+                body = handler.rfile.read(int(handler.headers["Content-Length"]))
+                message = email.parser.BytesParser().parsebytes(
+                    f"Content-Type: {handler.headers['Content-Type']}\r\n\r\n".encode() + body)
+                fields: dict[str, list[str]] = {}
+                files = {}
+                for part in message.get_payload():
+                    name = part.get_param("name", header="content-disposition")
+                    if part.get_filename():
+                        files[name] = part.get_payload(decode=True)
+                    else:
+                        fields.setdefault(name, []).append(part.get_payload(decode=True).decode())
+                self.requests.append({"key": handler.headers.get("xi-api-key"), "fields": fields, "files": files})
+                out = json.dumps(self.response).encode()
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/json")
+                handler.send_header("character-cost", "667")
+                handler.send_header("fiat-cost-before-overages", "0.0667")
+                handler.send_header("Content-Length", str(len(out)))
+                handler.end_headers()
+                handler.wfile.write(out)
+
+            def log_message(handler, *args) -> None:
+                pass
+
+        super().__init__(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server_address[1]}/v1/speech-to-text"
+
+
+# --- the properties
+
+
+@prop("P5 request", "the first run sends one complete transcription request, names not among its keyterms, and a rerun sends none")
+def p5_request(w: Work) -> None:
+    server = FakeElevenLabs(w.response)
+    out = w.root / "p5-request"
+    env = {"SCRIBE_API_URL": server.url}
+    r = w.scribe("run", str(w.recording), "--out", str(out), "--names", "Leah", "Andre", "Jenni",
+                 "--keyterms", "Artemis", "Gateway", env=env, offline=False)
+    w.scribe("run", str(w.recording), "--out", str(out), env=env, offline=False)
+    server.shutdown()
+    expect(len(server.requests) == 1, f"{len(server.requests)} transcription requests, not one")
+    got = server.requests[0]
+    want = {"model_id": ["scribe_v2"], "diarize": ["true"], "timestamps_granularity": ["word"],
+            "tag_audio_events": ["true"], "keyterms": ["Artemis", "Gateway"]}
+    expect(got["fields"] == want, f"the request's fields were {got['fields']}, not {want}")
+    expect(got["key"] == "fixture-no-key", f"the request carried the key {got['key']!r}")
+    expect(got["files"].get("file", b"")[:4] == b"fLaC", "the request carried no FLAC file")
+    expect("paid:   $0.07 to ElevenLabs, 667 credits" in r.stderr, f"the run did not report ElevenLabs' charge: {r.stderr[-400:]}")
+
+
+@prop("P1", "a quote is always a verbatim substring of the one turn it cites, after run and after regen")
+def p1(w: Work) -> None:
+    out = w.run(w.folder("p1"))
+    turns = {t["id"]: t["text"] for t in json.loads(read(out / "conversation.json"))["turns"]}
+
+    def quotes_hold(label: str) -> list[dict]:
+        quotes = json.loads(read(out / "analysis.json"))["quotes"]
+        for q in quotes:
+            expect(q["turn"] in turns, f"{label}: a quote cites {q['turn']}, which is not a turn: {q['text']!r}")
+            expect(q["text"] in turns[q["turn"]], f"{label}: {q['text']!r} is not in {q['turn']}: {turns[q['turn']]!r}")
+        md = read(out / "transcript.md")
+        spoken = "\n".join(transcript_turns(md))
+        for block in re.findall(r"(?m)^> (.+)$\n>$", md):
+            expect(block in spoken, f"{label}: transcript.md quotes {block!r}, which no turn in its transcript holds")
+        return quotes
+
+    # The fixture's six quotes: four verbatim, one with words dropped from the middle, which is
+    # repaired to the turn's own words, and one invented and one citing a missing turn, dropped.
+    quotes = {q["turn"]: q["text"] for q in quotes_hold("run")}
+    expect(sorted(quotes) == sorted(["t259", "t686", "t813", "t587", "t1581"]), f"after run the quotes cite {sorted(quotes)}")
+    repaired = "It was during COVID, and then the cool thing about this, everything about this, is that Reid Wiseman called me."
+    expect(quotes["t587"] == repaired, f"the quote with words dropped became {quotes['t587']!r}, not the turn's own {repaired!r}")
+
+    notes = json.loads((FIXTURE / "analysis.json").read_text())
+    notes["title"] = "Written again"
+    notes["quotes"].append({"turn": "t970", "text": "we have fewer selections and we select fewer astronauts", "note": "Near, not verbatim."})
+    again = w.root / "regen-notes.json"
+    again.write_text(json.dumps(notes))
+    before = read(out / "transcript.md")
+    w.scribe("regen", str(out), env={"SCRIBE_TEST_NOTES": str(again)})
+    after = read(out / "transcript.md")
+    expect("# Written again" in after, "regen left the notes as they were")
+    expect(transcript_part(after) == transcript_part(before), "regen changed the transcript itself")
+    quotes = {q["turn"]: q["text"] for q in quotes_hold("regen")}
+    expect(quotes.get("t970") == "we have fewer selections, and we select fewer astronauts.",
+           f"regen's near quote became {quotes.get('t970')!r}")
+
+
+@prop("P2 markdown", "a citation to a missing turn does not reach transcript.md")
+def p2_markdown(w: Work) -> None:
+    md = read(w.base / "transcript.md")
+    expect(NOTES_MARK in md, "transcript.md holds no notes, so this check cannot tell")
+    expect(MISSING_TURN not in md, f"transcript.md mentions {MISSING_TURN}")
+    expect("An ending nobody said" not in md, "the chapter that starts at a missing turn reached transcript.md")
+
+
+@prop("P2 page", "a citation to a missing turn does not reach report.html")
+def p2_page(w: Work) -> None:
+    page = read(w.base / "report.html")
+    expect(NOTES_MARK in page, "report.html holds no notes, so this check cannot tell")
+    expect(MISSING_TURN not in page, f"report.html carries {MISSING_TURN}")
+
+
+@prop("P3", "the statistics are counted from the transcript: Jenni's words, counted here from the response")
+def p3(w: Work) -> None:
+    words = sum(1 for x in w.response["words"] if x["type"] == "word" and x["speaker_id"] == "speaker_2")
+    md = read(w.base / "transcript.md")
+    header = next(line for line in md.splitlines() if line.startswith("| |"))
+    row = next(line for line in md.splitlines() if line.startswith("| Words |"))
+    cells = dict(zip([c.strip() for c in header.split("|")[2:-1]], [c.strip() for c in row.split("|")[2:-1]]))
+    expect(cells.get("Jenni") == f"{words:,}", f"Jenni's words are {cells.get('Jenni')} in transcript.md, {words:,} in the response")
+
+
+@prop("P4", "render rebuilds the same outputs from the folder, without a network")
+def p4(w: Work) -> None:
+    out = w.run(w.folder("p4"))
+    before = read(out / "transcript.md")
+    mark = w.mark()
+    w.scribe("render", str(out))
+    expect(read(out / "transcript.md") == before, "render wrote a different transcript.md from the same folder")
+    expect(not w.calls_since(mark), f"render called {w.calls_since(mark)}")
+
+
+@prop("P5", "a rerun never pays for a transcription again, in the same folder or another")
+def p5(w: Work) -> None:
+    out = w.folder("p5")
+    cached = (out / "cache" / "scribe.json").read_bytes()
+    w.run(out)
+    mark = w.mark()
+    w.run(out)
+    expect(not w.calls_since(mark), f"the second run with --out called {w.calls_since(mark)}")
+    expect((out / "cache" / "scribe.json").read_bytes() == cached, "the cached response was rewritten")
+
+    # the default place: the first run takes a saved response, the second finds its folder
+    saved = w.root / "saved-response.json"
+    saved.write_bytes(cached)
+    w.scribe("run", str(w.recording), "--transcription", str(saved))
+    made = sorted((w.root / "scribe").iterdir())
+    title = json.loads((FIXTURE / "analysis.json").read_text())["title"]
+    want = "2026-05-05-" + re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    expect([f.name for f in made] == [want], f"the default place holds {[f.name for f in made]}, not one folder {want}")
+    mark = w.mark()
+    w.scribe("run", str(w.recording))
+    expect(not w.calls_since(mark), f"the second run in the default place called {w.calls_since(mark)}")
+    expect([f.name for f in sorted((w.root / "scribe").iterdir())] == [want], "the second run made another folder")
+
+    # a new --out folder takes the response the others have, rather than paying (the run is offline)
+    elsewhere = w.root / "p5-elsewhere"
+    w.scribe("run", str(w.recording), "--out", str(elsewhere))
+    expect((elsewhere / "cache" / "scribe.json").read_bytes() == cached, "the new folder's response differs from the one on disk")
+
+
+@prop("P6", "with no audio beside it, the page loads and shows no player")
+def p6_no_audio(w: Work) -> None:
+    page = w.base / "report.html"
+    shown = on_page(page, VISIBLE_PLAYER)
+    expect(shown, "the page shows no player even with audio.opus beside it, so this check cannot tell")
+    shown = on_page(alone(page, w.root / "p6-alone"), VISIBLE_PLAYER)
+    expect(not shown, f"alone, the page still shows {shown}")
+
+
+@prop("P6 link", "with no audio beside it and its share link unreachable, the page shows no player")
+def p6_link(w: Work) -> None:
+    out = w.run(w.folder("p6-link"))
+    server, url = audio_server(out)
+    w.scribe("share", str(out), env={"SCRIBE_TEST_SHARE_URL": url})
+    page = alone(out / "report.html", w.root / "p6-link-alone")
+    until = (dt.date.today() + dt.timedelta(days=RETENTION_DAYS)).isoformat()
+    shown = on_page(page, VISIBLE_PLAYER)
+    expect(shown, "the page shows no player while its share link works, so this check cannot tell")
+    plays = on_page(page, "document.getElementById('plays').textContent")
+    expect(until in plays, f"the page says {plays!r} about the link, not until {until}")
+    expect(url in read(out / "transcript.md") and until in read(out / "transcript.md"), "transcript.md does not record the link and its date")
+    server.shutdown()
+    server.server_close()
+    shown = on_page(page, VISIBLE_PLAYER)
+    expect(not shown, f"with the link unreachable, the page still shows {shown}")
+
+
+@prop("P6 share", "share makes open links that never expire, and a second share keeps the audio's")
+def p6_share(w: Work) -> None:
+    out = w.run(w.folder("p6-share"))
+    mark = w.mark()
+    w.scribe("share", str(out))
+    w.scribe("share", str(out))
+    calls = [c for c in w.calls_since(mark) if not c.startswith("sftpgo-share list")]
+    remote = f"/scribe/{out.name}-{json.loads(read(out / 'conversation.json'))['meta']['sha256'][:8]}"
+    audio = [c for c in calls if "audio.opus" in c]
+    expect(len([c for c in audio if c.startswith("sftpgo-share upload")]) == 1, f"the audio went up more than once: {audio}")
+    creates = [c for c in audio if c.startswith("sftpgo-share create")]
+    expect(creates == [f"sftpgo-share create {remote}/audio.opus --open --expires never --json"], f"the audio's link was made as {creates}")
+    reports = [c for c in calls if c.startswith("sftpgo-share upload") and c.endswith(f"--to {remote} --overwrite") and ".html" in c]
+    expect(len(reports) == 2, f"the report went up {len(reports)} times in two shares, not twice")
+
+
+@prop("P7", "every section keeps one side margin and nothing scrolls sideways, 360 px up")
+def p7(w: Work) -> None:
+    for page in (w.base / "report.html", alone(w.base / "report.html", w.root / "p7-alone")):
+        for width in WIDTHS:
+            got = on_page(page, EDGES, width)
+            edges = got["edges"]
+            where = f"at {width} px, {'alone' if page.parent.name == 'p7-alone' else 'with its audio'}"
+            expect(len(edges) >= 3, f"{where} found only {edges} of the header, sections and footer")
+            xs = [x for _, x in edges]
+            expect(max(xs) - min(xs) <= 1, f"{where} the sections start at different x: {edges}")
+            expect(got["scroll"] <= got["width"], f"{where} the page is {got['scroll']} px wide, and scrolls sideways")
+
+
+@prop("P9", "every Claude call runs in safe mode with no tools")
+def p9(w: Work) -> None:
+    w.base  # noqa: B018, a run that names the speakers and writes the notes
+    calls = [c for c in w.calls.read_text().splitlines() if c.startswith("claude")]
+    expect(calls, "no Claude call was made, so this check cannot tell")
+    wrong = [c for c in calls if c != "claude safe-mode=yes tools=[]"]
+    expect(not wrong, f"calls without the isolation: {wrong}")
+
+
+@prop("P10", "a short stretch from a speaker silent 90 s either side goes to its neighbour, and nothing else moves")
+def p10(w: Work) -> None:
+    def lines_with(folder: Path, span: tuple[float, float]) -> tuple[str, list[str]]:
+        stray = text_between(w.response, *span)
+        return stray, [t for t in transcript_turns(read(folder / "transcript.md")) if stray in t]
+
+    before = text_between(w.response, PLANTED[0] - 1.2, PLANTED[0] - 0.01)
+    after = text_between(w.response, PLANTED[1] + 0.01, PLANTED[1] + 1.2)
+    out = w.run(w.folder("p10", relabelled(w.response, PLANTED, "speaker_2")))
+    stray, lines = lines_with(out, PLANTED)
+    expect(len(lines) == 1, f"{stray!r} is in {len(lines)} turns of transcript.md")
+    expect(before in lines[0] and after in lines[0], f"{stray!r} is not in one turn with {before!r} and {after!r}: {lines[0]!r}")
+    expect(re.match(r"\[[\d:]+\] \*\*Andre:\*\*", lines[0]), f"the stray's turn is not Andre's, the name the fixture gives him: {lines[0][:60]!r}")
+
+    for name, span, voice in (("p10-near", NEAR, "speaker_2"), ("p10-brief", BRIEF, "speaker_9")):
+        out = w.run(w.folder(name, relabelled(w.response, span, voice)))
+        stray, lines = lines_with(out, span)
+        expect(len(lines) == 1 and lines[0].split("** ", 1)[1].strip() == stray,
+               f"{name}: {stray!r} should keep a turn of its own, and is in {lines}")
+
+    # the unplanted fixture: every change of voice in the response is a change of turn
+    voices = [x["speaker_id"] for x in w.response["words"] if x["type"] != "spacing"]
+    changes = 1 + sum(a != b for a, b in zip(voices, voices[1:]))
+    turns = len(transcript_turns(read(w.base / "transcript.md")))
+    expect(turns == changes, f"the fixture has {changes} runs of one voice, and transcript.md {turns} turns: words moved")
+
+
+@prop("P12 markdown", "no raw turn id reaches transcript.md")
+def p12_markdown(w: Work) -> None:
+    md = read(w.base / "transcript.md")
+    expect(NOTES_MARK in md, "transcript.md holds no notes, so this check cannot tell")
+    ids = re.findall(r"\bt\d+\b", md)
+    expect(not ids, f"transcript.md shows turn ids {sorted(set(ids))}")
+
+
+@prop("P12 page", "no raw turn id reaches the text of report.html")
+def p12_page(w: Work) -> None:
+    text = on_page(w.base / "report.html", "document.body.innerText")
+    expect(NOTES_MARK in text, "the page shows no notes, so this check cannot tell")
+    ids = re.findall(r"\bt\d+\b", text)
+    expect(not ids, f"the page shows turn ids {sorted(set(ids))}")
+
+
+@prop("P14", "run never moves, changes or deletes the recording it was given, and copies it in unchanged")
+def p14(w: Work) -> None:
+    before = sha(w.recording), w.recording.stat().st_mtime_ns
+    out = w.run(w.folder("p14"))
+    expect(w.recording.exists(), "the recording is gone")
+    now = sha(w.recording), w.recording.stat().st_mtime_ns
+    expect(now == before, f"the recording was {before}, is {now}")
+    copy = out / w.recording.name
+    expect(copy.exists() and sha(copy) == before[0], "the folder holds no unchanged copy of the recording")
+
+
+@prop("rename", "rename relabels everywhere, keeps quotes as spoken, and merging two speakers keeps P1, P2 and P12")
+def rename(w: Work) -> None:
+    out = w.root / "rename"
+    shutil.copytree(w.base, out)
+    w.scribe("rename", str(out), "Andre=Andy")
+    md = read(out / "transcript.md")
+    expect("**Andy:**" in md and "**Andre:**" not in md, "the transcript still names Andre, or never Andy")
+    expect("Andy" in on_page(out / "report.html", "document.body.innerText"), "the page does not name Andy")
+    quotes = json.loads(read(out / "analysis.json"))["quotes"]
+    expect(any(q["text"].startswith("So Andre, you were selected") for q in quotes), "rename changed a quote's spoken words")
+
+    w.scribe("rename", str(out), "Andy=Leah")
+    conv = json.loads(read(out / "conversation.json"))
+    expect(sorted(sp["name"] for sp in conv["speakers"]) == ["Jenni", "Leah"], f"after the merge the speakers are {conv['speakers']}")
+    turns = {t["id"]: t["text"] for t in conv["turns"]}
+    an = json.loads(read(out / "analysis.json"))
+    for q in an["quotes"]:
+        expect(q["text"] in turns.get(q["turn"], ""), f"after the merge, {q['text']!r} is not in {q['turn']}")
+    for c in an["chapters"]:
+        expect(c["start_turn"] in turns, f"after the merge, a chapter starts at {c['start_turn']}, which is gone")
+    md = read(out / "transcript.md")
+    ids = re.findall(r"\bt\d+\b", md)
+    expect(not ids, f"after the merge, transcript.md shows turn ids {sorted(set(ids))}")
+
+
+if __name__ == "__main__":
+    sys.exit(run_properties(tyro.cli(Args, description=__doc__)))
