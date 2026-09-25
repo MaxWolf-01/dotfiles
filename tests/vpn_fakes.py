@@ -94,6 +94,8 @@ ENGINE_SECS = 2.0
 """How often tailscaled pushes an engine update."""
 RTT = 0.05
 """One round trip to any node that answers."""
+CONNECT_SECS = 3 * RTT
+"""How long a TCP connect that succeeds takes."""
 DEMAND = 1500
 """Bytes this machine's applications send through the exit node between two engine updates, unless a World
 says otherwise. A node that carries traffic answers with twice that."""
@@ -566,7 +568,7 @@ class World:
             self.tx[through] = self.tx.get(through, 0) + 120
             if carries:
                 self.rx[through] = self.rx.get(through, 0) + 120
-        self.advance(self.now + (3 * RTT if ok else timeout))
+        self.advance(self.now + (CONNECT_SECS if ok else timeout))
         self.step("connect", before, began=began, what=ok)
         return ok
 
