@@ -1,9 +1,20 @@
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
+let
+  # The colours are config rather than pywal's escapes, which it writes to
+  # every open terminal and would paint over bin/ssh-tint's tint. The prompt
+  # and LS_COLORS read the same file through wal's cache
+  # (zsh/wal-theme-config.zsh).
+  wal = builtins.fromJSON (builtins.readFile ../../zsh/wal-themes/ghibli-dark.json);
+in
 {
   programs.ghostty = {
     enable = true;
     enableZshIntegration = true;
     settings = {
+      background = wal.special.background;
+      foreground = wal.special.foreground;
+      cursor-color = wal.special.cursor;
+      palette = map (i: "${toString i}=${wal.colors."color${toString i}"}") (lib.range 0 15);
       font-family = "UbuntuSansMono Nerd Font Mono";
       shell-integration-features = "ssh-terminfo,ssh-env";
       confirm-close-surface = false;

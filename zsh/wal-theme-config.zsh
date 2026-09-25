@@ -9,7 +9,8 @@
 # WAL_THEME_IMAGE="$HOME/Pictures/cli-themes/kanagawa"
 # WAL_THEME_IMAGE="$HOME/Pictures/cli-themes/vaporwave-kanagawa"
 # WAL_THEME_IMAGE="$HOME/Pictures/cli-themes/black-hole"
-# Or use a custom JSON theme
+# Or use a custom JSON theme. The terminal's own colours come from
+# nix/home/ghostty.nix, which reads this file too: change both together.
 WAL_THEME_FILE="$HOME/.dotfiles/zsh/wal-themes/ghibli-dark.json"
 # WAL_THEME_FILE="$HOME/.dotfiles/zsh/wal-themes/ghibli-dark-original.json"
 # Or use a built-in theme instead
@@ -42,14 +43,15 @@ _wal_adjust_brightness() {
     printf "%d;%d;%d" "$r" "$g" "$b"
 }
 
-# Apply the theme
+# Write the theme to wal's cache. -s keeps wal from sending it to every open
+# terminal, where it would reset the background bin/ssh-tint sets.
 _apply_wal_theme() {
     if [[ -n "$WAL_THEME_NAME" ]]; then
-        wal --theme "$WAL_THEME_NAME" &> /dev/null
+        wal -s --theme "$WAL_THEME_NAME" &> /dev/null
     elif [[ -n "$WAL_THEME_FILE" ]]; then
-        wal -f "$WAL_THEME_FILE" &> /dev/null
+        wal -s -f "$WAL_THEME_FILE" &> /dev/null
     elif [[ -n "$WAL_THEME_IMAGE" ]]; then
-        wal -i "$WAL_THEME_IMAGE" &> /dev/null
+        wal -s -i "$WAL_THEME_IMAGE" &> /dev/null
     fi
 }
 
