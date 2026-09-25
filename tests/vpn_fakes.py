@@ -94,8 +94,8 @@ ENGINE_SECS = 2.0
 RTT = 0.05
 """One round trip to any node that answers."""
 DEMAND = 1500
-"""Bytes this machine's applications send through the exit node between two engine updates. A node that
-carries traffic answers with twice that."""
+"""Bytes this machine's applications send through the exit node between two engine updates, unless a World
+says otherwise. A node that carries traffic answers with twice that."""
 AFTER_SECS = 120.0
 """How long a run goes on after its last timed event."""
 HANG_SECS = 1800.0
@@ -335,6 +335,8 @@ class World:
         """tailscaled does not answer."""
         self.running = True
         """tailscale is up, as prefs' WantRunning says."""
+        self.demand = DEMAND
+        """Bytes this machine's applications send through the exit node between two engine updates."""
         self.status_reads = 0
         """Full status readings bin/vpn took through its port."""
         self.looked: list[float] = []
@@ -570,10 +572,10 @@ class World:
             self.ready.append(arrival)
 
     def engine_update(self) -> None:
-        if self.exit is not None:
-            self.tx[self.exit] = self.tx.get(self.exit, 0) + DEMAND
+        if self.exit is not None and self.demand:
+            self.tx[self.exit] = self.tx.get(self.exit, 0) + self.demand
             if self.carries(self.exit):
-                self.rx[self.exit] = self.rx.get(self.exit, 0) + 2 * DEMAND
+                self.rx[self.exit] = self.rx.get(self.exit, 0) + 2 * self.demand
         self.at(self.now + ENGINE_SECS, self.engine_update)
         if self.now < self.quiet_until:
             return
