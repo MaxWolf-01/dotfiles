@@ -147,9 +147,11 @@ with tailscaled's own catch-all and silently defeats filtering. `dns-blocked`
 answers "is this domain blocked, and by which list". Chain, gotchas, and the
 captive-portal escape (`portal`): `docs/dns.md`.
 
-Mullvad exit node: Cloudflare blocks some node IPs for Chrome-family clients
-(Electron apps break, browsers work) — `vpn` (`bin/vpn`) verifies and rotates,
-and its watcher service (`vpn watch`) re-checks; rationale in `vpn --help`.
+Mullvad exit node: `vpn` (`bin/vpn`). Its watcher service (`vpn watch`) is the
+one process that changes the exit node, and the `vpn` commands are its clients.
+It moves off a node Cloudflare blocks for Chrome-family clients (Electron apps
+break, browsers work), one that reports itself offline, and one that goes
+silent; what it does and why: `vpn --help`.
 The watcher also publishes the exit node's state, shown as a dot in the top bar
 by the GNOME extension in `desktop/vpn-dot`.
 

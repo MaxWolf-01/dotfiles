@@ -691,22 +691,10 @@ class Line:
 
 
 def line(stats: dict) -> Line:
-    """Read a line in either vocabulary: `by`, `from` and `to`, or today's `command`, `node` and `rotated_to`. A
-    move that stayed names in `rotated_to` where the exit node landed, when that is not where it started."""
-    event = stats.get("event", "")
-    if "by" in stats:
-        frm, to = stats.get("from"), stats.get("to")
-        return Line(event, event != "silent" and frm != to, stats["by"] == "outside", frm, to)
-    node, to = stats.get("node"), stats.get("rotated_to")
-    if event in ("pinned", "rotated", "offline", "changed"):
-        return Line(event, True, event == "changed", node, to)
-    if event == "clean" and to:
-        return Line(event, True, False, node, to)
-    if event == "off":
-        return Line(event, True, False, node, None)
-    if event in ("exhausted", "unreachable", "cancelled") and to:
-        return Line(event, True, False, node, to)
-    return Line(event, False, False, node, to)
+    """Read a node-log line. `to` is where the exit node was after it, so a line from one node to another
+    records a change."""
+    event, frm, to = stats.get("event", ""), stats.get("from"), stats.get("to")
+    return Line(event, event != "silent" and frm != to, stats.get("by") == "outside", frm, to)
 
 
 # --------------------------------------------------------------------------

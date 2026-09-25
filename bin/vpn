@@ -16,9 +16,9 @@ A move, asked for or the watcher's own, sends a handshake probe to its next 8 no
 
 Where a move goes from a node: the rest of its city, then the rest of its country, then Germany, Austria, Switzerland and the Netherlands, city by city, skipping nodes that report themselves offline. A city's nodes are dealt round-robin by provider series, the hundreds digit of a node's number, into one fixed cycle. The first node tried is the one after the current node in that cycle; each after it is the next one in the cycle from another provider, while the city has one. So repeated `vpn next` visits every node of a city before any twice, and a provider that fails costs one try, not the whole move.
 
-When the watcher has to leave a node, it moves off it the same way, and after a move that pinned nothing it tries again 5 minutes later.
+The watcher moves off a node the same way when Cloudflare blocks it, when it reports itself offline, and when it goes silent. After a move of its own that pinned nothing it starts none for 5 minutes. When no node answers the probe of a move off a silent node, it stays on that node, and probes again every 30 s while the silence lasts. It never turns the VPN off, and a node it moved to stays pinned until `vpn on`.
 
-Every change of exit node, the watcher's own and every one made outside vpn, and every time the exit node went silent, is one line in ~/logs/runs/vpn.jsonl (bin/run-log). The watcher also writes an hourly heartbeat to ~/logs/runs/vpn-watch.jsonl.
+Every change of exit node, the watcher's own and every one made outside vpn, is one line in ~/logs/runs/vpn.jsonl (bin/run-log), and so is a silence the watcher did not move off. `vpn rewrite-log` brings lines from before the watcher was the one controller into that vocabulary. The watcher also writes an hourly heartbeat to ~/logs/runs/vpn-watch.jsonl.
 
 Needs the tailscale operator grant (no sudo).
 
@@ -87,6 +87,8 @@ BLIND_SECS = 60
 """How long an exit node may be set with no engine update before the heartbeat calls the watcher blind."""
 BACKOFF_SECS = 300
 """How long the watcher starts no recovery after one that did not leave a working node."""
+REPROBE_SECS = 30
+"""How often the watcher probes again while its exit node is silent and no Mullvad node answered its last probe."""
 LOOK_SECS = 10
 """How often the watcher looks while an exit node is set. Vesktop opening and the event bus going quiet send
 nothing on the bus."""
@@ -161,18 +163,19 @@ RUN_LOG = Path(__file__).resolve().parent / "run-log"
 """Reached relative to this script, not through PATH: the systemd unit pins its own PATH and it does not carry ~/bin."""
 
 Verdict = Literal["clean", "blocked", "unreachable"]
-Cause = Literal["blocked", "offline"]
 Stop = Literal["superseded", "cancelled", "outside"]
 """Why a running move must stop: a newer request, its client gone, an outside change."""
 STOPPED: dict[Stop, str] = {"outside": "superseded by a change of exit node outside vpn",
                             "superseded": "superseded by a newer request", "cancelled": "cancelled"}
 """The words that begin the final line of a request that a stop ended."""
-Event = Literal["clean", "rotated", "offline", "pinned", "changed", "off", "exhausted", "unreachable",
-                "cancelled", "silent"]
+Event = Literal["moved", "on", "off", "changed", "stayed", "silent"]
+"""What a node-log line records: a change of exit node, or a silence the watcher observed."""
 State = Literal["up", "down", "off", "unknown"]
 Asked = Literal["on", "off", "next", "to"]
 """What a client can ask the watcher for."""
 Command = Literal[Asked, "watch"]
+By = Literal[Command, "outside"]
+"""Who made the change a node-log line records."""
 Mode = Literal["off", "automatic", "pinned"]
 """How the exit node is chosen."""
 
@@ -265,8 +268,9 @@ def mode(prefs: dict | None) -> Literal["off", "automatic", "pinned", "unknown"]
     return "off"
 
 
-def vpn_state(prefs: dict | None, status: dict | None, silent: bool) -> tuple[State, str]:
-    """The state the dot shows, and why: what prefs ask for against what status delivers.
+def vpn_state(prefs: dict | None, status: dict | None, silent: bool, stranded: bool = False) -> tuple[State, str]:
+    """The state the dot shows, and why: what prefs ask for against what status delivers. `stranded`: no
+    Mullvad node answered the probe of the watcher's last move off a silent node.
 
     Off comes from prefs alone. A status with no exit node while prefs name one
     is an outage, as when Tailnet Lock dropped every peer from the netmap.
@@ -286,7 +290,7 @@ def vpn_state(prefs: dict | None, status: dict | None, silent: bool) -> tuple[St
     if exit.online is False:
         return "down", "the node reports itself offline"
     if silent:
-        return "down", "the node stopped answering"
+        return "down", "no Mullvad node answers" if stranded else "the node stopped answering"
     return "up", ""
 
 
@@ -464,20 +468,12 @@ def log_run(unit: str, outcome: str, reason: str = "", stats: dict | None = None
         print(f"vpn: could not write the run log for {unit}: {proc.stderr.strip()}", file=sys.stderr)
 
 
-def log_node(
-    outcome: str,
-    event: Event,
-    command: Command,
-    node: str | None = None,
-    to: str | None = None,
-    tried: int = 0,
-    reason: str = "",
-    secs: int | None = None,
-) -> None:
-    """One line about the exit node, in the shape the dns/vpn dashboard reads.
-    `node` is the node the line is about, `to` the node it moved to, `secs` how
-    long a silent node went unanswered."""
-    stats = {"event": event, "command": command, "node": node, "rotated_to": to, "tried": tried}
+def log_node(outcome: str, event: Event, by: By, frm: str | None, to: str | None, why: str | None = None,
+             tried: int = 0, reason: str = "", secs: int | None = None) -> None:
+    """One node-log line, in the shape the dns/vpn dashboard reads. `from` and
+    `to` are the exit node before and after the line, null for none; `why` is
+    the cause of a move; `secs` how long a silent node went unanswered."""
+    stats = {"event": event, "by": by, "from": frm, "to": to, "why": why, "tried": tried}
     if secs is not None:
         stats["secs"] = secs
     log_run(NODE_UNIT, outcome, reason, stats)
@@ -851,6 +847,7 @@ def move(
     batch = candidates[:MAX_TRIES]
     if not batch:
         return Outcome("stayed", None, "unanswered", 0, f"no online node to move to; {put_back(start, ports)}", why)
+    say(f"probing {batch[0].name if len(batch) == 1 else f'the next {len(batch)} nodes'} …")
     answered = probe(batch, liveness, ports, stop)
     if (stopped := stop()) is not None:
         return halt(stopped)
@@ -976,6 +973,12 @@ class Silence:
     """The engine update that first saw the traffic go unanswered."""
     seen: float
     """The last engine update that found the node still silent."""
+    recovered: bool = False
+    """Whether a recovery acted on it. Its node-log line records the silence, so the silence's end writes none."""
+    stranded: bool = False
+    """Whether no Mullvad node answered the last recovery's probe."""
+    retry_at: float = float("-inf")
+    """When the next recovery from it may start."""
 
 
 @dataclass(frozen=True)
@@ -1036,6 +1039,8 @@ class Watch:
     moving: Command | None = None
     """Whose move set the exit node where the node log does not have it yet: the request's, or "watch" for the
     watcher's own."""
+    moving_why: Why | None = None
+    """Why that move is made; None while `vpn on` checks automatic mode's pick, before any move."""
     verified_id: str = ""
     """The node the Discord check last passed, forgotten whenever Vesktop is seen closed."""
     last_check: float = 0.0
@@ -1164,13 +1169,14 @@ def take(w: Watch, prefs: dict, ports: Ports) -> None:
         w.backlog.popleft().client.finish(False, unstarted("outside"))
     left, name = name_of(w, ours.node, ports), name_of(w, now.node, ports)
     if w.moving is not None and left != w.logged:
-        # The change a stopped move made before this one is the move's, and the log has not had it.
-        log_line(w, "skip", "cancelled", w.moving, w.logged, left,
-                 reason=f"stopped on {left or 'no exit node'} by a change of exit node outside vpn")
+        # The change a stopped move made before this one is the move's, and the log has not had it: `vpn on`
+        # turning automatic mode on, or the node a move had set.
+        log_line(w, "skip", "on" if w.moving == "on" and w.moving_why is None else "stayed", w.moving, w.logged,
+                 left, w.moving_why, reason=f"stopped on {left or 'no exit node'} by a change of exit node outside vpn")
         w.moving = None
     print(f"exit node changed outside vpn: {left or 'none'} → {name or 'none'}")
     if name != w.logged:
-        log_line(w, "ok", "changed", "watch", w.logged, name)
+        log_line(w, "ok", "changed", "outside", w.logged, name)
 
 
 def setting(w: Watch, prefs: dict) -> Setting:
@@ -1257,10 +1263,10 @@ def unstarted(stopped: Stop) -> str:
     return f"{STOPPED[stopped]}; nothing changed"
 
 
-def begin_move(w: Watch, by: Command | None) -> None:
-    """Start a move by `by`, or with None a request before its move or the look's check, with no outside change
-    seen and none of its sets logged."""
-    w.outside, w.moving = False, by
+def begin_move(w: Watch, by: Command | None, why: Why | None = None) -> None:
+    """Start a move by `by`, made because of `why`, or with None a request before its move or the look's check,
+    with no outside change seen and none of its sets logged."""
+    w.outside, w.moving, w.moving_why = False, by, why
 
 
 def serve(w: Watch, request: Request, ports: Ports) -> None:
@@ -1310,8 +1316,7 @@ def serve_on(w: Watch, request: Request, ports: Ports, stop: Callable[[], Stop |
         heard = ("Discord check clean" if verdict == "clean"
                  else "the Discord check got no answer, which says nothing about the node")
         w.moving = None
-        log_line(w, "ok", "clean", "on", start.name, picked.name if picked.name != start.name else None,
-                 reason="" if verdict == "clean" else heard)
+        log_line(w, "ok", "on", "on", start.name, picked.name, reason="" if verdict == "clean" else heard)
         return True, f"exit node: {picked.name} (automatic, {heard})"
     if picked is None:
         leaving = f"automatic mode picked no node within {PICK_SECS} s"
@@ -1320,10 +1325,10 @@ def serve_on(w: Watch, request: Request, ports: Ports, stop: Callable[[], Stop |
                    else f"{picked.name} carries no traffic; moving off it")
     if stop() is None:
         say(leaving)
+    w.moving_why = "blocked" if verdict == "blocked" else "silent"
     # A stop that came while the pick was checked ends this move at its first step.
-    outcome = move(start, candidates(picked, nodes), "blocked" if verdict == "blocked" else "offline", True, say,
-                   stop, w.live, ports)
-    record(w, "on", start, outcome, ports, moved="pinned", reason=leaving)
+    outcome = move(start, candidates(picked, nodes), w.moving_why, True, say, stop, w.live, ports)
+    record(w, "on", start, outcome, ports, reason=leaving)
     if outcome.because == "unanswered":
         return False, f"egress never reached Mullvad, and {outcome.reason} (portal: run `portal`)"
     return outcome.kind == "moved", outcome.reason
@@ -1349,7 +1354,7 @@ def asked(w: Watch, request: Request, start: Start, options: list[Node], ports: 
     """The move `vpn next` or `vpn to` asks for, through `options`: run and recorded."""
     if not options:
         raise VpnError("no online node to move to")
-    begin_move(w, request.request)
+    begin_move(w, request.request, "asked")
     outcome = move(start, options, "asked", True, request.client.say, stop, w.live, own(w, ports))
     record(w, request.request, start, outcome, ports)
     return outcome.kind == "moved", outcome.reason
@@ -1359,24 +1364,21 @@ def serve_off(w: Watch, request: Request, ports: Ports, stop: Callable[[], Stop 
     prefs, status = reading(w, ports)
     left = start_of(prefs, status).name
     own(w, ports).tailscaled.set_exit_node("")
-    log_line(w, "ok", "off", "off", left)
+    log_line(w, "ok", "off", "off", left, None)
     return True, "exit node off"
 
 
 SERVED = {"on": serve_on, "to": serve_to, "next": serve_next, "off": serve_off}
 
 
-MOVED: dict[Why, Event] = {"asked": "pinned", "blocked": "rotated", "offline": "offline", "silent": "offline"}
-"""The node-log event of a move that pinned a node, by why it was made."""
-
-
-def record(w: Watch, by: Command, start: Start, outcome: Outcome, ports: Ports, moved: Event | None = None,
-           reason: str = "") -> None:
-    """The node-log line for a move's Outcome, in the events the dns/vpn
-    dashboard reads, plus `cancelled` for a move that Ctrl-C or a newer request
-    stopped. `moved` overrides the event of a move that pinned a node, and
-    `reason` says why it was made. A move an outside change superseded writes
-    none: `take` logged it with the outside change.
+def record(w: Watch, by: Command, start: Start, outcome: Outcome, ports: Ports, reason: str = "",
+           again: bool = False) -> None:
+    """The node-log line for a move's Outcome: `moved` for one that pinned a
+    node, with `reason` saying why it was made, and `stayed` for one that did
+    not, failed, or skipped when Ctrl-C or a newer request stopped it. A move an
+    outside change superseded writes none: `take` logged it with the outside
+    change. With `again`, a move that stayed where it started writes none either:
+    the silence it recovered from already has its line.
 
     A move that stayed names where the exit node landed when that is not where
     it started, as when automatic mode took the place of a node outside Mullvad.
@@ -1389,19 +1391,17 @@ def record(w: Watch, by: Command, start: Start, outcome: Outcome, ports: Ports, 
         return
     if outcome.kind == "moved" and outcome.node is not None:
         w.moving = None
-        log_line(w, "ok", moved or MOVED[outcome.why], by, start.name, outcome.node.name, outcome.tried, reason)
+        log_line(w, "ok", "moved", by, start.name, outcome.node.name, outcome.why, outcome.tried, reason)
         return
     now = landing(w, ports)
     if w.outside and w.moving is None:
         return
     w.moving = None
     landed = start.name if now is None or w.outside else name_of(w, now.node, ports)
-    to = landed if landed != start.name else None
-    if outcome.because in ("cancelled", "superseded"):
-        log_line(w, "skip", "cancelled", by, start.name, to, outcome.tried, outcome.reason)
-    else:
-        log_line(w, "fail", "exhausted" if outcome.carried else "unreachable", by, start.name, to, outcome.tried,
-                 outcome.reason)
+    if again and landed == start.name:
+        return
+    log_line(w, "skip" if outcome.because in ("cancelled", "superseded") else "fail", "stayed", by, start.name,
+             landed, outcome.why, outcome.tried, outcome.reason)
 
 
 def landing(w: Watch, ports: Ports) -> Setting | None:
@@ -1419,14 +1419,11 @@ def landing(w: Watch, ports: Ports) -> Setting | None:
         w.live.wait(PICK_POLL_SECS)
 
 
-def log_line(w: Watch, outcome: str, event: Event, by: Command, node: str | None, to: str | None = None,
+def log_line(w: Watch, outcome: str, event: Event, by: By, frm: str | None, to: str | None, why: Why | None = None,
              tried: int = 0, reason: str = "") -> None:
-    """Write one node-log line, and keep where the log has the exit node."""
-    log_node(outcome, event, by, node, to, tried, reason)
-    if event == "off":
-        w.logged = None
-    elif event == "changed" or to is not None:
-        w.logged = to
+    """Write one node-log line about a change of exit node, and keep where the log has the exit node."""
+    log_node(outcome, event, by, frm, to, why, tried, reason)
+    w.logged = to
 
 
 def name_of(w: Watch, node_id: str, ports: Ports) -> str | None:
@@ -1466,15 +1463,19 @@ def learn(w: Watch, status: dict) -> None:
                 w.ids[name.split("/")[0]] = peer["ID"]
 
 
-def recover(w: Watch, cause: Cause, ports: Ports) -> None:
-    """Move the exit node off a node that Cloudflare blocks or that stopped
-    carrying traffic, from its place in the walk order.
+def recover(w: Watch, cause: Why, ports: Ports) -> None:
+    """Move the exit node off a node that Cloudflare blocks, that reports itself
+    offline or that is silent, from its place in the walk order.
 
     The Discord check runs on each node tried only while Vesktop runs, and a
     node pinned then is remembered as checked. A move that stays puts the node
     back, and no recovery starts for BACKOFF_SECS after it, unless a request or
-    an outside change stopped it.
+    an outside change stopped it. Off a silent node, a move no node answered
+    starts none for REPROBE_SECS instead, and within one silence only the first
+    move that stays is logged.
     """
+    began = ports.clock.now()
+    silence = w.silence if cause == "silent" else None
     vesktop = ports.vesktop()
     try:
         prefs, status = reading(w, ports)
@@ -1486,20 +1487,27 @@ def recover(w: Watch, cause: Cause, ports: Ports) -> None:
     if start.node is None:
         print("the exit node is not a Mullvad node tailscaled lists; leaving it alone")
         return
-    print(f"moving off {start.node.name}: "
-          f"{'Cloudflare blocks it' if cause == 'blocked' else 'it stopped carrying traffic'}")
-    begin_move(w, "watch")
+    print(f"moving off {start.node.name}: {LEAVING[cause]}")
+    begin_move(w, "watch", cause)
     outcome = move(start, candidates(start.node, mullvad_nodes(status)), cause, vesktop, print,
                    lambda: interrupted(w, ports), w.live, own(w, ports))
-    record(w, "watch", start, outcome, ports)
+    record(w, "watch", start, outcome, ports, again=silence is not None and silence.recovered)
     print(outcome.reason)
+    unanswered = outcome.because == "unanswered"
+    if silence is not None and w.silence is not None:
+        w.silence = replace(w.silence, recovered=True, stranded=unanswered, retry_at=began + REPROBE_SECS)
     if outcome.kind == "moved" and outcome.node is not None:
         if vesktop:
             checked(w, outcome.node, ports.clock.now())
         return
-    if outcome.kind == "superseded" or outcome.because == "superseded":
+    if outcome.kind == "superseded" or outcome.because == "superseded" or (silence is not None and unanswered):
         return
     w.backoff_until = ports.clock.now() + BACKOFF_SECS
+
+
+LEAVING: dict[Why, str] = {"blocked": "Cloudflare blocks it", "offline": "it reports itself offline",
+                           "silent": "it stopped answering", "asked": "asked to"}
+"""Why the watcher moves off a node, as its journal says."""
 
 
 def look(w: Watch, ports: Ports) -> float:
@@ -1524,9 +1532,11 @@ def look(w: Watch, ports: Ports) -> float:
         return FALLBACK_SECS
 
     w.looked_silent = live.silent()
-    prefs = ports.tailscaled.prefs()
-    publish(w, *vpn_state(prefs, poll, w.looked_silent), node, mode(prefs), now)
     record_silence(w, live)
+    prefs = ports.tailscaled.prefs()
+    silence = w.silence
+    publish(w, *vpn_state(prefs, poll, w.looked_silent, silence is not None and silence.stranded), node,
+            mode(prefs), now)
 
     if not state.id or now < w.backoff_until:
         return wait_until_due(w, now, live.streaming(), state)
@@ -1534,6 +1544,10 @@ def look(w: Watch, ports: Ports) -> float:
     if state.online is False:
         recover(w, "offline", ports)
         return FALLBACK_SECS
+
+    if silence is not None and node is not None and now >= silence.retry_at:
+        recover(w, "silent", ports)
+        return 1.0  # the dot shows where the move left things at once
 
     if vesktop and (state.id != w.verified_id or now - w.last_check >= RECHECK_SECS):
         w.last_check = now
@@ -1550,7 +1564,7 @@ def look(w: Watch, ports: Ports) -> float:
         elif result == "blocked" or not traffic_proof(node, live, ports, stop):
             if stop() is not None:
                 return 1.0
-            recover(w, "blocked" if result == "blocked" else "offline", ports)
+            recover(w, "blocked" if result == "blocked" else "silent", ports)
             return FALLBACK_SECS
         else:
             print("Discord did not answer but the node carries traffic; not a node problem, staying")
@@ -1565,8 +1579,9 @@ def checked(w: Watch, node: Node, now: float) -> None:
 
 def record_silence(w: Watch, live: Liveness) -> None:
     """Record each time the exit node goes silent: printed when it starts, and
-    one node-log line when it ends, saying how long it lasted up to the last
-    engine update that found it silent."""
+    printed when it ends, saying how long it lasted up to the last engine update
+    that found it silent. A silence no recovery acted on is also one node-log
+    line then."""
     since = live.unanswered_since if live.silent() else None
     if since is not None and w.silence is None:
         seen = live.samples[-1].at
@@ -1579,7 +1594,8 @@ def record_silence(w: Watch, live: Liveness) -> None:
         secs = round(ended.seen - ended.since)
         reason = f"{ended.node or 'the exit node'} answered nothing for at least {secs} s"
         print(reason)
-        log_node("ok", "silent", "watch", ended.node, reason=reason, secs=secs)
+        if not ended.recovered:
+            log_node("ok", "silent", "watch", ended.node, ended.node, reason=reason, secs=secs)
 
 
 def publish(w: Watch, state: State, reason: str, node: Node | None, how: str, now: float) -> None:
@@ -1610,6 +1626,8 @@ def wait_until_due(w: Watch, now: float, streaming: bool, state: ExitState) -> f
         due.append(FALLBACK_SECS)
     if state.id:
         due.append(LOOK_SECS)
+    if w.silence is not None and w.silence.stranded:
+        due.append(w.silence.retry_at - now)
     return max(1.0, min(due))
 
 
@@ -2135,6 +2153,71 @@ def list_(args: ListArgs) -> None:
         print(f"{mark} {row['name']:18s} {row['city']:22s} {'online' if row['online'] else 'offline'}")
 
 
+OLD_CHANGES = {"rotated": "blocked", "offline": "offline", "pinned": "asked"}
+"""The old events of a move that pinned a node, and why the move was made."""
+
+
+def rewritten(record: dict) -> dict:
+    """One node-log line of the vocabulary before the watcher became the one controller, in today's. A line
+    already in today's comes back as it is.
+
+    The old lines named `command` (none for vpn-pick, `vpn on`'s predecessor), `node` and `rotated_to`. The
+    events that pinned a node become `moved`, `clean` becomes `on`, `changed` a change by `outside`, and the
+    endings that pinned nothing (`exhausted`, `unreachable`, `cancelled`) and a Discord check that got no
+    answer (`canary-unreachable`) become `stayed` and `on`. `to` is where the exit node was after the line."""
+    stats = record.get("stats") or {}
+    if "by" in stats:
+        return record
+    event, node, target = stats.get("event"), stats.get("node"), stats.get("rotated_to")
+    by = stats.get("command") or "on"
+    asked = by in ("to", "next")
+    if event in OLD_CHANGES:
+        why = "asked" if asked else OLD_CHANGES[event]
+        if by == "on":
+            why = "blocked" if event == "rotated" or "Cloudflare" in (record.get("reason") or "") else "silent"
+        new = {"event": "moved", "by": by, "from": node, "to": target, "why": why}
+    elif event in ("clean", "canary-unreachable"):
+        new = {"event": "on", "by": by, "from": node, "to": target or node, "why": None}
+    elif event == "changed":
+        new = {"event": "changed", "by": "outside", "from": node, "to": target, "why": None}
+    elif event == "off":
+        new = {"event": "off", "by": "off", "from": node, "to": None, "why": None}
+    elif event in ("exhausted", "unreachable", "cancelled"):
+        why = "asked" if asked else {"on": "blocked" if event == "exhausted" else "silent",
+                                     "watch": "blocked" if event == "exhausted" else "offline"}.get(by)
+        new = {"event": "stayed", "by": by, "from": node, "to": target or node, "why": why}
+    elif event == "silent":
+        new = {"event": "silent", "by": "watch", "from": node, "to": node, "why": None, "secs": stats.get("secs")}
+    else:
+        return record
+    new["tried"] = stats.get("tried", 0)
+    return record | {"unit": NODE_UNIT, "stats": new}
+
+
+@dataclass
+class RewriteArgs:
+    log: Path = Path(os.environ.get("RUN_LOG_DIR", Path.home() / "logs/runs")) / f"{NODE_UNIT}.jsonl"
+    """The node log to rewrite."""
+
+
+@app.command(name="rewrite-log")
+def rewrite_log(args: RewriteArgs) -> None:
+    """Rewrite the node log's lines from before the watcher became the one controller into today's vocabulary, once.
+
+    The log as it was is kept beside it, with `.before-rewrite` appended to its name, and a second run leaves that
+    copy alone. Lines already in today's vocabulary stay as they are.
+    """
+    copy = args.log.with_name(args.log.name + ".before-rewrite")
+    if not copy.exists():
+        copy.write_bytes(args.log.read_bytes())
+    lines = [json.dumps(rewritten(json.loads(text)), ensure_ascii=False, separators=(",", ":"))
+             for text in args.log.read_text().splitlines() if text.strip()]
+    partial = args.log.with_name(args.log.name + ".partial")
+    partial.write_text("".join(f"{line}\n" for line in lines))
+    partial.replace(args.log)
+    print(f"rewrote {len(lines)} lines of {args.log}; the log as it was is {copy}")
+
+
 @app.command(name="watch")
 def watch() -> None:
     """Keep the exit node working: the long-running watcher, not a one-off check.
@@ -2146,16 +2229,16 @@ def watch() -> None:
     - No exit node set: it only records changes.
     - The exit node reports itself offline: it moves off it, as `vpn --help` describes, with the Discord check only while Vesktop runs.
     - While Vesktop runs: it runs the Discord check on every new node and every 10 minutes. When a 403 persists past the confirmation wait, or the check gets no answer and the node fails the traffic proof, it moves off the node.
-    - The exit node goes silent (traffic went into its tunnel 20 s ago and nothing has come back since): it records how long that lasted as one line in ~/logs/runs/vpn.jsonl, and moves nothing. A gap between engine updates longer than 20 s, a suspend for one, starts the count over, and while the stream is closed no node counts as silent.
+    - The exit node goes silent (traffic went into its tunnel 20 s ago and nothing has come back since): it moves off it. When no node answers that move's probe, it stays, the dot says no Mullvad node answers, and it probes again every 30 s until the silence ends or a probe finds a node. A gap between engine updates longer than 20 s, a suspend for one, starts the count over, and while the stream is closed no node counts as silent.
 
-    After a move of its own that pinned nothing, it starts no other for 5 minutes. It records every exit-node change it did not make itself, once, and writes an hourly heartbeat, which fails when an exit node is set and no engine update has come for 60 seconds.
+    After a move of its own that pinned nothing, other than one off a silent node that no node answered, it starts no other for 5 minutes. It records every exit-node change it did not make itself, once, and writes an hourly heartbeat, which fails when an exit node is set and no engine update has come for 60 seconds.
 
     It publishes the state for the top-bar dot to $XDG_RUNTIME_DIR/vpn-state.json whenever it changes:
 
         {"state": "up|down|off|unknown", "reason": "str", "mode": "off|automatic|pinned|unknown",
          "node": "str|null", "city": "str|null", "country": "str|null", "since": "ISO 8601"}
 
-    off: no exit node set, or tailscale stopped. down: an exit node is set, and tailscale is not running, or the node is missing from its status, reports itself offline, or is silent. unknown: tailscaled does not answer. Nothing is published while a move runs.
+    off: no exit node set, or tailscale stopped. down: an exit node is set, and tailscale is not running, or the node is missing from its status, reports itself offline, or is silent (reason "no Mullvad node answers" once a move off it found none answering). unknown: tailscaled does not answer. Nothing is published while a move runs.
     """
     arrivals: queue.Queue[Arrival] = queue.Queue()
     run_watcher(real_ports(WATCH_MASK, arrivals), arrivals.put, REQUEST_SOCKET)
