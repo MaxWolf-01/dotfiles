@@ -1021,6 +1021,9 @@ class Watch:
     """Whether an outside change came since the running move, or the look's check, began."""
     backlog: deque[Request] = field(default_factory=deque)
     """Requests that arrived while the watcher was busy, oldest first."""
+    moving: Command | None = None
+    """Whose move set the exit node where the node log does not have it yet: the request's, or "watch" for the
+    watcher's own."""
     verified_id: str = ""
     """The node the Discord check last passed, forgotten whenever Vesktop is seen closed."""
     last_check: float = 0.0
@@ -1142,12 +1145,18 @@ def take(w: Watch, prefs: dict, ports: Ports) -> None:
             return
     if now == w.at:
         return
+    ours = w.mine[-1] if w.mine else w.at
     w.at, w.outside = now, True
     w.mine.clear()
     while w.backlog:
         finish(w.backlog.popleft(), False, f"{STOPPED['outside']}; nothing changed")
-    name = name_of(w, now[1], ports)
-    print(f"exit node changed outside vpn: {w.logged or 'none'} → {name or 'none'}")
+    left, name = name_of(w, ours[1], ports), name_of(w, now[1], ports)
+    if w.moving is not None and left != w.logged:
+        # The change a stopped move made before this one is the move's, and the log has not had it.
+        log_line(w, "skip", "cancelled", w.moving, w.logged, left,
+                 reason=f"stopped on {left or 'no exit node'}: the exit node was changed outside vpn")
+    w.moving = None
+    print(f"exit node changed outside vpn: {left or 'none'} → {name or 'none'}")
     if name != w.logged:
         log_line(w, "ok", "changed", "watch", w.logged, name)
 
@@ -1187,8 +1196,7 @@ def own(w: Watch, ports: Ports) -> Ports:
     tailscaled = ports.tailscaled
 
     def set_exit_node(target: str) -> None:
-        drain(w, ports)
-        if w.outside:
+        if interrupted(w, ports) == "outside":
             raise VpnError("the exit node was changed outside vpn; leaving it as it is")
         want = wanted(w, target)
         tailscaled.set_exit_node(target)
@@ -1201,8 +1209,11 @@ def own(w: Watch, ports: Ports) -> Ports:
 
 def interrupted(w: Watch, ports: Ports, client: Client | None = None) -> Stop | None:
     """Why a running move or check must stop, if it must: an outside change, its
-    client gone, or a newer request. Takes in what arrived first."""
+    client gone, or a newer request. Takes in what arrived first, and reads the
+    prefs, for an outside change whose report is still on its way."""
     drain(w, ports)
+    if not w.outside and changed_outside(w, ports):
+        w.outside = True
     if w.outside:
         return "outside"
     if client is not None and not client.connected():
@@ -1210,6 +1221,15 @@ def interrupted(w: Watch, ports: Ports, client: Client | None = None) -> Stop | 
     if w.backlog:
         return "superseded"
     return None
+
+
+def changed_outside(w: Watch, ports: Ports) -> bool:
+    """Whether prefs now differ from what the watcher last set, or from what tailscaled last reported when
+    everything it set has been reported. `tailscale set` has changed prefs by the time it returns. `take` logs
+    such a change once its report arrives."""
+    prefs = ports.tailscaled.prefs()
+    expected = w.mine[-1] if w.mine else w.at
+    return prefs is not None and expected is not None and not reported(expected, setting(w, prefs))
 
 
 STOPPED: dict[Stop, str] = {"outside": "superseded: the exit node was changed outside vpn",
@@ -1220,7 +1240,7 @@ STOPPED: dict[Stop, str] = {"outside": "superseded: the exit node was changed ou
 def serve(w: Watch, request: Request, ports: Ports) -> None:
     """Run one request to its end and send the client its final line. A request
     stopped before its first step changes nothing."""
-    w.outside = False
+    w.outside, w.moving = False, None
     client = request.client
     print(f"vpn {request.request} {request.place}".rstrip())
     stopped = interrupted(w, ports, client)
@@ -1255,7 +1275,7 @@ def serve_on(w: Watch, request: Request, ports: Ports, stop: Callable[[], Stop |
     if not prefs.get("WantRunning"):
         raise VpnError("tailscale is stopped: `tailscale up` first")
     start, nodes, say = start_of(prefs, status), mullvad_nodes(status), request.client.say
-    ports = own(w, ports)
+    ports, w.moving = own(w, ports), "on"
     ports.tailscaled.set_exit_node("auto:any")
     picked = automatic_pick(nodes, w.live, ports, stop)
     verdict = None
@@ -1265,6 +1285,7 @@ def serve_on(w: Watch, request: Request, ports: Ports, stop: Callable[[], Stop |
             verdict = check_confirmed(w.live, ports, stop)
     if picked is not None and verdict in ("clean", "unreachable") and stop() is None:
         heard = "Discord check clean" if verdict == "clean" else "the Discord check got no answer, which says nothing about the node"
+        w.moving = None
         log_line(w, "ok", "clean", "on", start.name, picked.name if picked.name != start.name else None,
                  reason="" if verdict == "clean" else heard)
         return True, f"exit node: {picked.name} (automatic, {heard})"
@@ -1304,6 +1325,7 @@ def asked(w: Watch, request: Request, start: Start, options: list[Node], ports: 
     """The move `vpn next` or `vpn to` asks for, through `options`: run and recorded."""
     if not options:
         raise VpnError("no online node to move to")
+    w.moving = request.request
     outcome = move(start, options, "asked", True, request.client.say, stop, w.live, own(w, ports))
     record(w, request.request, start, outcome, ports)
     return outcome.kind == "moved", outcome.reason
@@ -1330,16 +1352,17 @@ def record(w: Watch, by: Command, start: Start, outcome: Outcome, ports: Ports, 
     dashboard reads, plus `cancelled` for a move that Ctrl-C or a newer request
     stopped. `moved` overrides the event of a move that pinned a node, and
     `reason` says why it was made. A move an outside change superseded writes
-    none: `take` logged the outside change.
+    none: `take` logged it with the outside change.
 
     A move that stayed names where the exit node landed when that is not where
     it started, as when automatic mode took the place of a node outside Mullvad.
     That is read from prefs, since tailscaled's report of the put-back may still
     be on its way."""
+    if outcome.kind == "superseded":
+        return
+    w.moving = None
     if outcome.kind == "moved" and outcome.node is not None:
         log_line(w, "ok", moved or MOVED[outcome.why], by, start.name, outcome.node.name, outcome.tried, reason)
-        return
-    if outcome.kind == "superseded":
         return
     drain(w, ports)
     prefs = None if w.outside else ports.tailscaled.prefs()
@@ -1420,7 +1443,7 @@ def recover(w: Watch, cause: Cause, ports: Ports) -> None:
         return
     print(f"moving off {start.node.name}: "
           f"{'Cloudflare blocks it' if cause == 'blocked' else 'it stopped carrying traffic'}")
-    w.outside = False
+    w.outside, w.moving = False, "watch"
     outcome = move(start, candidates(start.node, mullvad_nodes(status)), cause, vesktop, print,
                    lambda: interrupted(w, ports), w.live, own(w, ports))
     record(w, "watch", start, outcome, ports)
