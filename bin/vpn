@@ -46,7 +46,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -114,9 +114,12 @@ PROOF_PORT = 443
 PROOF_CONNECT_SECS = 1.0
 """The longest one of the traffic proof's connects waits."""
 PROOF_RETRY_SECS = 0.5
-"""How long the traffic proof waits for the node's bytes to grow before it connects again."""
+"""How long the traffic proof waits before it connects again, unless an engine update shows bytes going to the
+node sooner."""
+PICK_SECS = 5
+"""How long a move waits for tailscaled to name the node automatic mode picked."""
 PICK_POLL_SECS = 0.25
-"""How often a move asks tailscaled which node automatic mode picked, until it names one."""
+"""How often it asks meanwhile."""
 LOCK_WAIT_SECS = 90
 LOCALAPI_TIMEOUT_SECS = 10
 BUS_DEBOUNCE_SECS = 1.0
@@ -124,7 +127,8 @@ BUS_DEBOUNCE_SECS = 1.0
 BUS_RETRY_SECS = 5
 
 SOCKET = os.environ.get("VPN_TAILSCALED_SOCKET", "/var/run/tailscale/tailscaled.sock")
-"""tailscaled's LocalAPI. The tests point it at nothing, so a test that reaches it fails instead of reaching the real one."""
+"""tailscaled's LocalAPI. The tests point it at a socket that hangs up and counts each connection, so code that goes
+around the Tailscaled port fails its test instead of reaching the real tailscaled."""
 ENGINE_UPDATES = 1 << 0
 """NotifyWatchEngineUpdates: every ENGINE_SECS, each live peer's byte counters and last handshake."""
 PEER_PATCHES = 1 << 15
@@ -352,25 +356,28 @@ def vesktop_running(lock: Path = VESKTOP_LOCK) -> bool:
     return pid.isdigit() and Path(f"/proc/{pid}").is_dir()
 
 
-def heartbeat(poll: dict | None, exit_node: str | None, quiet: float, vesktop: bool, bus: bool) -> tuple[str, str, dict]:
+def heartbeat(poll: dict | None, exit_node: str | None, quiet: float, vesktop: bool,
+              streaming: bool) -> tuple[str, str, dict]:
     """The watcher's hourly line: outcome, reason, stats. `quiet` is how long ago
-    the last engine update arrived.
+    the last engine update arrived, and `streaming` whether one arrived within
+    STALE_SECS, which the stats call `bus`.
 
     Always ok, because a machine with the VPN off or tailscaled down is not a
     watcher that stopped watching, and this line answers only that question. The
-    one exception is the failure the watcher could otherwise not see: an exit
+    one exception is the failure the watcher could otherwise not see, an exit
     node set, tailscaled answering, and no engine update for BLIND_SECS. The
     watcher then sees none of the exit node's traffic, so it can call no node
     silent, and `fail` puts that in front of overdue-check.
     """
+    stats = {"vesktop": vesktop, "bus": streaming}
     if poll is None:
-        return "ok", "", {"state": "tailscale-down", "exit_node": None, "vesktop": vesktop, "bus": bus}
+        return "ok", "", {"state": "tailscale-down", "exit_node": None} | stats
     if not exit_state(poll).id:
-        return "ok", "", {"state": "no-exit-node", "exit_node": None, "vesktop": vesktop, "bus": bus}
+        return "ok", "", {"state": "no-exit-node", "exit_node": None} | stats
     if quiet > BLIND_SECS:
-        return "fail", (f"an exit node is set and no engine update came for {quiet:.0f} s — "
-                        f"the watcher is blind to its traffic"), {}
-    return "ok", "", {"state": "guarding", "exit_node": exit_node, "vesktop": vesktop, "bus": bus}
+        return "fail", (f"an exit node is set and no engine update came for {quiet:.0f} s, so the watcher is blind "
+                        f"to its traffic; `journalctl --user -u vpn-watch` says why the event bus was lost"), {}
+    return "ok", "", {"state": "guarding", "exit_node": exit_node} | stats
 
 
 ANYWHERE = "*"
@@ -518,12 +525,12 @@ class Tailscaled:
     status: Callable[[], dict | None]
     """A full status reading; None when tailscaled does not answer."""
     peerless: Callable[[], dict | None]
-    """A status reading without the peer list, which is nearly all of the full reading's size: the backend
-    state and the exit node with its online flag. None when tailscaled does not answer."""
+    """A status reading without the peer list, which is nearly all of the full reading's size. It still names
+    the backend state, and the exit node with its online flag. None when tailscaled does not answer."""
     prefs: Callable[[], dict | None]
     set_exit_node: Callable[[str], None]
     """`tailscale set`, with a node's full name, "auto:any", or "" for none. Raises VpnError when it fails."""
-    bus: Callable[[int], Iterator[dict]]
+    bus: Callable[[int], Generator[dict, None, None]]
     """The event bus under a mask of NotifyWatchOpt bits, one message per item, until the stream closes.
     It is read on a thread of its own that only hands each message to the queue `Clock.wait` takes from."""
 
@@ -533,8 +540,7 @@ class Network:
     probe: Callable[[str], None]
     """Send one UDP datagram to a tailnet IPv4 address's discard port, which makes tailscaled handshake with that node."""
     connect: Callable[[float], bool]
-    """The traffic proof's TCP connect, to 1.1.1.1:443 and 8.8.8.8:443 at once. Returns whether one answered
-    within the seconds given."""
+    """The traffic proof's TCP connect out. Returns whether it succeeded within the seconds given."""
     discord: Callable[[], Verdict]
     egress: Callable[[], dict]
 
@@ -544,7 +550,8 @@ class Clock:
     now: Callable[[], float]
     wait: Callable[[float], "Arrival"]
     """Wait up to the seconds given for the next bus message or request, and return it, or None once they pass
-    with nothing arriving. This is how bin/vpn waits for anything."""
+    with nothing arriving. This is how the watcher and the moves wait for anything; only the bus reader behind
+    the real one keeps time of its own."""
 
 
 @dataclass(frozen=True)
@@ -572,7 +579,7 @@ class Seen:
 
 @dataclass(frozen=True)
 class Sample:
-    """One engine update: when it arrived, and the live peers in it by node key."""
+    """When one engine update arrived, and the live peers in it by node key."""
 
     at: float
     peers: dict[str, Seen]
@@ -581,12 +588,12 @@ class Sample:
 @dataclass
 class Liveness:
     """Each peer's traffic and handshakes, from the engine updates tailscaled
-    pushes every 2 s, and from them whether the exit node is silent.
+    pushes every ENGINE_SECS, and from them whether the exit node is silent.
 
     Engine updates name peers by node key; a full status reading maps the keys
     to nodes. A peer missing from an update has sent and received nothing since
-    the one before, since tailscaled drops idle peers from its WireGuard
-    configuration, and one added back starts its counters from zero.
+    the one before, because tailscaled drops idle peers from its WireGuard
+    configuration. A peer added back starts its counters from zero.
     """
 
     clock: Clock
@@ -642,7 +649,7 @@ class Liveness:
 
         Anything coming back clears a silence. Traffic going in with nothing back
         starts one, unless it was only keepalives. A gap between updates longer
-        than SILENT_SECS starts over: during a suspend nothing could come back,
+        than SILENT_SECS starts over. During a suspend nothing could come back,
         and the time slept is not time unanswered.
         """
         key = self.keys.get(self.exit_id)
@@ -690,7 +697,15 @@ class Liveness:
         return any(s.peers[key].handshake > since for s in self.samples if key in s.peers)
 
     def received_since(self, node: Node, since: float) -> bool:
-        """Whether `node`'s received bytes grew after `since`.
+        """Whether `node`'s received bytes grew after `since`."""
+        return self.grew(node, since, "received")
+
+    def sent_since(self, node: Node, since: float) -> bool:
+        """Whether bytes went to `node` after `since`, which after a switch means traffic is routed to it."""
+        return self.grew(node, since, "sent")
+
+    def grew(self, node: Node, since: float, counter: Literal["received", "sent"]) -> bool:
+        """Whether one of `node`'s counters grew after `since`.
 
         Measured from the last update at or before `since`. Without one, from the
         first update after it, which can miss growth but never invents it."""
@@ -703,9 +718,13 @@ class Liveness:
             before, after = after[:1], after[1:]
         if not before:
             return False
-        base = before[-1].peers.get(key)
-        start = base.received if base else 0
-        return any(grown(s.peers[key].received if key in s.peers else 0, start) for s in after)
+
+        def count(sample: Sample) -> int:
+            seen = sample.peers.get(key)
+            return getattr(seen, counter) if seen else 0
+
+        start = count(before[-1])
+        return any(grown(count(s), start) for s in after)
 
 
 def engine_update(arrival: object) -> TypeGuard[dict]:
@@ -734,13 +753,13 @@ def probe(nodes: list[Node], liveness: Liveness, ports: Ports) -> list[Node]:
 
 
 def traffic_proof(node: Node | None, liveness: Liveness, ports: Ports) -> bool:
-    """Whether `node`, which the exit node was just set to, carries traffic: within
-    PROOF_SECS a TCP connect out succeeds and the node's received bytes grow. A
-    node outside Mullvad (None) carries nothing this can see.
+    """Whether `node`, which the exit node was just set to, carries traffic. It
+    does when, within PROOF_SECS, a TCP connect out through it succeeds and its
+    received bytes grow. A node outside Mullvad (None) carries nothing this can see.
 
-    Connects go out again every PROOF_RETRY_SECS until the bytes grow: the first
-    can leave through the old route while the switch to `node` takes effect, and
-    then nothing reaches `node` unless something else sends it traffic."""
+    Right after a switch a connect can still leave through the old route. So a
+    connect counts only once an engine update has shown bytes going to `node`,
+    and until one has, the connects go out again every PROOF_RETRY_SECS."""
     if node is None:
         return False
     clock = ports.clock
@@ -752,10 +771,13 @@ def traffic_proof(node: Node | None, liveness: Liveness, ports: Ports) -> bool:
         return connected and liveness.received_since(node, since)
 
     while (left := deadline - clock.now()) > 0:
-        connected = ports.network.connect(min(left, PROOF_CONNECT_SECS)) or connected
-        liveness.wait(min(PROOF_RETRY_SECS, max(deadline - clock.now(), 0.0)), until=proven)
+        routed = liveness.sent_since(node, since)
+        answered = ports.network.connect(min(left, PROOF_CONNECT_SECS))
+        connected = connected or (answered and routed)
         if proven():
             return True
+        liveness.wait(max(min(PROOF_RETRY_SECS, deadline - clock.now()), 0.0),
+                      until=lambda: proven() or (not routed and liveness.sent_since(node, since)))
     return proven()
 
 
@@ -900,7 +922,7 @@ def automatic(discord: bool, nodes: list[Node], liveness: Liveness, ports: Ports
     result = check_confirmed(liveness, ports) if discord else None
     if result != "blocked":
         return Automatic(picked, result, None)
-    print(f"Tailscale picked {picked.name} and Cloudflare blocks it — trying nodes next to it")
+    print(f"Tailscale picked {picked.name} and Cloudflare blocks it; trying nodes next to it")
     walked = walk(candidates(picked, nodes), liveness, ports)
     if walked.node is None:
         ports.tailscaled.set_exit_node("auto:any")
@@ -908,9 +930,9 @@ def automatic(discord: bool, nodes: list[Node], liveness: Liveness, ports: Ports
 
 
 def automatic_pick(nodes: list[Node], liveness: Liveness, ports: Ports) -> Node | None:
-    """The node of `nodes` automatic mode picked, once tailscaled names one, within PROOF_SECS."""
+    """The node of `nodes` automatic mode picked, once tailscaled names one, within PICK_SECS."""
     by_id = {n.id: n for n in nodes}
-    deadline = ports.clock.now() + PROOF_SECS
+    deadline = ports.clock.now() + PICK_SECS
     while True:
         picked = by_id.get(exit_state(ports.tailscaled.peerless()).id)
         if picked is not None or ports.clock.now() >= deadline:
@@ -967,8 +989,10 @@ class Silence:
 class Watch:
     """What the watcher remembers between looks."""
 
-    live: Liveness | None = None
-    """What the engine updates say; None before the watcher's first step."""
+    live: Liveness
+    """What the engine updates say."""
+    begun: bool = False
+    """Whether the watcher has taken its first step, which reads the full status."""
     nodes: dict[str, Node] = field(default_factory=dict)
     """The Mullvad nodes by stable ID, as the last full status reading listed them."""
     exit_name: str | None = None
@@ -1026,20 +1050,19 @@ def handle(w: Watch, arrival: Arrival, ports: Ports) -> float:
 
 
 def observe(w: Watch, arrival: Arrival, ports: Ports) -> float:
-    """Act on one bus message or tick, which is all the watcher gets until it
-    serves requests (see `handle`). Returns the seconds until the next tick is due.
+    """Act on one bus message or tick; `handle` also serves requests. Returns the
+    seconds until the next tick is due.
 
     The first step reads the full status and looks. An engine update is taken
     in, and brings the next look forward only when the silence verdict changed.
     Any other bus message starts a burst, and one look follows it. A tick is a
     look that came due, or the stream going quiet for STALE_SECS.
     """
-    clock = ports.clock
-    first = w.live is None
-    if w.live is None:
-        w.live = Liveness(clock)
+    clock, live = ports.clock, w.live
+    first = not w.begun
+    if first:
+        w.begun = True
         relearn(w, ports)
-    live = w.live
     if engine_update(arrival):
         live.feed(arrival)
         if live.unknown:
@@ -1068,7 +1091,7 @@ def next_wait(w: Watch, live: Liveness) -> float:
 def relearn(w: Watch, ports: Ports) -> None:
     """Read the full status: the nodes, their keys, and the exit node."""
     status = ports.tailscaled.status()
-    if status is None or w.live is None:
+    if status is None:
         return
     w.live.learn(status)
     w.nodes = {n.id: n for n in mullvad_nodes(status)}
@@ -1083,18 +1106,17 @@ def recover(w: Watch, cause: Cause, ports: Ports) -> None:
     remembered as checked. Whatever does not end on a working node is logged,
     and no recovery starts for BACKOFF_SECS after it.
     """
-    assert w.live is not None
     live, ports = w.live, guarded(ports)
     vesktop = ports.vesktop()
     try:
         with node_lock(live):
             status = ports.tailscaled.status()
             start = current_node(status)
-            if start is None:
+            if status is None or start is None:
                 print("the exit node is not a Mullvad node tailscaled lists; leaving it alone")
                 return
             print(f"moving off {start.name}: {'Cloudflare blocks it' if cause == 'blocked' else 'it stopped carrying traffic'}")
-            result = automatic(vesktop, mullvad_nodes(status or {}), live, ports)
+            result = automatic(vesktop, mullvad_nodes(status), live, ports)
             event: Event = "rotated" if cause == "blocked" else "offline"
             picked, walked = result.picked, result.walked
             if picked is None:
@@ -1124,7 +1146,6 @@ def recover(w: Watch, cause: Cause, ports: Ports) -> None:
 def look(w: Watch, ports: Ports) -> float:
     """One look at the exit node, acting on what it finds. Returns the seconds
     until the next look is due; a bus message brings it forward."""
-    assert w.live is not None
     live = w.live
     now = ports.clock.now()
     poll = ports.tailscaled.peerless()
@@ -1180,7 +1201,7 @@ def look(w: Watch, ports: Ports) -> float:
             recover(w, "blocked" if result == "blocked" else "offline", ports)
             return FALLBACK_SECS
         else:
-            print("Discord did not answer but the node carries traffic — not a node problem, staying")
+            print("Discord did not answer but the node carries traffic; not a node problem, staying")
 
     return wait_until_due(w, now, live.streaming(), state)
 
@@ -1287,7 +1308,7 @@ def tailscale_set(target: str) -> None:
         raise VpnError(f"tailscale set {target or '(none)'} failed: {proc.stderr.strip()}")
 
 
-def bus_stream(mask: int) -> Iterator[dict]:
+def bus_stream(mask: int) -> Generator[dict, None, None]:
     """The event bus as tailscaled streams it, one JSON message per line. A read
     that waits STALE_SECS raises TimeoutError."""
     conn = LocalAPIConnection(timeout=STALE_SECS)
@@ -1302,10 +1323,10 @@ def bus_stream(mask: int) -> Iterator[dict]:
         conn.close()
 
 
-def follow_bus(bus: Callable[[int], Iterator[dict]], mask: int, hand: Callable[[dict], None],
+def follow_bus(bus: Callable[[int], Generator[dict, None, None]], mask: int, hand: Callable[[dict], None],
                sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic) -> None:
-    """The bus reader, on a thread of its own: hand over each message of the
-    event bus, and do nothing else that could make tailscaled wait.
+    """The bus reader, on a thread of its own. It hands over each message of the
+    event bus, and does nothing else that could make tailscaled wait.
 
     A stream that carries no engine update for STALE_SECS is closed, and a
     closed stream is opened again every BUS_RETRY_SECS. Losing the bus and
@@ -1333,9 +1354,8 @@ def follow_bus(bus: Callable[[int], Iterator[dict]], mask: int, hand: Callable[[
         except (OSError, http.client.HTTPException, ValueError) as e:
             problem = f"{type(e).__name__}: {e}"
         finally:
-            close = getattr(stream, "close", None)
-            if close is not None:
-                close()
+            if stream is not None:
+                stream.close()
         if not failing:
             print(f"event bus lost ({problem}); opening it again every {BUS_RETRY_SECS} s")
             failing = True
@@ -1448,7 +1468,7 @@ def real_ports(mask: int | None = None) -> Ports:
 # --------------------------------------------------------------------------
 
 
-def tune_in(live: Liveness, status: dict) -> None:
+def await_update(live: Liveness, status: dict) -> None:
     """Learn `status`, then wait for the first engine update, which the traffic proof measures from."""
     live.learn(status)
     live.wait(ENGINE_SECS + 1, until=lambda: bool(live.samples))
@@ -1476,7 +1496,7 @@ def turn_on(ports: Ports) -> None:
             raise VpnError("tailscaled did not answer")
         if not prefs.get("WantRunning"):
             raise VpnError("tailscale is stopped: `tailscale up` first")
-        tune_in(live, status)
+        await_update(live, status)
         before = current_node(status)
         result = automatic(True, mullvad_nodes(status), live, ports)
         picked, walked = result.picked, result.walked
@@ -1485,7 +1505,7 @@ def turn_on(ports: Ports) -> None:
             log_node("fail", "unreachable", "on", reason=reason)
             raise VpnError(f"{reason} (portal: run `portal`)")
         if walked is None and result.verdict == "unreachable":
-            reason = f"the Discord check got no answer through {picked.name} — network trouble, not a blocked node"
+            reason = f"the Discord check got no answer through {picked.name}; network trouble, not a blocked node"
             log_node("skip", "canary-unreachable", "on", picked.name, reason=reason)
             raise VpnError(reason)
         if walked is None:
@@ -1533,8 +1553,8 @@ def go_to(place: str, ports: Ports) -> None:
         nodes = mullvad_nodes(status)
         matched = resolve(place, nodes)
         if not matched:
-            raise VpnError(f'no exit node matches "{place}" — see `vpn list`')
-        tune_in(live, status)
+            raise VpnError(f'no exit node matches "{place}"; see `vpn list`')
+        await_update(live, status)
         start = current_node(status)
         pin_first(destinations(place, matched, start), "to", start, nodes, live, ports)
 
@@ -1558,7 +1578,7 @@ def go_next(ports: Ports) -> None:
         status = ports.tailscaled.status()
         if status is None:
             raise VpnError("tailscaled did not answer")
-        tune_in(live, status)
+        await_update(live, status)
         start = current_node(status)
         nodes = mullvad_nodes(status)
         pin_first(candidates(start, nodes), "next", start, nodes, live, ports)
@@ -1703,7 +1723,7 @@ def list_(args: ListArgs) -> None:
 def watch() -> None:
     """Keep the exit node working: the long-running watcher, not a one-off check.
 
-    tailscaled tells the watcher the moment the exit node changes or goes offline, over its event bus, and pushes every 2 seconds how many bytes went into each live peer's tunnel and came back out. The watcher reads the exit node's state from tailscaled's local socket, which sends nothing over the network. It reads the full status, every peer included, only when it starts, when the exit node changes, and when a peer it does not know shows up. While an exit node is set it also looks every 10 seconds. With no engine update for 10 seconds, it counts the stream as closed: it opens it again every 5 seconds, and looks every 15 until it is back.
+    tailscaled tells the watcher the moment the exit node changes or goes offline, over its event bus, and pushes every 2 seconds how many bytes went into each live peer's tunnel and came back out. The watcher reads the exit node's state from tailscaled's local socket, which sends nothing over the network. It reads the full status, every peer included, only when it starts, when the exit node changes, and when a peer it does not know shows up. While an exit node is set it also looks every 10 seconds. With no engine update for 10 seconds, it counts the stream as closed. It opens it again every 5 seconds, and looks every 15 until the stream is back.
 
     - No exit node set: it only records changes.
     - The exit node reports itself offline: it turns on automatic mode, as `vpn --help` describes.
@@ -1720,7 +1740,7 @@ def watch() -> None:
     off: no exit node set, or tailscale stopped. down: an exit node is set, and tailscale is not running, or the node is missing from its status, reports itself offline, or is silent. unknown: tailscaled does not answer. Nothing is published while a vpn command is changing the exit node.
     """
     ports = real_ports(WATCH_MASK)
-    w = Watch()
+    w = Watch(live=Liveness(ports.clock))
     due = 0.0
     while True:
         due = observe(w, ports.clock.wait(due), ports)
