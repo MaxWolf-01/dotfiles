@@ -856,10 +856,11 @@ class Start:
     """The node in use, pinned or automatic mode's pick. None when off, and when the pinned node is outside
     Mullvad. A move that has moved the exit node off such a node cannot name it back, and puts automatic mode
     on instead."""
-    id: str = ""
+    id: str
     """The stable ID prefs name for a pinned node, one outside Mullvad included; empty when nothing is pinned."""
-    name: str | None = None
-    """The exit node's host name, one outside Mullvad included; None when off."""
+    name: str | None
+    """The exit node's name, one outside Mullvad included. None when off, when automatic mode has picked no node
+    yet, and when the network map does not list the node prefs name."""
 
 
 @dataclass(frozen=True)
@@ -886,9 +887,10 @@ def start_of(prefs: dict, status: dict) -> Start:
     how = mode(prefs)
     assert how != "unknown"
     if how == "off":
-        return Start("off", None)
-    return Start(how, current_node(status), prefs.get("ExitNodeID") or "" if how == "pinned" else "",
-                 (exit_peer(status) or {}).get("HostName"))
+        return Start("off", None, "", None)
+    node = current_node(status)
+    pinned_id = (prefs.get("ExitNodeID") or "") if how == "pinned" else ""
+    return Start(how, node, pinned_id, node.name if node else (exit_peer(status) or {}).get("HostName"))
 
 
 def move(
@@ -941,11 +943,7 @@ def move(
         except VpnError as e:
             if (stopped := stop()) is not None:
                 return halt(stopped)
-            try:
-                back = put_back(start, ports)
-            except VpnError as again:
-                back = f"and putting the exit node back failed too: {again}"
-            return Outcome("stayed", None, "failed", tried, f"{e}; {back}", why, carried)
+            return Outcome("stayed", None, "failed", tried, f"{e}; {put_back(start, ports)}", why, carried)
         passed = traffic_proof(node, liveness, ports, stop)
         if (stopped := stop()) is not None:
             return halt(stopped)
@@ -958,6 +956,8 @@ def move(
             return halt(stopped)
         return Outcome("moved", node, None, tried, f"pinned: {node.name} ({node.city}, {node.country})", why, carried)
 
+    if (stopped := stop()) is not None:
+        return halt(stopped)
     back = put_back(start, ports)
     if not answered:
         return Outcome("stayed", None, "unanswered", 0, f"no node answered the handshake; {back}", why)
@@ -982,8 +982,11 @@ def handshake_line(batch: list[Node], answered: list[Node]) -> str:
 
 
 def put_back(start: Start, ports: Ports) -> str:
-    """Put the exit node back as `start` had it, where prefs say it is not now, and say where it is. A start
-    pinned outside Mullvad that the exit node has left gets automatic mode, which may already be on."""
+    """Put the exit node back as `start` had it, where prefs say it is not now, and say where it is.
+
+    A start pinned to a node vpn cannot name back, one outside Mullvad or one
+    the network map does not list, gets automatic mode once the exit node has
+    left it, which may already be on. A `tailscale set` that fails is said too."""
     prefs = ports.tailscaled.prefs()
     now, pinned_to = mode(prefs), (prefs or {}).get("ExitNodeID")
     if start.mode == "off":
@@ -992,15 +995,17 @@ def put_back(start: Start, ports: Ports) -> str:
         target, there = "auto:any", now == "automatic"
         where = f"on {start.node.name} (automatic mode)" if start.node else "on automatic mode"
     elif start.node is None:
+        unnamed = f"{start.name}, which is outside Mullvad" if start.name else "the node the network map does not list"
         if now == "pinned" and pinned_to == start.id:
-            return f"the exit node is still on {start.name}"
-        if now != "automatic":
-            ports.tailscaled.set_exit_node("auto:any")
-        return f"the exit node is on automatic mode in place of {start.name}, which is outside Mullvad"
+            return f"the exit node is still on {unnamed}"
+        target, there, where = "auto:any", now == "automatic", f"on automatic mode in place of {unnamed}"
     else:
         target, there, where = start.node.fqdn, now == "pinned" and pinned_to == start.node.id, f"on {start.node.name}"
     if not there:
-        ports.tailscaled.set_exit_node(target)
+        try:
+            ports.tailscaled.set_exit_node(target)
+        except VpnError as e:
+            return f"putting the exit node back failed: {e}"
     return f"the exit node is {'still' if there else 'back'} {where}"
 
 
@@ -1225,7 +1230,7 @@ def recover(w: Watch, cause: Cause, ports: Ports) -> None:
     vesktop = ports.vesktop()
     try:
         with node_lock(live):
-            prefs, status = reading(ports)
+            prefs, status = prefs_and_status(ports)
             start = start_of(prefs, status)
             if start.node is None:
                 print("the exit node is not a Mullvad node tailscaled lists; leaving it alone")
@@ -1580,7 +1585,7 @@ def await_update(live: Liveness, status: dict) -> None:
     live.wait(ENGINE_SECS + 1, until=lambda: bool(live.samples))
 
 
-def reading(ports: Ports) -> tuple[dict, dict]:
+def prefs_and_status(ports: Ports) -> tuple[dict, dict]:
     """Prefs and a full status reading, or VpnError when tailscaled does not answer."""
     prefs, status = ports.tailscaled.prefs(), ports.tailscaled.status()
     if prefs is None or status is None:
@@ -1603,7 +1608,7 @@ def on() -> None:
 def turn_on(ports: Ports) -> None:
     live = Liveness(ports.clock)
     with node_lock(live):
-        prefs, status = reading(ports)
+        prefs, status = prefs_and_status(ports)
         if not prefs.get("WantRunning"):
             raise VpnError("tailscale is stopped: `tailscale up` first")
         await_update(live, status)
@@ -1622,9 +1627,10 @@ def turn_on(ports: Ports) -> None:
                 end_on_pick(start, picked, verdict)
                 return
             if picked is not None and stop() is None:
-                print(f"{picked.name} {'is blocked by Cloudflare' if verdict == 'blocked' else 'carries no traffic'}; "
-                      f"moving off it")
-            # A stop that came while the pick was checked ends this move at its first step, putting the exit node back.
+                print(f"Cloudflare blocks {picked.name}; moving off it" if verdict == "blocked"
+                      else f"{picked.name} carries no traffic; moving off it")
+            # A stop that came while the pick was checked ends this move at its first step: Ctrl-C puts the exit node
+            # back, an off click leaves it off.
             outcome = move(start, candidates(picked, nodes), "blocked" if verdict == "blocked" else "offline", True,
                            print, stop, live, ports)
         record_move("on", picked.name if picked else None, outcome)
@@ -1667,7 +1673,7 @@ def to(args: ToArgs) -> None:
 def go_to(place: str, ports: Ports) -> None:
     live = Liveness(ports.clock)
     with node_lock(live):
-        prefs, status = reading(ports)
+        prefs, status = prefs_and_status(ports)
         start = start_of(prefs, status)
         matched = resolve(place, mullvad_nodes(status))
         if not matched:
@@ -1689,13 +1695,15 @@ def next_() -> None:
 def go_next(ports: Ports) -> None:
     live = Liveness(ports.clock)
     with node_lock(live):
-        prefs, status = reading(ports)
+        prefs, status = prefs_and_status(ports)
         start = start_of(prefs, status)
         move_as_asked("next", start, candidates(start.node, mullvad_nodes(status)), status, live, ports)
 
 
 def move_as_asked(by: Command, start: Start, options: list[Node], status: dict, live: Liveness, ports: Ports) -> None:
     """The move `vpn next` or `vpn to` asks for, through `options`: run, recorded, and ended on."""
+    if not options:
+        raise VpnError("no online node to move to")
     await_update(live, status)
     ports, outside = guarded(ports, start)
     with interruptible(outside) as stop:
