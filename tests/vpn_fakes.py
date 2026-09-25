@@ -99,6 +99,11 @@ CONNECT_SECS = 3 * RTT
 DEMAND = 1500
 """Bytes this machine's applications send through the exit node between two engine updates, unless a World
 says otherwise. A node that carries traffic answers with twice that."""
+SESSION_SECS = 120.0
+"""WireGuard's REKEY_AFTER_TIME. Data for a node whose last handshake is younger than this goes over the session
+it has, and starts no handshake."""
+RETRY_SECS = 5.0
+"""WireGuard's REKEY_TIMEOUT: how long it waits for a handshake response before it sends the initiation again."""
 AFTER_SECS = 120.0
 """How long a run goes on after its last timed event."""
 HANG_SECS = 1800.0
@@ -143,6 +148,9 @@ class Host:
     Its own counters stay still."""
     discord_silent: bool = False
     """Discord does not answer through it, though it carries traffic and Cloudflare does not block it."""
+    late: bool = False
+    """Completes a handshake only on WireGuard's first retry, RETRY_SECS after it began, as a node does whose
+    first initiation was lost."""
 
     @property
     def fqdn(self) -> str:
@@ -347,7 +355,7 @@ class World:
         """Full status readings bin/vpn took through its port."""
         self.peerless_reads: list[float] = []
         """When bin/vpn read the status without peers, in seconds after the first moment. The watcher reads it once
-        per look, and a move asking which node automatic mode picked reads it too."""
+        per look, and `vpn on` asking which node automatic mode picked reads it too."""
         self.egress_asks = 0
         """How often bin/vpn asked am.i.mullvad.net."""
         self._runs: Path | None = None
@@ -379,6 +387,15 @@ class World:
 
     def carries(self, name: str | None) -> bool:
         return name == PC or (name in self.hosts and self.hosts[name].answers and self.hosts[name].carries)
+
+    def in_session(self, name: str) -> bool:
+        """Whether this machine has a WireGuard session with `name` young enough to send over without a handshake."""
+        return self.handshake.get(name, float("-inf")) > self.now - SESSION_SECS
+
+    def handshake_secs(self, name: str) -> float:
+        """How long a handshake with `name` takes to complete, from its first initiation."""
+        host = self.hosts.get(name)
+        return (RETRY_SECS if host and host.late else 0.0) + RTT
 
     def peers(self) -> dict[str, dict]:
         peers = {}
@@ -465,7 +482,7 @@ class World:
     def change(self, new: Setting) -> None:
         """Set the exit node as tailscaled does, and tell the bus. A new exit node that answers completes a
         handshake, whose initiation and response its counters count, unless the switch to it never takes effect
-        (it leaks). Automatic mode picks its node `pick_delay` after it is turned on."""
+        (it leaks) or a session with it is young enough to go on with. Automatic mode picks its node `pick_delay` after it is turned on."""
         old, was = self.exit, self.mode
         if new[0] == "automatic" and was != "automatic" and self.pick_delay and new[1] is not None:
             pick, new = new[1], ("automatic", None)
@@ -477,8 +494,9 @@ class World:
             self.at(self.now + self.pick_delay, picks)
         self.mode, self.exit = new
         host = self.hosts.get(self.exit or "")
-        if self.exit is not None and self.exit != old and self.answers(self.exit) and not (host and host.leaks):
-            self.handshake[self.exit] = self.now + RTT
+        if (self.exit is not None and self.exit != old and self.answers(self.exit) and not (host and host.leaks)
+                and not self.in_session(self.exit)):
+            self.handshake[self.exit] = self.now + self.handshake_secs(self.exit)
             self.tx[self.exit] = self.tx.get(self.exit, 0) + 148
             self.rx[self.exit] = self.rx.get(self.exit, 0) + 92
         self.arrive(notify(Prefs=self.prefs()))
@@ -549,12 +567,15 @@ class World:
     # --- the network
 
     def probe(self, ip: str) -> None:
-        """The Network port's probe, which takes a tailnet IPv4 address; an IPv6 one reaches nothing."""
+        """The Network port's probe, which takes a tailnet IPv4 address; an IPv6 one reaches nothing. Over a
+        session young enough to go on with, the datagram goes out alone and nothing answers it."""
         name = next((p["HostName"] for p in self.peers().values() if "." in ip and ip in p["TailscaleIPs"]), None)
-        if name is not None:
+        if name is not None and self.in_session(name):
+            self.tx[name] = self.tx.get(name, 0) + 32
+        elif name is not None:
             self.tx[name] = self.tx.get(name, 0) + 180
             if self.answers(name):
-                self.handshake[name] = self.now + RTT
+                self.handshake[name] = self.now + self.handshake_secs(name)
                 self.rx[name] = self.rx.get(name, 0) + 92
         self.step("probe", what=name or ip)
 
@@ -715,8 +736,7 @@ def probe(world: World, names: list[str]) -> list[str]:
 
 
 def start(world: World) -> Any:
-    by_name = nodes(world)
-    return vpn.Start(mode=world.mode, node=by_name.get(world.exit) if world.exit else None)
+    return vpn.start_of(world.prefs(), world.status())
 
 
 def bypassed() -> list[str]:
