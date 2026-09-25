@@ -15,31 +15,33 @@
 # The two refusals are not the same kind of thing, which is why -f overrides
 # only one of them. A kernel mismatch destroys your own session and no flag
 # changes that. A hold means someone else's job dies, which is a cost only you
-# can weigh, so -f is there to say "I know what I'm doing, hibernate now" --
-# and it prints what it stomped, so waking to a dead build comes with its
-# reason instead of a 1am re-derivation.
+# can weigh: -f shows what would die and asks, and a yes goes ahead. The table
+# stays on screen, so waking to a dead build comes with its reason instead of
+# a 1am re-derivation.
 #
 # `in` exists because `sleep 2m && hibernate` cannot work with the lid closed.
 # Whatever keeps logind off the lid during the wait has to end before
 # `hibernate` starts, and logind handles a lid that is still closed the moment
 # it may: the laptop suspends, and the hibernate is refused as "suspend already
-# in progress". So `in` holds the lid itself until the hibernate is under way.
-# The wait also sits under a `nosleep` hold, since idle suspend would otherwise
-# end it, and that hold alone ends before hibernating: overriding a hold takes
-# a password (see `./setup hibernation`), and nobody types one into a closed
-# laptop. For the same reason there is no -f with `in`. It checks now, while
-# you can still act on a refusal, and again when it fires. A hold refusing it
-# then keeps the machine awake for that hold's job, lid closed or not.
+# in progress". So `in` holds the lid itself until the hibernate is under way,
+# and waits under a `nosleep` hold, since idle suspend would otherwise end the
+# wait. `in` is a promise to hibernate at that time: a hold that is there when
+# you start it is asked about like -f, and one taken during the wait is
+# overridden, since a laptop kept awake in a bag by a job it was meant to
+# stop is the failure worth avoiding. The kernel check still wins; refused at
+# that point, the laptop suspends instead if its lid is closed.
 #
-# Set up by `./setup hibernation`.
+# Set up by `./setup hibernation`, whose polkit rule is what lets an override
+# go through without a password prompt behind a closed lid.
 #
-# Usage: hibernate [-f | in SPAN]
+# Usage: hibernate [-f] [in SPAN]
 #   -f       hibernate even while something holds sleep open, killing whatever
-#            that hold was protecting. Never overrides the kernel check: to
-#            hibernate onto a mismatched kernel, reboot into it first.
+#            that hold was protecting, after showing what that is and asking.
+#            Never overrides the kernel check: to hibernate onto a mismatched
+#            kernel, reboot into it first.
 #   in SPAN  hibernate SPAN from now, e.g. `in 2m`, `in 1h30m` (any systemd
-#            time span). Waits in the foreground: Ctrl-C calls it off, and
-#            `nosleep --list` shows it.
+#            time span), whatever holds sleep open by then. Waits in the
+#            foreground: Ctrl-C calls it off, and `nosleep --list` shows it.
 
 set -euo pipefail
 
@@ -53,59 +55,64 @@ while [ $# -gt 0 ]; do
         -f|--force) force=1; shift ;;
         -h|--help) usage; exit 0 ;;
         in) [ $# -ge 2 ] || { usage >&2; exit 1; }; span=$2; shift 2 ;;
-        # The second half of `in`, run by this script under its own inhibitor.
+        # The second half of `in`, run by this script under its own lid hold.
         __fire) fire=$2; shift 2 ;;
         *) usage >&2; exit 1 ;;
     esac
 done
+if [ -n "$span" ] && [ -z "$fire" ]; then
+    force=1
+    us=$(systemd-analyze timespan "$span" 2>/dev/null | awk '$1 == "μs:" {print $2}')
+    [ -n "$us" ] || { echo "hibernate: '$span' is not a time span, e.g. 2m, 1h30m" >&2; exit 1; }
+    secs=$((us / 1000000))
+fi
 
-# Whether hibernating now is allowed, saying why not if it isn't.
-allowed() {
-    local running next holds
+kernel_ok() {
+    local running next
     running="$(uname -r)"
     next="$(basename "$(readlink -f /boot/vmlinuz)")"
     next="${next#vmlinuz-}"
-    if [ "$running" != "$next" ]; then
-        echo "hibernate: refusing, running kernel $running, next boot is $next: reboot first" >&2
-        return 1
-    fi
-
-    # Asking first rather than reading systemd's refusal: `systemctl hibernate`
-    # fails with a message naming no holder, and the answer is already here.
-    holds="$(nosleep --list)"
-    [ "$holds" = "$CLEAR" ] && return 0
-    if [ "$force" = 1 ]; then
-        # Said before it goes, not after: the machine is about to stop executing.
-        echo "hibernate: overriding these holds:"
-        echo "$holds"
-        return 0
-    fi
-    echo "hibernate: refusing, something is holding sleep open:" >&2
-    echo "$holds" >&2
-    echo "clear it with the command in its row, or \`hibernate -f\` to hibernate anyway" >&2
+    [ "$running" = "$next" ] && return 0
+    echo "hibernate: refusing, running kernel $running, next boot is $next: reboot first" >&2
     return 1
 }
 
 if [ -n "$fire" ]; then
-    # The lid hold taken below outlives this wait. It holds no sleep, so
-    # `systemctl hibernate` goes through it.
+    # The lid hold taken below outlives this wait. It holds no sleep, so it
+    # is not among the holds -i gets past.
     nosleep --why "hibernate in $span" sleep "$fire"
-    allowed || exit 1
-    exec systemctl hibernate
+    kernel_ok || exit 1
+    holds="$(nosleep --list)"
+    # Said before it goes, not after: the machine is about to stop executing.
+    [ "$holds" = "$CLEAR" ] || { echo "hibernate: overriding these holds:"; echo "$holds"; }
+    exec systemctl hibernate -i
+fi
+
+kernel_ok || exit 1
+
+# Asking first rather than reading systemd's refusal: `systemctl hibernate`
+# fails with a message naming no holder, and the answer is already here.
+holds="$(nosleep --list)"
+if [ "$holds" != "$CLEAR" ]; then
+    if [ "$force" = 0 ]; then
+        echo "hibernate: refusing, something is holding sleep open:" >&2
+        echo "$holds" >&2
+        echo "clear it with the command in its row, or \`hibernate -f\` to hibernate anyway" >&2
+        exit 1
+    fi
+    echo "hibernate: something is holding sleep open:"
+    echo "$holds"
+    read -r -p "override these? [y/N] " answer || answer=
+    [[ $answer == [yY]* ]] || { echo "hibernate: left alone" >&2; exit 1; }
 fi
 
 if [ -n "$span" ]; then
-    [ "$force" = 0 ] || { echo "hibernate: -f cannot go with in, see --help" >&2; exit 1; }
-    us=$(systemd-analyze timespan "$span" 2>/dev/null | awk '$1 == "μs:" {print $2}')
-    [ -n "$us" ] || { echo "hibernate: '$span' is not a time span, e.g. 2m, 1h30m" >&2; exit 1; }
-    secs=$((us / 1000000))
-    allowed || exit 1
     echo "hibernating at $(date -d "+$secs sec" +%H:%M:%S), Ctrl-C to call it off"
     exec systemd-inhibit --what=handle-lid-switch --mode=block --who=hibernate \
         --why="hibernate in $span" "$0" in "$span" __fire "$secs"
 fi
 
-allowed || exit 1
-# Without -i unless forced, so a hold taken since the check still gets its say.
-if [ "$force" = 1 ]; then exec systemctl hibernate -i; fi
+# Without -i unless the holds were overridden, so a hold taken since the check
+# still gets its say.
+if [ "$holds" != "$CLEAR" ]; then exec systemctl hibernate -i; fi
 exec systemctl hibernate
