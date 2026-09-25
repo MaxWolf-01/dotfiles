@@ -268,6 +268,12 @@ def stable_id(name: str) -> str:
     return "n" + hashlib.sha256(b"id" + name.encode()).hexdigest()[:12].upper() + "CNTRL"
 
 
+def notify(**fields) -> dict:
+    """A bus message as tailscaled sends it: every field there, null where the message has nothing to say."""
+    return {"Version": "1.102.4", "ErrMessage": None, "LoginFinished": None, "State": None, "Prefs": None,
+            "NetMap": None, "Engine": None, "BrowseToURL": None, "PeerChangedPatch": None} | fields
+
+
 def iso(t: float | None) -> str:
     if t is None:
         return "0001-01-01T00:00:00Z"
@@ -446,7 +452,7 @@ class World:
         self.mode, self.exit = new
         if self.exit is not None and self.exit != old and self.answers(self.exit):
             self.handshake[self.exit] = self.now + RTT
-        self.arrive({"Prefs": self.prefs()})
+        self.arrive(notify(Prefs=self.prefs()))
 
     def watcher_sets(self, target: str) -> None:
         if self.down:
@@ -482,7 +488,7 @@ class World:
                 self.hosts[name] = replace(self.hosts[name], answers=True, carries=True)
             case Online(name, online):
                 self.hosts[name] = replace(self.hosts[name], online=online)
-                self.arrive({"PeerChanges": [{"NodeID": int(stable_id(name)[1:7], 16), "Online": online}]})
+                self.arrive(notify(PeerChangedPatch=[{"NodeID": int(stable_id(name)[1:7], 16), "Online": online}]))
             case Disconnect():
                 running = next((c for c in self.callers if not c.finishes and c.here), None)
                 if running is not None:
@@ -494,7 +500,7 @@ class World:
                 self.quiet_until = self.now + secs
             case BusGap(secs):
                 self.bus_down_until = self.now + secs
-                self.at(self.bus_down_until, lambda: self.arrive({"Prefs": self.prefs()}))
+                self.at(self.bus_down_until, lambda: self.arrive(notify(Prefs=self.prefs())))
 
     def when(self, trigger: AfterStep | At, happening: Happening) -> None:
         match trigger:
@@ -574,8 +580,8 @@ class World:
         live = {key(n): {"NodeKey": key(n), "TxBytes": self.tx.get(n, 0), "RxBytes": self.rx.get(n, 0),
                          "LastHandshake": iso(t)}
                 for n, t in self.handshake.items() if t <= self.now}
-        self.arrive({"Engine": {"RBytes": sum(self.rx.values()), "WBytes": sum(self.tx.values()),
-                                "NumLive": len(live), "LiveDERPs": 1, "LivePeers": live}})
+        self.arrive(notify(Engine={"RBytes": sum(self.rx.values()), "WBytes": sum(self.tx.values()),
+                                   "NumLive": len(live), "LiveDERPs": 1, "LivePeers": live}))
 
     def advance(self, until: float) -> None:
         while self.schedule and self.schedule[0][0] <= until:
@@ -721,7 +727,7 @@ def run(world: World, script: list[tuple[AfterStep | At, Happening]]) -> World:
     for trigger, happening in script:
         world.when(trigger, happening)
     world.end = T0 + world.last_at + AFTER_SECS
-    world.arrive({"Prefs": world.prefs()})
+    world.arrive(notify(Prefs=world.prefs()))
     w = vpn.Watch()
     due = 0.0
     with driving(world):
