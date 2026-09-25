@@ -130,12 +130,12 @@ def run(args: RunArgs) -> None:
     cached = folder / "cache" / "scribe.json"
     if cached.exists():
         progress.done("cached in cache/scribe.json, not sent again")
-        progress.cost("transcription", None, "none: the response was cached")
+        progress.paid(None, "nothing, the transcription was cached")
     elif reused := earlier_response(src.sha256, args.transcription, folder):
         shutil.copyfile(reused, cached)
         LOG.write(f"transcription reused from {reused}")
         progress.done(f"reused from {reused}, not sent again")
-        progress.cost("transcription", None, "none: an earlier response was reused")
+        progress.paid(None, "nothing, an earlier transcription was reused")
     else:
         transcribe(recording, folder, src, progress)
         n = sum(1 for x in read_json(cached)["words"] if x["type"] == "word")
@@ -519,10 +519,10 @@ def transcribe(recording: Path, folder: Path, src: Source, progress: "Progress")
     LOG.write(f"transcription {body.get('transcription_id')}, request {headers.get('x-trace-id') or headers.get('request-id')}")
     flac.unlink()
     if "fiat-cost-before-overages" in headers:
-        progress.cost("transcription", float(headers["fiat-cost-before-overages"]),
-                      f"reported by ElevenLabs, {headers.get('character-cost', '?')} credits")
+        progress.paid(float(headers["fiat-cost-before-overages"]),
+                      f"{int(headers.get('character-cost', 0)):,} credits, as ElevenLabs reports it")
     else:
-        progress.cost("transcription", None, "ElevenLabs reported no cost for this request")
+        progress.paid(None, "unknown, ElevenLabs reported no cost for this request")
 
 
 # ---------------------------------------------------------------- conversation.json
@@ -750,8 +750,7 @@ def claude(system: str, prompt: str, schema: dict, model: str, progress: "Progre
     if res.get("is_error") or "structured_output" not in res:
         raise Failed(f"claude -p ({what}) returned no structured output: {json.dumps(res)[:1500]}. {again}")
     LOG.write(f"claude: {what} done in {time.monotonic() - started:.1f} s, session {res.get('session_id', '?')}")
-    if res.get("total_cost_usd") is not None:
-        progress.cost(what, float(res["total_cost_usd"]), "list price as Claude Code reports it, which a subscription does not charge")
+    progress.used(res)
     return res["structured_output"]
 
 
@@ -835,8 +834,15 @@ def name_speakers(folder: Path, src: Source, model: str, ask: bool, progress: "P
         progress.say("")
         confirm(unsure, turns)
     write_json(folder / "cache" / "names.json", decisions)
-    named = [d["name"] or ("not a person" if d["kind"] != "person" else "no name") for d in decisions]
-    return ", ".join(named) + (f", {len(unsure)} confirmed by you" if unsure and ask else "")
+    voices_of: dict[str, int] = {}
+    for d in decisions:
+        label = d["name"] or ("not a person" if d["kind"] != "person" else "no name")
+        voices_of[label] = voices_of.get(label, 0) + 1
+    named = ", ".join(f"{n} ({k} voices)" if k > 1 else n for n, k in voices_of.items())
+    if unsure and ask:
+        return f"{named}; you confirmed {len(unsure)}"
+    guessed = [d["voice"] for d in unsure]
+    return named + (f"; {len(guessed)} guessed below high confidence, unasked ({', '.join(guessed)}), which `scribe rename` fixes" if guessed else "")
 
 
 def confirm(unsure: list[dict], turns: list[dict]) -> None:
@@ -1506,7 +1512,8 @@ class Progress:
         self.stages = stages
         self.tty = sys.stderr.isatty()
         self.live = False
-        self.costs: list[tuple[str, float | None, str]] = []
+        self.charge: tuple[float | None, str] | None = None
+        self.calls: list[dict] = []
         self.say(f"stages: {', '.join(stages)}")
 
     def say(self, text: str) -> None:
@@ -1538,14 +1545,34 @@ class Progress:
             self.live = False
         print(f"{self.prefix()}: {outcome} ({took:.1f} s)", file=sys.stderr, flush=True)
 
-    def cost(self, what: str, usd: float | None, source: str) -> None:
-        self.costs.append((what, usd, source))
-        LOG.write(f"cost {what}: {'' if usd is None else f'${usd:.4f}, '}{source}")
+    def paid(self, usd: float | None, how: str) -> None:
+        """What the transcription cost; the one charge a run makes."""
+        self.charge = (usd, how)
+        LOG.write(f"paid for the transcription: {'' if usd is None else f'${usd:.4f}, '}{how}")
+
+    def used(self, result: dict) -> None:
+        """A Claude call's models and tokens, from the result claude -p reports."""
+        self.calls.append(result)
+        LOG.write(f"claude used {json.dumps(result.get('modelUsage', {}))}, list price ${result.get('total_cost_usd', 0):.4f}")
 
     def summary(self) -> None:
-        if self.costs:
-            self.say("cost of this run:\n" + "\n".join(
-                f"  {what}: {'' if usd is None else f'${usd:.4f}, '}{source}" for what, usd, source in self.costs))
+        lines = []
+        if self.charge:
+            usd, how = self.charge
+            lines.append(f"paid:   {'' if usd is None else f'${usd:.2f} to ElevenLabs, '}{how}")
+        if self.calls:
+            models: dict[str, list[int]] = {}
+            for r in self.calls:
+                for model, u in r.get("modelUsage", {}).items():
+                    t = models.setdefault(u.get("canonicalModel", model), [0, 0])
+                    t[0] += u["inputTokens"] + u["cacheReadInputTokens"] + u["cacheCreationInputTokens"]
+                    t[1] += u["outputTokens"]
+            used = "; ".join(f"{m}, {i:,} tokens in, {o:,} out" for m, (i, o) in models.items())
+            listed = sum(r.get("total_cost_usd") or 0 for r in self.calls)
+            lines.append(f"claude: {len(self.calls)} calls" + (f", {used}" if used else ""))
+            lines.append(f"        ${listed:.2f} at API list price, which a subscription does not pay")
+        if lines:
+            self.say("\n".join(lines))
 
 
 def in_background[T](work: Callable[[], T], tick: Callable[[], None]) -> T:
