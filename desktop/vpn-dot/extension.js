@@ -66,7 +66,7 @@ class Dot extends PanelMenu.Button {
         this._updateLabel();
     }
 
-    // A click while the dot's own `vpn on` runs turns the VPN off: that walk
+    // A click while the dot's own `vpn on` runs turns the VPN off: that move
     // stops once it sees the exit node gone, and its failure goes unreported.
     _toggle() {
         const {state} = this._shown;
