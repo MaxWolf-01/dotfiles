@@ -89,8 +89,8 @@ def load(name: str, path: Path):
 vpn = load("vpn", Path(__file__).resolve().parent.parent / "bin" / "vpn")
 
 T0 = float(int(time.time()))
-"""The World's first moment. Near the wall clock, because bin/run-log stamps node-log lines with it and the
-watcher's readback of the node log compares those stamps with the time its own clock gives."""
+"""The World's first moment. Near the wall clock, so that the stamps bin/run-log puts on node-log lines read
+close to the World's own time."""
 ENGINE_SECS = 2.0
 """How often tailscaled pushes an engine update."""
 RTT = 0.05
