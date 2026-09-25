@@ -89,8 +89,7 @@ def load(name: str, path: Path):
 vpn = load("vpn", Path(__file__).resolve().parent.parent / "bin" / "vpn")
 
 T0 = float(int(time.time()))
-"""The World's first moment. Near the wall clock, so that the stamps bin/run-log puts on node-log lines read
-close to the World's own time."""
+"""The World's first moment: the wall clock when this module loads."""
 ENGINE_SECS = 2.0
 """How often tailscaled pushes an engine update."""
 RTT = 0.05
