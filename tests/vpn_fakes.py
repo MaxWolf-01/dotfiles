@@ -352,6 +352,8 @@ class World:
         """Bytes this machine's applications send through the exit node between two engine updates."""
         self.pick_delay = 0.0
         """How long automatic mode, once turned on, takes to pick a node, with no exit node in the status meanwhile."""
+        self.report_delay = 0.0
+        """How long the bus takes to report a change of prefs, which `tailscale set` has made by the time it returns."""
         self.status_reads = 0
         """Full status readings bin/vpn took through its port."""
         self.peerless_reads: list[float] = []
@@ -500,7 +502,11 @@ class World:
             self.handshake[self.exit] = self.now + self.handshake_secs(self.exit)
             self.tx[self.exit] = self.tx.get(self.exit, 0) + 148
             self.rx[self.exit] = self.rx.get(self.exit, 0) + 92
-        self.arrive(notify(Prefs=self.prefs()))
+        report = notify(Prefs=self.prefs())
+        if self.report_delay:
+            self.at(self.now + self.report_delay, lambda: self.arrive(report))
+        else:
+            self.arrive(report)
 
     def watcher_sets(self, target: str) -> None:
         if self.down:

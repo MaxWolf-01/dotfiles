@@ -146,6 +146,7 @@ REQUEST_SOCKET = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "vpn.sock"
 """Where the watcher takes requests. The vpn-watch unit deletes it when the watcher stops."""
 REQUEST_READ_SECS = 5
 """How long the watcher waits for a client that connected to send its request."""
+CTRL_C_ECHO_SECS = 0.5
 STATE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "vpn-state.json"
 """What the top-bar dot shows (desktop/vpn-dot). The vpn-watch unit deletes it when the watcher stops."""
 VESKTOP_LOCK = Path.home() / ".config/vesktop/SingletonLock"
@@ -1328,18 +1329,21 @@ def record(w: Watch, by: Command, start: Start, outcome: Outcome, ports: Ports, 
     """The node-log line for a move's Outcome, in the events the dns/vpn
     dashboard reads, plus `cancelled` for a move that Ctrl-C or a newer request
     stopped. `moved` overrides the event of a move that pinned a node, and
-    `reason` says why it was made. A move an
-    outside change superseded writes none: `take` logged the outside change.
+    `reason` says why it was made. A move an outside change superseded writes
+    none: `take` logged the outside change.
 
     A move that stayed names where the exit node landed when that is not where
-    it started, as when automatic mode took the place of a node outside Mullvad."""
+    it started, as when automatic mode took the place of a node outside Mullvad.
+    That is read from prefs, since tailscaled's report of the put-back may still
+    be on its way."""
     if outcome.kind == "moved" and outcome.node is not None:
         log_line(w, "ok", moved or MOVED[outcome.why], by, start.name, outcome.node.name, outcome.tried, reason)
         return
     if outcome.kind == "superseded":
         return
     drain(w, ports)
-    landed = None if w.outside or w.at is None else name_of(w, w.at[1], ports)
+    prefs = None if w.outside else ports.tailscaled.prefs()
+    landed = start.name if prefs is None else name_of(w, setting(w, prefs)[1], ports)
     to = landed if landed != start.name else None
     if outcome.because in ("cancelled", "superseded"):
         log_line(w, "skip", "cancelled", by, start.name, to, outcome.tried, outcome.reason)
@@ -1852,7 +1856,9 @@ def ask(request: Literal["on", "off", "next", "to"], place: str = "", path: Path
     VpnError with the final message when the request did not succeed.
 
     Ctrl-C closes the sending side, which cancels the request; the watcher's
-    final line still arrives and is printed. A second Ctrl-C leaves at once."""
+    final line still arrives and is printed. A second Ctrl-C leaves at once.
+    One press can arrive twice, from the terminal and forwarded by `uv run`,
+    so a press within CTRL_C_ECHO_SECS of the first counts as the same."""
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         conn.connect(str(path))
@@ -1861,24 +1867,31 @@ def ask(request: Literal["on", "off", "next", "to"], place: str = "", path: Path
         raise VpnError(NOT_RUNNING) from None
     conn.sendall((json.dumps({"request": request} | ({"place": place} if place else {})) + "\n").encode())
 
+    pressed: list[float] = []
+
     def cancel(*_) -> None:
-        signal.signal(signal.SIGINT, signal.default_int_handler)
+        if pressed and time.monotonic() - pressed[0] > CTRL_C_ECHO_SECS:
+            raise SystemExit(130)
+        pressed.append(time.monotonic())
         try:
             conn.shutdown(socket.SHUT_WR)
         except OSError:
             pass
 
-    signal.signal(signal.SIGINT, cancel)
-    with conn, conn.makefile("r", encoding="utf-8") as lines:
-        for text in lines:
-            message = json.loads(text)
-            if "say" in message:
-                print(message["say"], flush=True)
-                continue
-            if not message.get("ok"):
-                raise VpnError(message.get("message") or "failed")
-            print(message.get("message", ""), flush=True)
-            return
+    previous = signal.signal(signal.SIGINT, cancel)
+    try:
+        with conn, conn.makefile("r", encoding="utf-8") as lines:
+            for text in lines:
+                message = json.loads(text)
+                if "say" in message:
+                    print(message["say"], flush=True)
+                    continue
+                if not message.get("ok"):
+                    raise VpnError(message.get("message") or "failed")
+                print(message.get("message", ""), flush=True)
+                return
+    finally:
+        signal.signal(signal.SIGINT, previous)
     raise VpnError("vpn-watch hung up without an answer; `journalctl --user -u vpn-watch` says why")
 
 
