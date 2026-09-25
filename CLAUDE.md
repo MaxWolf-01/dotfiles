@@ -38,13 +38,7 @@ NEVER include any work related details whatsoever in commit messages, PRs, issue
 
 ## Issue Tracker
 
-`agent/tickets/` is a symlink into `secrets/agent/tickets/` — tickets are versioned in the private secrets repo, never in this public one (commit them there). Standard mx markdown-tracker conventions apply; `archive/` holds retired pre-mx-workflow task files.
-
-## Workflow Artefacts
-
-Everything the mx workflow produces lives in the secrets repo and is symlinked into place here, gitignored on this side: `agent/`, `decisions/` → `secrets/decisions/`, and `CONTEXT.md` when there is one. Commit them in `secrets`.
-
-`agent/research/` is gitignored everywhere (global `~/.config/git/ignore`) and stays that way — research is ephemeral, and `~` is backed up, so nothing is lost. Condense findings into the ticket, decision, or doc that needs them; never promote a research note to a doc.
+`agent/` is the mx agent repo: a private git repo of its own (branch `dotfiles` of `MaxWolf-01/agent-repos`), which this public repo ignores. The tickets, show directories, prototypes, research, the ADRs (`agent/decisions/`) and the glossary (`agent/CONTEXT.md`) are committed there with `git -C agent`, never here; `decisions` and `CONTEXT.md` at this repo's root are links into it. The mx `tracker` skill has the conventions.
 
 ## Claude Code Config
 

@@ -25,7 +25,7 @@ exit code.
 
 Alerts are email, delivered by `bin/alert-send`; the channel — who sends, who
 receives, over what — is `secrets/monitoring/alert.conf`, and the reasoning is
-`secrets/decisions/0002-alerts-by-email.md`. Senders that keep a run log record
+`decisions/0002-alerts-by-email.md`. Senders that keep a run log record
 what became of the delivery as `stats.alert` in their line; the watchdog goes
 further and logs its run as `fail` when its alert could not be delivered, so a
 dead channel shows as a red row here and, once its ok lines stop, as an alert
