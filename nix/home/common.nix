@@ -1,6 +1,7 @@
 { config, pkgs, lib, rime, system, ... }:
 {
   imports = [
+    ./terminal-colors.nix
     ./tmux.nix
   ];
 
@@ -379,6 +380,23 @@
     };
   };
 
+  # The terminal background while sshed into a host (bin/ssh-tint), keyed by
+  # host block above; `*` is every host without a tint of its own.
+  xdg.configFile."ssh-tint/hosts".text =
+    let
+      tints = {
+        pc = "#20233a"; # indigo
+        "xmg xmg19" = "#1c2a2a"; # teal
+        "zephylux main" = "#2a2130"; # plum
+        "a55 phone" = "#232b1e"; # moss
+        jarvis = "#2e2818"; # ochre
+        yapit-prod = "#35201c"; # clay, the warmest: production
+        "*" = "#302a24"; # warm grey
+      };
+      hostName = block: if block == "*" then "*" else config.programs.ssh.settings.${block}.data.HostName;
+    in
+    lib.concatLines (lib.mapAttrsToList (block: tint: "${hostName block} ${tint}") tints);
+
   home.packages = with pkgs; [
     age
     ast-grep
@@ -406,7 +424,6 @@
     openssh
     poppler-utils
     python3Packages.ipdb
-    pywal
     restic
     ripgrep
     rsync

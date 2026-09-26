@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Drive bin/ssh-tint and its zsh wrapper against a fake ssh. Run it directly;
+# no framework.
+#
+# What matters: a known host gets its own tint and anything else the fallback;
+# `off` returns to where the terminal was, which on a host reached over ssh is
+# that host's tint; output that is not a terminal is never touched; and the
+# wrapper keeps working around the ssh function ghostty defines after zshrc,
+# with ssh's exit status intact.
+
+set -uo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# `ssh -G` prints the resolved hostname the way the real one does; any other
+# call is the session, which exits with FAKE_STATUS.
+mkdir "$tmp/path"
+cat > "$tmp/path/ssh" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = -G ]; then echo "host $2"; echo "hostname ${FAKE_HOSTNAME:-$2}"; exit 0; fi
+echo "real ssh $*"
+exit "${FAKE_STATUS:-0}"
+EOF
+chmod +x "$tmp/path/ssh"
+
+printf '%s\n' "100.0.0.1 #111111" "100.0.0.2 #222222" "* #999999" > "$tmp/hosts"
+export SSH_TINT_HOSTS="$tmp/hosts" PATH="$tmp/path:$PATH"
+unset SSH_CONNECTION # set when the suite itself runs over ssh
+
+failures=0
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+# What ssh-tint writes to a real terminal, escapes made readable: ESC as `^`,
+# the string terminator ESC \ as `;`.
+on_tty() { # <env assignments...> -- <ssh-tint args...>
+    local envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
+    script -qec "env ${envs[*]} $root/bin/ssh-tint $*" /dev/null | tr -d '\r' | sed 's/\x1b\\/;/g; s/\x1b/^/g'
+}
+
+check "a known host gets its tint" "^]11;#111111;" "$(on_tty FAKE_HOSTNAME=100.0.0.1 -- on pc)"
+check "an unknown host gets the fallback" "^]11;#999999;" "$(on_tty FAKE_HOSTNAME=203.0.113.9 -- on somewhere)"
+check "off resets to the terminal's own background" "^]111;" "$(on_tty -- off)"
+check "off on a host reached over ssh restores that host's tint" \
+    "^]11;#111111;" "$(on_tty "SSH_CONNECTION='10.0.0.5 5000 100.0.0.1 22'" -- off)"
+check "output that is not a terminal is never tinted" \
+    "" "$(FAKE_HOSTNAME=100.0.0.1 "$root/bin/ssh-tint" on pc; "$root/bin/ssh-tint" off)"
+
+mv "$tmp/hosts" "$tmp/hosts.off"
+check "without a hosts file nothing is tinted" "" "$(on_tty FAKE_HOSTNAME=100.0.0.1 -- on pc)"
+mv "$tmp/hosts.off" "$tmp/hosts"
+
+# The wrapper, with ssh-tint replaced by a recorder. zsh/functions installs it
+# at the first command; `_ssh_tint_wrap` is called here as that hook would.
+cat > "$tmp/path/ssh-tint" <<'EOF'
+#!/usr/bin/env bash
+echo "tint $*"
+EOF
+chmod +x "$tmp/path/ssh-tint"
+wrapped() { # <zsh code run before the first command> -> what `ssh pc` did, and its status
+    FAKE_STATUS=7 zsh -fc "compdef() { :; }; source $root/zsh/functions; $1; _ssh_tint_wrap; ssh pc; echo status \$?"
+}
+
+check "the wrapper tints around an ssh function defined after zshrc, as ghostty's is" \
+    "tint on pc|ghostty pc|real ssh pc|tint off|status 7" \
+    "$(wrapped 'function ssh() { echo ghostty "$@"; command ssh "$@" }' | paste -sd'|')"
+check "without one it wraps plain ssh" \
+    "tint on pc|real ssh pc|tint off|status 7" "$(wrapped : | paste -sd'|')"
+
+echo
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+else
+    echo "$failures check(s) failed"
+fi
+exit $((failures > 0))

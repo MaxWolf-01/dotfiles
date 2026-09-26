@@ -1,6 +1,6 @@
 # jovial.zsh-theme
 # https://github.com/zthxxx/jovial/raw/master/jovial.zsh-theme
-# modified to use wal colors
+# modified: colours are terminal palette slots
 
 
 export JOVIAL_VERSION='2.5.5'
@@ -94,107 +94,35 @@ typeset -gA JOVIAL_SYMBOL=(
 #   ${sgr_reset}    => reset all effect (provide by jovial)
 #
 
-# Source wal colors if available
-if [[ -f ~/.cache/wal/colors.sh ]]; then
-    source ~/.cache/wal/colors.sh
-fi
-
-# Function to convert hex to zsh color format
-@jov.hex-to-zsh-color() {
-    local hex="${1#\#}"  # Remove # if present
-    echo "%F{#${hex}}"
-}
-
-# Use wal colors if available, otherwise fall back to defaults
-if [[ -n ${color0} ]]; then
-    typeset -gA JOVIAL_PALETTE=(
-        # hostname - use color6 (cyan)
-        host "$(@jov.hex-to-zsh-color ${color6})"
-
-        # common user name - use color9
-        user "$(@jov.hex-to-zsh-color ${color9})"
-
-        # only root user - use color1 (red) bold
-        root "%B$(@jov.hex-to-zsh-color ${color1})"
-
-        # current work dir path - use color3 (yellow) bold
-        path "%B$(@jov.hex-to-zsh-color ${color3})"
-
-        # git status info - use color4 (blue)
-        git "$(@jov.hex-to-zsh-color ${color4})"
-
-        # virtual env activate prompt - use color5 (magenta)
-        venv "$(@jov.hex-to-zsh-color ${color5})"
-     
-        # current time - use color7 (light gray)
-        time "$(@jov.hex-to-zsh-color ${color7})"
-
-        # elapsed time - use color11 (bright yellow)
-        elapsed "$(@jov.hex-to-zsh-color ${color11})"
-
-        # exit code - use color8 for mark, color9 for code
-        exit.mark "$(@jov.hex-to-zsh-color ${color8})"
-        exit.code "%B$(@jov.hex-to-zsh-color ${color9})"
-
-        # conjunction - use color2 (green)
-        conj. "$(@jov.hex-to-zsh-color ${color2})"
-
-        # shell typing area pointer - use color13
-        typing "$(@jov.hex-to-zsh-color ${color13})"
-
-        # for other common case text color - use color13
-        normal "$(@jov.hex-to-zsh-color ${color13})"
-
-        # success - use color10 (bright green)
-        success "$(@jov.hex-to-zsh-color ${color10})"
-        
-        # error - use color9 (bright red)
-        error "$(@jov.hex-to-zsh-color ${color9})"
-    )
-else
-    # Fallback to original colors if wal colors not available
-    typeset -gA JOVIAL_PALETTE=(
-        # hostname
-        host '%F{157}'
-
-        # common user name
-        user '%F{253}'
-
-        # only root user
-        root '%B%F{203}'
-
-        # current work dir path
-        path '%B%F{228}%}'
-
-        # git status info (dirty or clean / rebase / merge / cherry-pick)
-        git '%F{159}'
-
-        # virtual env activate prompt for python
-        venv '%F{159}'
-     
-        # current time when prompt render, pin at end-of-line
-        time '%F{254}'
-
-        # elapsed time of last command executed
-        elapsed '%F{222}'
-
-        # exit code of last command
-        exit.mark '%F{246}'
-        exit.code '%B%F{203}'
-
-        # 'conj.': short for 'conjunction', like as, at, in, on, using
-        conj. '%F{102}'
-
-        # shell typing area pointer
-        typing '%F{252}'
-
-        # for other common case text color
-        normal '%F{252}'
-
-        success '%F{040}'
-        error '%F{203}'
-    )
-fi
+# Colours are the terminal's palette slots (nix/home/terminal-colors.nix), so
+# the prompt follows the terminal's theme, over ssh too.
+typeset -gA JOVIAL_PALETTE=(
+    host '%F{6}'
+    user '%F{9}'
+    # only root user
+    root '%B%F{1}'
+    # current work dir path
+    path '%B%F{3}'
+    # git status info (dirty or clean / rebase / merge / cherry-pick)
+    git '%F{4}'
+    # virtual env activate prompt for python
+    venv '%F{5}'
+    # current time when prompt render, pin at end-of-line
+    time '%F{7}'
+    # elapsed time of last command executed
+    elapsed '%F{11}'
+    # exit code of last command
+    exit.mark '%F{8}'
+    exit.code '%B%F{9}'
+    # 'conj.': short for 'conjunction', like as, at, in, on, using
+    conj. '%F{2}'
+    # shell typing area pointer
+    typing '%F{13}'
+    # for other common case text color
+    normal '%F{13}'
+    success '%F{10}'
+    error '%F{9}'
+)
 
 # parts dispaly order from left to right of jovial theme at the first line 
 typeset -ga JOVIAL_PROMPT_ORDER=( host user path dev-env git-info )
