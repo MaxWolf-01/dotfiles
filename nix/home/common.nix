@@ -75,6 +75,7 @@
       ".env"
       "agent/transcripts"
       "agent/handoffs"
+      "agent/sessions"
       "agent/research"
       "agent/reviews"
       "agent/diffviews"
