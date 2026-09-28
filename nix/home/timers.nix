@@ -36,6 +36,11 @@ let
     bash coreutils uv jq
   ]);
 
+  # bin/slack-archive is a uv script that drives slackdump; jq for bin/run-log.
+  slackPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv jq slackdump
+  ]);
+
   dashboardPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv openssh jq
   ]);
@@ -402,6 +407,37 @@ in
     Timer = {
       OnCalendar = "*:07/15";
       Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Slack → ~/work/helferline/slack ---
+  # The local copy of the helferline workspace; why it exists is in
+  # bin/slack-archive. Noon, when the laptop is usually up, so Persistent rarely
+  # has to catch a run up after a suspend.
+
+  systemd.user.services.slack-archive = {
+    Unit = {
+      Description = "Add new Slack messages to the local archive";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${slackPath}" ];
+      ExecStart = "${dotfiles}/bin/slack-archive sync --record";
+      # oneshot has no start timeout of its own; a sync that hangs would leave
+      # every later firing a silent no-op. A first full archive took 8 minutes.
+      TimeoutStartSec = "1h";
+    };
+  };
+
+  systemd.user.timers.slack-archive = {
+    Unit.Description = "Daily Slack archive sync";
+    Timer = {
+      OnCalendar = "*-*-* 12:00:00";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
