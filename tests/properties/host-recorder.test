@@ -65,12 +65,16 @@ class Missing(Exception):
     """The script a property drives does not exist yet."""
 
 
+class Late(Exception):
+    """What the recorder was waited for did not come in time, and it is still running."""
+
+
 def prop(fn):
     PROPERTIES.append(fn)
     return fn
 
 
-def expected_failure(ticket: str, raises: type[Exception]):
+def expected_failure(ticket: str, raises: type[Exception] | tuple[type[Exception], ...]):
     """Mark a property that holds only once `ticket` lands. Until then it must fail with `raises`."""
 
     def mark(fn):
@@ -360,6 +364,7 @@ def machines(draw, host: str | None = None, panes_over: int = 0) -> tuple[Machin
     swap = draw(st.booleans())
     sizes = st.sampled_from(["small", "small", "near", "over", "large"])
     pid = iter(range(1000, 100000))
+    uuids = iter(draw(st.lists(st.uuids(), min_size=30, max_size=30, unique=True)))
     leaves: list[Cgroup] = []
 
     def leaf(path: str, size: str | None = None) -> Cgroup:
@@ -386,12 +391,12 @@ def machines(draw, host: str | None = None, panes_over: int = 0) -> tuple[Machin
         for name in draw(st.lists(st.sampled_from(APPS), max_size=4, unique=True)):
             leaf(f"{manager}/{draw(st.sampled_from(['app.slice', 'app.slice', 'background.slice']))}/{name}")
         for _ in range(draw(st.integers(0, 3))):
-            leaf(f"{manager}/app.slice/tmux-spawn-{draw(st.uuids())}.scope")
+            leaf(f"{manager}/app.slice/tmux-spawn-{next(uuids)}.scope")
         for _ in range(draw(st.integers(0, 4))):
-            leaf(f"{manager}/tmux-spawn-{draw(st.uuids())}.scope", draw(st.sampled_from(["small", "near"])))
+            leaf(f"{manager}/tmux-spawn-{next(uuids)}.scope", draw(st.sampled_from(["small", "near"])))
     for _ in range(panes_over):
         uid = draw(st.sampled_from(uids))
-        panes.add(leaf(f"user.slice/user-{uid}.slice/user@{uid}.service/tmux-spawn-{draw(st.uuids())}.scope",
+        panes.add(leaf(f"user.slice/user-{uid}.slice/user@{uid}.service/tmux-spawn-{next(uuids)}.scope",
                        draw(st.sampled_from(["over", "large"]))).name)
     if panes_over:
         for i in range(draw(st.integers(0, 8))):
@@ -466,7 +471,7 @@ class Recorder:
             if self.proc.poll() is not None:
                 raise AssertionError(f"the recorder exited ({self.proc.returncode}) waiting for {what}; {self.said()}")
             if time.monotonic() > end:
-                raise AssertionError(f"no {what} after {timeout} s; {self.said()}")
+                raise Late(f"no {what} after {timeout} s; {self.said()}")
             time.sleep(INTERVAL / 2)
 
     def rows(self, n: int) -> int:
@@ -597,6 +602,24 @@ def mb(row: dict[str, str], column: str) -> int:
     return int(row[column] or 0)
 
 
+def rankings(r: Recorder, root: Path, m: Machine, burning: list[Cgroup]) -> list[list[dict[str, str]]]:
+    """The first ranking, and the next one if it comes within 1.5 s, after `burning` used half a second of CPU
+    each, so that CPU users compete with the memory holders for its rows."""
+    r.wait("memory ranking", lambda: r.rankings())
+    for c in burning:
+        c.usage += 500_000
+    write(root, {k: v for k, v in cgroup_files(m).items() if k.endswith("cpu.stat")})
+    try:
+        r.wait("second memory ranking", lambda: len(r.rankings()) > 1, timeout=1.5)
+    except Late:
+        pass
+    return r.rankings()
+
+
+def burners(m: Machine) -> st.SearchStrategy[list[Cgroup]]:
+    return st.lists(st.sampled_from(m.leaves), max_size=4, unique_by=lambda c: c.path)
+
+
 @prop
 @expected_failure("host-recorder-core", Missing)
 @needs(RECORDER)
@@ -607,23 +630,14 @@ def p3(drawn, data):
 
     Over cgroup trees in pc's shape and a laptop's, each ranking's anonymous, shared and swapped memory add up
     to the root cgroup's, and swap to what /proc/meminfo says is used; each row rounds down to a MiB. Between
-    the first ranking and the next some cgroups burn CPU, so the second also lists CPU users."""
+    the first ranking and the next some cgroups burn CPU, so a second ranking lists CPU users too."""
     m, _ = drawn
     total = m.totals()
     root, state = machine_root(m)
     with Recorder(root, state) as r:
-        r.wait("memory ranking", lambda: r.rankings())
-        burning = data.draw(st.lists(st.sampled_from(m.leaves), max_size=4, unique_by=lambda c: c.path))
-        for c in burning:
-            c.usage += 500_000
-        write(root, {k: v for k, v in cgroup_files(m).items() if k.endswith("cpu.stat")})
-        try:
-            r.wait("second memory ranking", lambda: len(r.rankings()) > 1, timeout=1.5)
-        except AssertionError:
-            pass
-        rankings = r.rankings()
+        ranked = rankings(r, root, m, data.draw(burners(m)))
     expected = {"anon_mb": total.anon // MiB, "shmem_mb": total.shmem // MiB, "swap_mb": m.swap_used_kb() // 1024}
-    for ranking in rankings:
+    for ranking in ranked:
         for column, want in expected.items():
             got = sum(mb(row, column) for row in ranking)
             assert want - len(ranking) <= got <= want, (
@@ -640,29 +654,29 @@ def pc_with_panes(draw):
 @expected_failure("host-recorder-core", Missing)
 @needs(RECORDER)
 @checked(30)
-@given(pc_with_panes())
-def p4(drawn):
+@given(pc_with_panes(), st.data())
+def p4(drawn, data):
     """P4 On pc, a worker's tmux pane that holds more than the ranking's threshold is a row of its own, never
     folded into the rest row.
 
     Over pc-shaped trees whose worker panes sit directly under a user manager, among other cgroups over the
     threshold that can outnumber the ranking's rows, every pane over it is one row of each ranking, holding
-    what the pane holds."""
+    what the pane holds. Between the first ranking and the next some cgroups burn CPU."""
     m, panes = drawn
     by_name = {c.name: c for c in m.leaves}
     root, state = machine_root(m)
     with Recorder(root, state) as r:
-        r.wait("memory ranking", lambda: r.rankings())
-        ranking = r.rankings()[0]
-    for pane in sorted(panes):
-        c = by_name[pane]
-        rows = [row for row in ranking if row.get("unit") == pane]
-        assert len(rows) == 1, (f"pane {pane}, holding {c.held // MiB} MiB, is {len(rows)} rows of the ranking:\n"
-                                + "\n".join(f"  {row}" for row in ranking))
-        got = (mb(rows[0], "anon_mb"), mb(rows[0], "shmem_mb"), mb(rows[0], "swap_mb"))
-        assert got == (c.anon // MiB, c.shmem // MiB, c.swap // MiB), (
-            f"pane {pane} holds anon, shmem, swap {(c.anon // MiB, c.shmem // MiB, c.swap // MiB)} MiB, "
-            f"its row says {got}")
+        ranked = rankings(r, root, m, data.draw(burners(m)))
+    for n, ranking in enumerate(ranked, start=1):
+        for pane in sorted(panes):
+            c = by_name[pane]
+            rows = [row for row in ranking if row.get("unit") == pane]
+            assert len(rows) == 1, (f"pane {pane}, holding {c.held // MiB} MiB, is {len(rows)} rows of ranking {n}:\n"
+                                    + "\n".join(f"  {row}" for row in ranking))
+            got = (mb(rows[0], "anon_mb"), mb(rows[0], "shmem_mb"), mb(rows[0], "swap_mb"))
+            assert got == (c.anon // MiB, c.shmem // MiB, c.swap // MiB), (
+                f"pane {pane} holds anon, shmem, swap {(c.anon // MiB, c.shmem // MiB, c.swap // MiB)} MiB, "
+                f"its row in ranking {n} says {got}")
 
 
 # --------------------------------------------------------------------------
@@ -806,7 +820,7 @@ def answer(s: dict[str, Path], *host: str, at: str) -> dict:
 
 
 @prop
-@expected_failure("host-recorder-report", Exception)
+@expected_failure("host-recorder-report", (Missing, AssertionError))
 @needs(READER)
 @checked(25)
 @given(recordings())
@@ -814,7 +828,7 @@ def p6(recording):
     """P6 The reader gives the same answer for the same files whether it reads them locally or over ssh.
 
     Over directories of recorder files, the reader's answer about a moment is the same read locally and read
-    from pc through the stand-in ssh, but for the host it names."""
+    from pc through the stand-in ssh, apart from a `host` field naming where it read."""
     s = scene()
     shutil.rmtree(s["full"], ignore_errors=True)
     write(s["full"], recording.files)
