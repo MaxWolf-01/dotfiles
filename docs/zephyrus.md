@@ -1,13 +1,44 @@
-# The discrete GPU
+# zephyrus
 
-On the Ubuntu laptop (zephylux, GU603ZW, RTX 3070 Ti) the NVIDIA driver
-powers the dGPU down to D3cold whenever nothing uses it, and `bin/dgpu` keeps
-it that way on battery by locking its device files. `dgpu --help` has the
-commands and the terms; `./setup dgpu_runtime_pm` installs it.
+ASUS ROG Zephyrus M16 GU603ZW (hostname zephylux): i9-12900H, RTX 3070 Ti
+Laptop GPU, Ubuntu with standalone Home Manager.
+
+## Ports
+
+| Port | Wired to | Output |
+|---|---|---|
+| Thunderbolt 4 (USB-C) | iGPU | `card1-DP-1`, `card1-DP-2` |
+| USB-C 3.2 | dGPU | `card2-DP-3` |
+| HDMI | dGPU | `card2-HDMI-A-1` |
+
+Measured on 2026-09-28 by which card reads the monitor's EDID; the dGPU's
+power state does not reroute a port. A monitor on a dGPU port keeps the dGPU in
+D0. Two monitors on the iGPU need both on the Thunderbolt port, through an MST
+hub or a Thunderbolt dock (untested). Which output a monitor is on:
+
+    for c in /sys/class/drm/card*-*; do echo "${c##*/} $(cat $c/status)"; done
+
+## Heat
+
+The CPU and dGPU share heat pipes. `asus-power-cap` caps the CPU; nothing caps
+the dGPU. `nvidia-smi -pl` is unsupported, and with `nv_temp_target` at 75 °C,
+`nv_dynamic_boost` at 5 W and clocks locked to 900 MHz (`nvidia-smi -lgc`), a
+CUDA load still took it from 66 °C to 86 °C in 5 s at 70-80 W.
+
+The dGPU cuts the power at 98 °C (`nvidia-smi -q -d TEMPERATURE`): the screen
+goes black at once and the journal just stops. That happened three times
+between 2026-09-20 and 2026-09-26, each time during a CUDA job. GPU compute
+belongs on pc or a pod.
+
+## The discrete GPU
+
+The NVIDIA driver powers the dGPU down to D3cold whenever nothing uses it, and
+`bin/dgpu` keeps it that way on battery by locking its device files. `dgpu
+--help` has the commands and the terms; `./setup dgpu_runtime_pm` installs it.
 
 `watch dgpu status` is the instrument: card, power state, lock, power source.
 
-## What holds
+### What holds
 
 Measured on 2026-09-23, driver 580.178, kernel 7.0.0-34:
 
@@ -23,7 +54,7 @@ Measured on 2026-09-23, driver 580.178, kernel 7.0.0-34:
   and wakes it for as long as it runs; it no longer rewrites the device files
   to 0666 (`NVreg_ModifyDeviceFiles=0`, set by the setup step).
 
-## What wakes it
+### What wakes it
 
 Anything that opens the device files while they are unlocked, for as long as
 it holds them:
@@ -32,11 +63,7 @@ it holds them:
   `shown_boxes` to keep btop from waking it), `nvtop`.
 - CUDA, a Vulkan or EGL app that picks the dGPU, GNOME's "Launch using
   Graphics Card".
-- A monitor on HDMI, which is wired to the dGPU, for as long as it is
-  connected. Plugging it into a running session crashes gnome-shell, locked
-  or not, and gdm restarts the session with the monitor working; a session
-  that starts with the cable in works from the start. Save your work before
-  plugging in or out. The bug: `agent/tickets/hdmi-hotplug-crashes-gnome-shell.md`.
+- A monitor on a dGPU port (see Ports), for as long as it is connected.
 
 Who holds it right now:
 
@@ -46,8 +73,17 @@ The driver's own view: `cat /proc/driver/nvidia/gpus/0000:01:00.0/power`.
 The unit's runs: `journalctl -b -u dgpu-auto`. History: thermal-log's
 `dgpu_port` column (D3cold or D0 every 5 s).
 
-## Traps
+### Traps
 
+- **A monitor on a dGPU port with the card locked.** The next layout change
+  freezes the session: gnome-shell logs `Failed to create EGL image from buffer
+  object for secondary GPU` until `dgpu unlock`, and the monitor needs a
+  replug. `dgpu auto` locks on battery, so unplugging the charger sets this up.
+- **HDMI hot-plug.** Plugging HDMI into a running session crashes gnome-shell,
+  locked or not, and gdm restarts the session with the monitor working; a
+  session that starts with the cable in works from the start. Save your work
+  before plugging in or out. The bug:
+  `agent/tickets/hdmi-hotplug-crashes-gnome-shell.md`.
 - **A kernel upgrade without its NVIDIA modules.** Ubuntu phases updates, and
   `apt upgrade` can install `linux-image-X` while holding back
   `linux-modules-nvidia-580-open-X`. Booting that kernel leaves the card on

@@ -34,3 +34,6 @@ an idle timeout. Conditions are: whether the machine is on mains, whether it can
 shed heat where it happens to be sitting, and what hours at full load cost the
 parts. Where another host is up and the work needs nothing only this machine
 has, that host is the kinder place to run it.
+
+No GPU compute here unless max says so for that job: the dGPU overheats into a
+hardware power cut within minutes (`~/.dotfiles/docs/zephyrus.md`).
