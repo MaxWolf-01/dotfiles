@@ -23,7 +23,7 @@
 # Bridge keeps its vault key in the GNOME keyring and its own encrypted cache
 # in ~/.local/share/protonmail/bridge-v3; neither is backed up, and a new
 # machine logs in again.
-{ config, pkgs, ... }:
+{ config, lib, pkgs, ... }:
 let
   home = config.home.homeDirectory;
   maildir = "${home}/data/proton-mail";
@@ -32,6 +32,13 @@ in
   services.protonmail-bridge.enable = true;
 
   home.packages = [ pkgs.isync pkgs.notmuch ];
+
+  # mbsync creates the folders inside the Maildir but not the Maildir itself.
+  # Every message in it is decrypted, so only max may read it.
+  home.activation.protonMaildir = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+    run mkdir -p ${maildir}
+    run chmod 700 ${maildir}
+  '';
 
   # Mirror, not archive: a message deleted on Proton leaves the Maildir on the
   # next run, and the restic snapshots keep what the Maildir held. "All Mail"
