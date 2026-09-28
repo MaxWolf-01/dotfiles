@@ -158,6 +158,14 @@ for anything that stopped succeeding. Never add a notification to a job without
 reading why it is silent first. Layers, bounds, the dashboards, and what to do
 when one of them goes red: `docs/monitoring.md`.
 
+## Mail
+
+max's Proton mailbox is mirrored to `~/data/proton-mail` (zephylux only, every
+15 min) and searchable with `notmuch` (`notmuch search`, `notmuch show`;
+`proton-mail-mirror` pulls now). Read the local copy; never talk to Bridge's
+IMAP or SMTP directly, and never send mail. Setup and limits:
+`nix/home/proton-mail.nix`.
+
 ## Knowledge Base Publishing
 
 The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:
