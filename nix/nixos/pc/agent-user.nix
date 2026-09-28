@@ -10,7 +10,7 @@
 # must not be able to read the personal account's transcripts, worktrees or
 # plugin cache. A home boundary covers exactly what is inside a home; dispatch's
 # scratch dir and worker logs under /tmp are outside it.
-{ config, pkgs, lib, ... }:
+{ pkgs, lib, ... }:
 
 let
   # Fixed uids so each rootless docker socket path is known at build time (the
@@ -63,38 +63,17 @@ in
       # is already the NixOS default for normal users; it is pinned here so the
       # boundary does not depend on that default staying put.
       max.homeMode = "700";
-      # Pinned to what it already is, so max's user manager below has a known
-      # name.
-      max.uid = 1000;
     }
   ];
   users.groups = lib.mapAttrs (_: w: { gid = w.uid; }) workers;
 
-  # One memory ceiling for the workers together, so running out of memory costs
-  # pc a worker and never pc itself. logind puts every user's slice directly
-  # under user.slice, so no cgroup holds agent and agent-hl without holding max
-  # too: the ceiling sits on user.slice, and max's share of it is his own use.
-  # 24G of pc's 31.25 GiB leaves the system services, the kernel and its caches
-  # about 7 GiB. The workers' capacity in their HOST.md
-  # (nix/home/hosts/pc-worker-body.md) is counted against the 24G.
-  #
-  # Nothing under the ceiling swaps: swapped out, it would stall the machine
-  # long before the kernel's OOM killer acts, which waits for swap to fill as
-  # well. So at the ceiling the killer acts at once, on the process under
-  # user.slice with the highest score: its size, shifted by its oom_score_adj.
-  # The workers' processes descend from their ssh sessions and carry an
-  # oom_score_adj of 0. max's user services, the backups among them, carry the
-  # user manager's own plus 100, which by default is 200 and would put them
-  # first. His manager at -500 puts them behind a worker of the same size by
-  # about 40% of the ceiling. His ssh sessions keep 0 and compete with the
-  # workers by size.
+  # The workers' memory ceiling. logind parents every user's slice to
+  # user.slice, so it holds max's sessions too; the workers' oom_score_adj
+  # (nix/home/worker.nix) makes them the OOM killer's first pick. No swap: a
+  # swapping cgroup stalls pc long before the killer acts.
   systemd.slices.user.sliceConfig = {
     MemoryMax = "24G";
     MemorySwapMax = 0;
-  };
-  systemd.services."user@${toString config.users.users.max.uid}" = {
-    overrideStrategy = "asDropin";
-    serviceConfig.OOMScoreAdjust = -500;
   };
 
   # Rootless docker, for the workers alone. Two things about the upstream module

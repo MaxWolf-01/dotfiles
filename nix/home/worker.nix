@@ -57,6 +57,12 @@ in
   # else; that is where home-manager puts the session variables and PATH above.
   programs.zsh.enable = true;
 
+  # Inherited by every process of the worker, so past the memory ceiling
+  # (nix/nixos/pc/agent-user.nix) the OOM killer picks a worker before max's.
+  programs.zsh.envExtra = ''
+    if (( $(</proc/self/oom_score_adj) < 500 )); then echo 500 >/proc/self/oom_score_adj; fi
+  '';
+
   # Commit identity. There is no GitHub credential here; the identity matters
   # because the commits leave this host by push and land in `git log`.
   programs.git = {
