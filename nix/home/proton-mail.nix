@@ -48,7 +48,7 @@ in
     IMAPAccount proton
     Host 127.0.0.1
     Port 1143
-    User max@mwolf.dev
+    User maxwolf01@protonmail.com
     PassCmd "sops -d ${home}/.dotfiles/secrets/creds/raw/proton-bridge"
     TLSType STARTTLS
     # Bridge's certificate is self-signed; mbsync trusts it by exact match.
@@ -83,6 +83,7 @@ in
     [user]
     name=Max Wolf
     primary_email=max@mwolf.dev
+    other_email=maxwolf01@protonmail.com
 
     # No inbox tag: `folder:INBOX` says where a message is, and the tag would
     # land on Sent and Archive too.
