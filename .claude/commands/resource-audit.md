@@ -1,6 +1,6 @@
 ---
 description: Measure what this setup costs to run — unattended units against battery, RAM, writes and watts; the interactive side against bytes written
-argument-hint: "[host | unit | interactive]  e.g. pc, thermal-log, or nothing for the full pass"
+argument-hint: "[host | unit | interactive]  e.g. pc, host-recorder, or nothing for the full pass"
 ---
 
 The deliverable is measurements with options attached; max picks everything
@@ -43,10 +43,10 @@ measured value, its floor, and its behavior-preserving flag.
 ## Standing data sources — read before measuring anew
 
 - Per-run outcomes, stats, dashboards: `docs/monitoring.md`.
-- Battery, temperature, power caps: the thermal-log CSVs — path, cadence and
-  retention in `bin/thermal-log`'s header.
+- Memory, pressure, battery, temperature, power caps: the host recorder's
+  CSVs — columns, path, cadence and retention in `bin/host-recorder`'s header.
 - CPU per unit over any window, every unit down to the smallest:
-  `thermal-log-report` (thermal-log's hourly counters plus systemd's stop
+  `thermal-log-report` (the host recorder's hourly counters plus systemd's stop
   records). Step 2's ranking for CPU starts there.
 - HDD spin behaviour on pc: `journalctl -u hd-idle` logs every spindown and
   spinup — match each wake against the known timers.
