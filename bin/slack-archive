@@ -1,0 +1,373 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Keep a local, searchable copy of the helferline Slack workspace.
+
+The copy is a slackdump archive: one SQLite database, slackdump.sqlite, and every
+attached file under __uploads/<file id>/<name>. Slack's free plan hides whatever
+is older than 90 days, so past that point the archive is the only place a message
+can still be read.
+
+`sync` adds what is new; the other commands read the archive and work offline.
+Messages print oldest first, each headed by a ref (<channel id>/<ts>), which the
+thread command accepts as it does a Slack message link.
+
+slackdump keeps the login in ~/.cache/slackdump, bound to this machine. Making
+one needs a browser and a terminal:
+
+    slackdump workspace new helferlinegmbh
+
+Examples:
+
+    slack-archive search deploy
+    slack-archive search 'stage|prod' --channel coding --since 2026-09-01
+    slack-archive search . --channel coding --limit 30
+    slack-archive thread C08N09QPMPG/1790582458.981359
+    slack-archive channels
+    slack-archive sync
+"""
+
+import json as jsonlib
+import re
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Annotated
+
+import tyro
+from tyro.extras import SubcommandApp
+
+ARCHIVE = Path.home() / "work/helferline/slack"
+WORKSPACE = "helferlinegmbh"
+# By absolute path: the systemd unit pins a PATH without ~/bin.
+RUN_LOG_BIN = Path.home() / ".dotfiles/bin/run-log"
+UNIT = "slack-archive"
+AUTH_ERROR = 4  # slackdump's exit status for a login Slack rejected
+STALE_THREAD = "p30d"  # threads quiet for longer are not fetched again
+NOISE_SUBTYPES = {"channel_join", "channel_leave"}
+
+app = SubcommandApp()
+
+
+@dataclass
+class SyncArgs:
+    archive: Path = ARCHIVE
+    """The archive directory. Created by the first sync when it does not exist."""
+    record: bool = False
+    """Append the outcome to the run log (bin/run-log). For the timer."""
+    json: bool = False
+    """Print the summary as JSON. Schema: {"messages": int, "new": int, "files": int, "seconds": int}."""
+
+
+@dataclass
+class SearchArgs:
+    pattern: Annotated[str, tyro.conf.Positional]
+    """Python regex, case-insensitive, matched against the author, the text with mentions resolved to names, and attached file names. `.` matches every message."""
+    channel: str = ""
+    """Only this channel: its name (`coding`), `@<name>` for a direct message, or its id."""
+    since: str = ""
+    """Only messages on or after this day, YYYY-MM-DD."""
+    until: str = ""
+    """Only messages on or before this day, YYYY-MM-DD."""
+    limit: int = 50
+    """Print the newest N matches. 0 prints all."""
+    archive: Path = ARCHIVE
+    """The archive directory."""
+    json: bool = False
+    """Print a JSON array: [{"ref": str, "channel": str, "time": str, "user": str, "text": str, "thread": str|null, "replies": int, "files": [str]}]. `thread` is the ref of the thread a message belongs to, `files` are local paths."""
+
+
+@dataclass
+class ThreadArgs:
+    ref: Annotated[str, tyro.conf.Positional]
+    """Any message of the thread: a ref as printed by search, or a Slack message link."""
+    archive: Path = ARCHIVE
+    """The archive directory."""
+    json: bool = False
+    """Print the thread as a JSON array, in the search schema."""
+
+
+@dataclass
+class ChannelsArgs:
+    archive: Path = ARCHIVE
+    """The archive directory."""
+    json: bool = False
+    """Print a JSON array: [{"id": str, "channel": str, "messages": int, "last": str}]."""
+
+
+@app.command(name="sync")
+def sync(args: SyncArgs) -> int:
+    """Fetch what is new from Slack into the archive, or the whole visible history when there is no archive yet.
+
+    Channels you joined since the last run are picked up, the last week is fetched again for late edits, and threads with a reply in the last 30 days for new replies. An unreachable Slack is a skip; a rejected login is a fail whose reason says how to log in again.
+    """
+    started = time.monotonic()
+    try:
+        socket.create_connection(("slack.com", 443), timeout=10).close()
+    except OSError as e:
+        return finish(args, "skip", f"slack.com unreachable: {e}")
+
+    db = args.archive / "slackdump.sqlite"
+    before = count_messages(db) if db.exists() else 0
+    if db.exists():
+        # Without the stale filter every thread ever archived is fetched again on
+        # every run, so a run grows with the archive.
+        cmd = ["slackdump", "resume", "-workspace", WORKSPACE, "-threads", "-skip-stale-threads", STALE_THREAD,
+               "-refresh", "-dedupe", str(args.archive)]
+    else:
+        cmd = ["slackdump", "archive", "-workspace", WORKSPACE, "-o", str(args.archive)]
+
+    # slackdump logs to stderr: passed through, so a terminal or the journal sees
+    # it all, and its tail kept for the reason a failed run records.
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+    tail: deque[str] = deque(maxlen=30)
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        sys.stderr.write(line)
+        tail.append(re.sub(r"\x1b\[[0-9;]*m", "", line).strip())
+    code = proc.wait()
+
+    if code != 0:
+        errors = [l for l in tail if "ERROR" in l] or [l for l in tail if l] or [""]
+        reason = f"slackdump exited {code}: {errors[-1]}"
+        if code == AUTH_ERROR:
+            reason = f"login rejected, run `slackdump workspace new {WORKSPACE}` in a terminal; {reason}"
+        return finish(args, "fail", reason[:300])
+
+    after = count_messages(db)
+    with open_db(args.archive) as con:
+        files = con.execute("SELECT COUNT(DISTINCT ID) FROM FILE").fetchone()[0]
+    stats = {"messages": after, "new": after - before, "files": files, "seconds": round(time.monotonic() - started)}
+    return finish(args, "ok", stats=stats)
+
+
+@app.command(name="search")
+def search(args: SearchArgs) -> int:
+    """Print the messages that match a pattern, thread replies included."""
+    with open_db(args.archive) as con:
+        names = Names(con)
+        where, params = [], []
+        if args.channel:
+            where.append("CHANNEL_ID = ?")
+            params.append(names.channel_id(args.channel))
+        if args.since:
+            where.append("CAST(TS AS REAL) >= ?")
+            params.append(datetime.fromisoformat(args.since).timestamp())
+        if args.until:
+            where.append("CAST(TS AS REAL) < ?")
+            params.append(datetime.fromisoformat(args.until).timestamp() + 86400)
+        rows = latest_messages(con, " AND ".join(where) or "1", params)
+        pattern = re.compile(args.pattern, re.IGNORECASE)
+        hits = [m for m in (render(r, names, args.archive) for r in rows) if m and pattern.search(haystack(m))]
+    if args.limit:
+        hits = hits[-args.limit:]
+    show(hits, args.json)
+    return 0
+
+
+@app.command(name="thread")
+def thread(args: ThreadArgs) -> int:
+    """Print the whole thread a message belongs to."""
+    channel, ts = parse_ref(args.ref)
+    with open_db(args.archive) as con:
+        names = Names(con)
+        found = latest_messages(con, "CHANNEL_ID = ? AND TS = ?", [channel, ts])
+        if not found:
+            sys.exit(f"slack-archive: no message {channel}/{ts} in {args.archive}")
+        thread_ts = found[0]["THREAD_TS"] or ts
+        rows = latest_messages(con, "CHANNEL_ID = ? AND (THREAD_TS = ? OR TS = ?)", [channel, thread_ts, thread_ts])
+        show([m for m in (render(r, names, args.archive) for r in rows) if m], args.json)
+    return 0
+
+
+@app.command(name="channels")
+def channels(args: ChannelsArgs) -> int:
+    """List the archived channels and direct messages, most recently active first."""
+    with open_db(args.archive) as con:
+        names = Names(con)
+        rows = con.execute(
+            "SELECT CHANNEL_ID, COUNT(DISTINCT TS) N, MAX(CAST(TS AS REAL)) LAST FROM MESSAGE"
+            " GROUP BY CHANNEL_ID ORDER BY LAST DESC"
+        ).fetchall()
+    out = [{"id": r["CHANNEL_ID"], "channel": names.channel(r["CHANNEL_ID"]), "messages": r["N"], "last": when(r["LAST"])} for r in rows]
+    if args.json:
+        print(jsonlib.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        for c in out:
+            print(f"{c['last']}  {c['messages']:>5}  {c['channel']}  ({c['id']})")
+    return 0
+
+
+# --- reading the archive ---
+
+def open_db(archive: Path) -> sqlite3.Connection:
+    db = archive / "slackdump.sqlite"
+    if not db.exists():
+        sys.exit(f"slack-archive: no archive at {db}; `slack-archive sync` creates one")
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def count_messages(db: Path) -> int:
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+        return con.execute("SELECT COUNT(*) FROM (SELECT DISTINCT CHANNEL_ID, TS FROM MESSAGE)").fetchone()[0]
+
+
+def latest_messages(con: sqlite3.Connection, where: str, params: list) -> list[sqlite3.Row]:
+    """One row per message, oldest first. Every sync stores a message it fetched
+    again as a new row, and a thread's lead message sits in both the channel and
+    the thread, so the newest row stands for the message, edits included."""
+    return con.execute(
+        f"""SELECT * FROM (
+              SELECT CHANNEL_ID, TS, THREAD_TS, DATA,
+                     ROW_NUMBER() OVER (PARTITION BY CHANNEL_ID, TS ORDER BY CHUNK_ID DESC) RN
+              FROM MESSAGE WHERE {where})
+            WHERE RN = 1 ORDER BY CAST(TS AS REAL)""",
+        params,
+    ).fetchall()
+
+
+class Names:
+    """Display names for user and channel ids, from the newest record of each."""
+
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.users: dict[str, str] = {}
+        for row in con.execute("SELECT ID, USERNAME, DATA FROM S_USER ORDER BY CHUNK_ID"):
+            u = jsonlib.loads(row["DATA"])
+            self.users[row["ID"]] = u.get("real_name") or u.get("profile", {}).get("real_name") or row["USERNAME"]
+        self.channels: dict[str, str] = {}
+        for row in con.execute("SELECT ID, NAME, DATA FROM CHANNEL ORDER BY CHUNK_ID"):
+            c = jsonlib.loads(row["DATA"])
+            if c.get("is_im"):
+                self.channels[row["ID"]] = "@" + self.user(c.get("user", ""))
+            elif row["NAME"]:
+                self.channels[row["ID"]] = "#" + row["NAME"]
+
+    def user(self, uid: str) -> str:
+        return self.users.get(uid, uid)
+
+    def channel(self, cid: str) -> str:
+        return self.channels.get(cid, cid)
+
+    def channel_id(self, name: str) -> str:
+        """The id for a --channel value: a name with or without its # or @, or an id."""
+        if name in self.channels:
+            return name
+        for cid, label in self.channels.items():
+            if label.lower() in (name.lower(), "#" + name.lower()):
+                return cid
+        sys.exit(f"slack-archive: no channel {name!r}; `slack-archive channels` lists them")
+
+
+def render(row: sqlite3.Row, names: Names, archive: Path) -> dict | None:
+    m = jsonlib.loads(row["DATA"])
+    if m.get("subtype") in NOISE_SUBTYPES:
+        return None
+    cid, ts = row["CHANNEL_ID"], row["TS"]
+    thread_ts = row["THREAD_TS"]
+    files = []
+    for f in m.get("files", []):
+        local = archive / "__uploads" / f.get("id", "") / f.get("name", "")
+        files.append(str(local) if local.is_file() else f"{f.get('name') or f.get('id')} (not downloaded)")
+    return {
+        "ref": f"{cid}/{ts}",
+        "channel": names.channel(cid),
+        "time": when(float(ts)),
+        "user": names.user(m["user"]) if m.get("user") else m.get("username") or m.get("bot_profile", {}).get("name", "?"),
+        "text": mrkdwn(m.get("text", ""), names),
+        "thread": f"{cid}/{thread_ts}" if thread_ts else None,
+        "replies": m.get("reply_count", 0),
+        "files": files,
+    }
+
+
+def mrkdwn(text: str, names: Names) -> str:
+    """Slack's markup as plain text: <@U…> as @Name, <#C…|x> as #x, <url|label> as label (url)."""
+
+    def one(match: re.Match) -> str:
+        body, _, label = match.group(1).partition("|")
+        if body.startswith("@"):
+            return "@" + names.user(body[1:])
+        if body.startswith("#"):
+            return "#" + label if label else names.channel(body[1:])
+        if body.startswith("!"):
+            return label or "@" + body[1:].split("^")[0]
+        return f"{label} ({body})" if label else body
+
+    text = re.sub(r"<([^<>]+)>", one, text)
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def haystack(m: dict) -> str:
+    return "\n".join([m["user"], m["text"], *m["files"]])
+
+
+def show(messages: list[dict], as_json: bool) -> None:
+    if as_json:
+        print(jsonlib.dumps(messages, ensure_ascii=False, indent=1))
+        return
+    for m in messages:
+        head = f"{m['time']}  {m['channel']}  {m['user']}  [{m['ref']}]"
+        if m["replies"]:
+            head += f"  ({m['replies']} replies)"
+        elif m["thread"] and m["thread"] != m["ref"]:
+            head += f"  (reply in {m['thread']})"
+        print(head)
+        for line in m["text"].splitlines() or [""]:
+            print("    " + line)
+        for f in m["files"]:
+            print("    file: " + f)
+        print()
+
+
+def parse_ref(ref: str) -> tuple[str, str]:
+    """(channel id, ts) from `C…/1790582458.981359` or a Slack link `…/archives/C…/p1790582458981359`."""
+    if link := re.search(r"archives/(\w+)/p(\d{10})(\d{6})", ref):
+        return link.group(1), f"{link.group(2)}.{link.group(3)}"
+    if plain := re.fullmatch(r"(\w+)/(\d{10}\.\d{6})", ref.strip()):
+        return plain.group(1), plain.group(2)
+    sys.exit(f"slack-archive: {ref!r} is neither a ref (C…/1790582458.981359) nor a Slack message link")
+
+
+def when(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+# --- sync outcome ---
+
+def finish(args: SyncArgs, outcome: str, reason: str = "", stats: dict | None = None) -> int:
+    if args.record:
+        log_run(outcome, reason, stats)
+    if outcome != "ok":
+        print(f"{UNIT}: {outcome}: {reason}", file=sys.stderr)
+        return 1 if outcome == "fail" else 0
+    assert stats is not None
+    if args.json:
+        print(jsonlib.dumps(stats))
+    else:
+        print(f"{stats['messages']} messages ({stats['new']} new), {stats['files']} files -> {args.archive}")
+    return 0
+
+
+def log_run(outcome: str, reason: str = "", stats: dict | None = None) -> None:
+    cmd = [str(RUN_LOG_BIN), UNIT, outcome]
+    if reason:
+        cmd += ["--reason", reason]
+    if stats:
+        cmd += ["--stats", jsonlib.dumps(stats)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"{UNIT}: run-log failed: {proc.stderr.strip()}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,)))
