@@ -68,9 +68,10 @@ in
   users.groups = lib.mapAttrs (_: w: { gid = w.uid; }) workers;
 
   # The workers' memory ceiling. logind parents every user's slice to
-  # user.slice, so it holds max's sessions too; the workers' oom_score_adj
-  # (nix/home/worker.nix) makes them the OOM killer's first pick. No swap: a
-  # swapping cgroup stalls pc long before the killer acts.
+  # user.slice, so it holds max's sessions too. At the ceiling the OOM killer
+  # ranks by size plus oom_score_adj; the workers' 500 puts them before max's
+  # processes (200 or less) up to 7 GiB larger. No swap: a swapping cgroup
+  # stalls pc long before the killer acts.
   systemd.slices.user.sliceConfig = {
     MemoryMax = "24G";
     MemorySwapMax = 0;
@@ -86,6 +87,9 @@ in
   # these triggering conditions, of which one has to hold.
   virtualisation.docker.rootless.enable = true;
   systemd.user.services.docker.unitConfig.ConditionUser = lib.mkForce (map (name: "|${name}") names);
+  # Its containers inherit this, as ssh-started processes inherit the same
+  # value from nix/home/worker.nix.
+  systemd.user.services.docker.serviceConfig.OOMScoreAdjust = 500;
 
   # The uid rules above only see packets the workers' own processes send.
   # tailscaled originates its own as root, and its control socket is world

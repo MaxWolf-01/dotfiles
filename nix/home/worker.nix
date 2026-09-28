@@ -57,8 +57,8 @@ in
   # else; that is where home-manager puts the session variables and PATH above.
   programs.zsh.enable = true;
 
-  # Inherited by every process of the worker, so past the memory ceiling
-  # (nix/nixos/pc/agent-user.nix) the OOM killer picks a worker before max's.
+  # Every process an ssh command starts inherits it; why 500 is beside the
+  # memory ceiling in nix/nixos/pc/agent-user.nix.
   programs.zsh.envExtra = ''
     if (( $(</proc/self/oom_score_adj) < 500 )); then echo 500 >/proc/self/oom_score_adj; fi
   '';
