@@ -158,6 +158,12 @@ for anything that stopped succeeding. Never add a notification to a job without
 reading why it is silent first. Layers, bounds, the dashboards, and what to do
 when one of them goes red: `docs/monitoring.md`.
 
+## Mail
+
+`himalaya` reads max's Proton mailbox (zephylux only) through Proton Mail
+Bridge. It reads and never sends: no send path is configured, and none gets
+added without max's say. Setup, login and limits: `nix/home/proton-mail.nix`.
+
 ## Knowledge Base Publishing
 
 The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:

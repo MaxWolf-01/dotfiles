@@ -17,6 +17,7 @@
     ../dotnet.nix
     ../gnome.nix
     ../greyline.nix
+    ../proton-mail.nix
     ../timers.nix
     ../vibe-typer.nix
     ../wayland.nix
