@@ -191,8 +191,10 @@ in
       bind -T copy-mode-vi C-v send -X rectangle-toggle
       bind -T copy-mode-vi Escape send -X cancel
 
-      # Copy the pane's screen to the clipboard; in copy mode, the scrolled-to screen
-      bind y run-shell "${tmux} capture-pane -pJM -t '#{pane_id}' | wl-copy" \; display "Screen copied"
+      # Copy the pane's screen to the clipboard; in copy mode, the scrolled-to screen.
+      # Goes through the terminal (load-buffer -w), not wl-copy: on GNOME wl-copy
+      # grabs focus for a moment, and the focus change clears the message at once.
+      bind y run-shell "${tmux} capture-pane -pJM -t '#{pane_id}' | ${tmux} load-buffer -w -t '#{client_name}' -" \; display "Screen copied"
 
       # Open the pane's whole scrollback in nvim. The capture runs in run-shell
       # because display-popup does not expand #{pane_id} in its command.
