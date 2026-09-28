@@ -22,6 +22,9 @@
     extraPools = [ "tank" ];
     requestEncryptionCredentials = false;
   };
+  # No cgroup counts the ARC; the cap bounds how much of what the workers'
+  # ceiling (agent-user.nix) leaves the rest of pc it can take.
+  boot.kernelParams = [ "zfs.zfs_arc_max=${toString (8 * 1024 * 1024 * 1024)}" ];
 
   # Network
   networking.hostName = "pc";

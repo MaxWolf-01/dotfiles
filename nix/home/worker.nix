@@ -57,6 +57,12 @@ in
   # else; that is where home-manager puts the session variables and PATH above.
   programs.zsh.enable = true;
 
+  # Every process an ssh command starts inherits it; why 500 is beside the
+  # memory ceiling in nix/nixos/pc/agent-user.nix.
+  programs.zsh.envExtra = ''
+    if (( $(</proc/self/oom_score_adj) < 500 )); then echo 500 >/proc/self/oom_score_adj; fi
+  '';
+
   # Commit identity. There is no GitHub credential here; the identity matters
   # because the commits leave this host by push and land in `git log`.
   programs.git = {
