@@ -80,6 +80,7 @@ Structure:
 - `flake.nix` defines all hosts. PC is a NixOS system (with HM as a module); laptops are HM standalone.
 - `nix/home/` holds one Home Manager module per concern: a program (`firefox.nix`, `ghostty.nix`, `tmux.nix`, ...), a desktop layer (`desktop.nix`, `gnome.nix`, `wayland.nix`), a toolchain (`dotnet.nix`), the systemd user timers (`timers.nix` and `pc-timers.nix`, one file per host that has them), a user (`worker.nix`), and `common.nix` for what every machine gets. `ls nix/home/` is the index; each module's own options say what it sets.
 - `nix/home/hosts/` is per-machine: stateVersion plus the imports that pick the tier below.
+- `docs/<host>.md` is a machine's hardware: which port drives which GPU, thermal limits, traps.
 - `nix/nixos/pc/` is PC's NixOS system config.
 
 Host tiers:
