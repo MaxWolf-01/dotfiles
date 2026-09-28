@@ -142,12 +142,12 @@ shift "$n"
 """
 
 
-def on_host(host: str | None, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+def on_host(host: str | None, argv: list[str], stdin: str = "") -> subprocess.CompletedProcess[bytes]:
     """Run argv on `host`, or here when there is none: the one place local and remote reads part ways."""
     if host:
         ssh = shlex.split(os.environ.get("HOST_RECORDER_SSH") or "ssh")
         argv = [*ssh, "-o", "BatchMode=yes", host, shlex.join(argv)]
-    return subprocess.run(argv, capture_output=True, check=False)
+    return subprocess.run(argv, input=stdin.encode(), capture_output=True, check=False)
 
 
 def read_files(host: str | None, logdir: Path | None, names: list[str]) -> dict[str, str]:
@@ -308,15 +308,31 @@ def group_name(unit: str) -> str:
 Unit = tuple[str, str]  # (manager, unit name)
 
 
-def read_counters(files: dict[str, str], user: str) -> tuple[dict[Unit, list[tuple[float, int]]], float | None]:
+def counter_rows(files: dict[str, str]) -> list[dict[str, str]]:
+    """The hourly counters' rows whole enough to read."""
+    return [r for r in rows(files, ".counters.csv", "", "~")
+            if r.get("manager") and r.get("unit") and isinstance(number(r.get("usage_usec")), int)]
+
+
+def host_clock(host: str | None, stamps: list[str]) -> tuple[str, dict[str, float]]:
+    """The reading user's manager on `host`, and each of the host's local-time stamps in epoch seconds. The host
+    converts them, so its own time zone and daylight saving apply whichever machine reads."""
+    result = on_host(host, ["sh", "-c", "id -u && date -f - +%s"], stdin="".join(f"{s}\n" for s in stamps))
+    lines = result.stdout.decode().split()
+    if result.returncode or len(lines) != len(stamps) + 1:
+        fail(f"reading {host or 'this host'}'s clock failed: {result.stderr.decode(errors='replace').strip()}")
+    return f"user@{lines[0]}", {s: float(e) for s, e in zip(stamps, lines[1:])}
+
+
+def read_counters(counter: list[dict[str, str]], user: str,
+                  epoch: dict[str, float]) -> tuple[dict[Unit, list[tuple[float, int]]], float | None]:
     """Every unit's hourly counter samples, and the earliest sample time. Counters written before the recorder
     named a user manager by its uid say `user`, and are read as `user`'s: on a host with one user manager,
     the one they were."""
     series: dict[Unit, list[tuple[float, int]]] = defaultdict(list)
-    for row in rows(files, ".counters.csv", "", "~"):
-        t = time.mktime(time.strptime(row["time"], STAMP))
+    for row in counter:
         manager = user if row["manager"] == "user" else row["manager"]
-        series[(manager, row["unit"])].append((t, int(row["usage_usec"])))
+        series[(manager, row["unit"])].append((epoch[row["time"]], int(row["usage_usec"])))
     earliest = min((s[0][0] for s in series.values() if s), default=None)
     return series, earliest
 
@@ -393,14 +409,13 @@ def usage_in_window(run: Lifetime, t0: float, t1: float, earliest: float | None)
 def cpu(args: Args) -> None:
     t1 = time.time()
     t0 = t1 - args.hours * 3600
-    uid = on_host(args.host, ["id", "-u"])
-    if uid.returncode:
-        fail(f"reaching {args.host or 'this host'} failed: {uid.stderr.decode(errors='replace').strip()}")
-    user = f"user@{uid.stdout.decode().strip()}"
-    # From the day before the window: a lifetime's baseline is its last counter before the window starts.
-    files = read_files(args.host, args.logdir, [f"{d}.counters.csv" for d in
-                                                days(date.fromtimestamp(t0) - timedelta(days=1), date.fromtimestamp(t1))])
-    counters, earliest = read_counters(files, user)
+    # From the day before the window, since a lifetime's baseline is its last counter before the window
+    # starts, to the day after, for a host whose date is already ahead of this one's.
+    files = read_files(args.host, args.logdir, [f"{d}.counters.csv" for d in days(
+        date.fromtimestamp(t0) - timedelta(days=1), date.fromtimestamp(t1) + timedelta(days=1))])
+    counter = counter_rows(files)
+    user, epoch = host_clock(args.host, sorted({r["time"] for r in counter}))
+    counters, earliest = read_counters(counter, user, epoch)
     stops = read_stops(args.host, t0, user)
 
     per_unit: dict[Unit, int] = defaultdict(int)
