@@ -17,8 +17,11 @@
       # its rows matter. The OOM killer never picks it, and memory.min keeps
       # its pages resident: a small process that sleeps between samples is
       # otherwise the first the kernel reclaims, and it then stalls on every
-      # page it faults back in. 32M covers its ~6 MB resident and the page
-      # cache of the day's CSVs it writes.
+      # page it faults back in. memory.min covers what is charged to the
+      # unit: its own memory, the CSVs it writes, and any file page it faults
+      # in itself. Pages of bash another process read first are charged
+      # there and can be reclaimed, once: faulted back in by the recorder,
+      # they are its own. 32M covers its ~6 MB resident and the day's CSVs.
       OOMScoreAdjust = -1000;
       MemoryMin = "32M";
     };
