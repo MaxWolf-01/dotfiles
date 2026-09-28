@@ -191,6 +191,15 @@ in
       bind -T copy-mode-vi C-v send -X rectangle-toggle
       bind -T copy-mode-vi Escape send -X cancel
 
+      # Copy the pane's screen to the clipboard; in copy mode, the scrolled-to screen
+      bind y run-shell "${tmux} capture-pane -pJM -t '#{pane_id}' | wl-copy" \; display "Screen copied"
+
+      # Open the pane's whole scrollback in nvim. The capture runs in run-shell
+      # because display-popup does not expand #{pane_id} in its command.
+      # Replaces the default session list (s); prefix f picks sessions.
+      bind s run-shell "${tmux} capture-pane -pJS - -t '#{pane_id}' > \$XDG_RUNTIME_DIR/tmux-scrollback.txt" \; \
+        display-popup -E -w 90% -h 90% "nvim + \$XDG_RUNTIME_DIR/tmux-scrollback.txt; rm -f \$XDG_RUNTIME_DIR/tmux-scrollback.txt"
+
       # Intuitive splits (in current directory)
       bind | split-window -h -c "#{pane_current_path}"
       bind - split-window -v -c "#{pane_current_path}"
