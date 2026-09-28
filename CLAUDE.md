@@ -160,9 +160,11 @@ when one of them goes red: `docs/monitoring.md`.
 
 ## Mail
 
-`himalaya` reads max's Proton mailbox (zephylux only) through Proton Mail
-Bridge. It reads and never sends: no send path is configured, and none gets
-added without max's say. Setup, login and limits: `nix/home/proton-mail.nix`.
+max's Proton mailbox is mirrored to `~/data/proton-mail` (zephylux only, every
+15 min) and searchable with `notmuch` (`notmuch search`, `notmuch show`;
+`proton-mail-mirror` pulls now). Read the local copy; never talk to Bridge's
+IMAP or SMTP directly, and never send mail. Setup and limits:
+`nix/home/proton-mail.nix`.
 
 ## Knowledge Base Publishing
 

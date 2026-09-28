@@ -46,6 +46,11 @@ let
     bash coreutils uv jq git fd
   ]);
 
+  # sops for the Bridge password, jq for bin/run-log.
+  mailPath = lib.makeBinPath (with pkgs; [
+    bash coreutils isync notmuch sops jq
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -365,6 +370,38 @@ in
       OnCalendar = "*-*-* 03:30:00";
       Persistent = true;
       RandomizedDelaySec = "10m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Proton mailbox → ~/data/proton-mail ---
+  # What it pulls and how: nix/home/proton-mail.nix. Every 15 minutes because
+  # agents read the local copy, and a run with nothing new takes seconds.
+
+  systemd.user.services.proton-mail-mirror = {
+    Unit = {
+      Description = "Pull the Proton mailbox into a local Maildir";
+      After = [ "protonmail-bridge.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # /usr/bin for systemctl, which asks whether Bridge is up
+      Environment = [ "PATH=${mailPath}:/usr/bin:/bin" ];
+      ExecStart = "${dotfiles}/bin/proton-mail-mirror";
+      # The first run pulls the whole mailbox; later ones take seconds. oneshot
+      # has no start timeout of its own, and a hung run would make every later
+      # firing a silent no-op.
+      TimeoutStartSec = "2h";
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.proton-mail-mirror = {
+    Unit.Description = "Proton mail mirror (every 15 min)";
+    Timer = {
+      OnCalendar = "*:07/15";
+      Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
   };
