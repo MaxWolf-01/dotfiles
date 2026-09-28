@@ -8,7 +8,7 @@ Three layers carry the rest:
 
 | Layer | What it holds | Where |
 | --- | --- | --- |
-| Run log | one JSON line per run: outcome, why, the run's own numbers | `~/logs/runs/<unit>.jsonl`, appended by `bin/run-log` |
+| Job run log | one JSON line per run: outcome, why, the run's own numbers | `~/logs/runs/<unit>.jsonl`, appended by `bin/run-log` |
 | Overdue watchdog | the one job whose purpose is to alert: one email naming every unit that stopped succeeding | `bin/overdue-check`, daily on both hosts |
 | Dashboards | one static HTML page per topic, rebuilt on a timer, read when there is time | `~/Documents/dashboards/` |
 
@@ -25,7 +25,7 @@ exit code.
 
 Alerts are email, delivered by `bin/alert-send`; the channel — who sends, who
 receives, over what — is `secrets/monitoring/alert.conf`, and the reasoning is
-`decisions/0002-alerts-by-email.md`. Senders that keep a run log record
+`decisions/0002-alerts-by-email.md`. Senders that keep a job run log record
 what became of the delivery as `stats.alert` in their line; the watchdog goes
 further and logs its run as `fail` when its alert could not be delivered, so a
 dead channel shows as a red row here and, once its ok lines stop, as an alert
@@ -36,23 +36,23 @@ Everything that can send one, and where it points:
 | Subject | Sender | What it means | Where to look next |
 | --- | --- | --- | --- |
 | `❌ <unit> - Backup Failed` | `backup/restic_backup.sh` | that run left no snapshot; the message carries restic's own error | the same run is a `fail` line in `~/logs/runs/<unit>.jsonl`, with the path to the error log |
-| `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message, the attachment, and the `check_log` path in the run log carry restic's full output | `/backup-audit <unit>` — it opens the repo and reports what is broken |
-| `🕸️ <n> overdue: <unit> +<rest>` / `🕸️ <n> unchecked: <unit> +<rest>` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Could not check:`, one whose evidence could not be read at all — a repository that answers but cannot be opened, or an age key still locked after a reboot | overdue: the unit's run log, then its bound (below). Could not check: `/backup-audit`, which opens the repositories |
+| `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message, the attachment, and the `check_log` path in the job run log carry restic's full output | `/backup-audit <unit>` — it opens the repo and reports what is broken |
+| `🕸️ <n> overdue: <unit> +<rest>` / `🕸️ <n> unchecked: <unit> +<rest>` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Could not check:`, one whose evidence could not be read at all — a repository that answers but cannot be opened, or an age key still locked after a reboot | overdue: the unit's job run log, then its bound (below). Could not check: `/backup-audit`, which opens the repositories |
 | `⚠️ Yapit health` / `⚠️ Yapit deps` | `scripts/report.sh` / `scripts/dep-scout.sh` in `~/repos/code/yapit-tts/yapit` | last night's agent found issues, or a dependency needs acting on | the report itself, on the yapit dashboard |
 | `❌ / ✅ yapit deploy: <commit>` | `scripts/deploy.sh`, run by hand from the yapit repo | a production deploy failed partway, or shipped — deploys are rare and hand-run, so completion mails too | the deploy terminal output and `.deploys.log` in the repo |
-| `✅ / ❌ / ⚠️ instagram-saves: ...` | `secrets/scripts/instagram-saves --record`, hourly on pc | every saved Instagram post is downloaded and the unit can go (`✅`), the run broke (`❌`), or Instagram has refused this IP for a day (`⚠️`, at most one a day) | the run log, then `ledger.tsv` in `~/instagram-saves` on pc: one line per attempt, with the reason it ended that way |
+| `✅ / ❌ / ⚠️ instagram-saves: ...` | `secrets/scripts/instagram-saves --record`, hourly on pc | every saved Instagram post is downloaded and the unit can go (`✅`), the run broke (`❌`), or Instagram has refused this IP for a day (`⚠️`, at most one a day) | the job run log, then `ledger.tsv` in `~/instagram-saves` on pc: one line per attempt, with the reason it ended that way |
 | `CF firewall sync failed` | `scripts/sync-cf-firewall.sh`, hourly cron on yapit-prod | the Hetzner firewall could not be updated with current Cloudflare IPs | `/var/log/cf-firewall-sync.log` on the VPS |
 
 Nothing else sends on its own. A green backup, a skipped one, an integrity
 check whose connection dropped under it, a newly blocked domain, an exit node
-rotation, a routine dependency report: run log and dashboard only. `🔍` in a
+rotation, a routine dependency report: job run log and dashboard only. `🔍` in a
 yapit title means the report had no readable status line, so the setup could
 not tell whether the agent found anything and says so rather than staying
 quiet.
 
-## Run logs
+## Job run logs
 
-The envelope and the vocabulary are in `run-log --help`: `ok`, `skip`, `fail`,
+The envelope and the vocabulary are in `bin/run-log --help`: `ok`, `skip`, `fail`,
 the reason a skip or a fail must carry, and the per-job `stats` object. Each
 host writes its own logs and nothing collects them into one place, so pc's are
 read over ssh by whatever needs them.
@@ -66,6 +66,10 @@ ssh pc jq . logs/runs/phone-sync.jsonl
 A `skip` says a precondition the job does not control was absent, so it
 deliberately did nothing: expected, and never an alert on its own. A skip
 streak that never ends becomes visible through the watchdog bound below.
+
+The model run log, `~/logs/agent/runs.jsonl`, is another record: one line per
+model run the agent workflow starts, and what it cost. The mx plugin's own
+`run-log` writes it, and nothing on this page reads it.
 
 ## "unit X hasn't run in N days — is that a problem?"
 
@@ -94,9 +98,9 @@ and a dead pc still surfaces a week later.
 
 A host or backup target that cannot be reached is skipped rather than alerted,
 and printed on stdout only. That silence is bounded: a repository the probe
-cannot open is dated from the run log of whichever host makes that backup, and
+cannot open is dated from the job run log of whichever host makes that backup, and
 an outage outlasting the repo's `max_age_days` alerts with the unreachability
-named. A repository nothing can date — no run log on the host that backs it up
+named. A repository nothing can date — no job run log on the host that backs it up
 — is reported, not skipped. The mechanics are in the comments at the top of
 `bin/overdue-check`.
 
@@ -140,17 +144,17 @@ page that silently stopped refreshing is itself an overdue unit.
 
 ## A row is red
 
-The row's note names the cause; it comes from the run log line the job wrote.
+The row's note names the cause; it comes from the job run log line the job wrote.
 From there:
 
 1. `jq . ~/logs/runs/<unit>.jsonl` — the failing run in full, including the
    path to whatever log it left behind.
 2. `journalctl --user -u <unit>.service` — what the process printed, when the
-   run log line is missing or says nothing useful. On pc, prefix with
+   job run log line is missing or says nothing useful. On pc, prefix with
    `ssh pc`, and drop `--user` for the YouTube download, which is the one
    watched unit that runs as a system service.
 3. `/backup-audit [unit|host]` — the deep pass for backups, and the only thing
-   here that opens the repositories: are the snapshots the run logs claim
+   here that opens the repositories: are the snapshots the job run logs claim
    really there, is anything damaged, what changed. It costs minutes, so it
    runs on demand; the dashboard's buttons copy the prompt that starts it. A
    Claude Code command in this repo, `.claude/commands/backup-audit.md`.
@@ -165,5 +169,5 @@ From there:
    the moment its line exists, so seeding it stops the next morning's alert
    being about the line you just added.
 4. If it belongs on a page, add its row to that topic's collector. Bounds,
-   cadence and which host runs what are read from the config, the run log and
+   cadence and which host runs what are read from the config, the job run log and
    the timer files — a collector states none of them itself.
