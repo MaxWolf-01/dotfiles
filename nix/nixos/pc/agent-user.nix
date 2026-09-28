@@ -63,7 +63,8 @@ in
       # is already the NixOS default for normal users; it is pinned here so the
       # boundary does not depend on that default staying put.
       max.homeMode = "700";
-      # Pinned to what it already is, so max's slice below has a known name.
+      # Pinned to what it already is, so max's user manager below has a known
+      # name.
       max.uid = 1000;
     }
   ];
@@ -72,26 +73,29 @@ in
   # One memory ceiling for the workers together, so running out of memory costs
   # pc a worker and never pc itself. logind puts every user's slice directly
   # under user.slice, so no cgroup holds agent and agent-hl without holding max
-  # too: the ceiling sits on user.slice, and max's slice is shielded inside it.
-  #
-  # Past the ceiling the kernel's OOM killer takes the largest process under
-  # user.slice, which is a worker's; nothing outside it is touched. 24G of
-  # pc's 31.25 GiB leaves the system services, the kernel and its caches about
-  # 7 GiB. The workers get no swap: paged out, they would stall the machine
-  # long before the killer acts, which waits for swap to fill as well. The first
-  # 2G of max's slice is never reclaimed, so a worker filling the ceiling
-  # cannot page out his backups. The workers' capacity in their HOST.md
+  # too: the ceiling sits on user.slice, and max's share of it is his own use.
+  # 24G of pc's 31.25 GiB leaves the system services, the kernel and its caches
+  # about 7 GiB. The workers' capacity in their HOST.md
   # (nix/home/hosts/pc-worker-body.md) is counted against the 24G.
-  systemd.slices = {
-    user.sliceConfig.MemoryMax = "24G";
-    "user-${toString config.users.users.max.uid}" = {
-      overrideStrategy = "asDropin";
-      sliceConfig.MemoryMin = "2G";
-    };
-  } // lib.mapAttrs' (_: w: lib.nameValuePair "user-${toString w.uid}" {
+  #
+  # Nothing under the ceiling swaps: swapped out, it would stall the machine
+  # long before the kernel's OOM killer acts, which waits for swap to fill as
+  # well. So at the ceiling the killer acts at once, on the process under
+  # user.slice with the highest score: its size, shifted by its oom_score_adj.
+  # The workers' processes descend from their ssh sessions and carry an
+  # oom_score_adj of 0. max's user services, the backups among them, carry the
+  # user manager's own plus 100, which by default is 200 and would put them
+  # first. His manager at -500 puts them behind a worker of the same size by
+  # about 40% of the ceiling. His ssh sessions keep 0 and compete with the
+  # workers by size.
+  systemd.slices.user.sliceConfig = {
+    MemoryMax = "24G";
+    MemorySwapMax = 0;
+  };
+  systemd.services."user@${toString config.users.users.max.uid}" = {
     overrideStrategy = "asDropin";
-    sliceConfig.MemorySwapMax = 0;
-  }) workers;
+    serviceConfig.OOMScoreAdjust = -500;
+  };
 
   # Rootless docker, for the workers alone. Two things about the upstream module
   # make "just enable it" wrong here: its user service is wantedBy every

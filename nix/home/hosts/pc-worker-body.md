@@ -8,7 +8,8 @@ inside the worktree.
 ## Capacity
 
 Six workers at once, agent@pc and agent-hl@pc counted together: they share one
-memory budget, with no swap. Past it the kernel kills the largest worker
+memory budget, with no swap, and max's own sessions on pc draw on it too, so
+fewer fit while he works here. Past it the kernel kills the largest worker
 process, a `claude` or what it runs, and that worker ends while pc stays up. A
 process that crashes larger than 2 GiB leaves a journal entry and no core dump.
 
