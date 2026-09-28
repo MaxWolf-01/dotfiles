@@ -52,7 +52,6 @@ in
     slackdump # bin/slack-archive keeps a searchable copy of a workspace with it
     sshfs
     chromium
-    codex
     zathura
     texliveFull
   ];
