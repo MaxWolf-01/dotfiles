@@ -73,15 +73,6 @@
     };
     ignores = [
       ".env"
-      "agent/transcripts"
-      "agent/handoffs"
-      "agent/sessions"
-      "agent/research"
-      "agent/reviews"
-      "agent/diffviews"
-      "agent/harden"
-      "agent/board.html"
-      "agent/board.html.stamp.js"
       "node_modules"
       "repomix-output.*"
       "**/uv.lock"
