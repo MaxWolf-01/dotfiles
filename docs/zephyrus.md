@@ -70,7 +70,7 @@ Who holds it right now:
     for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -E '/dev/(nvidia|dri/renderD129)' | sed "s|^|$(cat $p/comm) |"; done | awk '{print $1, $NF}' | sort | uniq -c
 
 The driver's own view: `cat /proc/driver/nvidia/gpus/0000:01:00.0/power`.
-The unit's runs: `journalctl -b -u dgpu-auto`. History: thermal-log's
+The unit's runs: `journalctl -b -u dgpu-auto`. History: the host recorder's
 `dgpu_port` column (D3cold or D0 every 5 s).
 
 ### Traps
