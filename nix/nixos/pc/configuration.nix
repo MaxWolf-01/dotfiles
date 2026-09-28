@@ -103,6 +103,17 @@
     };
   };
 
+  # Core dumps are kept up to 2G. A larger crash leaves its journal entry
+  # (process, signal, time) and no file: systemd-coredump cuts the core off at
+  # ProcessSizeMax, a mebibyte over ExternalSizeMax, and deletes it for being
+  # over. Uncompressed, because a cut-off core compressed could come in under
+  # ExternalSizeMax and be kept.
+  systemd.coredump.settings.Coredump = {
+    ExternalSizeMax = "2G";
+    ProcessSizeMax = "2049M";
+    Compress = false;
+  };
+
   # User
   users.users.max = {
     isNormalUser = true;
