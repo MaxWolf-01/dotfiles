@@ -94,12 +94,13 @@ History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
   a wake or a hotplug that probe is gnome-shell's own, made once it hears of
   the event. So on those two `dgpu defer` unlocks first, before gnome-shell
   can draw: from a system-sleep hook before user processes are thawed, and
-  from udev before a change on the dGPU's card reaches gnome-shell. `auto`
-  decides again five seconds later, from what gnome-shell's probe found. It
+  from udev before a change on the dGPU's card reaches gnome-shell. `dgpu`
+  decides again a few seconds later, from what gnome-shell's probe found. It
   cannot stop a `dgpu lock` typed by hand under a monitor, nor an installed
   copy that differs from `bin/dgpu` (`dgpu status` says so; `dgpu install`
-  replaces it), nor the charger going out in the instant between a hotplug and
-  gnome-shell's probe, when the unit's `auto` still reads the old state.
+  replaces it), nor a decision made before gnome-shell's probe: the charger
+  going out in the instant between a hotplug and that probe, or a probe that
+  comes later than the delay (`RECHECK_DELAY` in `bin/dgpu`).
 - **HDMI hot-plug.** Plugging HDMI into a running session crashes gnome-shell,
   locked or not, and gdm restarts the session with the monitor working; a
   session that starts with the cable in works from the start. Save your work
