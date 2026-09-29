@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Keep the discrete GPU powered off. Lock its device files on battery, unlock on AC.
+# Keep the discrete GPU powered off. Lock its device files on battery, unlock on
+# AC, and leave them unlocked while a monitor is on one of the dGPU's ports.
 #
 # The driver powers an idle dGPU down to D3cold on its own (NVIDIA: runtime D3,
 # Ubuntu's on-demand PRIME mode ships it). What wakes it is a program opening
@@ -14,15 +15,24 @@
 # NVIDIA tool run as root would put the driver's 0666 back on /dev/nvidia*;
 # ./setup dgpu_runtime_pm turns that off (NVreg_ModifyDeviceFiles=0).
 #
-# A monitor on a port wired to the dGPU needs it unlocked: locked, the next
-# layout change freezes the session. Which ports those are, what wakes the
-# card, and how to see who holds it: docs/zephyrus.md.
+# A monitor on a port wired to the dGPU needs it unlocked: gnome-shell draws it
+# through the dGPU, and a lock under it hangs the session until a hard reset.
+# So `auto` locks only on battery with none of the dGPU's outputs connected,
+# and otherwise unlocks. It finds those outputs under the dGPU's own PCI
+# device, since card numbers change between boots, and reads the state the
+# driver already holds, which neither probes a port nor wakes the card.
 #
-# `install` puts a root-owned copy of this script in /usr/local/sbin, a unit
-# that runs `auto` at boot before the display manager and after every wake, and
-# a udev rule that runs it when the charger goes in or out and when the dGPU's
-# driver or render node appears. The copy does not follow edits made here:
-# `status` says when the two differ, `install` reinstalls.
+# `install` puts a root-owned copy of this script in /usr/local/sbin and has it
+# run `auto`:
+#   - at boot, before the display manager (a unit)
+#   - after every wake, before user processes are thawed (a system-sleep hook)
+#   - when a monitor is plugged in or out, before gnome-shell hears of it (a
+#     udev RUN+= on the DRM card's change event)
+#   - when the charger goes in or out, and when the dGPU's driver or render
+#     node appears (udev starting the unit)
+# The copy does not follow edits made here: `status` says when the two differ,
+# `install` reinstalls. Which port is which, and what the lock still cannot
+# prevent: docs/zephyrus.md.
 #
 # Terms:
 #   dGPU, iGPU   the discrete (NVIDIA) GPU and the one inside the CPU; the iGPU
@@ -32,30 +42,35 @@
 #                NVIDIA calls it RTD3
 #   device files /dev/nvidia*, /dev/dri/card*, /dev/dri/renderD*: what a program
 #                opens to use a GPU
+#   output       a GPU's connector for one port, named after this boot's card
+#                number (card1-DP-3)
 #   locked       those files carry no permission bits; a program's open fails
 #                and the card is not woken
 #   NVML         NVIDIA's monitoring library, behind nvidia-smi, btop, nvtop:
 #                every reader of it wakes the card
 #
 # Usage:
-#   dgpu status     card, driver, power state, lock, power source, installed units
+#   dgpu status     card, driver, power state, lock, the dGPU's outputs, power
+#                   source, what is installed
 #   dgpu lock       fail every open of the dGPU's device files
 #   dgpu unlock     restore their permissions
-#   dgpu auto       lock on battery, unlock on AC; what the unit runs
-#   dgpu install    install the copy, the unit and the udev rule, then run auto
+#   dgpu auto       lock on battery with no monitor on the dGPU, else unlock
+#   dgpu install    install the copy, the unit, the sleep hook and the udev
+#                   rule, then run auto
 #   dgpu reset      unlock and remove what install put in place
 
 set -euo pipefail
 
-# Overridable for tests/dgpu.test.
+# Overridable for tests/dgpu.test. DGPU_ROOT prefixes every path install writes.
 SYSFS_DRM=${DGPU_SYSFS_DRM:-/sys/class/drm}
 DEV=${DGPU_DEV:-/dev}
 POWER_SUPPLY=${DGPU_POWER_SUPPLY:-/sys/class/power_supply}
-INSTALLED=/usr/local/sbin/dgpu
+ROOT=${DGPU_ROOT:-}
+INSTALLED=$ROOT/usr/local/sbin/dgpu
 UNIT_NAME=dgpu-auto.service
-UNIT_PATH=/etc/systemd/system/$UNIT_NAME
-RULE_PATH=/etc/udev/rules.d/99-dgpu.rules
-WAKE_TARGETS="suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+UNIT_PATH=$ROOT/etc/systemd/system/$UNIT_NAME
+RULE_PATH=$ROOT/etc/udev/rules.d/99-dgpu.rules
+HOOK_PATH=$ROOT/etc/systemd/system-sleep/dgpu
 NO_DGPU="no dGPU with a driver bound (is the card on the bus: lspci -d 10de:; is its driver loaded: lsmod)"
 # How long `auto` waits for the render node after the driver's own event
 # created /dev/nvidia*; the DRM nodes arrive in a later udev event.
@@ -84,6 +99,28 @@ find_dgpu() {
         return 0
     done
     return 1
+}
+
+# The dGPU's outputs as "<name> <status>", one per line: the connectors of the
+# DRM card under its PCI device. Only ever read: writing `status` forces a
+# probe, which wakes the card.
+outputs() { # sysfs path
+    local s c
+    for s in "$1"/drm/card*/card*-*/status; do
+        [ -r "$s" ] || continue
+        c=${s%/status}
+        echo "${c##*/} $(cat "$s")"
+    done
+    return 0
+}
+
+# The dGPU's outputs with a monitor on them, space-separated.
+connected() { # sysfs path
+    local name state held=()
+    while read -r name state; do
+        if [ "$state" = connected ]; then held+=("$name"); fi
+    done < <(outputs "$1")
+    echo "${held[*]}"
 }
 
 # The device files that exist for the dGPU, one per line.
@@ -145,19 +182,30 @@ set_all() { # lock|unlock
 lock() { set_all lock; }
 unlock() { set_all unlock; }
 
-# The unit's entry point: a machine without a dGPU has nothing to do, not an error.
+# What the unit, the hook and the rule run: a machine without a dGPU has
+# nothing to do, not an error.
 auto() {
-    local addr driver dev i
+    local addr driver dev i held
     read -r addr driver dev < <(find_dgpu) || { echo "dgpu: $NO_DGPU, nothing to do" >&2; return 0; }
     for ((i = 0; i < NODE_WAIT * 10; i++)); do
         [ -e "$DEV/dri/by-path/pci-$addr-render" ] && break
         sleep 0.1
     done
-    if on_ac; then unlock; else lock; fi
+    if on_ac; then
+        unlock
+        return
+    fi
+    held=$(connected "$dev")
+    if [ -n "$held" ]; then
+        echo "dgpu: on battery with a monitor on $held, unlocked" >&2
+        unlock
+    else
+        lock
+    fi
 }
 
 show() {
-    local addr driver dev state
+    local addr driver dev state list
     if read -r addr driver dev < <(find_dgpu); then
         state=$(cat "$dev/power_state" 2>/dev/null || echo unknown)
         if locked "$addr"; then
@@ -165,6 +213,9 @@ show() {
         else
             echo "dgpu: $addr driver $driver, $state, unlocked"
         fi
+        list=$(outputs "$dev" | paste -sd,)
+        list=${list//,/, }
+        echo "outputs: ${list:-none}"
     else
         echo "dgpu: $NO_DGPU"
     fi
@@ -173,6 +224,11 @@ show() {
         echo "unit: $UNIT_NAME enabled"
     else
         echo "unit: not installed"
+    fi
+    if [ -f "$HOOK_PATH" ]; then
+        echo "sleep hook: $HOOK_PATH installed"
+    else
+        echo "sleep hook: not installed"
     fi
     if [ -f "$RULE_PATH" ]; then
         echo "udev: $(basename "$RULE_PATH") installed"
@@ -188,14 +244,16 @@ show() {
     fi
 }
 
-# The unit and the rule run as root, so they run a root-owned copy: a script
-# under $HOME is writable by every process of the user.
+# The unit, the hook and the rule run as root, so they run a root-owned copy: a
+# script under $HOME is writable by every process of the user.
 install_all() {
     sudo install -m 755 "$0" "$INSTALLED"
+    # Boot only. A wake is the hook's: a unit on a wake target starts after
+    # systemd-sleep has thawed user.slice, so gnome-shell could draw to a
+    # monitor on the dGPU before the unit unlocked it.
     sudo tee "$UNIT_PATH" >/dev/null <<EOF
 [Unit]
-Description=Lock the dGPU's device files on battery, unlock on AC
-After=$WAKE_TARGETS
+Description=Lock the dGPU's device files on battery with no monitor on the dGPU, unlock otherwise
 Before=display-manager.service
 # Several udev events start it within seconds of boot; the default burst limit would leave it failed.
 StartLimitIntervalSec=0
@@ -205,17 +263,32 @@ Type=oneshot
 ExecStart=$INSTALLED auto
 
 [Install]
-WantedBy=multi-user.target $WAKE_TARGETS
+WantedBy=multi-user.target
 EOF
     sudo systemctl daemon-reload
-    sudo systemctl enable --quiet $UNIT_NAME
+    # reenable, not enable: it also drops the links an older unit left in the
+    # wake targets' .wants directories.
+    sudo systemctl reenable --quiet $UNIT_NAME
+    sudo mkdir -p "$(dirname "$HOOK_PATH")"
+    sudo tee "$HOOK_PATH" >/dev/null <<EOF
+#!/bin/sh
+# Installed by dgpu install. systemd-sleep(8) runs this with "post" after a wake,
+# before it thaws user processes, so gnome-shell never draws under a stale lock.
+[ "\$1" = post ] || exit 0
+exec $INSTALLED auto
+EOF
+    sudo chmod 755 "$HOOK_PATH"
     # Mains only: the battery emits a change event on every capacity tick. The
     # driver's own event is the one that creates /dev/nvidia*; the render-node
-    # event covers a later driver reload.
+    # event covers a later driver reload. Those start the unit, since nothing
+    # there races gnome-shell. A monitor plugged in or out does: udev runs a
+    # RUN+= program before it hands the event on, to mutter among others. A
+    # RUN+= program has to be quick, so that one skips the render-node wait.
     sudo tee "$RULE_PATH" >/dev/null <<EOF
 ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
 ACTION=="add", SUBSYSTEM=="drm", KERNEL=="renderD*", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
 ACTION=="add", DEVPATH=="/bus/pci/drivers/nvidia", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
+ACTION=="change", SUBSYSTEM=="drm", ENV{DEVTYPE}=="drm_minor", KERNEL=="card*", RUN+="/usr/bin/env DGPU_NODE_WAIT=0 $INSTALLED auto"
 EOF
     sudo udevadm control --reload
 }
@@ -226,6 +299,7 @@ uninstall() {
         sudo rm "$UNIT_PATH"
         sudo systemctl daemon-reload
     fi
+    [ -f "$HOOK_PATH" ] && sudo rm "$HOOK_PATH"
     if [ -f "$RULE_PATH" ]; then
         sudo rm "$RULE_PATH"
         sudo udevadm control --reload
@@ -250,13 +324,13 @@ case "${1:-}" in
     install)
         install_all
         sudo "$INSTALLED" auto
-        echo "installed $UNIT_NAME, $(basename "$RULE_PATH") and $INSTALLED"
+        echo "installed $UNIT_NAME, $HOOK_PATH, $(basename "$RULE_PATH") and $INSTALLED"
         show
         ;;
     reset)
         find_dgpu >/dev/null && unlock
         uninstall
-        echo "unlocked, removed $UNIT_NAME, $(basename "$RULE_PATH") and $INSTALLED"
+        echo "unlocked, removed $UNIT_NAME, $HOOK_PATH, $(basename "$RULE_PATH") and $INSTALLED"
         show
         ;;
     ''|-h|--help)
