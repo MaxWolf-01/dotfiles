@@ -1,4 +1,4 @@
-{ pkgs, config, ... }:
+{ pkgs, config, lib, ... }:
 let
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
 in
@@ -70,6 +70,14 @@ in
     recursive = true;
   };
 
+  # GIO reads which apps handle a MIME type from each applications directory's
+  # mimeinfo.cache, never from the entries' own MimeType lines. The links above
+  # shadow the profile's entries, so without a cache here of their own they
+  # drop out of Nautilus's "Open With".
+  home.activation.updateDesktopDatabase = lib.hm.dag.entryAfter [ "linkGeneration" ] ''
+    run ${pkgs.desktop-file-utils}/bin/update-desktop-database ${config.xdg.dataHome}/applications
+  '';
+
   xdg.desktopEntries.vesktop = {
     name = "Vesktop";
     genericName = "Discord Client";
@@ -105,6 +113,9 @@ in
       "application/javascript" = "nvim.desktop";
       "application/x-shellscript" = "nvim.desktop";
       "audio/mpeg" = "org.gnome.Showtime.desktop";
+      "audio/vnd.wave" = "mpv.desktop";
+      "audio/wav" = "mpv.desktop";
+      "audio/x-wav" = "mpv.desktop";
       "video/mp4" = "mpv.desktop";
       "video/webm" = "mpv.desktop";
       "video/x-matroska" = "mpv.desktop";
