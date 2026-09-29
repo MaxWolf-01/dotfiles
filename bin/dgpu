@@ -22,14 +22,21 @@
 # device, since card numbers change between boots, and reads the state the
 # driver already holds, which neither probes a port nor wakes the card.
 #
-# `install` puts a root-owned copy of this script in /usr/local/sbin and has it
-# run `auto`:
-#   - at boot, before the display manager (a unit)
-#   - after every wake, before user processes are thawed (a system-sleep hook)
-#   - when a monitor is plugged in or out, before gnome-shell hears of it (a
-#     udev RUN+= on the DRM card's change event)
+# That state is only as new as the last probe, and after a wake or a hotplug
+# the probe is gnome-shell's, once it has heard of the event: a monitor just
+# plugged into a dGPU port still reads disconnected. So what runs on those two
+# is `defer`: it unlocks without reading the outputs, and has systemd run
+# `auto` a few seconds later, from the state gnome-shell's probe left.
+#
+# `install` puts a root-owned copy of this script in /usr/local/sbin and runs
+# it:
+#   - at boot, before the display manager: `auto` (a unit)
+#   - after every wake, before user processes are thawed: `defer` (a
+#     system-sleep hook)
+#   - when the dGPU's card reports a change, as a monitor goes in or out,
+#     before gnome-shell hears of it: `defer` (a udev RUN+= rule)
 #   - when the charger goes in or out, and when the dGPU's driver or render
-#     node appears (udev starting the unit)
+#     node appears: `auto` (udev starting the unit)
 # The copy does not follow edits made here: `status` says when the two differ,
 # `install` reinstalls. Which port is which, and what the lock still cannot
 # prevent: docs/zephyrus.md.
@@ -55,6 +62,7 @@
 #   dgpu lock       fail every open of the dGPU's device files
 #   dgpu unlock     restore their permissions
 #   dgpu auto       lock on battery with no monitor on the dGPU, else unlock
+#   dgpu defer      unlock, and have systemd run auto in a few seconds
 #   dgpu install    install the copy, the unit, the sleep hook and the udev
 #                   rule, then run auto
 #   dgpu reset      unlock and remove what install put in place
@@ -72,6 +80,9 @@ UNIT_PATH=$ROOT/etc/systemd/system/$UNIT_NAME
 RULE_PATH=$ROOT/etc/udev/rules.d/99-dgpu.rules
 HOOK_PATH=$ROOT/etc/systemd/system-sleep/dgpu
 NO_DGPU="no dGPU with a driver bound (is the card on the bus: lspci -d 10de:; is its driver loaded: lsmod)"
+# How long `defer` leaves the outputs to gnome-shell's probe before `auto`
+# reads them.
+RECHECK_DELAY=5
 # How long `auto` waits for the render node after the driver's own event
 # created /dev/nvidia*; the DRM nodes arrive in a later udev event.
 NODE_WAIT=${DGPU_NODE_WAIT:-3}
@@ -191,10 +202,7 @@ auto() {
         [ -e "$DEV/dri/by-path/pci-$addr-render" ] && break
         sleep 0.1
     done
-    # The unit, the hook and the rule can run at once. One read-and-apply at a
-    # time, so a run that read an older state never writes last.
-    exec 9<"$0"
-    flock 9
+    take_turn
     if on_ac; then
         unlock
         return
@@ -206,6 +214,25 @@ auto() {
     else
         lock
     fi
+}
+
+# What the hook and the rule run. It must not wait on anything: udev holds the
+# event until a RUN+= program exits. The delayed `auto` is a transient unit of
+# its own per call, so the last event is always followed by a full delay.
+defer() {
+    find_dgpu >/dev/null || { echo "dgpu: $NO_DGPU, nothing to do" >&2; return 0; }
+    take_turn
+    unlock
+    sudo systemd-run --quiet --collect --no-block --on-active="$RECHECK_DELAY" \
+        --description="dgpu: decide the lock after gnome-shell's probe" "$INSTALLED" auto
+}
+
+# The unit, the hook and the rule can run at once. One read-and-apply at a
+# time, so a run that read an older state never writes last. The hold ends
+# with the process.
+take_turn() {
+    exec 9<"$0"
+    flock 9
 }
 
 show() {
@@ -279,20 +306,21 @@ EOF
 # Installed by dgpu install. systemd-sleep(8) runs this with "post" after a wake,
 # before it thaws user processes, so gnome-shell never draws under a stale lock.
 [ "\$1" = post ] || exit 0
-exec $INSTALLED auto
+exec $INSTALLED defer
 EOF
     sudo chmod 755 "$HOOK_PATH"
     # Mains only: the battery emits a change event on every capacity tick. The
     # driver's own event is the one that creates /dev/nvidia*; the render-node
     # event covers a later driver reload. Those start the unit, since nothing
     # there races gnome-shell. A monitor plugged in or out does: udev runs a
-    # RUN+= program before it hands the event on, to mutter among others. A
-    # RUN+= program has to be quick, so that one skips the render-node wait.
+    # RUN+= program before it hands the event on, to mutter among others. Only
+    # the dGPU's card, the one whose PCI device is not the boot VGA: a change
+    # on the iGPU brings no monitor onto the dGPU.
     sudo tee "$RULE_PATH" >/dev/null <<EOF
 ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
 ACTION=="add", SUBSYSTEM=="drm", KERNEL=="renderD*", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
 ACTION=="add", DEVPATH=="/bus/pci/drivers/nvidia", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
-ACTION=="change", SUBSYSTEM=="drm", ENV{DEVTYPE}=="drm_minor", KERNEL=="card*", RUN+="/usr/bin/env DGPU_NODE_WAIT=0 $INSTALLED auto"
+ACTION=="change", SUBSYSTEM=="drm", ENV{DEVTYPE}=="drm_minor", KERNEL=="card*", ATTRS{boot_vga}=="0", RUN+="$INSTALLED defer"
 EOF
     sudo udevadm control --reload
 }
@@ -326,6 +354,9 @@ case "${1:-}" in
         ;;
     auto)
         auto
+        ;;
+    defer)
+        defer
         ;;
     install)
         install_all

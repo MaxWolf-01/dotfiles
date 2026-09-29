@@ -79,7 +79,8 @@ Who holds it right now:
 
 The driver's own view: `cat /proc/driver/nvidia/gpus/0000:01:00.0/power`.
 `dgpu`'s runs at boot and on the charger: `journalctl -b -u dgpu-auto`; after
-a wake: `journalctl -b -u 'systemd-*suspend*' -u 'systemd-*hibernate*'`.
+a wake: `journalctl -b -u 'systemd-*suspend*' -u 'systemd-*hibernate*'`; the
+delayed ones: `journalctl -b -u 'run-*' -g dgpu`.
 History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
 
 ### Traps
@@ -89,12 +90,16 @@ History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
   image from buffer object for secondary GPU` and the session hangs until a
   hard reset, which an unlock afterwards does not undo. On 2026-09-29 a resume
   from hibernate on battery did this. `dgpu auto` never locks while a dGPU
-  output is connected, and it decides before gnome-shell can draw: after
-  a wake from a system-sleep hook, before user processes are thawed, and on a
-  monitor plugged in or out from udev, before the event reaches gnome-shell.
-  It cannot stop a `dgpu lock` typed by hand under a monitor, nor an
-  installed copy that differs from `bin/dgpu` (`dgpu status` says so; `dgpu
-  install` replaces it).
+  output is connected, but an output reads what the last probe saw, and after
+  a wake or a hotplug that probe is gnome-shell's own, made once it hears of
+  the event. So on those two `dgpu defer` unlocks first, before gnome-shell
+  can draw: from a system-sleep hook before user processes are thawed, and
+  from udev before a change on the dGPU's card reaches gnome-shell. `auto`
+  decides again five seconds later, from what gnome-shell's probe found. It
+  cannot stop a `dgpu lock` typed by hand under a monitor, nor an installed
+  copy that differs from `bin/dgpu` (`dgpu status` says so; `dgpu install`
+  replaces it), nor the charger going out in the instant between a hotplug and
+  gnome-shell's probe, when the unit's `auto` still reads the old state.
 - **HDMI hot-plug.** Plugging HDMI into a running session crashes gnome-shell,
   locked or not, and gdm restarts the session with the monitor working; a
   session that starts with the cable in works from the start. Save your work

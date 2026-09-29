@@ -5,9 +5,10 @@
 # boot VGA, and only its device files change; lock takes every bit, unlock
 # gives back what udev sets; auto locks only on battery with none of the
 # dGPU's outputs connected, found through its PCI device whatever the card
-# numbers; install runs auto after a wake and on a monitor hotplug. That a
-# failed open keeps a real dGPU in D3cold, and that the hook and the rule run
-# before gnome-shell draws, show only on the hardware.
+# numbers; after a wake and on a change of the dGPU's card, the installed
+# hook and rule unlock whatever the outputs read and leave the decision to a
+# later auto. That a failed open keeps a real dGPU in D3cold, and that the hook
+# and the rule run before gnome-shell draws, show only on the hardware.
 
 set -uo pipefail
 
@@ -217,19 +218,31 @@ exec 8<&-
 wait "$waiting"
 check "and decides once it is released" "0 0 0 0 0 0 / 660 660" "$(modes)"
 
-# --- install and reset, into a fake root, with sudo, systemctl and udevadm stubbed
+# --- install and reset, into a fake root, with sudo, systemctl, systemd-run
+# --- and udevadm stubbed. The stubbed systemd-run keeps the command it was
+# --- given to run later, and run_scheduled is "later".
 
 fresh_tree
 on_battery
-fs="$root/fs" stubs="$root/stubs" calls="$root/calls"
+fs="$root/fs" stubs="$root/stubs" calls="$root/calls" scheduled="$root/scheduled"
 mkdir -p "$fs/usr/local/sbin" "$fs/etc/systemd/system" "$fs/etc/udev/rules.d" "$stubs"
 printf '#!/bin/sh\nexec "$@"\n' > "$stubs/sudo"
 printf '#!/bin/sh\necho "$(basename "$0") $*" >> "%s"\n' "$calls" > "$stubs/systemctl"
 cp "$stubs/systemctl" "$stubs/udevadm"
+printf '#!/bin/sh\necho "systemd-run $*" >> "%s"\nwhile [ "${1#--}" != "$1" ]; do shift; done\necho "$*" >> "%s"\n' \
+    "$calls" "$scheduled" > "$stubs/systemd-run"
 chmod +x "$stubs"/*
-installing() { PATH="$stubs:$PATH" DGPU_ROOT="$fs" run "$@"; }
+as_root() { # command...: as the hook, the rule and systemd run it
+    PATH="$stubs:$PATH" DGPU_ROOT="$fs" DGPU_SYSFS_DRM="$root/sys/drm" DGPU_DEV="$root/dev" \
+        DGPU_POWER_SUPPLY="$root/ps" DGPU_NODE_WAIT=0 "$@"
+}
+run_scheduled() {
+    local cmd
+    while read -r cmd; do as_root $cmd; done < "$scheduled"
+    rm "$scheduled"
+}
 
-installing install >/dev/null
+as_root "$script" install >/dev/null
 check "install succeeds" 0 $?
 hook="$fs/etc/systemd/system-sleep/dgpu"
 unit="$fs/etc/systemd/system/dgpu-auto.service"
@@ -241,17 +254,35 @@ check "the unit starts at boot and on no wake target" \
     "WantedBy=multi-user.target" "$(grep -E '^WantedBy=|^After=|sleep|suspend|hibernate' "$unit")"
 check "enabling the unit drops the links an older one left in the wake targets" \
     "systemctl reenable --quiet dgpu-auto.service" "$(grep -w reenable "$calls")"
-check "a monitor plugged in or out runs auto from the rule, before udev passes the event on" \
-    "ACTION==\"change\", SUBSYSTEM==\"drm\", ENV{DEVTYPE}==\"drm_minor\", KERNEL==\"card*\", RUN+=\"/usr/bin/env DGPU_NODE_WAIT=0 $fs/usr/local/sbin/dgpu auto\"" \
-    "$(grep 'SUBSYSTEM=="drm"' "$rule" | grep change)"
-run unlock
-DGPU_SYSFS_DRM="$root/sys/drm" DGPU_DEV="$root/dev" DGPU_POWER_SUPPLY="$root/ps" DGPU_NODE_WAIT=0 sh "$hook" pre
-check "the hook does nothing before the sleep" "660 660 666 666 666 666 / 660 660" "$(modes)"
-DGPU_SYSFS_DRM="$root/sys/drm" DGPU_DEV="$root/dev" DGPU_POWER_SUPPLY="$root/ps" DGPU_NODE_WAIT=0 sh "$hook" post
-check "and runs auto after the wake" "0 0 0 0 0 0 / 660 660" "$(modes)"
-check "status sees the hook" "sleep hook: $hook installed" "$(installing status | grep '^sleep hook:')"
+drm_change=$(grep 'SUBSYSTEM=="drm"' "$rule" | grep '"change"')
+check "the dGPU's card changing runs defer from the rule, before udev passes the event on" \
+    "ACTION==\"change\", SUBSYSTEM==\"drm\", ENV{DEVTYPE}==\"drm_minor\", KERNEL==\"card*\", ATTRS{boot_vga}==\"0\", RUN+=\"$fs/usr/local/sbin/dgpu defer\"" \
+    "$drm_change"
 
-installing reset >/dev/null
+# A path that can bring a monitor onto the dGPU unlocks whatever the outputs
+# read, since they read what the last probe saw, and decides again later.
+as_root "$script" lock
+as_root sh "$hook" pre
+check "the hook does nothing before the sleep" "0 0 0 0 0 0 / 660 660" "$(modes)"
+as_root sh "$hook" post
+check "after the wake the hook unlocks, with every dGPU output reading disconnected" \
+    "660 660 666 666 666 666 / 660 660" "$(modes)"
+check "and has systemd run auto later without waiting for it" \
+    "systemd-run --quiet --collect --no-block --on-active=5 --description=dgpu: decide the lock after gnome-shell's probe $fs/usr/local/sbin/dgpu auto" \
+    "$(grep '^systemd-run' "$calls")"
+run_scheduled
+check "the later auto locks, no monitor having turned up" "0 0 0 0 0 0 / 660 660" "$(modes)"
+
+as_root $(sed 's/.*RUN+="\([^"]*\)".*/\1/' <<< "$drm_change")
+check "a change on the dGPU's card unlocks, the new monitor still reading disconnected" \
+    "660 660 666 666 666 666 / 660 660" "$(modes)"
+output dgpu DP-3 connected
+run_scheduled 2>/dev/null
+check "and the later auto, reading gnome-shell's probe, leaves it unlocked" \
+    "660 660 666 666 666 666 / 660 660" "$(modes)"
+check "status sees the hook" "sleep hook: $hook installed" "$(as_root "$script" status | grep '^sleep hook:')"
+
+as_root "$script" reset >/dev/null
 check "reset succeeds" 0 $?
 check "and removes the copy, the unit, the hook and the rule" "" \
     "$(find "$fs" -type f)"
