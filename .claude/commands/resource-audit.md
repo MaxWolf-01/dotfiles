@@ -43,11 +43,12 @@ measured value, its floor, and its behavior-preserving flag.
 ## Standing data sources — read before measuring anew
 
 - Per-run outcomes, stats, dashboards: `docs/monitoring.md`.
-- Memory, pressure, battery, temperature, power caps: the host recorder's
-  CSVs — columns, path, cadence and retention in `bin/host-recorder`'s header.
-- CPU per unit over any window, every unit down to the smallest:
-  `thermal-log-report` (the host recorder's hourly counters plus systemd's stop
-  records). Step 2's ranking for CPU starts there.
+- What held memory and how pressure rose around a moment, and CPU per unit
+  over any window down to the smallest unit: `host-recorder-report`, on this
+  host or `--host pc`. Step 2's ranking for CPU starts there; `--help` says
+  what each question answers.
+- Battery, temperature, power caps: the host recorder's sensor columns, which
+  the reader does not answer — `bin/host-recorder`'s header names them.
 - HDD spin behaviour on pc: `journalctl -u hd-idle` logs every spindown and
   spinup — match each wake against the known timers.
 
