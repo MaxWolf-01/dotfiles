@@ -99,10 +99,11 @@ History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
   a change of the dGPU's card, from udev before the event reaches gnome-shell;
   after a wake, from the `dgpu-resume` unit once the NVIDIA driver has
   resumed, with the dGPU unlocked by a sleep hook before user processes are
-  thawed. At boot and on the charger it probes only a dGPU in D0; in D3cold
-  the dGPU drives no monitor. It cannot stop a `dgpu lock` typed by hand under
-  a monitor, nor an installed copy that differs from `bin/dgpu` (`dgpu status`
-  says so; `dgpu install` replaces it).
+  thawed. At boot and on the charger it probes only a dGPU in D0, since in
+  D3cold the dGPU drives no monitor; a charger event during a wake waits for
+  `dgpu-resume`. It cannot stop a `dgpu lock` typed by hand under a monitor,
+  nor an installed copy that differs from `bin/dgpu` (`dgpu status` says so;
+  `dgpu install` replaces it).
 - **HDMI hot-plug.** Plugging HDMI into a running session crashes gnome-shell,
   locked or not, and gdm restarts the session with the monitor working; a
   session that starts with the cable in works from the start. Save your work
