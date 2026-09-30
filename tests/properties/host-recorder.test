@@ -5,6 +5,9 @@
 # ///
 """The host recorder's properties, checked over generated machines. Run it directly; no framework.
 
+P1 to P6 are the properties of agent/tickets/host-recorder.md in the agent repo. P1 is checked by
+tests/host-recorder.test under strace, P5 by review.
+
 P2, P3 and P4 drive bin/host-recorder at its fixture root: HOST_RECORDER_ROOT names a directory that
 stands in for `/`, so every `/sys` and `/proc` path the recorder reads is read under it. Hypothesis draws
 the tree: a host's sensor set with its devices numbered in any order, the cgroups of a laptop or of pc
@@ -23,6 +26,7 @@ mark names, and the run fails the moment it holds; the ticket that makes it hold
 """
 
 import functools
+import itertools
 import json
 import os
 import re
@@ -34,6 +38,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -91,7 +96,7 @@ def needs(script: Path):
         @functools.wraps(fn)
         def run():
             if not script.exists():
-                raise Missing(f"{script.relative_to(REPO)} does not exist yet")
+                raise Missing(f"{script.relative_to(REPO)} does not exist")
             fn()
 
         return run
@@ -413,6 +418,9 @@ def machines(draw, host: str | None = None, panes_over: int = 0) -> tuple[Machin
 # --------------------------------------------------------------------------
 
 
+TOP_FILE = r"\d{4}-\d\d-\d\d\.top\.csv"
+
+
 class Recorder:
     """bin/host-recorder running at a fixture root, and what it has written so far."""
 
@@ -456,7 +464,7 @@ class Recorder:
 
     def rankings(self) -> list[list[dict[str, str]]]:
         """Each memory ranking's rows, the (rest) row that closes it included."""
-        header, rows = self.table(r"\d{4}-\d\d-\d\d\.top\.csv")
+        header, rows = self.table(TOP_FILE)
         blocks, block = [], []
         for row in rows:
             block.append(dict(zip(header, row)))
@@ -512,21 +520,32 @@ def machine_tree(root: Path, host: str, sensors: dict[str, tuple[dict, list[str]
             write(root, files)
 
 
-FULL_ROWS: dict[str, tuple[list[str], list[str]]] = {}
-"""Each host's header and a row the recorder writes with its whole sensor set present."""
+@dataclass(frozen=True)
+class Written:
+    """What the recorder writes on a host with its whole sensor set present: the samples' header, a sample,
+    and the ranking's header."""
+
+    header: list[str]
+    row: list[str]
+    top_header: list[str]
 
 
-def full_row(host: str) -> tuple[list[str], list[str]]:
-    if host not in FULL_ROWS:
+WRITTEN: dict[str, Written] = {}
+
+
+def written(host: str) -> Written:
+    if host not in WRITTEN:
         sensors = SENSORS[host]
         z, h = counts(sensors)
         work = scratch(f"full-{host}")
         machine_tree(work / "root", host, numbered(sensors, list(range(z)), list(range(h))), set())
         with Recorder(work / "root", work / "state") as r:
             r.rows(3)
+            r.wait("memory ranking", lambda: r.rankings())
             header, rows = r.samples()
-        FULL_ROWS[host] = (header, rows[-1])
-    return FULL_ROWS[host]
+            top_header, _ = r.table(TOP_FILE)
+        WRITTEN[host] = Written(header, rows[-1], top_header)
+    return WRITTEN[host]
 
 
 @st.composite
@@ -562,7 +581,7 @@ def p2(run):
     writing rows with every field of its header. Each field is what it is with every sensor present, or empty,
     and a sensor that vanishes empties the fields it gave."""
     host, sensors, absent, steps = run
-    full_header, full = full_row(host)
+    full_header, full = written(host).header, written(host).row
     work = scratch("p2")
     root = work / "root"
     machine_tree(root, host, sensors, absent)
@@ -680,75 +699,175 @@ def p4(drawn, data):
 # the reader
 # --------------------------------------------------------------------------
 
-SAMPLE_HEADER = ("time,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,mhz_max,load1,profile,spl_w,sppt_w,ac,bat_pct,bat_w,"
-                 "dgpu_disable,dgpu_port,dgpu_drv,mem_avail_mb,swap_used_mb")
-TOP_HEADER = "time,unit,cpu_pct,anon_mb,shmem_mb,swap_mb,procs,process,cwd"
-COUNTERS_HEADER = "time,manager,unit,usage_usec"
+OLD_SAMPLE_HEADER = ("time,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,mhz_max,load1,profile,spl_w,sppt_w,ac,bat_pct,bat_w,"
+                     "dgpu_disable,dgpu_port,dgpu_drv,mem_avail_mb,swap_used_mb")
+OLD_TOP_HEADER = "time,unit,cpu_pct,anon_mb,shmem_mb,swap_mb,procs,process,cwd"
+"""thermal-log's columns, which the laptop's history from before the host recorder is in."""
+
+MANAGERS = ["system", "user@1000", "user@1001", "user@1002"]
 TZ = "Europe/Berlin"
 
+READINGS = {
+    "mhz_max": lambda rng: str(rng.randint(400, 5200)),
+    "load1": lambda rng: f"{rng.uniform(0, 30):.2f}",
+    "mem_avail_mb": lambda rng: str(rng.randint(100, 60000)),
+    "swap_used_mb": lambda rng: str(rng.randint(0, 8000)),
+    "profile": lambda rng: rng.choice(["quiet", "balanced", "performance"]),
+    "bat_w": lambda rng: f"{rng.uniform(0, 90):.1f}",
+    "dgpu_port": lambda rng: rng.choice(["D0", "D3cold"]),
+    "dgpu_drv": lambda rng: rng.choice(["", "0", "1"]),
+}
+"""A sample column's reading, by name; a column not named here reads as a whole number, a pressure column as
+a share, a temperature as degrees."""
 
-def put(lines: dict[str, list[str]], name: str, header: str, row: str) -> None:
-    lines.setdefault(name, [header]).append(row)
+
+def reading(column: str, rng: Random) -> str:
+    if rng.random() < 0.05:
+        return ""
+    if column in READINGS:
+        return READINGS[column](rng)
+    if column.startswith("mem_") and "_avg" in column:
+        return f"{rng.uniform(0, 40):.2f}"
+    if column.endswith("_c"):
+        return str(rng.randint(15, 95))
+    return str(rng.randint(0, 6000))
 
 
-def blank(rng: Random, value: str) -> str:
-    """Now and then a reading is missing."""
-    return "" if rng.random() < 0.05 else value
+@dataclass(frozen=True)
+class Run:
+    """One life of the recorder: the samples it wrote, by number, whether it was the host recorder or
+    thermal-log before it, and whether a power cut ended it partway through a row."""
+
+    first: int
+    last: int
+    current: bool
+    cut: bool
 
 
 @dataclass(frozen=True)
 class Recording:
-    files: dict[str, str]
+    host: str
+    start: datetime
+    runs: list[Run]
+    units: list[tuple[str, str]]
+    seed: int
     at: str
 
 
 @st.composite
 def recordings(draw) -> Recording:
-    """A directory of recorder files, as the host recorder writes them: a sample every five seconds with some
-    stretches missing (the host was down), a memory ranking once a minute, every counter once an hour, across
-    midnight at times. And a moment to ask about, mostly among the samples."""
-    rng = Random(draw(st.integers(0, 2**32)))
+    """How a host's recorder ran: a sample every five seconds, over a few minutes to an hour and a half,
+    across midnight at times, in two to four runs with the host down between them. On the laptop the first
+    runs may be thermal-log's, the rest the host recorder's. The units its rankings name, a name under one to
+    three managers. And a moment to ask about, among the samples and often near a restart or a power cut."""
+    host = draw(st.sampled_from(["pc", "zephylux"]))
     start = datetime(2026, 9, draw(st.integers(20, 27)), draw(st.sampled_from([0, 7, 13, 23])),  # noqa: DTZ001
                      draw(st.integers(0, 59)), draw(st.integers(0, 59)))  # the recorder stamps local time
-    minutes = draw(st.integers(3, 90))
-    gaps = [(draw(st.integers(0, minutes * 12)), draw(st.integers(12, 240)))
-            for _ in range(draw(st.integers(0, 2)))]
-    units = draw(st.lists(st.sampled_from(SERVICES + APPS) | st.uuids().map(lambda u: f"tmux-spawn-{u}.scope"),
-                          min_size=2, max_size=10, unique=True))
-    usage = {u: rng.randrange(10**10) for u in ["(root)", *units]}
-    lines: dict[str, list[str]] = {}
-    hour = None
-    times = []
-    for n in range(minutes * 12):
-        if any(g <= n < g + length for g, length in gaps):
-            continue
-        t = start + timedelta(seconds=5 * n)
-        stamp = t.strftime("%Y-%m-%d %H:%M:%S")
-        times.append(t)
-        day = t.strftime("%Y-%m-%d")
-        readings = [
-            *(str(rng.randint(40, 95)) for _ in range(3)), str(rng.randint(0, 6000)), str(rng.randint(0, 6000)),
-            str(rng.randint(400, 5200)), f"{rng.uniform(0, 30):.2f}", rng.choice(["quiet", "balanced", "performance"]),
-            "45", "65", "1", str(rng.randint(5, 100)), f"{rng.uniform(0, 90):.1f}", "0", rng.choice(["D0", "D3cold"]),
-            rng.choice(["", "0", "1"]), str(rng.randint(100, 60000)), str(rng.randint(0, 8000))]
-        put(lines, f"{day}.csv", SAMPLE_HEADER, ",".join([stamp, *(blank(rng, v) for v in readings)]))
-        if n % 12:
-            continue
-        for u in rng.sample(units, rng.randint(1, len(units))):
-            put(lines, f"{day}.top.csv", TOP_HEADER, f"{stamp},{u},{rng.choice(['', str(rng.randint(10, 800))])},"
-                f"{rng.randint(0, 9000)},{rng.randint(0, 2000)},{rng.randint(0, 1000)},{rng.randint(1, 40)},"
-                f"{rng.choice(['claude', 'node', 'python3', 'bash'])},~/repos/project-{rng.randint(0, 6)}")
-        put(lines, f"{day}.top.csv", TOP_HEADER, f"{stamp},(rest),{rng.randint(0, 400)},{rng.randint(0, 20000)},"
-            f"{rng.randint(0, 3000)},{rng.randint(0, 2000)},,,")
-        if stamp[:13] != hour:
-            hour = stamp[:13]
-            for u in ["(root)", *units]:
-                usage[u] += rng.randrange(10**9)
-                manager = "system" if u == "(root)" or u in SERVICES else "user"
-                put(lines, f"{day}.counters.csv", COUNTERS_HEADER, f"{stamp},{manager},{u},{usage[u]}")
-    at = draw(st.sampled_from(times or [start])) + timedelta(seconds=draw(st.integers(-120, 120)))
-    return Recording({name: "\n".join(rows) + "\n" for name, rows in lines.items()},
-                     at.strftime("%Y-%m-%d %H:%M:%S"))
+    total = draw(st.integers(3, 90)) * 12
+    bounds = [0, *sorted(draw(st.lists(st.integers(1, total - 1), min_size=1, max_size=3, unique=True))), total]
+    count = len(bounds) - 1
+    old = draw(st.integers(1, count - 1) | st.integers(0, count)) if host == "zephylux" else 0
+    lives = []
+    for i, (a, b) in enumerate(itertools.pairwise(bounds)):
+        short = st.integers(0, min(24, b - a - 1))
+        down = draw(short | short | st.integers(0, min(240, b - a - 1))) if i else 0
+        lives.append(Run(a + down, b - 1, i >= old, draw(st.booleans())))
+    names = draw(st.lists(st.sampled_from(SERVICES + APPS) | st.uuids().map(lambda u: f"tmux-spawn-{u}.scope"),
+                          min_size=1, max_size=6, unique=True))
+    units = [(m, name) for name in names
+             for m in draw(st.lists(st.sampled_from(MANAGERS), min_size=1, max_size=3, unique=True))]
+    switch = [b.first for a, b in itertools.pairwise(lives) if b.current and not a.current]
+    cuts = [r.last for r in lives if r.cut]
+    restart = st.sampled_from(switch or [r.first for r in lives])
+    near = draw(restart | restart | st.sampled_from(cuts or [r.last for r in lives]) | st.integers(0, total - 1))
+    at = start + timedelta(seconds=5 * near + draw(st.integers(-120, 120)))
+    return Recording(host, start, lives, units, draw(st.integers(0, 2**32)), at.strftime("%Y-%m-%d %H:%M:%S"))
+
+
+@dataclass
+class Directory:
+    """The recorder's directory as the runs of a Recording leave it."""
+
+    lines: dict[str, list[str]] = field(default_factory=dict)
+    open: set[str] = field(default_factory=set)
+    """Files whose last line a power cut left without its newline."""
+    rows: list[tuple[str, str, bool]] = field(default_factory=list)
+    """Every sample row: its time, its day file, and whether the host recorder wrote it."""
+
+    def append(self, name: str, header: list[str], row: str) -> None:
+        """What either recorder does: a new file starts with its header, and a row written after a power cut
+        and no repair joins the cut one."""
+        lines = self.lines.setdefault(name, [",".join(header)])
+        if name in self.open:
+            lines[-1] += row
+            self.open.discard(name)
+        else:
+            lines.append(row)
+
+    def continue_day(self, name: str, header: list[str]) -> None:
+        """What the host recorder does to a day file it continues: a cut row gets ,torn and its newline, and the
+        file gets this run's header when it was last under other columns."""
+        if name not in self.lines:
+            return
+        lines = self.lines[name]
+        if name in self.open:
+            lines[-1] += ",torn"
+            self.open.discard(name)
+        if [line for line in lines if line.startswith("time,")][-1] != ",".join(header):
+            lines.append(",".join(header))
+
+    def cut(self, name: str, rng: Random) -> None:
+        line = self.lines[name][-1]
+        self.lines[name][-1] = line[: rng.randint(1, len(line) - 1)]
+        self.open.add(name)
+
+    def files(self) -> dict[str, str]:
+        return {name: "\n".join(lines) + ("" if name in self.open else "\n") for name, lines in self.lines.items()}
+
+
+def directory(recording: Recording) -> Directory:
+    """The files a Recording's runs write, in the columns the host recorder writes on its host today and in
+    thermal-log's before it."""
+    current = written(recording.host)
+    rng = Random(recording.seed)
+    d = Directory()
+    for run in recording.runs:
+        sample_header = current.header if run.current else OLD_SAMPLE_HEADER.split(",")
+        top_header = current.top_header if run.current else OLD_TOP_HEADER.split(",")
+        day = f"{recording.start + timedelta(seconds=5 * run.first):%Y-%m-%d}"
+        if run.current:
+            d.continue_day(f"{day}.csv", sample_header)
+            d.continue_day(f"{day}.top.csv", top_header)
+        last = ""
+        for n in range(run.first, run.last + 1):
+            t = recording.start + timedelta(seconds=5 * n)
+            stamp, day = f"{t:%Y-%m-%d %H:%M:%S}", f"{t:%Y-%m-%d}"
+            d.append(f"{day}.csv", sample_header,
+                     ",".join([stamp, *(reading(c, rng) for c in sample_header[1:])]))
+            d.rows.append((stamp, f"{day}.csv", run.current))
+            last = f"{day}.csv"
+            if (n - run.first) % 12:
+                continue
+            for manager, unit in rng.sample(recording.units, rng.randint(1, len(recording.units))):
+                row = ranking_row(rng, stamp, unit, old=not run.current) | {"manager": manager}
+                d.append(f"{day}.top.csv", top_header, ",".join(row.get(c, "") for c in top_header))
+            rest = {k: v for k, v in ranking_row(rng, stamp, "(rest)", old=not run.current).items()
+                    if k in ("time", "unit", "cpu_pct", "anon_mb", "shmem_mb", "swap_mb")}
+            d.append(f"{day}.top.csv", top_header, ",".join(rest.get(c, "") for c in top_header))
+            last = f"{day}.top.csv"
+        if run.cut:
+            d.cut(last, rng)
+    return d
+
+
+def ranking_row(rng: Random, stamp: str, unit: str, old: bool) -> dict[str, str]:
+    """A ranking row's fields by column. thermal-log let a carriage return through from a process name."""
+    process = rng.choice(["claude", "node", "python3", "bash", *(["tmux: client\r"] if old else [])])
+    return {"time": stamp, "unit": unit, "cpu_pct": rng.choice(["", str(rng.randint(10, 800))]),
+            "anon_mb": str(rng.randint(0, 9000)), "shmem_mb": str(rng.randint(0, 2000)),
+            "swap_mb": str(rng.randint(0, 1000)), "procs": str(rng.randint(1, 40)), "process": process,
+            "cwd": f"~/repos/project {rng.randint(0, 6)}", "mem_some_avg60": f"{rng.uniform(0, 40):.2f}",
+            "mem_full_avg60": f"{rng.uniform(0, 20):.2f}"}
 
 
 STAND_IN = """#!/usr/bin/env bash
@@ -758,18 +877,21 @@ echo "$*" >> {calls}
 while getopts 46AaCfGgKkMNnqsTtVvXxYyB:b:c:D:E:e:F:I:i:J:L:l:m:O:o:P:p:Q:R:S:W:w: _; do :; done
 shift $((OPTIND - 1))
 host=$1; shift
-ln -sfn {full} {logs}.flip && mv -T {logs}.flip {logs}
+ln -sfn {full} {flip} && mv -T {flip} {logs}
 env -i HOME="$HOME" USER="$USER" TZ={tz} LANG=C.UTF-8 PATH={path} bash -c "$*"
 status=$?
-ln -sfn {empty} {logs}.flip && mv -T {logs}.flip {logs}
+ln -sfn {empty} {flip} && mv -T {flip} {logs}
 exit $status
 """
 
 
+@functools.cache
 def reader_scene() -> dict[str, Path]:
-    """The directories and stand-ins every P6 example shares."""
+    """The directories and stand-ins every P6 example shares. The directory both reads name has a space and a
+    quote in its name, which the command sent through ssh has to carry."""
     base = scratch("reader")
-    paths = {k: base / k for k in ("logs", "full", "empty", "stubs", "calls")}
+    paths = {k: base / k for k in ("full", "empty", "stubs", "calls", "flip")}
+    paths["logs"] = base / "recorder files, max's"
     paths["empty"].mkdir()
     paths["stubs"].mkdir()
     paths["logs"].symlink_to(paths["empty"])
@@ -779,8 +901,7 @@ def reader_scene() -> dict[str, Path]:
                                "$HOST_RECORDER_SSH' >&2\nexit 255\n")
     paths["stand_in"] = base / "ssh-stand-in"
     paths["stand_in"].write_text(STAND_IN.format(
-        logs=shlex.quote(str(paths["logs"])), full=shlex.quote(str(paths["full"])),
-        empty=shlex.quote(str(paths["empty"])), calls=shlex.quote(str(paths["calls"])), tz=TZ,
+        **{k: shlex.quote(str(paths[k])) for k in ("logs", "full", "empty", "calls", "flip")}, tz=TZ,
         path=shlex.quote(f"{stubs}:{REPO / 'bin'}:{os.environ['PATH']}")))
     for script in (stubs / "journalctl", stubs / "ssh", paths["stand_in"]):
         script.chmod(0o755)
@@ -788,16 +909,10 @@ def reader_scene() -> dict[str, Path]:
     return paths
 
 
-@functools.cache
-def scene() -> dict[str, Path]:
-    return reader_scene()
-
-
 def flip(s: dict[str, Path], to: Path) -> None:
-    tmp = s["logs"].with_name("logs.flip")
-    tmp.unlink(missing_ok=True)
-    tmp.symlink_to(to)
-    tmp.replace(s["logs"])
+    s["flip"].unlink(missing_ok=True)
+    s["flip"].symlink_to(to)
+    s["flip"].replace(s["logs"])
 
 
 def answer(s: dict[str, Path], *host: str, at: str) -> dict:
@@ -816,18 +931,40 @@ def answer(s: dict[str, Path], *host: str, at: str) -> dict:
     return out
 
 
+CASES = ("a day file that switches columns", "a unit under several managers", "a row a power cut ended")
+COVERED: Counter = Counter()
+"""How many P6 examples asked about a window holding each of CASES, so a run that met one too rarely fails."""
+
+
+def covered(recording: Recording, d: Directory, local: dict) -> None:
+    lo, hi = local.get("from") or "", local.get("to") or ""
+    inside = [(name, current) for stamp, name, current in d.rows if lo <= stamp <= hi]
+    if any((name, not current) in inside for name, current in inside):
+        COVERED[CASES[0]] += 1
+    managers = Counter(h["unit"] for h in local.get("holders", []) if h.get("manager"))
+    if any(n > 1 for n in managers.values()):
+        COVERED[CASES[1]] += 1
+    ends = [f"{recording.start + timedelta(seconds=5 * r.last):%Y-%m-%d %H:%M:%S}" for r in recording.runs if r.cut]
+    if any(lo <= end <= hi for end in ends):
+        COVERED[CASES[2]] += 1
+
+
 @prop
 @needs(READER)
-@checked(25)
+@checked(40)
 @given(recordings())
 def p6(recording):
     """P6 The reader gives the same answer for the same files whether it reads them locally or over ssh.
 
-    Over directories of recorder files, the reader's answer about a moment is the same read locally and read
-    from pc through the stand-in ssh, apart from a `host` field naming where it read."""
-    s = scene()
+    Over directories of recorder files, in the host recorder's columns and thermal-log's, with day files the
+    host recorder continued after a restart or a power cut, the reader's answer about a moment is the same
+    read locally and read from pc through the stand-in ssh, apart from a `host` field naming where it read."""
+    d = directory(recording)
+    s = reader_scene()
     shutil.rmtree(s["full"], ignore_errors=True)
-    write(s["full"], recording.files)
+    s["full"].mkdir()
+    for name, text in d.files().items():
+        (s["full"] / name).write_text(text)
     s["calls"].unlink(missing_ok=True)
     flip(s, s["full"])
     try:
@@ -838,8 +975,11 @@ def p6(recording):
     assert s["calls"].exists(), "asked about pc, the reader never ran the stand-in ssh"
     assert local == remote, (f"about {recording.at}, read locally:\n{json.dumps(local, indent=1)[:3000]}\n"
                              f"read through ssh:\n{json.dumps(remote, indent=1)[:3000]}")
+    covered(recording, d, local)
 
 
+# --------------------------------------------------------------------------
+# running them
 # --------------------------------------------------------------------------
 
 
@@ -863,6 +1003,10 @@ def main() -> int:
                 failures += 1
                 print(f"FAIL  {title}\n      holds, but is still marked as an expected failure naming "
                       f"{expected[0]}: delete the mark")
+            elif p is p6 and (rare := [c for c in CASES if COVERED[c] < 3]):
+                failures += 1
+                print(f"FAIL  {title}\n      holds, but fewer than 3 examples asked about a window with "
+                      f"{' or '.join(rare)}, too few for it to say anything ({dict(COVERED)})")
             else:
                 print(f"ok    {title}")
     finally:
