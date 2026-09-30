@@ -100,7 +100,7 @@ History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
   after a wake, from the `dgpu-resume` unit once the NVIDIA driver has
   resumed, with the dGPU unlocked by a sleep hook before user processes are
   thawed. At boot and on the charger it probes only a dGPU in D0, since in
-  D3cold the dGPU drives no monitor; a charger event during a wake waits for
+  D3cold the dGPU drives no monitor; during a wake, that decision waits for
   `dgpu-resume`. It cannot stop a `dgpu lock` typed by hand under a monitor,
   nor an installed copy that differs from `bin/dgpu` (`dgpu status` says so;
   `dgpu install` replaces it).
