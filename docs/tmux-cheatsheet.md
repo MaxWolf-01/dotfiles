@@ -32,7 +32,6 @@ Prefix: **Ctrl+a** (press, release, then next key)
 | Key | Action |
 |-----|--------|
 | `f` | fzf session picker |
-| `s` | Built-in session list |
 | `S` | Create new session |
 | `$` | Rename current session |
 | `d` | Detach (session keeps running) |
@@ -52,14 +51,20 @@ tmux switch-client -t name   # Switch session (from inside tmux)
 |-----|--------|
 | `v` | Enter copy mode |
 | `/` | Enter copy mode + search |
+| `y` | Copy the visible screen to clipboard (in copy mode: the scrolled-to screen) |
+| `s` | Open the whole scrollback in nvim (popup) |
 | *in copy mode:* | |
 | `Ctrl+u/d` | Half-page up/down |
 | `Ctrl+b/f` | Full page up/down |
 | `g/G` | Top/bottom of buffer |
+| `H/M/L` | Top/middle/bottom of screen |
+| `{/}` | Previous/next paragraph (blank-line separated) |
 | `hjkl` | Line-by-line navigation |
 | `/` or `?` | Search forward/backward |
 | `n/N` | Next/prev search match |
 | `v` | Start selection |
+| `V` | Select whole lines |
+| `o` | Jump to the other end of the selection |
 | `y` | Yank to clipboard |
 | `q` or `Esc` | Exit copy mode |
 
@@ -103,6 +108,6 @@ Sessions auto-save every 1min. After reboot, just run `tmux`.
 3. **Save before leaving:** `Ctrl+s`
 4. **Detach:** `Ctrl+a d`
 5. **Come back:** `tms myproject` or `Ctrl+a f`
-6. **Switch sessions (inside tmux):** `Ctrl+a f` or `Ctrl+a s`
+6. **Switch sessions (inside tmux):** `Ctrl+a f`
 7. **After crash/reboot:** just `tmux` (auto-restores)
 8. **Done with project:** `tmux kill-session -t myproject`

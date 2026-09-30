@@ -178,7 +178,7 @@ if ! restic --repo "$repo_path" --password-command "$password_command" --no-lock
     # An unreachable target is expected: rsync.net down, pc off, no network.
     # Nobody is woken for it; the skip lands in the run log, which is where a
     # streak of them shows up.
-    if reason=$("$unreachable_reason" "$repo_check_log"); then
+    if reason=$("$unreachable_reason" --repo "$repo_path" "$repo_check_log"); then
         echo "Skipping $config_name: cannot reach $repo_path ($reason)"
         log_run skip --reason "target unreachable: $reason"
         exit 0
