@@ -46,9 +46,11 @@ measured value, its floor, and its behavior-preserving flag.
 - What held memory and how pressure rose around a moment, and CPU per unit
   over any window down to the smallest unit: `host-recorder-report`, on this
   host or `--host pc`. Step 2's ranking for CPU starts there; `--help` says
-  what each question answers.
+  what each question answers. pc's files are readable by wheel only: a worker
+  on pc lists the memory and CPU questions about pc as ones for max to run
+  from zephylux (`--host pc`), and goes on with the rest of the audit.
 - Battery, temperature, power caps: the host recorder's sensor columns, which
-  the reader does not answer — `bin/host-recorder`'s header names them.
+  the reader does not answer; `bin/host-recorder`'s header names them.
 - HDD spin behaviour on pc: `journalctl -u hd-idle` logs every spindown and
   spinup — match each wake against the known timers.
 

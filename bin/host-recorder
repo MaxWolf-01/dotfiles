@@ -41,11 +41,12 @@
 # tmux pane over 512 MB is a row whatever the cap: on pc each pane is one
 # worker, and which one grew is the question the ranking answers. A (rest) row
 # carries everything else, so the rows add up to the system's total. Each row
-# names its largest process and that process's working directory, which is
-# what tells one agent pane from another, and the cgroup's memory pressure
-# over the last minute. A pane's cgroup sits in its user manager's app.slice
-# on a laptop and directly under the user manager on pc
-# (tmux-spawn-*.scope); the walk takes both.
+# names the systemd manager that owns the cgroup (system or user@<uid>), its
+# largest process and that process's working directory, which is what tells
+# one agent pane from another, and the cgroup's memory pressure over the last
+# minute. A pane's cgroup (tmux-spawn-*.scope) sits in its user manager's
+# app.slice on a laptop and directly under the user manager on pc; the walk
+# takes both.
 #
 # Once an hour it writes every cgroup's cumulative CPU counter as well. The
 # ranking shows what burned in a given minute; the counters, with systemd's
@@ -69,8 +70,8 @@
 #          ~/.local/state/host-recorder: YYYY-MM-DD.csv, YYYY-MM-DD.top.csv for
 #          the per-minute ranking, YYYY-MM-DD.counters.csv for the hourly
 #          counters; all pruned after 14 days
-# Read it: host-recorder-report (--help), or by hand:
-#          column -s, -t ~/.local/state/host-recorder/$(date +%F).csv | less -S
+# Read it: host-recorder-report (--help), or by hand in that directory:
+#          column -s, -t $(date +%F).csv | less -S
 set -uo pipefail
 shopt -s nullglob
 
@@ -83,7 +84,7 @@ MEM_MIN_MB=512
 MEM_ROWS=10
 CPU_MIN_PCT=10 # of one core, averaged since the previous ranking
 CPU_ROWS=5
-TOP_HEADER="time,unit,cpu_pct,anon_mb,shmem_mb,swap_mb,procs,process,cwd,mem_some_avg60,mem_full_avg60"
+TOP_HEADER="time,manager,unit,cpu_pct,anon_mb,shmem_mb,swap_mb,procs,process,cwd,mem_some_avg60,mem_full_avg60"
 # cpu.stat usage per cgroup, kept in two tables that swap roles each ranking
 # (the previous one's and this one's), so nothing is copied; plus when the
 # previous ranking ran and the root's usage then.
@@ -98,6 +99,8 @@ CORE_HEADER="time,mhz_max,load1,mem_avail_mb,swap_used_mb,mem_some_avg10,mem_ful
 
 # A sensor set <set> is sensors_<set>_find, which looks its devices up by name,
 # sensors_<set>_read, which sets SENSORS to its fields, and its columns here.
+# SENSOR_SET maps the kernel's host name to a set, named as the repo names the
+# host (nix/home/hosts/<name>): the laptop is zephylux to the kernel.
 declare -A SENSOR_SET=([zephylux]=zephyrus [pc]=pc)
 declare -A SENSOR_COLUMNS=(
     [zephyrus]="pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv"
@@ -117,10 +120,15 @@ main() {
     HEADER=$CORE_HEADER${SET:+,${SENSOR_COLUMNS[$SET]}}
     mkdir -p "$LOGDIR" || { echo "host-recorder: cannot create $LOGDIR" >&2; exit 1; }
     find "$LOGDIR" -name '*.csv' -mtime "+$KEEP_DAYS" -delete
-    find_sensors
     # A pipe nothing ever writes to: read -t on it is a builtin sleep, saving a
     # fork+exec (~4 ms) per sample.
     exec {idle}<> <(:)
+    local today
+    printf -v today '%(%F)T' -1
+    continue_day "$LOGDIR/$today.csv" "$HEADER"
+    continue_day "$LOGDIR/$today.top.csv" "$TOP_HEADER"
+    continue_day "$LOGDIR/$today.counters.csv" "$CPU_HEADER"
+    find_sensors
     local n=0
     while :; do
         write_sample
@@ -130,6 +138,22 @@ main() {
         fi
         read -rt "$INTERVAL" -u "$idle" || :
     done
+}
+
+# continue_day <file> <header>: readies a day file this run appends to. A power
+# cut can leave its last row cut short: it is marked ,torn and its line ended
+# here, or the next row would be glued onto it. A file begun under other
+# columns (an older recorder, a sensor added to the set) gets this run's header
+# below its rows, and the reader takes each row by the header above it.
+continue_day() {
+    local line last=
+    [ -f "$1" ] || return 0
+    while IFS= read -r line; do
+        [[ $line == time,* ]] && last=$line
+    done < "$1"
+    # read fails on a last line with no newline, leaving it in line.
+    [ -z "$line" ] || echo ,torn >> "$1"
+    [ "$last" = "$2" ] || echo "$2" >> "$1"
 }
 
 # At start and after every ranking: a device's number is not stable across
@@ -162,7 +186,7 @@ row() {
     ROW+=",$SENSORS"
 }
 
-# --- zephylux's sensor set ---
+# --- zephyrus's sensor set ---
 
 sensors_zephyrus_find() {
     zone_by_type x86_pkg_temp ZONE_PKG
@@ -258,7 +282,7 @@ psi() {
 # each cgroup's cpu.stat usage since the previous ranking; the first ranking
 # after a start has nothing to compare against and leaves cpu_pct empty.
 write_top() {
-    local today stamp file d cur swp use prev v now elapsed=0 cpu_min unit manager pct line key val root_use out=
+    local today stamp file d cur swp use prev v now elapsed=0 cpu_min unit pct line key val root_use out=
     local listed_anon=0 listed_shmem=0 listed_swap=0 listed_cpu=0
     local rest_anon=0 rest_shmem=0 rest_swap rest_cpu=
     local pool_max=$((2 * MEM_ROWS))
@@ -341,7 +365,8 @@ write_top() {
         biggest_process "$d"
         psi "${d}memory.pressure" avg60
         unit=${d%/} unit=${unit##*/}
-        printf -v line '%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s\n' "$stamp" "$unit" "$pct" \
+        manager_of "$d"
+        printf -v line '%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s\n' "$stamp" "$MANAGER" "$unit" "$pct" \
             $((${m_anon[$d]} >> 20)) $((${m_shmem[$d]} >> 20)) $((${m_swap[$d]} >> 20)) \
             "$PROCS" "$PROC" "$CWD" "$PSI_SOME" "$PSI_FULL"
         out+=$line
@@ -366,29 +391,34 @@ write_top() {
         ((rest_cpu > 0)) || rest_cpu=0
     fi
     ROOT_CPU_PREV=$root_use
-    printf -v line '%s,(rest),%s,%d,%d,%d,,,,,\n' "$stamp" "$rest_cpu" \
+    printf -v line '%s,,(rest),%s,%d,%d,%d,,,,,\n' "$stamp" "$rest_cpu" \
         $((rest_anon >> 20)) $((rest_shmem >> 20)) $((rest_swap > 0 ? rest_swap >> 20 : 0))
     printf '%s' "$out$line" >> "$file"
 
     # The first ranking of each hour also writes every counter it just read.
     [ "${stamp:0:13}" = "$CPU_DUMP_HOUR" ] && return 0
     CPU_DUMP_HOUR=${stamp:0:13}
-    # A unit's name alone is ambiguous (the system bus and every user's session
-    # bus are all dbus.service), so each row also says which systemd manager
-    # owns it: system, or user@<uid> for that user's manager.
     file="$LOGDIR/$today.counters.csv"
     [ -f "$file" ] || echo "$CPU_HEADER" > "$file"
     out="$stamp,system,(root),$root_use"$'\n'
     for d in "${!cpu_next[@]}"; do
         unit=${d%/} unit=${unit##*/}
-        if [[ $d == */user@*.service/* ]]; then
-            manager=${d#*/user@} manager=user@${manager%%.service/*}
-        else
-            manager=system
-        fi
-        out+="$stamp,$manager,$unit,${cpu_next[$d]}"$'\n'
+        manager_of "$d"
+        out+="$stamp,$MANAGER,$unit,${cpu_next[$d]}"$'\n'
     done
     printf '%s' "$out" >> "$file"
+}
+
+# manager_of <cgroup dir>: MANAGER, the systemd manager that owns the unit:
+# system, or user@<uid> for that user's manager. A unit's name alone is
+# ambiguous: the system bus and every user's session bus are all dbus.service,
+# and on pc each worker runs its own docker.service.
+manager_of() {
+    if [[ $1 == */user@*.service/* ]]; then
+        MANAGER=${1#*/user@} MANAGER=user@${MANAGER%%.service/*}
+    else
+        MANAGER=system
+    fi
 }
 
 # insert_top <values> <items> <max> <value> <item>: keeps the two named arrays
@@ -444,7 +474,9 @@ biggest_process() {
         [ -n "${HOME:-}" ] && CWD=${PWD/#"$HOME"/\~}
     fi
     cd / || :
-    PROC=${PROC//,/ } CWD=${CWD//,/ }
+    # One field each, on one line: a directory or a process can name itself
+    # with a comma or a line break.
+    PROC=${PROC//[$'\n\r',]/ } CWD=${CWD//[$'\n\r',]/ }
 }
 
 # --- device lookups and readings ---
