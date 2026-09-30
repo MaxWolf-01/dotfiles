@@ -48,7 +48,7 @@ measured value, its floor, and its behavior-preserving flag.
   host or `--host pc`. Step 2's ranking for CPU starts there; `--help` says
   what each question answers.
 - Battery, temperature, power caps: the host recorder's sensor columns, which
-  the reader does not answer — `bin/host-recorder`'s header names them.
+  the reader does not answer; `bin/host-recorder`'s header names them.
 - HDD spin behaviour on pc: `journalctl -u hd-idle` logs every spindown and
   spinup — match each wake against the known timers.
 

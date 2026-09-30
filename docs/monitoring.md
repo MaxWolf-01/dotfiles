@@ -36,8 +36,8 @@ Everything that can send one, and where it points:
 | Subject | Sender | What it means | Where to look next |
 | --- | --- | --- | --- |
 | `❌ <unit> - Backup Failed` | `backup/restic_backup.sh` | that run left no snapshot; the message carries restic's own error | the same run is a `fail` line in `~/logs/runs/<unit>.jsonl`, with the path to the error log |
-| `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message, the attachment, and the `check_log` path in the job run log carry restic's full output | `/backup-audit <unit>` — it opens the repo and reports what is broken |
-| `🕸️ <n> overdue: <unit> +<rest>` / `🕸️ <n> unchecked: <unit> +<rest>` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Could not check:`, one whose evidence could not be read at all — a repository that answers but cannot be opened, or an age key still locked after a reboot | overdue: the unit's job run log, then its bound (below). Could not check: `/backup-audit`, which opens the repositories |
+| `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message, the attachment, and the `check_log` path in the job run log carry restic's full output | `/backup-audit <unit>`, which opens the repo and reports what is broken |
+| `🕸️ <n> overdue: <unit> +<rest>` / `🕸️ <n> unchecked: <unit> +<rest>` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Could not check:`, one whose evidence could not be read at all: a repository that answers but cannot be opened, or an age key still locked after a reboot | overdue: the unit's job run log, then its bound (below). Could not check: `/backup-audit`, which opens the repositories |
 | `⚠️ Yapit health` / `⚠️ Yapit deps` | `scripts/report.sh` / `scripts/dep-scout.sh` in `~/repos/code/yapit-tts/yapit` | last night's agent found issues, or a dependency needs acting on | the report itself, on the yapit dashboard |
 | `❌ / ✅ yapit deploy: <commit>` | `scripts/deploy.sh`, run by hand from the yapit repo | a production deploy failed partway, or shipped — deploys are rare and hand-run, so completion mails too | the deploy terminal output and `.deploys.log` in the repo |
 | `✅ / ❌ / ⚠️ instagram-saves: ...` | `secrets/scripts/instagram-saves --record`, hourly on pc | every saved Instagram post is downloaded and the unit can go (`✅`), the run broke (`❌`), or Instagram has refused this IP for a day (`⚠️`, at most one a day) | the job run log, then `ledger.tsv` in `~/instagram-saves` on pc: one line per attempt, with the reason it ended that way |
@@ -67,9 +67,9 @@ A `skip` says a precondition the job does not control was absent, so it
 deliberately did nothing: expected, and never an alert on its own. A skip
 streak that never ends becomes visible through the watchdog bound below.
 
-The model run log, `~/logs/agent/runs.jsonl`, is another record: one line per
-model run the agent workflow starts, and what it cost. The mx plugin's own
-`run-log` writes it, and nothing on this page reads it.
+Not to be confused with the model run log, `~/logs/agent/runs.jsonl`: one line
+per model run the agent workflow starts, and what it cost, written by the mx
+plugin's own `run-log`.
 
 ## "unit X hasn't run in N days — is that a problem?"
 
@@ -100,8 +100,8 @@ A host or backup target that cannot be reached is skipped rather than alerted,
 and printed on stdout only. That silence is bounded: a repository the probe
 cannot open is dated from the job run log of whichever host makes that backup, and
 an outage outlasting the repo's `max_age_days` alerts with the unreachability
-named. A repository nothing can date — no job run log on the host that backs it up
-— is reported, not skipped. The mechanics are in the comments at the top of
+named. A repository nothing can date (no job run log on the host that backs it up)
+is reported, not skipped. The mechanics are in the comments at the top of
 `bin/overdue-check`.
 
 ## Dashboards
