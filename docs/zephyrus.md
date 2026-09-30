@@ -71,6 +71,8 @@ it holds them:
 - CUDA, a Vulkan or EGL app that picks the dGPU, GNOME's "Launch using
   Graphics Card".
 - A monitor on a dGPU port (see Ports), for as long as it is connected.
+- `dgpu`'s probe of the dGPU's outputs, on a change of its card and after a
+  wake, where gnome-shell's own probe follows and would wake it anyway.
 
 Who holds it right now:
 
@@ -79,8 +81,8 @@ Who holds it right now:
 
 The driver's own view: `cat /proc/driver/nvidia/gpus/0000:01:00.0/power`.
 `dgpu`'s runs at boot and on the charger: `journalctl -b -u dgpu-auto`; after
-a wake: `journalctl -b -u 'systemd-*suspend*' -u 'systemd-*hibernate*'`; the
-delayed ones: `journalctl -b -u 'run-*' -g dgpu`.
+a wake: `journalctl -b -u dgpu-resume`, and the sleep hook's unlock under
+`journalctl -b -u 'systemd-*suspend*' -u 'systemd-*hibernate*'`.
 History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
 
 ### Traps
@@ -89,18 +91,18 @@ History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
   monitor through the dGPU; its next frame fails with `Failed to create EGL
   image from buffer object for secondary GPU` and the session hangs until a
   hard reset, which an unlock afterwards does not undo. On 2026-09-29 a resume
-  from hibernate on battery did this. `dgpu auto` never locks while a dGPU
-  output is connected, but an output reads what the last probe saw, and after
-  a wake or a hotplug that probe is gnome-shell's own, made once it hears of
-  the event. So on those two `dgpu defer` unlocks first, before gnome-shell
-  can draw: from a system-sleep hook before user processes are thawed, and
-  from udev before a change on the dGPU's card reaches gnome-shell. `dgpu`
-  decides again a few seconds later, from what gnome-shell's probe found. It
-  cannot stop a `dgpu lock` typed by hand under a monitor, nor an installed
-  copy that differs from `bin/dgpu` (`dgpu status` says so; `dgpu install`
-  replaces it), nor a decision made before gnome-shell's probe: the charger
-  going out in the instant between a hotplug and that probe, or a probe that
-  comes later than the delay (`RECHECK_DELAY` in `bin/dgpu`).
+  from hibernate on battery did this. `dgpu` never locks while a dGPU output
+  reads `connected` or `unknown`. An output reads what the driver's last probe
+  found, and after a hotplug or a wake nvidia-drm leaves that probe to
+  gnome-shell, so a monitor just plugged in still reads `disconnected`. `dgpu`
+  therefore probes the outputs itself before any decision that could lock: on
+  a change of the dGPU's card, from udev before the event reaches gnome-shell;
+  after a wake, from the `dgpu-resume` unit once the NVIDIA driver has
+  resumed, with the dGPU unlocked by a sleep hook before user processes are
+  thawed. At boot and on the charger it probes only a dGPU in D0; in D3cold
+  the dGPU drives no monitor. It cannot stop a `dgpu lock` typed by hand under
+  a monitor, nor an installed copy that differs from `bin/dgpu` (`dgpu status`
+  says so; `dgpu install` replaces it).
 - **HDMI hot-plug.** Plugging HDMI into a running session crashes gnome-shell,
   locked or not, and gdm restarts the session with the monitor working; a
   session that starts with the cable in works from the start. Save your work

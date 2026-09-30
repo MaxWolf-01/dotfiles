@@ -3,12 +3,13 @@
 #
 # The decisions under test: the dGPU is the display device that is not the
 # boot VGA, and only its device files change; lock takes every bit, unlock
-# gives back what udev sets; auto locks only on battery with none of the
-# dGPU's outputs connected, found through its PCI device whatever the card
-# numbers; after a wake and on a change of the dGPU's card, the installed
-# hook and rule unlock whatever the outputs read and leave the decision to a
-# later recheck. That a failed open keeps a real dGPU in D3cold, and that the
-# hook and the rule run before gnome-shell draws, show only on the hardware.
+# gives back what udev sets; dgpu locks only on battery with none of the
+# dGPU's outputs connected or unknown, found through its PCI device whatever
+# the card numbers; a decision that can lock probes the outputs first, unless
+# it finds the dGPU in D3cold outside a wake or a change of its card. That a
+# failed open keeps a real dGPU in D3cold, that the hook, the units and the
+# rule run in the order they are installed for, and that a probe updates
+# `status`, show only on the hardware.
 
 set -uo pipefail
 
@@ -31,6 +32,28 @@ check() {
 
 mode() { stat -L -c %a "$1"; }
 
+# sudo, systemctl and udevadm stubbed, and tee, which is how dgpu writes. A
+# write to an output's `status` is the driver's probe: the stub logs it, and
+# the output takes the state the test put in truth/, where a monitor the
+# driver has not probed yet is.
+stubs="$root/stubs" calls="$root/calls"
+mkdir "$stubs"
+printf '#!/bin/sh\nexec "$@"\n' > "$stubs/sudo"
+printf '#!/bin/sh\necho "$(basename "$0") $*" >> "%s"\n' "$calls" > "$stubs/systemctl"
+cp "$stubs/systemctl" "$stubs/udevadm"
+cat > "$stubs/tee" <<EOF
+#!/bin/sh
+case "\$1" in
+    */status)
+        o=\$(basename "\$(dirname "\$1")")
+        echo "probe \$o \$(cat)" >> "$calls"
+        [ -e "$root/truth/\$o" ] && cat "$root/truth/\$o" > "\$1"
+        exit 0 ;;
+esac
+exec $(command -v tee) "\$@"
+EOF
+chmod +x "$stubs"/*
+
 # An iGPU at 00:02.0 that owns the console, an NVIDIA dGPU at 01:00.0 in
 # D3cold, and the charger plugged in. The layout is a real sysfs's: each card
 # sits under its PCI device with its outputs inside it, /sys/class/drm links to
@@ -42,8 +65,8 @@ mode() { stat -L -c %a "$1"; }
 # boots, so the default is this boot's order and a case can swap it.
 fresh_tree() {
     igpu_card=${1:-0} dgpu_card=${2:-1}
-    rm -rf "${root:?}"/{sys,dev,ps}
-    mkdir -p "$root/sys/drm" "$root/sys/drivers/i915" "$root/sys/drivers/nvidia" \
+    rm -rf "${root:?}"/{sys,dev,ps,truth,calls}
+    mkdir -p "$root/truth" "$root/sys/drm" "$root/sys/drivers/i915" "$root/sys/drivers/nvidia" \
              "$root/dev/dri/by-path" "$root/ps/AC0" "$root/ps/BAT0"
     card 0000:00:02.0 "$igpu_card" i915 1 eDP-1 DP-1 DP-2
     card 0000:01:00.0 "$dgpu_card" nvidia 0 DP-3 HDMI-A-1
@@ -84,11 +107,22 @@ output() { # igpu|dgpu connector status
     echo "$3" > "$root/sys/drm/card$n-$2/status"
 }
 
+# What a probe of the output will find: a monitor the driver does not know of yet.
+plug() { # igpu|dgpu connector status
+    local n
+    if [ "$1" = igpu ]; then n=$igpu_card; else n=$dgpu_card; fi
+    echo "$3" > "$root/truth/card$n-$2"
+}
+
+probes() { cat "$calls" 2>/dev/null | grep -c '^probe .* detect$'; }
+
 run() {
-    DGPU_SYSFS_DRM="$root/sys/drm" DGPU_DEV="$root/dev" DGPU_POWER_SUPPLY="$root/ps" DGPU_NODE_WAIT=0 "$script" "$@"
+    PATH="$stubs:$PATH" DGPU_SYSFS_DRM="$root/sys/drm" DGPU_DEV="$root/dev" DGPU_POWER_SUPPLY="$root/ps" \
+        DGPU_NODE_WAIT=0 "$script" "$@"
 }
 
 on_battery() { echo 0 > "$root/ps/AC0/online"; }
+awake() { echo D0 > "$root/sys/pci/0000:01:00.0/power_state"; }
 
 modes() { # the dGPU's nodes, then the iGPU's
     local p="$root/dev/dri/by-path"
@@ -166,6 +200,7 @@ check "and the iGPU is untouched" "660 660" "$(mode "$root/dev/dri/card0") $(mod
 
 fresh_tree
 on_battery
+awake
 output dgpu DP-3 connected
 err=$(run auto 2>&1 >/dev/null)
 check "on battery with a monitor on the dGPU auto leaves it unlocked" \
@@ -182,16 +217,34 @@ check "the monitor unplugged, auto locks" "0 0 0 0 0 0 / 660 660" "$(modes)"
 
 fresh_tree
 on_battery
-output dgpu DP-3 unknown
 output igpu DP-1 connected
 run auto
-check "a monitor on the iGPU, or an output in an unknown state, does not stop the lock" \
-    "0 0 0 0 0 0 / 660 660" "$(modes)"
+check "a monitor on the iGPU does not stop the lock" "0 0 0 0 0 0 / 660 660" "$(modes)"
+awake
+output dgpu DP-3 unknown
+run auto 2>/dev/null
+check "a dGPU output the driver reports as unknown does" "660 660 666 666 666 666 / 660 660" "$(modes)"
+
+# --- a decision that can lock reads no output state older than its event
+
+fresh_tree
+on_battery
+plug dgpu DP-3 connected
+run auto
+check "a dGPU in D3cold on the charger path locks, and writes no status" \
+    "0 0 0 0 0 0 / 660 660 0" "$(modes) $(probes)"
+awake
+run auto 2>/dev/null
+check "an awake one is probed first, and its new monitor keeps it unlocked" \
+    "660 660 666 666 666 666 / 660 660 2" "$(modes) $(probes)"
+check "status shows what the probe found" \
+    "outputs: card1-DP-3 connected, card1-HDMI-A-1 disconnected" "$(run status | grep '^outputs:')"
 
 # --- the outputs are the dGPU's whatever this boot numbered the cards
 
 fresh_tree 1 0
 on_battery
+awake
 output dgpu HDMI-A-1 connected
 run auto 2>/dev/null
 check "the dGPU as card0: its monitor keeps it unlocked" "660 660 666 666 666 666 / 660 660" "$(modes)"
@@ -218,104 +271,75 @@ exec 8<&-
 wait "$waiting"
 check "and decides once it is released" "0 0 0 0 0 0 / 660 660" "$(modes)"
 
-# --- install and reset, into a fake root, with sudo, systemctl, systemd-run
-# --- and udevadm stubbed. The stubbed systemd-run keeps the command it was
-# --- given to run later, and run_scheduled is "later".
+# --- install and reset, into a fake root
 
 fresh_tree
 on_battery
-fs="$root/fs" stubs="$root/stubs" calls="$root/calls" scheduled="$root/scheduled"
-mkdir -p "$fs/usr/local/sbin" "$fs/etc/systemd/system" "$fs/etc/udev/rules.d" "$fs/run" "$stubs"
-printf '#!/bin/sh\nexec "$@"\n' > "$stubs/sudo"
-printf '#!/bin/sh\necho "$(basename "$0") $*" >> "%s"\n' "$calls" > "$stubs/systemctl"
-cp "$stubs/systemctl" "$stubs/udevadm"
-printf '#!/bin/sh\n[ -e "%s" ] && exit 1\necho "systemd-run $*" >> "%s"\nwhile [ "${1#--}" != "$1" ]; do shift; done\necho "$*" >> "%s"\n' \
-    "$root/systemd-run-fails" "$calls" "$scheduled" > "$stubs/systemd-run"
-chmod +x "$stubs"/*
-as_root() { # command...: as the hook, the rule and systemd run it
+fs="$root/fs"
+mkdir -p "$fs/usr/local/sbin" "$fs/etc/systemd/system" "$fs/etc/udev/rules.d"
+as_root() { # command...: as the hook, the units and the rule run it
     PATH="$stubs:$PATH" DGPU_ROOT="$fs" DGPU_SYSFS_DRM="$root/sys/drm" DGPU_DEV="$root/dev" \
         DGPU_POWER_SUPPLY="$root/ps" DGPU_NODE_WAIT=0 "$@"
 }
-run_scheduled() {
-    local cmd
-    while read -r cmd; do as_root $cmd; done < "$scheduled"
-    rm "$scheduled"
-}
+exec_start() { sed -n 's/^ExecStart=//p' "$1"; }
 
 as_root "$script" install >/dev/null
 check "install succeeds" 0 $?
 hook="$fs/etc/systemd/system-sleep/dgpu"
 unit="$fs/etc/systemd/system/dgpu-auto.service"
+resume="$fs/etc/systemd/system/dgpu-resume.service"
 rule="$fs/etc/udev/rules.d/99-dgpu.rules"
-check "install writes the copy, the unit, the sleep hook and the rule" "yes yes yes yes" \
-    "$([ -x "$fs/usr/local/sbin/dgpu" ] && echo yes) $([ -f "$unit" ] && echo yes) $([ -x "$hook" ] && echo yes) $([ -f "$rule" ] && echo yes)"
+check "install writes the copy, the two units, the sleep hook and the rule" "yes yes yes yes yes" \
+    "$([ -x "$fs/usr/local/sbin/dgpu" ] && echo yes) $([ -f "$unit" ] && echo yes) $([ -f "$resume" ] && echo yes) $([ -x "$hook" ] && echo yes) $([ -f "$rule" ] && echo yes)"
 check "and ran auto" "0 0 0 0 0 0 / 660 660" "$(modes)"
-check "the unit starts at boot and on no wake target" \
+check "dgpu-auto starts at boot and on no wake target" \
     "WantedBy=multi-user.target" "$(grep -E '^WantedBy=|^After=|sleep|suspend|hibernate' "$unit")"
-check "enabling the unit drops the links an older one left in the wake targets" \
-    "systemctl reenable --quiet dgpu-auto.service" "$(grep -w reenable "$calls")"
+check "dgpu-resume starts on every wake, once the NVIDIA driver has resumed" \
+    "After=systemd-suspend.service systemd-hibernate.service systemd-hybrid-sleep.service systemd-suspend-then-hibernate.service nvidia-resume.service
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target" \
+    "$(grep -E '^WantedBy=|^After=' "$resume")"
+check "enabling the units drops the links an older dgpu-auto left in the sleep targets" \
+    "systemctl reenable --quiet dgpu-auto.service dgpu-resume.service" "$(grep -w reenable "$calls")"
 drm_change=$(grep 'SUBSYSTEM=="drm"' "$rule" | grep '"change"')
-check "a card changing runs defer from the rule, before udev passes the event on" \
-    "ACTION==\"change\", SUBSYSTEM==\"drm\", ENV{DEVTYPE}==\"drm_minor\", KERNEL==\"card*\", RUN+=\"$fs/usr/local/sbin/dgpu defer\"" \
+check "a card changing runs probe from the rule, before udev passes the event on" \
+    "ACTION==\"change\", SUBSYSTEM==\"drm\", ENV{DEVTYPE}==\"drm_minor\", KERNEL==\"card*\", RUN+=\"$fs/usr/local/sbin/dgpu probe\"" \
     "$drm_change"
 
-# A path that can bring a monitor onto the dGPU unlocks whatever the outputs
-# read, since they read what the last probe saw, and decides again later.
+# A wake: the hook unlocks before the thaw and decides nothing; dgpu-resume
+# decides once the driver is back, from a probe, since a monitor plugged in
+# during the sleep still reads disconnected.
 as_root "$script" lock
 as_root sh "$hook" pre
 check "the hook does nothing before the sleep" "0 0 0 0 0 0 / 660 660" "$(modes)"
 as_root sh "$hook" post
-check "after the wake the hook unlocks, with every dGPU output reading disconnected" \
-    "660 660 666 666 666 666 / 660 660" "$(modes)"
-check "and has systemd run recheck later without waiting for it" \
-    "systemd-run --quiet --collect --no-block --on-active=5 --description=dgpu: decide the lock after gnome-shell's probe $fs/usr/local/sbin/dgpu recheck $(cat "$fs/run/dgpu-recheck")" \
-    "$(grep '^systemd-run' "$calls")"
-run_scheduled
-check "the later recheck locks, no monitor having turned up" "0 0 0 0 0 0 / 660 660" "$(modes)"
+check "after the wake the hook unlocks, though no output reads connected, and probes nothing" \
+    "660 660 666 666 666 666 / 660 660 0" "$(modes) $(probes)"
+plug dgpu DP-3 connected
+as_root $(exec_start "$resume") 2>/dev/null
+check "dgpu-resume probes, finds the monitor plugged in during the sleep, and leaves it unlocked" \
+    "660 660 666 666 666 666 / 660 660 2" "$(modes) $(probes)"
+plug dgpu DP-3 disconnected
+as_root $(exec_start "$resume")
+check "with no monitor found it locks" "0 0 0 0 0 0 / 660 660" "$(modes)"
 
+# A hotplug: the rule probes before gnome-shell hears of the event.
 rule_run=$(sed 's/.*RUN+="\([^"]*\)".*/\1/' <<< "$drm_change")
+rm "$calls"
 DEVPATH=/devices/pci0000:00/0000:00:02.0/drm/card0 as_root $rule_run
-check "a change on the iGPU's card leaves the lock and schedules nothing" \
-    "0 0 0 0 0 0 / 660 660 no" "$(modes) $([ -e "$scheduled" ] && echo yes || echo no)"
+check "a change on the iGPU's card leaves the lock and probes nothing" \
+    "0 0 0 0 0 0 / 660 660 0" "$(modes) $(probes)"
+plug dgpu HDMI-A-1 connected
+DEVPATH=/devices/pci0000:00/0000:00:01.0/0000:01:00.0/drm/card1 as_root $rule_run 2>/dev/null
+check "a change on the dGPU's card probes, and the monitor it found, still unknown to status before, unlocks" \
+    "660 660 666 666 666 666 / 660 660 2" "$(modes) $(probes)"
+plug dgpu HDMI-A-1 disconnected
 DEVPATH=/devices/pci0000:00/0000:00:01.0/0000:01:00.0/drm/card1 as_root $rule_run
-check "a change on the dGPU's card unlocks, the new monitor still reading disconnected" \
-    "660 660 666 666 666 666 / 660 660" "$(modes)"
-output dgpu DP-3 connected
-run_scheduled 2>/dev/null
-check "and the later recheck, reading gnome-shell's probe, leaves it unlocked" \
-    "660 660 666 666 666 666 / 660 660" "$(modes)"
-# Two events 4 s apart: the first one's recheck fires 1 s into the second's
-# wait for gnome-shell's probe, and must not decide from what it reads.
-# DP-3 reads disconnected, so a recheck that decided would lock.
-output dgpu DP-3 disconnected
-as_root sh "$hook" post
-as_root sh "$hook" post
-as_root $(head -1 "$scheduled")
-check "a recheck a later defer superseded decides nothing" "660 660 666 666 666 666 / 660 660" "$(modes)"
-as_root $(tail -1 "$scheduled")
-check "the latest one decides" "0 0 0 0 0 0 / 660 660" "$(modes)"
-rm "$scheduled"
-
-# A monitor arrives, still reading disconnected, and the defer it causes fails
-# to schedule its recheck: the earlier recheck must still stand down.
-as_root sh "$hook" post
-as_root "$script" lock
-touch "$root/systemd-run-fails"
-err=$(as_root sh "$hook" post 2>&1)
-check "a defer whose systemd-run fails exits non-zero" 1 $?
-check "and says what that leaves" \
-    "dgpu: systemd-run failed to schedule the recheck; the dGPU stays unlocked until the next wake, hotplug or charger event" "$err"
-check "having unlocked first" "660 660 666 666 666 666 / 660 660" "$(modes)"
-rm "$root/systemd-run-fails"
-run_scheduled
-check "and the earlier recheck stands down rather than lock under the monitor" \
-    "660 660 666 666 666 666 / 660 660" "$(modes)"
-
+check "and the monitor unplugged, it locks again" "0 0 0 0 0 0 / 660 660" "$(modes)"
 check "status sees the hook" "sleep hook: $hook installed" "$(as_root "$script" status | grep '^sleep hook:')"
 
 as_root "$script" reset >/dev/null
 check "reset succeeds" 0 $?
-check "and removes the copy, the unit, the hook and the rule" "" \
+check "and removes the copy, the units, the hook and the rule" "" \
     "$(find "$fs" -type f)"
 check "and unlocks" "660 660 666 666 666 666 / 660 660" "$(modes)"
 

@@ -17,26 +17,29 @@
 #
 # A monitor on a port wired to the dGPU needs it unlocked: gnome-shell draws it
 # through the dGPU, and a lock under it hangs the session until a hard reset.
-# So `auto` locks only on battery with none of the dGPU's outputs connected,
-# and otherwise unlocks. It finds those outputs under the dGPU's own PCI
-# device, since card numbers change between boots, and reads the state the
-# driver already holds, which neither probes a port nor wakes the card.
+# So `dgpu` locks only on battery with none of the dGPU's outputs connected or
+# unknown, and otherwise unlocks. It finds those outputs under the dGPU's own
+# PCI device, since card numbers change between boots.
 #
-# That state is only as new as the last probe, and after a wake or a hotplug
-# the probe is gnome-shell's, once it has heard of the event: a monitor just
-# plugged into a dGPU port still reads disconnected. So what runs on those two
-# is `defer`: it unlocks without reading the outputs, and has systemd decide
-# again a few seconds later, from the state gnome-shell's probe left.
+# Reading an output's state returns what the driver held at its last probe,
+# and after a hotplug or a wake that is stale: nvidia-drm marks the state dirty
+# and leaves the probe to whoever hears the event, which is gnome-shell. So a
+# decision that could lock either probes the outputs first (writes `detect` to
+# their `status`), or finds the dGPU in D3cold, where it drives no monitor and
+# a monitor plugged in would raise a change event of its own. A probe wakes a
+# card in D3cold, so it is made only where the card is awake or about to be.
 #
 # `install` puts a root-owned copy of this script in /usr/local/sbin and runs
 # it:
-#   - at boot, before the display manager: `auto` (a unit)
-#   - after every wake, before user processes are thawed: `defer` (a
+#   - at boot, before the display manager, and when the charger goes in or out
+#     or the dGPU's driver or render node appears: `auto`, which probes only a
+#     dGPU in D0 (the dgpu-auto unit, which udev starts for all but boot)
+#   - after every wake, before user processes are thawed: `unlock` (a
 #     system-sleep hook)
+#   - after every wake, once the NVIDIA driver has resumed: `probe` (the
+#     dgpu-resume unit). Probing any earlier finds the driver still asleep.
 #   - when the dGPU's card reports a change, as a monitor goes in or out,
-#     before gnome-shell hears of it: `defer` (a udev RUN+= rule)
-#   - when the charger goes in or out, and when the dGPU's driver or render
-#     node appears: `auto` (udev starting the unit)
+#     before gnome-shell hears of it: `probe` (a udev RUN+= rule)
 # The copy does not follow edits made here: `status` says when the two differ,
 # `install` reinstalls. Which port is which, and what the lock still cannot
 # prevent: docs/zephyrus.md.
@@ -61,10 +64,10 @@
 #                   source, what is installed
 #   dgpu lock       fail every open of the dGPU's device files
 #   dgpu unlock     restore their permissions
-#   dgpu auto       lock on battery with no monitor on the dGPU, else unlock
-#   dgpu defer      unlock, and have systemd run recheck in a few seconds
-#   dgpu recheck T  decide as auto does, unless a later defer replaced T
-#   dgpu install    install the copy, the unit, the sleep hook and the udev
+#   dgpu auto       lock on battery with no monitor on the dGPU, else unlock;
+#                   probes the outputs first when the dGPU is awake
+#   dgpu probe      probe the outputs, then decide as auto does
+#   dgpu install    install the copy, the units, the sleep hook and the udev
 #                   rule, then run auto
 #   dgpu reset      unlock and remove what install put in place
 
@@ -78,13 +81,13 @@ ROOT=${DGPU_ROOT:-}
 INSTALLED=$ROOT/usr/local/sbin/dgpu
 UNIT_NAME=dgpu-auto.service
 UNIT_PATH=$ROOT/etc/systemd/system/$UNIT_NAME
+RESUME_NAME=dgpu-resume.service
+RESUME_PATH=$ROOT/etc/systemd/system/$RESUME_NAME
 RULE_PATH=$ROOT/etc/udev/rules.d/99-dgpu.rules
 HOOK_PATH=$ROOT/etc/systemd/system-sleep/dgpu
-PENDING=$ROOT/run/dgpu-recheck
+SLEEP_TARGETS="suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+SLEEP_SERVICES="systemd-suspend.service systemd-hibernate.service systemd-hybrid-sleep.service systemd-suspend-then-hibernate.service"
 NO_DGPU="no dGPU with a driver bound (is the card on the bus: lspci -d 10de:; is its driver loaded: lsmod)"
-# How long `defer` leaves the outputs to gnome-shell's probe before `recheck`
-# reads them.
-RECHECK_DELAY=5
 # How long `auto` waits for the render node after the driver's own event
 # created /dev/nvidia*; the DRM nodes arrive in a later udev event.
 NODE_WAIT=${DGPU_NODE_WAIT:-3}
@@ -115,8 +118,7 @@ find_dgpu() {
 }
 
 # The dGPU's outputs as "<name> <status>", one per line: the connectors of the
-# DRM card under its PCI device. Only ever read: writing `status` forces a
-# probe, which wakes the card.
+# DRM card under its PCI device, as the driver's last probe left them.
 outputs() { # sysfs path
     local s c
     for s in "$1"/drm/card*/card*-*/status; do
@@ -127,11 +129,25 @@ outputs() { # sysfs path
     return 0
 }
 
-# The dGPU's outputs with a monitor on them, space-separated.
+# Has the driver probe each of the dGPU's outputs, so that what `status` reads
+# next is current. The driver runs its full probe on this write (status_store
+# in the kernel's drm_sysfs.c), which wakes a card in D3cold.
+probe_outputs() { # sysfs path
+    local s
+    for s in "$1"/drm/card*/card*-*/status; do
+        [ -e "$s" ] || continue
+        echo detect | sudo tee "$s" >/dev/null
+    done
+    return 0
+}
+
+# The dGPU's outputs that may have a monitor on them, space-separated.
+# `unknown` counts: the driver could not tell, and a lock under a monitor
+# costs a hard reset.
 connected() { # sysfs path
     local name state held=()
     while read -r name state; do
-        if [ "$state" = connected ]; then held+=("$name"); fi
+        if [ "$state" != disconnected ]; then held+=("$name"); fi
     done < <(outputs "$1")
     echo "${held[*]}"
 }
@@ -195,8 +211,8 @@ set_all() { # lock|unlock
 lock() { set_all lock; }
 unlock() { set_all unlock; }
 
-# What the unit runs. Here and below, a machine without a dGPU has nothing to
-# do, not an error.
+# What the dgpu-auto unit runs. Here and below, a machine without a dGPU has
+# nothing to do, not an error.
 auto() {
     local addr driver dev i
     read -r addr driver dev < <(find_dgpu) || { echo "dgpu: $NO_DGPU, nothing to do" >&2; return 0; }
@@ -205,13 +221,16 @@ auto() {
         sleep 0.1
     done
     take_turn
+    if ! on_ac && [ "$(cat "$dev/power_state" 2>/dev/null)" != D3cold ]; then
+        probe_outputs "$dev"
+    fi
     decide "$dev"
 }
 
-# What the hook and the rule run. udev holds the event until a RUN+= program
-# exits, so this waits on nothing but another run's turn, which is short.
-defer() {
-    local addr driver dev token
+# What the dgpu-resume unit and the rule run. udev passes the event on only
+# once this exits, so gnome-shell's own probe comes after this one.
+probe() {
+    local addr driver dev
     read -r addr driver dev < <(find_dgpu) || { echo "dgpu: $NO_DGPU, nothing to do" >&2; return 0; }
     # The rule's change event names its card in DEVPATH; a change on another
     # GPU's card brings no monitor onto the dGPU.
@@ -219,23 +238,7 @@ defer() {
         return 0
     fi
     take_turn
-    unlock
-    # Each defer supersedes the recheck an earlier one scheduled, which could
-    # otherwise fire inside this event's wait for gnome-shell's probe. The
-    # token is written before the recheck is scheduled, so if scheduling
-    # fails, no earlier recheck decides.
-    token="$(date +%s.%N)-$$"
-    echo "$token" | sudo tee "$PENDING" >/dev/null
-    sudo systemd-run --quiet --collect --no-block --on-active="$RECHECK_DELAY" \
-        --description="dgpu: decide the lock after gnome-shell's probe" "$INSTALLED" recheck "$token" ||
-        die "systemd-run failed to schedule the recheck; the dGPU stays unlocked until the next wake, hotplug or charger event"
-}
-
-recheck() { # token
-    local addr driver dev
-    read -r addr driver dev < <(find_dgpu) || { echo "dgpu: $NO_DGPU, nothing to do" >&2; return 0; }
-    take_turn
-    [ "$(cat "$PENDING" 2>/dev/null)" = "$1" ] || return 0
+    on_ac || probe_outputs "$dev"
     decide "$dev"
 }
 
@@ -255,7 +258,7 @@ decide() { # sysfs path
     fi
 }
 
-# The unit, the hook and the rule can run at once. One read-and-apply at a
+# The units and the rule can run at once. One read-and-apply at a
 # time, so a run that read an older state never writes last. The hold ends
 # with the process.
 take_turn() {
@@ -264,7 +267,7 @@ take_turn() {
 }
 
 show() {
-    local addr driver dev state list
+    local addr driver dev state list u
     if read -r addr driver dev < <(find_dgpu); then
         state=$(cat "$dev/power_state" 2>/dev/null || echo unknown)
         if locked "$addr"; then
@@ -279,11 +282,13 @@ show() {
         echo "dgpu: $NO_DGPU"
     fi
     if on_ac; then echo "power: AC"; else echo "power: battery"; fi
-    if systemctl is-enabled --quiet $UNIT_NAME 2>/dev/null; then
-        echo "unit: $UNIT_NAME enabled"
-    else
-        echo "unit: not installed"
-    fi
+    for u in $UNIT_NAME $RESUME_NAME; do
+        if systemctl is-enabled --quiet "$u" 2>/dev/null; then
+            echo "unit: $u enabled"
+        else
+            echo "unit: $u not installed"
+        fi
+    done
     if [ -f "$HOOK_PATH" ]; then
         echo "sleep hook: $HOOK_PATH installed"
     else
@@ -303,13 +308,13 @@ show() {
     fi
 }
 
-# The unit, the hook and the rule run as root, so they run a root-owned copy: a
+# The units, the hook and the rule run as root, so they run a root-owned copy: a
 # script under $HOME is writable by every process of the user.
 install_all() {
     sudo install -m 755 "$0" "$INSTALLED"
-    # Boot only. A wake is the hook's: a unit on a wake target starts after
-    # systemd-sleep has thawed user.slice, so gnome-shell could draw to a
-    # monitor on the dGPU before the unit unlocked it.
+    # Not on a wake: a unit on a wake target starts after systemd-sleep has
+    # thawed user.slice, and this one could lock before the dgpu-resume unit's
+    # probe.
     sudo tee "$UNIT_PATH" >/dev/null <<EOF
 [Unit]
 Description=Lock the dGPU's device files on battery with no monitor on the dGPU, unlock otherwise
@@ -324,17 +329,32 @@ ExecStart=$INSTALLED auto
 [Install]
 WantedBy=multi-user.target
 EOF
+    # nvidia-resume.service is where the NVIDIA driver finishes resuming, and
+    # it too runs only after the thaw; the sleep hook's unlock covers the gap.
+    sudo tee "$RESUME_PATH" >/dev/null <<EOF
+[Unit]
+Description=Probe the dGPU's outputs after a wake and lock its device files if none has a monitor on battery
+After=$SLEEP_SERVICES nvidia-resume.service
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALLED probe
+
+[Install]
+WantedBy=$SLEEP_TARGETS
+EOF
     sudo systemctl daemon-reload
-    # reenable, not enable: it also drops the links an older unit left in the
-    # wake targets' .wants directories.
-    sudo systemctl reenable --quiet $UNIT_NAME
+    # reenable, not enable: it also drops the links an older dgpu-auto left in
+    # the sleep targets' .wants directories.
+    sudo systemctl reenable --quiet $UNIT_NAME $RESUME_NAME
     sudo mkdir -p "$(dirname "$HOOK_PATH")"
     sudo tee "$HOOK_PATH" >/dev/null <<EOF
 #!/bin/sh
 # Installed by dgpu install. systemd-sleep(8) runs this with "post" after a wake,
 # before it thaws user processes, so gnome-shell never draws under a stale lock.
+# The decision is the dgpu-resume unit's.
 [ "\$1" = post ] || exit 0
-exec $INSTALLED defer
+exec $INSTALLED unlock
 EOF
     sudo chmod 755 "$HOOK_PATH"
     # Mains only: the battery emits a change event on every capacity tick. The
@@ -346,17 +366,20 @@ EOF
 ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
 ACTION=="add", SUBSYSTEM=="drm", KERNEL=="renderD*", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
 ACTION=="add", DEVPATH=="/bus/pci/drivers/nvidia", TAG+="systemd", ENV{SYSTEMD_WANTS}="$UNIT_NAME"
-ACTION=="change", SUBSYSTEM=="drm", ENV{DEVTYPE}=="drm_minor", KERNEL=="card*", RUN+="$INSTALLED defer"
+ACTION=="change", SUBSYSTEM=="drm", ENV{DEVTYPE}=="drm_minor", KERNEL=="card*", RUN+="$INSTALLED probe"
 EOF
     sudo udevadm control --reload
 }
 
 uninstall() {
-    if [ -f "$UNIT_PATH" ]; then
-        sudo systemctl disable --quiet $UNIT_NAME
-        sudo rm "$UNIT_PATH"
-        sudo systemctl daemon-reload
-    fi
+    local u
+    for u in "$UNIT_PATH" "$RESUME_PATH"; do
+        if [ -f "$u" ]; then
+            sudo systemctl disable --quiet "$(basename "$u")"
+            sudo rm "$u"
+            sudo systemctl daemon-reload
+        fi
+    done
     if [ -f "$HOOK_PATH" ]; then
         sudo rm "$HOOK_PATH"
     fi
@@ -364,7 +387,6 @@ uninstall() {
         sudo rm "$RULE_PATH"
         sudo udevadm control --reload
     fi
-    sudo rm -f "$PENDING"
     [ -f "$INSTALLED" ] && sudo rm "$INSTALLED"
     return 0
 }
@@ -382,22 +404,19 @@ case "${1:-}" in
     auto)
         auto
         ;;
-    defer)
-        defer
-        ;;
-    recheck)
-        recheck "${2:?dgpu recheck: which token (defer passes it)}"
+    probe)
+        probe
         ;;
     install)
         install_all
         sudo "$INSTALLED" auto
-        echo "installed $UNIT_NAME, $HOOK_PATH, $(basename "$RULE_PATH") and $INSTALLED"
+        echo "installed $UNIT_NAME, $RESUME_NAME, $HOOK_PATH, $(basename "$RULE_PATH") and $INSTALLED"
         show
         ;;
     reset)
         find_dgpu >/dev/null && unlock
         uninstall
-        echo "unlocked, removed $UNIT_NAME, $HOOK_PATH, $(basename "$RULE_PATH") and $INSTALLED"
+        echo "unlocked, removed $UNIT_NAME, $RESUME_NAME, $HOOK_PATH, $(basename "$RULE_PATH") and $INSTALLED"
         show
         ;;
     ''|-h|--help)
