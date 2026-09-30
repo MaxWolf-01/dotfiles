@@ -15,7 +15,8 @@ with the memory each one holds, the processes in them. The recorder runs as it d
 short interval, and writes its CSVs under XDG_STATE_HOME; the checks read what it wrote while it runs. It
 picks its sensor set by the host name it reads at `proc/sys/kernel/hostname`.
 
-P6 drives bin/host-recorder-report at a directory of recorder files, once reading it locally and once
+P6 drives bin/host-recorder-report at a directory of recorder files, in the columns a run of
+bin/host-recorder writes and in thermal-log's before it, once reading it locally and once
 through HOST_RECORDER_SSH, a stand-in `ssh` that runs its command here, in a scrubbed environment as a
 login would. Both reads name the same directory. It holds the files only while the stand-in runs a
 command or while the local read runs, so a reader that ignores the host it is asked about answers from
@@ -39,7 +40,7 @@ import tempfile
 import time
 import traceback
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from random import Random
@@ -754,33 +755,50 @@ class Recording:
     at: str
 
 
+CASES = ("a day file that switches columns", "a unit under several managers", "a row a power cut ended")
+COVERED: Counter = Counter()
+"""How many P6 examples asked about a window holding each of CASES, so a run that met one too rarely fails."""
+
+
 @st.composite
 def recordings(draw) -> Recording:
     """How a host's recorder ran: a sample every five seconds, over a few minutes to an hour and a half,
     across midnight at times, in two to four runs with the host down between them. On the laptop the first
     runs may be thermal-log's, the rest the host recorder's. The units its rankings name, a name under one to
-    three managers. And a moment to ask about, among the samples and often near a restart or a power cut."""
-    host = draw(st.sampled_from(["pc", "zephylux"]))
+    three managers. And a moment to ask about, aimed at one of CASES or at any sample."""
+    aim = draw(st.sampled_from([*CASES, "any sample"]))
+    switching, managed, cut = (aim == c for c in CASES)
+    host = "zephylux" if switching else draw(st.sampled_from(["pc", "zephylux"]))
     start = datetime(2026, 9, draw(st.integers(20, 27)), draw(st.sampled_from([0, 7, 13, 23])),  # noqa: DTZ001
                      draw(st.integers(0, 59)), draw(st.integers(0, 59)))  # the recorder stamps local time
     total = draw(st.integers(3, 90)) * 12
     bounds = [0, *sorted(draw(st.lists(st.integers(1, total - 1), min_size=1, max_size=3, unique=True))), total]
     count = len(bounds) - 1
-    old = draw(st.integers(1, count - 1) | st.integers(0, count)) if host == "zephylux" else 0
+    old = 0
+    if switching:
+        old = draw(st.integers(1, count - 1))
+    elif host == "zephylux":
+        old = draw(st.integers(0, count - 1 if managed else count))
     lives = []
     for i, (a, b) in enumerate(itertools.pairwise(bounds)):
         short = st.integers(0, min(24, b - a - 1))
-        down = draw(short | short | st.integers(0, min(240, b - a - 1))) if i else 0
-        lives.append(Run(a + down, b - 1, i >= old, draw(st.booleans())))
+        down = 0 if not i else draw(short if switching and i == old else short | st.integers(0, min(240, b - a - 1)))
+        lives.append(Run(a + down, b - 1, current=i >= old, cut=draw(st.booleans())))
     names = draw(st.lists(st.sampled_from(SERVICES + APPS) | st.uuids().map(lambda u: f"tmux-spawn-{u}.scope"),
                           min_size=1, max_size=6, unique=True))
-    units = [(m, name) for name in names
-             for m in draw(st.lists(st.sampled_from(MANAGERS), min_size=1, max_size=3, unique=True))]
-    switch = [b.first for a, b in itertools.pairwise(lives) if b.current and not a.current]
-    cuts = [r.last for r in lives if r.cut]
-    restart = st.sampled_from(switch or [r.first for r in lives])
-    near = draw(restart | restart | st.sampled_from(cuts or [r.last for r in lives]) | st.integers(0, total - 1))
-    at = start + timedelta(seconds=5 * near + draw(st.integers(-120, 120)))
+    units = [(m, name) for i, name in enumerate(names) for m in draw(
+        st.lists(st.sampled_from(MANAGERS), min_size=2 if managed and not i else 1, max_size=3, unique=True))]
+    if switching:
+        near = lives[old].first
+    elif managed:
+        near = draw(st.integers(lives[-1].first, lives[-1].last))
+    elif cut:
+        k = draw(st.integers(0, count - 1))
+        lives[k] = replace(lives[k], cut=True)
+        near = lives[k].last
+    else:
+        near = draw(st.integers(0, total - 1))
+    at = start + timedelta(seconds=5 * near + draw(st.integers(-60, 120)))
     return Recording(host, start, lives, units, draw(st.integers(0, 2**32)), at.strftime("%Y-%m-%d %H:%M:%S"))
 
 
@@ -789,18 +807,20 @@ class Directory:
     """The recorder's directory as the runs of a Recording leave it."""
 
     lines: dict[str, list[str]] = field(default_factory=dict)
-    open: set[str] = field(default_factory=set)
+    unterminated: set[str] = field(default_factory=set)
     """Files whose last line a power cut left without its newline."""
     rows: list[tuple[str, str, bool]] = field(default_factory=list)
     """Every sample row: its time, its day file, and whether the host recorder wrote it."""
+    ranked: list[tuple[str, str, str]] = field(default_factory=list)
+    """Every ranking row that names its manager: its time, manager and unit."""
 
     def append(self, name: str, header: list[str], row: str) -> None:
         """What either recorder does: a new file starts with its header, and a row written after a power cut
         and no repair joins the cut one."""
         lines = self.lines.setdefault(name, [",".join(header)])
-        if name in self.open:
+        if name in self.unterminated:
             lines[-1] += row
-            self.open.discard(name)
+            self.unterminated.discard(name)
         else:
             lines.append(row)
 
@@ -810,19 +830,20 @@ class Directory:
         if name not in self.lines:
             return
         lines = self.lines[name]
-        if name in self.open:
+        if name in self.unterminated:
             lines[-1] += ",torn"
-            self.open.discard(name)
+            self.unterminated.discard(name)
         if [line for line in lines if line.startswith("time,")][-1] != ",".join(header):
             lines.append(",".join(header))
 
     def cut(self, name: str, rng: Random) -> None:
         line = self.lines[name][-1]
         self.lines[name][-1] = line[: rng.randint(1, len(line) - 1)]
-        self.open.add(name)
+        self.unterminated.add(name)
 
     def files(self) -> dict[str, str]:
-        return {name: "\n".join(lines) + ("" if name in self.open else "\n") for name, lines in self.lines.items()}
+        return {name: "\n".join(lines) + ("" if name in self.unterminated else "\n")
+                for name, lines in self.lines.items()}
 
 
 def directory(recording: Recording) -> Directory:
@@ -851,6 +872,8 @@ def directory(recording: Recording) -> Directory:
             for manager, unit in rng.sample(recording.units, rng.randint(1, len(recording.units))):
                 row = ranking_row(rng, stamp, unit, old=not run.current) | {"manager": manager}
                 d.append(f"{day}.top.csv", top_header, ",".join(row.get(c, "") for c in top_header))
+                if run.current:
+                    d.ranked.append((stamp, manager, unit))
             rest = {k: v for k, v in ranking_row(rng, stamp, "(rest)", old=not run.current).items()
                     if k in ("time", "unit", "cpu_pct", "anon_mb", "shmem_mb", "swap_mb")}
             d.append(f"{day}.top.csv", top_header, ",".join(rest.get(c, "") for c in top_header))
@@ -931,18 +954,13 @@ def answer(s: dict[str, Path], *host: str, at: str) -> dict:
     return out
 
 
-CASES = ("a day file that switches columns", "a unit under several managers", "a row a power cut ended")
-COVERED: Counter = Counter()
-"""How many P6 examples asked about a window holding each of CASES, so a run that met one too rarely fails."""
-
-
 def covered(recording: Recording, d: Directory, local: dict) -> None:
     lo, hi = local.get("from") or "", local.get("to") or ""
     inside = [(name, current) for stamp, name, current in d.rows if lo <= stamp <= hi]
     if any((name, not current) in inside for name, current in inside):
         COVERED[CASES[0]] += 1
-    managers = Counter(h["unit"] for h in local.get("holders", []) if h.get("manager"))
-    if any(n > 1 for n in managers.values()):
+    managers = {(manager, unit) for stamp, manager, unit in d.ranked if lo <= stamp <= hi}
+    if any(n > 1 for n in Counter(unit for _, unit in managers).values()):
         COVERED[CASES[1]] += 1
     ends = [f"{recording.start + timedelta(seconds=5 * r.last):%Y-%m-%d %H:%M:%S}" for r in recording.runs if r.cut]
     if any(lo <= end <= hi for end in ends):
@@ -951,6 +969,7 @@ def covered(recording: Recording, d: Directory, local: dict) -> None:
 
 @prop
 @needs(READER)
+@needs(RECORDER)
 @checked(40)
 @given(recordings())
 def p6(recording):
