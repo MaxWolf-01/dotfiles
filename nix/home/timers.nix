@@ -45,8 +45,8 @@ let
     bash coreutils uv openssh jq
   ]);
 
-  # The activity board shells out to git in every checkout it finds, and finds
-  # them with fd.
+  # The activity board and the commits collector shell out to git in every
+  # checkout they find, and find them with fd.
   activityPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv jq git fd
   ]);
@@ -320,6 +320,29 @@ in
 
   systemd.user.timers.brave-archive = {
     Unit.Description = "Brave archive collection (hourly)";
+    Timer = {
+      OnCalendar = "hourly";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Commits from local git history → the lifelog record ---
+
+  systemd.user.services.git-commits-collect = {
+    Unit.Description = "Record max's new commits from every local checkout";
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${activityPath}" ];
+      ExecStart = "${secrets}/scripts/git-commits-collect --record";
+      # A checkout whose refs have not moved is skipped, so a run takes seconds;
+      # the first, or one after --full, reads every history (about a minute).
+      Nice = 10;
+    };
+  };
+
+  systemd.user.timers.git-commits-collect = {
+    Unit.Description = "Commits collection (hourly)";
     Timer = {
       OnCalendar = "hourly";
       Persistent = true;
