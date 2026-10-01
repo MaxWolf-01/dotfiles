@@ -14,7 +14,7 @@ let
   ]);
 
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh
+    bash coreutils rsync openssh jq # jq: bin/run-log builds its line with it
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
@@ -294,7 +294,7 @@ in
     Service = {
       Type = "oneshot";
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/bin:/bin" ];
-      ExecStart = "${secrets}/scripts/browsing-archive";
+      ExecStart = "${secrets}/scripts/browsing-archive --record";
     };
   };
 
@@ -302,6 +302,26 @@ in
     Unit.Description = "Browsing archive collection (every 30 min)";
     Timer = {
       OnCalendar = "*:00/30";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Brave history → its own archive, before Brave expires it (90 days) ---
+
+  systemd.user.services.brave-archive = {
+    Unit.Description = "Append new Brave visits to the Brave archive";
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${uvScriptPath}" ];
+      ExecStart = "${secrets}/scripts/brave-archive --record";
+    };
+  };
+
+  systemd.user.timers.brave-archive = {
+    Unit.Description = "Brave archive collection (hourly)";
+    Timer = {
+      OnCalendar = "hourly";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
@@ -327,7 +347,7 @@ in
 
   # --- YouTube watch history → browsing archive ---
 
-  systemd.user.services.yt-watch = {
+  systemd.user.services.yt-watch-collect = {
     Unit = {
       Description = "Append YouTube watch history to the browsing archive";
       After = [ "network-online.target" ];
@@ -336,11 +356,11 @@ in
     Service = {
       Type = "oneshot";
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/bin:/bin" ];
-      ExecStart = "${secrets}/scripts/yt-watch-collect";
+      ExecStart = "${secrets}/scripts/yt-watch-collect --record";
     };
   };
 
-  systemd.user.timers.yt-watch = {
+  systemd.user.timers.yt-watch-collect = {
     Unit.Description = "Daily YouTube watch history collection";
     Timer = {
       OnCalendar = "*-*-* 12:30:00";
@@ -456,7 +476,7 @@ in
         "PATH=${syncPath}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${secrets}/scripts/jarvis-sync";
+      ExecStart = "${secrets}/scripts/jarvis-sync --record";
     };
   };
 
