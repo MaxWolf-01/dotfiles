@@ -56,7 +56,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -64,8 +64,7 @@ import tyro
 
 HERE = Path(__file__).resolve().parent
 HOME = Path.home().resolve()
-SERVED = (HOME, Path(tempfile.gettempdir()).resolve())
-"""Where /f/ serves from: every page an agent opens sits in one of these."""
+TEMP = Path(tempfile.gettempdir()).resolve()
 
 TRELLIS = {  # fetched, not committed: its licence asks a sponsorship for commercial use
     "index.js": "239bc6506cdc4b4391a34a091d87fe4dc7ab46a2152f24781bd261621a652220",
@@ -76,8 +75,8 @@ TRELLIS_URL = "https://cdn.jsdelivr.net/npm/@danfessler/trellis@0.3.0/dist/"
 
 @dataclass
 class Args:
-    port: int = 8377
-    """Port to serve on, on 127.0.0.1."""
+    port: int = int(os.environ.get("CONTAINER_HUB_PORT") or 8377)
+    """Port to serve on, on 127.0.0.1; claude-browser looks for the hub on $CONTAINER_HUB_PORT too."""
     state: Path = Path("~/.local/state/container-hub")
     """Directory the hub keeps each container's members and marks in."""
 
@@ -212,6 +211,8 @@ class Page:
     kind: str = "page"
     session: str | None = None
     """The session a session page is of."""
+    payload: dict | None = None
+    """A diffview page on its own server: the data it carries, read once."""
 
 
 def agent_of(directory: Path | None) -> tuple[Path | None, tuple[str, ...]]:
@@ -263,6 +264,7 @@ def read_target(target: str, cwd: str | None, port: int) -> Page:
         page = Page(url=target.split("#")[0])
         # a diffview page on its own server: its file is where its payload says
         if parts.hostname in ("127.0.0.1", "localhost") and (payload := diffview_payload(fetch(target))):
+            page.payload = payload
             if (key := Path(payload.get("key") or "/nonexistent")).is_file():
                 found = page_of_path(key)
                 page.agent, page.slug, page.kind = found.agent, found.slug, found.kind
@@ -301,15 +303,13 @@ def diffview_payload(page: bytes) -> dict | None:
 
 
 def agent_facing(page: Page) -> str | None:
-    """Why a page is for agents and never opens in front of the user (story 7), or None."""
+    """Why a page is for agents and never opens in front of the user, or None."""
     if page.kind == "show" and page.path and page.path.name == "report.md" and page.path.parent.name == page.slug:
         return "a worker's report is for agents"
     if page.path and page.path.suffix == ".html" and page.path.is_file():
         payload = diffview_payload(page.path.read_bytes())
-    elif page.path is None and page.url.startswith("http") and page.agent:
-        payload = diffview_payload(fetch(page.url))
     else:
-        payload = None
+        payload = page.payload
     sources = (payload or {}).get("sources") or []
     files = [(s, f) for s in sources for f in s.get("files") or []]
     if files and all(s.get("kind") == "git" and (Path(s.get("root", "/")) / "tickets").is_dir()
@@ -358,6 +358,17 @@ def place(page: Page, session: str | None, cwd: str | None) -> Placement:
     return Placement("loose", "loose pages")
 
 
+def chosen(name: str, page: Page, cwd: str | None, derived: Placement) -> Placement:
+    """The container a page is put in by name: a ticket of the tracker the page or the opener sits in names
+    that ticket's tree, anything else the container of that key. The page keeps its own ticket."""
+    if name == derived.key:
+        return derived
+    tracker = tracker_at(page.agent) or tracker_at(agent_of(Path(cwd).resolve() if cwd else None)[0])
+    if tracker and name in tracker.tickets:
+        return replace(tree_placement(tracker, name), ticket=derived.ticket)
+    return Placement(name, name, ticket=derived.ticket)
+
+
 # --------------------------------------------------------------------------
 # a container's own state: its members and the user's marks, one file each
 # --------------------------------------------------------------------------
@@ -368,8 +379,26 @@ listeners: dict[str, list[queue.Queue]] = {}
 launched: dict[str, float] = {}
 
 
+def key_path(key: str) -> str:
+    """A container's key as it is spelled in its view's address and its state file's name."""
+    return urllib.parse.quote(key, safe="@.-_")
+
+
 def state_file(key: str) -> Path:
-    return STATE / "containers" / (urllib.parse.quote(key, safe="@.-_") + ".json")
+    return STATE / "containers" / (key_path(key) + ".json")
+
+
+OPENED: set[Path] = set()
+"""Every page an agent opened: what /f/ serves outside an agent directory."""
+
+
+def servable(path: Path) -> bool:
+    """What /f/ serves: the agent directories, the hub's own renders, and a page an agent opened with what
+    sits beside it, though never all of $HOME or the temp dir for a page opened from there. A page the view
+    shows shares the hub's origin, so whatever is served here, every page in the view can read."""
+    if path.is_relative_to(STATE) or agent_of(path)[1]:
+        return True
+    return any(path == f or (f.parent not in (HOME, TEMP, Path("/")) and path.is_relative_to(f.parent)) for f in OPENED)
 
 
 def load(key: str) -> dict | None:
@@ -412,17 +441,21 @@ def title_of(page: Page) -> str:
     return page.path.name
 
 
-def open_page(body: dict, port: int) -> tuple[int, dict]:
+def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
+    """from_page says a page in the view asked, for a link clicked in it: it may open only what it could
+    already read, so no page can widen what /f/ serves."""
     page = read_target(body["target"], body.get("cwd"), port)
     if page.path and not page.path.exists():
         return 404, {"error": f"{page.path} does not exist"}
+    if page.path and from_page and not servable(page.path):
+        return 403, {"error": f"{page.path} is not a page the hub serves"}
     if why := agent_facing(page):
         return 200, {"skipped": why}
     session = body.get("session") or None
     placement = place(page, session, body.get("cwd"))
     # the view names its own container for a link clicked in it, claude-browser --container any other
-    if body.get("container") and body["container"] != placement.key:
-        placement = Placement(body["container"], body["container"], ticket=placement.ticket)
+    if body.get("container"):
+        placement = chosen(body["container"], page, body.get("cwd"), placement)
     mid = member_id(page.url)
     by = body.get("by") or "agent"
     now = time.time()
@@ -441,12 +474,14 @@ def open_page(body: dict, port: int) -> tuple[int, dict]:
             data["members"].append(member)
         member.update(closed=False, at=now, by=by)
         save(data)
+        if page.path:
+            OPENED.add(page.path)
         listening = broadcast(placement.key, {"type": action, "id": mid, "by": by, "group": member["group"]})
         launch = not listening and now - launched.get(placement.key, 0) > 10
         if launch:
             launched[placement.key] = now
     return 200, {"container": placement.key, "id": mid, "action": action, "launch": launch,
-                 "view": "/c/" + urllib.parse.quote(placement.key, safe="@.-_")}
+                 "view": "/c/" + key_path(placement.key)}
 
 
 def mark(key: str, what: str, body: dict) -> tuple[int, dict]:
@@ -577,7 +612,7 @@ def containers() -> list[dict]:
 
 def index_page() -> bytes:
     rows = "".join(
-        f'<li><a href="/c/{urllib.parse.quote(c["key"], safe="@.-_")}">{html_escape(c["name"])}</a>'
+        f'<li><a href="/c/{key_path(c["key"])}">{html_escape(c["name"])}</a>'
         f'<span>{html_escape(c["repo"])}</span><span>{c["groups"]} orchestrator{"s" * (c["groups"] != 1)} · '
         f'{c["pages"]} page{"s" * (c["pages"] != 1)} · {time.strftime("%Y-%m-%d %H:%M", time.localtime(c["last"]))}</span></li>'
         for c in containers())
@@ -722,8 +757,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(302, b"", "text/plain", {"Location": "/f" + urllib.parse.quote(str(page))})
         if path.startswith("/f/"):
             target = Path(urllib.parse.unquote(path.removeprefix("/f"))).resolve()
-            if not any(target.is_relative_to(d) for d in (*SERVED, STATE)):
-                return self.send(403, b"outside $HOME", "text/plain")
+            if not servable(target):
+                return self.send(403, b"not a page the hub serves", "text/plain")
             if not target.exists() and diffview and diffview.is_beside_page(target):
                 return self.send(200, b"null", "application/json")  # nothing saved beside the page yet
             return self.send_file(target)
@@ -761,7 +796,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(refused[0], refused[1], "text/plain")
             raw = self.rfile.read(int(self.headers["Content-Length"]))
             target = Path(path.removeprefix("/f")).resolve()
-            if not any(target.is_relative_to(d) for d in (*SERVED, STATE)) or not diffview.is_state_file(target):
+            if not servable(target) or not diffview.is_state_file(target):
                 return self.send(403, b"forbidden", "text/plain")
             code, body = diffview.write_state(target, raw)
             return self.send(code, body, "application/json" if code == 409 else "text/plain")
@@ -771,7 +806,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
             if path == "/api/open":
-                code, answer = open_page(body, self.port())
+                code, answer = open_page(body, self.port(), from_page=self.headers.get("Origin") is not None)
             elif path in ("/api/close", "/api/seen", "/api/visit"):
                 code, answer = mark(body["container"], path.removeprefix("/api/"), body)
             else:
@@ -803,6 +838,8 @@ def main(args: Args) -> None:
     global STATE
     STATE = args.state.expanduser().resolve()
     STATE.mkdir(parents=True, exist_ok=True)
+    for path in (STATE / "containers").glob("*.json"):
+        OPENED.update(Path(m["path"]) for m in json.loads(path.read_text())["members"] if m.get("path"))
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.daemon_threads = True
     threading.Thread(target=watch_disk, args=(threading.Event(),), daemon=True).start()

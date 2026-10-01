@@ -9,6 +9,9 @@
 # comes from the mx plugin under ~/.claude*/plugins, found by the hub itself,
 # and is a uv script too. diffview, which renders a ticket's recorded ranges,
 # sits beside the hub in bin/.
+#
+# Restart=always, not on-failure: the hub never exits on its own, so any exit,
+# a clean one included, leaves every agent's pages opening as plain tabs.
 { config, pkgs, lib, ... }:
 let
   scriptPath = lib.makeBinPath (with pkgs; [ bash coreutils uv git curl ]);
