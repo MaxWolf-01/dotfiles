@@ -12,6 +12,7 @@
 
   imports = [
     ../brave.nix
+    ../container-hub.nix
     ../desktop.nix
     ../display-layout.nix
     ../dotnet.nix
