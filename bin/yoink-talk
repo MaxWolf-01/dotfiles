@@ -1,0 +1,440 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro>=1.0.14", "numpy"]
+# ///
+"""Yoink a recorded talk from YouTube: its slides, a transcript and notes, as one markdown file.
+
+The talk lands in <output-dir>/<slug>/, the slug made from the video's title:
+
+- <slug>.md: the notes and the transcript, each slide placed where it appeared
+- slides/: one JPEG per slide, named after its number and the time it appeared,
+  and slides.json, every appearance of a slide in order
+- <slug>.m4a: the talk's audio
+- transcript.md, report.html and the rest of what `scribe run` makes (`scribe --help`)
+
+A slide is a stretch of at least two seconds in which the picture holds still.
+A camera inset that keeps moving in one corner, as conference recordings
+carry, is found and ignored, and so is a moving cursor. A slide that is built
+up in steps is saved once, finished, at the time its first step appeared.
+A slide shown again later is referenced again, not saved twice. Video playing
+inside a slide, and stretches with the speaker filling the frame, give no slide.
+
+ElevenLabs Scribe transcribes, through `with-secrets elevenlabs scribe run`,
+which charges by the hour of audio; scribe.log records what each run cost. A second run on the same folder transcribes nothing
+and pays nothing: each step that already has its output is skipped, so it only
+rebuilds <slug>.md. Run it again after `scribe rename` or `scribe regen`.
+
+YouTube refuses some VPN addresses. When the download fails here, it is
+retried on pc, which leaves through the home connection, and copied back.
+
+Examples:
+
+    yoink-talk https://www.youtube.com/watch?v=-9IUXzQN_Sc
+    yoink-talk https://youtu.be/-9IUXzQN_Sc --names "Jeff Clune" --keyterms MAP-Elites POET
+    yoink-talk https://youtu.be/-9IUXzQN_Sc --via pc --keep-video
+"""
+
+import json
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Annotated, Literal
+
+import numpy as np
+import tyro
+
+LIBRARY = Path.home() / "Documents" / "library"
+SCRIBE = Path(__file__).resolve().parent / "scribe"
+REMOTE_HOST = "pc"
+VIDEO_FORMAT = "bv*[height<=1080][vcodec^=avc1]/bv*[height<=1080]"
+"""H.264 first: it decodes several times faster than AV1 or VP9 at the same size."""
+AUDIO_FORMAT = "ba[ext=m4a]/ba"
+
+
+@dataclass
+class Args:
+    url: Annotated[str, tyro.conf.Positional]
+    """The talk's YouTube URL."""
+    output_dir: Path = LIBRARY
+    """Parent directory. The talk lands in <output-dir>/<slug>/."""
+    name: str = ""
+    """Directory and file name to use instead of the slug of the video's title."""
+    names: list[str] = field(default_factory=list)
+    """People likely speaking, spelled right; passed to `scribe run --names`."""
+    keyterms: list[str] = field(default_factory=list)
+    """Words the transcription should expect; passed to `scribe run --keyterms`, which then costs 20% more."""
+    yes: bool = False
+    """Accept Claude's speaker names without asking; passed to `scribe run --yes`."""
+    via: Literal["auto", "here", "pc"] = "auto"
+    """Where to download from. auto tries here, then pc."""
+    keep_video: bool = False
+    """Keep the downloaded video in cache/ once the slides are out of it."""
+
+
+def main() -> None:
+    args = tyro.cli(Args, description=__doc__)
+    meta, where = video_meta(args.url, args.via)
+    folder = args.output_dir.expanduser() / (args.name or slug(meta["title"]))
+    claim(folder, meta)
+    say(f"{meta['title']} ({hms(meta['duration'])}) -> {folder}")
+
+    audio = next((p for p in folder.glob(f"{folder.name}.*") if p.suffix != ".md"), None)
+    if not audio:
+        say("downloading the audio")
+        audio = download(meta, AUDIO_FORMAT, folder, folder.name, where)
+
+    index = folder / "slides" / "slides.json"
+    if not index.exists():
+        video = next(iter((folder / "cache").glob("video.*")), None)
+        if not video:
+            say("downloading the video")
+            video = download(meta, VIDEO_FORMAT, folder / "cache", "video", where)
+        say("finding the slides")
+        write_slides(video, find_slides(video), folder / "slides")
+        if not args.keep_video:
+            video.unlink()
+    shown = json.loads(index.read_text())
+    say(f"{len(shown)} slides shown, {len({s['file'] for s in shown})} distinct")
+
+    say("transcribing")
+    scribe = ["with-secrets", "elevenlabs", str(SCRIBE), "run", str(audio), "--out", str(folder),
+              "--date", f"{meta['upload_date'][:4]}-{meta['upload_date'][4:6]}-{meta['upload_date'][6:]}"]
+    scribe += [*(["--names", *args.names] if args.names else []), *(["--keyterms", *args.keyterms] if args.keyterms else [])]
+    scribe += ["--yes"] if args.yes else []
+    if subprocess.run(scribe, stdout=subprocess.DEVNULL).returncode:
+        die(f"scribe failed; its message is above, and {folder / 'scribe.log'} has the details. "
+            "Run yoink-talk again once it is fixed: the download and the slides are kept.")
+
+    md = folder / f"{folder.name}.md"
+    md.write_text(talk_markdown(folder, meta, shown))
+    print(folder)
+
+
+# ---------------------------------------------------------------- the video
+
+
+def video_meta(url: str, via: str) -> tuple[dict, str]:
+    """The video's title, upload date, duration, channel and canonical URL, and the host YouTube
+    answered on: here, unless via says pc or YouTube refuses this machine."""
+    cmd = ["yt-dlp", "-J", "--no-warnings", url]
+    if via != "pc":
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            return pick_meta(r.stdout), "here"
+        why = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"yt-dlp exited {r.returncode}"
+        if via == "here":
+            die(f"reading the video's details failed: {why}")
+        say(f"YouTube refused this machine ({why}); downloading on {REMOTE_HOST}")
+    return pick_meta(run(["ssh", REMOTE_HOST, shlex.join(cmd)], f"reading the video's details on {REMOTE_HOST}")), REMOTE_HOST
+
+
+def pick_meta(info: str) -> dict:
+    data = json.loads(info)
+    return {k: data.get(k) or "" for k in ("id", "title", "upload_date", "duration", "channel", "webpage_url")}
+
+
+def claim(folder: Path, meta: dict) -> None:
+    """The folder belongs to this video from now on; one holding another video is refused."""
+    record = folder / "cache" / "talk.json"
+    if record.exists():
+        other = json.loads(record.read_text())
+        if other["id"] != meta["id"]:
+            die(f"{folder} holds another talk, {other['webpage_url']}. Pick another --name.")
+    elif folder.exists() and any(folder.iterdir()):
+        die(f"{folder} exists and is not a yoink-talk folder. Pick another --name.")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+
+
+def download(meta: dict, fmt: str, into: Path, stem: str, where: str) -> Path:
+    """One stream of the video, saved as into/stem.<ext>; downloaded on `where` and copied here."""
+    into.mkdir(parents=True, exist_ok=True)
+    cmd = ["yt-dlp", "-q", "--no-warnings", "--no-simulate", "--print", "after_move:filepath", "-f", fmt]
+    if where == "here":
+        out = run([*cmd, "-o", f"{into / stem}.%(ext)s", meta["webpage_url"]], f"downloading {fmt}")
+        return Path(out.strip().splitlines()[-1])
+    remote_dir = f"/var/tmp/yoink-talk-{meta['id']}"
+    out = run(["ssh", where, shlex.join([*cmd, "-o", f"{remote_dir}/{stem}.%(ext)s", meta["webpage_url"]])],
+              f"downloading {fmt} on {where}")
+    remote = out.strip().splitlines()[-1]
+    local = into / Path(remote).name
+    run(["scp", "-q", f"{where}:{remote}", str(local)], f"copying {local.name} from {where}")
+    run(["ssh", where, shlex.join(["rm", "-r", remote_dir])], f"removing {remote_dir} on {where}")
+    return local
+
+
+# ---------------------------------------------------------------- slides
+
+FPS = 2
+"""Frames a second compared; a slide shown for less than HOLD frames of these is missed."""
+WIDTH = 320
+"""Frames are compared at this width, which keeps a cursor to a few pixels."""
+CELL = 10
+"""Pixels per side of the squares the inset is located by."""
+NOISE = 20
+"""A pixel has changed when its grey level moves by more than this; less is compression noise."""
+STILL = 0.002
+"""A frame holds still when less than this share of the pixels outside the inset changed."""
+HOLD = 4
+"""Frames a picture must hold still to count as a slide."""
+SAME = 0.01
+"""Two pictures are the same slide when less than this share of their pixels differ."""
+INSET = 0.03
+"""A square belongs to the inset when it changes in more than this share of the frames in which only a few squares change."""
+BUILD_AREA = 0.25
+"""A step of a build changes less than this share of the frame."""
+
+
+def find_slides(video: Path) -> list[dict]:
+    """Every appearance of a slide: when it appeared (s), the time of the frame that shows it whole
+    (frame_s), and for a slide shown before, the index of its first appearance (again)."""
+    frames = decode(video)
+    keep = ~inset_mask(frames)
+    if not keep.any():
+        return []
+    area = keep.sum()
+
+    def share(a: np.ndarray, b: np.ndarray) -> float:
+        return float(((np.abs(a.astype(np.int16) - b) > NOISE) & keep).sum() / area)
+
+    moved = np.ones(len(frames))
+    for i in range(1, len(frames)):
+        moved[i] = share(frames[i], frames[i - 1])
+
+    # a slide: a run of still frames; it appeared with the frame before the run, which changed
+    runs, i = [], 0
+    while i < len(frames):
+        if moved[i] < STILL:
+            j = i
+            while j + 1 < len(frames) and moved[j + 1] < STILL:
+                j += 1
+            if j - i + 2 >= HOLD:
+                runs.append([max(i - 1, 0), j])
+            i = j + 1
+        else:
+            i += 1
+
+    # a run broken only by something passing through, such as a cursor, is one slide
+    merged: list[list[int]] = []
+    for r in runs:
+        if merged and share(frames[merged[-1][1]], frames[r[1]]) < SAME:
+            merged[-1][1] = r[1]
+        else:
+            merged.append(r)
+
+    slides: list[list[int]] = []
+    for k, (start, end) in enumerate(merged):
+        nxt = merged[k + 1] if k + 1 < len(merged) else None
+        if nxt and nxt[0] - end <= HOLD and is_build_step(frames[end], frames[nxt[1]], keep):
+            nxt[0] = start
+            continue
+        slides.append([start, end])
+
+    shown: list[dict] = []
+    for start, end in slides:
+        first = next((k for k, s in enumerate(shown) if s["again"] is None and share(frames[s["end"]], frames[end]) < SAME), None)
+        shown.append({"s": start / FPS, "frame_s": end / FPS, "end": end, "again": first})
+    return shown
+
+
+def decode(video: Path) -> np.ndarray:
+    """Grey frames, FPS a second, WIDTH wide; the height is rounded to whole CELLs."""
+    probe = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                 "-of", "csv=p=0", str(video)], "reading the video's size")
+    w, h = map(int, probe.strip().split(","))
+    height = max(CELL, round(WIDTH * h / w / CELL) * CELL)
+    proc = subprocess.run(["ffmpeg", "-v", "error", "-threads", "4", "-i", str(video),
+                           "-vf", f"fps={FPS},scale={WIDTH}:{height},format=gray", "-f", "rawvideo", "-"],
+                          capture_output=True)
+    if proc.returncode:
+        die(f"decoding {video} failed (ffmpeg exited {proc.returncode}): {proc.stderr.decode()[-800:]}")
+    return np.frombuffer(proc.stdout, np.uint8).reshape(-1, height, WIDTH)
+
+
+def inset_mask(frames: np.ndarray) -> np.ndarray:
+    """The pixels of a camera inset or anything else that keeps moving while the slide holds still.
+
+    Found in squares of CELL pixels: those that change again and again in frames
+    where only a few squares change, so that a new slide, which changes many, does not count.
+    Grown by one square on each side, to cover the inset's edge."""
+    n, h, w = len(frames) - 1, frames.shape[1] // CELL, frames.shape[2] // CELL
+    hits, lone = np.zeros((h, w)), 0
+    for i in range(n):
+        d = np.abs(frames[i + 1].astype(np.int16) - frames[i]) > NOISE
+        cells = d.reshape(h, CELL, w, CELL).mean((1, 3)) > 0.02
+        if 1 <= cells.sum() <= 6:
+            hits += cells
+            lone += 1
+    hot = hits / max(lone, 1) > INSET
+    grown = hot.copy()
+    grown[1:] |= hot[:-1]
+    grown[:-1] |= hot[1:]
+    hot = grown.copy()
+    hot[:, 1:] |= grown[:, :-1]
+    hot[:, :-1] |= grown[:, 1:]
+    return np.kron(hot, np.ones((CELL, CELL), bool))
+
+
+def is_build_step(a: np.ndarray, b: np.ndarray, keep: np.ndarray) -> bool:
+    """b adds to a without taking anything away: the change is small, falls on empty parts of a,
+    and leaves a's text and drawings where they were. Empty parts are those without detail
+    around them, a black page or the white inside a plot alike."""
+    a16 = a.astype(np.int16)
+    m = (np.abs(a16 - b) > NOISE) & keep
+    if m.sum() / keep.sum() >= BUILD_AREA:
+        return False
+    if not m.any():
+        return True
+    detail = local_std(a16) >= 6
+    return (~detail[m]).mean() > 0.85 and m[detail & keep].mean() < 0.03
+
+
+def local_std(a: np.ndarray, r: int = 3) -> np.ndarray:
+    """Each pixel's standard deviation over the square of side 2r+1 around it."""
+
+    def mean(x: np.ndarray) -> np.ndarray:
+        s = np.pad(np.pad(x.astype(np.float64), r, mode="edge").cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+        k = 2 * r + 1
+        return (s[k:, k:] - s[:-k, k:] - s[k:, :-k] + s[:-k, :-k]) / (k * k)
+
+    return np.sqrt(np.maximum(mean(a * a) - mean(a) ** 2, 0))
+
+
+def write_slides(video: Path, shown: list[dict], into: Path) -> None:
+    """Each distinct slide as a full-size JPEG, and slides.json listing every appearance.
+    A slide shown again points at the file saved the first time."""
+    into.mkdir(parents=True, exist_ok=True)
+    files: list[str] = []
+    saved = 0
+    for s in shown:
+        if s["again"] is not None:
+            files.append(files[s["again"]])
+            continue
+        saved += 1
+        name = f"{saved:03}-{hms(s['s']).replace(':', '-')}.jpg"
+        run(["ffmpeg", "-v", "error", "-y", "-ss", f"{s['frame_s']:.2f}", "-i", str(video), "-frames:v", "1", "-q:v", "2",
+             str(into / name)], f"saving slide {name}")
+        files.append(name)
+    index = [{"s": s["s"], "file": f} for s, f in zip(shown, files)]
+    (into / "slides.json").write_text(json.dumps(index, indent=1))
+
+
+# ---------------------------------------------------------------- the markdown
+
+PARAGRAPH = 45.0
+"""Seconds: a paragraph of one speaker ends at the first sentence end after this long."""
+LATE = 15.0
+"""Seconds a slide or chapter may wait for a sentence to end before the paragraph is cut for it."""
+SENTENCE_END = re.compile(r"[.?!][\"')\]]*$")
+
+
+def talk_markdown(folder: Path, meta: dict, shown: list[dict]) -> str:
+    """The notes scribe wrote, then the transcript in paragraphs with the slides and chapters between them."""
+    conv = json.loads((folder / "conversation.json").read_text())
+    names = {sp["id"]: sp["name"] for sp in conv["speakers"]}
+    starts = {t["id"]: t["s"] for t in conv["turns"]}
+    an_path = folder / "analysis.json"
+    chapters = json.loads(an_path.read_text())["chapters"] if an_path.exists() else []
+
+    markers = sorted(
+        [(starts[c["start_turn"]], 0, f"### {c['title']} [{hms(starts[c['start_turn']])}]")
+         for c in chapters if c["start_turn"] in starts]
+        + [(s["s"], 1, f"![{hms(s['s'])}](slides/{s['file']})") for s in shown]
+    )
+    out: list[str] = []
+    para: list[str] = []
+    head: dict = {"s": 0.0, "spk": None}
+    last_spk = None
+
+    def flush() -> None:
+        nonlocal last_spk
+        if para:
+            who = f"**{names[head['spk']]}:** " if head["spk"] != last_spk else ""
+            out.append(f"[{hms(head['s'])}] {who}{''.join(para).strip()}")
+            last_spk = head["spk"]
+            para.clear()
+
+    for w in conv["words"]:
+        ended = bool(para) and bool(SENTENCE_END.search(para[-1]))
+        due = [m for m in markers if m[0] <= w["s"]]
+        if due and (not para or ended or w["s"] - due[0][0] > LATE):
+            flush()
+            out += [m[2] for m in due]
+            markers = markers[len(due):]
+        if para and (w["spk"] != head["spk"] or (ended and w["s"] - head["s"] > PARAGRAPH)):
+            flush()
+        if not para:
+            head = {"s": w["s"], "spk": w["spk"]}
+        para.append(w["w"])
+    flush()
+    out += [m[2] for m in markers]
+
+    speakers = [sp["name"] for sp in conv["speakers"] if sp["kind"] == "person"]
+    up = meta["upload_date"]
+    front = [
+        "---",
+        f"title: {json.dumps(meta['title'], ensure_ascii=False)}",
+        f"source: {meta['webpage_url']}",
+        f"channel: {json.dumps(meta['channel'], ensure_ascii=False)}",
+        f"date: {up[:4]}-{up[4:6]}-{up[6:]}",
+        f'duration: "{hms(meta["duration"])}"',
+        f"speakers: [{', '.join(speakers)}]",
+        f"transcription: {conv['meta']['transcription']}",
+        f"slides: {len({s['file'] for s in shown})}",
+        "---",
+        "",
+        f"# {meta['title']}",
+        "",
+    ]
+    return "\n".join(front + scribe_notes(folder) + ["## Transcript", ""] + [x + "\n" for x in out]).rstrip() + "\n"
+
+
+def scribe_notes(folder: Path) -> list[str]:
+    """The notes from scribe's transcript.md: everything between its title and its statistics."""
+    lines = (folder / "transcript.md").read_text().splitlines()
+    begin = next((i + 1 for i, x in enumerate(lines) if x.startswith("# ")), 0)
+    end = next((i for i, x in enumerate(lines) if x in ("## Statistics", "## Transcript")), len(lines))
+    notes = lines[begin:end]
+    return notes + ["", "Statistics and the plain transcript: [transcript.md](transcript.md); "
+                    "the transcript with a player: [report.html](report.html).", ""]
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def run(cmd: list[str], what: str) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        die(f"{what} failed: {cmd[0]} is not on PATH.")
+    if r.returncode:
+        die(f"{what} failed ({cmd[0]} exited {r.returncode}): {r.stderr.strip()[-800:]}")
+    return r.stdout
+
+
+def say(text: str) -> None:
+    print(text, file=sys.stderr, flush=True)
+
+
+def die(text: str):
+    sys.exit(f"yoink-talk: {text}")
+
+
+def hms(t: float) -> str:
+    """Seconds as m:ss or h:mm:ss, rounded down as a player's clock is."""
+    t = int(t)
+    h, m, s = t // 3600, t % 3600 // 60, t % 60
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+def slug(text: str) -> str:
+    return "-".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split()) or "talk"
+
+
+if __name__ == "__main__":
+    main()
