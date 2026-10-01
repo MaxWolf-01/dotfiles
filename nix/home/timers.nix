@@ -56,6 +56,13 @@ let
     bash coreutils isync notmuch sops jq
   ]);
 
+  # bin/officebuddy-invoice is a uv script reading the mail with notmuch and the
+  # PDF with pdftotext; bin/alert-send sends with curl, its token from sops, and
+  # sed escapes the HTML body; jq for bin/run-log.
+  invoicePath = lib.makeBinPath (with pkgs; [
+    bash coreutils gnused uv notmuch poppler-utils curl sops jq
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -407,6 +414,36 @@ in
     Timer = {
       OnCalendar = "*:07/15";
       Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Officebuddy invoices → a scan-to-pay mail each ---
+  # Reads the mirror's copy (above); what it mails and when: bin/officebuddy-invoice.
+  # Daily is plenty against a 14-day payment term.
+
+  systemd.user.services.officebuddy-invoice = {
+    Unit = {
+      Description = "Mail a scan-to-pay QR code for each new Officebuddy invoice";
+      After = [ "proton-mail-mirror.service" "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${invoicePath}:/usr/bin:/bin" ];
+      ExecStart = "${dotfiles}/bin/officebuddy-invoice";
+      # oneshot has no start timeout of its own; a hung run would make every
+      # later firing a silent no-op.
+      TimeoutStartSec = "15m";
+    };
+  };
+
+  systemd.user.timers.officebuddy-invoice = {
+    Unit.Description = "Daily Officebuddy invoice check";
+    Timer = {
+      OnCalendar = "*-*-* 10:20:00";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
