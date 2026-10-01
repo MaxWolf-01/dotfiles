@@ -49,7 +49,7 @@ let
   # Saves in tmux-resurrect's format, for its restore; tmux-save.sh says why it
   # replaces resurrect's own save. Tested by tests/tmux-save.test.
   tmuxSave = pkgs.writeShellScript "tmux-save" ''
-    PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.procps pkgs.diffutils pkgs.gnutar pkgs.gzip ]}
+    PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.procps pkgs.diffutils pkgs.gnused pkgs.gnutar pkgs.gzip ]}
     exec ${pkgs.bash}/bin/bash ${./tmux-save.sh} ${tmux} "$HOME/.tmux/resurrect"
   '';
 in
