@@ -1,0 +1,693 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["hypothesis"]
+# ///
+"""Check the properties of work containers (the dotfiles ticket work-containers). Run it directly; no framework.
+
+P1, P2 and P6 are checked at the container hub's HTTP seam, P3 at claude-browser's, P4 at the address
+`diffview --open` prints and the hub behind it. P5, links and keys inside a page, is reviewed in a browser.
+
+Every check starts its own bin/container-hub on a free port, never 8377, with HOME and the hub's state in
+a scratch directory, so a hub already running on this machine is never touched; claude-browser and diffview
+find it through $CONTAINER_HUB_PORT. Which container a page went to is read from the hub's answer: the key
+is the hub's to choose.
+
+Hypothesis draws whole worlds: one or two repos, each with an agent repo of ticket trees, every ticket
+committed by one of a few sessions (a `Session:` trailer), pages under the tickets' show, prototype and
+diffview paths, and loose pages under no ticket. Then what the sessions do: open those pages, several times,
+by different sessions and by different spellings of the same file, close them and mark them seen.
+
+A property marked as an expected failure is not meant to hold yet. Until the ticket it names lands, the hub
+answers 501 on every route, so it may fail in any way; the run fails the moment it holds, and the ticket that
+makes it hold deletes the mark.
+
+Examples:
+
+    tests/properties/work-containers.test
+    tests/properties/work-containers.test P1 P3
+"""
+
+import atexit
+import contextlib
+import itertools
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+from hypothesis import HealthCheck, Phase, given, settings
+from hypothesis import strategies as st
+from hypothesis.database import DirectoryBasedExampleDatabase
+
+BIN = Path(__file__).resolve().parents[2] / "bin"
+SCRATCH = Path(tempfile.mkdtemp(prefix="work-containers-test."))
+LIVE_HUB_PORT = 8377
+"""The port of the hub this machine runs, which no check may touch."""
+
+PROPERTIES = []
+
+
+def prop(fn):
+    PROPERTIES.append(fn)
+    return fn
+
+
+def expected_failure(ticket: str):
+    """Mark a property that holds only once `ticket` lands. Until then the hub is a stub, so any failure counts."""
+
+    def mark(fn):
+        fn.expected = ticket
+        return fn
+
+    return mark
+
+
+def checked(examples: int, shrink: bool = True):
+    """Hypothesis settings. A property that restarts the hub in every example does not shrink: each attempt
+    would cost a restart."""
+    phases = [Phase.explicit, Phase.reuse, Phase.generate] + ([Phase.target, Phase.shrink] if shrink else [])
+    return settings(
+        max_examples=examples,
+        deadline=None,
+        phases=phases,
+        report_multiple_bugs=False,
+        database=DirectoryBasedExampleDatabase(Path(__file__).resolve().parent / ".hypothesis"),
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+    )
+
+
+# --------------------------------------------------------------------------
+# the world: repos, ticket trees, sessions and pages, on disk
+# --------------------------------------------------------------------------
+
+SLUGS = ["map-columns", "csv-import", "one-flow", "board-orients", "sync-state", "drop-zone"]
+"""Few enough that two repos often hold the same slug."""
+
+PAGE_KINDS = [
+    "agent/show/{slug}/index.html",
+    "agent/show/{slug}/figure.svg",
+    "agent/prototypes/{slug}/index.html",
+    "agent/diffviews/{slug}.html",
+]
+
+SPELLINGS = ["path", "file-url", "dotted", "symlink", "served"]
+"""How an opener names a page: its path, a file:// URL, a path through `/./`, a path through a symlinked
+directory, or the address the hub serves it at (a link followed inside a page)."""
+
+WORLDS = itertools.count()
+
+
+@dataclass(frozen=True)
+class Ticket:
+    repo: str
+    slug: str
+    parent: str | None
+    session: int
+    """Which of the world's sessions committed it."""
+
+
+@dataclass(frozen=True)
+class World:
+    tickets: tuple[Ticket, ...]
+    pages: tuple[str, ...]
+    """Paths relative to the world's directory; loose pages sit outside every repo."""
+    sessions: int
+
+
+@st.composite
+def worlds(draw) -> World:
+    sessions = draw(st.integers(1, 3))
+    tickets = []
+    for repo in draw(st.lists(st.sampled_from(["alpha", "beta"]), min_size=1, max_size=2, unique=True)):
+        slugs = draw(st.lists(st.sampled_from(SLUGS), min_size=1, max_size=4, unique=True))
+        for i, slug in enumerate(slugs):
+            parent = draw(st.sampled_from([None, *slugs[:i]])) if i else None
+            tickets.append(Ticket(repo, slug, parent, draw(st.integers(0, sessions - 1))))
+    pages = [f"repos/{t.repo}/" + kind.format(slug=t.slug)
+             for t in tickets for kind in draw(st.lists(st.sampled_from(PAGE_KINDS), max_size=2, unique=True))]
+    pages += [f"scratch/note-{i}.html" for i in range(draw(st.integers(0, 2)))]
+    if not pages:
+        pages.append(f"repos/{tickets[0].repo}/" + PAGE_KINDS[0].format(slug=tickets[0].slug))
+    return World(tuple(tickets), tuple(pages), sessions)
+
+
+@dataclass
+class Placed:
+    """A world written under a directory of its own, with session ids no other world uses."""
+
+    world: World
+    root: Path
+    sessions: list[str]
+
+    def page(self, i: int) -> Path:
+        return self.root / self.world.pages[i]
+
+
+def git(cwd: Path, *args: str, env: dict | None = None) -> None:
+    subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", *args],
+                   cwd=cwd, env=env or base_env(SCRATCH), check=True, capture_output=True)
+
+
+TICKET = """---
+status: {status}
+{parent}priority: 2
+size: S
+---
+
+# {title}
+
+## Brief
+
+{brief}
+
+## Acceptance criteria
+
+## Comments
+"""
+
+
+def place(world: World, home: Path) -> Placed:
+    n = next(WORLDS)
+    root = home / f"world-{n}"
+    sessions = [f"{n:08x}-0000-4000-8000-{s:012x}" for s in range(world.sessions)]
+    for repo in sorted({t.repo for t in world.tickets}):
+        code = root / "repos" / repo
+        (code / "agent" / "tickets").mkdir(parents=True)
+        git(code, "init", "-q")
+        (code / ".git" / "info" / "exclude").write_text("agent/\n")
+        (code / "README.md").write_text(f"{repo}\n")
+        git(code, "add", "README.md")
+        git(code, "commit", "-q", "-m", "init")
+        agent = code / "agent"
+        git(agent, "init", "-q")
+        for i, t in enumerate(x for x in world.tickets if x.repo == repo):
+            (agent / "tickets" / f"{t.slug}.md").write_text(TICKET.format(
+                status="claimed" if t.parent else "open", parent=f"parent: {t.parent}\n" if t.parent else "",
+                title=t.slug.replace("-", " ").capitalize(), brief=f"The {t.slug} ticket of {repo}."))
+            stamp = f"2026-10-01T10:{i:02d}:00+00:00"
+            env = {**base_env(SCRATCH), "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+            git(agent, "add", f"tickets/{t.slug}.md", env=env)
+            git(agent, "commit", "-q", "-m", f"file {t.slug}\n\nSession: {sessions[t.session]}", env=env)
+    for rel in world.pages:
+        page = root / rel
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(f"<!doctype html><title>{rel}</title><p>{rel}</p>\n" if page.suffix == ".html"
+                        else f'<svg xmlns="http://www.w3.org/2000/svg"><title>{rel}</title></svg>\n')
+    (root / "link").symlink_to(root, target_is_directory=True)
+    return Placed(world, root, sessions)
+
+
+# --------------------------------------------------------------------------
+# processes: the hub, and the environment everything under test runs in
+# --------------------------------------------------------------------------
+
+UV_DIRS = {
+    "UV_CACHE_DIR": subprocess.run(["uv", "cache", "dir"], capture_output=True, text=True, check=True).stdout.strip(),
+    "UV_PYTHON_INSTALL_DIR": subprocess.run(["uv", "python", "dir"], capture_output=True, text=True, check=True).stdout.strip(),
+}
+"""uv's own directories, which would otherwise move into the scratch HOME and fetch everything again."""
+
+
+def base_env(home: Path, **extra: str) -> dict[str, str]:
+    """This environment with HOME moved, no session of its own, and no git or XDG configuration of the
+    user's: a global commit hook would stamp the fixture's commits with this run's session."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("CLAUDE", "GIT_", "XDG_CONFIG", "XDG_DATA", "XDG_STATE", "XDG_CACHE", "CONTAINER_HUB"))}
+    env.update({k: v for k, v in UV_DIRS.items() if v}, HOME=str(home), PATH=f"{BIN}:{os.environ['PATH']}",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    env.update(extra)
+    return env
+
+
+def free_port() -> int:
+    while True:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port != LIVE_HUB_PORT:
+            return port
+
+
+class HubError(Exception):
+    pass
+
+
+class Hub:
+    """bin/container-hub on a port of its own, its HOME and state in a scratch directory."""
+
+    def __init__(self):
+        self.home = Path(tempfile.mkdtemp(prefix="hub-home.", dir=SCRATCH))
+        self.state = self.home / ".local" / "state" / "container-hub"
+        self.port = free_port()
+        self.origin = f"http://127.0.0.1:{self.port}"
+        self.log = self.home / "hub.log"
+        self.proc: subprocess.Popen | None = None
+
+    def start(self) -> "Hub":
+        with self.log.open("a") as log:
+            self.proc = subprocess.Popen(
+                [BIN / "container-hub", "--port", str(self.port), "--state", str(self.state)],
+                env=base_env(self.home), cwd=self.home, stdout=log, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, start_new_session=True)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise HubError(f"the hub exited with {self.proc.returncode} on start:\n{self.log.read_text()}")
+            with contextlib.suppress(OSError), socket.create_connection(("127.0.0.1", self.port), timeout=1):
+                return self
+            time.sleep(0.1)
+        raise HubError(f"the hub did not answer on port {self.port} within 60 s:\n{self.log.read_text()}")
+
+    def kill(self) -> None:
+        """SIGKILL, so what survives is what the hub had written by the time it answered."""
+        if not self.proc:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        self.proc.wait()
+        # `uv run` is only the group's leader: the server is its child, and holds the port until it is reaped
+        deadline = time.monotonic() + 10
+        with contextlib.suppress(ProcessLookupError):
+            while time.monotonic() < deadline:
+                os.killpg(self.proc.pid, 0)
+                time.sleep(0.05)
+            raise HubError(f"the hub's processes outlived a SIGKILL by 10 s (group {self.proc.pid})")
+        self.proc = None
+
+    def restart(self) -> None:
+        self.kill()
+        self.start()
+
+    def request(self, method: str, url: str, body: bytes | None = None,
+                headers: dict | None = None) -> tuple[int, bytes, str]:
+        """Status, body and the URL answered at, after redirects."""
+        req = urllib.request.Request(urllib.parse.urljoin(self.origin, url), data=body, method=method,
+                                     headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.read(), r.url
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), e.url
+
+    def api(self, method: str, path: str, body: dict | None = None):
+        data = None if body is None else json.dumps(body).encode()
+        status, raw, _ = self.request(method, path, data, {"Content-Type": "application/json"} if data else None)
+        if not 200 <= status < 300:
+            raise HubError(f"{method} {path} answered {status}: {raw[:300]!r}, to {json.dumps(body) if body else 'no body'}")
+        return json.loads(raw) if raw else None
+
+    def open(self, target: str, session: str) -> tuple[str, str]:
+        """The container the page went to, and its member id there."""
+        answer = self.api("POST", "/api/open", {"target": target, "session": session})
+        return answer["container"], answer["id"]
+
+    def container(self, key: str) -> dict:
+        return self.api("GET", "/api/c/" + urllib.parse.quote(key, safe=""))
+
+
+HUBS: list[Hub] = []
+
+
+def shared_hub() -> Hub:
+    """One hub for every example of the property running now; main() stops it after the property."""
+    if not HUBS:
+        HUBS.append(Hub().start())
+    return HUBS[0]
+
+
+def stop_hubs() -> None:
+    for hub in HUBS:
+        hub.kill()
+    HUBS.clear()
+
+
+def spell(placed: Placed, i: int, how: str, hub: Hub, member_url: str | None) -> str:
+    page = placed.page(i)
+    if how == "file-url":
+        return "file://" + urllib.parse.quote(str(page))
+    if how == "dotted":
+        return f"{page.parent}/./{page.name}"
+    if how == "symlink":
+        return str(placed.root / "link" / page.relative_to(placed.root))
+    if how == "served" and member_url:
+        return urllib.parse.urljoin(hub.origin, member_url)
+    return str(page)
+
+
+def member(view: dict, member_id: str) -> dict | None:
+    return next((m for m in view["members"] if m["id"] == member_id), None)
+
+
+def listing(view: dict) -> str:
+    return "\n".join(f"        {m['id']}  {m['url']}{'  (closed)' if m.get('closed') else ''}" for m in view["members"])
+
+
+# --------------------------------------------------------------------------
+# P1: no second copy
+# --------------------------------------------------------------------------
+
+STEP = st.tuples(st.sampled_from(["open", "open", "open", "close"]), st.integers(0, 7),
+                 st.sampled_from(SPELLINGS), st.integers(0, 2))
+
+
+@prop
+@expected_failure("pages-open-into-containers")
+@checked(25)
+@given(worlds(), st.lists(STEP, min_size=1, max_size=12))
+def p1(world, steps):
+    """P1 Opening a page never produces a second copy of a page the container already holds.
+
+    Whatever spelling the opener uses and whichever session opens it, a container holds one member per page
+    opened into it: the first open adds one, every later one leaves the count as it was. A closed page is
+    still held, so opening it again adds nothing either."""
+    hub = shared_hub()
+    placed = place(world, hub.home)
+    into: dict[str, set[int]] = {}
+    last: dict[int, tuple[str, str]] = {}
+    done = []
+    for op, i, how, s in steps:
+        i, session = i % len(world.pages), placed.sessions[s % world.sessions]
+        if op == "close":
+            if i not in last:
+                continue
+            key, mid = last[i]
+            hub.api("POST", "/api/close", {"container": key, "id": mid})
+            done.append(f"close {world.pages[i]} in {key}")
+        else:
+            url = member(hub.container(last[i][0]), last[i][1])["url"] if how == "served" and i in last else None
+            target = spell(placed, i, how, hub, url)
+            key, mid = hub.open(target, session)
+            last[i] = (key, mid)
+            into.setdefault(key, set()).add(i)
+            done.append(f"open {target} as session {s} -> {key} {mid}")
+        view = hub.container(key)
+        assert len(view["members"]) == len(into[key]), (
+            f"container {key} holds {len(view['members'])} members after these steps, but only "
+            f"{len(into[key])} distinct pages were opened into it:\n      " + "\n      ".join(done)
+            + f"\n      its members:\n{listing(view)}")
+
+
+# --------------------------------------------------------------------------
+# P2: survives a restart
+# --------------------------------------------------------------------------
+
+MARK = st.tuples(st.sampled_from(["close", "seen", "unseen"]), st.integers(0, 7))
+
+
+@prop
+@expected_failure("pages-open-into-containers")
+@checked(8, shrink=False)
+@given(worlds(), st.lists(st.integers(0, 2), min_size=1, max_size=8), st.lists(MARK, max_size=8))
+def p2(world, openers, marks):
+    """P2 A container's pages, and their closed and seen marks, survive a hub restart.
+
+    The hub is killed (SIGKILL) once the container has answered with every page opened, closed and marked;
+    after it starts again each container answers the same members, the same closed members and the same
+    seen pages."""
+    hub = shared_hub()
+    placed = place(world, hub.home)
+    ids: dict[int, tuple[str, str]] = {}
+    for i in range(len(world.pages)):
+        ids[i] = hub.open(spell(placed, i, "path", hub, None), placed.sessions[openers[i % len(openers)] % world.sessions])
+    closed, seen = set(), {}
+    for op, i in marks:
+        key, mid = ids[i % len(world.pages)]
+        if op == "close":
+            hub.api("POST", "/api/close", {"container": key, "id": mid})
+            closed.add(mid)
+        else:
+            url = member(hub.container(key), mid)["url"]
+            hub.api("POST", "/api/seen", {"container": key, "url": url, "seen": op == "seen", "why": "tick"})
+            seen[(key, url)] = op == "seen"
+    before = {key: snapshot(hub.container(key)) for key, _ in ids.values()}
+    for key, mid in ids.values():
+        members, _ = before[key]
+        assert mid in {m[0] for m in members}, f"{mid} is not a member of {key} before the restart: {members}"
+        shut = mid in {m[0] for m in members if m[2]}
+        assert shut == (mid in closed), f"{mid} in {key} should{'' if mid in closed else ' not'} be closed before the restart"
+    for (key, url), is_seen in seen.items():
+        assert (url in before[key][1]) == is_seen, f"{url} in {key} should{'' if is_seen else ' not'} be seen before the restart"
+    hub.restart()
+    for key, was in before.items():
+        now = snapshot(hub.container(key))
+        assert now == was, f"container {key} changed across the restart:\n      before {was}\n      after  {now}"
+
+
+def snapshot(view: dict) -> tuple[frozenset, frozenset]:
+    """A container's members, as (id, url, closed), and the pages marked seen."""
+    return (frozenset((m["id"], m["url"], bool(m.get("closed"))) for m in view["members"]),
+            frozenset(view.get("seen") or ()))
+
+
+# --------------------------------------------------------------------------
+# P3: no hub, a plain tab
+# --------------------------------------------------------------------------
+
+BRAVE = """#!/bin/sh
+printf '%s\\n' "$@" > "$RECORD.tmp" && mv "$RECORD.tmp" "$RECORD"
+"""
+
+SYSTEMD_RUN = """#!/bin/sh
+# drop systemd-run's own options, run the command they wrap
+while [ "${1#--}" != "$1" ]; do shift; done
+exec "$@"
+"""
+
+
+@contextlib.contextmanager
+def no_hub(how: str):
+    """A port with no hub on it: nothing listening, a socket that never answers, or a server that is not one."""
+    if how == "nothing":
+        yield free_port()
+        return
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(8)
+    stop = False
+    if how == "foreign":
+        def serve():
+            while not stop:
+                with contextlib.suppress(OSError):
+                    conn, _ = s.accept()
+                    with conn:
+                        conn.recv(65536)
+                        conn.sendall(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+
+        threading.Thread(target=serve, daemon=True).start()
+    try:
+        yield s.getsockname()[1]
+    finally:
+        stop = True
+        s.close()
+
+
+@prop
+def p3():
+    """P3 With no hub answering, claude-browser hands the browser the plain URL or file, as today.
+
+    Nothing on the hub's port, a socket that accepts and never answers, and a server that is not a hub: each
+    time the browser gets the profile and the target it got before containers, the file as a file:// URL of
+    its real path, a URL as it was given, and a blank tab for no target, within a few seconds."""
+    home = Path(tempfile.mkdtemp(prefix="p3-home.", dir=SCRATCH))
+    stubs = home / "stubs"
+    stubs.mkdir()
+    for name, body in (("brave", BRAVE), ("systemd-run", SYSTEMD_RUN)):
+        (stubs / name).write_text(body)
+        (stubs / name).chmod(0o755)
+    state = home / ".config" / "BraveSoftware" / "Brave-Browser" / "Local State"
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({"profile": {"info_cache": {"Profile 3": {"name": "Personal"}}}}))
+    pages = home / "repos" / "alpha" / "agent" / "show" / "map-columns"
+    pages.mkdir(parents=True)
+    (pages / "index.html").write_text("<!doctype html><p>map columns</p>\n")
+    (pages / "a figure.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"/>\n')
+    (home / "linked").symlink_to(pages)
+    cases = [
+        ([str(pages / "index.html")], f"file://{pages}/index.html"),
+        (["agent/show/map-columns/a figure.svg"], f"file://{pages}/a figure.svg"),
+        ([str(home / "linked" / "index.html")], f"file://{pages}/index.html"),
+        (["https://example.com/a/b?c=d#e"], "https://example.com/a/b?c=d#e"),
+        ([], "about:blank"),
+    ]
+    for how in ("nothing", "silent", "foreign"):
+        for args, target in cases:
+            record = home / "record"
+            record.unlink(missing_ok=True)
+            with no_hub(how) as port:
+                env = base_env(home, CLAUDE_CONFIG_DIR=str(home / ".claude"), CONTAINER_HUB_PORT=str(port),
+                               CLAUDE_CODE_SESSION_ID="00000000-0000-4000-8000-000000000003", RECORD=str(record),
+                               PATH=f"{stubs}:{BIN}:{os.environ['PATH']}")
+                started = time.monotonic()
+                run = subprocess.run([BIN / "claude-browser", *args], env=env, cwd=home / "repos" / "alpha",
+                                     capture_output=True, text=True, timeout=30, check=False)
+                took = time.monotonic() - started
+            at = f"claude-browser {' '.join(args)} with {how} on the hub's port"
+            assert run.returncode == 0, f"{at} exited {run.returncode}: {run.stderr}"
+            assert took < 10, f"{at} took {took:.1f} s"
+            deadline = time.monotonic() + 10
+            while not record.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert record.exists(), f"{at}: the browser was never started"
+            handed = record.read_text().splitlines()
+            assert len(handed) == 2 and handed[0] == "--profile-directory=Profile 3", f"{at}: the browser got {handed}"
+            got = urllib.parse.unquote(handed[1]) if handed[1].startswith("file://") else handed[1]
+            assert got == target, f"{at}: the browser got {handed[1]!r}, not {target!r}"
+
+
+# --------------------------------------------------------------------------
+# P4: a diffview page takes comments through the hub
+# --------------------------------------------------------------------------
+
+
+@prop
+@expected_failure("diffview-serves-through-hub")
+def p4():
+    """P4 A diffview page that `diffview --open` opens is served by the hub, so it is never read-only.
+
+    The address it prints is on the hub's origin and answers with the page; the hub answers /.health with
+    `saves: true`; and a state-file write to the page's address plus `.state.json`, from the hub's own
+    origin, lands in the file beside the page."""
+    hub = shared_hub()
+    repo = hub.home / "repos" / "alpha"
+    repo.mkdir(parents=True)
+    (hub.home / ".cache" / "diffview").mkdir(parents=True)
+    (hub.home / ".cache" / "diffview" / "highlight.min.js").write_text("")  # diffview would fetch it otherwise
+    token = f"line-{os.getpid()}-only-in-this-diff"
+    git(repo, "init", "-q")
+    (repo / "notes.txt").write_text("one\n")
+    git(repo, "add", "notes.txt")
+    git(repo, "commit", "-q", "-m", "one")
+    (repo / "notes.txt").write_text(f"one\n{token}\n")
+    git(repo, "commit", "-q", "-am", "two")
+    page = repo / "agent" / "diffviews" / "map-columns.html"
+    record = hub.home / "opened"
+    browser = hub.home / "browser"
+    browser.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" > {record}\n')
+    browser.chmod(0o755)
+    env = base_env(hub.home, CONTAINER_HUB_PORT=str(hub.port), DIFFVIEW_BROWSER=str(browser),
+                   DIFFVIEW_IDLE_SECONDS="5")
+    try:
+        run = subprocess.run([BIN / "diffview", f"{repo}@HEAD~1..HEAD", "-o", str(page), "--open",
+                              "--no-auto-summary"], cwd=repo, env=env, capture_output=True, text=True, timeout=120,
+                             check=False)
+        assert run.returncode == 0, f"diffview --open exited {run.returncode}: {run.stderr}"
+        address = next((line for line in run.stdout.splitlines() if line.startswith(("http://", "https://"))), None)
+        assert address, f"diffview --open printed no http address: {run.stdout!r}"
+        where = urllib.parse.urlsplit(address)
+        assert where.scheme == "http" and where.netloc in (f"127.0.0.1:{hub.port}", f"localhost:{hub.port}"), (
+            f"diffview --open printed {address}, not an address on the hub at port {hub.port}")
+        status, raw, _ = hub.request("GET", "/.health")
+        health = json.loads(raw) if status == 200 else None
+        assert isinstance(health, dict) and health.get("saves") is True, f"/.health answered {status}: {raw[:200]!r}"
+        status, raw, final = hub.request("GET", address)
+        assert status == 200 and token.encode() in raw, f"{address} answered {status}, without the page"
+        state = {"writer": "p4", "savedAt": 1, "comments": [{"id": 1, "path": "notes.txt", "text": "why?"}]}
+        target = urllib.parse.urlsplit(final)._replace(query="", fragment="").geturl() + ".state.json"
+        status, raw, _ = hub.request("POST", target, json.dumps(state).encode(),
+                                     {"Origin": f"{where.scheme}://{where.netloc}", "Content-Type": "application/json"})
+        assert 200 <= status < 300, f"the state write to {target} answered {status}: {raw[:200]!r}"
+        beside = Path(f"{page}.state.json")
+        assert beside.is_file() and json.loads(beside.read_text()) == state, (
+            f"{beside} does not hold the state written: {beside.read_text() if beside.is_file() else 'missing'}")
+    finally:
+        stop_diffview_servers(hub.home)
+
+
+def stop_diffview_servers(home: Path) -> None:
+    """The diffview servers `--open` left under home: every one writes its pid into a marker."""
+    for marker in home.rglob(".serve.json"):
+        with contextlib.suppress(OSError, ValueError, KeyError, ProcessLookupError):
+            os.kill(int(json.loads(marker.read_text())["pid"]), signal.SIGTERM)
+
+
+# --------------------------------------------------------------------------
+# P6: the container is derived from files on disk
+# --------------------------------------------------------------------------
+
+
+@prop
+@expected_failure("pages-open-into-containers")
+@checked(8, shrink=False)
+@given(worlds(), st.lists(st.integers(0, 2), min_size=1, max_size=8), st.randoms(use_true_random=False))
+def p6(world, openers, rng):
+    """P6 The container is derived from files on disk: the hub's own state can go.
+
+    Each page is opened by one or two of the world's sessions. The hub is killed, its state directory
+    deleted, and it is started again; opening the same pages by the same sessions, in another order,
+    answers the same container for each."""
+    hub = shared_hub()
+    placed = place(world, hub.home)
+    opens = []
+    for i in range(len(world.pages)):
+        first = openers[i % len(openers)] % world.sessions
+        opens.append((i, placed.sessions[first]))
+        if (second := openers[(i + 1) % len(openers)] % world.sessions) != first:
+            opens.append((i, placed.sessions[second]))
+    before = {(i, s): hub.open(str(placed.page(i)), s)[0] for i, s in opens}
+    hub.kill()
+    shutil.rmtree(hub.state, ignore_errors=True)
+    hub.start()
+    rng.shuffle(opens)
+    for i, s in opens:
+        now = hub.open(str(placed.page(i)), s)[0]
+        assert now == before[(i, s)], (
+            f"{world.pages[i]} opened by {s} went to {before[(i, s)]}, and to {now} once the hub's state was gone")
+
+
+# --------------------------------------------------------------------------
+
+
+def main(only: list[str]) -> int:
+    failures = 0
+    for p in PROPERTIES:
+        title = " ".join(p.__doc__.split("\n\n")[0].split())
+        if only and title.split()[0] not in only:
+            continue
+        expected = getattr(p, "expected", None)
+        try:
+            p()
+        except Exception as e:
+            if expected:
+                why = (str(e).splitlines() or [""])[0][:160]
+                print(f"xfail {title}\n      (holds once {expected} lands; fails now with {type(e).__name__}: {why})")
+                continue
+            failures += 1
+            print(f"FAIL  {title}")
+            print("".join("      " + row for row in "".join(traceback.format_exception(e)).splitlines(True)))
+            continue
+        finally:
+            stop_hubs()
+        if expected:
+            failures += 1
+            print(f"FAIL  {title}\n      holds, but is still marked as an expected failure naming {expected}: "
+                  f"delete the mark")
+        else:
+            print(f"ok    {title}")
+    print()
+    print("FAILED" if failures else "all ok")
+    return 1 if failures else 0
+
+
+def clean_up() -> None:
+    stop_hubs()
+    stop_diffview_servers(SCRATCH)
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    atexit.register(clean_up)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    sys.exit(main(sys.argv[1:]))
