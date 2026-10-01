@@ -1,0 +1,343 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "segno"]
+# ///
+"""Mail a scan-to-pay QR code for each new Officebuddy invoice.
+
+Finds the invoices rechnung@buddy.at sent in the local mail (notmuch) within the
+last --days, reads amount, payee account, invoice number and payment term from
+the PDF (pdftotext -layout), and mails each one through bin/alert-send: a text
+summary, an EPC QR code (GiroCode) a banking app scans to pre-fill the transfer,
+and the invoice PDF. An invoice it cannot read with certainty is mailed as
+unreadable instead, with no code, naming the message. Either way the message is
+then tagged officebuddy-mailed, so the next run leaves it alone.
+
+The tag lives in the notmuch index, which is rebuilt from the Maildir and so can
+lose it; --days bounds what a rebuilt index mails again.
+
+Needs notmuch and pdftotext on PATH. Every run but a --dry-run leaves one line
+in ~/logs/runs/officebuddy-invoice.jsonl (bin/run-log): ok with how many
+invoices were mailed and how many were unreadable, fail when notmuch, a
+delivery or a tag failed. A failed delivery leaves the message untagged, so the
+next run tries it again.
+
+Exits 0 on ok, 1 on fail.
+
+Examples:
+
+    officebuddy-invoice
+    officebuddy-invoice --dry-run
+    officebuddy-invoice --days 400 --dry-run
+"""
+
+import email
+import email.policy
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from email.message import EmailMessage
+from pathlib import Path
+
+import segno
+import tyro
+
+UNIT = "officebuddy-invoice"
+TAG = "officebuddy-mailed"
+SENDER = "rechnung@buddy.at"
+BIN = Path(__file__).resolve().parent
+
+
+@dataclass
+class Args:
+    days: int = 45
+    """Only invoices whose mail is at most this many days old."""
+    dry_run: bool = False
+    """Print what would be mailed; send nothing, tag nothing, log nothing."""
+
+
+@dataclass(frozen=True)
+class Invoice:
+    number: str
+    issued: date
+    total: Decimal
+    payee: str
+    iban: str
+    bic: str
+    term_days: int
+
+    @property
+    def due(self) -> date:
+        return self.issued + timedelta(days=self.term_days)
+
+
+class Unreadable(Exception):
+    """The invoice does not say, unambiguously, what to pay; the message says why."""
+
+
+# --- reading an invoice: pdftotext -layout's rendering in, fields out
+
+AMOUNT = r"-?\d{1,3}(?:\.\d{3})*,\d{2}"
+
+
+def parse(text: str) -> Invoice:
+    """Read the invoice fields from its pdftotext -layout rendering.
+
+    Header and footer repeat on every page, so each field is collected from
+    every place it appears, and copies that disagree make the invoice
+    unreadable rather than a guess.
+    """
+    lines = text.splitlines()
+    problems: list[str] = []
+
+    def one(what: str, found: list[str], valid: str) -> str | None:
+        distinct = sorted(set(found))
+        if not distinct:
+            problems.append(f"no {what} found")
+        elif len(distinct) > 1:
+            problems.append(f"the {what} is not unique: {', '.join(distinct)}")
+        elif not re.fullmatch(valid, distinct[0]):
+            problems.append(f"the {what} does not look like one: {distinct[0]!r}")
+        else:
+            return distinct[0]
+        return None
+
+    def below(label: str) -> list[str]:
+        """The last word of the first non-empty line under each line carrying label."""
+        found = []
+        for i, line in enumerate(lines):
+            if label in line:
+                rest = [later for later in lines[i + 1 :] if later.strip()]
+                if rest:
+                    found.append(rest[0].split()[-1])
+        return found
+
+    def matches(pattern: str) -> list[str]:
+        """The pattern's group in each line, first match per line."""
+        return [m.group(1) for line in lines if (m := re.search(pattern, line))]
+
+    number = one("invoice number", below("Rechnungsnummer:"), r"[A-Z]*\d+")
+    issued = one("invoice date", below("Rechnungsdatum:"), r"\d{2}\.\d{2}\.\d{4}")
+    total = one("total", matches(rf"^\s*Total\s*€\s+({AMOUNT})\s*$"), AMOUNT)
+    payee = one("payee", matches(r"buddy\.at by (.+?)(?:\s{2,}|$)"), r".{1,70}")
+    iban = one(
+        "IBAN",
+        [i.replace(" ", "") for i in matches(r"IBAN:\s*(.+?)\s*(?:IBAN:|\s{2,}|$)")],
+        r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}",
+    )
+    bic = one("BIC", matches(r"BIC:\s*(\S+)"), r"[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?")
+    term = one("payment term", matches(r"Zahlungskonditionen:\s*(\d+)\s+Tage"), r"\d{1,3}")
+
+    if iban and not iban_checksum_ok(iban):
+        problems.append(f"the IBAN fails its checksum: {iban}")
+    amount = Decimal(total.replace(".", "").replace(",", ".")) if total else None
+    if amount is not None and not Decimal("0.01") <= amount <= Decimal("999999999.99"):
+        problems.append(f"the total is not an amount a transfer can carry: {total}")
+    issued_on = None
+    if issued:
+        day, month, year = map(int, issued.split("."))
+        try:
+            issued_on = date(year, month, day)
+        except ValueError:
+            problems.append(f"the invoice date is not a date: {issued}")
+    if problems:
+        raise Unreadable("; ".join(problems))
+    assert number and issued_on and amount and payee and iban and bic and term
+    return Invoice(number, issued_on, amount, payee, iban, bic, int(term))
+
+
+def iban_checksum_ok(iban: str) -> bool:
+    """ISO 13616: the IBAN, rotated and lettered to digits, is 1 mod 97."""
+    rotated = iban[4:] + iban[:4]
+    return int("".join(str(int(c, 36)) for c in rotated)) % 97 == 1
+
+
+# --- what is mailed
+
+
+def epc_payload(invoice: Invoice) -> str:
+    """The EPC069-12 version 002 payload: UTF-8, SEPA credit transfer, the
+    invoice number as unstructured remittance text. Purpose and structured
+    reference stay empty; the trailing information field is left off."""
+    return "\n".join([
+        "BCD", "002", "1", "SCT",
+        invoice.bic, invoice.payee, invoice.iban, f"EUR{invoice.total:.2f}",
+        "", "", invoice.number,
+    ])  # fmt: skip
+
+
+def write_qr(payload: str, path: Path) -> None:
+    # EPC069-12 fixes error correction at M and the version at 13 at most.
+    qr = segno.make(payload, error="m", boost_error=False, micro=False, encoding="utf-8")
+    if qr.version > 13:
+        raise Unreadable(f"the payment code would be QR version {qr.version}, above EPC's 13")
+    qr.save(path, scale=8, border=4)
+
+
+def euro(amount: Decimal) -> str:
+    return f"{amount:,.2f} €".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def summary(invoice: Invoice) -> tuple[str, str]:
+    due = f"{invoice.due:%d.%m.%Y}"
+    subject = f"💶 Officebuddy {invoice.number}: {euro(invoice.total)} due {due}"
+    iban = " ".join(invoice.iban[i : i + 4] for i in range(0, len(invoice.iban), 4))
+    body = f"""Officebuddy invoice {invoice.number} of {invoice.issued:%d.%m.%Y}. Scan the code in George to pay it.
+
+Amount:     {euro(invoice.total)}
+Payee:      {invoice.payee}
+IBAN:       {iban}
+BIC:        {invoice.bic}
+Reference:  {invoice.number}
+Due:        {due} ({invoice.term_days} days)
+
+The invoice is attached.
+"""
+    return subject, body
+
+
+def unreadable_summary(mail: EmailMessage, message_id: str, why: str) -> tuple[str, str]:
+    subject = f"⚠️ Officebuddy invoice unreadable: {mail['Subject']}"
+    body = f"""An invoice from {SENDER} could not be read, so it carries no payment code. Pay it by hand.
+
+Why:        {why}
+Subject:    {mail["Subject"]}
+Date:       {mail["Date"]}
+Message-ID: {message_id}
+
+Find it with: notmuch show id:{message_id}
+"""
+    return subject, body
+
+
+# --- the mailbox
+
+
+def notmuch(*argv: str) -> bytes:
+    done = subprocess.run(["notmuch", *argv], capture_output=True, check=False)
+    if done.returncode != 0:
+        detail = done.stderr.decode(errors="replace").strip().splitlines()
+        raise RuntimeError(f"notmuch {argv[0]}: {detail[-1] if detail else f'exit {done.returncode}'}")
+    return done.stdout
+
+
+def id_term(message_id: str) -> str:
+    return 'id:"' + message_id.replace('"', '""') + '"'
+
+
+def new_invoices(days: int) -> list[str]:
+    since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+    query = f"from:{SENDER} and date:@{since}.. and not tag:{TAG}"
+    return json.loads(notmuch("search", "--output=messages", "--format=json", "--sort=oldest-first", query))
+
+
+def pdfs(mail: EmailMessage) -> list[tuple[str, bytes]]:
+    found = []
+    for part in mail.walk():
+        name = part.get_filename() or ""
+        if part.get_content_type() == "application/pdf" or name.lower().endswith(".pdf"):
+            found.append((Path(name).name or "invoice.pdf", part.get_payload(decode=True) or b""))
+    return found
+
+
+def pdf_text(path: Path) -> str:
+    done = subprocess.run(["pdftotext", "-layout", str(path), "-"], capture_output=True, check=False)
+    if done.returncode != 0:
+        raise Unreadable(f"pdftotext failed: {done.stderr.decode(errors='replace').strip()}")
+    return done.stdout.decode(errors="replace")
+
+
+@dataclass(frozen=True)
+class Outgoing:
+    subject: str
+    body: str
+    inline: Path | None
+    attach: Path | None
+    readable: bool
+
+
+def prepare(message_id: str, work: Path) -> Outgoing:
+    mail = email.message_from_bytes(notmuch("show", "--format=raw", id_term(message_id)), policy=email.policy.default)
+    assert isinstance(mail, EmailMessage)
+    attach = None
+    try:
+        found = pdfs(mail)
+        if len(found) != 1:
+            raise Unreadable(f"the mail has {len(found)} PDF attachments, not one")
+        name, content = found[0]
+        attach = work / name
+        attach.write_bytes(content)
+        invoice = parse(pdf_text(attach))
+        qr = work / f"girocode-{invoice.number}.png"
+        write_qr(epc_payload(invoice), qr)
+    except Unreadable as e:
+        return Outgoing(*unreadable_summary(mail, message_id, str(e)), None, attach, readable=False)
+    return Outgoing(*summary(invoice), qr, attach, readable=True)
+
+
+def send(out: Outgoing) -> int:
+    argv = [str(BIN / "alert-send"), out.subject]
+    argv += ["--inline", str(out.inline)] if out.inline else []
+    argv += ["--attach", str(out.attach)] if out.attach else []
+    return subprocess.run(argv, input=out.body.encode(), check=False).returncode
+
+
+# --- one run
+
+
+def run(args: Args) -> tuple[str, str | None, dict]:
+    """Mail every new invoice; return the run log's outcome, reason and stats."""
+    stats = {"mailed": 0, "unreadable": 0}
+    failures: list[str] = []
+    undelivered = 0
+    try:
+        message_ids = new_invoices(args.days)
+    except RuntimeError as e:
+        print(f"{UNIT}: could not search the mail: {e}", file=sys.stderr)
+        return "fail", str(e), stats
+    for message_id in message_ids:
+        with tempfile.TemporaryDirectory(prefix=f"{UNIT}-") as tmp:
+            try:
+                out = prepare(message_id, Path(tmp))
+            except RuntimeError as e:
+                failures.append(f"{message_id}: {e}")
+                continue
+            if args.dry_run:
+                print(f"{out.subject}\n\n{out.body}")
+                continue
+            if (code := send(out)) != 0:
+                undelivered += 1
+                failures.append(f"{message_id}: alert-send exited {code}")
+                continue
+        stats["mailed" if out.readable else "unreadable"] += 1
+        try:
+            notmuch("tag", f"+{TAG}", "--", id_term(message_id))
+        except RuntimeError as e:
+            # Mailed but untagged: the next run mails it again, and this says why.
+            failures.append(f"{message_id} was mailed but not tagged, so it will be again: {e}")
+    if undelivered:
+        stats["alert"] = f"{undelivered} not delivered"
+    elif stats["mailed"] or stats["unreadable"]:
+        stats["alert"] = "delivered"
+    if failures:
+        print("\n".join(f"{UNIT}: {f}" for f in failures), file=sys.stderr)
+        more = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
+        return "fail", failures[0] + more, stats
+    return "ok", None, stats
+
+
+def main(args: Args) -> int:
+    outcome, reason, stats = run(args)
+    if not args.dry_run:
+        argv = [str(BIN / "run-log"), UNIT, outcome, "--stats", json.dumps(stats)]
+        subprocess.run(argv + (["--reason", reason] if reason else []), check=False)
+    return 0 if outcome == "ok" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(tyro.cli(Args, description=__doc__)))
