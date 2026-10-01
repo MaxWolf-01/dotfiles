@@ -1,0 +1,201 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "httpx", "websockets"]
+# ///
+"""Download the GIFs starred in Discord's GIF picker into a local folder.
+
+Reads the favourites through Vesktop: restarts it with a DevTools port open,
+asks Discord's API for the favourites as the logged-in page, then restarts it
+without the port (a Vesktop that was closed stays closed). The token never
+leaves the page. A Vesktop that already has the port open is used as it is.
+
+Downloads only what the folder lacks. Nothing is ever deleted: a GIF that was
+unstarred, or whose link now 404s, keeps its file and its manifest entry. Links
+that fail are tried again on the next run.
+
+The folder holds favorites.json, the manifest: every favourite ever seen, keyed
+by its link, with Discord's entry (src, format, width, height, order) and the
+name of the downloaded file. Files are named <order>-<slug>.<ext>, where order
+is the GIF's place in the picker when it was first downloaded.
+
+Examples:
+
+    discord-gifs-download
+    discord-gifs-download --out /tmp/gifs
+"""
+
+import asyncio
+import json
+import mimetypes
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import httpx
+import tyro
+import websockets
+
+MAIN_BUNDLE = "Vesktop/resources/app.asar"  # in the main process's argv, not as a --flag
+
+# Fetches the favourites fresh from the API, not from the client's cache, and decodes
+# them with the client's own protobuf class. Format: 1 = image, 2 = video.
+FETCH_FAVOURITES_JS = """
+(async () => {
+  const { RestAPI, UserSettingsActionCreators } = Vencord.Webpack.Common;
+  const proto = UserSettingsActionCreators.FrecencyUserSettingsActionCreators.ProtoClass;
+  const res = await RestAPI.get({ url: "/users/@me/settings-proto/2" });
+  const bytes = Uint8Array.from(atob(res.body.settings), c => c.charCodeAt(0));
+  return proto.fromBinary(bytes).favoriteGifs?.gifs ?? {};
+})()
+"""
+
+READY_JS = """
+!!(window.Vencord?.Webpack?.Common?.UserStore?.getCurrentUser?.()
+   && Vencord.Webpack.Common.UserSettingsActionCreators?.FrecencyUserSettingsActionCreators?.ProtoClass)
+"""
+
+
+@dataclass
+class Args:
+    out: Path = Path.home() / "Pictures/discord/gifs"
+    """Folder the GIFs and favorites.json go to. Created when missing."""
+    port: int = 9222
+    """DevTools port Vesktop is started with."""
+
+
+def main(args: Args) -> None:
+    devtools = f"http://127.0.0.1:{args.port}"
+    if devtools_up(devtools):
+        favourites = asyncio.run(evaluate(devtools, FETCH_FAVOURITES_JS))
+    else:
+        was_running = bool(vesktop_pids())
+        quit_vesktop()
+        launch_vesktop(f"--remote-debugging-port={args.port}")
+        try:
+            wait_until_ready(devtools)
+            favourites = asyncio.run(evaluate(devtools, FETCH_FAVOURITES_JS))
+        finally:
+            quit_vesktop()
+            if was_running:
+                launch_vesktop()
+    download(favourites, args.out)
+
+
+def download(favourites: dict, out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    manifest_path = out / "favorites.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    for link, entry in favourites.items():
+        manifest[link] = {**manifest.get(link, {}), **entry}
+
+    new, failed = 0, []
+    with httpx.Client(follow_redirects=True, timeout=30, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for link, entry in sorted(manifest.items(), key=lambda kv: kv[1]["order"]):
+            if entry.get("file") and (out / entry["file"]).exists():
+                continue
+            stem = f"{entry['order']:03d}-{slug(link)}"
+            if existing := next(out.glob(f"{glob_escape(stem)}.*"), None):
+                entry["file"] = existing.name
+                continue
+            try:
+                res = client.get(entry["src"])
+                res.raise_for_status()
+            except httpx.HTTPError as e:
+                failed.append((link, str(e).splitlines()[0]))
+                continue
+            ctype = res.headers.get("content-type", "").split(";")[0]
+            ext = mimetypes.guess_extension(ctype) or Path(entry["src"].split("?")[0]).suffix or ".bin"
+            (out / f"{stem}{ext}").write_bytes(res.content)
+            entry["file"] = f"{stem}{ext}"
+            print(f"new  {entry['file']}")
+            new += 1
+
+    manifest_path.write_text(json.dumps(manifest, indent=1) + "\n")
+    print(f"{len(favourites)} starred, {new} downloaded, {len(failed)} failed, {len(manifest)} in {out}")
+    for link, error in failed:
+        print(f"fail {link}\n     {error}", file=sys.stderr)
+
+
+def slug(link: str) -> str:
+    last = link.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+    return re.sub(r"[^A-Za-z0-9]+", "-", last)[:60].strip("-")
+
+
+def glob_escape(s: str) -> str:
+    return re.sub(r"([*?\[])", r"[\1]", s)
+
+
+def vesktop_pids() -> list[int]:
+    pids = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        args = [a.decode(errors="replace") for a in argv]
+        if any(a.endswith(MAIN_BUNDLE) for a in args) and not any(a.startswith("--type=") for a in args):
+            pids.append(int(proc.name))
+    return pids
+
+
+def quit_vesktop(timeout: float = 20) -> None:
+    pids = vesktop_pids()
+    for pid in pids:
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while vesktop_pids():
+        if time.monotonic() > deadline:
+            sys.exit(f"Vesktop (pid {pids}) did not quit within {timeout:.0f}s of SIGTERM; close it by hand and rerun.")
+        time.sleep(0.3)
+
+
+def launch_vesktop(*flags: str) -> None:
+    subprocess.Popen(["vesktop", *flags], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def devtools_up(devtools: str) -> bool:
+    try:
+        return httpx.get(f"{devtools}/json/version", timeout=1).is_success
+    except httpx.HTTPError:
+        return False
+
+
+def wait_until_ready(devtools: str, timeout: float = 90) -> None:
+    """Wait for Discord to be logged in and its settings classes loaded."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if asyncio.run(evaluate(devtools, READY_JS)):
+                return
+        except (httpx.HTTPError, StopIteration, OSError, websockets.WebSocketException, RuntimeError):
+            pass
+        time.sleep(1)
+    sys.exit(f"Discord did not finish loading in Vesktop within {timeout:.0f}s (is it logged in?).")
+
+
+async def evaluate(devtools: str, expression: str):
+    """Evaluate JS in Vesktop's Discord page over the Chrome DevTools Protocol; return its value."""
+    pages = httpx.get(f"{devtools}/json/list", timeout=5).json()
+    ws_url = next(p["webSocketDebuggerUrl"] for p in pages if p["type"] == "page" and "discord.com" in p["url"])
+    async with websockets.connect(ws_url, max_size=None) as ws:
+        await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+            "expression": expression, "returnByValue": True, "awaitPromise": True}}))
+        while (msg := json.loads(await ws.recv())).get("id") != 1:
+            pass
+    result = msg["result"]
+    if "exceptionDetails" in result:
+        raise RuntimeError(result["exceptionDetails"].get("exception", {}).get("description", result["exceptionDetails"]))
+    return result["result"].get("value")
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__))
