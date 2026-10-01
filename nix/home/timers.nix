@@ -335,16 +335,20 @@ in
       Type = "oneshot";
       Environment = [ "PATH=${activityPath}" ];
       ExecStart = "${secrets}/scripts/git-commits-collect --record";
-      # A checkout whose refs have not moved is skipped, so a run takes seconds;
-      # the first, or one after --full, reads every history (about a minute).
+      # A first or --full run reads every history, about a minute.
+      TimeoutStartSec = "10min";
+      # Nothing waits on the record within the hour, and it competes with whatever max is doing.
       Nice = 10;
+      IOSchedulingClass = "idle";
     };
   };
 
   systemd.user.timers.git-commits-collect = {
     Unit.Description = "Commits collection (hourly)";
     Timer = {
-      OnCalendar = "hourly";
+      # Quarter to: brave-archive and the backups dashboard have the hour, and each
+      # resolves a uv environment on a laptop that has just woken up.
+      OnCalendar = "*:45:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
