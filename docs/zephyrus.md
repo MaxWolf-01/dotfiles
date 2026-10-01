@@ -38,9 +38,17 @@ belongs on pc or a pod.
 ## The discrete GPU
 
 The NVIDIA driver powers the dGPU down to D3cold whenever nothing uses it, and
-`bin/dgpu` keeps it that way on battery by locking its device files, unless a
-monitor is on one of the dGPU's ports. `dgpu --help` has the commands, the
-terms and what runs it when; `./setup dgpu_runtime_pm` installs it.
+`bin/dgpu` keeps it that way by locking its device files, on AC and on
+battery alike, unless a monitor is on one of the dGPU's ports. The dock at the
+desk drives its monitors through the Thunderbolt port, which is the iGPU's, so
+docked the dGPU stays locked. `dgpu --help` has the commands, the terms and
+what runs it when; `./setup dgpu_runtime_pm` installs it.
+
+The lock evicts nothing. A program that opened the dGPU while it was unlocked
+keeps it awake until it exits; logging out and in again clears the session's,
+and from the next boot the lock is in place before gdm starts. A `dgpu unlock`
+typed by hand stands until the next hotplug on the dGPU, driver load, wake
+or boot.
 
 `watch dgpu status` is the instrument: card, power state, lock, the dGPU's
 outputs, power source.
@@ -53,8 +61,7 @@ Measured on 2026-09-23, driver 580.178, kernel 7.0.0-34:
   goes to sleep within seconds of its last user exiting, on either.
 - gnome-shell holds handles on the card (`nvidia-smi` lists it with 3 MiB)
   and that does not keep it awake.
-- Unplugging the charger locks and the card sleeps within seconds; replugging
-  unlocks. Resume from hibernate: D3cold, locked.
+- Resume from hibernate: D3cold, locked.
 - A locked card refuses `nvidia-smi` ("Insufficient Permissions") and every
   other open made as the user.
 - `sudo nvidia-smi` still reads the card, since root ignores permission bits,
@@ -80,7 +87,7 @@ Who holds it right now:
     for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -E "/dev/nvidia|$r" | sed "s|^|$(cat $p/comm) |"; done | awk '{print $1, $NF}' | sort | uniq -c
 
 The driver's own view: `cat /proc/driver/nvidia/gpus/0000:01:00.0/power`.
-`dgpu`'s runs at boot and on the charger: `journalctl -b -u dgpu-auto`; after
+`dgpu`'s runs at boot and on a driver load: `journalctl -b -u dgpu-auto`; after
 a wake: `journalctl -b -u dgpu-resume`, and the sleep hook's unlock under
 `journalctl -b -u 'systemd-*suspend*' -u 'systemd-*hibernate*'`.
 History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
@@ -99,7 +106,7 @@ History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
   a change of the dGPU's card, from udev before the event reaches gnome-shell;
   after a wake, from the `dgpu-resume` unit once the NVIDIA driver has
   resumed, with the dGPU unlocked by a sleep hook before user processes are
-  thawed. At boot and on the charger it probes only a dGPU in D0, since in
+  thawed. At boot and on a driver load it probes only a dGPU in D0, since in
   D3cold the dGPU drives no monitor; during a wake, that decision waits for
   `dgpu-resume`. It cannot stop a `dgpu lock` typed by hand under a monitor,
   nor an installed copy that differs from `bin/dgpu` (`dgpu status` says so;
