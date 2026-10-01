@@ -47,7 +47,8 @@ what runs it when; `./setup dgpu_runtime_pm` installs it.
 The lock evicts nothing. A program that opened the dGPU while it was unlocked
 keeps it awake until it exits; logging out and in again clears the session's,
 and from the next boot the lock is in place before gdm starts. A `dgpu unlock`
-typed by hand stands until the next hotplug on the dGPU, wake or boot.
+typed by hand stands until the next hotplug on the dGPU, driver load, wake
+or boot.
 
 `watch dgpu status` is the instrument: card, power state, lock, the dGPU's
 outputs, power source.
