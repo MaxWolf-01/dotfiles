@@ -23,7 +23,8 @@ diffview's own code; `diffview --open`, `--watch` and `--serve` hand their pages
     POST /api/open            {"target", "session"?, "cwd"?, "container"?, "group"?, "title"?, "by"?}: a path,
                               file:// URL or URL becomes a member of its container, or comes forward again if
                               it is one. Answers {"container", "id", "action", "view", "launch"}, where launch
-                              says no view of the container is showing, or {"skipped": why} for an agent's page.
+                              says no view of the container is showing; {"skipped": why} for an agent's page;
+                              {"tab": why} for a page on another site, which the view could not reach into.
     POST /api/close           {"container", "id"}: hide a member; it stays a member, and an open brings it back.
     POST /api/seen            {"container", "url", "seen"}: the user's seen mark on a page.
     POST /api/visit           {"container", "group"}: the user looked at a group; what was new there is not.
@@ -36,9 +37,10 @@ diffview's own code; `diffview --open`, `--watch` and `--serve` hand their pages
                               its pages
     POST /f/<page>.state.json a diffview page saving its comments
     GET  /f/<page>.watch.json the watch record of a page `diffview --watch` keeps current, with "alive": whether
-                              its watcher still runs. A watched page follows its rebuilds by it, and leaves its
+                              its diffview watcher still runs. A watched page follows its rebuilds by it, and leaves its
                               container once a repo it watched is gone.
-    POST /f/<page>.summary.json  a watched page asking its watcher to write the summary again; 409 with none running
+    POST /f/<page>.summary.json  a watched page asking its diffview watcher to write the summary again; 409 with
+                              none running
     GET  /.health             {"saves": true}: diffview pages served here can save
 
 Examples:
@@ -48,6 +50,7 @@ Examples:
 """
 
 import hashlib
+import html
 import importlib.machinery
 import importlib.util
 import json
@@ -55,7 +58,10 @@ import mimetypes
 import os
 import queue
 import re
+import select
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -111,18 +117,18 @@ class Tracker:
         """The code repo's name, `.dotfiles` read as `dotfiles`."""
         return self.root.parent.parent.name.lstrip(".") or self.root.parent.parent.name
 
-    def tree(self, slug: str) -> str:
-        seen = set()
-        while (parent := self.tickets[slug].get("parent")) in self.tickets and slug not in seen:
+    def ancestors(self, slug: str):
+        """The ticket's parent, its parent's, and so on up to its tree's root; a cycle ends the walk."""
+        seen = {slug}
+        while (slug := self.tickets.get(slug, {}).get("parent")) in self.tickets and slug not in seen:
             seen.add(slug)
-            slug = parent
-        return slug
+            yield slug
+
+    def tree(self, slug: str) -> str:
+        return [slug, *self.ancestors(slug)][-1]
 
     def depth(self, slug: str) -> int:
-        n = 0
-        while (slug := self.tickets.get(slug, {}).get("parent")) in self.tickets and n < 50:
-            n += 1
-        return n
+        return sum(1 for _ in self.ancestors(slug))
 
 
 ROOTS: dict[Path, Path] = {}  # an agent directory -> the root of its tracker, which does not move
@@ -395,7 +401,7 @@ def servable(path: Path) -> bool:
         return True
     if agent and path.is_file() and git(agent.parent, "ls-files", "--error-unmatch", "--", str(path)):
         return True
-    if any(path == f or (not too_broad(f.parent) and path.is_relative_to(f.parent)) for f in OPENED):
+    if any(path == f or (not too_broad(base := f if f.is_dir() else f.parent) and path.is_relative_to(base)) for f in OPENED):
         return True
     # what diffview keeps beside a page goes where the page goes, so a page served on its own still saves
     beside = diffview.page_beside(path) if diffview else None
@@ -433,17 +439,30 @@ def save_shared(listed: list[str]) -> None:
 
 
 def load_shared() -> list[str]:
-    try:
-        listed = json.loads(shared_file().read_text())
-    except (OSError, ValueError):
-        return []
+    listed = read_json(shared_file())
     return [p for p in listed if isinstance(p, str)] if isinstance(listed, list) else []
 
 
 def load(key: str) -> dict | None:
+    data = read_json(state_file(key))
+    return data if isinstance(data, dict) else None
+
+
+def read_json(path: Path):
+    """A file the hub keeps, None when there is none. One it cannot read is moved aside rather than left for the
+    next save to overwrite, since the marks in it are the one thing nothing else on disk can give back."""
     try:
-        return json.loads(state_file(key).read_text())
-    except (OSError, ValueError):
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        aside = path.with_name(f"{path.name}.unreadable-{time.time_ns()}")
+        try:
+            os.replace(path, aside)
+        except OSError:
+            aside = None
+        print(f"{path} could not be read ({e}); " + (f"moved to {aside}, and started anew" if aside else "left where it is"),
+              file=sys.stderr, flush=True)
         return None
 
 
@@ -484,6 +503,8 @@ def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
     """from_page says a page in the view asked, for a link clicked in it: it may open only what it could
     already read, so no page can widen what /f/ serves."""
     page = read_target(body["target"], body.get("cwd"), port)
+    if not page.path and not page.url.startswith("/"):
+        return 200, {"tab": "a page on another site opens as a browser tab: the view cannot reach into it, and many sites refuse to be framed"}
     if page.path and not page.path.exists():
         return 404, {"error": f"{page.path} does not exist"}
     if page.path and from_page and not (page.path.is_file() and servable(page.path)):
@@ -579,7 +600,8 @@ def ticket_artefacts(tracker: Tracker, slug: str) -> list[dict]:
     ranges = tracker.tickets.get(slug, {}).get("diff") or []
     if review.is_file():
         found.append(artefact(page_of_path(review), slug, "diff"))
-    elif ranges:
+    # the review page may be of an earlier round than the ranges the ticket records now
+    if ranges:
         found.append({"url": diff_url(tracker.root, slug), "id": member_id(diff_url(tracker.root, slug)), "ticket": slug,
                       "kind": "diff", "title": "diff · " + ", ".join(ranges), "mtime": tracker.tickets[slug]["mtime"]})
     for base in (tracker.agent / "show" / slug, tracker.agent / "prototypes" / slug):
@@ -659,8 +681,8 @@ def containers() -> list[dict]:
 
 def index_page() -> bytes:
     rows = "".join(
-        f'<li><a href="/c/{key_path(c["key"])}">{html_escape(c["name"])}</a>'
-        f'<span>{html_escape(c["repo"])}</span><span>{c["groups"]} orchestrator{"s" * (c["groups"] != 1)} · '
+        f'<li><a href="/c/{key_path(c["key"])}">{html.escape(c["name"])}</a>'
+        f'<span>{html.escape(c["repo"])}</span><span>{c["groups"]} orchestrator{"s" * (c["groups"] != 1)} · '
         f'{c["pages"]} page{"s" * (c["pages"] != 1)} · {time.strftime("%Y-%m-%d %H:%M", time.localtime(c["last"]))}</span></li>'
         for c in containers())
     return INDEX.replace("__ROWS__", rows or "<li>none yet: a container appears with the first page an agent opens</li>").encode()
@@ -669,14 +691,10 @@ def index_page() -> bytes:
 def listing(directory: Path) -> bytes:
     """Every page under a directory, linked relative to it, so a directory's address is somewhere to start."""
     pages = sorted(directory.rglob("*.html"))
-    rows = "".join(f'<li><a href="{urllib.parse.quote(str(p.relative_to(directory)))}">{html_escape(str(p.relative_to(directory)))}</a></li>'
+    rows = "".join(f'<li><a href="{urllib.parse.quote(str(p.relative_to(directory)))}">{html.escape(str(p.relative_to(directory)))}</a></li>'
                    for p in pages) or "<li>no pages here yet</li>"
-    return (INDEX.replace("<title>containers</title>", f"<title>{html_escape(directory.name)}</title>")
-            .replace("<h1>containers</h1><ul>__ROWS__</ul>", f"<h1>{html_escape(str(directory))}</h1><ul>{rows}</ul>")).encode()
-
-
-def html_escape(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return (INDEX.replace("<title>containers</title>", f"<title>{html.escape(directory.name)}</title>")
+            .replace("<h1>containers</h1><ul>__ROWS__</ul>", f"<h1>{html.escape(str(directory))}</h1><ul>{rows}</ul>")).encode()
 
 
 INDEX = """<!doctype html><meta charset="utf-8"><title>containers</title>
@@ -699,19 +717,29 @@ INDEX = """<!doctype html><meta charset="utf-8"><title>containers</title>
 # --------------------------------------------------------------------------
 
 
-def render_diff(tracker_root: Path, ticket: str) -> Path | None:
+def render_diff(tracker_root: Path, ticket: str) -> tuple[Path | None, str]:
+    """The page of a ticket's recorded ranges, rendered on first use; else None and why not."""
     tracker = tracker_at(tracker_root.parent)
     ranges = tracker.tickets.get(ticket, {}).get("diff") if tracker else None
     if not ranges:
-        return None
+        return None, "no diff recorded for this ticket"
     code, agent = tracker_root.parent.parent, tracker_root.parent
     specs = [f"{agent if r.startswith('agent@') else code}@{r.split('@', 1)[-1]}" for r in ranges]
     out = STATE / "diffs" / f"{ticket}-{hashlib.sha1(' '.join(specs).encode()).hexdigest()[:8]}.html"
-    if not out.exists():
-        out.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([str(HERE / "diffview"), *specs, "-o", str(out), "--no-auto-summary", "--title", f"{ticket} · diff"],
-                       cwd=code, capture_output=True, check=False, timeout=300)
-    return out if out.exists() else None
+    if out.exists():
+        return out, ""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    command = [str(HERE / "diffview"), *specs, "-o", str(out), "--no-auto-summary", "--title", f"{ticket} · diff"]
+    try:
+        run = subprocess.run(command, cwd=code, capture_output=True, text=True, check=False, timeout=300)
+    except subprocess.TimeoutExpired:
+        why = f"diffview {' '.join(specs)} took over 300 s"
+    else:
+        if out.exists():
+            return out, ""
+        why = f"diffview {' '.join(specs)} failed: {run.stderr.strip()[-500:]}"
+    print(f"rendering {ticket}'s diff: {why}", file=sys.stderr, flush=True)
+    return None, why
 
 
 def trellis(name: str) -> Path | None:
@@ -770,7 +798,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send(code, json.dumps(obj).encode(), "application/json")
 
     def send_file(self, path: Path) -> None:
-        # a directory diffview shared is somewhere to start, as its own server's address was
+        # a shared directory with no index.html lists its pages
         if path.is_dir() and not (path / "index.html").is_file() and any(path.is_relative_to(d) for d in SHARED):
             return self.send(200, listing(path), "text/html; charset=utf-8")
         if path.is_dir():
@@ -797,7 +825,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self.send(200, index_page(), "text/html; charset=utf-8")
         if path.startswith("/c/"):
-            return self.send_file(HERE / "container-hub.html")
+            view = (HERE / "container-hub.html").read_text().replace('"__RESTART__"', json.dumps(restart_command()))
+            return self.send(200, view.encode(), "text/html; charset=utf-8")
         if path.startswith("/static/trellis/") and (name := path.rsplit("/", 1)[-1]) in TRELLIS:
             try:
                 return self.send_file(trellis(name))
@@ -810,9 +839,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.stream(urllib.parse.unquote(path.removeprefix("/events/")))
         if path == "/diff":
             query = urllib.parse.parse_qs(parts.query)
-            page = render_diff(Path(query.get("tracker", [""])[0]), query.get("ticket", [""])[0])
+            page, why = render_diff(Path(query.get("tracker", [""])[0]), query.get("ticket", [""])[0])
             if not page:
-                return self.send(404, b"no diff recorded for this ticket", "text/plain")
+                return self.send(502 if why.startswith("diffview") else 404, why.encode(), "text/plain; charset=utf-8")
             return self.send(302, b"", "text/plain", {"Location": "/f" + urllib.parse.quote(str(page))})
         if path.startswith("/f/"):
             target = Path(urllib.parse.unquote(path.removeprefix("/f"))).resolve()
@@ -828,31 +857,46 @@ class Handler(BaseHTTPRequestHandler):
         self.send(404, b"not found", "text/plain")
 
     def stream(self, key: str) -> None:
+        """A listener counts as a view showing the container, which decides whether claude-browser opens one, so it
+        goes the moment its view closes rather than at the next write that fails."""
         q: queue.Queue = queue.Queue()
         try:
             seen_by[q] = view_digest(key)
-        except Exception:  # the disk watch's first round tells this listener instead
-            pass
+        except Exception as e:  # without a digest, the disk watch's first round tells this listener to read again
+            print(f"listening on {key}: {e}", file=sys.stderr, flush=True)
         with lock:
             listeners.setdefault(key, []).append(q)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             self.wfile.write(b": connected\n\n")
             self.wfile.flush()
-            while True:
+            quiet = 0
+            while not self.peer_gone():
                 try:
-                    self.wfile.write(f"data: {json.dumps(q.get(timeout=15))}\n\n".encode())
+                    self.wfile.write(f"data: {json.dumps(q.get(timeout=1))}\n\n".encode())
                 except queue.Empty:
+                    if (quiet := quiet + 1) < 15:
+                        continue
                     self.wfile.write(b": keepalive\n\n")
+                quiet = 0
                 self.wfile.flush()
         except OSError:
             pass
         finally:
             with lock:
                 listeners[key].remove(q)
+
+    def peer_gone(self) -> bool:
+        """An event stream's client sends nothing after its request, so its socket turning readable means it closed."""
+        if not select.select([self.connection], [], [], 0)[0]:
+            return False
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
 
     def do_POST(self):
         if not self.local():
@@ -867,7 +911,7 @@ class Handler(BaseHTTPRequestHandler):
                 # a watched page asking its watcher for a new summary
                 if diffview.request_summary(diffview.page_beside(target)):
                     return self.send(204, b"", "text/plain")
-                return self.send(409, b"no watcher runs for this page", "text/plain")
+                return self.send(409, b"no diffview watcher runs for this page", "text/plain")
             if not servable(target) or not diffview.is_state_file(target):
                 return self.send(403, b"forbidden", "text/plain")
             code, body = diffview.write_state(target, raw)
@@ -895,16 +939,27 @@ def view_digest(key: str) -> str:
     return hashlib.sha1(json.dumps(container_view(key), sort_keys=True).encode()).hexdigest()
 
 
-def watch_disk(stop: threading.Event) -> None:
+def restart_command() -> str:
+    """What brings this hub back once it is gone: its user service where it runs as one, else the command that
+    started it."""
+    try:
+        service = Path("/proc/self/cgroup").read_text().strip().endswith("/container-hub.service")
+    except OSError:
+        service = False
+    return "systemctl --user restart container-hub" if service else shlex.join(["setsid", "-f", sys.argv[0], *sys.argv[1:]])
+
+
+def watch_disk() -> None:
     """A view that is showing hears when the disk under its container changes: a ticket's status, a page
     deleted, a new artefact. Only the containers someone is looking at are read."""
-    while not stop.wait(2):
+    while True:
+        time.sleep(2)
         with lock:
             watched = {k: list(qs) for k, qs in listeners.items() if qs}
         for key, qs in watched.items():
             try:
                 digest = view_digest(key)
-            except Exception as e:  # a half-written file read mid-change: the next round reads it whole
+            except Exception as e:  # a ticket or page changing under the read: the next round reads it again
                 print(f"watching {key}: {e}", file=sys.stderr, flush=True)
                 continue
             for q in qs:
@@ -927,7 +982,7 @@ def main(args: Args) -> None:
         save_shared(kept)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.daemon_threads = True
-    threading.Thread(target=watch_disk, args=(threading.Event(),), daemon=True).start()
+    threading.Thread(target=watch_disk, daemon=True).start()
     print(f"container-hub on http://127.0.0.1:{args.port}/, state in {STATE}", flush=True)
     server.serve_forever()
 

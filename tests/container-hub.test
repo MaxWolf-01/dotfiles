@@ -12,13 +12,16 @@ beta, each with an agent repo whose tickets were committed by sessions (a `Sessi
 
 import contextlib
 import http.client
+import http.server
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -101,6 +104,7 @@ def free_port() -> int:
 
 PORT = free_port()
 ORIGIN = f"http://127.0.0.1:{PORT}"
+TEMP_PAGE = Path(tempfile.gettempdir()) / f"container-hub-test-{PORT}.html"  # directly in the temp dir
 
 
 def request(method: str, path: str, body: dict | None = None, headers: dict | None = None) -> tuple[int, dict | bytes]:
@@ -190,6 +194,14 @@ try:
         pass
     check("...and tells a showing view to reload it", ("reopened", a["id"]), (json.loads(line[5:])["type"], json.loads(line[5:])["id"]))
     events.close()
+    quiet = http.client.HTTPConnection("127.0.0.1", PORT, timeout=3)
+    quiet.request("GET", f"/events/{in_view(a)}")
+    stream, heard = quiet.getresponse(), []
+    with contextlib.suppress(TimeoutError, OSError):
+        while line := stream.readline().decode():
+            heard += [line] if line.startswith("data:") else []
+    quiet.close()
+    check("a view that starts listening hears nothing while nothing changes", [], heard)
 
     note = page(HOME / "notes" / "scratch.html")
     by_trailer = open_page(note, ORCHESTRATOR, cwd=str(alpha))
@@ -267,6 +279,20 @@ try:
                     if x["ticket"] == "map-columns" and x["kind"] == "diff")
     status_code, rendered = request("GET", recorded["url"])
     check("a ticket's recorded diff range renders when opened", (200, True), (status_code, b"notes.txt" in rendered))
+    review_page = page(agent / "diffviews" / "map-columns.html")
+    check("a ticket with a review page still lists the ranges it records", ["diff", f"diff · code@{commits[0]}..{commits[1]}"],
+          sorted(x["title"] for g in view(a["container"])[1]["groups"] for x in g["artefacts"]
+                 if x["ticket"] == "map-columns" and x["kind"] == "diff"))
+    review_page.unlink()
+    with (agent / "tickets/map-columns.md").open("r+") as f:
+        text = f.read().replace(f"code@{commits[0]}..{commits[1]}", f"code@{commits[0]}..0123abc")
+        f.seek(0)
+        f.truncate()
+        f.write(text)
+    broken = next(x for g in view(a["container"])[1]["groups"] for x in g["artefacts"] if x["ticket"] == "map-columns" and x["kind"] == "diff")
+    status_code, said = request("GET", broken["url"])
+    check("a recorded range diffview cannot render answers why, not that none is recorded", (502, True),
+          (status_code, b"0123abc" in said))
 
     # --- serving
 
@@ -283,6 +309,14 @@ try:
     check("...nor open a directory to widen what is served", (403, 403),
           (request("POST", "/api/open", {"container": a["container"], "target": str(note.parent)}, {"Origin": ORIGIN})[0],
            request("GET", "/f" + urllib.parse.quote(str(page(HOME / "beside-notes.html"))))[0]))
+    check("a write for another Host is refused", 403,
+          request("POST", "/api/open", {"target": str(note)}, {"Host": "attacker.example:80", "Origin": ORIGIN})[0])
+    shown = page(HOME / "work" / "out" / "report" / "index.html")
+    page(HOME / "work" / "out" / "secret.txt", "secret")
+    open_page(shown.parent, ORCHESTRATOR, cwd=str(alpha))
+    check("a directory an agent opens is served, and nothing beside it", (200, 403),
+          (request("GET", "/f" + urllib.parse.quote(str(shown)))[0],
+           request("GET", "/f" + urllib.parse.quote(str(HOME / "work" / "out" / "secret.txt")))[0]))
     check("a file git tracks in the repo around an agent directory is served", 200,
           request("GET", "/f" + urllib.parse.quote(str(alpha / "README.md")))[0])
     check("...an untracked one is not", 403, request("GET", "/f" + urllib.parse.quote(str(page(alpha / ".env", "KEY=1"))))[0])
@@ -326,6 +360,15 @@ try:
           (request("POST", shared_page["url"] + ".state.json", state, {"Origin": ORIGIN})[0],
            json.loads(Path(f"{alone}.state.json").read_text())))
     check("...while the rest of home stays unserved", 403, request("GET", "/f" + urllib.parse.quote(str(HOME / "beside-notes.html")))[0])
+    in_temp = page(TEMP_PAGE)
+    beside_temp = page(TEMP_PAGE.with_name(TEMP_PAGE.stem + "-beside.html"))
+    serving = subprocess.run([BIN / "diffview", "--serve", str(in_temp)], env={**ENV, "CONTAINER_HUB_PORT": str(PORT)},
+                             capture_output=True, text=True, timeout=120)
+    temp_url = serving.stdout.split(" at ")[-1].strip()
+    check("diffview --serve takes a page sitting directly in the temp dir", (0, 200),
+          (serving.returncode, request("GET", temp_url.removeprefix(ORIGIN))[0] if temp_url.startswith(ORIGIN) else None))
+    check("...and the rest of the temp dir stays unserved", 403, request("GET", "/f" + urllib.parse.quote(str(beside_temp)))[0])
+    check("...as the temp dir is never shared whole", 403, request("POST", "/api/serve", {"path": tempfile.gettempdir()})[0])
 
     # --- what leaves
 
@@ -354,11 +397,12 @@ try:
     local_state.parent.mkdir(parents=True)
     local_state.write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Personal"}}}}))
 
-    def browse(*args: str, cwd: Path = gamma, **sessions: str) -> list[str]:
+    def browse(*args: str, cwd: Path = gamma, port: int = PORT, **sessions: str) -> list[str]:
+        """What claude-browser handed the browser; what it said on the way is in browse.said."""
         record.unlink(missing_ok=True)
-        subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=True, capture_output=True, timeout=30,
-                       env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CODE_SESSION_ID": WORKER, **sessions,
-                            "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+        browse.said = subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=True, capture_output=True, timeout=30, text=True,
+                                     env={**ENV, "CONTAINER_HUB_PORT": str(port), "CLAUDE_CODE_SESSION_ID": WORKER, **sessions,
+                                          "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
         deadline = time.monotonic() + 5
         while not record.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -385,6 +429,44 @@ try:
     check("claude-browser --container puts the page there", 200, view("picked")[0])
     check("the hub's own pages open as tabs, not members", [ORIGIN + "/"], browse(ORIGIN + "/")[1:])
     check("...so no container holds them", 404, view("loose")[0])
+    check("a page on another site opens as a plain tab", ["--profile-directory=Default", "https://example.com/docs#part"],
+          browse("https://example.com/docs#part"))
+    check("...and joins no container", True, "tab" in open_page("https://example.com/docs", WORKER))
+    check("...nor does a link to one clicked in the view", True,
+          "tab" in request("POST", "/api/open", {"container": g["container"], "target": "https://example.com/x"}, {"Origin": ORIGIN})[1])
+    missing = "agent/show/one-flow/never-written.html"
+    check("a page the hub refuses opens as a plain tab", ["--profile-directory=Default", missing], browse(missing))
+    check("...and claude-browser says why", True, "refused the page (404" in browse.said and "does not exist" in browse.said)
+
+    class NotAHub(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<!doctype html><p>some other service")
+
+        def log_message(self, *_):
+            pass
+
+    other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NotAHub)
+    threading.Thread(target=other.serve_forever, daemon=True).start()
+    check("a service on the hub's port that answers 200 but is no hub: a plain tab", ["--profile-directory=Default", f"file://{fresh}"],
+          browse(str(fresh), port=other.server_address[1]))
+    check("...and claude-browser says so", True, "no container hub" in browse.said)
+    other.shutdown()
+
+    closing = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    closing.request("GET", "/events/closing")
+    stream = closing.getresponse()
+    stream.readline(), stream.readline()
+    check("with its view showing, a page opened into a container launches none", False,
+          open_page(fresh, WORKER, container="closing")["launch"])
+    stream.readline(), stream.readline()  # read to the end, as a tab does: it closes then with a FIN, never a reset
+    stream.close()
+    closing.close()
+    time.sleep(2)
+    check("...and once that view closes, the next open launches one", True,
+          open_page(fresh, WORKER, container="closing")["launch"])
 
     # --- a watched diffview: in the group of the session that started it, while its worktree exists
 
@@ -445,12 +527,18 @@ try:
             time.sleep(0.1)
     check("a damaged state file does not keep the hub from starting", (None, 200), (hub.poll(), request("GET", "/")[0]))
     check("...and the containers beside it are still there", 200, view(a["container"])[0])
+    check("...and it is moved aside, not left for the next save to overwrite", (False, 1),
+          ((SCRATCH / "state/containers/damaged.json").exists(), len(list((SCRATCH / "state/containers").glob("damaged.json.unreadable-*")))))
+    check("a page an agent opened outside every agent directory is served after a restart", 200,
+          request("GET", "/f" + urllib.parse.quote(str(note)))[0])
     check("what was shared before the restart is served after it", (200, 200),
           (request("GET", shared["url"] + "nested/review.html")[0], request("GET", shared_page["url"])[0]))
 finally:
     os.killpg(hub.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
     hub.wait()
-    subprocess.run(["rm", "-rf", str(SCRATCH)], check=False)
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    for leftover in TEMP_PAGE.parent.glob(TEMP_PAGE.stem + "*"):
+        leftover.unlink(missing_ok=True)
 
 print()
 print("FAILED" if failures else "all ok")
