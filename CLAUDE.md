@@ -139,7 +139,8 @@ Tailnet-wide: every device resolves through Mullvad's filtering resolver, pushed
 with `bin/tailscale-dns` from `secrets/tailscale/dns.json`. Servers (pc, jarvis,
 yapit-prod) are opted out. Never add `Domains=~.` to a resolved config — it ties
 with tailscaled's own catch-all and silently defeats filtering. `dns-blocked`
-answers "is this domain blocked, and by which list". Chain, gotchas, and the
+answers "is this domain blocked, and by which list"; `dns-filter off` turns
+filtering off on zephylux for a few minutes. Chain, gotchas, and the
 captive-portal escape (`portal`): `docs/dns.md`.
 
 Mullvad exit node: `vpn` (`bin/vpn`). Its watcher service (`vpn watch`) is the
