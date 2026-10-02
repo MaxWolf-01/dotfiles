@@ -315,13 +315,19 @@ in
       Type = "oneshot";
       Environment = [ "PATH=${uvScriptPath}" ];
       ExecStart = "${secrets}/scripts/brave-archive --record";
+      # oneshot has no start timeout of its own; a hung run would leave every later
+      # firing a silent no-op.
+      TimeoutStartSec = "10min";
     };
   };
 
   systemd.user.timers.brave-archive = {
     Unit.Description = "Brave archive collection (hourly)";
     Timer = {
-      OnCalendar = "hourly";
+      # Twenty to: the other hourly uv jobs have the hour, ten and twenty past and
+      # quarter to, and each resolves a uv environment on a laptop that has just
+      # woken up.
+      OnCalendar = "*:40:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
@@ -337,7 +343,8 @@ in
       ExecStart = "${secrets}/scripts/git-commits-collect --record";
       # A first or --full run reads every history, about a minute.
       TimeoutStartSec = "10min";
-      # Nothing waits on the record within the hour, and it competes with whatever max is doing.
+      # Nothing waits on the record within the hour, and it competes with
+      # whatever max is doing.
       Nice = 10;
       IOSchedulingClass = "idle";
     };
@@ -346,8 +353,8 @@ in
   systemd.user.timers.git-commits-collect = {
     Unit.Description = "Commits collection (hourly)";
     Timer = {
-      # Quarter to: brave-archive and the backups dashboard have the hour, and each
-      # resolves a uv environment on a laptop that has just woken up.
+      # Quarter to: the backups dashboard has the hour and brave-archive twenty to,
+      # and each resolves a uv environment on a laptop that has just woken up.
       OnCalendar = "*:45:00";
       Persistent = true;
     };
@@ -646,10 +653,9 @@ in
   };
 
   # The odd one out: it reports on no job, only on when this machine was in use.
-  # It re-reads lifelog's views over every source in full, about a minute of CPU
-  # across the cores, so it runs once a day rather than hourly. The page is a
-  # record of years; the last hour of it is not what anyone opens it for, and
-  # `systemctl --user start` covers wanting today.
+  # It re-reads lifelog's views over every source in full, so it runs once a day
+  # rather than hourly. The page is a record of years; the last hour of it is not
+  # what anyone opens it for, and `systemctl --user start` covers wanting today.
 
   systemd.user.services.dashboard-activity = {
     Unit.Description = "Rebuild the activity dashboard from lifelog's views";
