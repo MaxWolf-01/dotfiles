@@ -13,7 +13,8 @@ The pages are served by a container hub of the test's own, on a free port, never
 own so its state is the test's.
 
 Run it directly; no framework. Uses the chromium build playwright keeps in its cache
-(`uv run --with playwright playwright install chromium` once, if it is missing).
+(`uv run --with playwright playwright install chromium` once, if it is missing), or $CHROMIUM where that build
+cannot run (NixOS).
 """
 
 import base64
@@ -34,7 +35,7 @@ import urllib.request
 import zlib
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwright
 
 DIFFVIEW = Path(__file__).resolve().parent.parent / "bin" / "diffview"
 failures = 0
@@ -121,7 +122,7 @@ class Watcher:
 
     def __init__(self, spec: str, out: Path, *flags: str, env: dict | None = None):
         self.proc = subprocess.Popen([str(DIFFVIEW), spec, "--watch", "-o", str(out), *flags],
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env or HUB_ENV)
         self.lines: queue.Queue[str] = queue.Queue()
         threading.Thread(target=lambda: [self.lines.put(line) for line in self.proc.stdout], daemon=True).start()
         self.url = ""
@@ -155,6 +156,10 @@ def watch_case(repo: Path, pages: Path) -> None:
     w = Watcher(spec, out, "--no-auto-summary")
     try:
         check("--watch starts on an empty diff", True, w.printed("watching"))
+        check("its page is served by the container hub", served(out), w.url)
+        second = subprocess.run([str(DIFFVIEW), spec, "--watch", "--no-auto-summary", "-o", str(out)],
+                                capture_output=True, text=True, env=HUB_ENV, timeout=60)
+        check("a second watcher of the same page is refused", (1, True), (second.returncode, "already watched" in second.stderr))
         check("the empty page is written", True, out.is_file() and '"files": []' in out.read_text())
         nested = repo / "nested"   # an untracked repository inside the repo: listed by git as a directory, not a file
         nested.mkdir()
@@ -493,7 +498,7 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
                                  'case "$m" in fail) echo shim refused >&2; exit 1;; slow*) sleep 4; m=${m#slow };; esac\n'
                                  'cat >/dev/null\necho "$m"\n')
     (shim / "claude").chmod(0o755)
-    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "MODE_FILE": str(mode)}
+    env = {**HUB_ENV, "PATH": f"{shim}:{os.environ['PATH']}", "MODE_FILE": str(mode)}
     out = pages / f"rewrite-{os.getpid()}.html"
     sidecar = Path(str(out) + ".summary.json")
     original = (repo / "a.txt").read_text()
@@ -517,7 +522,7 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
         page = browser.new_page()
         failed_requests: list[str] = []
         page.on("response", lambda r: failed_requests.append(f"{r.status} {r.url}") if r.status >= 400 else None)
-        page.goto(w.url + out.name)
+        page.goto(w.url)
         check("a watched page carries the command that started its watcher", True,
               page.evaluate("DATA.restart").startswith(f"diffview {repo}@base.. --watch -o "))
         page.wait_for_selector(".summary .rewrite.stale")
@@ -530,9 +535,10 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
               (first.get("summary"), first.get("for", {}).get("adds"), first.get("for", {}).get("dels")))
         page.wait_for_selector(".summary .rewrite:not(.stale)")
         check("↻ on a fresh summary says it is current", True, "for this diff" in title())
+        built = page.evaluate("DATA.generated")
         (repo / "a.txt").write_text(original + "line 81 appended\n")
         check("more changes regenerate the page", True, w.printed("regenerated"))
-        page.reload()
+        check("which reloads itself in the browser", True, rebuilt(page, built))
         page.wait_for_selector(".summary .rewrite.stale")
         check("↻ then says how far the diff has moved", True, "the diff is now +4 −2" in title())
         mode.write_text("slow summary two")   # the model takes a while, and the tree moves on meanwhile
@@ -555,7 +561,7 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
         check("the page still shows the old summary", True, "summary two" in page.locator(".summary").inner_text())
         # a second page on the watcher follows the first between rebuilds, as on a --serve server
         other = browser.new_page()
-        other.goto(w.url + out.name)
+        other.goto(w.url)
         other.wait_for_selector("tbody.hunk")
         page.locator('tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="20"]').click()
         page.keyboard.type("typed on the watched page")
@@ -568,12 +574,32 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
         check("a watched page follows the file between rebuilds", True, shown())
         check("and nothing it asked the watcher for failed, the waits for a state file and a new summary included", [], failed_requests)
         other.close()
+        w.stop()
+        try:
+            page.wait_for_selector(".watchgone", timeout=10_000)
+        except PlaywrightTimeout:
+            pass
+        check("a page whose watcher has stopped says so, with the command that restarts it", page.evaluate("DATA.restart"),
+              page.locator(".watchgone code").all_inner_texts()[0] if page.locator(".watchgone code").count() else None)
+        built = page.evaluate("DATA.generated")
+        w = Watcher(f"{repo}@base..", out, "--no-auto-summary", env=env)
+        check("the watcher started again", True, w.printed("watching"))
+        check("and the page catches up, the warning gone", (True, 0), (rebuilt(page, built), page.locator(".watchgone").count()))
         page.close()
     finally:
         w.stop()
         (repo / "a.txt").write_text(original)
         for p in pages.glob(f"{out.stem}*"):
             p.unlink()
+
+
+def rebuilt(page, built: str) -> bool:
+    """The page reloaded itself into a build other than the one named."""
+    try:
+        page.wait_for_function(f"typeof DATA !== 'undefined' && DATA.generated !== {json.dumps(built)}", timeout=15_000)
+        return True
+    except PlaywrightTimeout:
+        return False
 
 
 def outage_case(repo: Path, pages: Path, browser) -> None:
@@ -1205,14 +1231,14 @@ def main() -> int:
     check("the file count names changed files only", True, "(1 files," in proc.stdout)
     check("nothing outside the source got baked in", False, "not yours" in out.read_text())
 
-    watch_case(repo, pages)
     fork_case(root, pages)
 
     try:
+        watch_case(repo, pages)   # it brings the hub up, which the finally below stops
         serve = subprocess.run([str(DIFFVIEW), "--serve", str(pages)], env=HUB_ENV, capture_output=True, text=True, timeout=120)
         url = serve.stdout.split(" at ")[-1].split()[0].rstrip("/") + "/" + out.name
         with sync_playwright() as p:
-            browser = p.chromium.launch()
+            browser = p.chromium.launch(executable_path=os.environ.get("CHROMIUM") or None)
             page = browser.new_page(viewport={"width": 1280, "height": 2400},   # tall: every hunk fits, so j/k only move
                                     permissions=["clipboard-read", "clipboard-write"])
             page.on("dialog", lambda d: d.dismiss())
@@ -1388,7 +1414,7 @@ def main() -> int:
     finally:
         stop_hub()
         shutil.rmtree(HUB_HOME, ignore_errors=True)
-        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"tabs-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*"), *pages.glob(f"quiet-{os.getpid()}*"), *pages.glob(f"history-{os.getpid()}*")]:
+        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"tabs-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*"), *pages.glob(f"quiet-{os.getpid()}*"), *pages.glob(f"history-{os.getpid()}*"), *pages.glob(f"watch-{os.getpid()}*")]:
             p.unlink()
         shutil.rmtree(root, ignore_errors=True)
     print(f"\n{failures} failure(s)")

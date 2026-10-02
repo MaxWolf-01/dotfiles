@@ -39,6 +39,7 @@ Examples:
 """
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -77,7 +78,7 @@ class Args:
     open: bool = False
     """Open the generated page in the browser ($DIFFVIEW_BROWSER, else xdg-open), served by the container hub so it can take comments."""
     watch: bool = False
-    """Regenerate whenever the sources change and serve the page on localhost with live reload; runs until Ctrl-C, so start it as a background task. The summary is written once; the ↻ beside it says how far the diff has moved since and rewrites it on request. Starts fine on sources with no changes yet: the page says so and fills in. The written file stays a plain snapshot you can share."""
+    """Regenerate whenever the sources change; the page, served by the container hub, reloads itself on each change. Runs until Ctrl-C or until a repo it reads is removed, so start it as a background task; the page says when it has stopped and how to start it again. The summary is written once; the ↻ beside it says how far the diff has moved since and rewrites it on request. Starts fine on sources with no changes yet: the page says so and fills in. The written file stays a plain snapshot you can share."""
     notes: str = ""
     """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top; an image other than SVG, whole): the place to say what was read and deliberately left alone. A note with "re": "C4" answers that review comment: it sits under it, indented, and needs no path or line of its own; the thread can go on from there (the reviewer replies to a note with c or its reply button, and the reply carries "re A3"). Answering a comment does not resolve it. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
@@ -99,6 +100,7 @@ def main(args: Args) -> None:
     if args.watch:
         watch(args, out, page)
         return
+    drop_watch_record(out)
     # a derived page is the throwaway case, so serve it: the url this prints should be
     # one you can comment on, not a read-only file
     url = page_url(out) if args.open or derived else f"file://{out.resolve()}"
@@ -485,17 +487,6 @@ def start_hub(origin: str) -> str:
     return f"the container hub did not come up at {origin} within 45 s; see {where}"
 
 
-def bind_local(handler_cls, seed: str):
-    """Loopback on a port derived from seed, so the origin stays stable across relaunches."""
-    from http.server import ThreadingHTTPServer
-
-    derived = 41000 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 4000
-    try:
-        return ThreadingHTTPServer(("127.0.0.1", derived), handler_cls)
-    except OSError:
-        return ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-
-
 def local_request(handler) -> bool:
     """Binding to loopback stops remote sockets, not a web page that points a name at 127.0.0.1."""
     host = (handler.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
@@ -524,7 +515,7 @@ def write_refusal(handler) -> tuple[int, bytes] | None:
     return None
 
 
-BESIDE = (".state.json", ".summary.json")   # what diffview keeps beside a page
+BESIDE = (".state.json", ".summary.json", ".watch.json")   # what diffview keeps beside a page for the page to read
 
 
 def page_beside(target: Path, kinds: tuple[str, ...] = BESIDE) -> Path | None:
@@ -582,93 +573,36 @@ def write_state(target: Path, raw: bytes) -> tuple[int, bytes]:
 
 
 def watch(args: Args, out: Path, page: dict) -> None:
-    """Serve the page on localhost, regenerate when the sources change, let the page live-reload."""
-    from http.server import BaseHTTPRequestHandler
-
+    """Regenerate when the sources change; the hub serves the page, which reloads itself off the watch record."""
+    if (held_by := watch_record(out)) and held_by["alive"]:
+        sys.exit(f"diffview: {out} is already watched by another diffview --watch; stop that one first")
+    restore_request(out)
     summary = page["summary"]
     expecting = page["summaryPending"]  # the first build asked for a summary that is still being written
     if expecting:
         args.auto_summary = False  # asked once; never re-pay per rebuild
-    version = {"g": page["generated"], "k": str(out.resolve())}
-    rewrite = threading.Event()   # the page asked for the summary to be written again; the loop below does it
-    superseded: dict = {}         # the sidecar that request replaced, kept for when the model call fails
-
-    class Handler(BaseHTTPRequestHandler):
-        timeout = REQUEST_TIMEOUT
-
-        def do_GET(self):
-            if not local_request(self):
-                self.send_response(403)
-                self.end_headers()
-                return
-            if self.path == "/version":
-                body = json.dumps(version).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-            elif self.path.endswith(".summary.json") or self.path.endswith(".state.json"):
-                sidecar = summary_path(out) if self.path.endswith(".summary.json") else state_path(out)
-                try:
-                    body = sidecar.read_bytes()
-                except FileNotFoundError:
-                    body = b"null"   # nothing written beside the page yet, as a --serve server answers it
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-            else:
-                body = out.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self):
-            if refused := write_refusal(self):
-                self.send_response(refused[0])
-                self.end_headers()
-                return
-            if self.path == "/summary":
-                superseded.update(load_sidecar(out))
-                summary_path(out).unlink(missing_ok=True)   # gone before the page starts polling, so it waits for the new one
-                rewrite.set()
-                self.send_response(204)
-                self.end_headers()
-                return
-            if not self.path.endswith(".state.json"):
-                self.send_response(404)
-                self.end_headers()
-                return
-            code, body = write_state(state_path(out), self.rfile.read(int(self.headers["Content-Length"])))
-            self.send_response(code)
-            if body:
-                self.send_header("Content-Type", "application/json" if code == 409 else "text/plain")
-                self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *_):
-            pass
-
-    server = bind_local(Handler, " ".join(args.sources))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    watched = watched_paths(args)
+    held = publish_watch(out, {"g": page["generated"], "watches": watched}, None)
+    url = page_url(out)
     last = sources_sig(args)   # taken before the announcement, so "watching" means: from here on
-    print(f"diffview: watching {len(args.sources)} source(s); live page at {url}  (Ctrl-C stops)", flush=True)
+    where = f"live page at {url}" if url.startswith("http") else f"page at {url}, which does not reload itself"
+    print(f"diffview: watching {len(args.sources)} source(s); {where}  (Ctrl-C stops)", flush=True)
     if args.open:
         launch(url)
 
     try:
         while True:
             time.sleep(2)
+            # a removed worktree is the end of the work this page followed, not a state to wait out
+            if gone := next((p for p in watched if not Path(p).exists()), None):
+                print(f"diffview: {gone} is gone; watch stopped, the written file stays valid", flush=True)
+                return
             try:
-                if rewrite.is_set():
-                    rewrite.clear()
+                if (superseded := take_request(out)) is not None:
                     text, page = rewrite_summary(args, out, superseded)
                     if page:
                         summary = text
-                        version["g"] = page["generated"]
-                    superseded.clear()
-                    superseded.update(load_sidecar(out))   # a request that arrived mid-call found no sidecar to keep
+                        held = publish_watch(out, {"g": page["generated"], "watches": watched}, held)
                 sig = sources_sig(args)
                 if sig == last:
                     continue
@@ -676,7 +610,7 @@ def watch(args: Args, out: Path, page: dict) -> None:
                 if expecting and not summary:   # only a summary this run asked for; a sidecar left by an earlier round is not one
                     summary = load_summary(out)
                 page = build(args, out, summary, awaiting=expecting and not summary)
-                version["g"] = page["generated"]
+                held = publish_watch(out, {"g": page["generated"], "watches": watched}, held)
                 if args.auto_summary and page["summaryPending"]:  # the first build with anything in it asks for the summary
                     expecting, args.auto_summary = True, False
                 print(f"diffview: sources changed, regenerated ({datetime.now():%H:%M:%S})", flush=True)
@@ -685,6 +619,129 @@ def watch(args: Args, out: Path, page: dict) -> None:
                 print(f"diffview: sources unreadable right now, still serving the last page ({e})", flush=True)
     except KeyboardInterrupt:
         print("\ndiffview: watch stopped; the written file stays valid")
+
+
+def watched_paths(args: Args) -> list[str]:
+    """The directories and files the sources are read from: the repos, or both sides of an OLD=NEW."""
+    paths = []
+    for spec in args.sources:
+        if "=" in spec and ".." not in spec.split("=")[0]:
+            paths += [str(Path(p).expanduser().resolve()) for p in spec.split("=", 1)]
+        else:
+            paths.append(str(Path(spec.rsplit("@", 1)[0] if "@" in spec else ".").expanduser().resolve()))
+    return list(dict.fromkeys(paths))
+
+
+def watch_path(out: Path) -> Path:
+    return Path(str(out) + ".watch.json")
+
+
+def request_path(out: Path) -> Path:
+    return Path(str(out) + ".summary.request.json")
+
+
+def publish_watch(out: Path, record: dict, held: int | None) -> int:
+    """Write the watch record beside the page and hold it locked for as long as this watcher runs: a lock
+    goes with its process, a killed one included, so whoever reads the record can tell a live watcher from
+    one that exited. The record is replaced whole, and the new file is locked before it replaces the old
+    one, which is let go only after; so the record in place is never unlocked while the watcher lives.
+    Returns the descriptor now held."""
+    target = watch_path(out)
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.write(fd, json.dumps(record).encode())
+    os.replace(tmp, target)
+    if held is not None:
+        os.close(held)
+    return fd
+
+
+def watch_record(out: Path) -> dict | None:
+    """The watch record beside a page, with "alive" saying whether its watcher still runs; None for a page
+    no watcher ever wrote."""
+    target = watch_path(out)
+    for _ in range(10):
+        try:
+            fd = os.open(target, os.O_RDONLY)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as f:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                alive = False
+            except BlockingIOError:
+                alive = True
+            try:
+                current = os.stat(target).st_ino == os.fstat(fd).st_ino
+            except FileNotFoundError:
+                current = False
+            if not alive and not current:
+                continue   # unlocked because the watcher had just moved its record on: read the new one
+            raw = f.read()
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            return None
+        return {**record, "alive": alive} if isinstance(record, dict) else None
+    return None
+
+
+def drop_watch_record(out: Path) -> None:
+    """A page rendered again without --watch is no longer watched; a record left by an exited watcher goes."""
+    if (record := watch_record(out)) and not record["alive"]:
+        watch_path(out).unlink(missing_ok=True)
+
+
+def watched_repo_gone(out: Path) -> bool:
+    """The page was watched and a source it was read from has been removed: its worktree merged and gone."""
+    record = watch_record(out)
+    return bool(record) and any(not Path(p).exists() for p in record.get("watches") or [])
+
+
+SUMMARY_REQUEST = threading.Lock()
+
+
+def request_summary(out: Path) -> bool:
+    """Ask the page's watcher to write its summary again; False when no watcher runs to do it.
+
+    The sidecar moves into the request, so a page polling for the new summary waits for it rather than
+    reading the old one back, and the watcher still has the old one to put back when the model call fails."""
+    if not ((record := watch_record(out)) and record["alive"]):
+        return False
+    with SUMMARY_REQUEST:
+        request = request_path(out)
+        if not request.exists():   # a request already waiting is the same request
+            try:
+                os.replace(summary_path(out), request)
+            except FileNotFoundError:
+                request.write_text("{}")
+    return True
+
+
+def take_request(out: Path) -> dict | None:
+    """The summary a request superseded, once the request is taken; None when nothing asked."""
+    request = request_path(out)
+    try:
+        raw = request.read_text()
+    except FileNotFoundError:
+        return None
+    request.unlink(missing_ok=True)
+    try:
+        superseded = json.loads(raw)
+    except ValueError:
+        superseded = {}
+    # asked again while a rewrite ran, the request found no sidecar: the one that rewrite left is the old one now
+    return superseded if isinstance(superseded, dict) and superseded else load_sidecar(out)
+
+
+def restore_request(out: Path) -> None:
+    """A request an exited watcher never took: the page that made it is no longer waiting, so the summary it
+    moved aside goes back."""
+    request = request_path(out)
+    if request.exists() and not summary_path(out).exists() and request.read_text().strip() not in ("", "{}"):
+        os.replace(request, summary_path(out))
+    request.unlink(missing_ok=True)
 
 
 def rewrite_summary(args: Args, out: Path, previous: dict) -> tuple[str, dict | None]:

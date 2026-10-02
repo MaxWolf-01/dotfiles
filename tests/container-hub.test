@@ -10,6 +10,7 @@ One hub on a free port, never 8377, with HOME and its state in a scratch directo
 beta, each with an agent repo whose tickets were committed by sessions (a `Session:` trailer).
 """
 
+import contextlib
 import http.client
 import json
 import os
@@ -123,6 +124,29 @@ def open_page(target, session: str | None = None, **extra) -> dict:
 
 def view(key: str) -> tuple[int, dict]:
     return request("GET", "/api/c/" + urllib.parse.quote(key, safe=""))
+
+
+def listening_ports(root: int) -> list[int]:
+    """The TCP ports a process and every process under it listen on, read from /proc."""
+    children: dict[int, list[int]] = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            pid, rest = stat.read_text().split(" ", 1)
+        except OSError:
+            continue
+        children.setdefault(int(rest.rsplit(")", 1)[1].split()[1]), []).append(int(pid))
+    tree, todo = set(), [root]
+    while todo:
+        tree.add(pid := todo.pop())
+        todo += children.get(pid, [])
+    sockets = set()
+    for pid in tree:
+        for fd in Path(f"/proc/{pid}/fd").glob("*"):
+            with contextlib.suppress(OSError):
+                if (link := os.readlink(fd)).startswith("socket:["):
+                    sockets.add(link[len("socket:["):-1])
+    return [int(f[1].rsplit(":", 1)[1], 16) for table in ("/proc/net/tcp", "/proc/net/tcp6")
+            for f in (line.split() for line in Path(table).read_text().splitlines()[1:]) if f[3] == "0A" and f[9] in sockets]
 
 
 # --------------------------------------------------------------------------
@@ -361,6 +385,39 @@ try:
     check("claude-browser --container puts the page there", 200, view("picked")[0])
     check("the hub's own pages open as tabs, not members", [ORIGIN + "/"], browse(ORIGIN + "/")[1:])
     check("...so no container holds them", 404, view("loose")[0])
+
+    # --- a watched diffview: in the group of the session that started it, while its worktree exists
+
+    worktree = HOME / "repos" / "alpha-csv-import"
+    git(alpha, "worktree", "add", "-q", "-b", "csv-import", str(worktree))
+    (worktree / "notes.txt").write_text("one\ntwo\n")
+    watcher = subprocess.Popen([BIN / "diffview", f"{worktree}@HEAD..", "--watch", "--open", "--no-auto-summary"],
+                               cwd=alpha, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                               env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
+                                    "DIFFVIEW_BROWSER": "claude-browser", "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+    try:
+        said = []
+        while (line := watcher.stdout.readline()) and "watching" not in line:
+            said.append(line)
+        live = line.split("live page at ")[-1].split()[0] if "live page at " in line else line
+        check("--watch prints the hub's address of its page", True, live.startswith(f"{ORIGIN}/f/"))
+        check("...and its watcher listens on no port", [], listening_ports(watcher.pid))
+        watched = Path(urllib.parse.unquote(urllib.parse.urlsplit(live).path.removeprefix("/f")))
+        home_of = open_page(note, ORCHESTRATOR, cwd=str(alpha))["container"]   # where that session's pages go
+        member = lambda: next((m for m in view(home_of)[1].get("members", []) if m["path"] == str(watched)), None)
+        deadline = time.monotonic() + 30
+        while not member() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        check("--watch --open puts the page in the group of the session that started it", ORCHESTRATOR, (member() or {}).get("group"))
+        check("the hub says its watcher runs", True, request("GET", member()["url"] + ".watch.json")[1].get("alive"))
+        git(alpha, "worktree", "remove", "--force", str(worktree))
+        check("the watcher stops once its worktree is removed", 0, watcher.wait(timeout=30))
+        check("...and the page leaves its container", None, member())
+        check("...though its file stays", True, watched.is_file())
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(watcher.pid, signal.SIGKILL)   # `uv run` leads the group; the watcher is its child
+        watcher.wait()
     # --- a damaged state file
 
     (SCRATCH / "state/containers/damaged.json").write_text("{not json")
