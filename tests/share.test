@@ -1,0 +1,476 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro>=1.0.14"]
+# ///
+"""Check bin/share. Run it directly; no framework.
+
+P1 to P6 are the properties of the share-html-pages-privately ticket in the
+agent repo. Three seams, as the ticket names them:
+
+- root: share against a temporary root, its deploy replaced by a stub that
+  keeps a copy of every public/ it is handed. The oracle is the tree and
+  shares.json, read back. The password check runs the real StatiCrypt.
+- site: `wrangler dev` serving a root share built, fetched over HTTP.
+- deploy (only with --deploy): one share put on share.mwolf.dev for real,
+  fetched from pc, removed, and fetched again. It needs the Cloudflare token
+  and ssh to pc, and leaves the site with no shares, whatever happens.
+
+StatiCrypt and wrangler come through npx, which needs the network the first
+time each runs.
+
+Examples:
+
+    tests/share.test
+    tests/share.test --only root
+    tests/share.test --deploy
+"""
+
+import json
+import os
+import pty
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+import tyro
+
+REPO = Path(__file__).resolve().parent.parent
+SHARE = REPO / "bin" / "share"
+MIB = 2**20
+PLAIN = "plain-words-only-the-password-reveals"
+PAGE = f"""<!doctype html><html><head><title>Anzeiger &amp; contacts</title>
+<meta property="og:title" content="Anzeiger contacts"></head><body><p>{PLAIN}</p></body></html>"""
+WANTED_HEADERS = {"x-robots-tag": "noindex, nofollow", "referrer-policy": "no-referrer"}
+
+
+@dataclass
+class Args:
+    only: list[Literal["root", "site", "deploy"]] = field(default_factory=list)
+    """Run only these seams."""
+    deploy: bool = False
+    """Also deploy to share.mwolf.dev for real and fetch it from pc."""
+    keep: bool = False
+    """Keep the work directory and print where it is."""
+
+
+class Counterexample(AssertionError):
+    pass
+
+
+def expect(holds: bool, what: str) -> None:
+    if not holds:
+        raise Counterexample(what)
+
+
+CHECKS: list[tuple[str, str, object]] = []
+
+
+def check(seam: str, says: str):
+    def register(fn):
+        CHECKS.append((seam, says, fn))
+        return fn
+
+    return register
+
+
+# Stands in for wrangler: keeps a copy of public/ and the config for every deploy, in order.
+# $SHARE_TEST_FAIL makes it fail the way a deploy without a network does.
+WRANGLER_STUB = r"""#!/usr/bin/env bash
+[ -n "$SHARE_TEST_FAIL" ] && { echo "stub wrangler: no network" >&2; exit 1; }
+[ "$1" = deploy ] || { echo "stub wrangler: unexpected $*" >&2; exit 1; }
+n=$(ls "$SHARE_TEST_DEPLOYS" | wc -l)
+mkdir -p "$SHARE_TEST_DEPLOYS/$n"
+cp -r public "$SHARE_TEST_DEPLOYS/$n/public"
+cp "$3" "$SHARE_TEST_DEPLOYS/$n/wrangler.json"
+"""
+
+
+class Work:
+    def __init__(self, tmp: Path):
+        self.tmp = tmp
+        self.root = tmp / "root"
+        self.deploys = tmp / "deploys"
+        self.deploys.mkdir()
+        self.stub = tmp / "wrangler"
+        self.stub.write_text(WRANGLER_STUB)
+        self.stub.chmod(0o755)
+        self.files = tmp / "files"
+        self.files.mkdir()
+        self.share("init")
+
+    def env(self, **extra: str) -> dict[str, str]:
+        return {**os.environ, "SHARE_ROOT": str(self.root), "SHARE_WRANGLER": str(self.stub),
+                "SHARE_TEST_DEPLOYS": str(self.deploys), **extra}
+
+    def share(self, *args: str, ok: bool = True, stdin: str | None = None, **env: str) -> subprocess.CompletedProcess:
+        r = subprocess.run([str(SHARE), *args], env=self.env(**env), capture_output=True, text=True,
+                           input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL, timeout=600)
+        if ok:
+            expect(r.returncode == 0, f"share {' '.join(args)} exited {r.returncode}: {r.stderr[-1500:]}")
+        return r
+
+    def file(self, name: str, text: str = PAGE) -> Path:
+        p = self.files / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return p
+
+    def put(self, path: Path, *flags: str) -> str:
+        url = self.share(str(path), *flags).stdout.strip()
+        m = re.fullmatch(r"https://share\.mwolf\.dev/([^/]+)/", url)
+        expect(m is not None, f"share printed {url!r}, not one URL")
+        return m.group(1)
+
+    def shares(self) -> list[dict]:
+        return json.loads((self.root / "shares.json").read_text())
+
+    def last_deploy(self) -> Path:
+        return self.deploys / str(len(list(self.deploys.iterdir())) - 1)
+
+    def deploy_count(self) -> int:
+        return len(list(self.deploys.iterdir()))
+
+
+def tree(d: Path) -> dict[str, bytes]:
+    return {str(p.relative_to(d)): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+# --- the root, with the deploy stubbed
+
+
+@check("root", "a single page becomes <id>/index.html, recorded in shares.json, and the deploy is the root's public/")
+def single_page(w: Work) -> None:
+    sid = w.put(w.file("contacts.html"))
+    expect((w.root / "public" / sid / "index.html").read_text() == PAGE, "the page is not at <id>/index.html as it was")
+    entry = [s for s in w.shares() if s["id"] == sid]
+    expect(len(entry) == 1, f"shares.json has {len(entry)} entries for {sid}")
+    e = entry[0]
+    expect(e["title"] == "Anzeiger & contacts", f"the title was recorded as {e['title']!r}")
+    expect(e["source"] == str(w.files / "contacts.html") and e["password"] is False, f"recorded {e}")
+    expect(e["url"] == f"https://share.mwolf.dev/{sid}/", f"recorded the url {e['url']}")
+    expect(tree(w.last_deploy() / "public") == tree(w.root / "public"), "the deploy was handed something other than public/")
+
+
+@check("root", "a file keeps its name and a folder its layout under the share; shares.json never reaches public/")
+def layouts(w: Work) -> None:
+    pdf = w.put(w.file("invoice.pdf", "%PDF-1.4"))
+    expect(os.listdir(w.root / "public" / pdf) == ["invoice.pdf"], f"the file became {os.listdir(w.root / 'public' / pdf)}")
+    folder = w.files / "talk"
+    w.file("talk/index.html")
+    w.file("talk/img/a.svg", "<svg/>")
+    sid = w.put(folder)
+    expect(tree(w.root / "public" / sid) == tree(folder), "the folder's contents did not arrive as they are")
+    deployed = tree(w.last_deploy() / "public")
+    expect(not any("shares.json" in k for k in deployed), "shares.json was deployed")
+    expect(deployed.get("_headers", b"").decode().split() == "/* X-Robots-Tag: noindex, nofollow Referrer-Policy: no-referrer".split(),
+           f"_headers is {deployed.get('_headers')!r}")
+
+
+@check("root", "P4: ids are at least 96 random bits, and never repeat")
+def p4_ids(w: Work) -> None:
+    ids = [w.put(w.file(f"p4-{i}.html")) for i in range(4)]
+    expect(len(set(ids)) == len(ids), f"ids repeat: {ids}")
+    for i in ids:
+        # 96 bits: 24 hex digits, 16 base64url characters; anything shorter cannot hold them
+        expect(len(i) >= 24 and re.fullmatch(r"[0-9a-f]+", i) or len(i) >= 16 and re.fullmatch(r"[A-Za-z0-9_-]+", i),
+               f"the id {i!r} cannot hold 96 bits")
+    source = SHARE.read_text()
+    expect("secrets.token_" in source and "random." not in source, "ids are not drawn with secrets")
+
+
+@check("root", "P6: a file over 25 MiB is refused before anything is uploaded, naming SFTPGo")
+def p6_large(w: Work) -> None:
+    before, deploys = tree(w.root), w.deploy_count()
+    big = w.files / "big"
+    big.mkdir()
+    w.file("big/index.html")
+    with open(big / "audio.opus", "wb") as f:
+        f.truncate(25 * MIB + 1)
+    r = w.share(str(big), ok=False)
+    expect(r.returncode != 0, "a folder holding a file of 25 MiB and a byte was shared")
+    expect("SFTPGo" in r.stderr and "audio.opus" in r.stderr, f"the refusal says {r.stderr!r}")
+    expect(w.deploy_count() == deploys and tree(w.root) == before, "the refusal deployed or changed the root")
+    (big / "audio.opus").unlink()
+    with open(big / "audio.opus", "wb") as f:
+        f.truncate(25 * MIB)
+    w.put(big)
+
+
+@check("root", "--replace puts new content behind the same URL, and drops what the old content had")
+def replace(w: Work) -> None:
+    folder = w.files / "report"
+    w.file("report/index.html")
+    w.file("report/old.png", "old")
+    sid = w.put(folder)
+    (folder / "old.png").unlink()
+    w.file("report/index.html", PAGE.replace("contacts", "contacts, second edition"))
+    again = w.put(folder, "--replace", sid)
+    expect(again == sid, f"--replace made a new id {again}")
+    expect(tree(w.root / "public" / sid) == tree(folder), "the share does not hold exactly the new content")
+    entries = [s for s in w.shares() if s["id"] == sid]
+    expect(len(entries) == 1 and "second edition" in entries[0]["title"], f"shares.json holds {entries}")
+    r = w.share(str(folder), "--replace", "f" * 32, ok=False)
+    expect(r.returncode != 0 and "no share" in r.stderr, f"--replace of an unknown id: {r.returncode} {r.stderr!r}")
+
+
+@check("root", "P3: rm takes a share out of public/, shares.json and the next deploy, and leaves the others")
+def p3_rm(w: Work) -> None:
+    keep, gone = w.put(w.file("keep.html")), w.put(w.file("gone.html"))
+    w.share("rm", gone)
+    expect(not (w.root / "public" / gone).exists(), "the removed share is still in public/")
+    expect(gone not in {s["id"] for s in w.shares()} and keep in {s["id"] for s in w.shares()}, "shares.json is wrong after rm")
+    deployed = tree(w.last_deploy() / "public")
+    expect(not any(k.startswith(gone) for k in deployed), "the deploy after rm still holds the share")
+    expect(f"{keep}/index.html" in deployed, "the deploy after rm dropped a share the root holds")
+    expect({k.split("/")[0] for k in deployed} - {"_headers"} == {s["id"] for s in w.shares()},
+           "the deployed shares are not the shares in shares.json")
+
+
+@check("root", "P3: a failed deploy leaves the root as it was, so the root stays what is deployed")
+def p3_failed(w: Work) -> None:
+    sid = w.put(w.file("stays.html"))
+    before = (tree(w.root / "public"), w.shares())
+    r = w.share(str(w.file("never.html")), ok=False, SHARE_TEST_FAIL="1")
+    expect(r.returncode != 0, "share succeeded with the deploy failing")
+    expect((tree(w.root / "public"), w.shares()) == before, "a failed put changed the root")
+    r = w.share(str(w.file("stays.html", "new")), "--replace", sid, ok=False, SHARE_TEST_FAIL="1")
+    expect((tree(w.root / "public"), w.shares()) == before, "a failed --replace changed the root")
+    r = w.share("rm", sid, ok=False, SHARE_TEST_FAIL="1")
+    expect((tree(w.root / "public"), w.shares()) == before, "a failed rm changed the root")
+
+
+@check("root", "no root, no share: a machine without one is refused, not given a fresh one")
+def no_root(w: Work) -> None:
+    r = w.share(str(w.file("x.html")), ok=False, SHARE_ROOT=str(w.tmp / "nowhere"))
+    expect(r.returncode != 0 and "share init" in r.stderr, f"without a root: {r.returncode} {r.stderr!r}")
+    expect(not (w.tmp / "nowhere").exists(), "share made a root of its own")
+
+
+@check("root", "P5: a password share's page reaches public/ only as StatiCrypt's output, under its generic title")
+def p5_password(w: Work) -> None:
+    folder = w.files / "secret"
+    secret = "words-only-this-password-reveals"
+    w.file("secret/index.html", PAGE.replace(PLAIN, secret))
+    w.file("secret/sub/more.html", PAGE.replace(PLAIN, secret))
+    # getpass reads the terminal, so the password goes in through a pty
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execve(str(SHARE), [str(SHARE), str(folder), "--password"], w.env())
+    out = b""
+    for prompt in (b"password: ", b"again: "):
+        while not out.endswith(prompt):
+            out += os.read(fd, 1)
+        os.write(fd, b"pw\n")
+    while True:
+        try:
+            chunk = os.read(fd, 1024)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    _, status = os.waitpid(pid, 0)
+    expect(os.waitstatus_to_exitcode(status) == 0, f"share --password failed: {out.decode(errors='replace')[-1500:]}")
+    sid = re.search(rb"https://share\.mwolf\.dev/([0-9a-f]+)/", out).group(1).decode()
+    for page in ("index.html", "sub/more.html"):
+        text = (w.root / "public" / sid / page).read_text()
+        expect("staticrypt" in text and secret not in text, f"{page} is not StatiCrypt's output")
+        expect("<title>Protected Page</title>" in text and "Anzeiger" not in text, f"{page} gives its title away")
+    for p in w.root.rglob("*"):
+        expect(not p.is_file() or secret.encode() not in p.read_bytes(), f"the plain page was written to {p}")
+    expect([s["password"] for s in w.shares() if s["id"] == sid] == [True], "shares.json does not mark the share as a password one")
+
+
+# --- the site, as wrangler dev serves a root
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Response:
+    def __init__(self, status: int, headers: dict[str, str], body: bytes):
+        self.status, self.headers, self.body = status, headers, body
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
+def fetch(url: str, headers: dict[str, str] | None = None) -> Response:
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=30) as r:
+            return Response(r.status, {k.lower(): v for k, v in r.headers.items()}, r.read())
+    except urllib.error.HTTPError as e:
+        return Response(e.code, {k.lower(): v for k, v in e.headers.items()}, e.read())
+
+
+def site_checks(base: str, sid: str, audio: bytes, ranges_required: bool) -> list[str]:
+    """The served site's checks against base; returns the notes worth reporting."""
+    notes = []
+    responses = {path: fetch(base + path) for path in ("/", "/robots.txt", "/" + "0" * 32 + "/", f"/{sid}", f"/{sid}/", f"/{sid}/audio.opus", "/_headers")}
+    for path in ("/", "/robots.txt", "/" + "0" * 32 + "/", "/_headers"):
+        expect(responses[path].status == 404, f"P1: {path} answered {responses[path].status}, not 404")
+    for path, r in responses.items():
+        for name, value in WANTED_HEADERS.items():
+            expect(r.headers.get(name) == value, f"P2: {path} ({r.status}) carries {name}: {r.headers.get(name)!r}")
+    page = responses[f"/{sid}/"]
+    expect(page.status == 200 and page.headers.get("content-type", "").startswith("text/html"), f"the page answered {page.status} {page.headers.get('content-type')}")
+    expect("attachment" not in page.headers.get("content-disposition", ""), "the page is sent as an attachment")
+    expect(PLAIN.encode() in page.body, "the page is not the one shared")
+    expect(responses[f"/{sid}"].status in (301, 302, 307, 308) and responses[f"/{sid}"].headers.get("location", "").endswith(f"/{sid}/"),
+           f"/{sid} answered {responses[f'/{sid}'].status}, not a redirect to /{sid}/")
+    expect(responses[f"/{sid}/audio.opus"].body == audio, "the audio is not the one shared")
+    r = fetch(f"{base}/{sid}/audio.opus", {"Range": "bytes=1000-1999"})
+    if r.status == 206:
+        expect(r.body == audio[1000:2000], "the range answered other bytes")
+    elif ranges_required:
+        raise Counterexample(f"a Range request on the audio answered {r.status}, not 206 Partial Content")
+    else:
+        notes.append(f"a Range request on the audio answered {r.status} with {len(r.body)} bytes, not 206")
+    return notes
+
+
+@check("site", "P1, P2 and a page served as a page, by wrangler dev over a real root")
+def site(w: Work) -> list[str]:
+    folder = w.files / "site"
+    w.file("site/index.html")
+    audio = secrets.token_bytes(300_000)
+    (folder / "audio.opus").write_bytes(audio)
+    sid = w.put(folder)
+    port = free_port()
+    # its own process group, so stopping it stops the workerd processes it starts
+    dev = subprocess.Popen(["npx", "--yes", "wrangler@4.140.0", "dev", "--config", str(w.root / "wrangler.json"),
+                            "--ip", "127.0.0.1", "--port", str(port)],
+                           cwd=w.root, env={**os.environ, "WRANGLER_SEND_METRICS": "false"},
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        base = f"http://127.0.0.1:{port}"
+        for _ in range(240):
+            try:
+                urllib.request.urlopen(base + "/", timeout=2)
+                break
+            except urllib.error.HTTPError:
+                break
+            except OSError:
+                expect(dev.poll() is None, f"wrangler dev exited {dev.returncode}")
+                time.sleep(0.5)
+        return site_checks(base, sid, audio, ranges_required=False)
+    finally:
+        os.killpg(dev.pid, signal.SIGTERM)
+        try:
+            dev.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(dev.pid, signal.SIGKILL)
+
+
+# --- one real deploy
+
+
+def from_pc(url: str, *curl: str) -> str:
+    """curl on pc: the laptop's DNS goes through the exit node."""
+    r = subprocess.run(["ssh", "pc", "nix", "shell", "nixpkgs#curl", "-c", "curl", "-sS", "--max-time", "30", *curl, url],
+                       capture_output=True, text=True, timeout=300)
+    expect(r.returncode == 0, f"curl {url} on pc exited {r.returncode}: {r.stderr[-500:]}")
+    return r.stdout
+
+
+@check("deploy", "P1, P2, P3 on share.mwolf.dev: a share fetched from pc, removed, and gone")
+def real(w: Work) -> list[str]:
+    root = w.tmp / "real"
+    env = {**os.environ, "SHARE_ROOT": str(root)}
+    env.pop("SHARE_WRANGLER", None)
+    sh = lambda *a: subprocess.run([str(SHARE), *a], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=900)
+    expect(sh("init").returncode == 0, "init failed")
+    folder = w.files / "real"
+    w.file("real/index.html")
+    audio = secrets.token_bytes(300_000)
+    (folder / "audio.opus").write_bytes(audio)
+    r = sh(str(folder))
+    expect(r.returncode == 0, f"the real deploy failed: {r.stderr[-1500:]}")
+    sid = r.stdout.strip().rstrip("/").rsplit("/", 1)[-1]
+    notes = []
+    try:
+        base = "https://share.mwolf.dev"
+        for _ in range(30):
+            if "200" in from_pc(f"{base}/{sid}/", "-o", "/dev/null", "-w", "%{http_code}"):
+                break
+            time.sleep(10)
+        heads = {}
+        for path in ("/", "/robots.txt", "/" + "0" * 32 + "/", f"/{sid}", f"/{sid}/", f"/{sid}/audio.opus"):
+            raw = from_pc(base + path, "-D", "-", "-o", "/dev/null")
+            status = int(raw.split()[1])
+            hs = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in raw.splitlines()[1:] if ":" in l)}
+            heads[path] = (status, hs)
+        for path in ("/", "/robots.txt", "/" + "0" * 32 + "/"):
+            expect(heads[path][0] == 404, f"P1: {path} answered {heads[path][0]}")
+        for path, (status, hs) in heads.items():
+            for name, value in WANTED_HEADERS.items():
+                expect(hs.get(name) == value, f"P2: {path} ({status}) carries {name}: {hs.get(name)!r}")
+        status, hs = heads[f"/{sid}/"]
+        expect(status == 200 and hs.get("content-type", "").startswith("text/html") and "attachment" not in hs.get("content-disposition", ""),
+               f"the page answered {status} {hs.get('content-type')} {hs.get('content-disposition')}")
+        expect(PLAIN in from_pc(f"{base}/{sid}/"), "the page served is not the one shared")
+        ranged = from_pc(f"{base}/{sid}/audio.opus", "-D", "-", "-o", "/dev/null", "-H", "Range: bytes=1000-1999")
+        notes.append(f"Range on the deployed audio: {ranged.splitlines()[0].strip()}, "
+                     f"{next((l.strip() for l in ranged.splitlines() if l.lower().startswith('content-range')), 'no Content-Range')}")
+        # the account's other addresses: workers.dev must not resolve to the Worker
+        sub = subprocess.run(["ssh", "pc", "nix", "shell", "nixpkgs#curl", "-c", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                              "--max-time", "20", f"https://share.{os.environ.get('SHARE_TEST_WORKERS_SUBDOMAIN', 'invalid')}.workers.dev/{sid}/"],
+                             capture_output=True, text=True, timeout=120).stdout
+        notes.append(f"workers.dev address answered {sub or 'nothing'}")
+    finally:
+        r = sh("rm", sid)
+        expect(r.returncode == 0, f"removing the real share failed, so it is still online: {r.stderr[-1500:]}")
+    for _ in range(30):
+        code = from_pc(f"{base}/{sid}/", "-o", "/dev/null", "-w", "%{http_code}")
+        if code == "404":
+            break
+        time.sleep(10)
+    expect(code == "404", f"P3: after rm the share answers {code}")
+    return notes
+
+
+def main(args: Args) -> int:
+    seams = args.only or ["root", "site", *(["deploy"] if args.deploy else [])]
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="share-test-", delete=not args.keep) as tmp:
+        w = Work(Path(tmp))
+        for seam, says, fn in CHECKS:
+            if seam not in seams:
+                continue
+            try:
+                notes = fn(w) or []
+                print(f"ok   {seam}: {says}")
+                for n in notes:
+                    print(f"       note: {n}")
+            except Counterexample as exc:
+                failures += 1
+                print(f"FAIL {seam}: {says}\n       {exc}")
+            except Exception:
+                failures += 1
+                print(f"FAIL {seam}: {says}\n{traceback.format_exc()}")
+        if args.keep:
+            print(f"kept {tmp}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(tyro.cli(Args, description=__doc__, config=(tyro.conf.OmitArgPrefixes,))))
