@@ -132,6 +132,13 @@ The only service on pc with a public (non-tailnet) surface. Manage accounts with
 `bin/sftpgo-user`. Bootstrap, operational traps and how to debug a dead public
 URL: `docs/sftpgo.md`. Why each setting is what it is: `nix/nixos/pc/sftpgo.nix`.
 
+## Sharing a page
+
+`bin/share` puts an HTML page, a file or a folder online at `share.mwolf.dev`,
+behind a random path, until `share rm` takes it down; it runs on the laptop,
+which holds the share root. What it refuses goes to the SFTPGo drop.
+`share --help` says how.
+
 
 ## DNS
 
