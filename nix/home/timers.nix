@@ -13,8 +13,10 @@ let
     bash coreutils yt-dlp openssh
   ]);
 
+  # uv runs lifelog for the collectors' last runs jarvis-sync ships; jq because
+  # bin/run-log builds its line with it.
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh jq # jq: bin/run-log builds its line with it
+    bash coreutils rsync openssh uv jq
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
