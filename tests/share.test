@@ -26,11 +26,13 @@ Examples:
     tests/share.test --deploy
 """
 
+import functools
 import json
 import os
 import pty
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -41,6 +43,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -75,7 +78,7 @@ def expect(holds: bool, what: str) -> None:
         raise Counterexample(what)
 
 
-CHECKS: list[tuple[str, str, object]] = []
+CHECKS: list[tuple[str, str, Callable[["Work"], None]]] = []
 
 
 def check(seam: str, says: str):
@@ -322,9 +325,8 @@ def fetch(url: str, headers: dict[str, str] | None = None) -> Response:
         return Response(e.code, {k.lower(): v for k, v in e.headers.items()}, e.read())
 
 
-def site_checks(base: str, sid: str, audio: bytes, ranges_required: bool) -> list[str]:
-    """The served site's checks against base; returns the notes worth reporting."""
-    notes = []
+def site_checks(base: str, sid: str, audio: bytes) -> None:
+    """The served site's checks against base."""
     responses = {path: fetch(base + path) for path in ("/", "/robots.txt", "/" + "0" * 32 + "/", f"/{sid}", f"/{sid}/", f"/{sid}/audio.opus", "/_headers")}
     for path in ("/", "/robots.txt", "/" + "0" * 32 + "/", "/_headers"):
         expect(responses[path].status == 404, f"P1: {path} answered {responses[path].status}, not 404")
@@ -338,18 +340,22 @@ def site_checks(base: str, sid: str, audio: bytes, ranges_required: bool) -> lis
     expect(responses[f"/{sid}"].status in (301, 302, 307, 308) and responses[f"/{sid}"].headers.get("location", "").endswith(f"/{sid}/"),
            f"/{sid} answered {responses[f'/{sid}'].status}, not a redirect to /{sid}/")
     expect(responses[f"/{sid}/audio.opus"].body == audio, "the audio is not the one shared")
-    r = fetch(f"{base}/{sid}/audio.opus", {"Range": "bytes=1000-1999"})
-    if r.status == 206:
-        expect(r.body == audio[1000:2000], "the range answered other bytes")
-    elif ranges_required:
-        raise Counterexample(f"a Range request on the audio answered {r.status}, not 206 Partial Content")
-    else:
-        notes.append(f"a Range request on the audio answered {r.status} with {len(r.body)} bytes, not 206")
-    return notes
+    # seeking: what a browser asks for first, a range in the middle, the tail, and past the end
+    for asked, status, part, content_range in (
+        ("bytes=0-", 206, audio, f"bytes 0-{len(audio) - 1}/{len(audio)}"),
+        ("bytes=1000-1999", 206, audio[1000:2000], f"bytes 1000-1999/{len(audio)}"),
+        ("bytes=-500", 206, audio[-500:], f"bytes {len(audio) - 500}-{len(audio) - 1}/{len(audio)}"),
+        (f"bytes={len(audio)}-", 416, b"", f"bytes */{len(audio)}"),
+    ):
+        r = fetch(f"{base}/{sid}/audio.opus", {"Range": asked})
+        expect((r.status, r.headers.get("content-range"), r.body) == (status, content_range, part),
+               f"Range {asked} answered {r.status} {r.headers.get('content-range')} with {len(r.body)} bytes")
+        for name, value in WANTED_HEADERS.items():
+            expect(r.headers.get(name) == value, f"P2: the answer to Range {asked} carries {name}: {r.headers.get(name)!r}")
 
 
-@check("site", "P1, P2 and a page served as a page, by wrangler dev over a real root")
-def site(w: Work) -> list[str]:
+@check("site", "P1, P2, a page served as a page and audio that seeks, by wrangler dev over a real root")
+def site(w: Work) -> None:
     folder = w.files / "site"
     w.file("site/index.html")
     audio = secrets.token_bytes(300_000)
@@ -372,7 +378,7 @@ def site(w: Work) -> list[str]:
             except OSError:
                 expect(dev.poll() is None, f"wrangler dev exited {dev.returncode}")
                 time.sleep(0.5)
-        return site_checks(base, sid, audio, ranges_required=False)
+        return site_checks(base, sid, audio)
     finally:
         os.killpg(dev.pid, signal.SIGTERM)
         try:
@@ -384,16 +390,29 @@ def site(w: Work) -> list[str]:
 # --- one real deploy
 
 
-def from_pc(url: str, *curl: str) -> str:
-    """curl on pc: the laptop's DNS goes through the exit node."""
-    r = subprocess.run(["ssh", "pc", "nix", "shell", "nixpkgs#curl", "-c", "curl", "-sS", "--max-time", "30", *curl, url],
+@functools.cache
+def edge_ip() -> str:
+    """share.mwolf.dev's address as Cloudflare's nameserver gives it, asked from pc. pc's own
+    resolver may still hold the name's absence from before the first deploy."""
+    r = subprocess.run(["ssh", "pc", "nix", "shell", "nixpkgs#dig", "-c", "dig", "+short", "share.mwolf.dev", "@haley.ns.cloudflare.com"],
                        capture_output=True, text=True, timeout=300)
-    expect(r.returncode == 0, f"curl {url} on pc exited {r.returncode}: {r.stderr[-500:]}")
+    ips = r.stdout.split()
+    expect(bool(ips), f"Cloudflare's nameserver has no address for share.mwolf.dev: {r.stderr[-300:]}")
+    return ips[0]
+
+
+def from_pc(url: str, *curl: str, ok: bool = True) -> str:
+    """curl on pc, which reaches the site the way a recipient does: the laptop's DNS goes through the exit node."""
+    # ssh hands the remote shell one string, so each argument is quoted into it
+    remote = shlex.join(["nix", "shell", "nixpkgs#curl", "-c", "curl", "-sS", "--max-time", "30",
+                         "--resolve", f"share.mwolf.dev:443:{edge_ip()}", *curl, url])
+    r = subprocess.run(["ssh", "pc", remote], capture_output=True, text=True, errors="replace", timeout=300)
+    expect(r.returncode == 0 or not ok, f"curl {url} on pc exited {r.returncode}: {r.stderr[-500:]}")
     return r.stdout
 
 
 @check("deploy", "P1, P2, P3 on share.mwolf.dev: a share fetched from pc, removed, and gone")
-def real(w: Work) -> list[str]:
+def real(w: Work) -> None:
     root = w.tmp / "real"
     env = {**os.environ, "SHARE_ROOT": str(root)}
     env.pop("SHARE_WRANGLER", None)
@@ -406,20 +425,22 @@ def real(w: Work) -> list[str]:
     r = sh(str(folder))
     expect(r.returncode == 0, f"the real deploy failed: {r.stderr[-1500:]}")
     sid = r.stdout.strip().rstrip("/").rsplit("/", 1)[-1]
-    notes = []
     try:
         base = "https://share.mwolf.dev"
-        for _ in range(30):
-            if "200" in from_pc(f"{base}/{sid}/", "-o", "/dev/null", "-w", "%{http_code}"):
+        # a new version reaches an edge's servers one by one: wait until three fetches in a row see it
+        seen = 0
+        for _ in range(60):
+            seen = seen + 1 if from_pc(f"{base}/{sid}/", "-o", "/dev/null", "-w", "%{http_code}", ok=False) == "200" else 0
+            if seen == 3:
                 break
-            time.sleep(10)
+            time.sleep(5)
         heads = {}
         for path in ("/", "/robots.txt", "/" + "0" * 32 + "/", f"/{sid}", f"/{sid}/", f"/{sid}/audio.opus"):
             raw = from_pc(base + path, "-D", "-", "-o", "/dev/null")
             status = int(raw.split()[1])
             hs = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in raw.splitlines()[1:] if ":" in l)}
             heads[path] = (status, hs)
-        for path in ("/", "/robots.txt", "/" + "0" * 32 + "/"):
+        for path in ("/", "/" + "0" * 32 + "/"):
             expect(heads[path][0] == 404, f"P1: {path} answered {heads[path][0]}")
         for path, (status, hs) in heads.items():
             for name, value in WANTED_HEADERS.items():
@@ -429,23 +450,27 @@ def real(w: Work) -> list[str]:
                f"the page answered {status} {hs.get('content-type')} {hs.get('content-disposition')}")
         expect(PLAIN in from_pc(f"{base}/{sid}/"), "the page served is not the one shared")
         ranged = from_pc(f"{base}/{sid}/audio.opus", "-D", "-", "-o", "/dev/null", "-H", "Range: bytes=1000-1999")
-        notes.append(f"Range on the deployed audio: {ranged.splitlines()[0].strip()}, "
-                     f"{next((l.strip() for l in ranged.splitlines() if l.lower().startswith('content-range')), 'no Content-Range')}")
-        # the account's other addresses: workers.dev must not resolve to the Worker
-        sub = subprocess.run(["ssh", "pc", "nix", "shell", "nixpkgs#curl", "-c", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                              "--max-time", "20", f"https://share.{os.environ.get('SHARE_TEST_WORKERS_SUBDOMAIN', 'invalid')}.workers.dev/{sid}/"],
-                             capture_output=True, text=True, timeout=120).stdout
-        notes.append(f"workers.dev address answered {sub or 'nothing'}")
+        expect(ranged.split()[1] == "206" and f"content-range: bytes 1000-1999/{len(audio)}" in ranged.lower(),
+               f"Range on the deployed audio answered {ranged.splitlines()[0].strip()}")
+        # P1's other addresses: the Worker's own workers.dev name and its preview URLs, as the API reports them
+        api = subprocess.run(["with-secrets", "cloudflare-mwolf-dev-workers", "bash", "-c",
+                              'curl -sS --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" '
+                              'https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/share/subdomain'],
+                             capture_output=True, text=True, timeout=120)
+        sub = json.loads(api.stdout).get("result") or {}
+        expect(sub.get("enabled") is False and sub.get("previews_enabled") is False, f"P1: the Worker's workers.dev settings are {api.stdout[-500:]}")
     finally:
         r = sh("rm", sid)
         expect(r.returncode == 0, f"removing the real share failed, so it is still online: {r.stderr[-1500:]}")
     for _ in range(30):
-        code = from_pc(f"{base}/{sid}/", "-o", "/dev/null", "-w", "%{http_code}")
+        code = from_pc(f"{base}/{sid}/", "-o", "/dev/null", "-w", "%{http_code}", ok=False)
         if code == "404":
             break
         time.sleep(10)
     expect(code == "404", f"P3: after rm the share answers {code}")
-    return notes
+    # last, so the checks above still run: the zone's managed robots.txt (Cloudflare's AI crawl
+    # control) answers here whatever the Worker holds
+    expect(heads["/robots.txt"][0] == 404, f"P1: /robots.txt answered {heads['/robots.txt'][0]}, from the zone's managed robots.txt")
 
 
 def main(args: Args) -> int:
@@ -457,10 +482,8 @@ def main(args: Args) -> int:
             if seam not in seams:
                 continue
             try:
-                notes = fn(w) or []
+                fn(w)
                 print(f"ok   {seam}: {says}")
-                for n in notes:
-                    print(f"       note: {n}")
             except Counterexample as exc:
                 failures += 1
                 print(f"FAIL {seam}: {says}\n       {exc}")
