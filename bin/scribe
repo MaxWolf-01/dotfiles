@@ -58,6 +58,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -242,11 +243,11 @@ def rename(args: RenameArgs) -> None:
 
 @dataclass
 class ShareArgs:
-    """Put a conversation's audio and report on the SFTPGo drop on pc, behind links anyone can open.
+    """Put a conversation's report online with its audio, through `share`, and print the link.
 
-    The uploaded report plays from the audio's link and carries its figures inside it, scaled
-    down, so the page works on its own wherever it goes. The drop deletes a file some months after its upload; share prints the date. A second
-    share uploads the report again and keeps the links. Anyone holding a link can download the file."""
+    The shared page carries its figures inside it, scaled down, and plays the audio beside it.
+    A second share puts the report up again behind the same link, while that share still
+    exists. Anyone holding the link can open the page; `share rm` takes it down."""
 
     folder: Annotated[Path, tyro.conf.Positional]
     """A conversation's folder."""
@@ -255,13 +256,7 @@ class ShareArgs:
 @app.command(name="share")
 def share(args: ShareArgs) -> None:
     folder = open_folder(args.folder)
-    record = put_on_drop(folder)
-    audio, report = record["audio"], record["report"]
-    print(f"report: {report['url']}")
-    print("        Send this link. It downloads the page, which then plays from the audio link.")
-    print(f"audio:  {audio['url']}")
-    print(f"        The drop keeps it until {audio['until']}.")
-    print(f"revoke: sftpgo-share revoke {audio['id']}; sftpgo-share revoke {report['id']}")
+    print(put_online(folder))
 
 
 def open_folder(folder: Path) -> Path:
@@ -676,7 +671,7 @@ def speakers_of(words: list[dict], names: dict[str, dict]) -> tuple[list[dict], 
 
 
 def build_conversation(folder: Path) -> dict:
-    """conversation.json, rebuilt from the cached response, the speaker decisions and the share record."""
+    """conversation.json, rebuilt from the cached response and the speaker decisions."""
     src = load_source(folder)
     response = read_json(folder / "cache" / "scribe.json")
     names_path = folder / "cache" / "names.json"
@@ -690,8 +685,6 @@ def build_conversation(folder: Path) -> dict:
     # talking time orders the people again: strays and merged voices changed it
     air = talking_time(stretches(words))
     speakers.sort(key=lambda sp: (sp["kind"] != "person", -air.get(sp["id"], 0.0)))
-    shared = folder / "cache" / "share.json"
-    audio_link = read_json(shared).get("audio") if shared.exists() else None
     return {
         "meta": {
             "source": src.name,
@@ -703,7 +696,6 @@ def build_conversation(folder: Path) -> dict:
             **({"url": src.url} if src.url else {}),
             "transcription": MODEL,
             "built": dt.datetime.now().isoformat(timespec="seconds"),
-            **({"share": {k: audio_link[k] for k in ("id", "url", "until")}} if audio_link else {}),
         },
         "speakers": speakers,
         "words": words,
@@ -1427,7 +1419,6 @@ def transcript_markdown(conv: dict, an: dict, figs: list[dict]) -> str:
         f"speakers: [{', '.join(sp['name'] for sp in people(conv))}]",
         f"url: {meta['url']}" if meta.get("url") else f"source: {json.dumps(meta['source'], ensure_ascii=False)}",
         f"transcription: {meta['transcription']}",
-        *([f"audio: {meta['share']['url']}", f"audio_until: {meta['share']['until']}"] if "share" in meta else []),
         "---",
         "",
         f"# {title_of(conv, an)}",
@@ -1553,8 +1544,8 @@ def preview(conv: dict, an: dict) -> str:
 
 def to_html(conv: dict, an: dict, st: dict, figs: list[dict], md: str, audio_beside: bool) -> str:
     """report.html: the template with the data embedded. The audio is optional: the page plays
-    audio.opus beside it, else the share link, else shows no player. Figures are linked, not
-    embedded, so they show where the page sits in its folder."""
+    audio.opus beside it, else shows no player. Figures are linked, not embedded, so they show
+    where the page sits in its folder."""
     colours = {sp["id"]: i % len(PALETTE_DAY) for i, sp in enumerate(people(conv))}
     meta = conv["meta"]
     data = {
@@ -1574,7 +1565,6 @@ def to_html(conv: dict, an: dict, st: dict, figs: list[dict], md: str, audio_bes
         "text": stats_text(st),
         "md": md,
         "audio": "audio.opus" if audio_beside else None,
-        "share": meta.get("share"),
         "built": dt.datetime.now().isoformat(timespec="seconds"),
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
@@ -1590,55 +1580,32 @@ def to_html(conv: dict, an: dict, st: dict, figs: list[dict], md: str, audio_bes
 
 # ---------------------------------------------------------------- sharing
 
-RETENTION_DAYS = 9 * 30
-"""How long the drop keeps a file after its upload: retentionMonths in nix/nixos/pc/sftpgo.nix, in 30-day months."""
-
-
-def put_on_drop(folder: Path) -> dict:
-    """audio.opus on the drop behind an open link, the report rebuilt to play from it, and the
-    report uploaded beside it behind a link of its own. The only place anything is uploaded."""
-    record_path = folder / "cache" / "share.json"
-    record = read_json(record_path) if record_path.exists() else {}
-    src = load_source(folder)
-    remote = f"/scribe/{folder.name}-{src.sha256[:8]}"
-    live = {s["id"] for s in json.loads(drop(["list", "--json"], "listing the drop's links"))}
-    today = dt.date.today()
-
-    def link(local: Path, name: str, old: dict | None, reuse: bool) -> dict:
-        """The file on the drop behind a link: the one it has while the drop still keeps it, when reuse."""
-        if reuse and old and old["id"] in live and old["until"] > today.isoformat():
-            LOG.write(f"share: {name} is on the drop until {old['until']}, behind {old['url']}")
-            return old
-        upload = local
-        if local.name != name:
-            upload = folder / "cache" / name
-            shutil.copyfile(local, upload)
-        drop(["upload", str(upload), "--to", remote, "--overwrite"], f"uploading {name} to the drop")
-        LOG.write(f"share: uploaded {upload.stat().st_size} bytes to {remote}/{name}")
-        kept = {"uploaded": today.isoformat(), "until": (today + dt.timedelta(days=RETENTION_DAYS)).isoformat()}
-        if old and old["id"] in live and old["path"] == f"{remote}/{name}":
-            return {**old, **kept}
-        made = json.loads(drop(["create", f"{remote}/{name}", "--open", "--expires", "never", "--json"], f"making a link to {name}"))
-        LOG.write(f"share: link {made['id']} to {remote}/{name}")
-        return {"id": made["id"], "url": made["url"], "path": f"{remote}/{name}", **kept}
-
+def put_online(folder: Path) -> str:
+    """report.html with its figures embedded, as index.html, and audio.opus beside it, put online by
+    `share`, behind the link an earlier share made while that share still exists. The only place
+    anything is uploaded. Returns the link."""
     if not (folder / "audio.opus").exists():
         raise Failed(f"{folder} has no audio.opus to share. `scribe run` on its recording makes it.")
-    record["audio"] = link(folder / "audio.opus", "audio.opus", record.get("audio"), reuse=True)
-    write_json(record_path, record)
-    write_json(folder / "conversation.json", build_conversation(folder))
-    render_folder(folder, embed_figures=True)
-    record["report"] = link(folder / "report.html", f"{folder.name}.html", record.get("report"), reuse=False)
-    render_folder(folder)
-    write_json(record_path, record)
-    return record
+    record_path = folder / "cache" / "share.json"
+    old = read_json(record_path).get("id") if record_path.exists() else None
+    live = {s["id"] for s in json.loads(run_share(["list", "--json"], "listing the shares"))}
+    with tempfile.TemporaryDirectory(prefix="scribe-share-") as tmp:
+        render_folder(folder, embed_figures=True)
+        shutil.copyfile(folder / "report.html", Path(tmp) / "index.html")
+        render_folder(folder)
+        shutil.copyfile(folder / "audio.opus", Path(tmp) / "audio.opus")
+        url = run_share([tmp, *(["--replace", old] if old in live else [])], "putting the report online").strip()
+    share_id = url.rstrip("/").rsplit("/", 1)[-1]
+    write_json(record_path, {"id": share_id, "url": url})
+    LOG.write(f"share: {url}")
+    return url
 
 
-def drop(args: list[str], what: str) -> str:
+def run_share(args: list[str], what: str) -> str:
     try:
-        return run_cmd(["sftpgo-share", *args], what)
+        return run_cmd(["share", *args], what)
     except Failed as exc:
-        raise Failed(f"{exc}. sftpgo-share needs the tailnet and the account password (docs/sftpgo.md).")
+        raise Failed(f"{exc}. `share --help` says what share needs.")
 
 
 # ---------------------------------------------------------------- the terminal, the log, small helpers
