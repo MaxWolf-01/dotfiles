@@ -175,11 +175,12 @@
       span-window-left = [ "<Control><Super>Left" ];
       span-window-right = [ "<Control><Super>Right" ];
       span-window-up = [ "<Control><Super>Up" ];
-      # Ctrl+Alt+hjkl is left to the browser: it moves between panels in the agent containers.
-      focus-window-down = [ "<Shift><Control><Alt>j" ];
-      focus-window-left = [ "<Shift><Control><Alt>h" ];
-      focus-window-right = [ "<Shift><Control><Alt>l" ];
-      focus-window-up = [ "<Shift><Control><Alt>k" ];
+      # Directional focus is off: Ctrl+Alt+hjkl and their Shift forms belong to the
+      # agent containers' view in the browser (bin/container-hub.html).
+      focus-window-down = [];
+      focus-window-left = [];
+      focus-window-right = [];
+      focus-window-up = [];
       focus-window-next = [ "<Super>j" ];
       focus-window-prev = [ "<Super>k" ];
       # Order matters: the extension pads missing per-monitor entries with the
