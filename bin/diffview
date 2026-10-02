@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -96,6 +97,8 @@ def main(args: Args) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     if derived:
         warn_displaced(out)
+    if args.watch and (held_by := watch_record(out)) and held_by["alive"]:
+        sys.exit(f"diffview: {out} is already watched by another diffview --watch; stop that one first")
     page = build(args, out, args.summary)
     if args.watch:
         watch(args, out, page)
@@ -408,7 +411,6 @@ def comment_id(item: object, path: str) -> int:
 HUB_PORT = int(os.environ.get("CONTAINER_HUB_PORT") or 8377)
 HUB_SERVICE_PORT = 8377   # the port the container-hub user service answers on
 MAX_STATE_BYTES = 4_000_000   # a real state file is under 20 KB; anything near this is not a page saving
-REQUEST_TIMEOUT = 30          # a client that announces a body and never sends it must not hold a thread for good
 
 
 def page_url(out: Path) -> str:
@@ -574,19 +576,19 @@ def write_state(target: Path, raw: bytes) -> tuple[int, bytes]:
 
 def watch(args: Args, out: Path, page: dict) -> None:
     """Regenerate when the sources change; the hub serves the page, which reloads itself off the watch record."""
-    if (held_by := watch_record(out)) and held_by["alive"]:
-        sys.exit(f"diffview: {out} is already watched by another diffview --watch; stop that one first")
     restore_request(out)
     summary = page["summary"]
     expecting = page["summaryPending"]  # the first build asked for a summary that is still being written
     if expecting:
         args.auto_summary = False  # asked once; never re-pay per rebuild
-    watched = watched_paths(args)
-    held = publish_watch(out, {"g": page["generated"], "watches": watched}, None)
+    watched = watched_repos(args)
+    publish = lambda page, held: publish_watch(out, {"g": page["generated"], "watches": watched}, held)
+    held = publish(page, None)
     url = page_url(out)
     last = sources_sig(args)   # taken before the announcement, so "watching" means: from here on
     where = f"live page at {url}" if url.startswith("http") else f"page at {url}, which does not reload itself"
     print(f"diffview: watching {len(args.sources)} source(s); {where}  (Ctrl-C stops)", flush=True)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)   # a stop by kill ends the watch as Ctrl-C does
     if args.open:
         launch(url)
 
@@ -602,7 +604,7 @@ def watch(args: Args, out: Path, page: dict) -> None:
                     text, page = rewrite_summary(args, out, superseded)
                     if page:
                         summary = text
-                        held = publish_watch(out, {"g": page["generated"], "watches": watched}, held)
+                        held = publish(page, held)
                 sig = sources_sig(args)
                 if sig == last:
                     continue
@@ -610,7 +612,7 @@ def watch(args: Args, out: Path, page: dict) -> None:
                 if expecting and not summary:   # only a summary this run asked for; a sidecar left by an earlier round is not one
                     summary = load_summary(out)
                 page = build(args, out, summary, awaiting=expecting and not summary)
-                held = publish_watch(out, {"g": page["generated"], "watches": watched}, held)
+                held = publish(page, held)
                 if args.auto_summary and page["summaryPending"]:  # the first build with anything in it asks for the summary
                     expecting, args.auto_summary = True, False
                 print(f"diffview: sources changed, regenerated ({datetime.now():%H:%M:%S})", flush=True)
@@ -619,17 +621,15 @@ def watch(args: Args, out: Path, page: dict) -> None:
                 print(f"diffview: sources unreadable right now, still serving the last page ({e})", flush=True)
     except KeyboardInterrupt:
         print("\ndiffview: watch stopped; the written file stays valid")
+    finally:
+        restore_request(out)   # a ↻ pressed in the watcher's last tick is never answered
 
 
-def watched_paths(args: Args) -> list[str]:
-    """The directories and files the sources are read from: the repos, or both sides of an OLD=NEW."""
-    paths = []
-    for spec in args.sources:
-        if "=" in spec and ".." not in spec.split("=")[0]:
-            paths += [str(Path(p).expanduser().resolve()) for p in spec.split("=", 1)]
-        else:
-            paths.append(str(Path(spec.rsplit("@", 1)[0] if "@" in spec else ".").expanduser().resolve()))
-    return list(dict.fromkeys(paths))
+def watched_repos(args: Args) -> list[str]:
+    """The repos the git sources are read from. An OLD=NEW side is left out: a file rewritten by removing it
+    first is missing for a moment, which a repo never is until its worktree is removed for good."""
+    return list(dict.fromkeys(str(Path(spec.rsplit("@", 1)[0] if "@" in spec else ".").expanduser().resolve())
+                              for spec in args.sources if not ("=" in spec and ".." not in spec.split("=")[0])))
 
 
 def watch_path(out: Path) -> Path:
@@ -658,8 +658,8 @@ def publish_watch(out: Path, record: dict, held: int | None) -> int:
 
 
 def watch_record(out: Path) -> dict | None:
-    """The watch record beside a page, with "alive" saying whether its watcher still runs; None for a page
-    no watcher ever wrote."""
+    """The watch record beside a page, with "alive" saying whether its watcher still runs and "gone" whether
+    a repo it watched has been removed; None for a page no watcher ever wrote."""
     target = watch_path(out)
     for _ in range(10):
         try:
@@ -683,20 +683,22 @@ def watch_record(out: Path) -> dict | None:
             record = json.loads(raw)
         except ValueError:
             return None
-        return {**record, "alive": alive} if isinstance(record, dict) else None
+        if not isinstance(record, dict):
+            return None
+        return {**record, "alive": alive, "gone": any(not Path(p).exists() for p in record.get("watches") or [])}
     return None
 
 
 def drop_watch_record(out: Path) -> None:
-    """A page rendered again without --watch is no longer watched; a record left by an exited watcher goes."""
+    """A page rendered again without --watch is no longer watched; what an exited watcher left beside it goes."""
     if (record := watch_record(out)) and not record["alive"]:
+        restore_request(out)
         watch_path(out).unlink(missing_ok=True)
 
 
 def watched_repo_gone(out: Path) -> bool:
-    """The page was watched and a source it was read from has been removed: its worktree merged and gone."""
-    record = watch_record(out)
-    return bool(record) and any(not Path(p).exists() for p in record.get("watches") or [])
+    """The page was watched and a repo it was read from has been removed: its worktree merged and gone."""
+    return bool((record := watch_record(out)) and record["gone"])
 
 
 SUMMARY_REQUEST = threading.Lock()
