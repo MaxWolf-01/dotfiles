@@ -9,8 +9,9 @@ The page is the human-in-the-loop review surface: file tree + side-by-side diff,
 keyboard-driven (press ? in the page), line/hunk comments that export as markdown
 via the copy button, ready to paste back to the authoring agent; the diff itself
 copies too, as a patch, with those comments inline or without. Comments are saved
-to a file beside the page and read back from it on load; only a served page can
-write it -- see --serve; opened as a plain file the page is read-only and says so.
+to a file beside the page and read back from it on load; only a page the container
+hub serves can write it -- see --serve; opened as a plain file the page is read-only
+and says so.
 
 A changed image shows on its card, both versions side by side or overlaid, baked
 into the page like the text around it; a version too big to bake says so on its
@@ -38,19 +39,16 @@ Examples:
 """
 
 import base64
-import fcntl
 import hashlib
-import html
 import json
 import os
 import re
 import shlex
-import signal
 import subprocess
 import sys
 import threading
 import time
-import urllib.parse
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -67,7 +65,7 @@ class Args:
     sources: Annotated[list[str], tyro.conf.Positional]
     """Source specs: REPO@RANGE, RANGE (cwd), or OLD=NEW paths."""
     output: Annotated[str, tyro.conf.arg(aliases=["-o"])] = ""
-    """Path of the generated HTML file. The path is the review's identity: render to it again and the comments already on it are still there. Leave this empty and the name is derived from the sources instead, under ~/Downloads/diffview, and that page is served so it can take comments. A derived name is pinned to those exact diffs, so a review that will gain ranges over later rounds needs a path you choose."""
+    """Path of the generated HTML file. The path is the review's identity: render to it again and the comments already on it are still there. Leave this empty and the name is derived from the sources instead, under ~/Downloads/diffview, and that page is served by the container hub so it can take comments. A derived name is pinned to those exact diffs, so a review that will gain ranges over later rounds needs a path you choose."""
     summary: str = ""
     """One plain-English paragraph on what this change is about (shown at the top; inline markdown ok)."""
     auto_summary: bool = True
@@ -77,13 +75,13 @@ class Args:
     title: str = ""
     """Page title; derived from the sources when empty."""
     open: bool = False
-    """Open the generated page in the browser ($DIFFVIEW_BROWSER, else xdg-open), served from its own directory so it can take comments."""
+    """Open the generated page in the browser ($DIFFVIEW_BROWSER, else xdg-open), served by the container hub so it can take comments."""
     watch: bool = False
     """Regenerate whenever the sources change and serve the page on localhost with live reload; runs until Ctrl-C, so start it as a background task. The summary is written once; the ↻ beside it says how far the diff has moved since and rewrites it on request. Starts fine on sources with no changes yet: the page says so and fills in. The written file stays a plain snapshot you can share."""
     notes: str = ""
     """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side are optional, a line-less note attaches to the whole file. A note on a file the diff does not touch puts that file on the page too, read-only, opened at the noted lines (line-less: at its top; an image other than SVG, whole): the place to say what was read and deliberately left alone. A note with "re": "C4" answers that review comment: it sits under it, indented, and needs no path or line of its own; the thread can go on from there (the reviewer replies to a note with c or its reply button, and the reply carries "re A3"). Answering a comment does not resolve it. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
-    """Serve this directory of already-rendered pages so they can save comments to disk, and exit. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent, and the server stops on its own once every page on it has been closed for a grace period: the message it prints says how long, and $DIFFVIEW_IDLE_SECONDS changes it. A page cut off from its server says so and keeps what you type in the browser until the server is back: run this again, and it answers on the port the page knows."""
+    """Have the container hub (container-hub, on $CONTAINER_HUB_PORT, else 8377) serve this directory of already-rendered pages so they can save comments to disk, print its address there, and exit. Starts the hub when it is down: its user service where that is installed and serves the port, else a hub of its own. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent. A page cut off from the hub says so and keeps what you type in the browser until the hub is back: run this again."""
     context: int = 3
     """Context lines around each hunk (git diff -U)."""
 
@@ -403,24 +401,21 @@ def comment_id(item: object, path: str) -> int:
     return int(m[1])
 
 
-# ---------------------------------------------------------------- serve mode
+# ---------------------------------------------------------------- serving, through the container hub
 
-IDLE_EXIT_SECONDS = int(os.environ.get("DIFFVIEW_IDLE_SECONDS") or 30 * 60)   # the tests shrink it to seconds
+HUB_PORT = int(os.environ.get("CONTAINER_HUB_PORT") or 8377)
+HUB_SERVICE_PORT = 8377   # the port the container-hub user service answers on
 MAX_STATE_BYTES = 4_000_000   # a real state file is under 20 KB; anything near this is not a page saving
 REQUEST_TIMEOUT = 30          # a client that announces a body and never sends it must not hold a thread for good
-SERVE_MARKER = ".serve.json"
-SERVE_LOCK = ".serve.lock"
-CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".json": "application/json", ".png": "image/png",
-                 ".svg": "image/svg+xml", ".css": "text/css", ".js": "text/javascript"}
 
 
 def page_url(out: Path) -> str:
-    """The url to hand someone: served, so the page can take comments; the file when it cannot be."""
-    port = ensure_server(out.parent)
-    if port is None:
-        print(f"diffview: {out.parent.resolve()} is too broad to serve; read-only", file=sys.stderr)
+    """The url to hand someone: on the container hub, so the page can take comments; the file when it cannot be."""
+    url, why = hub_address(out)
+    if url is None:
+        print(f"diffview: {why}; read-only", file=sys.stderr)
         return f"file://{out.resolve()}"
-    return f"http://127.0.0.1:{port}/{out.name}"
+    return url
 
 
 def launch(url: str) -> None:
@@ -429,210 +424,76 @@ def launch(url: str) -> None:
 
 
 def serve_root(root_spec: str) -> None:
-    """Serve a tree of already-rendered pages, in the background, and return.
-
-    One server per tree: an already-running one is reported rather than replaced.
-    """
+    """Have the hub serve a tree of already-rendered pages, and say where."""
     root = Path(root_spec).expanduser().resolve()
     if not root.is_dir():
         sys.exit(f"diffview: --serve {root} is not a directory")
-    running = already_serving(root)
-    port = running or ensure_server(root)
-    if port is None:
-        sys.exit(f"diffview: refusing to serve {root} — it holds your whole home or more")
-    if running:
-        print(f"diffview: already serving {root} at http://127.0.0.1:{port}/")
-        return
-    print(f"diffview: serving {root} at http://127.0.0.1:{port}/  (exits {IDLE_EXIT_SECONDS // 60} minutes after the last page closes)")
+    url, why = hub_address(root)
+    if url is None:
+        sys.exit(f"diffview: cannot serve {root}: {why}")
+    print(f"diffview: serving {root} at {url}")
 
 
-def ensure_server(root: Path) -> int | None:
-    """The port serving this directory, starting one if needed. None when it is too broad to serve."""
-    root = root.resolve()
-    home = Path.home().resolve()  # resolved on both sides, or a symlinked home walks straight past this
-    if root == home or root in home.parents:
-        return None
-    marker = root / SERVE_MARKER
-    # one starter at a time per root: the second finds the first's marker instead of binding a
-    # second server beside it (a lock file of its own, as the marker's inode is replaced on exit)
-    with open(root / SERVE_LOCK, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        port = already_serving(root)
-        if port:
-            return port
-        # a page left open on the last server still points at its port; answering there again
-        # is what lets that page save without a reload
-        server = bind_server(root, marker_port(marker))
-        port = server.server_address[1]
-        pid = os.fork()
-        if pid:
-            # written here, so the marker exists the moment this command returns
-            marker.write_text(json.dumps({"port": port, "pid": pid, "root": str(root)}))
-            return port
-        lock.close()   # the child inherited the lock; held here, no later starter could ever get in
+def hub_address(path: Path) -> tuple[str | None, str]:
+    """Where the container hub serves path, a page or a directory of them, the hub started if it is down;
+    else None and why not."""
+    origin = f"http://127.0.0.1:{HUB_PORT}"
+    ask = urllib.request.Request(f"{origin}/api/serve", json.dumps({"path": str(path.resolve())}).encode(),
+                                 {"Content-Type": "application/json"})
+    for started in (False, True):
+        try:
+            with urllib.request.urlopen(ask, timeout=30) as r:
+                return origin + json.loads(r.read())["url"], ""
+        except urllib.error.HTTPError as e:
+            said = e.read().decode(errors="replace")
+            try:
+                said = json.loads(said)["error"]
+            except (ValueError, KeyError, TypeError):
+                pass
+            return None, f"the container hub at {origin} refused it: {said}"
+        except (OSError, ValueError) as e:
+            if started:
+                return None, f"the container hub at {origin} did not answer: {e}"
+            if why := start_hub(origin):
+                return None, why
+    raise AssertionError("unreachable")
 
-    os.setsid()
-    devnull = os.open(os.devnull, os.O_RDWR)
-    for fd in (0, 1, 2):
-        os.dup2(devnull, fd)
-    # serve on its own thread: shutdown() from a signal handler inside the serving
-    # thread would wait for a loop that cannot run until the handler returns
-    stop = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    threading.Thread(target=idle_watchdog, args=(server, stop, root), daemon=True).start()
+
+def start_hub(origin: str) -> str:
+    """Bring the hub up: its user service, where that is installed and answers on this port, else a hub of
+    this command's own, in a session of its own so it outlives it. Empty once it answers, else why not."""
+    log = Path.home() / ".local" / "state" / "container-hub" / "hub.log"
+    # under a minute in all: `board` gives `diffview --serve` 60 s before it opens the page as a file
+    deadline = time.monotonic() + 45
     try:
-        stop.wait()
-    finally:
-        release_marker(marker, os.getpid())
-    os._exit(0)
+        service = HUB_PORT == HUB_SERVICE_PORT and subprocess.run(
+            ["systemctl", "--user", "start", "container-hub"], capture_output=True, timeout=20, check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        service = False
+    if not service:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as out:
+            subprocess.Popen([str(Path(__file__).resolve().parent / "container-hub"), "--port", str(HUB_PORT)],
+                             stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    while time.monotonic() < deadline:   # a first run has uv resolve the hub's dependencies
+        try:
+            with urllib.request.urlopen(f"{origin}/.health", timeout=1):
+                return ""
+        except OSError:
+            time.sleep(0.2)
+    where = "journalctl --user -u container-hub" if service else str(log)
+    return f"the container hub did not come up at {origin} within 45 s; see {where}"
 
 
-def release_marker(marker: Path, pid: int) -> None:
-    """Drop this server's pid from the marker, keeping the port for the next server on this root.
-
-    Only if the marker still names this server: the lock in ensure_server keeps two servers
-    from starting on one root, but a marker written by hand, or by an older diffview, is not
-    this server's to overwrite.
-    """
-    try:
-        record = json.loads(marker.read_text())
-        if record["pid"] != pid:
-            return
-        del record["pid"]
-        tmp = marker.with_name(f"{marker.name}.{pid}.tmp")
-        tmp.write_text(json.dumps(record))
-        os.replace(tmp, marker)
-    except (OSError, ValueError, KeyError):
-        return
-
-
-def marker_port(marker: Path) -> int | None:
-    """The port the last server on this root answered on, dead or alive."""
-    try:
-        return int(json.loads(marker.read_text())["port"])
-    except (OSError, ValueError, KeyError):
-        return None
-
-
-def index_page(root: Path, directory: Path) -> bytes:
-    """Every review page under this directory, so the served URL is somewhere to start."""
-    pages = sorted(p for p in directory.rglob("*.html"))
-    links = "".join(
-        f'<li><a href="/{html.escape(str(p.relative_to(root)))}">{html.escape(str(p.relative_to(directory)))}</a></li>'
-        for p in pages
-    ) or "<li>no pages rendered here yet</li>"
-    return (f'<!doctype html><meta charset="utf-8"><title>diffview · {html.escape(directory.name)}</title>'
-            '<style>body{background:#141519;color:#d6dae2;font:15px/1.7 ui-monospace,monospace;padding:2rem}'
-            'a{color:#7aa2f7}h1{font-size:15px;color:#9aa1af;font-weight:600}ul{padding-left:1.2rem}</style>'
-            f"<h1>{html.escape(str(directory))}</h1><ul>{links}</ul>").encode()
-
-
-def already_serving(root: Path) -> int | None:
-    """The port of a live server for this root; None when the marker names a dead one, or nothing."""
-    port = marker_port(root / SERVE_MARKER)
-    if port is None:
-        return None
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/.health", timeout=1) as r:
-            if json.loads(r.read())["root"] == str(root):
-                return port
-    except (OSError, ValueError, KeyError):
-        pass
-    return None
-
-
-def idle_watchdog(server, stop: threading.Event, root: Path) -> None:
-    """No page has been heard from for the grace period, or the tree went away: either way the review is over.
-
-    An open page fetches its state file every couple of seconds, about once a minute from the
-    background, so the grace period only starts counting once the last tab is closed, frozen
-    or discarded. The clock is monotonic: on Linux
-    it pauses through suspend, so a laptop woken after a night does not read as a night idle.
-    """
-    while not stop.wait(max(1, min(60, IDLE_EXIT_SECONDS / 4))):
-        if not root.is_dir() or time.monotonic() - server.last_request > IDLE_EXIT_SECONDS:
-            stop.set()
-
-
-def bind_server(root: Path, port: int | None):
-    """The server for one review tree, bound but not yet serving."""
-    from http.server import BaseHTTPRequestHandler
-
-    class Handler(BaseHTTPRequestHandler):
-        timeout = REQUEST_TIMEOUT
-
-        def do_GET(self):
-            self.server.last_request = time.monotonic()
-            if not local_request(self):
-                self.respond(403, b"forbidden", "text/plain")
-                return
-            if self.path.split("?")[0] == "/.health":
-                self.respond(200, json.dumps({"root": str(root)}).encode(), "application/json")
-                return
-            target = self.resolve(self.path)
-            if target is None:
-                self.respond(404, b"not found", "text/plain")
-                return
-            if target.is_dir():
-                self.respond(200, index_page(root, target), CONTENT_TYPES[".html"])
-                return
-            if not target.is_file():
-                if is_beside_page(target):   # nothing written beside the page yet: nothing to read, where a 404 would say wrong url
-                    self.respond(200, b"null", CONTENT_TYPES[".json"])
-                    return
-                self.respond(404, b"not found", "text/plain")
-                return
-            self.respond(200, target.read_bytes(), CONTENT_TYPES.get(target.suffix, "application/octet-stream"))
-
-        def do_POST(self):
-            self.server.last_request = time.monotonic()
-            if refused := write_refusal(self):
-                self.respond(*refused, "text/plain")
-                return
-            target = self.resolve(self.path)
-            if target is None or not is_state_file(target):
-                self.respond(404, b"not found", "text/plain")
-                return
-            code, body = write_state(target, self.rfile.read(int(self.headers["Content-Length"])))
-            self.respond(code, body, "application/json" if code == 409 else "text/plain")
-
-        def resolve(self, path: str) -> Path | None:
-            """The file a request names, or None when it points outside the served tree."""
-            rel = urllib.parse.unquote(path.split("?")[0]).lstrip("/")
-            target = (root / rel).resolve()
-            return target if target == root or target.is_relative_to(root) else None
-
-        def respond(self, code: int, body: bytes, ctype: str):
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            if body:
-                self.wfile.write(body)
-
-        def log_message(self, *_):
-            pass
-
-    server = bind_local(Handler, str(root), port)
-    server.last_request = time.monotonic()
-    return server
-
-
-def bind_local(handler_cls, seed: str, preferred: int | None = None):
-    """Loopback on the preferred port, else one derived from seed, so the origin stays stable across relaunches."""
+def bind_local(handler_cls, seed: str):
+    """Loopback on a port derived from seed, so the origin stays stable across relaunches."""
     from http.server import ThreadingHTTPServer
 
     derived = 41000 + int(hashlib.sha256(seed.encode()).hexdigest(), 16) % 4000
-    for port in (preferred, derived):
-        if port is None:
-            continue
-        try:
-            return ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
-        except OSError:
-            continue
-    return ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    try:
+        return ThreadingHTTPServer(("127.0.0.1", derived), handler_cls)
+    except OSError:
+        return ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
 
 
 def local_request(handler) -> bool:
@@ -663,13 +524,22 @@ def write_refusal(handler) -> tuple[int, bytes] | None:
     return None
 
 
-def is_beside_page(target: Path, kinds: tuple[str, ...] = (".state.json", ".summary.json")) -> bool:
+BESIDE = (".state.json", ".summary.json")   # what diffview keeps beside a page
+
+
+def page_beside(target: Path, kinds: tuple[str, ...] = BESIDE) -> Path | None:
+    """The page a file diffview keeps beside one would belong to, existing or not; None for any other file."""
+    return next((target.with_name(target.name.removesuffix(k)) for k in kinds if target.name.endswith(".html" + k)), None)
+
+
+def is_beside_page(target: Path, kinds: tuple[str, ...] = BESIDE) -> bool:
     """A file diffview keeps beside a page that exists, written yet or not."""
-    return any(target.name.endswith(".html" + kind) and target.with_name(target.name.removesuffix(kind)).is_file() for kind in kinds)
+    page = page_beside(target, kinds)
+    return page is not None and page.is_file()
 
 
 def is_state_file(target: Path) -> bool:
-    """A state file of a page that exists: the only path a write to a --serve server may land on."""
+    """A state file of a page that exists: the only path a write to a page's server may land on."""
     return is_beside_page(target, (".state.json",))
 
 
