@@ -180,7 +180,7 @@ The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo 
 
 - **`vault-triage`** (`~/bin/`) — curses TUI for triaging unpublished notes into whitelist or blacklist
 - **`vault-sync`** (`~/bin/`) — copies whitelisted notes to the quartz repo's `content/` dir, and uploads the media they reference to R2 instead (below)
-- **Pre-push hook** (`git/hooks/quartz-sync-pre-push`) — runs `vault-sync` under `with-secrets cloudflare-mwolf-dev-workers` when pushing the vault, then commits and pushes the quartz repo; a failed upload aborts the push
+- **Pre-push hook** (`git/hooks/quartz-sync-pre-push`) — runs `vault-sync` under `with-secrets cloudflare-mwolf-dev-workers` when pushing the vault, then commits and pushes the quartz repo; a failed upload aborts the push, and so does a Quartz checkout whose `quartz.config.ts` sets no `mediaBaseUrl`
 - **`whitelist.json`** and **`blacklist.txt`** live in the vault repo (data, not tooling)
 
 The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to GitHub Pages on push to `v4`.
