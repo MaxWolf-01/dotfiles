@@ -183,7 +183,9 @@ The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo 
 - **Pre-push hook** (`git/hooks/quartz-sync-pre-push`) — runs `vault-sync` under `with-secrets cloudflare-mwolf-dev-workers` when pushing the vault, then commits and pushes the quartz repo; a failed upload aborts the push, and so does a Quartz checkout whose `quartz.config.ts` sets no `mediaBaseUrl`
 - **`whitelist.json`** and **`blacklist.txt`** live in the vault repo (data, not tooling)
 
-The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to GitHub Pages on push to `v4`.
+The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to the Cloudflare
+Worker `mwolf-dev` on push to `v4` (`.github/workflows/deploy.yml`). The Worker serves
+mwolf.dev and www.mwolf.dev, and that repo's `wrangler.jsonc` says how.
 
 The site's images and videos live in the R2 bucket `mwolf-dev-media` on max's
 Cloudflare account, flat by file name, and the site links them at
