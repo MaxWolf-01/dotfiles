@@ -12,7 +12,7 @@ an HTML page, or a folder whose `index.html` opens it, served at `share.mwolf.de
 until `share rm` takes it down. The drop sends every file as a download, which a
 phone does not open as a page.
 
-The drop keeps what `share` refuses or cannot do: a file over 25 MiB, a zip or
+The drop keeps what `share` refuses or cannot do: a file too large for it, a zip or
 folder meant to be downloaded, a link that expires or counts its downloads, and
 a password the server checks.
 
