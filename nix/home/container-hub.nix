@@ -1,0 +1,31 @@
+# container-hub: the one local server every page an agent opens goes through,
+# on 127.0.0.1:8377. claude-browser hands it each page; what a container is and
+# how a page finds its own: bin/container-hub --help. Up from login, so the
+# containers index at http://127.0.0.1:8377/ is the way back to every
+# container after a reboot.
+#
+# The hub is a uv PEP 723 script, so uv resolves its deps at run. git reads the
+# sessions' commits; curl fetches trellis on first use; the tracker it reads
+# comes from the mx plugin under ~/.claude*/plugins, found by the hub itself,
+# and is a uv script too. diffview, which renders a ticket's recorded ranges,
+# sits beside the hub in bin/.
+#
+# Restart=always, not on-failure: the hub never exits on its own, so any exit,
+# a clean one included, leaves every agent's pages opening as plain tabs.
+{ config, pkgs, lib, ... }:
+let
+  scriptPath = lib.makeBinPath (with pkgs; [ bash coreutils uv git curl ]);
+  dotfiles = "${config.home.homeDirectory}/.dotfiles";
+in
+{
+  systemd.user.services.container-hub = {
+    Unit.Description = "The container hub: every page an agent opens, in its container";
+    Service = {
+      ExecStart = "${dotfiles}/bin/container-hub";
+      Environment = [ "PATH=${scriptPath}" ];
+      Restart = "always";
+      RestartSec = 2;
+    };
+    Install.WantedBy = [ "default.target" ];
+  };
+}
