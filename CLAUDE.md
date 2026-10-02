@@ -179,11 +179,20 @@ IMAP or SMTP directly, and never send mail. Setup and limits:
 The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:
 
 - **`vault-triage`** (`~/bin/`) — curses TUI for triaging unpublished notes into whitelist or blacklist
-- **`vault-sync`** (`~/bin/`) — copies whitelisted files + referenced media to the quartz repo's `content/` dir
-- **Pre-push hook** (`git/hooks/quartz-sync-pre-push`) — runs `vault-sync` automatically when pushing the vault, then commits and pushes the quartz repo
+- **`vault-sync`** (`~/bin/`) — copies whitelisted notes to the quartz repo's `content/` dir, and uploads the media they reference to R2 instead (below)
+- **Pre-push hook** (`git/hooks/quartz-sync-pre-push`) — runs `vault-sync` under `with-secrets cloudflare-mwolf-dev-workers` when pushing the vault, then commits and pushes the quartz repo; a failed upload aborts the push, and so does a Quartz checkout whose `quartz.config.ts` sets no `mediaBaseUrl`
 - **`whitelist.json`** and **`blacklist.txt`** live in the vault repo (data, not tooling)
 
 The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to GitHub Pages on push to `v4`.
+
+The site's images and videos live in the R2 bucket `mwolf-dev-media` on max's
+Cloudflare account, flat by file name, and the site links them at
+`https://media.mwolf.dev/<file name>` (Quartz's `mediaBaseUrl`). The bucket is
+reached only through that custom domain; its `r2.dev` URL is off. It was made
+with two R2 API calls: `POST accounts/<id>/r2/buckets` (location hint `weur`),
+then `POST .../r2/buckets/mwolf-dev-media/domains/custom`. It only grows: media
+no note references any more stays. A file changed under the same name keeps its
+URL, so Cloudflare's cache serves the old bytes for a few hours.
 
 ## What stays outside Nix
 

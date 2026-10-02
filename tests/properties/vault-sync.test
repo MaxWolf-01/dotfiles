@@ -1,0 +1,181 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.13"
+# dependencies = ["boto3>=1.36", "moto[server]>=5"]
+# ///
+"""Check where bin/vault-sync puts a published note's media. Run it directly; no framework.
+
+P1 to P3 are the properties of the serve-site-media-from-r2 ticket in the agent
+repo: media a published note references lands in the bucket under its file
+name, none of it lands in the quartz content dir, and each object is
+byte-identical to the vault's file.
+
+vault-sync runs as the hook runs it, as a subprocess against a fixture vault,
+with an in-process S3 server (moto) standing in for R2. HOME points at a
+temporary directory, so no real vault, library or cache is read.
+
+Example:
+
+    tests/properties/vault-sync.test
+"""
+
+import hashlib
+import logging
+import os
+import random
+import socket
+import subprocess
+import tempfile
+from pathlib import Path
+
+import boto3
+from moto.server import ThreadedMotoServer
+
+REPO = Path(__file__).resolve().parents[2]
+BUCKET = "mwolf-dev-media"
+MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".mp4", ".webm", ".mov"}
+
+failures = 0
+
+
+def check(what: str, expected: object, actual: object) -> None:
+    global failures
+    if expected != actual:
+        failures += 1
+        print(f"FAIL {what}\n  expected: {expected!r}\n  actual:   {actual!r}")
+    else:
+        print(f"ok   {what}")
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def make_vault(root: Path) -> Path:
+    vault = root / "vault"
+    (vault / "notes").mkdir(parents=True)
+    (vault / "Obsidian/attachments").mkdir(parents=True)
+    (vault / "whitelist.json").write_text('{"files": ["notes/a.md"], "patterns": []}')
+    (vault / "notes/a.md").write_text(
+        "# A\n\n"
+        "![[pic one.png|300]]\n\n"
+        "See [[clip.mp4|the clip]].\n\n"
+        "```litegal\n![[strip “1”.webp]]\n```\n\n"
+        "`![[in-code.png]]` is code, not an embed.\n\n"
+        # one unpaired backtick, as a double-backtick span leaves to a
+        # single-backtick reading, must not hide the embeds after it
+        "Mask with ``x.tril()`` or pass `mask` instead.\n\n"
+        "![[after-stray-backtick.png|600]]\n\n"
+        "Masked values are `-inf`.\n\n"
+        # a link before a media link on the same line is not part of its name
+        "[[Spinoza]] called it [[god-or-nature.webp|God or Nature]].\n\n"
+        "```python\nprint(`![[in-fence.png]]`)\n```\n\n"
+        "![[after-fence.gif]]\n"
+    )
+    rng = random.Random(1)
+    for rel in ["Obsidian/attachments/pic one.png", "notes/clip.mp4",
+                "Obsidian/attachments/strip “1”.webp", "Obsidian/attachments/in-code.png",
+                "Obsidian/attachments/unreferenced.png", "Obsidian/attachments/after-stray-backtick.png",
+                "Obsidian/attachments/god-or-nature.webp", "Obsidian/attachments/in-fence.png",
+                "Obsidian/attachments/after-fence.gif"]:
+        (vault / rel).write_bytes(rng.randbytes(rng.randrange(1000, 5000)))
+    git = ["git", "-C", str(vault), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "fixture"], check=True)
+    return vault
+
+
+def run_sync(root: Path, vault: Path, endpoint: str | None) -> subprocess.CompletedProcess:
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(root / "home"),
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache/uv")),
+        "VAULT_DIR": str(vault),
+        "QUARTZ_DIR": str(root / "quartz"),
+    }
+    if endpoint:
+        env |= {
+            "CLOUDFLARE_S3_API_ENDPOINT": endpoint,
+            "CLOUDFLARE_ACCESS_KEY_ID": "test",
+            "CLOUDFLARE_SECRET_ACCESS_KEY": "test",
+        }
+    return subprocess.run([REPO / "bin/vault-sync"], env=env, capture_output=True, text=True)
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def main() -> None:
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)  # moto's request log
+    port = free_port()
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=port, verbose=False)
+    server.start()
+    endpoint = f"http://127.0.0.1:{port}"
+    s3 = boto3.client("s3", endpoint_url=endpoint, region_name="us-east-1",
+                      aws_access_key_id="test", aws_secret_access_key="test")
+    s3.create_bucket(Bucket=BUCKET)
+
+    def objects() -> dict[str, bytes]:
+        keys = [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKET).get("Contents", [])]
+        return {k: s3.get_object(Bucket=BUCKET, Key=k)["Body"].read() for k in keys}
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "home").mkdir()
+            vault = make_vault(root)
+
+            r = run_sync(root, vault, endpoint)
+            check("first sync exits 0", 0, r.returncode)
+            if r.returncode:
+                print(r.stdout[-2000:], r.stderr[-2000:])
+
+            published = {"pic one.png": "Obsidian/attachments/pic one.png",
+                         "clip.mp4": "notes/clip.mp4",
+                         "strip “1”.webp": "Obsidian/attachments/strip “1”.webp",
+                         "after-stray-backtick.png": "Obsidian/attachments/after-stray-backtick.png",
+                         "god-or-nature.webp": "Obsidian/attachments/god-or-nature.webp",
+                         "after-fence.gif": "Obsidian/attachments/after-fence.gif"}
+            got = objects()
+            check("P1: the bucket holds exactly the referenced media, keyed by file name",
+                  sorted(published), sorted(got))
+            check("P3: every object is byte-identical to the vault's file",
+                  {k: sha256((vault / v).read_bytes()) for k, v in published.items()},
+                  {k: sha256(v) for k, v in got.items()})
+            check("an object carries its media type",
+                  "image/png", s3.head_object(Bucket=BUCKET, Key="pic one.png")["ContentType"])
+
+            content = root / "quartz/content"
+            check("the note is copied to content", True, (content / "notes/a.md").is_file())
+            check("P2: no media file is written under content", [],
+                  [str(p) for p in content.rglob("*") if p.suffix.lower() in MEDIA_SUFFIXES])
+
+            r = run_sync(root, vault, endpoint)
+            check("a second sync with nothing changed uploads nothing",
+                  True, "6 published, 0 uploaded" in r.stdout)
+
+            # same size, different bytes: only a content comparison notices
+            webp = vault / "Obsidian/attachments/strip “1”.webp"
+            webp.write_bytes(bytes(b ^ 0xFF for b in webp.read_bytes()))
+            r = run_sync(root, vault, endpoint)
+            check("a changed file is uploaded again, and only it",
+                  True, "6 published, 1 uploaded" in r.stdout)
+            check("P3: the re-uploaded object matches the changed file",
+                  sha256(webp.read_bytes()), sha256(objects()["strip “1”.webp"]))
+
+            r = run_sync(root, vault, None)
+            check("a sync without R2 credentials fails", True, r.returncode != 0)
+            check("and names what is missing", True, "CLOUDFLARE_S3_API_ENDPOINT" in r.stdout)
+    finally:
+        server.stop()
+
+    print(f"\n{'FAILED' if failures else 'passed'}: {failures} failure(s)")
+    raise SystemExit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()
