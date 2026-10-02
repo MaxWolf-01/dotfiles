@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -152,7 +153,17 @@ try:
         # the keys answer with the hub frozen: it gets the change once it runs again
         hub_view = lambda: api("/api/c/" + urllib.parse.quote(key, safe=""))
         csv_import = lambda: next(m for m in hub_view()["members"] if m["id"] == ids["csv-import"])
-        opened_at = csv_import()["at"]
+        events, listening = [], threading.Event()  # what the hub broadcasts on the container
+
+        def listen() -> None:
+            with urllib.request.urlopen(ORIGIN + "/events/" + urllib.parse.quote(key, safe="")) as r:
+                for line in r:
+                    listening.set()
+                    if line.startswith(b"data:"):
+                        events.append(json.loads(line[5:]))
+
+        threading.Thread(target=listen, daemon=True).start()
+        listening.wait(30)
         os.killpg(hub.pid, signal.SIGSTOP)
         try:
             view.evaluate(f"ws.focus({json.dumps(ids['csv-import'])})")
@@ -165,18 +176,19 @@ try:
             settles("...and moves on to the next unseen page", ids["csv-import"], focused)
         finally:
             os.killpg(hub.pid, signal.SIGCONT)
-        # closed reads False before the close arrives too: wait on the two changes that leave a trace of their own
-        settles("the hub has the seen mark once it runs again", True,
-                lambda: any(u.endswith("/map-columns/index.html") for u in hub_view()["seen"]))
-        settles("...and the reopen", True, lambda: csv_import()["at"] > opened_at)
-        check("...after the close", False, csv_import()["closed"])
+        # closed reads False before the close arrives too, so the read waits until the hub has applied both
+        settles("the hub has the close and the reopen once it runs again", {"close", "reopened"},
+                lambda: {e["type"] for e in events if e.get("id") == ids["csv-import"]})
+        check("...in that order", False, csv_import()["closed"])
+        settles("...and the seen mark", True, lambda: any(u.endswith("/map-columns/index.html") for u in hub_view()["seen"]))
 
         # a ruling in the tracker minimizes the ticket's pages, and the session page stays
-        # a page opened after its ticket's ruling stays up, and the kernel stamps a file from a clock some ms behind
-        # the hub's: written in the same tick as the reopen, the ruling would read as older than it
-        reopened_at = csv_import()["at"]
+        # A page opened after its ticket's ruling stays up. The kernel stamps the ticket file from a clock a few
+        # milliseconds behind the hub's, so a ruling written right after the reopen can read as older than it; it is
+        # written again until it reads as newer.
+        reopened_at, deadline = csv_import()["at"], time.monotonic() + 10
         ticket("csv-import", "done", "map-columns")
-        while (AGENT / "tickets/csv-import.md").stat().st_mtime <= reopened_at:
+        while (AGENT / "tickets/csv-import.md").stat().st_mtime <= reopened_at and time.monotonic() < deadline:
             time.sleep(0.01)
             ticket("csv-import", "done", "map-columns")
         view.wait_for_function(f"!ws.views().some(v => v.id === {json.dumps(ids['csv-import'])} && v.placement === 'docked')",
