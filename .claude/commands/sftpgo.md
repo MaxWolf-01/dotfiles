@@ -1,9 +1,20 @@
 ---
-description: The file drop on pc (SFTPGo). Use when asked to send or share a file with someone, hand out or revoke access to the drop, collect files from someone, or put files onto pc's drop — and before touching accounts or shares in its web admin.
+description: The file drop on pc (SFTPGo), and where a shared file belongs. Use when asked to send or share a file with someone, hand out or revoke access to the drop, collect files from someone, or put files onto pc's drop — and before touching accounts or shares in its web admin.
 ---
 
 Reach the file drop on pc. Both tools print their own usage; run them with `--help`
 for flags. This covers only which tool to reach for, and the model they assume.
+
+## Page or file
+
+A file meant to open as a web page goes to `share` (`share --help`), not here:
+an HTML page, or a folder whose `index.html` opens it, served at `share.mwolf.dev`
+until `share rm` takes it down. The drop sends every file as a download, which a
+phone does not open as a page.
+
+The drop keeps what `share` refuses or cannot do: a file over 25 MiB, a zip or
+folder meant to be downloaded, a link that expires or counts its downloads, and
+a password the server checks.
 
 ## The model
 
