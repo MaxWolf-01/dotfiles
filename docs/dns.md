@@ -135,8 +135,8 @@ which list refused the name; the resolver it asks comes from
 `secrets/tailscale/dns.json`.
 
 To get past a block on zephylux, `dns-filter off [minutes]` asks Mullvad's
-unfiltered resolver instead for that long (10 minutes by default), then turns
-filtering back on by itself; `dns-filter on` turns it back on at once.
+unfiltered resolver instead for that long, then turns filtering back on by
+itself; `dns-filter on` turns it back on at once.
 
 For the other direction — what started being refused lately, and which of it
 something on this machine keeps retrying — read
