@@ -6,11 +6,15 @@
 """Drive a rendered diffview page in a headless browser and check the contract its
 readers depend on: context opens from the baked file with the right line numbers on
 both sides, survives a reload once served, takes comments like any hunk line, a
-note on a file outside the diff puts that file on the page, and a server that dies
-mid-review loses nothing typed.
+note on a file outside the diff puts that file on the page, and a container hub that
+dies mid-review loses nothing typed.
+
+The pages are served by a container hub of the test's own, on a free port, never 8377, with a home of its
+own so its state is the test's.
 
 Run it directly; no framework. Uses the chromium build playwright keeps in its cache
-(`uv run --with playwright playwright install chromium` once, if it is missing).
+(`uv run --with playwright playwright install chromium` once, if it is missing), or $CHROMIUM where that build
+cannot run (NixOS).
 """
 
 import base64
@@ -19,21 +23,66 @@ import os
 import queue
 import re
 import shutil
-import signal
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwright
 
 DIFFVIEW = Path(__file__).resolve().parent.parent / "bin" / "diffview"
 failures = 0
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+HUB_PORT = free_port()
+HUB = f"http://127.0.0.1:{HUB_PORT}"
+os.environ["CONTAINER_HUB_PORT"] = str(HUB_PORT)   # every diffview this test runs finds the test's hub
+HUB_HOME = Path(tempfile.mkdtemp(prefix="diffview-page-hub."))
+# uv's own directories stay where they are, or a hub under that home resolves its dependencies anew
+HUB_ENV = {**os.environ, "HOME": str(HUB_HOME), **{k: subprocess.run(["uv", *a], capture_output=True, text=True, check=True).stdout.strip()
+                                                     for k, a in (("UV_CACHE_DIR", ("cache", "dir")), ("UV_PYTHON_INSTALL_DIR", ("python", "dir")))}}
+
+
+def hub_answers() -> bool:
+    try:
+        socket.create_connection(("127.0.0.1", HUB_PORT), timeout=1).close()
+        return True
+    except OSError:
+        return False
+
+
+def start_hub() -> None:
+    """The way a page's restart command brings the hub back: `diffview --serve`, which starts one when none answers."""
+    subprocess.run([str(DIFFVIEW), "--serve", str(PAGES)], env=HUB_ENV, check=True, capture_output=True, timeout=120)
+
+
+def stop_hub() -> None:
+    subprocess.run(["pkill", "-f", f"container-hub --port {HUB_PORT}"], check=False)
+    deadline = time.monotonic() + 10
+    while hub_answers() and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
+PAGES = Path.home() / "Downloads" / "diffview" / "test"   # the served tree must sit below home, not at it
+
+
+def served(path: Path) -> str:
+    """Where the hub serves a page under PAGES."""
+    return f"{HUB}/f{urllib.parse.quote(str(path))}"
 
 
 def check(what: str, expected, actual) -> None:
@@ -74,7 +123,7 @@ class Watcher:
 
     def __init__(self, spec: str, out: Path, *flags: str, env: dict | None = None):
         self.proc = subprocess.Popen([str(DIFFVIEW), spec, "--watch", "-o", str(out), *flags],
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env or HUB_ENV)
         self.lines: queue.Queue[str] = queue.Queue()
         threading.Thread(target=lambda: [self.lines.put(line) for line in self.proc.stdout], daemon=True).start()
         self.url = ""
@@ -108,6 +157,12 @@ def watch_case(repo: Path, pages: Path) -> None:
     w = Watcher(spec, out, "--no-auto-summary")
     try:
         check("--watch starts on an empty diff", True, w.printed("watching"))
+        check("its page is served by the container hub", served(out), w.url)
+        first = out.read_bytes()
+        second = subprocess.run([str(DIFFVIEW), f"{repo}@base..", "--watch", "--no-auto-summary", "-o", str(out)],
+                                capture_output=True, text=True, env=HUB_ENV, timeout=60)
+        check("a second watcher of the same page is refused, the page left as the first one wrote it",
+              (1, True, True), (second.returncode, "already watched" in second.stderr, out.read_bytes() == first))
         check("the empty page is written", True, out.is_file() and '"files": []' in out.read_text())
         nested = repo / "nested"   # an untracked repository inside the repo: listed by git as a directory, not a file
         nested.mkdir()
@@ -126,7 +181,45 @@ def watch_case(repo: Path, pages: Path) -> None:
         shutil.rmtree(repo / "nested", ignore_errors=True)
 
 
-def fork_case(root: Path, pages: Path) -> None:
+def request_case(root: Path, repo: Path, pages: Path) -> None:
+    """A summary asked of a watcher through the hub: by a page with none yet, by a request file the page never wrote,
+    and one a watcher exited on, which the next watcher puts back. A page rendered again without --watch is no longer
+    watched."""
+    shim = root / "request-shim"
+    shim.mkdir()
+    (shim / "change-summary").write_text('#!/bin/sh\ncat >/dev/null\necho "written on request"\n')
+    (shim / "change-summary").chmod(0o755)
+    out = pages / f"request-{os.getpid()}.html"
+    sidecar, request = Path(f"{out}.summary.json"), Path(f"{out}.summary.request.json")
+    subprocess.run([str(DIFFVIEW), f"{repo}@base..", "--no-auto-summary", "-o", str(out)], env=HUB_ENV, check=True, capture_output=True)
+    request.write_text(json.dumps({"summary": "left by an exited watcher"}))
+    w = Watcher(f"{repo}@base..", out, "--no-auto-summary", env={**HUB_ENV, "PATH": f"{shim}:{os.environ['PATH']}"})
+    try:
+        check("a summary an exited watcher's request moved aside is put back", (True, "left by an exited watcher", False),
+              (w.printed("watching"), json.loads(sidecar.read_text()).get("summary") if sidecar.exists() else None, request.exists()))
+        sidecar.unlink()
+        ask = urllib.request.Request(w.url + ".summary.json", b"", {"Origin": HUB}, method="POST")
+        with urllib.request.urlopen(ask, timeout=30) as r:
+            check("a page with no summary yet asks the watcher for one", 204, r.status)
+        check("...which writes it", (True, "written on request"),
+              (w.printed("summary rewritten", 20), json.loads(sidecar.read_text()).get("summary") if sidecar.exists() else None))
+        sidecar.unlink()
+        request.write_text("not json")
+        check("a request file that does not parse is still a request", (True, "written on request"),
+              (w.printed("summary rewritten", 20), json.loads(sidecar.read_text()).get("summary") if sidecar.exists() else None))
+    finally:
+        w.stop()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(w.url + ".summary.json", b"", {"Origin": HUB}, method="POST"), timeout=30) as r:
+            asked = r.status
+    except urllib.error.HTTPError as e:
+        asked = e.code
+    check("a page whose watcher has exited is told none runs", 409, asked)
+    subprocess.run([str(DIFFVIEW), f"{repo}@base..", "--no-auto-summary", "-o", str(out)], env=HUB_ENV, check=True, capture_output=True)
+    check("a page rendered again without --watch drops what its exited watcher left", False, Path(f"{out}.watch.json").exists())
+
+
+def fork_case(root: Path) -> None:
     """`A..` and `A...` against a working tree once A has moved on: only the three-dot form is the branch's own work."""
     repo = root / "forked"
     repo.mkdir()
@@ -144,7 +237,7 @@ def fork_case(root: Path, pages: Path) -> None:
     (repo / "edit.txt").write_text("uncommitted on the branch\n")
 
     def files(spec: str) -> set[str]:
-        out = pages / f"fork-{os.getpid()}-{spec.count('.')}.html"
+        out = root / f"fork-{os.getpid()}-{spec.count('.')}.html"
         subprocess.run([str(DIFFVIEW), f"{repo}@{spec}", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
         return {f["path"] for f in json.loads(out.read_text().split("const DATA = ", 1)[1].split(";\n", 1)[0])["sources"][0]["files"]}
 
@@ -446,7 +539,7 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
                                  'case "$m" in fail) echo shim refused >&2; exit 1;; slow*) sleep 4; m=${m#slow };; esac\n'
                                  'cat >/dev/null\necho "$m"\n')
     (shim / "claude").chmod(0o755)
-    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "MODE_FILE": str(mode)}
+    env = {**HUB_ENV, "PATH": f"{shim}:{os.environ['PATH']}", "MODE_FILE": str(mode)}
     out = pages / f"rewrite-{os.getpid()}.html"
     sidecar = Path(str(out) + ".summary.json")
     original = (repo / "a.txt").read_text()
@@ -470,7 +563,7 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
         page = browser.new_page()
         failed_requests: list[str] = []
         page.on("response", lambda r: failed_requests.append(f"{r.status} {r.url}") if r.status >= 400 else None)
-        page.goto(w.url + out.name)
+        page.goto(w.url)
         check("a watched page carries the command that started its watcher", True,
               page.evaluate("DATA.restart").startswith(f"diffview {repo}@base.. --watch -o "))
         page.wait_for_selector(".summary .rewrite.stale")
@@ -483,9 +576,10 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
               (first.get("summary"), first.get("for", {}).get("adds"), first.get("for", {}).get("dels")))
         page.wait_for_selector(".summary .rewrite:not(.stale)")
         check("↻ on a fresh summary says it is current", True, "for this diff" in title())
+        built = page.evaluate("DATA.generated")
         (repo / "a.txt").write_text(original + "line 81 appended\n")
         check("more changes regenerate the page", True, w.printed("regenerated"))
-        page.reload()
+        check("which reloads itself in the browser", True, rebuilt(page, built))
         page.wait_for_selector(".summary .rewrite.stale")
         check("↻ then says how far the diff has moved", True, "the diff is now +4 −2" in title())
         mode.write_text("slow summary two")   # the model takes a while, and the tree moves on meanwhile
@@ -508,7 +602,7 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
         check("the page still shows the old summary", True, "summary two" in page.locator(".summary").inner_text())
         # a second page on the watcher follows the first between rebuilds, as on a --serve server
         other = browser.new_page()
-        other.goto(w.url + out.name)
+        other.goto(w.url)
         other.wait_for_selector("tbody.hunk")
         page.locator('tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="20"]').click()
         page.keyboard.type("typed on the watched page")
@@ -521,12 +615,32 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
         check("a watched page follows the file between rebuilds", True, shown())
         check("and nothing it asked the watcher for failed, the waits for a state file and a new summary included", [], failed_requests)
         other.close()
+        w.stop()
+        try:
+            page.wait_for_selector(".watchgone", timeout=10_000)
+        except PlaywrightTimeout:
+            pass
+        check("a page whose watcher has stopped says so, with the command that restarts it", page.evaluate("DATA.restart"),
+              page.locator(".watchgone code").all_inner_texts()[0] if page.locator(".watchgone code").count() else None)
+        built = page.evaluate("DATA.generated")
+        w = Watcher(f"{repo}@base..", out, "--no-auto-summary", env=env)
+        check("the watcher started again", True, w.printed("watching"))
+        check("and the page catches up, the warning gone", (True, 0), (rebuilt(page, built), page.locator(".watchgone").count()))
         page.close()
     finally:
         w.stop()
         (repo / "a.txt").write_text(original)
         for p in pages.glob(f"{out.stem}*"):
             p.unlink()
+
+
+def rebuilt(page, built: str) -> bool:
+    """The page reloaded itself into a build other than the one named."""
+    try:
+        page.wait_for_function(f"typeof DATA !== 'undefined' && DATA.generated !== {json.dumps(built)}", timeout=15_000)
+        return True
+    except PlaywrightTimeout:
+        return False
 
 
 def outage_case(repo: Path, pages: Path, browser) -> None:
@@ -536,8 +650,6 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     out = pages / f"outage-{os.getpid()}.html"
     state = Path(str(out) + ".state.json")
     subprocess.run([str(DIFFVIEW), f"{repo}@base..HEAD", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
-    marker = pages / ".serve.json"
-    served = lambda: json.loads(marker.read_text())
     on_disk = lambda: [c["text"] for c in json.loads(state.read_text())["comments"]] if state.is_file() else []
 
     def wait_for(cond, seconds: float = 10) -> bool:
@@ -546,18 +658,10 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
             time.sleep(0.2)
         return cond()
 
-    def stop() -> None:
-        pid = served()["pid"]
-        os.kill(pid, signal.SIGTERM)
-        wait_for(lambda: "pid" not in served())
-
-    def restart() -> None:
-        subprocess.run([str(DIFFVIEW), "--serve", str(pages)], check=True, capture_output=True)
-
-    port = served()["port"]
+    stop, restart = stop_hub, start_hub
     context = browser.new_context()   # one context: the local copy lives in it, as it does in a real browser profile
     page = context.new_page()
-    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.goto(served(out))
     page.wait_for_selector("tbody.hunk")
 
     def comment(text: str, line: int) -> None:
@@ -571,7 +675,7 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     comment("typed while it was gone", 21)
     page.wait_for_selector(".savefail")
     check("the next save raises the warning", True, "not saving" in page.locator(".savefail").inner_text())
-    check("with the restart command", f"diffview --serve {pages}", page.locator(".savefail code").first.inner_text())
+    check("with the restart command", f"diffview --serve {out}", page.locator(".savefail code").first.inner_text())
     check("and the file did not get it", ["saved while the server lived"], on_disk())
     restart()
     check("a restarted server gets what was typed meanwhile", True,
@@ -594,7 +698,7 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     state.write_text(json.dumps(held))
     restart()
     page = context.new_page()
-    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.goto(served(out))
     page.wait_for_selector("tbody.hunk")
     check("a fresh tab merges the local copy into the file: the hand restore and the outage's comment both land", True,
           wait_for(lambda: on_disk() == ["saved while the server lived", "typed while it was gone", "restored by hand", "typed during the second outage"]))
@@ -615,7 +719,7 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     state.write_text(json.dumps(held))
     restart()
     page = context.new_page()
-    page.goto(f"http://127.0.0.1:{port}/{out.name}")
+    page.goto(served(out))
     page.wait_for_selector("tbody.hunk")
     check("a comment deleted by hand stays deleted, and the outage's comment lands beside the rest", True,
           wait_for(lambda: on_disk() == ["saved while the server lived", "restored by hand", "typed during the second outage", "typed during the third outage"]))
@@ -630,9 +734,8 @@ def tabs_case(repo: Path, pages: Path, browser, notes: Path) -> None:
     out = pages / f"tabs-{os.getpid()}.html"
     state = Path(str(out) + ".state.json")
     subprocess.run([str(DIFFVIEW), f"{repo}@base..HEAD", "--notes", str(notes), "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
-    port = json.loads((pages / ".serve.json").read_text())["port"]
-    origin = f"http://127.0.0.1:{port}"
-    url = f"{origin}/{out.name}"
+    origin = HUB
+    url = served(out)
     on_disk = lambda: [(c["id"], c["text"]) for c in json.loads(state.read_text())["comments"]] if state.is_file() else []
     texts = lambda page: page.locator(".cbox .ctext").all_inner_texts()
     gutter = lambda page, line: page.locator(f'tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="{line}"]')
@@ -833,7 +936,7 @@ def tabs_case(repo: Path, pages: Path, browser, notes: Path) -> None:
 
 def heartbeat_case(url: str, browser) -> None:
     """An open page fetches its state file every two seconds, and at once when its tab comes to the front: that
-    is how it follows the file, and the request its server counts it open by. The clock is faked so a minute
+    is how it follows the file. The clock is faked so a minute
     takes no time; each tick gets a moment for its fetch to return, since a tick finding one in flight leaves it be."""
     page = browser.new_page()
     fetches: list[str] = []
@@ -1149,7 +1252,7 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="diffview-test-"))
     repo = fixture(root)
-    pages = Path.home() / "Downloads" / "diffview" / "test"   # the served tree must sit below home, not at it
+    pages = PAGES
     pages.mkdir(parents=True, exist_ok=True)
     out = pages / f"page-{os.getpid()}.html"
     notes = root / "notes.json"
@@ -1169,14 +1272,15 @@ def main() -> int:
     check("the file count names changed files only", True, "(1 files," in proc.stdout)
     check("nothing outside the source got baked in", False, "not yours" in out.read_text())
 
-    watch_case(repo, pages)
-    fork_case(root, pages)
+    fork_case(root)
 
-    serve = subprocess.run([str(DIFFVIEW), "--serve", str(pages)], capture_output=True, text=True)
-    url = serve.stdout.split(" at ")[-1].split()[0].rstrip("/") + "/" + out.name
     try:
+        watch_case(repo, pages)   # it brings the hub up, which the finally below stops
+        request_case(root, repo, pages)
+        serve = subprocess.run([str(DIFFVIEW), "--serve", str(pages)], env=HUB_ENV, capture_output=True, text=True, timeout=120)
+        url = serve.stdout.split(" at ")[-1].split()[0].rstrip("/") + "/" + out.name
         with sync_playwright() as p:
-            browser = p.chromium.launch()
+            browser = p.chromium.launch(executable_path=os.environ.get("CHROMIUM") or None)
             page = browser.new_page(viewport={"width": 1280, "height": 2400},   # tall: every hunk fits, so j/k only move
                                     permissions=["clipboard-read", "clipboard-write"])
             page.on("dialog", lambda d: d.dismiss())
@@ -1350,11 +1454,9 @@ def main() -> int:
             rewrite_case(root, repo, pages, browser)
             browser.close()
     finally:
-        try:
-            os.kill(json.loads((pages / ".serve.json").read_text())["pid"], signal.SIGTERM)
-        except (OSError, ValueError, KeyError):
-            pass
-        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"tabs-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*"), *pages.glob(f"quiet-{os.getpid()}*"), *pages.glob(f"history-{os.getpid()}*")]:
+        stop_hub()
+        shutil.rmtree(HUB_HOME, ignore_errors=True)
+        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"tabs-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*"), *pages.glob(f"quiet-{os.getpid()}*"), *pages.glob(f"history-{os.getpid()}*"), *pages.glob(f"watch-{os.getpid()}*"), *pages.glob(f"request-{os.getpid()}*")]:
             p.unlink()
         shutil.rmtree(root, ignore_errors=True)
     print(f"\n{failures} failure(s)")

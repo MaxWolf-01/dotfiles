@@ -1,0 +1,1014 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro"]  # diffview's too, whose module this loads
+# ///
+"""The container hub: one local server for every page an agent opens, each page a member of its container.
+
+`claude-browser` hands every page here. A container is a ticket tree: a page's container is the tree of
+the ticket its path names (`agent/show/<slug>/`, `agent/prototypes/<slug>/`, `agent/diffviews/<slug>.html`,
+`agent/tickets/<slug>.md`), read from the tracker of the repo it sits in; failing that, the tree of the
+ticket the opening session last committed on (its `Session:` trailers); failing that, the session's own
+container. Inside a container, a group is the session that opened the page. Membership, closes, seen marks
+and visits live in one JSON file per container under --state; everything else is read from disk on every
+request, so the hub's state can go and only those marks go with it.
+
+Pages are served from here (`/f/<absolute path>`), so the container's view (`/c/<key>`) shares their origin
+and reaches into them: their links and keys. A diffview page served here saves its comments through
+diffview's own code; `diffview --open`, `--watch` and `--serve` hand their pages here to be served. Worker reports and diffviews of nothing but ticket files are for agents and never open.
+
+    GET  /                    the containers, most recently opened into first: the way back after a reboot
+    GET  /c/<key>             the container's view
+    GET  /events/<key>        server-sent events: something in the container changed
+    POST /api/open            {"target", "session"?, "cwd"?, "container"?, "group"?, "title"?, "by"?}: a path,
+                              file:// URL or URL becomes a member of its container, or comes forward again if
+                              it is one. Every answer carries "say", the line the caller prints, and "open", the
+                              absolute URL the caller opens in the browser, or null to open nothing. Beside them:
+                              {"container", "id", "action", "view", "launch"} for a member, where launch says no
+                              view of the container is showing and open is the view at the member; {"skipped": why}
+                              for an agent's page; {"tab": why} for a page on another site, which the view could not
+                              reach into, and open is that URL as given.
+    POST /api/close           {"container", "id"}: hide a member; it stays a member, and an open brings it back.
+    POST /api/seen            {"container", "url", "seen"}: the user's seen mark on a page.
+    POST /api/visit           {"container", "group"}: the user looked at a group; what was new there is not.
+    POST /api/serve           {"path"}: from a local tool only, serve a page with what sits beside it, or a
+                              directory with everything under it, without making it a member. Answers {"url"}.
+    GET  /api/c/<key>         the container: {"members": [{"id", "url", "closed", ...}], "seen": {url: when},
+                              "groups": [...]}. A member's url is where the hub serves it, relative to here.
+    GET  /diff?tracker=&ticket=   a ticket's recorded `diff:` ranges, rendered by diffview on first open
+    GET  /f/<path>            a file under $HOME or the temp dir; a shared directory without an index.html lists
+                              its pages
+    POST /f/<page>.state.json a diffview page saving its comments
+    GET  /f/<page>.watch.json the watch record of a page `diffview --watch` keeps current, with "alive": whether
+                              its diffview watcher still runs. A watched page follows its rebuilds by it, and leaves its
+                              container once a repo it watched is gone.
+    POST /f/<page>.summary.json  a watched page asking its diffview watcher to write the summary again; 409 with
+                              none running
+    GET  /.health             {"saves": true}: diffview pages served here can save
+
+Examples:
+
+    container-hub
+    container-hub --port 18377 --state /tmp/hub-state
+"""
+
+import hashlib
+import html
+import importlib.machinery
+import importlib.util
+import json
+import mimetypes
+import os
+import queue
+import re
+import select
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import weakref
+from dataclasses import dataclass, replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import tyro
+
+HERE = Path(__file__).resolve().parent
+HOME = Path.home().resolve()
+TEMP = Path(tempfile.gettempdir()).resolve()
+
+TRELLIS = {  # fetched, not committed: its licence asks a sponsorship for commercial use
+    "index.js": "239bc6506cdc4b4391a34a091d87fe4dc7ab46a2152f24781bd261621a652220",
+    "style.css": "b9a87ed7f7b1ecb8c23928c35a1e6361ff27461babc0b49d13be0916b59a603c",
+}
+TRELLIS_URL = "https://cdn.jsdelivr.net/npm/@danfessler/trellis@0.3.0/dist/"
+
+
+@dataclass
+class Args:
+    port: int = int(os.environ.get("CONTAINER_HUB_PORT") or 8377)
+    """Port to serve on, on 127.0.0.1; claude-browser looks for the hub on $CONTAINER_HUB_PORT too."""
+    state: Path = Path("~/.local/state/container-hub")
+    """Directory the hub keeps each container's members and marks in."""
+
+
+# --------------------------------------------------------------------------
+# what the files on disk say: trackers, and the tickets sessions committed on
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Tracker:
+    """One repo's tracker, as `tracker data` reads it."""
+
+    root: Path
+    """`agent/tickets` in the repo's main checkout, whichever worktree asked."""
+    tickets: dict[str, dict]
+    signature: tuple
+
+    @property
+    def agent(self) -> Path:
+        return self.root.parent
+
+    @property
+    def repo(self) -> str:
+        """The code repo's name, `.dotfiles` read as `dotfiles`."""
+        return self.root.parent.parent.name.lstrip(".") or self.root.parent.parent.name
+
+    def ancestors(self, slug: str):
+        """The ticket's parent, its parent's, and so on up to its tree's root; a cycle ends the walk."""
+        seen = {slug}
+        while (slug := self.tickets.get(slug, {}).get("parent")) in self.tickets and slug not in seen:
+            seen.add(slug)
+            yield slug
+
+    def tree(self, slug: str) -> str:
+        return [slug, *self.ancestors(slug)][-1]
+
+    def depth(self, slug: str) -> int:
+        return sum(1 for _ in self.ancestors(slug))
+
+
+ROOTS: dict[Path, Path] = {}  # an agent directory -> the root of its tracker, which does not move
+TRACKERS: dict[Path, Tracker] = {}
+
+
+def tracker_command() -> str | None:
+    """`tracker` from the mx plugin: on PATH inside a Claude Code session, under the plugin cache otherwise."""
+    if found := shutil.which("tracker"):
+        return found
+    scripts = HOME.glob(".claude*/plugins/cache/*/mx/*/skills/tracker/tracker.py")
+    version = lambda p: tuple(int(x) if x.isdigit() else 0 for x in p.parents[2].name.split("."))
+    return str(max(scripts, key=version, default="")) or None
+
+
+def signature(root: Path) -> tuple:
+    try:
+        return tuple(sorted((e.name, e.stat().st_mtime_ns, e.stat().st_size) for e in os.scandir(root) if e.name.endswith(".md")))
+    except OSError:
+        return ()
+
+
+def tracker_at(agent: Path | None) -> Tracker | None:
+    """The tracker an agent directory belongs to, read again only once a ticket file has changed. None when
+    there is none, or `tracker` refuses to read it."""
+    if agent is None:
+        return None
+    if (root := ROOTS.get(agent)) and (hit := TRACKERS.get(root)) and hit.signature == signature(root):
+        return hit
+    command = tracker_command()
+    if not command or not agent.parent.is_dir():
+        return None
+    run = subprocess.run([command, "data"], cwd=agent.parent, capture_output=True, text=True, check=False)
+    if run.returncode != 0:
+        print(f"tracker data in {agent.parent} failed: {run.stderr.strip()[:300]}", file=sys.stderr, flush=True)
+        return None
+    data = json.loads(run.stdout)
+    root = Path(data["root"]).resolve()
+    stats = {e.name: e.stat().st_mtime for e in os.scandir(root) if e.name.endswith(".md")}
+    tickets = {t["slug"]: {"status": t["status"], "parent": t.get("parent"), "title": t.get("title") or t["slug"],
+                           "diff": t.get("diff") or [], "mtime": stats.get(f"{t['slug']}.md", 0)}
+               for t in data["tickets"]}
+    ROOTS[agent] = root
+    TRACKERS[root] = Tracker(root, tickets, signature(root))
+    return TRACKERS[root]
+
+
+SESSION_LOGS: dict[Path, tuple[str, dict[str, list[str]]]] = {}
+TICKET_PATH = re.compile(r"(?:tickets/([^/]+)\.md|(?:show|prototypes)/([^/]+)/.*|diffviews/([^/]+)\.html)$")
+
+
+def git(cwd: Path, *args: str) -> str:
+    run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=False)
+    return run.stdout if run.returncode == 0 else ""
+
+
+def session_tickets(agent: Path, session: str) -> list[str]:
+    """The tickets a session's commits in an agent repo touched, the most recent first, from the `Session:`
+    trailers on every branch."""
+    refs = git(agent, "for-each-ref", "--format=%(objectname)")
+    if not refs:
+        return []
+    common = Path(git(agent, "rev-parse", "--path-format=absolute", "--git-common-dir").strip() or agent)
+    cached = SESSION_LOGS.get(common)
+    if not cached or cached[0] != refs:
+        by: dict[str, list[tuple[int, str]]] = {}
+        out = git(agent, "log", "--all", "--format=%x1e%ct%x1f%(trailers:key=Session,valueonly,separator=%x20)", "--name-only")
+        for record in out.split("\x1e")[1:]:
+            head, _, names = record.partition("\n")
+            when, _, sids = head.partition("\x1f")
+            slugs = [next(g for g in m.groups() if g) for n in names.split("\n") if (m := TICKET_PATH.match(n.strip()))]
+            for sid in sids.split():
+                by.setdefault(sid, []).extend((int(when), s) for s in slugs)
+        ordered = {sid: list(dict.fromkeys(s for _, s in sorted(pairs, key=lambda p: -p[0]))) for sid, pairs in by.items()}
+        SESSION_LOGS[common] = cached = (refs, ordered)
+    return cached[1].get(session, [])
+
+
+# --------------------------------------------------------------------------
+# what a page is, read off how it was named
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Page:
+    url: str
+    """Where the view loads it: /f/<path> for a file, the URL itself otherwise. One page, one url."""
+    path: Path | None = None
+    """The file, where there is one; a page whose file is gone leaves its container."""
+    agent: Path | None = None
+    """The agent directory it sits in, or the one of the repo it sits in."""
+    slug: str | None = None
+    kind: str = "page"
+    session: str | None = None
+    """The session a session page is of."""
+
+
+def agent_of(directory: Path | None) -> tuple[Path | None, tuple[str, ...]]:
+    """The agent directory a path sits in or under, and the path's parts below it."""
+    if directory is None:
+        return None, ()
+    for d in (directory, *directory.parents):
+        if d.name == "agent" and (d / "tickets").is_dir():
+            return d, directory.relative_to(d).parts
+        if (d / "agent" / "tickets").is_dir():
+            return d / "agent", ()
+    return None, ()
+
+
+def page_of_path(path: Path, query: str = "") -> Page:
+    path = path.resolve()
+    agent, rel = agent_of(path)
+    page = Page(url="/f" + urllib.parse.quote(str(path)) + (f"?{query}" if query else ""), path=path, agent=agent)
+    match rel:
+        case ("show", slug, *_):
+            page.slug, page.kind = slug, "show"
+        case ("prototypes", slug, *_):
+            page.slug, page.kind = slug, "prototype"
+        case ("diffviews", name) if name.endswith(".html"):
+            page.slug, page.kind = name.removesuffix(".html"), "diff"
+        case ("tickets", name) if name.endswith(".md"):
+            page.slug = name.removesuffix(".md")
+        case ("sessions", session, *_):
+            page.kind, page.session = "session", session
+        case ("board.html",):
+            page.kind = "board"
+    return page
+
+
+def read_target(target: str, cwd: str | None, port: int) -> Page:
+    """A path, a file:// URL, one of this hub's URLs or any other URL, as the page it names."""
+    parts = urllib.parse.urlsplit(target)
+    if parts.scheme in ("http", "https") and parts.netloc in (f"127.0.0.1:{port}", f"localhost:{port}"):
+        return read_target(urllib.parse.urlunsplit(("", "", parts.path, parts.query, "")), cwd, port)
+    if parts.scheme == "file":
+        return page_of_path(Path(urllib.parse.unquote(parts.path)), parts.query)
+    if not parts.scheme and target.startswith("/f/"):
+        return page_of_path(Path(urllib.parse.unquote(parts.path.removeprefix("/f"))), parts.query)
+    if not parts.scheme and parts.path == "/diff":
+        query = urllib.parse.parse_qs(parts.query)
+        tracker, ticket = query.get("tracker", [""])[0], query.get("ticket", [""])[0]
+        return Page(url=diff_url(Path(tracker), ticket), agent=Path(tracker).parent, slug=ticket, kind="diff")
+    if parts.scheme:
+        return Page(url=target.split("#")[0])
+    path = Path(target).expanduser()
+    if not path.is_absolute():
+        path = Path(cwd or ".") / path
+    return page_of_path(path)
+
+
+def diff_url(tracker_root: Path, ticket: str) -> str:
+    return "/diff?" + urllib.parse.urlencode({"tracker": str(tracker_root), "ticket": ticket})
+
+
+DATA_MARK = b"const DATA = "
+
+
+def diffview_payload(page: bytes) -> dict | None:
+    """The data a diffview page carries, None for any other page."""
+    at = page.find(DATA_MARK)
+    if at < 0:
+        return None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(page[at + len(DATA_MARK):].decode(errors="replace"))
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def agent_facing(page: Page) -> str | None:
+    """Why a page is for agents and never opens in front of the user, or None."""
+    if page.kind == "show" and page.path and page.path.name == "report.md" and page.path.parent.name == page.slug:
+        return "a worker's report is for agents"
+    payload = diffview_payload(page.path.read_bytes()) if page.path and page.path.suffix == ".html" and page.path.is_file() else None
+    sources = (payload or {}).get("sources") or []
+    files = [(s, f) for s in sources for f in s.get("files") or []]
+    if files and all(s.get("kind") == "git" and (Path(s.get("root", "/")) / "tickets").is_dir()
+                     and f.get("path", "").startswith("tickets/") for s, f in files):
+        return "a diffview of tracker files is for agents"
+    return None
+
+
+# --------------------------------------------------------------------------
+# which container a page goes to
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Placement:
+    key: str
+    name: str
+    repo: str = ""
+    tracker: Path | None = None
+    root: str | None = None
+    ticket: str | None = None
+
+
+def tree_placement(tracker: Tracker, slug: str) -> Placement:
+    root = tracker.tree(slug)
+    # the tracker's path in the key: two repos whose trees share a slug get two containers
+    digest = hashlib.sha1(str(tracker.root).encode()).hexdigest()[:6]
+    return Placement(f"{root}@{tracker.repo}.{digest}", root, tracker.repo, tracker.root, root, slug)
+
+
+def place(page: Page, session: str | None, cwd: str | None) -> Placement:
+    """The page's ticket's tree; else the tree of the ticket its session last committed on; else the session's
+    own container. Read from files alone, so the same page and session always land in the same place."""
+    tracker = tracker_at(page.agent)
+    if tracker and page.slug in tracker.tickets:
+        return tree_placement(tracker, page.slug)
+    session = page.session or session
+    if session:
+        agent = page.agent or agent_of(Path(cwd).resolve() if cwd else None)[0]
+        tracker = tracker or tracker_at(agent)
+        if tracker:
+            for slug in session_tickets(agent, session):
+                if slug in tracker.tickets:
+                    return tree_placement(tracker, slug)
+        return Placement(f"session-{session}", f"session {session[:8]}")
+    return Placement("loose", "loose pages")
+
+
+def chosen(name: str, page: Page, cwd: str | None, derived: Placement) -> Placement:
+    """The container a page is put in by name: a ticket of the tracker the page or the opener sits in names
+    that ticket's tree, anything else the container of that key. The page keeps its own ticket."""
+    if name == derived.key:
+        return derived
+    for agent in (page.agent, agent_of(Path(cwd).resolve() if cwd else None)[0]):
+        if (tracker := tracker_at(agent)) and name in tracker.tickets:
+            return replace(tree_placement(tracker, name), ticket=derived.ticket)
+    return Placement(name, name, ticket=derived.ticket)
+
+
+# --------------------------------------------------------------------------
+# a container's own state: its members and the user's marks, one file each
+# --------------------------------------------------------------------------
+
+STATE = Path()
+lock = threading.RLock()
+listeners: dict[str, list[queue.Queue]] = {}
+# The digest of its container each listener last saw, taken when it starts listening and moved on by every round
+# of the disk watch: a listener hears of every change made since it started, and of nothing else. What changed
+# before is the listener's to read once its stream is open.
+seen_by: weakref.WeakKeyDictionary[queue.Queue, str] = weakref.WeakKeyDictionary()
+launched: dict[str, float] = {}
+
+
+def key_path(key: str) -> str:
+    """A container's key as it is spelled in its view's address and its state file's name."""
+    return urllib.parse.quote(key, safe="@.-_")
+
+
+def state_file(key: str) -> Path:
+    return STATE / "containers" / (key_path(key) + ".json")
+
+
+OPENED: set[Path] = set()
+"""Every page an agent opened or a local tool asked to have served: what /f/ serves outside an agent directory."""
+SHARED: set[Path] = set()
+"""The directories a local tool asked to have served whole (`POST /api/serve`)."""
+
+
+def servable(path: Path) -> bool:
+    """What /f/ serves: the agent directories, the files git tracks in the repos around them, the hub's own
+    renders, a directory a local tool shared, and a page an agent opened or a tool shared with what sits beside
+    it, though never all of $HOME or the temp dir for a page opened from there. A page the view shows shares
+    the hub's origin, so whatever is served here, every page in the view can read."""
+    agent, inside = agent_of(path)
+    if path.is_relative_to(STATE) or inside or any(path.is_relative_to(d) for d in SHARED):
+        return True
+    if agent and path.is_file() and git(agent.parent, "ls-files", "--error-unmatch", "--", str(path)):
+        return True
+    if any(path == f or (not too_broad(base := f if f.is_dir() else f.parent) and path.is_relative_to(base)) for f in OPENED):
+        return True
+    # what diffview keeps beside a page goes where the page goes, so a page served on its own still saves
+    beside = diffview.page_beside(path) if diffview else None
+    return beside is not None and servable(beside)
+
+
+def too_broad(directory: Path) -> bool:
+    """A directory holding all of $HOME or the temp dir, which /f/ never serves whole."""
+    return HOME.is_relative_to(directory) or TEMP.is_relative_to(directory)
+
+
+def shared_file() -> Path:
+    return STATE / "served.json"
+
+
+def share(body: dict) -> tuple[int, dict]:
+    """Serve a page, or a directory of them, for a local tool. Kept on disk, so a page left open in a tab
+    still saves once the hub has restarted."""
+    path = Path(body["path"]).expanduser().resolve()
+    if not path.exists():
+        return 404, {"error": f"{path} does not exist"}
+    if path.is_dir() and too_broad(path):
+        return 403, {"error": f"{path} holds all of your home or the temp dir, which the hub never serves whole"}
+    with lock:
+        if path not in OPENED | SHARED:
+            save_shared([*load_shared(), str(path)])  # first, so a share that cannot be kept is not served either
+            (SHARED if path.is_dir() else OPENED).add(path)
+    return 200, {"url": "/f" + urllib.parse.quote(str(path)) + ("/" if path.is_dir() else "")}
+
+
+def save_shared(listed: list[str]) -> None:
+    tmp = shared_file().with_name(f".served.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(listed, indent=1) + "\n")
+    os.replace(tmp, shared_file())
+
+
+def load_shared() -> list[str]:
+    listed = read_json(shared_file())
+    return [p for p in listed if isinstance(p, str)] if isinstance(listed, list) else []
+
+
+def load(key: str) -> dict | None:
+    data = read_json(state_file(key))
+    return data if isinstance(data, dict) else None
+
+
+def read_json(path: Path):
+    """A file the hub keeps, None when there is none. One that does not parse is moved aside rather than left for
+    the next save to overwrite, since the marks in it are the one thing nothing else on disk can give back. One
+    that cannot be read at all raises: what is in it is unknown, so nothing may write over it."""
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except ValueError as e:
+        aside = path.with_name(f"{path.name}.unreadable-{time.time_ns()}")
+        try:
+            os.replace(path, aside)
+        except OSError:
+            aside = None
+        print(f"{path} could not be read ({e}); " + (f"moved to {aside}, and started anew" if aside else "left where it is"),
+              file=sys.stderr, flush=True)
+        return None
+
+
+def save(data: dict) -> None:
+    """Atomically, and before the request is answered: a crash keeps everything already answered."""
+    path = state_file(data["key"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1) + "\n")
+    os.replace(tmp, path)
+
+
+def broadcast(key: str, event: dict) -> int:
+    with lock:
+        qs = list(listeners.get(key, []))
+    for q in qs:
+        q.put(event)
+    return len(qs)
+
+
+def member_id(url: str) -> str:
+    return "m" + hashlib.sha1(url.encode()).hexdigest()[:10]
+
+
+def title_of(page: Page) -> str:
+    if not page.path:
+        return urllib.parse.urlsplit(page.url).path.rsplit("/", 1)[-1] or page.url
+    if page.kind == "session":
+        md = page.path.parent / "session.md"
+        head = next((line[2:] for line in md.read_text().splitlines() if line.startswith("# ")), None) if md.is_file() else None
+        return head or f"session {page.session[:8]}"
+    if page.slug and page.kind in ("show", "prototype"):
+        return str(page.path.relative_to(page.agent / {"show": "show", "prototype": "prototypes"}[page.kind] / page.slug))
+    return page.path.name
+
+
+def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
+    """from_page says a page in the view asked, for a link clicked in it: it may open only what it could
+    already read, so no page can widen what /f/ serves."""
+    page = read_target(body["target"], body.get("cwd"), port)
+    if not page.path and not page.url.startswith("/"):
+        why = "a page on another site opens as a browser tab: the view cannot reach into it, and many sites refuse to be framed"
+        return 200, {"tab": why, "say": why, "open": body["target"]}
+    if page.path and not page.path.exists():
+        return 404, {"error": f"{page.path} does not exist"}
+    if page.path and from_page and not (page.path.is_file() and servable(page.path)):
+        return 403, {"error": f"{page.path} is not a page the hub serves"}
+    if why := agent_facing(page):
+        return 200, {"skipped": why, "say": f"not opened, {why}", "open": None}
+    session = body.get("session") or None
+    placement = place(page, session, body.get("cwd"))
+    # the view names its own container for a link clicked in it, claude-browser --container any other
+    if body.get("container"):
+        placement = chosen(body["container"], page, body.get("cwd"), placement)
+    mid = member_id(page.url)
+    by = body.get("by") or "agent"
+    now = time.time()
+    with lock:
+        data = load(placement.key) or {"key": placement.key, "name": placement.name, "repo": placement.repo,
+                                       "tracker": str(placement.tracker) if placement.tracker else None,
+                                       "root": placement.root, "members": [], "seen": {}, "visited": {}}
+        member = next((m for m in data["members"] if m["id"] == mid), None)
+        action = "reopened" if member else "added"
+        if not member:
+            member = {"id": mid, "url": page.url, "path": str(page.path) if page.path else None,
+                      "group": body.get("group") or page.session or session or "loose",
+                      # a session page heads its group, under no ticket
+                      "ticket": None if page.kind == "session" else placement.ticket,
+                      "kind": page.kind, "title": body.get("title") or title_of(page), "first": now}
+            data["members"].append(member)
+        member.update(closed=False, at=now, by=by)
+        if not from_page:
+            member["agent"] = True  # what an agent opened is served with what sits beside it: see servable
+        save(data)
+        if page.path and not from_page:
+            OPENED.add(page.path)
+        listening = broadcast(placement.key, {"type": action, "id": mid, "by": by, "group": member["group"]})
+        launch = not listening and now - launched.get(placement.key, 0) > 10
+        if launch:
+            launched[placement.key] = now
+    view = "/c/" + key_path(placement.key)
+    return 200, {"container": placement.key, "id": mid, "action": action, "launch": launch, "view": view,
+                 "say": f"in container {placement.key}; " + ("its view opens at the page" if launch else "its open view shows the page"),
+                 "open": f"http://127.0.0.1:{port}{view}#{mid}" if launch else None}
+
+
+def mark(key: str, what: str, body: dict) -> tuple[int, dict]:
+    with lock:
+        data = load(key)
+        if data is None:
+            return 404, {"error": f"no container {key}"}
+        if what == "close":
+            found = [m for m in data["members"] if m["id"] == body["id"]]
+            if not found:
+                return 404, {"error": f"no member {body['id']} in {key}"}
+            found[0]["closed"] = True
+        elif what == "seen":
+            if body.get("seen", True):
+                data["seen"][body["url"]] = time.time()
+            else:
+                data["seen"].pop(body["url"], None)
+        elif what == "visit":
+            data["visited"][body["group"]] = time.time()
+        save(data)
+    broadcast(key, {"type": what, **{k: v for k, v in body.items() if k != "container"}})
+    return 200, {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# a container as the view draws it, derived again on every read
+# --------------------------------------------------------------------------
+
+SKIP_DIRS = {"out", "run", "records", "sample", "pages", "vendor", "node_modules", "PROTOTYPE-wipe-me"}
+
+
+def show_files(root: Path, depth: int = 0):
+    """A directory with an index.html is one artefact; otherwise its pages and figures are, one each.
+    Markdown counts only at the top, and report.md never: it is the worker's, for agents."""
+    if (root / "index.html").is_file():
+        yield root / "index.html"
+        return
+    for p in sorted(root.iterdir()):
+        if p.is_dir() and p.name not in SKIP_DIRS and not p.name.startswith("."):
+            yield from show_files(p, depth + 1)
+        elif p.suffix in (".html", ".svg", ".png", ".pdf") or (p.suffix == ".md" and depth == 0 and p.name != "report.md"):
+            yield p
+
+
+def artefact(page: Page, ticket: str | None, title: str | None = None) -> dict:
+    mtime = page.path.stat().st_mtime if page.path and page.path.exists() else 0
+    return {"url": page.url, "id": member_id(page.url), "ticket": ticket, "kind": page.kind,
+            "title": title or title_of(page), "mtime": mtime}
+
+
+def ticket_artefacts(tracker: Tracker, slug: str) -> list[dict]:
+    found = []
+    review = tracker.agent / "diffviews" / f"{slug}.html"
+    ranges = tracker.tickets.get(slug, {}).get("diff") or []
+    if review.is_file():
+        found.append(artefact(page_of_path(review), slug, "review"))
+    # the review page may be of an earlier round than the ranges the ticket records now
+    if ranges:
+        found.append({"url": diff_url(tracker.root, slug), "id": member_id(diff_url(tracker.root, slug)), "ticket": slug,
+                      "kind": "diff", "title": "diff · " + ", ".join(ranges), "mtime": tracker.tickets[slug]["mtime"]})
+    for base in (tracker.agent / "show" / slug, tracker.agent / "prototypes" / slug):
+        if base.is_dir():
+            found += [artefact(page_of_path(p), slug) for p in show_files(base)]
+    return found
+
+
+def resume_command(session: str) -> str:
+    return diffview.resume_command(session) if diffview else f"claude --resume {session}"
+
+
+def present(path: Path) -> bool:
+    """A member's file is still there, and when it is a watched diffview, so is every repo it watched: a live
+    diff belongs in its container while its worktree exists."""
+    return path.exists() and not (diffview and diffview.watched_repo_gone(path))
+
+
+def container_view(key: str) -> dict | None:
+    """Everything the view draws. None once the container is gone: its tree retired, or every page of it
+    deleted. A member whose file is gone leaves it here."""
+    data = load(key)
+    if data is None:
+        return None
+    tracker = tracker_at(Path(data["tracker"]).parent) if data.get("tracker") else None
+    with lock:
+        data = load(key)
+        if data is None:
+            return None
+        kept = [m for m in data["members"] if not m.get("path") or present(Path(m["path"]))]
+        retired = data.get("tracker") and (not Path(data["tracker"]).is_dir() or (tracker and data["root"] not in tracker.tickets))
+        if retired or not kept:
+            state_file(key).unlink(missing_ok=True)
+            return None
+        if len(kept) != len(data["members"]):
+            data["members"] = kept
+            save(data)
+    in_tree = {s for s in tracker.tickets if tracker.tree(s) == data["root"]} if tracker else set()
+    groups = []
+    for sid in dict.fromkeys(m["group"] for m in sorted(data["members"], key=lambda m: m["first"])):
+        mine = [m for m in data["members"] if m["group"] == sid]
+        committed = [s for s in session_tickets(tracker.agent, sid) if s in in_tree] if tracker else []
+        slugs = list(dict.fromkeys([*committed, *(m["ticket"] for m in mine if m["ticket"])]))
+        tops = sorted((s for s in slugs if tracker and s in tracker.tickets), key=lambda s: (tracker.depth(s), slugs.index(s)))
+        arts = []
+        session_page = tracker.agent / "sessions" / sid / "index.html" if tracker else None
+        if session_page and session_page.is_file():
+            arts.append(artefact(page_of_path(session_page), None))
+        for slug in slugs:
+            arts += ticket_artefacts(tracker, slug) if tracker else []
+        listed = {a["url"] for a in arts}
+        arts += [{"url": m["url"], "id": m["id"], "ticket": m["ticket"], "kind": m["kind"], "title": m["title"],
+                  "mtime": m["first"]} for m in mine if m["url"] not in listed]
+        tickets = [{"slug": s, **({k: tracker.tickets[s][k] for k in ("status", "title", "diff")} if tracker and s in tracker.tickets
+                                   else {"status": "gone", "title": s, "diff": []}),
+                    "ruled_at": tracker.tickets[s]["mtime"] if tracker and s in tracker.tickets else 0} for s in slugs]
+        session = sid if sid != "loose" else None
+        groups.append({"name": tops[0] if tops else (f"session {sid[:8]}" if session else "loose pages"), "id": sid,
+                       "resume": resume_command(sid) if session else "", "tickets": tickets, "artefacts": arts,
+                       "visited": data["visited"].get(sid, 0)})
+    board = tracker.agent / "board.html" if tracker else None
+    return {"container": key, "name": data["name"], "repo": data.get("repo", ""), "root": data.get("root"),
+            "groups": groups, "members": data["members"], "seen": data["seen"],
+            "board": page_of_path(board).url if board and board.is_file() else None}
+
+
+def containers() -> list[dict]:
+    """Every container that is still there, the one most recently opened into first."""
+    found = []
+    for path in sorted((STATE / "containers").glob("*.json")):
+        try:
+            key = (load(urllib.parse.unquote(path.stem)) or {}).get("key")
+            view = container_view(key) if key else None
+        except OSError as e:
+            print(f"listing {path}: {e}", file=sys.stderr, flush=True)
+            continue
+        if view:
+            found.append({"key": key, "name": view["name"], "repo": view["repo"], "pages": len(view["members"]),
+                          "groups": len(view["groups"]), "last": max(m["at"] for m in view["members"])})
+    return sorted(found, key=lambda c: -c["last"])
+
+
+def index_page() -> bytes:
+    rows = "".join(
+        f'<li><a href="/c/{key_path(c["key"])}">{html.escape(c["name"])}</a>'
+        f'<span>{html.escape(c["repo"])}</span><span>{c["groups"]} orchestrator{"s" * (c["groups"] != 1)} · '
+        f'{c["pages"]} page{"s" * (c["pages"] != 1)} · {time.strftime("%Y-%m-%d %H:%M", time.localtime(c["last"]))}</span></li>'
+        for c in containers())
+    return INDEX.replace("__ROWS__", rows or "<li>none yet: a container appears with the first page an agent opens</li>").encode()
+
+
+def listing(directory: Path) -> bytes:
+    """Every page under a directory, linked relative to it, so a directory's address is somewhere to start."""
+    pages = sorted(directory.rglob("*.html"))
+    rows = "".join(f'<li><a href="{urllib.parse.quote(str(p.relative_to(directory)))}">{html.escape(str(p.relative_to(directory)))}</a></li>'
+                   for p in pages) or "<li>no pages here yet</li>"
+    return (INDEX.replace("<title>containers</title>", f"<title>{html.escape(directory.name)}</title>")
+            .replace("<h1>containers</h1><ul>__ROWS__</ul>", f"<h1>{html.escape(str(directory))}</h1><ul>{rows}</ul>")).encode()
+
+
+INDEX = """<!doctype html><meta charset="utf-8"><title>containers</title>
+<style>
+  :root { color-scheme: light dark; --ground: light-dark(#f4e4cd, #1a1714); --body: light-dark(#37261d, #ede3d2);
+    --muted: light-dark(#5e5650, #b0a89e); --accent: light-dark(#426724, #6ea444); --edge: light-dark(#cfbca3, #4a433b); }
+  body { margin: 0; padding: 3rem 2rem; background: var(--ground); color: var(--body); font: 15px/1.6 "IBM Plex Mono", ui-monospace, monospace; }
+  h1 { font: 600 17px/1.4 Newsreader, Georgia, serif; margin: 0 0 1rem; }
+  ul { list-style: none; padding: 0; margin: 0; max-width: 60rem; }
+  li { display: grid; grid-template-columns: minmax(12rem, 2fr) 1fr 2fr; gap: 1rem; padding: 6px 0; border-bottom: 1px solid var(--edge); }
+  a { color: var(--accent); text-decoration: none; font-weight: 500; } a:hover { text-decoration: underline; }
+  span { color: var(--muted); }
+</style>
+<h1>containers</h1><ul>__ROWS__</ul>
+"""
+
+
+# --------------------------------------------------------------------------
+# rendering a ticket's ranges, and trellis, on first use
+# --------------------------------------------------------------------------
+
+
+def render_diff(tracker_root: Path, ticket: str) -> tuple[Path | None, int, str]:
+    """The page of a ticket's recorded ranges, rendered on first use; else None, the status to answer, and why."""
+    tracker = tracker_at(tracker_root.parent)
+    ranges = tracker.tickets.get(ticket, {}).get("diff") if tracker else None
+    if not ranges:
+        return None, 404, "no diff recorded for this ticket"
+    code, agent = tracker_root.parent.parent, tracker_root.parent
+    specs = [f"{agent if r.startswith('agent@') else code}@{r.split('@', 1)[-1]}" for r in ranges]
+    out = STATE / "diffs" / f"{ticket}-{hashlib.sha1(' '.join(specs).encode()).hexdigest()[:8]}.html"
+    if out.exists():
+        return out, 200, ""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    command = [str(HERE / "diffview"), *specs, "-o", str(out), "--no-auto-summary", "--title", f"{ticket} · diff"]
+    try:
+        run = subprocess.run(command, cwd=code, capture_output=True, text=True, check=False, timeout=300)
+    except subprocess.TimeoutExpired:
+        why = f"diffview {' '.join(specs)} took over 300 s"
+    else:
+        if out.exists():
+            return out, 200, ""
+        why = f"diffview {' '.join(specs)} failed: {run.stderr.strip()[-500:]}"
+    print(f"rendering {ticket}'s diff: {why}", file=sys.stderr, flush=True)
+    return None, 502, why
+
+
+def trellis(name: str) -> Path | None:
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "container-hub" / "trellis-0.3.0"
+    path = cache / name
+    if not path.is_file():
+        cache.mkdir(parents=True, exist_ok=True)
+        # curl rather than urllib: uv's Python finds no CA bundle on NixOS
+        run = subprocess.run(["curl", "-fsSL", "--max-time", "30", TRELLIS_URL + name], capture_output=True, check=False)
+        body = run.stdout
+        if run.returncode != 0:
+            raise OSError(f"curl {TRELLIS_URL}{name}: {run.stderr.decode(errors='replace').strip()}")
+        if hashlib.sha256(body).hexdigest() != TRELLIS[name]:
+            raise OSError(f"{TRELLIS_URL}{name} does not match the pinned sha256")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(body)
+        os.replace(tmp, path)
+    return path
+
+
+# --------------------------------------------------------------------------
+# the server
+# --------------------------------------------------------------------------
+
+
+def load_diffview():
+    """diffview's own module, beside this script, so a page served here saves through the same code."""
+    path = HERE / "diffview"
+    if not path.is_file():
+        return None
+    loader = importlib.machinery.SourceFileLoader("diffview", str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("diffview", loader))
+    sys.dont_write_bytecode = True  # its cache would land in bin/, which is on PATH
+    loader.exec_module(module)
+    return module
+
+
+diffview = load_diffview()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, obj, code: int = 200) -> None:
+        self.send(code, json.dumps(obj).encode(), "application/json")
+
+    def send_file(self, path: Path) -> None:
+        # a shared directory with no index.html lists its pages
+        if path.is_dir() and not (path / "index.html").is_file() and any(path.is_relative_to(d) for d in SHARED):
+            return self.send(200, listing(path), "text/html; charset=utf-8")
+        if path.is_dir():
+            path = path / "index.html"
+        if not path.is_file():
+            return self.send(404, f"{path} does not exist".encode(), "text/plain")
+        ctype = "text/plain; charset=utf-8" if path.suffix == ".md" else mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self.send(200, path.read_bytes(), ctype)
+
+    def port(self) -> int:
+        return self.server.server_address[1]
+
+    def local(self) -> bool:
+        """A web page can point a name at 127.0.0.1, so only these Host headers are answered."""
+        return (self.headers.get("Host") or "").lower() in (f"127.0.0.1:{self.port()}", f"localhost:{self.port()}")
+
+    def do_GET(self):
+        if not self.local():
+            return self.send(403, b"forbidden", "text/plain")
+        parts = urllib.parse.urlsplit(self.path)
+        path = parts.path
+        if path == "/.health":  # a diffview page asks this before it offers its comment controls
+            return self.send_json({"saves": diffview is not None})
+        if path == "/":
+            return self.send(200, index_page(), "text/html; charset=utf-8")
+        if path.startswith("/c/"):
+            view = (HERE / "container-hub.html").read_text().replace('"__RESTART__"', json.dumps(restart_command()))
+            return self.send(200, view.encode(), "text/html; charset=utf-8")
+        if path.startswith("/static/trellis/") and (name := path.rsplit("/", 1)[-1]) in TRELLIS:
+            try:
+                return self.send_file(trellis(name))
+            except OSError as e:
+                return self.send(502, f"trellis could not be fetched: {e}".encode(), "text/plain")
+        if path.startswith("/api/c/"):
+            view = container_view(urllib.parse.unquote(path.removeprefix("/api/c/")))
+            return self.send_json(view) if view else self.send_json({"error": "no such container"}, 404)
+        if path.startswith("/events/"):
+            return self.stream(urllib.parse.unquote(path.removeprefix("/events/")))
+        if path == "/diff":
+            query = urllib.parse.parse_qs(parts.query)
+            page, status, why = render_diff(Path(query.get("tracker", [""])[0]), query.get("ticket", [""])[0])
+            if not page:
+                return self.send(status, why.encode(), "text/plain; charset=utf-8")
+            return self.send(302, b"", "text/plain", {"Location": "/f" + urllib.parse.quote(str(page))})
+        if path.startswith("/f/"):
+            target = Path(urllib.parse.unquote(path.removeprefix("/f"))).resolve()
+            if not servable(target):
+                return self.send(403, b"not a page the hub serves", "text/plain")
+            if diffview and (page := diffview.page_beside(target, (".watch.json",))) and page.is_file():
+                return self.send_json(diffview.watch_record(page))  # with whether its watcher still runs
+            if not target.exists() and diffview and diffview.is_beside_page(target):
+                return self.send(200, b"null", "application/json")  # nothing saved beside the page yet
+            if target.is_dir() and not path.endswith("/"):  # the pages in it link relative to it
+                return self.send(301, b"", "text/plain", {"Location": path + "/" + (f"?{parts.query}" if parts.query else "")})
+            return self.send_file(target)
+        self.send(404, b"not found", "text/plain")
+
+    def stream(self, key: str) -> None:
+        """A listener counts as a view showing the container, which decides whether claude-browser opens one, so it
+        goes the moment its view closes rather than at the next write that fails."""
+        q: queue.Queue = queue.Queue()
+        try:
+            seen_by[q] = view_digest(key)
+        except Exception as e:  # without a digest, the disk watch's first round tells this listener to read again
+            print(f"listening on {key}: {e}", file=sys.stderr, flush=True)
+        with lock:
+            listeners.setdefault(key, []).append(q)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            quiet = 0
+            while not self.peer_gone():
+                try:
+                    self.wfile.write(f"data: {json.dumps(q.get(timeout=1))}\n\n".encode())
+                except queue.Empty:
+                    if (quiet := quiet + 1) < 15:
+                        continue
+                    self.wfile.write(b": keepalive\n\n")
+                quiet = 0
+                self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            with lock:
+                listeners[key].remove(q)
+
+    def peer_gone(self) -> bool:
+        """An event stream's client sends nothing after its request, so its socket turning readable means it closed."""
+        if not select.select([self.connection], [], [], 0)[0]:
+            return False
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
+    def do_POST(self):
+        if not self.local():
+            return self.send(403, b"forbidden", "text/plain")
+        path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+        if path.startswith("/f/") and diffview:
+            if refused := diffview.write_refusal(self):
+                return self.send(refused[0], refused[1], "text/plain")
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            target = Path(path.removeprefix("/f")).resolve()
+            if servable(target) and diffview.is_beside_page(target, (".summary.json",)):
+                # a watched page asking its watcher for a new summary
+                if diffview.request_summary(diffview.page_beside(target)):
+                    return self.send(204, b"", "text/plain")
+                return self.send(409, b"no diffview watcher runs for this page", "text/plain")
+            if not servable(target) or not diffview.is_state_file(target):
+                return self.send(403, b"forbidden", "text/plain")
+            code, body = diffview.write_state(target, raw)
+            return self.send(code, body, "application/json" if code == 409 else "text/plain")
+        # a page on another site can POST to loopback; only this origin's pages and local tools (no Origin) may write
+        if self.headers.get("Origin") not in (None, f"http://127.0.0.1:{self.port()}", f"http://localhost:{self.port()}"):
+            return self.send(403, b"forbidden", "text/plain")
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            if path == "/api/open":
+                code, answer = open_page(body, self.port(), from_page=self.headers.get("Origin") is not None)
+            elif path == "/api/serve":
+                # a page in the view must not widen what it can read
+                code, answer = (403, {"error": "only a local tool may share"}) if self.headers.get("Origin") else share(body)
+            elif path in ("/api/close", "/api/seen", "/api/visit"):
+                code, answer = mark(body["container"], path.removeprefix("/api/"), body)
+            else:
+                code, answer = 404, {"error": "no such route"}
+        except (KeyError, ValueError, TypeError) as e:
+            code, answer = 400, {"error": f"{type(e).__name__}: {e}"}
+        except OSError as e:  # the hub's own disk failed it, a file it keeps unreadable or a write refused
+            code, answer = 500, {"error": f"{type(e).__name__}: {e}"}
+        self.send_json(answer, code)
+
+
+def view_digest(key: str) -> str:
+    return hashlib.sha1(json.dumps(container_view(key), sort_keys=True).encode()).hexdigest()
+
+
+def restart_command() -> str:
+    """What brings this hub back once it is gone: its user service where it runs as one, else the command that
+    started it."""
+    try:
+        service = Path("/proc/self/cgroup").read_text().strip().endswith("/container-hub.service")
+    except OSError:
+        service = False
+    return "systemctl --user restart container-hub" if service else shlex.join(["setsid", "-f", str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
+
+
+def watch_disk() -> None:
+    """A view that is showing hears when the disk under its container changes: a ticket's status, a page
+    deleted, a new artefact. Only the containers someone is looking at are read."""
+    while True:
+        time.sleep(2)
+        with lock:
+            watched = {k: list(qs) for k, qs in listeners.items() if qs}
+        for key, qs in watched.items():
+            try:
+                digest = view_digest(key)
+            except Exception as e:  # a ticket or page changing under the read: the next round reads it again
+                print(f"watching {key}: {e}", file=sys.stderr, flush=True)
+                continue
+            for q in qs:
+                if seen_by.get(q) != digest:
+                    q.put({"type": "disk"})
+                seen_by[q] = digest
+
+
+def main(args: Args) -> None:
+    global STATE
+    STATE = args.state.expanduser().resolve()
+    STATE.mkdir(parents=True, exist_ok=True)
+    for path in (STATE / "containers").glob("*.json"):
+        try:
+            data = load(urllib.parse.unquote(path.stem)) or {"members": []}
+        except OSError as e:  # the hub starts without that container's pages; the file is left as it is
+            print(f"starting without {path}: {e}", file=sys.stderr, flush=True)
+            continue
+        OPENED.update(Path(m["path"]) for m in data["members"] if m.get("path") and m.get("agent"))
+    try:
+        listed = load_shared()
+    except OSError as e:  # left as it is, like an unreadable container
+        print(f"starting without what {shared_file()} shares: {e}", file=sys.stderr, flush=True)
+    else:
+        kept = [p for p in listed if Path(p).exists()]  # a page deleted since stops being served
+        for path in map(Path, kept):
+            (SHARED if path.is_dir() else OPENED).add(path)
+        if kept != listed:
+            save_shared(kept)
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=watch_disk, daemon=True).start()
+    print(f"container-hub on http://127.0.0.1:{args.port}/, state in {STATE}", flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__))
