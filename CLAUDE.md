@@ -191,7 +191,8 @@ Cloudflare account, flat by file name, and the site links them at
 reached only through that custom domain; its `r2.dev` URL is off. It was made
 with two R2 API calls: `POST accounts/<id>/r2/buckets` (location hint `weur`),
 then `POST .../r2/buckets/mwolf-dev-media/domains/custom`. It only grows: media
-no note references any more stays.
+no note references any more stays. A file changed under the same name keeps its
+URL, so Cloudflare's cache serves the old bytes for a few hours.
 
 ## What stays outside Nix
 
