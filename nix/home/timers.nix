@@ -45,9 +45,9 @@ let
     bash coreutils uv openssh jq
   ]);
 
-  # The activity board and the commits collector shell out to git in every
-  # checkout they find, and find them with fd.
-  activityPath = lib.makeBinPath (with pkgs; [
+  # The commits collector shells out to git in every checkout it finds, and
+  # finds them with fd.
+  gitCommitsPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv jq git fd
   ]);
 
@@ -333,7 +333,7 @@ in
     Unit.Description = "Record max's new commits from every local checkout";
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${activityPath}" ];
+      Environment = [ "PATH=${gitCommitsPath}" ];
       ExecStart = "${secrets}/scripts/git-commits-collect --record";
       # A first or --full run reads every history, about a minute.
       TimeoutStartSec = "10min";
@@ -646,16 +646,16 @@ in
   };
 
   # The odd one out: it reports on no job, only on when this machine was in use.
-  # It re-reads every source in full — a year of wakatime heartbeats, every git
-  # checkout under ~/repos — for about ten seconds of CPU, so it runs once a day
-  # rather than hourly. The page is a record of years; the last hour of it is not
-  # what anyone opens it for, and `systemctl --user start` covers wanting today.
+  # It re-reads lifelog's views over every source in full, about a minute of CPU
+  # across the cores, so it runs once a day rather than hourly. The page is a
+  # record of years; the last hour of it is not what anyone opens it for, and
+  # `systemctl --user start` covers wanting today.
 
   systemd.user.services.dashboard-activity = {
-    Unit.Description = "Rebuild the activity dashboard from this machine's own traces";
+    Unit.Description = "Rebuild the activity dashboard from lifelog's views";
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${activityPath}" ];
+      Environment = [ "PATH=${uvScriptPath}" ];
       ExecStart = "${secrets}/scripts/dashboard-activity --record";
       TimeoutStartSec = "10min";
       # Nothing waits on this page, and it competes with whatever max is doing.
