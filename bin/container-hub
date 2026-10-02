@@ -15,7 +15,8 @@ request, so the hub's state can go and only those marks go with it.
 
 Pages are served from here (`/f/<absolute path>`), so the container's view (`/c/<key>`) shares their origin
 and reaches into them: their links and keys. A diffview page served here saves its comments through
-diffview's own code. Worker reports and diffviews of nothing but ticket files are for agents and never open.
+diffview's own code; `diffview --open` and `diffview --serve` hand their pages here rather than serving them
+themselves. Worker reports and diffviews of nothing but ticket files are for agents and never open.
 
     GET  /                    the containers, most recently opened into first: the way back after a reboot
     GET  /c/<key>             the container's view
@@ -27,10 +28,12 @@ diffview's own code. Worker reports and diffviews of nothing but ticket files ar
     POST /api/close           {"container", "id"}: hide a member; it stays a member, and an open brings it back.
     POST /api/seen            {"container", "url", "seen"}: the user's seen mark on a page.
     POST /api/visit           {"container", "group"}: the user looked at a group; what was new there is not.
+    POST /api/serve           {"path"}: from a local tool only, serve a page with what sits beside it, or a
+                              directory with everything under it, without making it a member. Answers {"url"}.
     GET  /api/c/<key>         the container: {"members": [{"id", "url", "closed", ...}], "seen": {url: when},
                               "groups": [...]}. A member's url is where the hub serves it, relative to here.
     GET  /diff?tracker=&ticket=   a ticket's recorded `diff:` ranges, rendered by diffview on first open
-    GET  /f/<path>            a file under $HOME or the temp dir
+    GET  /f/<path>            a file under $HOME or the temp dir; a directory without an index.html lists its pages
     POST /f/<page>.state.json a diffview page saving its comments
     GET  /.health             {"saves": true}: diffview pages served here can save
 
@@ -389,20 +392,63 @@ def state_file(key: str) -> Path:
 
 
 OPENED: set[Path] = set()
-"""Every page an agent opened: what /f/ serves outside an agent directory."""
+"""Every page an agent opened or a local tool asked to have served: what /f/ serves outside an agent directory."""
+SHARED: set[Path] = set()
+"""The directories a local tool asked to have served whole (`POST /api/serve`)."""
 
 
 def servable(path: Path) -> bool:
     """What /f/ serves: the agent directories, the files git tracks in the repos around them, the hub's own
-    renders, and a page an agent opened with what sits beside it, though never all of $HOME or the temp dir
-    for a page opened from there. A page the view shows shares the hub's origin, so whatever is served here,
-    every page in the view can read."""
+    renders, a directory a local tool shared, and a page an agent opened or a tool shared with what sits beside
+    it, though never all of $HOME or the temp dir for a page opened from there. A page the view shows shares
+    the hub's origin, so whatever is served here, every page in the view can read."""
     agent, inside = agent_of(path)
-    if path.is_relative_to(STATE) or inside:
+    if path.is_relative_to(STATE) or inside or any(path.is_relative_to(d) for d in SHARED):
         return True
     if agent and path.is_file() and git(agent.parent, "ls-files", "--error-unmatch", "--", str(path)):
         return True
-    return any(path == f or (f.parent not in (HOME, TEMP, Path("/")) and path.is_relative_to(f.parent)) for f in OPENED)
+    if any(path == f or (not too_broad(f.parent) and path.is_relative_to(f.parent)) for f in OPENED):
+        return True
+    # what diffview keeps beside a page goes where the page goes, so a page served on its own still saves
+    beside = next((path.with_name(path.name.removesuffix(k)) for k in (".state.json", ".summary.json")
+                   if path.name.endswith(".html" + k)), None)
+    return beside is not None and servable(beside)
+
+
+def too_broad(directory: Path) -> bool:
+    """A directory holding all of $HOME or the temp dir, which /f/ never serves whole."""
+    return HOME.is_relative_to(directory) or TEMP.is_relative_to(directory)
+
+
+def shared_file() -> Path:
+    return STATE / "served.json"
+
+
+def share(body: dict) -> tuple[int, dict]:
+    """Serve a page, or a directory of them, for a local tool. Kept on disk, so a page left open in a tab
+    still saves once the hub has restarted."""
+    path = Path(body["path"]).expanduser().resolve()
+    if not path.exists():
+        return 404, {"error": f"{path} does not exist"}
+    if path.is_dir() and too_broad(path):
+        return 403, {"error": f"{path} holds all of your home or the temp dir, which the hub never serves whole"}
+    with lock:
+        if path not in OPENED | SHARED:
+            (SHARED if path.is_dir() else OPENED).add(path)
+            listed = load_shared()
+            listed.append(str(path))
+            tmp = shared_file().with_name(f".served.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(listed, indent=1) + "\n")
+            os.replace(tmp, shared_file())
+    return 200, {"url": "/f" + urllib.parse.quote(str(path)) + ("/" if path.is_dir() else "")}
+
+
+def load_shared() -> list[str]:
+    try:
+        listed = json.loads(shared_file().read_text())
+    except (OSError, ValueError):
+        return []
+    return [p for p in listed if isinstance(p, str)] if isinstance(listed, list) else []
 
 
 def load(key: str) -> dict | None:
@@ -625,6 +671,15 @@ def index_page() -> bytes:
     return INDEX.replace("__ROWS__", rows or "<li>none yet: a container appears with the first page an agent opens</li>").encode()
 
 
+def listing(directory: Path) -> bytes:
+    """Every page under a directory, linked relative to it, so a directory's address is somewhere to start."""
+    pages = sorted(directory.rglob("*.html"))
+    rows = "".join(f'<li><a href="{urllib.parse.quote(str(p.relative_to(directory)))}">{html_escape(str(p.relative_to(directory)))}</a></li>'
+                   for p in pages) or "<li>no pages here yet</li>"
+    return (INDEX.replace("<title>containers</title>", f"<title>{html_escape(directory.name)}</title>")
+            .replace("<h1>containers</h1><ul>__ROWS__</ul>", f"<h1>{html_escape(str(directory))}</h1><ul>{rows}</ul>")).encode()
+
+
 def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
@@ -720,6 +775,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send(code, json.dumps(obj).encode(), "application/json")
 
     def send_file(self, path: Path) -> None:
+        if path.is_dir() and not (path / "index.html").is_file():
+            return self.send(200, listing(path), "text/html; charset=utf-8")
         if path.is_dir():
             path = path / "index.html"
         if not path.is_file():
@@ -767,6 +824,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(403, b"not a page the hub serves", "text/plain")
             if not target.exists() and diffview and diffview.is_beside_page(target):
                 return self.send(200, b"null", "application/json")  # nothing saved beside the page yet
+            if target.is_dir() and not path.endswith("/"):  # the pages in it link relative to it
+                return self.send(301, b"", "text/plain", {"Location": urllib.parse.quote(path) + "/"})
             return self.send_file(target)
         self.send(404, b"not found", "text/plain")
 
@@ -813,6 +872,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
             if path == "/api/open":
                 code, answer = open_page(body, self.port(), from_page=self.headers.get("Origin") is not None)
+            elif path == "/api/serve":
+                # a page in the view must not widen what it can read
+                code, answer = (403, {"error": "only a local tool may share"}) if self.headers.get("Origin") else share(body)
             elif path in ("/api/close", "/api/seen", "/api/visit"):
                 code, answer = mark(body["container"], path.removeprefix("/api/"), body)
             else:
@@ -847,6 +909,11 @@ def main(args: Args) -> None:
     for path in (STATE / "containers").glob("*.json"):
         data = load(urllib.parse.unquote(path.stem)) or {"members": []}
         OPENED.update(Path(m["path"]) for m in data["members"] if m.get("path") and m.get("agent"))
+    kept = [p for p in load_shared() if Path(p).exists()]  # a page deleted since stops being served
+    for path in map(Path, kept):
+        (SHARED if path.is_dir() else OPENED).add(path)
+    if kept != load_shared():
+        shared_file().write_text(json.dumps(kept, indent=1) + "\n")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.daemon_threads = True
     threading.Thread(target=watch_disk, args=(threading.Event(),), daemon=True).start()
