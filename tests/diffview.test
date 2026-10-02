@@ -11,18 +11,30 @@ set -uo pipefail
 # real shells pin the browser via this var; the --open checks stub xdg-open, so force that path
 export DIFFVIEW_BROWSER=""
 
-diffview="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/diffview"
+bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
+diffview="$bin/diffview"
 work=$(mktemp -d)
-# every derived render starts a server for its output directory; leave none behind
+free_port() { python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])"; }
+
+# a container hub of the test's own, never the one on 8377, with a home of its own outside $work
+# so $work can be served whole; uv keeps its real directories, or the hub resolves its dependencies anew
+hubhome=$(mktemp -d)
+uvcache=$(uv cache dir)
+uvpython=$(uv python dir)
+export CONTAINER_HUB_PORT
+CONTAINER_HUB_PORT=$(free_port)
+hub="http://127.0.0.1:$CONTAINER_HUB_PORT"
+HOME="$hubhome" UV_CACHE_DIR="$uvcache" UV_PYTHON_INSTALL_DIR="$uvpython" setsid "$bin/container-hub" --port "$CONTAINER_HUB_PORT" --state "$hubhome/state" \
+    > "$hubhome/hub.log" 2>&1 &
+hubpid=$!
+downport=$(free_port)   # where a hub is down until a diffview brings one up
 cleanup() {
-    for marker in "$work"/.serve.json "$work"/*/.serve.json "$work"/*/*/.serve.json; do
-        [ -f "$marker" ] || continue
-        # the server clears its own marker as it goes, so reading one is always a race
-        kill "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['pid'])" "$marker" 2>/dev/null)" 2>/dev/null
-    done
-    rm -rf "$work"
+    kill -- "-$hubpid" 2>/dev/null
+    pkill -f "container-hub --port $downport" 2>/dev/null
+    rm -rf "$work" "$hubhome"
 }
 trap cleanup EXIT
+for _ in $(seq 300); do curl -sf -o /dev/null "$hub/.health" && break; sleep 0.2; done
 
 failures=0
 check() {
@@ -380,7 +392,7 @@ check "same specs derive the same page" "$d1" "$d2"
 check "different specs derive different pages" yes "$([ "$d1" != "$d3" ] && echo yes)"
 check "derived pages land under Downloads/diffview" yes "$(case "$d1" in "$work"/Downloads/diffview/*) echo yes;; esac)"
 check "a derived name carries no range to mis-copy" yes "$(grep -qE '/repo-[0-9a-f]{8}\.html$' <<<"$d1" && echo yes)"
-check "a derived page is served, so its url can take comments" yes "$(HOME="$work" "$diffview" "$repo@HEAD~2..HEAD" --no-auto-summary | tail -1 | grep -qE '^http://127\.0\.0\.1:[0-9]+/repo-[0-9a-f]{8}\.html$' && echo yes)"
+check "a derived page is served by the hub, so its url can take comments" yes "$(HOME="$work" "$diffview" "$repo@HEAD~2..HEAD" --no-auto-summary | tail -1 | grep -qE "^$hub/f$work/Downloads/diffview/repo-[0-9a-f]{8}\.html\$" && echo yes)"
 
 # the displacing render is the moment comments are about to be stranded, so it says so
 echo '{"savedAt":1,"comments":[{"id":1}],"viewed":[],"nextId":2,"verdict":[]}' > "$d1.state.json"
@@ -413,35 +425,36 @@ printf '#!/bin/sh\necho "$1" > "%s/opened"\n' "$work/stub" > "$work/stub/xdg-ope
 chmod +x "$work/stub/xdg-open"
 PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/o.html" --no-auto-summary --open >/dev/null 2>&1
 opened=$(cat "$work/stub/opened")
-check "--open opens a served page" yes "$(grep -q '^http://127.0.0.1:[0-9]*/o.html$' <<<"$opened" && echo yes)"
-check "and that server answers for the page's directory" "$work/pages" "$(curl -s "${opened%/o.html}/.health" | python3 -c 'import json,sys;print(json.load(sys.stdin)["root"])')"
-kill "$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['pid'])")" 2>/dev/null
+check "--open opens the page on the container hub" "$hub/f$work/pages/o.html" "$opened"
+curl -s -o "$work/served.html" "$opened"   # grep -q on a pipe would cut curl off, which pipefail counts as a failure
+check "which serves the page there" yes "$(grep -q "\"key\": \"$work/pages/o.html\"" "$work/served.html" && echo yes)"
+check "and says the pages it serves can save" True "$(curl -s "$hub/.health" | python3 -c 'import json,sys;print(json.load(sys.stdin)["saves"])')"
 
-HOME="$work" PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/home.html" --no-auto-summary --open >/dev/null 2>&1
-check "a directory holding your home is not served" yes "$(grep -q "^file://$work/home.html$" "$work/stub/opened" && echo yes)"
-
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$hubhome/home.html" --no-auto-summary --open >/dev/null 2>&1
+check "a page sitting in your home is served on its own" "$hub/f$hubhome/home.html" "$(cat "$work/stub/opened")"
+check "and nothing else in your home with it" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$hub/f$hubhome/hub.log")"
+refused=$("$diffview" --serve "$hubhome" 2>&1)
+check "your home is never served whole" "1 yes" "$? $(grep -q 'never serves whole' <<<"$refused" && echo yes)"
 # a symlinked home must not walk past that guard: resolve both sides or it does
-ln -s "$work" "$work/homelink"
-HOME="$work/homelink" PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/home.html" --no-auto-summary --open >/dev/null 2>&1
-check "a symlinked home is not served either" yes "$(grep -q "^file://$work/home.html$" "$work/stub/opened" && echo yes)"
+ln -s "$hubhome" "$work/homelink"
+check "nor through a symlink to it" 1 "$("$diffview" --serve "$work/homelink" >/dev/null 2>&1; echo $?)"
 
 # the page is opened as one url, not shadowed by a second one naming the read-only file
 lines=$(PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/o.html" --no-auto-summary --open 2>/dev/null | grep -c '^file://')
 check "no file:// url is printed alongside the served one" 0 "$lines"
 
 # loopback binding is not enough on its own: a page can point a name at 127.0.0.1
-port=$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['port'])")
-check "a foreign Host header is refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example.com' "http://127.0.0.1:$port/.health")"
-check "and a loopback one is not" 200 "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/.health")"
-kill "$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['pid'])")" 2>/dev/null
+check "a foreign Host header is refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example.com' "$hub/.health")"
+check "and a loopback one is not" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$hub/.health")"
 
 # a page writes the state whole, so a second page on the same review would erase the first;
 # the server takes writes from the page that owns the file, and refuses the one that is behind
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/race.html" --no-auto-summary >/dev/null
-"$diffview" --serve "$work/pages" >/dev/null
-port=$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['port'])")
-origin="http://127.0.0.1:$port"
-state="$origin/race.html.state.json"
+served=$("$diffview" --serve "$work/pages")
+check "--serve prints the directory's address on the hub" "diffview: serving $work/pages at $hub/f$work/pages/" "$served"
+origin=$hub
+pages="$origin/f$work/pages"
+state="$pages/race.html.state.json"
 post() { curl -s -o /dev/null -w '%{http_code}\n' -X POST -H "Origin: $origin" -d "$1" "$state"; }   # one write per code, so parallel posts below never interleave
 held() { python3 -c "import json;print(json.dumps(json.load(open('$work/pages/race.html.state.json'))$1))"; }
 check "the first write to a review lands" 204 "$(post '{"savedAt": 1001, "writer": "a", "since": null, "comments": ["a1"]}')"
@@ -455,8 +468,9 @@ check "and takes the review over" '["b2"] "b"' "$(held '["comments"]') $(held '[
 # another reads as no state at all -- which would wave the next write through unchecked
 big=$(python3 -c "import json;print(json.dumps({'savedAt': 7001, 'writer': 'b', 'since': None, 'comments': ['x' * 400] * 200}))")
 rm -f "$work/pages/codes"
-for _ in $(seq 1 12); do post "$big" >> "$work/pages/codes" & done
-wait
+posts=()   # waited on by pid: a bare wait would wait on the hub too
+for _ in $(seq 1 12); do post "$big" >> "$work/pages/codes" & posts+=($!); done
+wait "${posts[@]}"
 check "concurrent writes from one page all land" 12 "$(grep -c '^204$' "$work/pages/codes")"
 check "and leave the state file readable" ok "$(python3 -c "import json;json.load(open('$work/pages/race.html.state.json'));print('ok')" 2>&1 | tail -1)"
 
@@ -477,50 +491,36 @@ check "a write from another origin is refused" 403 "$(foreign -H 'Origin: http:/
 check "so is one from a null origin" 403 "$(foreign -H 'Origin: null')"
 check "and one that names no origin at all" 403 "$(foreign -H 'Origin:')"
 check "none of them touched the file" "$before" "$(held '')"
-check "the server's own origin on localhost writes too" 204 "$(foreign -H "Origin: http://localhost:$port")"
+check "the server's own origin on localhost writes too" 204 "$(foreign -H "Origin: http://localhost:$CONTAINER_HUB_PORT")"
 check "a write must announce its length" 411 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" "$state")"
 head -c 4200000 /dev/zero | tr '\0' x > "$work/pages/huge"
 check "and one over the size cap is refused" 413 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" --data-binary "@$work/pages/huge" "$state")"
-check "a write lands only beside a page that exists" 404 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" -d '{}' "$origin/nopage.html.state.json")"
+check "a write lands only beside a page that exists" 403 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" -d '{}' "$pages/nopage.html.state.json")"
 cp "$work/pages/race.html" "$work/outside.html"   # a real page, just not under the served tree
-check "and never outside the served tree, page or no page" 404 "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is -X POST -H "Origin: $origin" -d '{}' "$origin/../outside.html.state.json")"
+check "and never outside the served tree, page or no page" 403 "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is -X POST -H "Origin: $origin" -d '{}' "$pages/../outside.html.state.json")"
 check "so no such files appear" yes "$([ ! -e "$work/pages/nopage.html.state.json" ] && [ ! -e "$work/outside.html.state.json" ] && echo yes)"
 
 # a page polls its state and summary files; one with nothing written beside it yet is a page with nothing
 # to read, and a 404 there is a red line in the browser's console on a page that is fine
-check "a page with no state written yet answers null" "null 200" "$(curl -s -w ' %{http_code}' "$origin/o.html.state.json")"
-check "and one with no summary written yet the same" "null 200" "$(curl -s -w ' %{http_code}' "$origin/o.html.summary.json")"
-check "a url beside no page is not found" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$origin/nopage.html.state.json")"
-kill "$(python3 -c "import json;print(json.load(open('$work/pages/.serve.json'))['pid'])")" 2>/dev/null
+check "a page with no state written yet answers null" "null 200" "$(curl -s -w ' %{http_code}' "$pages/o.html.state.json")"
+check "and one with no summary written yet the same" "null 200" "$(curl -s -w ' %{http_code}' "$pages/o.html.summary.json")"
+check "a url beside no page is not found" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$pages/nopage.html.state.json")"
 
-# --- the server lives as long as a page is open: an open page beats once a minute, and the
-# server exits a grace period after the last beat; the marker keeps the port for the next one
+# --- with no hub answering, --serve brings one up; two at once, from a person and an agent say, leave one
 
-mkdir -p "$work/beat"
-"$diffview" "$repo@HEAD~1..HEAD" -o "$work/beat/b.html" --no-auto-summary >/dev/null
-DIFFVIEW_IDLE_SECONDS=3 "$diffview" --serve "$work/beat" >/dev/null
-bport=$(python3 -c "import json;print(json.load(open('$work/beat/.serve.json'))['port'])")
-bpid=$(python3 -c "import json;print(json.load(open('$work/beat/.serve.json'))['pid'])")
-for _ in $(seq 7); do curl -s -o /dev/null "http://127.0.0.1:$bport/.health"; sleep 1; done
-check "a page beating every second keeps the server past its grace period" yes "$(kill -0 "$bpid" 2>/dev/null && echo yes)"
-for _ in $(seq 40); do kill -0 "$bpid" 2>/dev/null || break; sleep 0.2; done
-check "without beats it exits once the grace period passes" no "$(kill -0 "$bpid" 2>/dev/null && echo yes || echo no)"
-check "and leaves its port in the marker, its pid gone" "$bport no" "$(python3 -c "import json;m=json.load(open('$work/beat/.serve.json'));print(m['port'], 'yes' if 'pid' in m else 'no')")"
-# two starts at the same moment, from a person and an agent say, must not leave two servers
-# on one directory with the tabs split between them
-"$diffview" --serve "$work/beat" > "$work/beat/start1" 2>&1 &
-"$diffview" --serve "$work/beat" > "$work/beat/start2" 2>&1 &
-wait
-ports=$(grep -oh 'http://127.0.0.1:[0-9]*' "$work/beat/start1" "$work/beat/start2" | sort -u | wc -l)
-check "two servers started at once on one directory become one" "1 1" "$ports $(pgrep -fc "diffview --serve $work/beat")"
-kill "$(python3 -c "import json;print(json.load(open('$work/beat/.serve.json'))['pid'])")" 2>/dev/null
-for _ in $(seq 40); do [ -z "$(pgrep -f "diffview --serve $work/beat")" ] && break; sleep 0.2; done
-# the tab still open on the old port must reach the next server without a reload
-free=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])")
-python3 -c "import json;json.dump({'port': $free, 'root': '$work/beat'}, open('$work/beat/.serve.json', 'w'))"
-"$diffview" --serve "$work/beat" >/dev/null
-check "a restarted server answers on the port the marker holds" "$work/beat" "$(curl -s "http://127.0.0.1:$free/.health" | python3 -c 'import json,sys;print(json.load(sys.stdin)["root"])')"
-kill "$(python3 -c "import json;print(json.load(open('$work/beat/.serve.json'))['pid'])")" 2>/dev/null
+mkdir -p "$work/beat" "$work/downhome"
+starts=()
+for n in 1 2; do
+    HOME="$work/downhome" UV_CACHE_DIR="$uvcache" UV_PYTHON_INSTALL_DIR="$uvpython" CONTAINER_HUB_PORT=$downport \
+        "$diffview" --serve "$work/beat" > "$work/beat/start$n" 2>&1 &
+    starts+=($!)
+done
+wait "${starts[@]}"
+check "--serve with the hub down starts one and prints the address on it" \
+    "diffview: serving $work/beat at http://127.0.0.1:$downport/f$work/beat/ x2" "$(sort -u "$work/beat/start1" "$work/beat/start2") x$(cat "$work/beat/start1" "$work/beat/start2" | grep -c serving)"
+for _ in $(seq 50); do [ "$(pgrep -fc "bin/python .*container-hub --port $downport")" -le 1 ] && break; sleep 0.2; done
+check "and two at once leave one hub" 1 "$(pgrep -fc "bin/python .*container-hub --port $downport")"
+pkill -f "container-hub --port $downport"
 
 # --- the auto summary lands after the page, never before it
 
@@ -586,8 +586,8 @@ rm -f "$work/stub/change-summary"
 if command -v chromium >/dev/null; then
     # the pages are driven over http: only a served page can save comments, so a
     # file:// run would exercise the read-only path instead of the review machinery
-    "$diffview" --serve "$work" >/dev/null
-    base="http://127.0.0.1:$(python3 -c "import json;print(json.load(open('$work/.serve.json'))['port'])")"
+    base=$("$diffview" --serve "$work" | grep -o 'http://[^ ]*')
+    base=${base%/}
     # file cards render lazily on scroll; force them so the DOM snapshot is deterministic
     sed 's#</body>#<script>setTimeout(() => document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render"))), 300)</script></body>#' \
         "$work/range.html" > "$work/dom.html"
@@ -953,7 +953,20 @@ EOF
     dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/gap-dom.html" 2>/dev/null)
     check "a fully opened gap turns the lower hunk's header into a hairline" "before=0 after=1 gaps=2 height=2px" "$(grep -o 'id="gap">[^<]*' <<<"$dom" | cut -d'>' -f2)"
 
-    kill "$(python3 -c "import json;print(json.load(open('$work/.serve.json'))['pid'])")" 2>/dev/null
+    # a panel resized in a container makes the browser report a ResizeObserver loop; that is no error of the page's
+    cat > "$work/resize.js" <<'EOF'
+setTimeout(() => {
+  dispatchEvent(new ErrorEvent("error", { message: "ResizeObserver loop completed with undelivered notifications" }));
+  const quiet = document.getElementById("toast").textContent;
+  dispatchEvent(new ErrorEvent("error", { message: "boom" }));
+  document.body.append(Object.assign(document.createElement("pre"), { id: "resize", textContent:
+    `quiet=[${quiet}] loud=[${document.getElementById("toast").textContent}]` }));
+}, 300);
+EOF
+    sed 's#</body>#<script src="resize.js"></script></body>#' "$work/range.html" > "$work/resize.html"
+    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/resize.html" 2>/dev/null)
+    check "a ResizeObserver loop raises no error, and any other error still does" "quiet=[] loud=[JS error: boom]" \
+        "$(grep -o 'id="resize">[^<]*' <<<"$dom" | cut -d'>' -f2)"
 else
     echo "skip chromium not found — DOM checks not run"
 fi
