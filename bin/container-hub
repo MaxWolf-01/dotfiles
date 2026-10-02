@@ -62,6 +62,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import weakref
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -362,6 +363,10 @@ def chosen(name: str, page: Page, cwd: str | None, derived: Placement) -> Placem
 STATE = Path()
 lock = threading.RLock()
 listeners: dict[str, list[queue.Queue]] = {}
+# The digest of its container each listener last saw, taken when it starts listening and moved on by every round
+# of the disk watch: a listener hears of every change made since it started, and of nothing else. What changed
+# before is the listener's to read once its stream is open.
+seen_by: weakref.WeakKeyDictionary[queue.Queue, str] = weakref.WeakKeyDictionary()
 launched: dict[str, float] = {}
 
 
@@ -824,6 +829,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def stream(self, key: str) -> None:
         q: queue.Queue = queue.Queue()
+        try:
+            seen_by[q] = view_digest(key)
+        except Exception:  # the disk watch's first round tells this listener instead
+            pass
         with lock:
             listeners.setdefault(key, []).append(q)
         self.send_response(200)
@@ -882,22 +891,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(answer, code)
 
 
+def view_digest(key: str) -> str:
+    return hashlib.sha1(json.dumps(container_view(key), sort_keys=True).encode()).hexdigest()
+
+
 def watch_disk(stop: threading.Event) -> None:
     """A view that is showing hears when the disk under its container changes: a ticket's status, a page
     deleted, a new artefact. Only the containers someone is looking at are read."""
-    last: dict[str, str] = {}
     while not stop.wait(2):
         with lock:
-            keys = [k for k, qs in listeners.items() if qs]
-        for key in keys:
+            watched = {k: list(qs) for k, qs in listeners.items() if qs}
+        for key, qs in watched.items():
             try:
-                digest = hashlib.sha1(json.dumps(container_view(key), sort_keys=True).encode()).hexdigest()
+                digest = view_digest(key)
             except Exception as e:  # a half-written file read mid-change: the next round reads it whole
                 print(f"watching {key}: {e}", file=sys.stderr, flush=True)
                 continue
-            if key in last and last[key] != digest:
-                broadcast(key, {"type": "disk"})
-            last[key] = digest
+            for q in qs:
+                if seen_by.get(q) != digest:
+                    q.put({"type": "disk"})
+                seen_by[q] = digest
 
 
 def main(args: Args) -> None:
