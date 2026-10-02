@@ -325,7 +325,8 @@ in
     Unit.Description = "Brave archive collection (hourly)";
     Timer = {
       # Twenty to: the other hourly uv jobs have the hour, ten and twenty past and
-      # quarter to, and each resolves a uv environment on a laptop that has just woken up.
+      # quarter to, and each resolves a uv environment on a laptop that has just
+      # woken up.
       OnCalendar = "*:40:00";
       Persistent = true;
     };
