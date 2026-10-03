@@ -637,7 +637,7 @@ in
   };
 
   # This one collects from no other host, unlike the backups dashboard: zephylux
-  # is the only machine that filters DNS or holds a Mullvad exit node, so there
+  # is the only machine with the DNS archive and a Mullvad exit node, so there
   # is nothing to reach over ssh. /usr/bin for tailscale, the Ubuntu system
   # package, which it asks for the node egress currently goes through.
 
