@@ -2,7 +2,7 @@
 description: Update Home Manager packages — flake update, build, review diff, switch, commit.
 ---
 
-Update nixpkgs + home-manager flake inputs, preview changes, and switch; then offer to move the scripts pages pin.
+Update nixpkgs + home-manager flake inputs, preview changes, and switch; then offer to move any pinned page script that has a newer release.
 
 ## Steps
 
