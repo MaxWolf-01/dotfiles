@@ -10,6 +10,13 @@
     rime = {
       url = "github:lukasl-dev/rime";
       inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
+    # Only rime uses it. rime's own lock has not moved since 2026-01, and the
+    # rust-overlay pinned there warns on every build (stdenv.isLinux is deprecated).
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
     disko = {
       url = "github:nix-community/disko";
