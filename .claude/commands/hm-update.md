@@ -20,6 +20,8 @@ Note the nixpkgs date range from the output (old → new).
 home-manager build --flake ~/.dotfiles#$NIX_HOST
 ```
 
+- Fix every deprecation the build or the switch warns about (`evaluation warning: ... is deprecated`, `warning: 'x' is a deprecated alias`), not just the ones in our own files: `nix eval --option abort-on-warn true --show-trace ~/.dotfiles#homeConfigurations.$NIX_HOST.activationPackage.drvPath` traces the first warning to the file it comes from; one in an input's code goes away by bumping that input or overriding it with `follows`, and one upstream keeps on purpose (Home Manager's `nix profile install`, kept for Lix: home-manager#8786) is named to the user, not patched.
+
 ### 3. Get current generation path
 
 ```bash
