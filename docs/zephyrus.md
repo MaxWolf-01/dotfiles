@@ -130,4 +130,9 @@ History: the host recorder's `dgpu_port` column (D3cold or D0 every 5 s).
   30 s. A failed switch-on leaves a "dGPU off" flag in CMOS that can hide the
   card at the next boot. supergfxctl's Integrated mode is that switch; it was
   removed for this reason.
+- **A wake that kills the card.** On 2026-09-29 a monitor unplug made the
+  driver wake the card, its firmware never came back (Xid 119, then 154), and
+  the next hibernate hung in `nvidia-sleep.sh` with the lid shut until the
+  power cut out. `dgpu-wedge-watch` (`nix/home/timers.nix`) tells max to
+  reboot when the kernel logs it; only a reboot recovers the card.
 - **`reboot -h 0`** is not a thing on systemd; `reboot`.

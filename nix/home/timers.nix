@@ -770,6 +770,23 @@ in
     Install.WantedBy = [ "default.target" ];
   };
 
+  # A dGPU whose firmware dies on a wake makes every suspend and hibernate hang
+  # (docs/zephyrus.md, Traps). The kernel logs it; this tells max to reboot.
+  systemd.user.services.dgpu-wedge-watch = {
+    Unit.Description = "Tell max when the dGPU has died";
+    Service.Environment = "PATH=${home}/.nix-profile/bin:/usr/bin:/bin"; # sops, curl for alert-send
+    Service.ExecStart = pkgs.writeShellScript "dgpu-wedge-watch" ''
+      read -r line < <(/usr/bin/journalctl -k -b -f -n all -o cat |
+        ${pkgs.gnugrep}/bin/grep --line-buffered -m1 -E \
+          'GPU may be in a bad state|NVRM: Xid \(PCI:[^)]*\): (119|154),') || exit 1
+      msg="Save your work, run 'sudo nvidia-bug-report.sh' and keep the file, then reboot.
+Don't hibernate or suspend until then. The kernel logged: $line"
+      ${pkgs.libnotify}/bin/notify-send -u critical "The dGPU has died" "$msg"
+      ${dotfiles}/bin/alert-send "$(uname -n): the dGPU has died" <<<"$msg"
+    '';
+    Install.WantedBy = [ "default.target" ];
+  };
+
   # --- Tailnet Lock: keep Mullvad exit nodes signed ---
   # A user timer suffices here: zephylux grants max the tailscale operator role,
   # which carries the write access `lock sign` needs. pc has no operator, so its
