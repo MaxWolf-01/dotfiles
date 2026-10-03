@@ -26,7 +26,6 @@
 # - resurrect's save hooks are not run, and its old-save pruning is left to the
 #   caller.
 set -u
-shopt -s extglob
 
 tmux=$1
 dir=$2
@@ -161,7 +160,9 @@ done
 # the first line, or its screen has more than one non-empty line (counted here
 # with colour codes stripped, since this capture keeps them). A pane holds up to
 # 50,000 lines, so this works on an array of lines: a pattern trimmed off the
-# end of one long string retries at every position and takes minutes.
+# end of one long string retries at every position and takes minutes. The strip
+# runs in sed: bash's own pattern substitution is worse than quadratic in the
+# codes on a line, and one screen of a full-screen TUI took 10 s a save.
 dirty=0
 for key in "${captured[@]}"; do
     f="$stage/pane-$key"
@@ -171,11 +172,7 @@ for key in "${captured[@]}"; do
     while ((last >= 0)) && [ -z "${lines[last]}" ]; do last=$((last - 1)); done
     read -r hist cy <<<"${hist_cy[$key]}"
     if [ "$hist" -eq 0 ] && [ "$cy" -eq 0 ]; then
-        nonempty=0
-        for line in "${lines[@]:0:last+1}"; do
-            line=${line//$'\e['*([0-9;:])m/}
-            [ -n "$line" ] && nonempty=$((nonempty + 1))
-        done
+        nonempty=$(printf '%s\n' "${lines[@]:0:last+1}" | sed 's/\x1b\[[0-9;:]*m//g; /^$/d' | wc -l)
         if [ "$nonempty" -le 1 ]; then
             empty[$key]=1
             rm -f "$f"

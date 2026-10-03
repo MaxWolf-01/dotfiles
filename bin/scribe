@@ -10,11 +10,16 @@
 after the conversation's title once the notes exist. A later run on the same
 recording finds that folder again. The folder holds:
 
-- the original recording, copied in unchanged
-- transcript.md: summary, people, chapters, follow-ups, open threads, mentions,
-  quotes, statistics and the full transcript with speakers and times
-- report.html: the same as one page with charts and a player, which works as a
+- the original recording, copied in unchanged, unless --no-copy-recording
+- <folder>.md, the transcript: speakers and times, with a heading where each
+  chapter starts and the figures placed where they were shown
+- analysis.md: summary, people, chapters, follow-ups, open threads, mentions,
+  quotes and statistics
+- report.html: both as one page with charts and a player, which works as a
   file on its own; it loads its fonts from Google Fonts when it can
+- figures.json, when you add one: images to show in the transcript, each at
+  the time it was shown, as [{"s": seconds, "file": "path/in/the/folder.jpg"}].
+  An image goes in at the first sentence end after its time.
 - conversation.json: words, turns and speakers; everything else is derived from it
 - analysis.json: Claude's notes, which `regen` writes again
 - audio.opus: the audio the report plays
@@ -37,8 +42,10 @@ Examples:
 """
 
 import atexit
+import base64
 import datetime as dt
 import difflib
+import functools
 import hashlib
 import html
 import io
@@ -51,6 +58,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -86,8 +94,6 @@ def index_path() -> Path:
 
 @dataclass
 class RunArgs:
-    """Transcribe a recording into its conversation's folder, or rebuild the folder from its cache."""
-
     audio: Annotated[Path, tyro.conf.Positional]
     """The recording; anything ffmpeg reads."""
     out: str = ""
@@ -104,6 +110,10 @@ class RunArgs:
     """Language code (en, de, ...) for a recording in one language. auto lets the transcription model detect it."""
     date: str = ""
     """Recording date, YYYY-MM-DD. Default: the file's creation tag, else its modification time."""
+    url: str = ""
+    """Where the recording came from, such as a video's page; shown in the transcript's frontmatter and the report."""
+    copy_recording: bool = True
+    """Copy the recording into the folder. --no-copy-recording leaves it where it is; the folder keeps audio.opus, made from it."""
     yes: bool = False
     """Accept Claude's names without asking. Without a terminal, they are accepted anyway."""
     model: str = "opus"
@@ -112,6 +122,7 @@ class RunArgs:
 
 @app.command(name="run")
 def run(args: RunArgs) -> None:
+    """Transcribe a recording into its conversation's folder, or rebuild the folder from its cache."""
     recording = args.audio.expanduser().resolve()
     if not recording.is_file():
         raise Failed(f"no such file: {recording}")
@@ -122,9 +133,11 @@ def run(args: RunArgs) -> None:
     progress.say(f"{recording.name} ({hms(src.duration)}) -> {folder}")
 
     progress.start("preparing audio")
-    copy_recording(recording, folder)
+    if args.copy_recording:
+        copy_recording(recording, folder)
     encoding = Encoding(recording, folder)
-    progress.done(f"{recording.name} is in the folder" + (", audio.opus encoding alongside" if encoding.proc else ""))
+    progress.done((f"{recording.name} is in the folder" if args.copy_recording else f"{recording.name} stays where it is")
+                  + (", audio.opus encoding alongside" if encoding.proc else ""))
 
     progress.start("transcribing")
     cached = folder / "cache" / "scribe.json"
@@ -158,18 +171,16 @@ def run(args: RunArgs) -> None:
     progress.start("rendering")
     progress.update("waiting for audio.opus")
     encoding.wait()
-    render_folder(folder)
     folder = title_folder(folder, src, recording)
     register(src.sha256, folder)
-    progress.done("transcript.md, report.html")
+    render_folder(folder)
+    progress.done(f"{folder.name}.md, analysis.md, report.html")
     progress.summary()
     print(folder)
 
 
 @dataclass
 class RegenArgs:
-    """Write the notes again from conversation.json, then rebuild transcript.md and report.html. Transcribes nothing."""
-
     folder: Annotated[Path, tyro.conf.Positional]
     """A conversation's folder."""
     model: str = "opus"
@@ -178,6 +189,7 @@ class RegenArgs:
 
 @app.command(name="regen")
 def regen(args: RegenArgs) -> None:
+    """Write the notes again from conversation.json, then rebuild the transcript, analysis.md and report.html. Transcribes nothing."""
     folder = open_folder(args.folder)
     progress = Progress(["writing notes", "rendering"])
     progress.start("writing notes")
@@ -185,21 +197,20 @@ def regen(args: RegenArgs) -> None:
     progress.done(f"{an['title']!r}: {len(an['chapters'])} chapters, {len(an['quotes'])} quotes")
     progress.start("rendering")
     render_folder(folder)
-    progress.done("transcript.md, report.html")
+    progress.done(f"{folder.name}.md, analysis.md, report.html")
     progress.summary()
     print(folder)
 
 
 @dataclass
 class RenderArgs:
-    """Rebuild transcript.md and report.html from conversation.json and analysis.json, without any network request."""
-
     folder: Annotated[Path, tyro.conf.Positional]
     """A conversation's folder."""
 
 
 @app.command(name="render")
 def render(args: RenderArgs) -> None:
+    """Rebuild the transcript, analysis.md and report.html from conversation.json, analysis.json and figures.json, without any network request."""
     folder = open_folder(args.folder)
     render_folder(folder)
     print(folder)
@@ -207,10 +218,6 @@ def render(args: RenderArgs) -> None:
 
 @dataclass
 class RenameArgs:
-    """Rename speakers in a conversation's folder and rebuild it. Calls no model and no network.
-
-    The spoken words and the quotes stay as said; the speaker labels, the notes' prose and the outputs change."""
-
     folder: Annotated[Path, tyro.conf.Positional]
     """A conversation's folder."""
     pairs: Annotated[list[str], tyro.conf.Positional]
@@ -219,6 +226,9 @@ class RenameArgs:
 
 @app.command(name="rename")
 def rename(args: RenameArgs) -> None:
+    """Rename speakers in a conversation's folder and rebuild it. Calls no model and no network.
+
+    The spoken words and the quotes stay as said; the speaker labels, the notes' prose and the outputs change."""
     folder = open_folder(args.folder)
     bad = [p for p in args.pairs if not re.fullmatch(r"[^=]+=[^=]+", p)]
     if bad or not args.pairs:
@@ -229,26 +239,19 @@ def rename(args: RenameArgs) -> None:
 
 @dataclass
 class ShareArgs:
-    """Put a conversation's audio and report on the SFTPGo drop on pc, behind links anyone can open.
-
-    The report is rebuilt to play from the audio's link, so the page works on its own wherever it
-    goes. The drop deletes a file some months after its upload; share prints the date. A second
-    share uploads the report again and keeps the links. Anyone holding a link can download the file."""
-
     folder: Annotated[Path, tyro.conf.Positional]
     """A conversation's folder."""
 
 
 @app.command(name="share")
 def share(args: ShareArgs) -> None:
+    """Put a conversation's report online with its audio, through `share`, and print the link.
+
+    The shared page carries its figures inside it, scaled down, and plays the audio beside it.
+    A second share puts the report up again behind the same link, while that share still
+    exists. Anyone holding the link can open the page; `share rm` takes it down."""
     folder = open_folder(args.folder)
-    record = put_on_drop(folder)
-    audio, report = record["audio"], record["report"]
-    print(f"report: {report['url']}")
-    print("        Send this link. It downloads the page, which then plays from the audio link.")
-    print(f"audio:  {audio['url']}")
-    print(f"        The drop keeps it until {audio['until']}.")
-    print(f"revoke: sftpgo-share revoke {audio['id']}; sftpgo-share revoke {report['id']}")
+    print(put_online(folder))
 
 
 def open_folder(folder: Path) -> Path:
@@ -278,6 +281,7 @@ class Source:
     keyterms: list[str] = field(default_factory=list)
     language: str = "auto"
     me: str = ""
+    url: str = ""
     titled: bool = False
     """The folder carries the conversation's title in its name, and keeps it from then on."""
     placed: bool = False
@@ -317,11 +321,11 @@ def settle_folder(recording: Path, args: RunArgs) -> tuple[Path, Source]:
         date = args.date or recording_date(recording)
         folder = folder or free_name(base_dir(), f"{date}-{slug(recording.stem)}")
         src = Source(name=recording.name, sha256=digest, duration=duration_of(recording), date=date,
-                     names=args.names, keyterms=args.keyterms, language=args.language, me=args.me, placed=bool(args.out))
+                     names=args.names, keyterms=args.keyterms, language=args.language, me=args.me, url=args.url, placed=bool(args.out))
     else:
         # options given again replace the ones recorded; the defaults leave them as they were
         src.names, src.keyterms = args.names or src.names, args.keyterms or src.keyterms
-        src.me, src.date = args.me or src.me, args.date or src.date
+        src.me, src.date, src.url = args.me or src.me, args.date or src.date, args.url or src.url
         src.language = src.language if args.language == "auto" else args.language
     folder.mkdir(parents=True, exist_ok=True)
     save_source(folder, src)
@@ -507,6 +511,9 @@ def transcribe(recording: Path, folder: Path, src: Source, progress: "Progress")
     headers = {k: v for k, v in r.headers.items()
                if k in ("x-trace-id", "request-id", "character-cost", "fiat-cost-before-overages", "fiat-currency")}
     LOG.write(f"response: {r.status_code} after {time.monotonic() - started:.1f} s, headers {json.dumps(headers)}")
+    if r.status_code == 401 and "quota_exceeded" in r.text:
+        raise Failed(f"ElevenLabs refused the request for lack of credits: {r.text[:400]}. "
+                     "Nothing was cached or charged. The plan's credits and their reset date: https://elevenlabs.io/app/subscription")
     if r.status_code == 401:
         raise Failed(f"ElevenLabs rejected the key (401): {r.text[:300]}. Check the key in `with-secrets elevenlabs`.")
     if r.status_code != 200:
@@ -607,10 +614,17 @@ def fix_strays(words: list[dict]) -> int:
     return moved
 
 
+TURN_LONGEST = 45.0
+"""Seconds: a turn this long ends at its next sentence end, so that the notes can cite, and a
+chapter start, inside a monologue such as a talk."""
+SENTENCE_END = re.compile(r"[.?!][\"')\]]*$")
+
+
 def build_turns(words: list[dict]) -> list[dict]:
     turns: list[dict] = []
     for i, w in enumerate(words):
-        if turns and turns[-1]["spk"] == w["spk"]:
+        long = turns and w["s"] - turns[-1]["s"] >= TURN_LONGEST and SENTENCE_END.search(words[i - 1]["w"])
+        if turns and turns[-1]["spk"] == w["spk"] and not long:
             turns[-1]["e"] = max(turns[-1]["e"], w["e"])
             turns[-1]["w1"] = i + 1
         else:
@@ -652,7 +666,7 @@ def speakers_of(words: list[dict], names: dict[str, dict]) -> tuple[list[dict], 
 
 
 def build_conversation(folder: Path) -> dict:
-    """conversation.json, rebuilt from the cached response, the speaker decisions and the share record."""
+    """conversation.json, rebuilt from the cached response and the speaker decisions."""
     src = load_source(folder)
     response = read_json(folder / "cache" / "scribe.json")
     names_path = folder / "cache" / "names.json"
@@ -666,8 +680,6 @@ def build_conversation(folder: Path) -> dict:
     # talking time orders the people again: strays and merged voices changed it
     air = talking_time(stretches(words))
     speakers.sort(key=lambda sp: (sp["kind"] != "person", -air.get(sp["id"], 0.0)))
-    shared = folder / "cache" / "share.json"
-    audio_link = read_json(shared).get("audio") if shared.exists() else None
     return {
         "meta": {
             "source": src.name,
@@ -676,9 +688,9 @@ def build_conversation(folder: Path) -> dict:
             "duration": round(src.duration, 2),
             "language": response.get("language_code"),
             "me": src.me,
+            **({"url": src.url} if src.url else {}),
             "transcription": MODEL,
             "built": dt.datetime.now().isoformat(timespec="seconds"),
-            **({"share": {k: audio_link[k] for k in ("id", "url", "until")}} if audio_link else {}),
         },
         "speakers": speakers,
         "words": words,
@@ -1002,7 +1014,10 @@ def write_notes(folder: Path, model: str, progress: "Progress") -> dict:
                     f"Notes:\n{json.dumps(draft, ensure_ascii=False, indent=1)}\n\n"
                     f"Cited turns:\n{transcript_lines([by_id[i] for i in cited], lambda t: names[t['spk']])}",
                     ANALYSIS_SCHEMA, model, progress, "editing the notes")
-    analysis = {**fit_notes(edited, conv), "generated": {"model": model, "at": dt.datetime.now().isoformat(timespec="seconds")}}
+    # the model claude -p resolved the alias to, as its two results report it
+    ids = sorted({u.get("canonicalModel", m) for r in progress.calls[-2:] for m, u in r.get("modelUsage", {}).items()})
+    analysis = {**fit_notes(edited, conv), "generated": {
+        "model": model, **({"model_id": ", ".join(ids)} if ids else {}), "at": dt.datetime.now().isoformat(timespec="seconds")}}
     write_json(folder / "analysis.json", analysis)
     return analysis
 
@@ -1312,19 +1327,58 @@ def stat_cell(value, unit: str) -> str:
     return {"hms": hms, "%": lambda v: f"{v}%", "s": lambda v: f"{v} s"}.get(unit, lambda v: f"{v:,}")(value)
 
 
-# ---------------------------------------------------------------- transcript.md and report.html
+# ---------------------------------------------------------------- the transcript, analysis.md and report.html
 
 
-def render_folder(folder: Path) -> None:
-    """transcript.md and report.html from conversation.json and analysis.json alone; no network."""
+def render_folder(folder: Path, embed_figures: bool = False) -> None:
+    """<folder>.md, analysis.md and report.html from conversation.json, analysis.json and
+    figures.json alone; no network. embed_figures puts the figures into the report itself,
+    smaller, for a copy that travels without the folder."""
     conv = read_json(folder / "conversation.json")
     an_path = folder / "analysis.json"
     an = fit_notes(read_json(an_path), conv) if an_path.exists() else no_notes()
     st = compute_stats(conv)
-    md = to_markdown(conv, an, st)
-    (folder / "transcript.md").write_text(md)
-    (folder / "report.html").write_text(to_html(conv, an, st, md, (folder / "audio.opus").exists()))
-    LOG.write("wrote transcript.md and report.html")
+    figs_path = folder / "figures.json"
+    figs = place_figures(conv, read_json(figs_path) if figs_path.exists() else [])
+    transcript, notes = transcript_markdown(conv, an, figs), analysis_markdown(conv, an, st, folder.name)
+    (folder / f"{folder.name}.md").write_text(transcript)
+    (folder / "analysis.md").write_text(notes)
+    shown = [{**f, "file": embedded(folder / f["file"])} for f in figs] if embed_figures else figs
+    (folder / "report.html").write_text(to_html(conv, an, st, shown, notes + "\n" + transcript, (folder / "audio.opus").exists()))
+    LOG.write(f"wrote {folder.name}.md, analysis.md and report.html, with {len(figs)} figures")
+
+
+EMBED_WIDTH = 1280
+"""Pixels: an embedded figure is scaled down to this width, enough for a slide's text."""
+
+
+@functools.cache
+def embedded(image: Path) -> str:
+    """The image as a data URL, a JPEG at most EMBED_WIDTH wide."""
+    jpeg = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(image), "-vf", f"scale='min({EMBED_WIDTH},iw)':-2", "-q:v", "4",
+         "-f", "image2pipe", "-c:v", "mjpeg", "-"], capture_output=True)
+    if jpeg.returncode:
+        raise Failed(f"embedding {image} failed (ffmpeg exited {jpeg.returncode}): {jpeg.stderr.decode()[-400:]}")
+    return "data:image/jpeg;base64," + base64.b64encode(jpeg.stdout).decode()
+
+
+FIGURE_LATE = 15.0
+"""Seconds a figure waits for a sentence to end before it cuts into one."""
+
+
+def place_figures(conv: dict, figures: list[dict]) -> list[dict]:
+    """Each figure with the word it goes before (w; len(words) for after the last): the first word
+    at or after its time that starts a turn or a sentence, or the first word FIGURE_LATE seconds
+    after its time when no sentence ends before then."""
+    words = conv["words"]
+    starts = {t["w0"] for t in conv["turns"]}
+    placed = []
+    for f in sorted(figures, key=lambda f: f["s"]):
+        w = next((i for i, x in enumerate(words) if x["s"] >= f["s"] and (
+            i in starts or SENTENCE_END.search(words[i - 1]["w"]) or x["s"] - f["s"] > FIGURE_LATE)), len(words))
+        placed.append({"s": f["s"], "file": f["file"], "w": w})
+    return placed
 
 
 def ref(t: dict, names: dict) -> str:
@@ -1344,13 +1398,61 @@ def refs_md(text: str, conv: dict) -> str:
     return re.sub(r"\s+([.,;:])", r"\1", CITATION.sub(one, text))
 
 
-def to_markdown(conv: dict, an: dict, st: dict) -> str:
-    """transcript.md: everything textual in one file."""
+def title_of(conv: dict, an: dict) -> str:
+    return an["title"] or Path(conv["meta"]["source"]).stem
+
+
+def transcript_markdown(conv: dict, an: dict, figs: list[dict]) -> str:
+    """<folder>.md: the transcript, a heading where each chapter starts, each figure where it was shown."""
     meta = conv["meta"]
+    names = {sp["id"]: sp["name"] for sp in conv["speakers"]}
+    L = [
+        "---",
+        f"title: {json.dumps(title_of(conv, an), ensure_ascii=False)}",
+        f"date: {meta['date']}",
+        f'duration: "{hms(meta["duration"])}"',
+        f"speakers: [{', '.join(sp['name'] for sp in people(conv))}]",
+        f"url: {meta['url']}" if meta.get("url") else f"source: {json.dumps(meta['source'], ensure_ascii=False)}",
+        f"transcription: {meta['transcription']}",
+        "---",
+        "",
+        f"# {title_of(conv, an)}",
+        "",
+        "[Analysis](analysis.md) · [Report with the audio](report.html)",
+        "",
+    ]
+    starts = {c["start_turn"]: c["title"] for c in an["chapters"]}
+    words = conv["words"]
+    at_word: dict[int, list[dict]] = {}
+    for f in figs:
+        at_word.setdefault(f["w"], []).append(f)
+
+    def figure(f: dict) -> list[str]:
+        return [f"![{hms(f['s'])}]({f['file']})", ""]
+
+    for t in conv["turns"]:
+        if t["id"] in starts:
+            L += [f"## {starts[t['id']]} [{hms(t['s'])}]", ""]
+        cuts = [i for i in range(t["w0"], t["w1"]) if i in at_word]
+        bounds = [t["w0"], *[i for i in cuts if i > t["w0"]], t["w1"]]
+        for f in at_word.get(t["w0"], []):
+            L += figure(f)
+        for k, (a, b) in enumerate(zip(bounds, bounds[1:])):
+            if k:
+                for f in at_word[a]:
+                    L += figure(f)
+            text = "".join(w["w"] for w in words[a:b]).strip()
+            L += [f"[{hms(words[a]['s'])}] " + (f"**{names[t['spk']]}:** " if k == 0 else "") + text, ""]
+    for f in at_word.get(len(words), []):
+        L += figure(f)
+    return "\n".join(L).rstrip() + "\n"
+
+
+def analysis_markdown(conv: dict, an: dict, st: dict, name: str) -> str:
+    """analysis.md: Claude's notes on the conversation, and its statistics, with what made them."""
     by_id = {t["id"]: t for t in conv["turns"]}
     names = {sp["id"]: sp["name"] for sp in conv["speakers"]}
     persons = people(conv)
-    title = an["title"] or Path(meta["source"]).stem
 
     def at(item: dict, text: str) -> str:
         """The item's turns, less those its text already cites."""
@@ -1358,25 +1460,23 @@ def to_markdown(conv: dict, an: dict, st: dict) -> str:
         shown = ", ".join(ref(by_id[i], names) for i in item["turns"] if i not in inline)
         return f" ({shown})" if shown else ""
 
-    notes = an.get("generated")
+    gen = an.get("generated")
     L = [
         "---",
-        f"title: {json.dumps(title, ensure_ascii=False)}",
-        f"date: {meta['date']}",
-        f'duration: "{hms(meta["duration"])}"',
-        f"speakers: [{', '.join(sp['name'] for sp in persons)}]",
-        f"source: {json.dumps(meta['source'], ensure_ascii=False)}",
-        f"transcription: {meta['transcription']}",
-        *([f"notes: Claude {notes['model']}, {notes['at']}"] if notes else []),
-        *([f"audio: {meta['share']['url']}", f"audio_until: {meta['share']['until']}"] if "share" in meta else []),
+        f"title: {json.dumps(title_of(conv, an) + ': analysis', ensure_ascii=False)}",
+        f'transcript: "[[{name}]]"',
+        *([f"notes_by: {gen.get('model_id') or 'Claude ' + gen['model']}", f"notes_at: {gen['at']}"] if gen else []),
+        "statistics: computed from the times of the transcript's words",
         "---",
         "",
-        f"# {title}",
+        f"# {title_of(conv, an)}: analysis",
+        "",
+        f"[Transcript]({name}.md) · [Report with the audio](report.html)",
         "",
     ]
     if an["summary"]:
         L += [refs_md(an["summary"], conv), ""]
-    if notes:
+    if an.get("generated"):
         sketches = {p["speaker"]: p["sketch"] for p in an["people"]}
         L += ["## People", ""]
         for sp in persons:
@@ -1397,12 +1497,6 @@ def to_markdown(conv: dict, an: dict, st: dict) -> str:
         if not an["quotes"]:
             L += ["None found.", ""]
     L += statistics_md(persons, st)
-    L += ["## Transcript", ""]
-    starts = {c["start_turn"]: c["title"] for c in an["chapters"]}
-    for t in conv["turns"]:
-        if t["id"] in starts:
-            L += [f"### {starts[t['id']]} [{hms(t['s'])}]", ""]
-        L += [f"[{hms(t['s'])}] **{names[t['spk']]}:** {t['text']}", ""]
     return "\n".join(L).rstrip() + "\n"
 
 
@@ -1424,17 +1518,45 @@ PALETTE_NIGHT = ["#3f86d6", "#d9652f", "#1f9c82", "#a66cc4", "#ad8508", "#d8506e
 PAGE = Path(__file__).resolve().parent / "scribe.html"
 
 
-def to_html(conv: dict, an: dict, st: dict, md: str, audio_beside: bool) -> str:
+PREVIEW_LONGEST = 300
+"""Characters of the summary a link preview shows; chat apps cut a description near here."""
+
+
+def preview(conv: dict, an: dict) -> str:
+    """What a link preview says under the title: length and date as a person writes them
+    (66 min · 1 Oct 2026), then the summary's opening without its citations, cut after the
+    last whole sentence that fits. The summary names whoever matters, so no speaker list."""
+    minutes = max(1, round(conv["meta"]["duration"] / 60))
+    length = f"{minutes // 60} h {minutes % 60:02} min" if minutes >= 90 else f"{minutes} min"
+    try:
+        day = dt.date.fromisoformat(conv["meta"]["date"])
+        date = f"{day.day} {day:%b %Y}"
+    except (ValueError, TypeError):
+        date = conv["meta"]["date"]
+    head = " · ".join(x for x in (length, date) if x)
+    summary = re.sub(r"\s*\[t\d+(?:\s*,\s*t\d+)*\]", "", an["summary"])
+    fits = ""
+    for sentence in re.split(r"(?<=[.?!])\s+", summary):
+        if len(fits) + len(sentence) + 1 > PREVIEW_LONGEST:
+            break
+        fits = f"{fits} {sentence}".strip()
+    return f"{head}. {fits}" if fits else head
+
+
+def to_html(conv: dict, an: dict, st: dict, figs: list[dict], md: str, audio_beside: bool) -> str:
     """report.html: the template with the data embedded. The audio is optional: the page plays
-    audio.opus beside it, else the share link, else shows no player."""
+    audio.opus beside it, else shows no player. Figures are linked, not embedded, so they show
+    where the page sits in its folder."""
     colours = {sp["id"]: i % len(PALETTE_DAY) for i, sp in enumerate(people(conv))}
     meta = conv["meta"]
     data = {
-        "meta": {k: meta[k] for k in ("source", "date", "duration", "transcription")},
+        "meta": {k: meta.get(k, "") for k in ("source", "url", "date", "duration", "transcription")},
         "speakers": [{"id": sp["id"], "name": sp["name"], "kind": sp["kind"], "c": colours.get(sp["id"], -1)} for sp in conv["speakers"]],
         "turns": [
             {"id": t["id"], "spk": t["spk"], "s": t["s"], "e": t["e"],
-             "w": [[w["w"], round(w["s"], 2)] for w in conv["words"][t["w0"] : t["w1"]]]}
+             "w": [[w["w"], round(w["s"], 2)] for w in conv["words"][t["w0"] : t["w1"]]],
+             "f": [[f["w"] - t["w0"], f["file"], f["s"]] for f in figs
+                   if t["w0"] <= f["w"] < t["w1"] or (f["w"] == len(conv["words"]) and t is conv["turns"][-1])]}
             for t in conv["turns"]
         ],
         "analysis": an,
@@ -1444,13 +1566,13 @@ def to_html(conv: dict, an: dict, st: dict, md: str, audio_beside: bool) -> str:
         "text": stats_text(st),
         "md": md,
         "audio": "audio.opus" if audio_beside else None,
-        "share": meta.get("share"),
         "built": dt.datetime.now().isoformat(timespec="seconds"),
     }
     blob = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return (
         PAGE.read_text()
-        .replace("__TITLE__", html.escape(an["title"] or Path(meta["source"]).stem))
+        .replace("__TITLE__", html.escape(title_of(conv, an)))
+        .replace("__DESCRIPTION__", html.escape(preview(conv, an)))
         .replace("__PALETTE_LIGHT__", json.dumps(PALETTE_DAY))
         .replace("__PALETTE_DARK__", json.dumps(PALETTE_NIGHT))
         .replace("__DATA__", blob)
@@ -1459,54 +1581,32 @@ def to_html(conv: dict, an: dict, st: dict, md: str, audio_beside: bool) -> str:
 
 # ---------------------------------------------------------------- sharing
 
-RETENTION_DAYS = 9 * 30
-"""How long the drop keeps a file after its upload: retentionMonths in nix/nixos/pc/sftpgo.nix, in 30-day months."""
-
-
-def put_on_drop(folder: Path) -> dict:
-    """audio.opus on the drop behind an open link, the report rebuilt to play from it, and the
-    report uploaded beside it behind a link of its own. The only place anything is uploaded."""
-    record_path = folder / "cache" / "share.json"
-    record = read_json(record_path) if record_path.exists() else {}
-    src = load_source(folder)
-    remote = f"/scribe/{folder.name}-{src.sha256[:8]}"
-    live = {s["id"] for s in json.loads(drop(["list", "--json"], "listing the drop's links"))}
-    today = dt.date.today()
-
-    def link(local: Path, name: str, old: dict | None, reuse: bool) -> dict:
-        """The file on the drop behind a link: the one it has while the drop still keeps it, when reuse."""
-        if reuse and old and old["id"] in live and old["until"] > today.isoformat():
-            LOG.write(f"share: {name} is on the drop until {old['until']}, behind {old['url']}")
-            return old
-        upload = local
-        if local.name != name:
-            upload = folder / "cache" / name
-            shutil.copyfile(local, upload)
-        drop(["upload", str(upload), "--to", remote, "--overwrite"], f"uploading {name} to the drop")
-        LOG.write(f"share: uploaded {upload.stat().st_size} bytes to {remote}/{name}")
-        kept = {"uploaded": today.isoformat(), "until": (today + dt.timedelta(days=RETENTION_DAYS)).isoformat()}
-        if old and old["id"] in live and old["path"] == f"{remote}/{name}":
-            return {**old, **kept}
-        made = json.loads(drop(["create", f"{remote}/{name}", "--open", "--expires", "never", "--json"], f"making a link to {name}"))
-        LOG.write(f"share: link {made['id']} to {remote}/{name}")
-        return {"id": made["id"], "url": made["url"], "path": f"{remote}/{name}", **kept}
-
+def put_online(folder: Path) -> str:
+    """report.html with its figures embedded, as index.html, and audio.opus beside it, put online by
+    `share`, behind the link an earlier share made while that share still exists. The only place
+    anything is uploaded. Returns the link."""
     if not (folder / "audio.opus").exists():
         raise Failed(f"{folder} has no audio.opus to share. `scribe run` on its recording makes it.")
-    record["audio"] = link(folder / "audio.opus", "audio.opus", record.get("audio"), reuse=True)
-    write_json(record_path, record)
-    write_json(folder / "conversation.json", build_conversation(folder))
-    render_folder(folder)
-    record["report"] = link(folder / "report.html", f"{folder.name}.html", record.get("report"), reuse=False)
-    write_json(record_path, record)
-    return record
+    record_path = folder / "cache" / "share.json"
+    old = read_json(record_path).get("id") if record_path.exists() else None
+    live = {s["id"] for s in json.loads(run_share(["list", "--json"], "listing the shares"))}
+    with tempfile.TemporaryDirectory(prefix="scribe-share-") as tmp:
+        render_folder(folder, embed_figures=True)
+        shutil.copyfile(folder / "report.html", Path(tmp) / "index.html")
+        render_folder(folder)
+        shutil.copyfile(folder / "audio.opus", Path(tmp) / "audio.opus")
+        url = run_share([tmp, *(["--replace", old] if old in live else [])], "putting the report online").strip()
+    share_id = url.rstrip("/").rsplit("/", 1)[-1]
+    write_json(record_path, {"id": share_id, "url": url})
+    LOG.write(f"share: {url}")
+    return url
 
 
-def drop(args: list[str], what: str) -> str:
+def run_share(args: list[str], what: str) -> str:
     try:
-        return run_cmd(["sftpgo-share", *args], what)
+        return run_cmd(["share", *args], what)
     except Failed as exc:
-        raise Failed(f"{exc}. sftpgo-share needs the tailnet and the account password (docs/sftpgo.md).")
+        raise Failed(f"{exc}. `share --help` says what share needs.")
 
 
 # ---------------------------------------------------------------- the terminal, the log, small helpers

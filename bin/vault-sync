@@ -1,22 +1,33 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.13"
+# dependencies = ["boto3>=1.36"]
 # ///
-"""Sync whitelisted Obsidian vault notes + referenced media to Quartz.
+"""Sync whitelisted Obsidian vault notes to Quartz, and their media to R2.
 
-Reads whitelist.json from the vault, copies matching files and any media
-they reference to the Quartz content dir.
+Reads whitelist.json from the vault and copies matching notes to the Quartz
+content dir. Media (whitelisted or referenced by a whitelisted note) never goes
+there: it is uploaded, byte for byte, to the R2 bucket served at
+https://media.mwolf.dev/<file name>, which is where the site links it.
+Only files missing from the bucket or differing from it are uploaded.
 
-Env vars: VAULT_DIR, QUARTZ_DIR (both have sensible defaults).
+Env vars: VAULT_DIR (default ~/repos/obsidian/knowledge-base), QUARTZ_DIR
+(default ~/repos/github/MaxWolf-01/quartz-knowledge-base), and the R2
+credentials of `with-secrets cloudflare-mwolf-dev-workers`:
+CLOUDFLARE_S3_API_ENDPOINT, CLOUDFLARE_ACCESS_KEY_ID, CLOUDFLARE_SECRET_ACCESS_KEY.
 """
 
+import base64
 import fnmatch
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict
@@ -25,12 +36,18 @@ HOME = Path.home()
 VAULT_DIR_DEFAULT = HOME / "repos/obsidian/knowledge-base"
 QUARTZ_DIR_DEFAULT = HOME / "repos/github/MaxWolf-01/quartz-knowledge-base"
 
+# The quartz repo's quartz/util/media.ts rewrites links to these same
+# extensions to the bucket, and bin/yoink-batch prefixes files with them; the
+# three lists change together.
 MEDIA_EXTENSIONS = frozenset({
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
     ".mp4", ".webm", ".mov",
 })
 
-MAX_FILE_SIZE = 100 * 1024 * 1024  # TODO: remove once self-hosting (no GitHub file size limit)
+MEDIA_BUCKET = "mwolf-dev-media"
+
+# GitHub refuses files over 100 MB; media goes to R2 and is exempt.
+MAX_FILE_SIZE = 100 * 1024 * 1024
 
 
 class Whitelist(TypedDict):
@@ -64,24 +81,31 @@ def extract_media_refs(markdown: str, file_path: str) -> set[str]:
     """Extract local media filenames referenced in markdown.
 
     Supports both Obsidian (![[img.png]], [[img.png]]) and standard
-    markdown (![alt](img.png)) syntax. Skips URLs and code blocks, except
-    litegal blocks: those render as image galleries, so the embeds inside
-    them are real media references.
+    markdown (![alt](img.png)) syntax. Skips URLs, comments and code blocks,
+    except litegal blocks: those render as image galleries, so the embeds
+    inside them are real media references.
     """
+    # Quartz strips Obsidian comments from the raw text before parsing it, so a
+    # %% inside code opens a comment too; only a closed pair is one.
+    markdown = re.sub(r"%%.*?%%", "", markdown, flags=re.DOTALL)
     litegal = "\n".join(
         m.group(1) for m in re.finditer(r"```litegal\n(.*?)```", markdown, re.DOTALL)
     )
 
-    # Strip code blocks and inline code
-    text = re.sub(r"```[^`]*```", "", markdown, flags=re.DOTALL)
+    # Strip code blocks and inline code. A code span ends on its own line and
+    # at a run of as many backticks as opened it: a backtick left unpaired
+    # would otherwise pair with one paragraphs later and hide what lies between.
+    text = re.sub(r"(?ms)^ {0,3}(`{3,}|~{3,}).*?^ {0,3}\1[ \t]*$", "", markdown)
     text = re.sub(r"(?m)^( {4}|\t).*$\n?", "", text)
-    text = re.sub(r"`[^`]+`", "", text)
+    text = re.sub(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)", "", text)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
     text = f"{text}\n{litegal}"
 
     ext = r"\.(jpg|jpeg|png|gif|webp|svg|mp4|webm|mov)"
+    target = rf"[^\[\]|]*?{ext}[^|\]]*?"  # stays inside its own [[...]]
     patterns = [
-        rf"!\[\[(.*?{ext}[^|\]]*?)(?:\|[^\]]+)?\]\]",  # ![[media|modifier]]
-        rf"\[\[(.*?{ext}[^|\]]*?)(?:\|[^\]]+)?\]\]",    # [[media|modifier]]
+        rf"!\[\[({target})(?:\|[^\]]+)?\]\]",  # ![[media|modifier]]
+        rf"\[\[({target})(?:\|[^\]]+)?\]\]",    # [[media|modifier]]
         rf"!\[[^\]]*\]\(([^)]*?{ext})\)",                # ![alt](media.ext)
     ]
 
@@ -143,7 +167,15 @@ def is_whitelisted(
     return False
 
 
-def sync(source_dir: Path, content_dir: Path, whitelist: Whitelist) -> tuple[int, int]:
+def sync(
+    source_dir: Path, content_dir: Path, whitelist: Whitelist
+) -> tuple[int, int, dict[str, Path]]:
+    """Copy whitelisted notes to content_dir; return the media to publish.
+
+    The media come back as {file name: source path}, flat by name like the
+    bucket's keys. Two files with one name would both be published under it,
+    one showing the other's bytes, so the sync refuses them, naming both.
+    """
     # Report missing whitelisted files
     missing = {f for f in whitelist["files"] if not (source_dir / f).is_file()}
     if missing:
@@ -157,11 +189,12 @@ def sync(source_dir: Path, content_dir: Path, whitelist: Whitelist) -> tuple[int
     if content_dir.exists():
         shutil.rmtree(content_dir)
     content_dir.mkdir(parents=True)
-    media_dir = content_dir / "media"
-    media_dir.mkdir()
 
     copied = 0
     skipped = 0
+    # By name, then by resolved path. The vault's library/ is a symlink to
+    # the library scanned below, so one file is found under two paths.
+    found: dict[str, dict[Path, Path]] = {}
 
     # Copy whitelisted files from vault
     for source_path in source_dir.rglob("*", recurse_symlinks=True):
@@ -174,22 +207,22 @@ def sync(source_dir: Path, content_dir: Path, whitelist: Whitelist) -> tuple[int
             skipped += 1
             continue
 
+        if is_media(source_path):
+            found.setdefault(source_path.name, {})[source_path.resolve()] = source_path
+            continue
+
         if source_path.stat().st_size > MAX_FILE_SIZE:
             log(f"Skipping (>{MAX_FILE_SIZE // 1024 // 1024}MB): {rel}", "WARNING")
             skipped += 1
             continue
 
-        if is_media(source_path):
-            target = media_dir / source_path.name
-        else:
-            target = content_dir / rel
-
+        target = content_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, target)
         log(f"Copied: {rel}")
         copied += 1
 
-    # Copy referenced media from external directories (library, archive)
+    # Referenced media from external directories (library, archive)
     external_dirs = [
         HOME / "Documents" / "archive" / "papers",
         HOME / "Documents" / "library",
@@ -200,16 +233,86 @@ def sync(source_dir: Path, content_dir: Path, whitelist: Whitelist) -> tuple[int
         log(f"Checking external directory for media: {ext_dir}")
         for path in ext_dir.rglob("*"):
             if path.is_file() and is_media(path) and path.name in referenced_media:
-                target = media_dir / path.name
-                if not target.exists():
-                    if path.stat().st_size > MAX_FILE_SIZE:
-                        log(f"Skipping (>{MAX_FILE_SIZE // 1024 // 1024}MB): {path.name}", "WARNING")
-                        continue
-                    shutil.copy2(path, target)
-                    log(f"Copied external media: {path.name}")
-                    copied += 1
+                found.setdefault(path.name, {}).setdefault(path.resolve(), path)
 
-    return copied, skipped
+    if collisions := {name: paths for name, paths in found.items() if len(paths) > 1}:
+        for name, paths in sorted(collisions.items()):
+            log(f"{len(paths)} files would be published as {name}:", "ERROR")
+            for path in sorted(paths.values()):
+                log(f"  - {path}", "ERROR")
+        log("Media is published flat by file name; rename all but one of each. "
+            "Nothing was uploaded.", "ERROR")
+        sys.exit(1)
+
+    return copied, skipped, {name: next(iter(paths.values())) for name, paths in found.items()}
+
+
+def _r2_client():
+    import boto3
+    from botocore.config import Config
+
+    env = ("CLOUDFLARE_S3_API_ENDPOINT", "CLOUDFLARE_ACCESS_KEY_ID", "CLOUDFLARE_SECRET_ACCESS_KEY")
+    if unset := [name for name in env if not os.getenv(name)]:
+        log(f"R2 credentials missing: {', '.join(unset)}. Run under "
+            "`with-secrets cloudflare-mwolf-dev-workers`.", "ERROR")
+        sys.exit(1)
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ["CLOUDFLARE_S3_API_ENDPOINT"],
+        aws_access_key_id=os.environ["CLOUDFLARE_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["CLOUDFLARE_SECRET_ACCESS_KEY"],
+        region_name="auto",
+        # botocore's default CRC checksums are not what R2 is checked against
+        # here: every upload carries its Content-MD5 instead.
+        config=Config(
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+            max_pool_connections=16,
+        ),
+    )
+
+
+def _md5(path: Path) -> bytes:
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "md5").digest()
+
+
+def upload_media(media: dict[str, Path]) -> None:
+    """Upload each file whose name is missing from the bucket or whose bytes differ.
+
+    An object's ETag is the MD5 of its bytes (single-part uploads only, which
+    is all this makes), so it is compared against the local file's MD5. R2
+    rejects an upload whose bytes do not match the Content-MD5 it carries.
+    """
+    client = _r2_client()
+    remote: dict[str, tuple[int, str]] = {}
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=MEDIA_BUCKET):
+        for obj in page.get("Contents", []):
+            remote[obj["Key"]] = (obj["Size"], obj["ETag"].strip('"'))
+
+    def needs_upload(name: str, path: Path) -> bytes | None:
+        """The file's MD5 when it has to go up, None when the bucket has it."""
+        digest = _md5(path)
+        if remote.get(name) == (path.stat().st_size, digest.hex()):
+            return None
+        return digest
+
+    def put(name: str, path: Path, digest: bytes) -> None:
+        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        with path.open("rb") as body:
+            client.put_object(
+                Bucket=MEDIA_BUCKET, Key=name, Body=body, ContentType=content_type,
+                ContentMD5=base64.b64encode(digest).decode(),
+            )
+        log(f"Uploaded: {name}")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        digests = dict(zip(media, pool.map(needs_upload, media, media.values())))
+        pending = {name: d for name, d in digests.items() if d is not None}
+        # list() so an upload that raised re-raises here and fails the sync
+        list(pool.map(put, pending, (media[n] for n in pending), pending.values()))
+
+    log(f"Media: {len(media)} published, {len(pending)} uploaded to {MEDIA_BUCKET}.")
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -320,8 +423,9 @@ def main() -> None:
     log(f"Quartz: {quartz_dir}")
 
     whitelist = load_whitelist(whitelist_path)
-    copied, skipped = sync(vault_dir, content_dir, whitelist)
+    copied, skipped, media = sync(vault_dir, content_dir, whitelist)
     log(f"Sync complete. {copied} files copied, {skipped} files skipped.")
+    upload_media(media)
 
     # Per-line blame for git-blame toggle on the site. Cache lives in
     # ~/.cache/ (user-local, never committed) because content/ gets rmtree'd

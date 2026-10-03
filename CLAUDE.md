@@ -132,6 +132,13 @@ The only service on pc with a public (non-tailnet) surface. Manage accounts with
 `bin/sftpgo-user`. Bootstrap, operational traps and how to debug a dead public
 URL: `docs/sftpgo.md`. Why each setting is what it is: `nix/nixos/pc/sftpgo.nix`.
 
+## Sharing a page
+
+`bin/share` puts an HTML page, a file or a folder online at `share.mwolf.dev`,
+behind a random path, until `share rm` takes it down; it runs on the laptop,
+which holds the share root. What it refuses goes to the SFTPGo drop.
+`share --help` says how.
+
 
 ## DNS
 
@@ -139,7 +146,8 @@ Tailnet-wide: every device resolves through Mullvad's filtering resolver, pushed
 with `bin/tailscale-dns` from `secrets/tailscale/dns.json`. Servers (pc, jarvis,
 yapit-prod) are opted out. Never add `Domains=~.` to a resolved config — it ties
 with tailscaled's own catch-all and silently defeats filtering. `dns-blocked`
-answers "is this domain blocked, and by which list". Chain, gotchas, and the
+answers "is this domain blocked, and by which list"; `dns-filter off` turns
+filtering off on zephylux for a few minutes. Chain, gotchas, and the
 captive-portal escape (`portal`): `docs/dns.md`.
 
 Mullvad exit node: `vpn` (`bin/vpn`). Its watcher service (`vpn watch`) is the
@@ -171,11 +179,22 @@ IMAP or SMTP directly, and never send mail. Setup and limits:
 The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:
 
 - **`vault-triage`** (`~/bin/`) — curses TUI for triaging unpublished notes into whitelist or blacklist
-- **`vault-sync`** (`~/bin/`) — copies whitelisted files + referenced media to the quartz repo's `content/` dir
-- **Pre-push hook** (`git/hooks/quartz-sync-pre-push`) — runs `vault-sync` automatically when pushing the vault, then commits and pushes the quartz repo
+- **`vault-sync`** (`~/bin/`) — copies whitelisted notes to the quartz repo's `content/` dir, and uploads the media they reference to R2 instead (below)
+- **Pre-push hook** (`git/hooks/quartz-sync-pre-push`) — runs `vault-sync` under `with-secrets cloudflare-mwolf-dev-workers` when pushing the vault, then commits and pushes the quartz repo; a failed upload aborts the push, and so does a Quartz checkout whose `quartz.config.ts` sets no `mediaBaseUrl`
 - **`whitelist.json`** and **`blacklist.txt`** live in the vault repo (data, not tooling)
 
-The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to GitHub Pages on push to `v4`.
+The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to the Cloudflare
+Worker `mwolf-dev` on push to `v4` (`.github/workflows/deploy.yml`). The Worker serves
+mwolf.dev and www.mwolf.dev, and that repo's `wrangler.jsonc` says how.
+
+The site's images and videos live in the R2 bucket `mwolf-dev-media` on max's
+Cloudflare account, flat by file name, and the site links them at
+`https://media.mwolf.dev/<file name>` (Quartz's `mediaBaseUrl`). The bucket is
+reached only through that custom domain; its `r2.dev` URL is off. It was made
+with two R2 API calls: `POST accounts/<id>/r2/buckets` (location hint `weur`),
+then `POST .../r2/buckets/mwolf-dev-media/domains/custom`. It only grows: media
+no note references any more stays. A file changed under the same name keeps its
+URL, so Cloudflare's cache serves the old bytes for a few hours.
 
 ## What stays outside Nix
 

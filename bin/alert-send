@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Send one alert email to the configured recipient — the single send path every
-# unattended alerter uses. Subject as the argument, body on stdin.
+# Send one alert email to the configured recipient. Every unattended alerter
+# sends its mail through this script. Subject as the argument, body on stdin.
 # Channel and rationale: decisions/0002-alerts-by-email.md.
 
 set -uo pipefail
@@ -9,24 +9,30 @@ CONFIG="$HOME/.dotfiles/secrets/monitoring/alert.conf"
 
 usage() {
     cat <<EOF
-Usage: alert-send SUBJECT [--attach FILE]...
+Usage: alert-send SUBJECT [--attach FILE]... [--inline IMAGE]...
 
 Reads the message body from stdin and mails it, with any attachments, to the
 recipient configured in $CONFIG
 (the config documents its own variables).
 
-An attachment that does not exist is replaced by a note in the body naming it:
-the alert still goes out, because it matters more than its enclosure.
+--inline shows an image (.png, .jpg, .jpeg or .gif) in the message itself,
+below the body text: the mail then carries an HTML version of the body with
+the images in it, beside the plain-text one. Without --inline the message is
+plain text only.
+
+An attachment or image that does not exist is replaced by a note in the body
+naming it: the alert still goes out, because it matters more than its enclosure.
 
 Exits 0 when the SMTP server accepted the message, 1 when it did not, 2 on a
 config or usage error. Unattended callers record a nonzero exit in their run
-log — a delivery failure must be visible somewhere that is not the channel
-that just failed.
+log, so a failed delivery shows up somewhere other than the channel that just
+failed.
 EOF
 }
 
 subject=""
 attachments=()
+images=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
@@ -34,6 +40,10 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { echo "alert-send: --attach needs a value" >&2; exit 2; }
             attachments+=("$2"); shift 2 ;;
         --attach=*) attachments+=("${1#*=}"); shift ;;
+        --inline)
+            [ $# -ge 2 ] || { echo "alert-send: --inline needs a value" >&2; exit 2; }
+            images+=("$2"); shift 2 ;;
+        --inline=*) images+=("${1#*=}"); shift ;;
         -*) echo "alert-send: unknown option: $1" >&2; usage >&2; exit 2 ;;
         *)
             if [ -n "$subject" ]; then
@@ -49,6 +59,21 @@ if [ -z "$subject" ]; then
     usage >&2
     exit 2
 fi
+
+image_type() {
+    case "${1,,}" in
+        *.png) echo image/png ;;
+        *.jpg|*.jpeg) echo image/jpeg ;;
+        *.gif) echo image/gif ;;
+        *) return 1 ;;
+    esac
+}
+for file in "${images[@]}"; do
+    if ! image_type "$file" >/dev/null; then
+        echo "alert-send: --inline takes a .png, .jpg, .jpeg or .gif, got: $file" >&2
+        exit 2
+    fi
+done
 
 if [ ! -f "$CONFIG" ]; then
     echo "alert-send: no channel config at $CONFIG — nothing was sent.
@@ -75,8 +100,69 @@ if ! token=$(eval "$password_command"); then
 fi
 
 msg=$(mktemp)
-trap 'rm -f "$msg"' EXIT
+body=$(mktemp)
+trap 'rm -f "$msg" "$body"' EXIT
 boundary="alert-send-$(date +%s)-$$"
+
+{
+    cat
+    for file in "${attachments[@]}"; do
+        [ -r "$file" ] || printf '\n[attachment missing or unreadable: %s]\n' "$file"
+    done
+    for file in "${images[@]}"; do
+        [ -r "$file" ] || printf '\n[inline image missing or unreadable: %s]\n' "$file"
+    done
+} > "$body"
+
+text_part() {
+    printf 'Content-Type: text/plain; charset=utf-8\n'
+    printf 'Content-Transfer-Encoding: base64\n'
+    printf '\n'
+    base64 "$body"
+}
+
+# multipart/related holds the HTML and the images it shows by cid:, and the
+# multipart/alternative inside it lets a client pick text or HTML. A boundary
+# that starts with another is legal but trips lenient parsers, hence prefixes.
+inline_part() {
+    local related="related-$boundary" alternative="alternative-$boundary" i file
+    printf 'Content-Type: multipart/related; boundary="%s"\n' "$related"
+    printf '\n'
+    printf -- '--%s\n' "$related"
+    printf 'Content-Type: multipart/alternative; boundary="%s"\n' "$alternative"
+    printf '\n'
+    printf -- '--%s\n' "$alternative"
+    text_part
+    printf -- '--%s\n' "$alternative"
+    printf 'Content-Type: text/html; charset=utf-8\n'
+    printf 'Content-Transfer-Encoding: base64\n'
+    printf '\n'
+    {
+        printf '<!DOCTYPE html>\n<html><head><meta charset="utf-8"></head><body>\n'
+        printf '<pre style="font-family: inherit; white-space: pre-wrap;">'
+        sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$body"
+        printf '</pre>\n'
+        for i in "${!images[@]}"; do
+            [ -r "${images[$i]}" ] || continue
+            printf '<p><img src="cid:image-%s.%s@alert-send.invalid" alt="%s"></p>\n' \
+                "$i" "$boundary" "$(basename "${images[$i]}")"
+        done
+        printf '</body></html>\n'
+    } | base64
+    printf -- '--%s--\n' "$alternative"
+    for i in "${!images[@]}"; do
+        file="${images[$i]}"
+        [ -r "$file" ] || continue
+        printf -- '--%s\n' "$related"
+        printf 'Content-Type: %s; name="%s"\n' "$(image_type "$file")" "$(basename "$file")"
+        printf 'Content-Disposition: inline; filename="%s"\n' "$(basename "$file")"
+        printf 'Content-ID: <image-%s.%s@alert-send.invalid>\n' "$i" "$boundary"
+        printf 'Content-Transfer-Encoding: base64\n'
+        printf '\n'
+        base64 "$file"
+    done
+    printf -- '--%s--\n' "$related"
+}
 
 # RFC 2047 for the subject and base64 for the body: alert text here carries
 # UTF-8 (unit names are ASCII, the markers are not), and encoding it always is
@@ -90,15 +176,11 @@ boundary="alert-send-$(date +%s)-$$"
     printf 'Content-Type: multipart/mixed; boundary="%s"\n' "$boundary"
     printf '\n'
     printf -- '--%s\n' "$boundary"
-    printf 'Content-Type: text/plain; charset=utf-8\n'
-    printf 'Content-Transfer-Encoding: base64\n'
-    printf '\n'
-    {
-        cat
-        for file in "${attachments[@]}"; do
-            [ -r "$file" ] || printf '\n[attachment missing or unreadable: %s]\n' "$file"
-        done
-    } | base64
+    if [ ${#images[@]} -gt 0 ]; then
+        inline_part
+    else
+        text_part
+    fi
     for file in "${attachments[@]}"; do
         [ -r "$file" ] || continue
         printf -- '--%s\n' "$boundary"

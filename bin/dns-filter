@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Turn DNS filtering off for a few minutes, for a link behind a blocked domain.
+#
+#   dns-filter                 is filtering on, and if not, when does it come back
+#   dns-filter off [minutes]   off for that long (default 10), then on by itself
+#   dns-filter on              on now, cancelling the pending revert
+#
+# Lookups keep going to Mullvad over DoH; off swaps the filtering resolver for
+# its unfiltered sibling. The swap is a drop-in under /run, which a reboot
+# clears, so a reboot turns filtering back on too. The filtering resolver's URL
+# lives in bin/dns-failover-install, not here.
+set -euo pipefail
+
+UNFILTERED=https://dns.mullvad.net/dns-query
+UNITS=(dnsproxy-direct dnsproxy-front)
+DROPINS=(/run/systemd/system/dnsproxy-{direct,front}.service.d/50-dns-filter-off.conf)
+REVERT_UNIT=dns-filter-on
+# Shared by `on` and the revert timer, which runs it as root after max has
+# long stopped watching. Restarting the dnsproxies and flushing resolved drops
+# every answer cached under the other resolver.
+REVERT="rm -f ${DROPINS[*]} && systemctl daemon-reload && systemctl restart ${UNITS[*]} && resolvectl flush-caches"
+
+usage() { sed -n '4,6s/^#   //p' "$0" >&2; exit 2; }
+
+status() {
+  if [[ ! -e ${DROPINS[1]} ]]; then
+    echo "dns-filter: on"
+    return
+  fi
+  local until
+  until=$(systemctl show "$REVERT_UNIT.timer" -p NextElapseUSecRealtime --value)
+  if [[ -n $until ]]; then
+    echo "dns-filter: off until $until"
+  else
+    echo "dns-filter: off, and no revert is pending; run: dns-filter on" >&2
+    exit 1
+  fi
+}
+
+cancel_revert() {
+  sudo systemctl stop "$REVERT_UNIT.timer" "$REVERT_UNIT.service" 2> /dev/null || true
+  sudo systemctl reset-failed "$REVERT_UNIT.timer" "$REVERT_UNIT.service" 2> /dev/null || true
+}
+
+off() {
+  local minutes=${1:-10}
+  [[ $minutes =~ ^[1-9][0-9]*$ ]] || { echo "dns-filter: minutes must be a whole number above 0, got '$minutes'" >&2; exit 2; }
+  if ! systemctl cat dnsproxy-front 2> /dev/null | grep -q '^Environment=DNS_UPSTREAM='; then
+    echo "dns-filter: dnsproxy-front takes no DNS_UPSTREAM; rerun bin/dns-failover-install first" >&2
+    exit 1
+  fi
+
+  # The revert is armed before filtering goes off, so no failure past this
+  # point leaves it off with nothing to turn it back on. A wall-clock time
+  # rather than --on-active: a monotonic timer pauses while the laptop sleeps.
+  cancel_revert
+  sudo systemd-run --quiet --collect --unit="$REVERT_UNIT" \
+    --on-calendar="$(date -u -d "+$minutes min" '+%Y-%m-%d %H:%M:%S') UTC" --timer-property=AccuracySec=1s \
+    /bin/sh -c "$REVERT"
+
+  local dropin
+  for dropin in "${DROPINS[@]}"; do
+    sudo mkdir -p "$(dirname "$dropin")"
+    printf '[Service]\nEnvironment=DNS_UPSTREAM=%s\n' "$UNFILTERED" | sudo tee "$dropin" > /dev/null
+  done
+  sudo systemctl daemon-reload
+  sudo systemctl restart "${UNITS[@]}"
+  sudo resolvectl flush-caches
+
+  status
+  echo "dns-filter: a browser may still hold the failed lookup for a minute; reload after that"
+}
+
+on() {
+  cancel_revert
+  sudo /bin/sh -c "$REVERT"
+  status
+}
+
+case ${1:-} in
+  "") status ;;
+  off) [[ $# -le 2 ]] || usage; off "${@:2}" ;;
+  on) [[ $# -eq 1 ]] || usage; on ;;
+  *) usage ;;
+esac

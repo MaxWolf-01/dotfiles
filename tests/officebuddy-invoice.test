@@ -1,0 +1,352 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "segno", "zxing-cpp", "pillow"]
+# ///
+"""Drive bin/officebuddy-invoice. Run it directly; no framework.
+
+Needs notmuch and zbarimg on PATH, e.g.
+    nix shell nixpkgs#notmuch nixpkgs#zbar -c tests/officebuddy-invoice.test
+
+The promises here: the September invoice reads as the values printed on it, an
+invoice missing or contradicting one of them is unreadable rather than guessed,
+the QR code decodes to the EPC payload for that invoice, and against a real
+notmuch database each invoice is mailed exactly once, an unreadable one is
+mailed as such, and a failed delivery is tried again on the next run.
+
+The invoice fixture is an anonymised pdftotext -layout rendering of the real
+one, two pages, the footer on each. Mail goes out through the real
+bin/alert-send against a stubbed curl, the way tests/alert-send.test drives it;
+pdftotext is stubbed, because the fixture is text and the PDF is not committed.
+
+zbarimg decodes the codes; zxing-cpp reads the one with a non-ASCII payee,
+because zbar guesses the charset of QR bytes and reads UTF-8 as Shift JIS.
+"""
+
+import email
+import email.policy
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from email.message import EmailMessage
+from email.utils import format_datetime
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+import zxingcpp
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "bin" / "officebuddy-invoice"
+FIXTURE = (ROOT / "tests" / "fixtures" / "officebuddy-invoice" / "invoice.txt").read_text()
+
+for tool in ("notmuch", "zbarimg"):
+    if not shutil.which(tool):
+        sys.exit(f"FAIL {tool} is not on PATH; run this under: nix shell nixpkgs#notmuch nixpkgs#zbar -c {__file__}")
+
+sys.dont_write_bytecode = True  # importing bin/ must not leave a __pycache__ on $PATH
+loader = SourceFileLoader("officebuddy_invoice", str(SCRIPT))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec
+ob = importlib.util.module_from_spec(spec)
+loader.exec_module(ob)
+
+failures = 0
+
+
+def check(what: str, expected, actual) -> None:
+    global failures
+    if expected == actual:
+        print(f"ok   {what}")
+    else:
+        print(f"FAIL {what}\n       expected: {expected!r}\n       actual:   {actual!r}")
+        failures += 1
+
+
+def unreadable(text: str) -> str:
+    try:
+        ob.parse(text)
+    except ob.Unreadable as e:
+        return str(e)
+    return "read without complaint"
+
+
+# The values printed on the September invoice, and the EPC payload they make by
+# EPC069-12: BCD, version 002, charset 1 (UTF-8), SCT, BIC, name, IBAN, amount,
+# purpose, structured reference, unstructured text.
+SEPTEMBER_PAYLOAD = "BCD\n002\n1\nSCT\nBKAUATWW\nMAX Catering GmbH\nAT101100009693324700\nEUR70.20\n\n\nB15777"
+
+# --- the parser
+
+invoice = ob.parse(FIXTURE)
+check("the invoice number", "B15777", invoice.number)
+check("the total", Decimal("70.20"), invoice.total)
+check("the invoice date", "30.09.2026", f"{invoice.issued:%d.%m.%Y}")
+check("the first-listed IBAN, not the second", "AT101100009693324700", invoice.iban)
+check("the first-listed BIC", "BKAUATWW", invoice.bic)
+check("the payee from the footer", "MAX Catering GmbH", invoice.payee)
+check("the payment term", 14, invoice.term_days)
+check("due 14 days after the invoice date", "14.10.2026", f"{invoice.due:%d.%m.%Y}")
+
+no_total = "\n".join(line for line in FIXTURE.splitlines() if "Total €" not in line)
+check("an invoice without a total is unreadable", True, "no total found" in unreadable(no_total))
+
+second_total = FIXTURE.replace(
+    "Total €                                   70,20",
+    "Total €                                   70,20\n                           Total €                                   72,00",
+)
+check("two different totals are unreadable", True, "total is not unique" in unreadable(second_total))
+
+one_page_other_bank = FIXTURE.replace("IBAN: AT10 1100 0096 9332 4700", "IBAN: AT48 3200 0000 1234 5864", 1)
+check("pages naming different accounts are unreadable", True, "IBAN is not unique" in unreadable(one_page_other_bank))
+
+typo_iban = FIXTURE.replace("AT10 1100 0096 9332 4700", "AT10 1100 0096 9332 4701")
+check("an IBAN failing its checksum is unreadable", True, "checksum" in unreadable(typo_iban))
+
+credit_note = FIXTURE.replace("70,20\nZahlung", "-70,20\nZahlung")
+check("a negative total is unreadable", True, "total" in unreadable(credit_note))
+
+thousands = FIXTURE.replace("  70,20\nZahlung", "1.070,20\nZahlung")
+check("a total with a thousands separator reads", Decimal("1070.20"), ob.parse(thousands).total)
+
+# --- the QR code
+
+check("the EPC payload", SEPTEMBER_PAYLOAD, ob.epc_payload(invoice))
+with tempfile.TemporaryDirectory() as tmp:
+    png = Path(tmp) / "code.png"
+    ob.write_qr(ob.epc_payload(invoice), png)
+    decoded = subprocess.run(["zbarimg", "--raw", "-q", str(png)], capture_output=True, text=True, check=False).stdout
+    check("the QR code decodes to the EPC payload", SEPTEMBER_PAYLOAD, decoded.rstrip("\n"))
+
+    umlaut = ob.Invoice("B1", invoice.issued, Decimal("1.00"), "Müller Catering GmbH", invoice.iban, invoice.bic, 14)
+    ob.write_qr(ob.epc_payload(umlaut), png)
+    [read] = zxingcpp.read_barcodes(Image.open(png))
+    check("a non-ASCII payee is in the code as UTF-8", ob.epc_payload(umlaut).encode(), read.bytes)
+    check("the code carries EPC's error correction level", "M", read.ec_level)
+
+# --- the job, against a real notmuch database
+#
+# The stubbed pdftotext prints the fixture for the September PDF's bytes and the
+# fixture without its total for the broken one's, so which mail carried which
+# PDF decides what the job reads.
+
+work = Path(tempfile.mkdtemp())
+maildir = work / "mail"
+for sub in ("cur", "new", "tmp"):
+    (maildir / "INBOX" / sub).mkdir(parents=True)
+(work / "fixtures").mkdir()
+(work / "fixtures" / "good.txt").write_text(FIXTURE)
+(work / "fixtures" / "broken.txt").write_text(no_total)
+GOOD_PDF, BROKEN_PDF = b"%PDF-1.4 the September invoice", b"%PDF-1.4 a changed layout"
+
+stub = work / "stub"
+stub.mkdir()
+(stub / "pdftotext").write_text(f"""#!/usr/bin/env bash
+# pdftotext -layout FILE -
+case "$(cat "$2")" in
+    "{GOOD_PDF.decode()}") cat {work}/fixtures/good.txt ;;
+    "{BROKEN_PDF.decode()}") cat {work}/fixtures/broken.txt ;;
+    *) echo "stub pdftotext: unknown PDF" >&2; exit 1 ;;
+esac
+""")
+(stub / "curl").write_text(f"""#!/usr/bin/env bash
+prev=""
+for a in "$@"; do
+    [ "$prev" = "--upload-file" ] && cp "$a" "{work}/sent/$(date +%s%N)"
+    prev="$a"
+done
+exit "${{STUB_CURL_EXIT:-0}}"
+""")
+for f in stub.iterdir():
+    f.chmod(0o755)
+(work / "sent").mkdir()
+
+home = work / "home"
+(home / ".dotfiles/secrets/monitoring").mkdir(parents=True)
+(home / ".dotfiles/secrets/monitoring/alert.conf").write_text(
+    'smtp_url="smtp://localhost:587"\nsmtp_user="u"\npassword_command="echo t"\n'
+    'mail_from="from@example.invalid"\nmail_to="to@example.invalid"\n'
+)
+(work / "notmuch-config").write_text(f"[database]\npath={work}/db\nmail_root={maildir}\n[new]\ntags=unread;\n")
+env = {
+    **os.environ,
+    "HOME": str(home),
+    "PATH": f"{stub}:{os.environ['PATH']}",
+    "NOTMUCH_CONFIG": str(work / "notmuch-config"),
+    "RUN_LOG_DIR": str(work / "runs"),
+}
+(work / "db").mkdir()
+
+
+def deliver(
+    name: str,
+    sender: str,
+    subject: str,
+    pdf: bytes | None,
+    age_days: int = 1,
+    subtype: str = "pdf",
+    filename: str = "Rechnung.pdf",
+) -> None:
+    mail = EmailMessage()
+    mail["From"] = sender
+    mail["To"] = "max@example.invalid"
+    mail["Subject"] = subject
+    mail["Date"] = format_datetime((datetime.now(timezone.utc) - timedelta(days=age_days)).astimezone())
+    mail["Message-ID"] = f"<{name}@example.invalid>"
+    mail.set_content("Sehr geehrte Damen und Herren, anbei Ihre Rechnung.")
+    if pdf is not None:
+        mail.add_attachment(pdf, maintype="application", subtype=subtype, filename=filename)
+    (maildir / "INBOX" / "new" / name).write_bytes(mail.as_bytes())
+    subprocess.run(["notmuch", "new", "--quiet"], env=env, check=True)
+
+
+def run_job(**extra_env: str) -> int:
+    return subprocess.run([str(SCRIPT)], env={**env, **extra_env}, capture_output=True, check=False).returncode
+
+
+def path_without(tool: str) -> Path:
+    """A one-directory PATH holding the test's PATH, the stubs first, minus tool:
+    the host may have its own copy of tool anywhere on PATH, so leaving the stub
+    out is not enough."""
+    bare = work / f"path-without-{tool}"
+    if not bare.exists():
+        bare.mkdir()
+        for directory in env["PATH"].split(os.pathsep):
+            for exe in Path(directory).glob("*") if Path(directory).is_dir() else []:
+                link = bare / exe.name
+                if exe.name != tool and not link.is_symlink() and os.access(exe, os.X_OK):
+                    link.symlink_to(exe)
+    assert not shutil.which(tool, path=str(bare))
+    return bare
+
+
+def sent() -> list[EmailMessage]:
+    """Every message submitted so far, oldest first, and empty the outbox."""
+    found = []
+    for path in sorted((work / "sent").iterdir()):
+        found.append(email.message_from_bytes(path.read_bytes(), policy=email.policy.default))
+        path.unlink()
+    return found
+
+
+def last_run() -> dict:
+    return json.loads((work / "runs" / "officebuddy-invoice.jsonl").read_text().splitlines()[-1])
+
+
+try:
+    subprocess.run(["notmuch", "new", "--quiet"], env=env, check=True)
+    deliver("sept", "Max-Catering <rechnung@buddy.at>", "Ihre Rechnung B15777 von Max-Catering", GOOD_PDF)
+    deliver("order", "Officebuddy <bestellung@buddy.at>", "Deine Officebuddy Bestellung", None)
+    deliver("old", "Max-Catering <rechnung@buddy.at>", "Ihre Rechnung B14000 von Max-Catering", GOOD_PDF, age_days=100)
+
+    check("the first run exits 0", 0, run_job())
+    mails = sent()
+    check("it mails the one new invoice, not the order or the old one", 1, len(mails))
+    mail = mails[0]
+    check(
+        "the subject names invoice, amount and due date",
+        "💶 Officebuddy B15777: 70,20 € due 14.10.2026",
+        mail["Subject"],
+    )
+    parts = {part.get_content_type(): part for part in mail.walk()}
+    check(
+        "the summary states the amount and IBAN",
+        True,
+        all(s in parts["text/plain"].get_content() for s in ("70,20 €", "AT10 1100 0096 9332 4700", "B15777")),
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        png = Path(tmp) / "mailed.png"
+        png.write_bytes(parts["image/png"].get_content())
+        decoded = subprocess.run(
+            ["zbarimg", "--raw", "-q", str(png)], capture_output=True, text=True, check=False
+        ).stdout
+    check("the mailed code decodes to the September payload", SEPTEMBER_PAYLOAD, decoded.rstrip("\n"))
+    check(
+        "the code is shown inline in the HTML",
+        True,
+        f"cid:{parts['image/png']['Content-ID'].strip('<>')}" in parts["text/html"].get_content(),
+    )
+    check("the invoice PDF is attached", GOOD_PDF, parts["application/octet-stream"].get_content())
+    check(
+        "the run log says ok, one mailed",
+        ("ok", 1, 0, "delivered"),
+        (
+            last_run()["outcome"],
+            last_run()["stats"]["mailed"],
+            last_run()["stats"]["unreadable"],
+            last_run()["stats"]["alert"],
+        ),
+    )
+
+    check("a second run exits 0", 0, run_job())
+    check("...and mails nothing", 0, len(sent()))
+    check("...and logs ok, none mailed", ("ok", 0), (last_run()["outcome"], last_run()["stats"]["mailed"]))
+
+    deliver("broken", "Max-Catering <rechnung@buddy.at>", "Ihre Rechnung B15900 von Max-Catering", BROKEN_PDF)
+    check("an unreadable invoice still exits 0", 0, run_job())
+    mails = sent()
+    check("it is mailed once", 1, len(mails))
+    body = mails[0].get_body(("plain",)).get_content() if mails else ""
+    check(
+        "as unreadable, with no code",
+        (True, False),
+        (
+            mails[0]["Subject"].startswith("⚠️ Officebuddy invoice unreadable") if mails else False,
+            any(p.get_content_type() == "image/png" for p in mails[0].walk()) if mails else True,
+        ),
+    )
+    check("naming the message and why", True, "broken@example.invalid" in body and "no total found" in body)
+    check("the run log counts it", 1, last_run()["stats"]["unreadable"])
+    run_job()
+    check("and it is not mailed again", 0, len(sent()))
+
+    deliver("nopdf", "Max-Catering <rechnung@buddy.at>", "Neue Bankverbindung", None)
+    run_job()
+    check("a mail from the invoice address without a PDF is not an invoice", 0, len(sent()))
+
+    deliver("octet", "Max-Catering <rechnung@buddy.at>", "Ihre Rechnung B16000 von Max-Catering", GOOD_PDF,
+            subtype="octet-stream", filename="Rechnung B16000.pdf")  # fmt: skip
+    run_job()
+    mails = sent()
+    check("a PDF sent as application/octet-stream is still an invoice", 1, len(mails))
+
+    deliver("dotdot", "Max-Catering <rechnung@buddy.at>", "Ihre Rechnung B16050 von Max-Catering", GOOD_PDF,
+            filename="..")  # fmt: skip
+    run_job()
+    mails = sent()
+    check(
+        "a PDF named '..' is mailed as invoice.pdf",
+        ["invoice.pdf"],
+        [p.get_filename() for m in mails for p in m.walk() if p.get_content_type() == "application/octet-stream"],
+    )
+
+    deliver("notools", "Max-Catering <rechnung@buddy.at>", "Ihre Rechnung B16070 von Max-Catering", GOOD_PDF)
+    check("a run without pdftotext exits 1", 1, run_job(PATH=str(path_without("pdftotext"))))
+    check("...logs fail, naming what is missing", ("fail", True),
+          (last_run()["outcome"], "FileNotFoundError" in (last_run()["reason"] or "")))  # fmt: skip
+    check("...and the next run mails it", (0, 1), (run_job(), len(sent())))
+
+    deliver("oct", "Max-Catering <rechnung@buddy.at>", "Ihre Rechnung B16100 von Max-Catering", GOOD_PDF)
+    check("a run whose delivery fails exits 1", 1, run_job(STUB_CURL_EXIT="67"))
+    sent()
+    check(
+        "...and logs fail, naming the delivery",
+        ("fail", "1 not delivered"),
+        (last_run()["outcome"], last_run()["stats"]["alert"]),
+    )
+    check("the next run delivers it", 0, run_job())
+    check("...once", 1, len(sent()))
+finally:
+    shutil.rmtree(work)
+
+print()
+if failures:
+    print(f"{failures} check(s) failed")
+    sys.exit(1)
+print("all checks passed")

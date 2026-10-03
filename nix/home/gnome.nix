@@ -93,6 +93,8 @@
       minimize = [ "<Super>m" ];
       maximize = [ "<Shift><Super>m" "<Super>Up" ];
       unmaximize = [ "<Super>Down" ];
+      # Ubuntu's default adds <Primary><Alt>d, which the agent containers use (done, next page).
+      show-desktop = [ "<Primary><Super>d" "<Super>d" ];
       switch-to-workspace-1 = [ "<Super>1" ];
       switch-to-workspace-2 = [ "<Super>2" ];
       switch-to-workspace-3 = [ "<Super>3" ];
@@ -173,10 +175,12 @@
       span-window-left = [ "<Control><Super>Left" ];
       span-window-right = [ "<Control><Super>Right" ];
       span-window-up = [ "<Control><Super>Up" ];
-      focus-window-down = [ "<Control><Alt>j" ];
-      focus-window-left = [ "<Control><Alt>h" ];
-      focus-window-right = [ "<Control><Alt>l" ];
-      focus-window-up = [ "<Control><Alt>k" ];
+      # Directional focus is off: Ctrl+Alt+hjkl and their Shift forms belong to the
+      # agent containers' view in the browser (bin/container-hub.html).
+      focus-window-down = [];
+      focus-window-left = [];
+      focus-window-right = [];
+      focus-window-up = [];
       focus-window-next = [ "<Super>j" ];
       focus-window-prev = [ "<Super>k" ];
       # Order matters: the extension pads missing per-monitor entries with the

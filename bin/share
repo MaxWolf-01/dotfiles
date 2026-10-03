@@ -1,0 +1,387 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro>=1.0.14"]
+# ///
+"""Put a page online at https://share.mwolf.dev/<id>/, behind a random path that is its only secret.
+
+A single HTML file is served at the share's URL itself; any other file keeps
+its name under it, and its link ends in that name; a folder's contents go under
+it as they are, and its index.html is the page the link opens. Nothing
+expires: a share stays up until `share rm` removes it. --password encrypts
+every HTML page in the browser with StatiCrypt; the password is asked for, never
+taken as an argument.
+
+The shares live in the share root, $SHARE_ROOT (default ~/Documents/share/):
+public/ holds one folder per share and is the Cloudflare Worker's whole site,
+shares.json beside it records each share. Every change deploys the whole root,
+so the site holds exactly the shares the root holds, and the root lives on one
+machine only: a deploy from another root would drop every share this one holds.
+On that machine, `share init` makes it.
+
+Files over 25 MiB, zips meant to be downloaded, and shares that should expire or
+carry a server-side password go to the SFTPGo drop instead (sftpgo-share).
+
+Deploying needs the Cloudflare token, so share runs wrangler under with-secrets
+cloudflare-mwolf-dev-workers. $SHARE_WRANGLER replaces the whole wrangler command.
+
+Examples:
+
+    share init
+    share ~/Documents/overview.html
+    share ~/talks/slides --password
+    share report/ --replace 3f9c0e...
+    share list
+    share list --json | jq -r '.[].url'
+    share rm 3f9c0e...
+"""
+
+import contextlib
+import datetime as dt
+import fcntl
+import getpass
+import html
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated
+
+import tyro
+from tyro.extras import SubcommandApp
+
+app = SubcommandApp()
+
+DOMAIN = "share.mwolf.dev"
+MAX_ASSET = 25 * 1024 * 1024
+"""Bytes: the most a Worker's static asset may hold."""
+WRANGLER = ["with-secrets", "cloudflare-mwolf-dev-workers", "npx", "--yes", "wrangler@4.140.0"]
+STATICRYPT = ["npx", "--yes", "staticrypt@3.5.4"]
+HEADERS = "/*\n  X-Robots-Tag: noindex, nofollow\n  Referrer-Policy: no-referrer\n"
+"""public/_headers: on every response, 404s and redirects included."""
+WORKER = {
+    "name": "share",
+    "main": "worker.js",
+    "compatibility_date": "2026-09-01",
+    "assets": {"directory": "public", "binding": "ASSETS", "run_worker_first": True,
+               "html_handling": "auto-trailing-slash", "not_found_handling": "none"},
+    # no address but the custom domain: no workers.dev name, no per-version preview URLs
+    "workers_dev": False,
+    "preview_urls": False,
+    "routes": [{"pattern": DOMAIN, "custom_domain": True}],
+}
+
+# Static assets answer a Range request with the whole file, and a browser cannot seek audio
+# it does not have (iOS Safari will not play it at all), so the script cuts the range out of
+# the asset. Everything else is the asset's own response, _headers included.
+SCRIPT = """\
+export default {
+  async fetch(request, env) {
+    const asset = await env.ASSETS.fetch(request)
+    const m = /^bytes=(\\d*)-(\\d*)$/.exec(request.headers.get("Range") || "")
+    if (!m || (!m[1] && !m[2]) || request.method !== "GET" || asset.status !== 200) return asset
+    const body = await asset.arrayBuffer()
+    const size = body.byteLength
+    const start = m[1] ? +m[1] : Math.max(0, size - +m[2])
+    const end = m[1] && m[2] ? Math.min(+m[2], size - 1) : size - 1
+    const headers = new Headers(asset.headers)
+    if (start >= size || start > end) {
+      headers.set("Content-Range", `bytes */${size}`)
+      return new Response(null, { status: 416, headers })
+    }
+    headers.set("Content-Range", `bytes ${start}-${end}/${size}`)
+    headers.set("Content-Length", String(end - start + 1))
+    return new Response(body.slice(start, end + 1), { status: 206, headers })
+  },
+}
+"""
+
+
+def root_dir() -> Path:
+    return Path(os.environ.get("SHARE_ROOT") or Path.home() / "Documents" / "share").expanduser()
+
+
+# ---------------------------------------------------------------- commands
+
+
+@dataclass
+class PutArgs:
+    path: Annotated[Path, tyro.conf.Positional]
+    """The file or folder to share."""
+    password: bool = False
+    """Ask for a password and encrypt every HTML page with it; the other files go up as they are."""
+    replace: str = ""
+    """Put the content behind this existing share's URL instead of a new one."""
+
+
+@app.command(name="put")
+def put(args: PutArgs) -> None:
+    """Put a file or folder online and print its URL, the only line on stdout."""
+    src = args.path.expanduser().resolve()
+    if not src.exists():
+        raise Failed(f"{src} does not exist.")
+    if src.is_dir() and not (src / "index.html").is_file():
+        raise Failed(f"{src} has no index.html at its top, the page its link would open. "
+                     "A folder of files to download goes to the SFTPGo drop (sftpgo-share).")
+    refuse_large(files_of(src), src)
+    # the link opens the page; a file that is not one is reached by its name
+    url = f"https://{DOMAIN}/{{}}/" + ("" if src.is_dir() or is_html(src) else urllib.parse.quote(src.name))
+    with locked_root() as root:
+        shares = read_shares(root)
+        old = find(shares, args.replace) if args.replace else None
+        share_id = old["id"] if old else secrets.token_hex(16)
+        if old and url.format(share_id) != old["url"]:
+            fits = "a page" if old["url"].endswith("/") else f"a file named {Path(urllib.parse.unquote(old['url'])).name}"
+            raise Failed(f"the share's link is {old['url']}, and {src.name} would move it to {url.format(share_id)}, "
+                         f"which breaks the link already sent. Replace it with {fits}, or share {src.name} anew.")
+        password = ask_password() if args.password else None
+        with tempfile.TemporaryDirectory(dir=root, prefix=".incoming-") as tmp:
+            built = build(src, Path(tmp), password)
+            refuse_large(files_of(built), src, after="encrypted")
+            target = root / "public" / share_id
+            aside = Path(tmp) / "replaced"
+            if old:
+                target.rename(aside)
+            built.rename(target)
+            entry = {
+                "id": share_id,
+                "source": str(src),
+                "title": title_of(src),
+                "date": dt.date.today().isoformat(),
+                "password": password is not None,
+                "url": url.format(share_id),
+            }
+            # an interrupt rolls back too: tmp, which holds the replaced content, is deleted on the way out
+            try:
+                deploy(root)
+                write_shares(root, [entry if s["id"] == share_id else s for s in shares] if old else [*shares, entry])
+            except BaseException:
+                shutil.rmtree(target)
+                if old:
+                    aside.rename(target)
+                raise
+    print(entry["url"])
+
+
+@dataclass
+class ListArgs:
+    json: bool = False
+    """Print the shares as JSON:
+    [{"id": "str", "source": "str", "title": "str", "date": "YYYY-MM-DD", "password": "bool", "url": "str"}]"""
+
+
+@app.command(name="list")
+def list_shares(args: ListArgs) -> None:
+    """List the shares, newest first."""
+    root = existing_root()
+    shares = sorted(read_shares(root), key=lambda s: s["date"], reverse=True)
+    if args.json:
+        print(json.dumps(shares, ensure_ascii=False, indent=1))
+        return
+    for s in shares:
+        lock = " [password]" if s["password"] else ""
+        print(f"{s['date']}  {s['url']}{lock}\n            {s['title']}  ({s['source']})")
+
+
+@dataclass
+class RmArgs:
+    ids: Annotated[list[str], tyro.conf.Positional]
+    """The ids of the shares to remove, as `share list` shows them."""
+
+
+@app.command(name="rm")
+def rm(args: RmArgs) -> None:
+    """Take shares offline: removed from the root, then the site deployed without them."""
+    with locked_root() as root:
+        shares = read_shares(root)
+        gone = list(dict.fromkeys(find(shares, i)["id"] for i in args.ids))
+        with tempfile.TemporaryDirectory(dir=root, prefix=".removed-") as tmp:
+            moved = []
+            try:
+                for i in gone:
+                    if (root / "public" / i).is_dir():
+                        (root / "public" / i).rename(Path(tmp) / i)
+                        moved.append(i)
+                deploy(root)
+                write_shares(root, [s for s in shares if s["id"] not in gone])
+            except BaseException:
+                for i in moved:
+                    (Path(tmp) / i).rename(root / "public" / i)
+                raise
+    for i in gone:
+        print(f"removed {i}", file=sys.stderr)
+
+
+@dataclass
+class InitArgs:
+    pass
+
+
+@app.command(name="init")
+def init(args: InitArgs) -> None:
+    """Make the share root on this machine, the only one that will hold the shares."""
+    root = root_dir()
+    if (root / "shares.json").exists():
+        raise Failed(f"{root} is already a share root.")
+    (root / "public").mkdir(parents=True, exist_ok=True)
+    write_shares(root, [])
+    print(f"made the share root {root}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- the root
+
+
+class Failed(Exception):
+    """A failure the user can act on; its message says what failed and what to do."""
+
+
+def existing_root() -> Path:
+    root = root_dir()
+    if not (root / "shares.json").exists():
+        raise Failed(
+            f"there is no share root at {root}. The shares live on one machine; on that machine, "
+            "`share init` makes the root, and $SHARE_ROOT points share at one elsewhere.")
+    return root
+
+
+@contextlib.contextmanager
+def locked_root() -> Iterator[Path]:
+    """The root, held against another share changing it at the same time."""
+    root = existing_root()
+    with open(root / ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Failed(f"another share is changing {root} right now; try again once it is done.")
+        yield root
+
+
+def read_shares(root: Path) -> list[dict]:
+    return json.loads((root / "shares.json").read_text())
+
+
+def write_shares(root: Path, shares: list[dict]) -> None:
+    tmp = root / "shares.json.tmp"
+    tmp.write_text(json.dumps(shares, ensure_ascii=False, indent=1) + "\n")
+    tmp.replace(root / "shares.json")
+
+
+def find(shares: list[dict], share_id: str) -> dict:
+    match = [s for s in shares if s["id"] == share_id]
+    if not match:
+        raise Failed(f"there is no share {share_id}; `share list` shows them.")
+    return match[0]
+
+
+# ---------------------------------------------------------------- building a share
+
+
+def files_of(path: Path) -> list[Path]:
+    return [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+
+
+def refuse_large(files: list[Path], src: Path, after: str = "") -> None:
+    big = [p for p in files if p.stat().st_size > MAX_ASSET]
+    if big:
+        sizes = ", ".join(f"{p.name} ({p.stat().st_size / 2**20:.1f} MiB{', ' + after if after else ''})" for p in big)
+        raise Failed(
+            f"{sizes} is over the 25 MiB a file on {DOMAIN} may have, so nothing of {src} was shared. "
+            "The SFTPGo drop takes large files: sftpgo-share upload, then sftpgo-share create.")
+
+
+def is_html(path: Path) -> bool:
+    return path.suffix.lower() in (".html", ".htm")
+
+
+def build(src: Path, tmp: Path, password: str | None) -> Path:
+    """The share's folder, made in tmp: src as it will be served, its pages encrypted when a password is given."""
+    out = tmp / "share"
+    if password is None:
+        if src.is_dir():
+            shutil.copytree(src, out)
+        else:
+            out.mkdir()
+            shutil.copy2(src, out / ("index.html" if is_html(src) else src.name))
+        return out
+    if not any(is_html(p) for p in files_of(src)):
+        raise Failed(f"{src} holds no HTML page, and a password encrypts only pages.")
+    # StatiCrypt reads the source and writes only ciphertext, so the plain page is never copied anywhere
+    encrypted = tmp / "encrypted"
+    run([*STATICRYPT, str(src), *(["-r"] if src.is_dir() else []), "-d", str(encrypted), "-c", "false", "--short"],
+        "encrypting with StatiCrypt", env={**os.environ, "STATICRYPT_PASSWORD": password})
+    if src.is_dir():
+        (encrypted / src.name).rename(out)
+    else:
+        out.mkdir()
+        (encrypted / src.name).rename(out / "index.html")
+    return out
+
+
+def ask_password() -> str:
+    if not sys.stdin.isatty():
+        raise Failed("--password asks for the password on the terminal, and there is none.")
+    first = getpass.getpass("password: ")
+    if not first:
+        raise Failed("the password is empty.")
+    if getpass.getpass("again: ") != first:
+        raise Failed("the two passwords differ.")
+    return first
+
+
+def title_of(src: Path) -> str:
+    """The page's own title, else the file's or folder's name."""
+    page = src if src.is_file() else src / "index.html"
+    if is_html(page) and page.exists():
+        m = re.search(r"<title[^>]*>(.*?)</title>", page.read_text(errors="replace"), re.S | re.I)
+        if m and m.group(1).strip():
+            return html.unescape(" ".join(m.group(1).split()))
+    return src.name
+
+
+# ---------------------------------------------------------------- deploying
+
+
+def deploy(root: Path) -> None:
+    """The whole of public/ as the Worker's only version."""
+    (root / "public" / "_headers").write_text(HEADERS)
+    (root / "worker.js").write_text(SCRIPT)
+    (root / "wrangler.json").write_text(json.dumps(WORKER, indent=1) + "\n")
+    wrangler = shlex.split(os.environ["SHARE_WRANGLER"]) if os.environ.get("SHARE_WRANGLER") else WRANGLER
+    print(f"deploying {root / 'public'} to {DOMAIN}", file=sys.stderr)
+    run([*wrangler, "deploy", "--config", str(root / "wrangler.json")], "deploying",
+        env={**os.environ, "WRANGLER_SEND_METRICS": "false"}, cwd=root)
+
+
+def run(cmd: list[str], what: str, env: dict[str, str] | None = None, cwd: Path | None = None) -> None:
+    try:
+        r = subprocess.run(cmd, env=env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Failed(f"{what} failed: {cmd[0]} is not on PATH.")
+    if r.returncode:
+        raise Failed(f"{what} failed ({shlex.join(cmd[:4])} exited {r.returncode}): {(r.stderr + r.stdout).strip()[-1500:]}")
+
+
+def main() -> None:
+    commands = {"put", "list", "rm", "init"}
+    # `share <path>` is `share put <path>`
+    if len(sys.argv) > 1 and sys.argv[1] not in commands and sys.argv[1] not in ("-h", "--help"):
+        sys.argv.insert(1, "put")
+    try:
+        app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
+    except Failed as exc:
+        sys.exit(f"share: {exc}")
+    except KeyboardInterrupt:
+        sys.exit("\nshare: interrupted")
+
+
+if __name__ == "__main__":
+    main()

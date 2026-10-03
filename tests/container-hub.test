@@ -1,0 +1,802 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""Drive bin/container-hub and bin/claude-browser over HTTP and check the ticket pages-open-into-containers
+promises beyond the work-containers properties: where a page lands, what never opens, what leaves.
+Run it directly; no framework.
+
+One hub on a free port, never 8377, with HOME and its state in a scratch directory. Two repos, alpha and
+beta, each with an agent repo whose tickets were committed by sessions (a `Session:` trailer).
+"""
+
+import contextlib
+import fcntl
+import hashlib
+import http.client
+import http.server
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parents[1] / "bin"
+SCRATCH = Path(tempfile.mkdtemp(prefix="container-hub-test."))
+HOME = SCRATCH / "home"
+TEMP = SCRATCH / "tmp"  # the temp dir of everything the test runs, beside HOME and not around it, so each guard is checked on its own
+ORCHESTRATOR = "aaaaaaaa-0000-4000-8000-000000000001"
+WORKER = "bbbbbbbb-0000-4000-8000-000000000002"
+STRANGER = "cccccccc-0000-4000-8000-000000000003"
+SPIKER = "dddddddd-0000-4000-8000-000000000004"
+
+failures = 0
+
+
+def check(what: str, expected, actual) -> None:
+    global failures
+    if expected == actual:
+        print(f"ok   {what}")
+    else:
+        failures += 1
+        print(f"FAIL {what}\n       expected: {expected!r}\n       actual:   {actual!r}")
+
+
+def env(**extra: str) -> dict:
+    keep = {k: v for k, v in os.environ.items()
+            if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB"))}
+    for k in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR"):  # uv's own, which would otherwise move into HOME
+        keep[k] = subprocess.run(["uv", *(("cache", "dir") if k == "UV_CACHE_DIR" else ("python", "dir"))],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+    return {**keep, "HOME": str(HOME), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", **extra}
+
+
+ENV = env(TMPDIR=str(TEMP))
+
+
+def git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, env=ENV,
+                   check=True, capture_output=True)
+
+
+TICKET = "---\nstatus: {status}\n{parent}priority: 2\nsize: S\n---\n\n# {slug}\n\n## Brief\n\n{slug}.\n\n## Acceptance criteria\n\n## Comments\n"
+
+
+def ticket(agent: Path, slug: str, status: str = "open", parent: str | None = None) -> None:
+    (agent / "tickets" / f"{slug}.md").write_text(
+        TICKET.format(status=status, parent=f"parent: {parent}\n" if parent else "", slug=slug))
+
+
+def repo(name: str, tickets: list[tuple[str, str | None, str]]) -> Path:
+    """A code repo holding an agent repo; each ticket (slug, parent, session) committed by its session."""
+    code = HOME / "repos" / name
+    agent = code / "agent"
+    (agent / "tickets").mkdir(parents=True)
+    git(code, "init", "-q")
+    (code / ".git" / "info" / "exclude").write_text("agent/\n")
+    (code / "README.md").write_text(name)
+    git(code, "add", "README.md")
+    git(code, "commit", "-q", "-m", "init")
+    git(agent, "init", "-q")
+    for slug, parent, session in tickets:
+        ticket(agent, slug, "claimed" if parent else "open", parent)
+        git(agent, "add", f"tickets/{slug}.md")
+        git(agent, "commit", "-q", "-m", f"file {slug}", "-m", f"Session: {session}")
+    return code
+
+
+def page(path: Path, body: str = "<!doctype html><p>a page</p>") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    return path
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = free_port()
+ORIGIN = f"http://127.0.0.1:{PORT}"
+TEMP_PAGE = TEMP / f"container-hub-test-{PORT}.html"  # directly in the temp dir
+
+
+def request(method: str, path: str, body: dict | None = None, headers: dict | None = None,
+            origin: str = ORIGIN) -> tuple[int, dict | bytes]:
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(origin + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            status, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, raw
+
+
+def open_page(target, session: str | None = None, **extra) -> dict:
+    return request("POST", "/api/open", {"target": str(target), **({"session": session} if session else {}), **extra})[1]
+
+
+def view(key: str) -> tuple[int, dict]:
+    return request("GET", "/api/c/" + urllib.parse.quote(key, safe=""))
+
+
+def listening_ports(root: int) -> list[int]:
+    """The TCP ports a process and every process under it listen on, read from /proc."""
+    children: dict[int, list[int]] = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            pid, rest = stat.read_text().split(" ", 1)
+        except OSError:
+            continue
+        children.setdefault(int(rest.rsplit(")", 1)[1].split()[1]), []).append(int(pid))
+    tree, todo = set(), [root]
+    while todo:
+        tree.add(pid := todo.pop())
+        todo += children.get(pid, [])
+    sockets = set()
+    for pid in tree:
+        for fd in Path(f"/proc/{pid}/fd").glob("*"):
+            with contextlib.suppress(OSError):
+                if (link := os.readlink(fd)).startswith("socket:["):
+                    sockets.add(link[len("socket:["):-1])
+    return [int(f[1].rsplit(":", 1)[1], 16) for table in ("/proc/net/tcp", "/proc/net/tcp6")
+            for f in (line.split() for line in Path(table).read_text().splitlines()[1:]) if f[3] == "0A" and f[9] in sockets]
+
+
+# --------------------------------------------------------------------------
+
+HOME.mkdir()
+TEMP.mkdir()
+HLJS = HOME / ".cache/diffview" / ("hljs-" + re.search(r'HLJS_VERSION = "(.+)"', (BIN / "diffview").read_text())[1])
+HLJS.mkdir(parents=True)
+(HLJS / "highlight.min.js").write_text("")  # fails its pin, so diffview neither fetches nor highlights
+alpha = repo("alpha", [("map-columns", None, ORCHESTRATOR), ("csv-import", "map-columns", ORCHESTRATOR)])
+beta = repo("beta", [("map-columns", None, STRANGER)])
+gamma = repo("gamma", [("one-flow", None, WORKER)])  # opened only through claude-browser
+agent = alpha / "agent"
+hub = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(SCRATCH / "state")],
+                       env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("w"), start_new_session=True)
+try:
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            socket.create_connection(("127.0.0.1", PORT), timeout=1).close()
+            break
+        except OSError:
+            time.sleep(0.1)
+    member_of = lambda opened: next(m for m in view(opened["container"])[1]["members"] if m["id"] == opened["id"])
+    in_view = lambda opened: opened["view"].removeprefix("/c/")
+
+    # --- where a page lands
+
+    a = open_page(page(alpha / "agent/show/csv-import/index.html"), WORKER)
+    b = open_page(page(beta / "agent/show/map-columns/index.html"), WORKER)
+    check("a child ticket's page lands in its tree's container", "map-columns", a["container"].split("@")[0])
+    check("...which names itself, its repo and its tree, and no board while the repo has none", (a["container"], "alpha", "map-columns", None),
+          tuple(view(a["container"])[1][k] for k in ("container", "repo", "root", "board")))
+    check("two repos whose trees share a slug get two containers", True, a["container"] != b["container"])
+    check("the first open of a page adds it", "added", a["action"])
+    request("POST", "/api/close", {"container": a["container"], "id": a["id"]})
+    check("a closed page stays a member, closed", True, member_of(a)["closed"])
+    check("closing in a container that does not exist, or a page it does not hold, is not found", (404, 404),
+          (request("POST", "/api/close", {"container": "no-such-container", "id": a["id"]})[0],
+           request("POST", "/api/close", {"container": a["container"], "id": "m0000000000"})[0]))
+    seen_mark = lambda seen: request("POST", "/api/seen", {"container": a["container"], "url": member_of(a)["url"], "seen": seen})
+    seen_mark(True)
+    check("the user marks a page seen", True, member_of(a)["url"] in view(a["container"])[1]["seen"])
+    seen_mark(False)
+    check("...and takes the mark back", False, member_of(a)["url"] in view(a["container"])[1]["seen"])
+    events = urllib.request.urlopen(f"{ORIGIN}/events/{in_view(a)}", timeout=10)
+    events.readline()
+    again = open_page(alpha / "agent/show/csv-import/index.html", STRANGER)
+    check("a second open of the same page brings the same member forward", ("reopened", a["id"]), (again["action"], again["id"]))
+    check("...open again", False, member_of(a)["closed"])
+    check("...and adds no second copy", 1, len(view(a["container"])[1]["members"]))
+    while not (line := events.readline().decode()).startswith("data:"):
+        pass
+    check("...and tells a showing view to reload it", ("reopened", a["id"]), (json.loads(line[5:])["type"], json.loads(line[5:])["id"]))
+    events.close()
+    quiet = http.client.HTTPConnection("127.0.0.1", PORT, timeout=3)
+    quiet.request("GET", f"/events/{in_view(a)}")
+    stream, heard = quiet.getresponse(), []
+    with contextlib.suppress(TimeoutError, OSError):
+        while line := stream.readline().decode():
+            heard += [line] if line.startswith("data:") else []
+    quiet.close()
+    check("a view that starts listening hears nothing while nothing changes", [], heard)
+
+    note = page(HOME / "notes" / "scratch.html")
+    by_trailer = open_page(note, ORCHESTRATOR, cwd=str(alpha))
+    check("a page under no ticket goes to the tree its session last committed on", a["container"], by_trailer["container"])
+    check("...as a page of the ticket it committed on last", "csv-import", member_of(by_trailer)["ticket"])
+    check("...in that session's group", ORCHESTRATOR, member_of(by_trailer)["group"])
+    ticket(agent, "drop-zone")
+    git(agent, "add", "tickets/drop-zone.md")
+    git(agent, "commit", "-q", "-m", "file drop-zone", "-m", f"Session: {ORCHESTRATOR}")
+    later = open_page(page(HOME / "notes" / "later.html"), ORCHESTRATOR, cwd=str(alpha))
+    check("a session that commits on another tree takes its later pages there", ("drop-zone", "drop-zone"),
+          (later["container"].split("@")[0], member_of(later)["ticket"]))
+    check("a session with no commits keeps its pages in its own container", f"session-{STRANGER}",
+          open_page(note, STRANGER, cwd=str(alpha))["container"])
+    elsewhere = open_page(alpha / "agent/show/csv-import/index.html", ORCHESTRATOR, container="elsewhere")
+    check("--container overrides the derivation", "elsewhere", elsewhere["container"])
+    check("...and the page keeps its ticket there", "csv-import", member_of(elsewhere)["ticket"])
+    check("--container naming a ticket puts the page in that ticket's tree", a["container"],
+          open_page(note, ORCHESTRATOR, cwd=str(alpha), container="csv-import")["container"])
+    across = open_page(page(gamma / "agent/show/one-flow/across.html"), ORCHESTRATOR, cwd=str(alpha), container="csv-import")
+    check("...a ticket of the opener's tracker when the page sits in another", a["container"], across["container"])
+    ticket_file = open_page(agent / "tickets/csv-import.md", WORKER)
+    check("a ticket file lands in its tree's container, as a page of that ticket", (a["container"], "csv-import"),
+          (ticket_file["container"], member_of(ticket_file)["ticket"]))
+    payload = open_page(page(alpha / "agent/show/csv-import/broken.html", "<script>const DATA = {not json</script>"), WORKER)
+    check("a page that looks like a diffview but carries no data opens like any other", a["container"], payload.get("container"))
+    session_page = open_page(page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html"), ORCHESTRATOR)
+    check("a session page goes to its session's group, under no ticket", (ORCHESTRATOR, None),
+          (member_of(session_page)["group"], member_of(session_page)["ticket"]))
+    worker_page = open_page(page(alpha / f"agent/sessions/{WORKER}/index.html"))
+    check("a session page lands where its own session works, whoever opens it, in its group", (f"session-{WORKER}", WORKER),
+          (worker_page["container"], member_of(worker_page)["group"]))
+    check("...a container named after the session's id, cut short", f"session {WORKER[:8]}", view(worker_page["container"])[1]["name"])
+    check("...whose group says how to resume that session", f"claude --resume {WORKER}", view(worker_page["container"])[1]["groups"][0]["resume"])
+    check("a group lists its session's page though nobody opened it in that container", True,
+          any(x["kind"] == "session" for g in view(a["container"])[1]["groups"] if g["id"] == WORKER for x in g["artefacts"]))
+    check("a page named relative to the opener's directory lands as its absolute path does", a["id"],
+          open_page("agent/show/csv-import/index.html", WORKER, cwd=str(alpha)).get("id"))
+    check("a page that carries DATA naming sources without files opens like any other", a["container"],
+          open_page(page(alpha / "agent/show/csv-import/sourced.html", '<script>const DATA = {"sources": [{"kind": "git"}]}</script>'),
+                    WORKER).get("container"))
+    check("so does a directory named like a page", a["container"],
+          open_page(page(alpha / "agent/show/csv-import/deck.html/index.html").parent, WORKER).get("container"))
+
+    # --- what never opens
+
+    report = page(alpha / "agent/show/drop-zone/report.md", "## Comments\n")
+    page(alpha / "agent/show/drop-zone/notes.md", "# notes\n")
+    page(alpha / "agent/show/drop-zone/figures/plot.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
+    page(alpha / "agent/show/drop-zone/out/raw.html")
+    skipped = open_page(report, WORKER)
+    check("a worker's report never opens", (True, None), ("skipped" in skipped, skipped["open"]))
+    check("...and the line the hub has its caller print says why", True, "not opened" in skipped["say"] and "report" in skipped["say"])
+    arts = [x["title"] for g in view(later["container"])[1]["groups"] for x in g["artefacts"]]
+    check("a group lists its tickets' show files but never a worker's report", (True, False),
+          ("notes.md" in arts, "report.md" in arts))
+    check("...and the figures in their folders, though not what a run wrote out", (True, False),
+          ("figures/plot.svg" in arts, "out/raw.html" in arts))
+    git(agent, "commit", "-q", "--allow-empty", "-m", "base")
+    ticket(agent, "csv-import", "review", "map-columns")
+    git(agent, "commit", "-q", "-am", "csv-import in review", "-m", f"Session: {ORCHESTRATOR}")
+    tracker_diff = agent / "diffviews" / "tracker.html"
+    tracker_diff.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([BIN / "diffview", f"{agent}@HEAD~1..HEAD", "-o", str(tracker_diff), "--no-auto-summary"],
+                   env=ENV, check=True, capture_output=True)
+    check("a diffview of tracker files never opens", True, "skipped" in open_page(tracker_diff, ORCHESTRATOR))
+    check("...though its source kept as text does, being no diffview", True,
+          "container" in open_page(shutil.copy(tracker_diff, tracker_diff.with_suffix(".txt")), ORCHESTRATOR))
+    check("a report beside a prototype is no worker's report, and opens", True,
+          "container" in open_page(page(alpha / "agent/prototypes/csv-import/report.md", "# what the prototype showed\n"), WORKER))
+    ticket(agent, "csv-import", "claimed", "map-columns")
+    page(agent / "show/csv-import/plan.md", "# plan\n")
+    git(agent, "add", "tickets/csv-import.md", "show/csv-import/plan.md")
+    git(agent, "commit", "-q", "-m", "csv-import back, with a plan")
+    mixed_diff = agent / "diffviews" / "mixed.html"
+    subprocess.run([BIN / "diffview", f"{agent}@HEAD~1..HEAD", "-o", str(mixed_diff), "--no-auto-summary"],
+                   env=ENV, check=True, capture_output=True)
+    check("a diffview of a ticket and a show file opens", a["container"], open_page(mixed_diff, ORCHESTRATOR).get("container"))
+    (alpha / "notes.txt").write_text("one\n")
+    git(alpha, "add", "notes.txt")
+    git(alpha, "commit", "-q", "-m", "notes")
+    code_diff = agent / "diffviews" / "csv-import.html"
+    subprocess.run([BIN / "diffview", f"{alpha}@HEAD~1..HEAD", "-o", str(code_diff), "--no-auto-summary"],
+                   env=ENV, check=True, capture_output=True)
+    check("a diffview of code opens", a["container"], open_page(code_diff, ORCHESTRATOR).get("container"))
+
+    groups = view(a["container"])[1]["groups"]
+    check("a group is named after the top of the tickets its session committed on", "map-columns",
+          next(g for g in groups if g["id"] == ORCHESTRATOR)["name"])
+    scratch_member = member_of(by_trailer)
+    check("a member no ticket lists is in its group's sidebar as it was opened", [{
+        "url": scratch_member["url"], "id": scratch_member["id"], "ticket": "csv-import", "kind": "page", "title": "scratch.html",
+        "mtime": scratch_member["first"]}], [x for g in groups if g["id"] == ORCHESTRATOR for x in g["artefacts"] if x["id"] == by_trailer["id"]])
+    ticket(agent, "spike", "open", "map-columns")
+    spike = open_page(page(agent / "show/spike/index.html"), SPIKER)
+    (agent / "tickets/spike.md").unlink()
+    spiker = next((g for g in view(spike["container"])[1]["groups"] if g["id"] == SPIKER), {})
+    check("a group whose ticket left the tracker is named after its session, never visited, the ticket marked gone",
+          (f"session {SPIKER[:8]}", 0, [{"slug": "spike", "status": "gone", "title": "spike", "diff": [], "ruled_at": 0}]),
+          (spiker.get("name"), spiker.get("visited"), spiker.get("tickets")))
+
+    # --- the tracker drives the view
+
+    ticket(agent, "csv-import", "done", "map-columns")
+    status = lambda: next(t["status"] for g in view(a["container"])[1]["groups"] for t in g["tickets"] if t["slug"] == "csv-import")
+    check("a ticket's status in the tracker is the view's", "done", status())
+    commits = subprocess.run(["git", "log", "--reverse", "--format=%h", "-2"], cwd=alpha, capture_output=True,
+                             text=True, check=True).stdout.split()
+    # the agent repo's last commit adds show/csv-import/plan.md
+    agent_range = "..".join(subprocess.run(["git", "log", "--reverse", "--format=%h", "-2"], cwd=agent, capture_output=True,
+                                           text=True, check=True).stdout.split())
+    ticket(agent, "map-columns")
+    with (agent / "tickets/map-columns.md").open("r+") as f:
+        text = f.read().replace("size: S\n", f"size: S\ndiff:\n  - code@{commits[0]}..{commits[1]}\n  - agent@{agent_range}\n")
+        f.seek(0)
+        f.write(text)
+    # what the hub cached before it left agent ranges out: one page of both ranges, keyed by both
+    old_specs = f"{alpha}@{commits[0]}..{commits[1]} {agent}@{agent_range}"
+    page(SCRATCH / "state" / "diffs" / f"map-columns-{hashlib.sha1(old_specs.encode()).hexdigest()[:8]}.html", "stale render")
+    listed = [x for g in view(a["container"])[1]["groups"] for x in g["artefacts"] if x["ticket"] == "map-columns" and x["kind"] == "diff"]
+    check("a ticket with no review page lists one diff, of its code ranges alone", [f"diff · code@{commits[0]}..{commits[1]}"],
+          [x["title"] for x in listed])
+    recorded = listed[0]
+    status_code, rendered = request("GET", recorded["url"])
+    check("a ticket's recorded code range renders when opened", (200, True), (status_code, b"notes.txt" in rendered))
+    check("...without its agent range, and never from a render cached with it", (False, False),
+          (b"plan.md" in rendered, b"stale render" in rendered))
+    renders = lambda: {p: p.stat().st_mtime_ns for p in (SCRATCH / "state" / "diffs").iterdir()}
+    first_render = renders()
+    check("...and once: opened again, the page already rendered is served", (200, first_render),
+          (request("GET", recorded["url"])[0], renders()))
+    from_view = request("POST", "/api/open", {"container": a["container"], "target": recorded["url"], "group": ORCHESTRATOR,
+                                              "title": recorded["title"], "by": "user"}, {"Origin": ORIGIN})[1]
+    check("a recorded range clicked in the view becomes a member of its ticket", (a["container"], "diff", "map-columns"),
+          (from_view["container"], member_of(from_view)["kind"], member_of(from_view)["ticket"]))
+    check("...under the title the view gave it, opened by the user", (recorded["title"], "user"),
+          (member_of(from_view)["title"], member_of(from_view)["by"]))
+    open_page(ORIGIN + recorded["url"], ORCHESTRATOR)
+    check("...and opened by an agent at the hub's own address, it widens nothing served", 403,
+          request("GET", "/f" + urllib.parse.quote(str(page(HOME / "private.html"))))[0])
+    check("a ticket with no range recorded has no diff to render", 404,
+          request("GET", "/diff?" + urllib.parse.urlencode({"tracker": str(agent / "tickets"), "ticket": "drop-zone"}))[0])
+    ticket(agent, "drop-zone")
+    with (agent / "tickets/drop-zone.md").open("r+") as f:
+        text = f.read().replace("size: S\n", f"size: S\ndiff:\n  - agent@{agent_range}\n")
+        f.seek(0)
+        f.write(text)
+    check("a ticket recording only agent ranges lists no diff", [],
+          [x for g in view(later["container"])[1]["groups"] for x in g["artefacts"] if x["ticket"] == "drop-zone" and x["kind"] == "diff"])
+    check("...and has none to render", 404,
+          request("GET", "/diff?" + urllib.parse.urlencode({"tracker": str(agent / "tickets"), "ticket": "drop-zone"}))[0])
+    review_page = page(agent / "diffviews" / "map-columns.html")
+    check("a ticket with a review page lists it as its one diff", ["review"],
+          [x["title"] for g in view(a["container"])[1]["groups"] for x in g["artefacts"]
+           if x["ticket"] == "map-columns" and x["kind"] == "diff"])
+    review_page.unlink()
+    with (agent / "tickets/map-columns.md").open("r+") as f:
+        text = f.read().replace(f"code@{commits[0]}..{commits[1]}", f"code@{commits[0]}..0123abc")
+        f.seek(0)
+        f.truncate()
+        f.write(text)
+    broken = next(x for g in view(a["container"])[1]["groups"] for x in g["artefacts"] if x["ticket"] == "map-columns" and x["kind"] == "diff")
+    status_code, said = request("GET", broken["url"])
+    check("a recorded range diffview cannot render answers why, not that none is recorded", (502, True),
+          (status_code, b"0123abc" in said))
+
+    # --- serving
+
+    status_code, health = request("GET", "/.health")
+    check("/.health says diffview pages can save", {"saves": True}, health)
+    served = member_of(a)["url"]
+    check("a member is served on the hub's origin", 200, request("GET", served)[0])
+    check("a request for another Host is refused", 403, request("GET", served, headers={"Host": "attacker.example:80"})[0])
+    secret = page(HOME / ".ssh" / "id_ed25519", "not a page")
+    check("a file no agent opened, outside every agent directory, is not served", 403,
+          request("GET", "/f" + urllib.parse.quote(str(secret)))[0])
+    check("...and a page in the view cannot open it to have it served", 403,
+          request("POST", "/api/open", {"container": a["container"], "target": str(secret)}, {"Origin": ORIGIN})[0])
+    check("...nor open a directory to widen what is served", (403, 403),
+          (request("POST", "/api/open", {"container": a["container"], "target": str(note.parent)}, {"Origin": ORIGIN})[0],
+           request("GET", "/f" + urllib.parse.quote(str(page(HOME / "beside-notes.html"))))[0]))
+    check("a write for another Host is refused", 403,
+          request("POST", "/api/open", {"target": str(note)}, {"Host": "attacker.example:80", "Origin": ORIGIN})[0])
+    shown = page(HOME / "work" / "out" / "report" / "index.html")
+    page(HOME / "work" / "out" / "secret.txt", "secret")
+    open_page(shown.parent, ORCHESTRATOR, cwd=str(alpha))
+    check("a directory an agent opens is served, and nothing beside it", (200, 403),
+          (request("GET", "/f" + urllib.parse.quote(str(shown)))[0],
+           request("GET", "/f" + urllib.parse.quote(str(HOME / "work" / "out" / "secret.txt")))[0]))
+    check("a file git tracks in the repo around an agent directory is served", 200,
+          request("GET", "/f" + urllib.parse.quote(str(alpha / "README.md")))[0])
+    check("...an untracked one is not", 403, request("GET", "/f" + urllib.parse.quote(str(page(alpha / ".env", "KEY=1"))))[0])
+    request("POST", "/api/open", {"container": a["container"], "target": str(alpha / "README.md"), "group": ORCHESTRATOR, "by": "user"},
+            {"Origin": ORIGIN})
+    check("...not even once the view opened a tracked file beside it", 403, request("GET", "/f" + urllib.parse.quote(str(alpha / ".env")))[0])
+    page(alpha / "site" / "style.css", "p {}")
+    git(alpha, "add", "site/style.css")
+    git(alpha, "commit", "-q", "-m", "site")
+    page(alpha / "site" / "index.html")
+    check("...nor an untracked page reached through a directory git tracks files in", 403,
+          request("GET", "/f" + urllib.parse.quote(str(alpha / "site")) + "/")[0])
+    check("an open from another origin is refused", 403,
+          request("POST", "/api/open", {"target": str(note)}, {"Origin": "http://attacker.example"})[0])
+    diff_url = member_of(open_page(code_diff, ORCHESTRATOR))["url"]
+    state = {"writer": "t", "savedAt": 1, "comments": []}
+    check("a diffview page saves its comments through the hub", 204,
+          request("POST", diff_url + ".state.json", state, {"Origin": ORIGIN})[0])
+    check("...beside the page", state, json.loads(Path(f"{code_diff}.state.json").read_text()))
+    check("a state write from another origin is refused", 403,
+          request("POST", diff_url + ".state.json", state, {"Origin": "http://attacker.example"})[0])
+    check("a page no diffview watches asking for a new summary is told none runs", 409,
+          request("POST", diff_url + ".summary.json", {}, {"Origin": ORIGIN})[0])
+    watch_record = Path(f"{code_diff}.watch.json")
+    for garbage in ("not json", "[1]"):
+        watch_record.write_text(garbage)
+        check(f"a watch record that is no record ({garbage}) reads as none", (200, None), request("GET", diff_url + ".watch.json"))
+    check("...and keeps its page in the container", True, any(m["url"] == diff_url for m in view(a["container"])[1]["members"]))
+    watch_record.unlink()
+    unserved = page(HOME / "unserved" / "watched.html")
+    with open(f"{unserved}.watch.json", "w") as record:
+        record.write(json.dumps({"g": 1, "watches": []}))
+        record.flush()
+        fcntl.flock(record, fcntl.LOCK_EX)  # held, as a live watcher holds its record
+        check("a page the hub does not serve cannot ask its watcher for a summary", 403,
+              request("POST", "/f" + urllib.parse.quote(str(unserved)) + ".summary.json", {}, {"Origin": ORIGIN})[0])
+    check("...so nothing asked it", False, Path(f"{unserved}.summary.request.json").exists())
+    check("a route the hub does not have is not found, with a body or none", (404, 404),
+          (request("POST", "/api/nothing", {})[0], request("POST", "/api/nothing")[0]))
+    bare = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    bare.sendall(b"GET /.health HTTP/1.0\r\n\r\n")
+    check("a request that names no Host is refused", b"HTTP/1.0 403", bare.recv(4096)[:12])
+    bare.close()
+    check("an open that names no target is a bad request", 400, request("POST", "/api/open", {"session": WORKER})[0])
+
+    # --- trellis, served from a cache that is checked on every use
+
+    trellis_cache = HOME / ".cache/container-hub" / ("trellis-" + re.search(r'TRELLIS_VERSION = "(.+)"', (BIN / "container-hub").read_text())[1])
+    trellis_cache.mkdir(parents=True, exist_ok=True)
+    (trellis_cache / "style.css").write_text("body { background: url(https://attacker.example/x) }")
+    status_code, body = request("GET", "/static/trellis/style.css")
+    check("a cached trellis file that differs from its pin is refused", 502, status_code)
+    check("...naming the file", True, b"style.css does not match its pinned sha256" in body)
+    check("...on the hub's stderr too", True, "style.css does not match its pinned sha256" in (SCRATCH / "hub.log").read_text())
+    check("...and left in place rather than fetched over", "body { background: url(https://attacker.example/x) }",
+          (trellis_cache / "style.css").read_text())
+    (trellis_cache / "style.css").unlink()
+
+    # --- what diffview hands the hub: a directory of pages, or a page, served without joining a container
+
+    rendered = page(SCRATCH / "rendered pages" / "nested" / "review.html")  # a space, which a url spells encoded
+    status_code, shared = request("POST", "/api/serve", {"path": str(rendered.parents[1])})
+    check("a local tool shares a directory and gets its address", (200, "/f" + urllib.parse.quote(str(rendered.parents[1])) + "/"),
+          (status_code, shared.get("url")))
+    check("...under which every page is served", 200, request("GET", shared["url"] + "nested/review.html")[0])
+    listed = request("GET", shared["url"])[1]
+    check("...and the directory's address lists them, linked relative to it", True, b'href="nested/review.html"' in listed)
+    bare = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    bare.request("GET", shared["url"].rstrip("/"))
+    moved = bare.getresponse()
+    check("...an address without the trailing slash is sent to the one with it", (301, shared["url"]),
+          (moved.status, moved.getheader("Location")))
+    bare.close()
+    check("a shared directory joins no container", 404, view("loose")[0])
+    check("a directory nobody shared is not listed", 404, request("GET", "/f" + urllib.parse.quote(str(agent / "tickets")) + "/")[0])
+    check("a page in the view cannot share", 403,
+          request("POST", "/api/serve", {"path": str(secret.parent)}, {"Origin": ORIGIN})[0])
+    check("...nor can another site", 403,
+          request("POST", "/api/serve", {"path": str(secret.parent)}, {"Origin": "http://attacker.example"})[0])
+    check("a path that does not exist is not shared", 404, request("POST", "/api/serve", {"path": str(SCRATCH / "nowhere.html")})[0])
+    check("a directory holding all of home, or home itself, is never shared", (403, 403),
+          (request("POST", "/api/serve", {"path": str(HOME.parent)})[0], request("POST", "/api/serve", {"path": str(HOME)})[0]))
+    alone = page(HOME / "alone.html")
+    status_code, shared_page = request("POST", "/api/serve", {"path": str(alone)})
+    check("a page in home is shared on its own", (200, 200), (status_code, request("GET", shared_page["url"])[0]))
+    request("POST", "/api/serve", {"path": str(alone)})
+    check("...and kept in the list of what is shared once, shared twice", 1,
+          json.loads((SCRATCH / "state/served.json").read_text()).count(str(alone)))
+    check("...and saves beside itself", (204, state),
+          (request("POST", shared_page["url"] + ".state.json", state, {"Origin": ORIGIN})[0],
+           json.loads(Path(f"{alone}.state.json").read_text())))
+    check("...while the rest of home stays unserved", 403, request("GET", "/f" + urllib.parse.quote(str(HOME / "beside-notes.html")))[0])
+    in_temp = page(TEMP_PAGE)
+    beside_temp = page(TEMP_PAGE.with_name(TEMP_PAGE.stem + "-beside.html"))
+    serving = subprocess.run([BIN / "diffview", "--serve", str(in_temp)], env={**ENV, "CONTAINER_HUB_PORT": str(PORT)},
+                             capture_output=True, text=True, timeout=120)
+    temp_url = serving.stdout.split(" at ")[-1].strip()
+    check("diffview --serve takes a page sitting directly in the temp dir", (0, 200),
+          (serving.returncode, request("GET", temp_url.removeprefix(ORIGIN))[0] if temp_url.startswith(ORIGIN) else None))
+    check("...and the rest of the temp dir stays unserved", 403, request("GET", "/f" + urllib.parse.quote(str(beside_temp)))[0])
+    check("...as the temp dir is never shared whole", 403, request("POST", "/api/serve", {"path": str(TEMP)})[0])
+
+    # --- what leaves
+
+    gone = page(alpha / "agent/prototypes/csv-import/index.html")
+    gone_id = open_page(gone, ORCHESTRATOR)["id"]
+    gone.unlink()
+    check("a member whose file is deleted leaves its container", False,
+          any(m["id"] == gone_id for m in view(a["container"])[1]["members"]))
+    index = request("GET", "/")[1].decode()
+    check("the index lists every container", True, all(f'"/c/{in_view(x)}"' in index for x in (a, b, elsewhere)))
+    check("...the one opened into last first", True, index.index(f'"/c/{in_view(a)}"') < index.index(f'"/c/{in_view(b)}"'))
+    (beta / "agent/tickets/map-columns.md").unlink()
+    check("a container whose tree left the tracker is gone", 404, view(b["container"])[0])
+    check("...and left the index", False, f'"/c/{in_view(b)}"' in request("GET", "/")[1].decode())
+    delta = repo("delta", [("lone", None, STRANGER)])
+    epsilon = repo("epsilon", [("solo", None, STRANGER)])
+    d = open_page(page(delta / "agent/show/lone/index.html"), STRANGER)
+    e = open_page(page(epsilon / "agent/show/solo/index.html"), STRANGER)
+    zeta = repo("zeta", [("whole", None, STRANGER)])
+    z = open_page(page(zeta / "agent/show/whole/index.html"), STRANGER)
+    (zeta / "agent/tickets/half-written.md").write_text("no frontmatter yet\n")  # `tracker data` refuses the whole tracker
+    check("a container whose tracker refuses its tickets for now is still there", (200, [z["id"]]),
+          (lambda r: (r[0], [m["id"] for m in r[1].get("members", [])]))(view(z["container"])))
+    shutil.rmtree(delta / "agent" / "tickets")
+    shutil.rmtree(epsilon)
+    check("a container whose tracker is gone is gone, its pages still there or not", (404, 404),
+          (view(d["container"])[0], view(e["container"])[0]))
+    check("...and left the index", (200, False, False),
+          (lambda r: (r[0], f'"/c/{in_view(d)}"' in r[1].decode(), f'"/c/{in_view(e)}"' in r[1].decode()))(request("GET", "/")))
+
+    # --- claude-browser with a hub
+
+    stubs = SCRATCH / "stubs"
+    stubs.mkdir()
+    record = SCRATCH / "browser"
+    (stubs / "brave").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {record}\n')
+    (stubs / "systemd-run").write_text('#!/bin/sh\nwhile [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n')
+    for s in stubs.iterdir():
+        s.chmod(0o755)
+    local_state = HOME / ".config/BraveSoftware/Brave-Browser/Local State"
+    local_state.parent.mkdir(parents=True)
+    local_state.write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Personal"}}}}))
+
+    def browse(*args: str, cwd: Path = gamma, port: int = PORT, **sessions: str) -> list[str]:
+        """What claude-browser handed the browser; what it said on the way is in browse.said."""
+        record.unlink(missing_ok=True)
+        browse.said = subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=True, capture_output=True, timeout=30, text=True,
+                                     env={**ENV, "CONTAINER_HUB_PORT": str(port), "CLAUDE_CODE_SESSION_ID": WORKER, **sessions,
+                                          "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
+        deadline = time.monotonic() + 5
+        while not record.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return record.read_text().splitlines() if record.exists() else []
+
+    fresh = page(gamma / "agent/show/one-flow/figure.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
+    opened = browse("agent/show/one-flow/figure.svg")
+    launching = browse.said
+    g = open_page(fresh, WORKER)
+    check("with no view showing, claude-browser opens the container's view at the page", ["--profile-directory=Default", f"{ORIGIN}/c/{in_view(g)}#{g['id']}"],
+          opened)
+    check("...and says the page is in its container, on one line", (True, 1),
+          (launching.startswith(f"claude-browser: in container {g['container']}"), launching.count("\n")))
+    check("...and the page is a member", True, any(m["path"] == str(fresh) for m in view(g["container"])[1]["members"]))
+    check("a second page in the same container moments later opens no second view", [],
+          browse(str(page(gamma / "agent/show/one-flow/index.html"))))
+    events = urllib.request.urlopen(f"{ORIGIN}/events/{in_view(g)}", timeout=10)
+    events.readline()
+    check("with a view showing, claude-browser starts no browser", [], browse(str(fresh)))
+    shown = open_page(fresh, WORKER)
+    check("...and prints the line the hub gave it", f"claude-browser: {shown['say']}\n", browse.said)
+    events.close()
+    check("a worker's report starts no browser either", [], browse(str(report)))
+    check("...and claude-browser prints why, as the hub put it", f"claude-browser: {skipped['say']}\n", browse.said)
+    by_origin = page(gamma / "agent/show/one-flow/origin.html")
+    browse(str(by_origin), MX_ORIGIN_SESSION=ORCHESTRATOR)
+    check("a page goes to the group of the session in MX_ORIGIN_SESSION, over the process's own",
+          ORCHESTRATOR, next(m["group"] for m in view(g["container"])[1]["members"] if m["path"] == str(by_origin)))
+    browse("--container", "picked", str(by_origin))
+    check("claude-browser --container puts the page there", 200, view("picked")[0])
+    unprofiled = subprocess.run([BIN / "claude-browser", "--container", "unprofiled", str(by_origin)], cwd=gamma, capture_output=True,
+                                timeout=30, text=True, env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CONFIG_DIR": str(HOME / ".claude-nobody"),
+                                                            "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+    check("a view that has no Brave profile to open in is not said to open: only why not", (1, False, True),
+          (unprofiled.returncode, "in container" in unprofiled.stderr, "no profile named 'nobody'" in unprofiled.stderr))
+    check("the hub's own pages open as tabs, not members", [ORIGIN + "/"], browse(ORIGIN + "/")[1:])
+    check("...a container's view among them, without a word", ([f"{ORIGIN}/c/picked"], ""), (browse(f"{ORIGIN}/c/picked")[1:], browse.said))
+    check("claude-browser with no page opens a blank tab, without a word", (["about:blank"], ""), (browse()[1:], browse.said))
+    check("...so no container holds them", 404, view("loose")[0])
+    check("a page on another site opens as a plain tab", ["--profile-directory=Default", "https://example.com/docs#part"],
+          browse("https://example.com/docs#part"))
+    check("...as the hub asked, not as a page it refused", (True, False), ("opens as a browser tab" in browse.said, "refused" in browse.said))
+    check("...and joins no container", True, "tab" in open_page("https://example.com/docs", WORKER))
+    check("...the hub answering that URL as given for its caller to open", "https://example.com/docs?a=b#part",
+          open_page("https://example.com/docs?a=b#part", WORKER)["open"])
+    check("...nor does a link to one clicked in the view", True,
+          "tab" in request("POST", "/api/open", {"container": g["container"], "target": "https://example.com/x"}, {"Origin": ORIGIN})[1])
+    missing = "agent/show/one-flow/never-written.html"
+    check("a page the hub refuses opens as a plain tab", ["--profile-directory=Default", missing], browse(missing))
+    check("...and claude-browser says why", True, "refused the page (404" in browse.said and "does not exist" in browse.said)
+
+    class NotAHub(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<!doctype html><p>some other service")
+
+        def log_message(self, *_):
+            pass
+
+    other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NotAHub)
+    threading.Thread(target=other.serve_forever, daemon=True).start()
+    check("a service on the hub's port that answers 200 but is no hub: a plain tab", ["--profile-directory=Default", f"file://{fresh}"],
+          browse(str(fresh), port=other.server_address[1]))
+    check("...and claude-browser says so", True, "no container hub" in browse.said)
+    other.shutdown()
+    loose = open_page(page(HOME / "notes" / "unclaimed.html"))
+    check("a page no session opened, under no ticket, lands with the loose pages", ("loose", "loose"),
+          (loose["container"], member_of(loose)["group"]))
+    check("...in a group of that name, with no session to resume", ("loose pages", ""),
+          (lambda g: (g["name"], g["resume"]))(view("loose")[1]["groups"][0]))
+
+    closing = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    closing.request("GET", "/events/closing")
+    stream = closing.getresponse()
+    stream.readline(), stream.readline()
+    showing = open_page(fresh, WORKER, container="closing")
+    check("with its view showing, a page opened into a container launches none, and gives its caller nothing to open",
+          (False, None), (showing["launch"], showing["open"]))
+    stream.readline(), stream.readline()  # read to the end, as a tab does: it closes then with a FIN, never a reset
+    stream.close()
+    closing.close()
+    time.sleep(2)  # the hub looks for a closed view once a second
+    closed = open_page(fresh, WORKER, container="closing")
+    check("...and once that view closes, the next open launches one, at the member", (True, f"{ORIGIN}/c/closing#{closed['id']}"),
+          (closed["launch"], closed["open"]))
+    check("...saying something else than an open into a showing view", True, closed["say"] != showing["say"])
+    killed = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    killed.sendall(f"GET /events/resetting HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n\r\n".encode())
+    killed.recv(4096)
+    check("a view whose browser is killed launches none while it shows", False, open_page(fresh, WORKER, container="resetting")["launch"])
+    killed.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    killed.close()  # with what the hub sent it unread, which closes with a reset
+    time.sleep(2)
+    check("...and once it is gone, the next open launches one", True, open_page(fresh, WORKER, container="resetting")["launch"])
+
+    # --- a watched diffview: in the group of the session that started it, while its worktree exists
+
+    worktree = HOME / "repos" / "alpha-csv-import"
+    git(alpha, "worktree", "add", "-q", "-b", "csv-import", str(worktree))
+    (worktree / "notes.txt").write_text("one\ntwo\n")
+    watcher = subprocess.Popen([BIN / "diffview", f"{worktree}@HEAD..", "--watch", "--open", "--no-auto-summary"],
+                               cwd=alpha, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                               env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
+                                    "DIFFVIEW_BROWSER": "claude-browser", "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+    try:
+        said = []
+        while (line := watcher.stdout.readline()) and "watching" not in line:
+            said.append(line)
+        live = line.split("live page at ")[-1].split()[0] if "live page at " in line else line
+        check("--watch prints the hub's address of its page", True, live.startswith(f"{ORIGIN}/f/"))
+        check("...and its watcher listens on no port", [], listening_ports(watcher.pid))
+        watched = Path(urllib.parse.unquote(urllib.parse.urlsplit(live).path.removeprefix("/f")))
+        home_of = open_page(note, ORCHESTRATOR, cwd=str(alpha))["container"]   # where that session's pages go
+        member = lambda: next((m for m in view(home_of)[1].get("members", []) if m["path"] == str(watched)), None)
+        deadline = time.monotonic() + 30
+        while not member() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        check("--watch --open puts the page in the group of the session that started it", ORCHESTRATOR, (member() or {}).get("group"))
+        check("the hub says its watcher runs", True, member() and request("GET", member()["url"] + ".watch.json")[1].get("alive"))
+        record = "/f" + urllib.parse.quote(str(watched)) + ".watch.json"
+        git(alpha, "worktree", "remove", "--force", str(worktree))
+        check("the watcher stops once its worktree is removed", 0, watcher.wait(timeout=30))
+        check("...and the hub says it stopped for good", (False, True),
+              (request("GET", record)[1].get("alive"), request("GET", record)[1].get("gone")))
+        check("...and the page leaves its container", None, member())
+        check("...though its file stays", True, watched.is_file())
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(watcher.pid, signal.SIGKILL)   # `uv run` leads the group; the watcher is its child
+        watcher.wait()
+    # --- a damaged state file
+
+    def restart() -> subprocess.Popen:
+        os.killpg(hub.pid, signal.SIGKILL)
+        hub.wait()
+        # `uv run` leads the group and is reaped first; the server holds the port until it is gone too
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(hub.pid, 0)
+                time.sleep(0.05)
+            except ProcessLookupError:
+                break
+        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(SCRATCH / "state")],
+                                   env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("a"), start_new_session=True)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and started.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", PORT), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        return started
+
+    (SCRATCH / "state/containers/damaged.json").write_text("{not json")
+    UNREADABLE = os.geteuid() != 0  # mode 0 stops no read by root
+    if UNREADABLE:
+        unreadable = SCRATCH / "state/containers/unreadable.json"
+        unreadable.write_text('{"key": "unreadable", "members": []}\n')
+        unreadable.chmod(0)  # read, it raises; nothing can tell what it holds
+    fleeting = page(HOME / "fleeting.html")
+    request("POST", "/api/serve", {"path": str(fleeting)})
+    fleeting.unlink()
+    hub = restart()
+    check("a shared page deleted before a restart leaves the list of what is shared", False,
+          str(fleeting) in json.loads((SCRATCH / "state/served.json").read_text()))
+    check("a damaged state file does not keep the hub from starting", (None, 200), (hub.poll(), request("GET", "/")[0]))
+    check("...and the containers beside it are still there", 200, view(a["container"])[0])
+    check("...and it is moved aside, not left for the next save to overwrite", (False, 1),
+          ((SCRATCH / "state/containers/damaged.json").exists(), len(list((SCRATCH / "state/containers").glob("damaged.json.unreadable-*")))))
+    check("a page an agent opened outside every agent directory is served after a restart", 200,
+          request("GET", "/f" + urllib.parse.quote(str(note)))[0])
+    if UNREADABLE:
+        check("the index still lists the rest beside a state file it cannot read", True,
+              f'"/c/{in_view(a)}"' in request("GET", "/")[1].decode())
+        check("...and a page opened into its container is refused, not written over it", 500,
+              request("POST", "/api/open", {"target": str(note), "container": "unreadable"})[0])
+        unreadable.chmod(0o644)
+        check("...which is as it was", '{"key": "unreadable", "members": []}\n', unreadable.read_text())
+    check("what was shared before the restart is served after it", (200, 200),
+          (request("GET", shared["url"] + "nested/review.html")[0], request("GET", shared_page["url"])[0]))
+    served_list = SCRATCH / "state/served.json"
+    if UNREADABLE:
+        listed = served_list.read_text()
+        served_list.chmod(0)
+        hub = restart()
+        check("an unreadable list of shared pages does not keep the hub from starting", (None, 200), (hub.poll(), request("GET", "/")[0]))
+        check("...and sharing is refused rather than written over it, asked twice", [500, 500],
+              [request("POST", "/api/serve", {"path": str(alone)})[0] for _ in range(2)])
+        check("...nor served", 403, request("GET", shared_page["url"])[0])
+        served_list.chmod(0o644)
+        check("...which is as it was", listed, served_list.read_text())
+    else:
+        print("skip: the unreadable-file checks, since root reads a file of mode 0")
+
+    # --- a hub as its user service runs it: no tracker on PATH, the mx plugin's under HOME; and here no diffview beside it
+
+    lone_bin = SCRATCH / "lone-bin"
+    lone_bin.mkdir()
+    for name in ("container-hub", "container-hub.html"):
+        shutil.copy2(BIN / name, lone_bin / name)
+    service_home = SCRATCH / "service-home"
+    cache = service_home / ".claude/plugins/cache/market/mx"
+    for version, script in (("1.0.9", "#!/bin/sh\nexit 1\n"), ("1.0.10", f'#!/bin/sh\nexec {shutil.which("tracker", path=ENV["PATH"])} "$@"\n')):
+        (cache / version / "skills/tracker").mkdir(parents=True)
+        (cache / version / "skills/tracker/tracker.py").write_text(script)
+        (cache / version / "skills/tracker/tracker.py").chmod(0o755)
+    service_port = free_port()
+    service_hub = subprocess.Popen(
+        [lone_bin / "container-hub", "--port", str(service_port), "--state", str(SCRATCH / "service-state")],
+        env={**ENV, "HOME": str(service_home), "PATH": ":".join(d for d in ENV["PATH"].split(":") if not (Path(d) / "tracker").exists())},
+        stdout=subprocess.DEVNULL, stderr=(SCRATCH / "service-hub.log").open("w"), start_new_session=True)
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and service_hub.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", service_port), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        check("the hub as its service runs it starts", None, service_hub.poll())
+        service = lambda *args: request(*args, origin=f"http://127.0.0.1:{service_port}")
+        check("with no tracker on PATH, the hub reads the tracker of the newest mx plugin", a["container"],
+              service("POST", "/api/open", {"target": str(alpha / "agent/show/csv-import/index.html"), "session": WORKER})[1].get("container"))
+        check("a hub with no diffview beside it says its pages cannot save", (200, {"saves": False}), service("GET", "/.health"))
+        check("...and refuses a save, as no route it has", 404,
+              service("POST", "/f" + urllib.parse.quote(str(code_diff)) + ".state.json", {}, {"Origin": f"http://127.0.0.1:{service_port}"})[0])
+    finally:
+        os.killpg(service_hub.pid, signal.SIGKILL)
+        service_hub.wait()
+finally:
+    os.killpg(hub.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
+    hub.wait()
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+
+print()
+print("FAILED" if failures else "all ok")
+sys.exit(1 if failures else 0)

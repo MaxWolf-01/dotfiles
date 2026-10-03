@@ -13,8 +13,10 @@ let
     bash coreutils yt-dlp openssh
   ]);
 
+  # uv runs lifelog for the collectors' last runs jarvis-sync ships; jq because
+  # bin/run-log builds its line with it.
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh
+    bash coreutils rsync openssh uv jq
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
@@ -45,15 +47,22 @@ let
     bash coreutils uv openssh jq
   ]);
 
-  # The activity board shells out to git in every checkout it finds, and finds
-  # them with fd.
-  activityPath = lib.makeBinPath (with pkgs; [
+  # The commits collector shells out to git in every checkout it finds, and
+  # finds them with fd.
+  gitCommitsPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv jq git fd
   ]);
 
   # sops for the Bridge password, jq for bin/run-log.
   mailPath = lib.makeBinPath (with pkgs; [
     bash coreutils isync notmuch sops jq
+  ]);
+
+  # bin/officebuddy-invoice is a uv script reading the mail with notmuch and the
+  # PDF with pdftotext; bin/alert-send sends with curl, its token from sops, and
+  # sed escapes the HTML body; jq for bin/run-log.
+  invoicePath = lib.makeBinPath (with pkgs; [
+    bash coreutils gnused uv notmuch poppler-utils curl sops jq
   ]);
 
   sshAuthSock = "/run/user/1000/ssh-agent";
@@ -294,7 +303,7 @@ in
     Service = {
       Type = "oneshot";
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/bin:/bin" ];
-      ExecStart = "${secrets}/scripts/browsing-archive";
+      ExecStart = "${secrets}/scripts/browsing-archive --record";
     };
   };
 
@@ -302,6 +311,60 @@ in
     Unit.Description = "Browsing archive collection (every 30 min)";
     Timer = {
       OnCalendar = "*:00/30";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Brave history → its own archive, before Brave expires it (90 days) ---
+
+  systemd.user.services.brave-archive = {
+    Unit.Description = "Append new Brave visits to the Brave archive";
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${uvScriptPath}" ];
+      ExecStart = "${secrets}/scripts/brave-archive --record";
+      # oneshot has no start timeout of its own; a hung run would leave every later
+      # firing a silent no-op.
+      TimeoutStartSec = "10min";
+    };
+  };
+
+  systemd.user.timers.brave-archive = {
+    Unit.Description = "Brave archive collection (hourly)";
+    Timer = {
+      # Twenty to: the other hourly uv jobs have the hour, ten and twenty past and
+      # quarter to, and each resolves a uv environment on a laptop that has just
+      # woken up.
+      OnCalendar = "*:40:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Commits from local git history → the lifelog record ---
+
+  systemd.user.services.git-commits-collect = {
+    Unit.Description = "Record max's new commits from every local checkout";
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${gitCommitsPath}" ];
+      ExecStart = "${secrets}/scripts/git-commits-collect --record";
+      # A first or --full run reads every history, about a minute.
+      TimeoutStartSec = "10min";
+      # Nothing waits on the record within the hour, and it competes with
+      # whatever max is doing.
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.git-commits-collect = {
+    Unit.Description = "Commits collection (hourly)";
+    Timer = {
+      # Quarter to: the backups dashboard has the hour and brave-archive twenty to,
+      # and each resolves a uv environment on a laptop that has just woken up.
+      OnCalendar = "*:45:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
@@ -327,7 +390,7 @@ in
 
   # --- YouTube watch history → browsing archive ---
 
-  systemd.user.services.yt-watch = {
+  systemd.user.services.yt-watch-collect = {
     Unit = {
       Description = "Append YouTube watch history to the browsing archive";
       After = [ "network-online.target" ];
@@ -336,11 +399,11 @@ in
     Service = {
       Type = "oneshot";
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/bin:/bin" ];
-      ExecStart = "${secrets}/scripts/yt-watch-collect";
+      ExecStart = "${secrets}/scripts/yt-watch-collect --record";
     };
   };
 
-  systemd.user.timers.yt-watch = {
+  systemd.user.timers.yt-watch-collect = {
     Unit.Description = "Daily YouTube watch history collection";
     Timer = {
       OnCalendar = "*-*-* 12:30:00";
@@ -411,6 +474,36 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Officebuddy invoices → a scan-to-pay mail each ---
+  # Reads the mirror's copy (above); what it mails and when: bin/officebuddy-invoice.
+  # Daily is plenty against a 14-day payment term.
+
+  systemd.user.services.officebuddy-invoice = {
+    Unit = {
+      Description = "Mail a scan-to-pay QR code for each new Officebuddy invoice";
+      After = [ "proton-mail-mirror.service" "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${invoicePath}:/usr/bin:/bin" ];
+      ExecStart = "${dotfiles}/bin/officebuddy-invoice";
+      # oneshot has no start timeout of its own; a hung run would make every
+      # later firing a silent no-op.
+      TimeoutStartSec = "15m";
+    };
+  };
+
+  systemd.user.timers.officebuddy-invoice = {
+    Unit.Description = "Daily Officebuddy invoice check";
+    Timer = {
+      OnCalendar = "*-*-* 10:20:00";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Slack → ~/work/helferline/slack ---
   # The local copy of the helferline workspace; why it exists is in
   # bin/slack-archive. Noon, when the laptop is usually up, so Persistent rarely
@@ -456,7 +549,7 @@ in
         "PATH=${syncPath}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${secrets}/scripts/jarvis-sync";
+      ExecStart = "${secrets}/scripts/jarvis-sync --record";
     };
   };
 
@@ -599,16 +692,15 @@ in
   };
 
   # The odd one out: it reports on no job, only on when this machine was in use.
-  # It re-reads every source in full — a year of wakatime heartbeats, every git
-  # checkout under ~/repos — for about ten seconds of CPU, so it runs once a day
+  # It re-reads lifelog's views over every source in full, so it runs once a day
   # rather than hourly. The page is a record of years; the last hour of it is not
   # what anyone opens it for, and `systemctl --user start` covers wanting today.
 
   systemd.user.services.dashboard-activity = {
-    Unit.Description = "Rebuild the activity dashboard from this machine's own traces";
+    Unit.Description = "Rebuild the activity dashboard from lifelog's views";
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${activityPath}" ];
+      Environment = [ "PATH=${uvScriptPath}" ];
       ExecStart = "${secrets}/scripts/dashboard-activity --record";
       TimeoutStartSec = "10min";
       # Nothing waits on this page, and it competes with whatever max is doing.
