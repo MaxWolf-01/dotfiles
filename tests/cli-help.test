@@ -1,0 +1,227 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Check that every executable in bin/ answers -h and --help without doing anything.
+
+An answer exits 0 and prints a line starting with "usage:" (any case) on stdout. Doing
+anything is any of: a file appearing in the scratch HOME, working directory or TMPDIR;
+a call to a stubbed command; reading stdin; running past the timeout. A file appearing in
+the repo fails the run too, without naming the script, since the scripts run in parallel.
+
+Each script runs with nothing real in reach, since the scripts this exists to catch are
+the ones that ignore --help and do their work:
+
+- no network: a network namespace of its own (unshare -n). The uid is kept, so a script
+  that re-runs itself under sudo when it is not root still tries to.
+- a scratch HOME, working directory, TMPDIR and XDG_RUNTIME_DIR, all empty
+- stubs first on PATH for every bin/ script and every command that acts outward (STUBS
+  below). A stub records the call and fails.
+- stdin a pipe nothing is written to, so a prompt waits until the timeout instead of
+  reading an answer; no controlling terminal, so /dev/tty cannot be opened either
+- no display, D-Bus session or tmux server
+
+Scripts reached by absolute path, and unix sockets (tailscaled's, the system bus), stay
+reachable; the stubs cover the clients that talk to them.
+
+uv resolves each uv script's dependencies first, with the network and without running
+the script, so the runs themselves work offline from the uv cache.
+
+The fixtures in tests/fixtures/cli-help break the rule one way each, and every one has
+to be caught, so a check that stopped seeing its kind of side effect fails here too.
+Needs unprivileged user namespaces; where the kernel refuses them, it exits 2 before
+running anything.
+
+Examples:
+
+    tests/cli-help.test
+    tests/cli-help.test --only vault-sync pw-strength
+"""
+
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from functools import cache
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import tyro
+
+REPO = Path(__file__).resolve().parents[1]
+BIN = REPO / "bin"
+FIXTURES = REPO / "tests" / "fixtures" / "cli-help"
+TIMEOUT = 30
+
+STUBS = """
+    curl wget ssh scp sftp rsync rclone restic nc socat mbsync notmuch gh wrangler yt-dlp
+    sudo doas su pkexec adduser usermod useradd visudo
+    systemctl systemd-run systemd-inhibit loginctl busctl gdbus dbus-send gsettings dconf
+    shutdown reboot rtcwake mount umount
+    tailscale mullvad nmcli resolvectl ip bluetoothctl
+    git sops claude docker podman nix nixos-rebuild home-manager tmux
+    notify-send mail sendmail msmtp
+    xdg-open gio open firefox chromium chromium-browser google-chrome brave brave-browser
+    wl-copy xclip xsel vim nvim
+""".split()
+
+USAGE = re.compile(r"^\s*usage:", re.IGNORECASE | re.MULTILINE)
+UV_LOCK = re.compile(r"uv-[0-9a-f]+\.lock")
+
+# What each fixture does instead of answering, and the words its failure has to contain.
+FIXTURE_FAILURES = {
+    "exits-nonzero": "exited 1",
+    "no-usage": "no usage line",
+    "prompts": "timed out",
+    "uploads": "called curl",
+    "writes": "wrote home/",
+}
+
+
+@dataclass
+class Args:
+    only: list[str] = field(default_factory=list)
+    """Check only these bin/ scripts, by name. The fixtures are always checked."""
+
+
+def main(args: Args) -> int:
+    if subprocess.run(["unshare", "-n", "--map-current-user", "true"], capture_output=True).returncode != 0:
+        print("cli-help.test: unshare -n refused; this kernel gives no unprivileged user namespaces,"
+              " and without one the scripts would run with the network", file=sys.stderr)
+        return 2
+    scripts = [p for p in sorted(BIN.iterdir()) if p.is_file() and os.access(p, os.X_OK)]
+    if args.only:
+        unknown = set(args.only) - {p.name for p in scripts}
+        if unknown:
+            print(f"cli-help.test: not executables in bin/: {' '.join(sorted(unknown))}", file=sys.stderr)
+            return 2
+        scripts = [p for p in scripts if p.name in args.only]
+
+    with tempfile.TemporaryDirectory(prefix="cli-help-") as tmp:
+        root = Path(tmp)
+        stubs = make_stubs(root / "stubs", [p.name for p in BIN.iterdir()] + STUBS)
+        for script in scripts:
+            prefetch(script)
+        runs = [(s, flag) for s in scripts for flag in ("-h", "--help")]
+        fixtures = sorted(FIXTURES.iterdir())
+        before = repo_state()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda r: check(root, stubs, *r), runs))
+            fixture_results = list(pool.map(lambda s: check(root, stubs, s, "--help"), fixtures))
+        written = repo_state() - before
+
+    failures = 0
+    for (script, flag), problems in zip(runs, results):
+        print(f"{'FAIL' if problems else 'ok  '} {script.name} {flag}{': ' + '; '.join(problems) if problems else ''}")
+        failures += bool(problems)
+    for fixture, problems in zip(fixtures, fixture_results):
+        expected = FIXTURE_FAILURES[fixture.name]
+        caught = any(expected in p for p in problems)
+        print(f"{'ok  ' if caught else 'FAIL'} fixture {fixture.name} is caught: {expected}"
+              f"{'' if caught else ' (got: ' + ('; '.join(problems) or 'nothing') + ')'}")
+        failures += not caught
+    for line in sorted(written):
+        print(f"FAIL a script wrote into the repo, which no check can pin on one: {line}")
+        failures += 1
+    print(f"{failures} failed" if failures else "all passed")
+    return 1 if failures else 0
+
+
+def make_stubs(directory: Path, names: list[str]) -> Path:
+    directory.mkdir()
+    for name in names:
+        stub = directory / name
+        stub.write_text(f'#!/bin/sh\necho "{name} $*" >> "$CLI_HELP_CALLS"\nexit 1\n')
+        stub.chmod(0o755)
+    return directory
+
+
+def prefetch(script: Path) -> None:
+    """Resolve a uv script's dependencies into the uv cache, without running the script."""
+    if "uv run" in script.read_text(errors="replace").split("\n", 1)[0]:
+        subprocess.run(["uv", "sync", "--quiet", "--script", str(script)], capture_output=True, timeout=600)
+
+
+def check(root: Path, stubs: Path, script: Path, flag: str) -> list[str]:
+    """What the script did on `script flag` beyond answering it; empty when it only answered."""
+    run = Path(tempfile.mkdtemp(dir=root, prefix=f"{script.name}{flag}-"))
+    scratch = {name: run / name for name in ("home", "work", "tmp", "runtime")}
+    for d in scratch.values():
+        d.mkdir()
+    scratch["runtime"].chmod(0o700)
+    calls = run / "calls"
+    calls.touch()
+    env = {
+        "PATH": f"{stubs}:{os.environ['PATH']}",
+        "HOME": str(scratch["home"]),
+        "TMPDIR": str(scratch["tmp"]),
+        "XDG_RUNTIME_DIR": str(scratch["runtime"]),
+        "TMUX_TMPDIR": str(scratch["tmp"]),
+        "USER": os.environ.get("USER", ""),
+        "LOGNAME": os.environ.get("USER", ""),
+        "LANG": "C.UTF-8",
+        "TERM": "dumb",
+        "EDITOR": "vim",
+        "CLI_HELP_CALLS": str(calls),
+        "UV_CACHE_DIR": uv_dir("cache"),
+        "UV_PYTHON_INSTALL_DIR": uv_dir("python"),
+        "UV_OFFLINE": "1",
+    }
+    stdin_read, stdin_write = os.pipe()
+    proc = subprocess.Popen(
+        ["unshare", "-n", "--map-current-user", str(script), flag],
+        cwd=scratch["work"], env=env, stdin=stdin_read, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    os.close(stdin_read)
+    problems = []
+    try:
+        out, err = proc.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        problems.append(f"timed out after {TIMEOUT}s, waiting on stdin or doing its work")
+    finally:
+        os.close(stdin_write)
+        # Whatever it left running in its session goes too.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if proc.returncode != 0 and not problems:
+        problems.append(f"exited {proc.returncode}: {last_line(err)}")
+    if not problems and not USAGE.search(out):
+        problems.append(f"no usage line on stdout: {last_line(out) or '(empty)'}")
+    problems += [f"called {line}" for line in calls.read_text().splitlines()]
+    for name, d in scratch.items():
+        written = [p.relative_to(d) for p in sorted(d.rglob("*"))]
+        # uv locks a script's environment with a file in TMPDIR before the script starts.
+        problems += [f"wrote {name}/{p}" for p in written if not (name == "tmp" and UV_LOCK.fullmatch(str(p)))]
+    shutil.rmtree(run, ignore_errors=True)
+    return problems
+
+
+def repo_state() -> set[str]:
+    """The repo's changed, untracked and ignored paths, as git status lists them."""
+    status = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", "--ignored=matching", "--untracked-files=all"],
+                            capture_output=True, text=True, check=True)
+    return set(status.stdout.splitlines())
+
+
+@cache
+def uv_dir(what: str) -> str:
+    return subprocess.run(["uv", what, "dir"], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def last_line(text: str) -> str:
+    lines = text.strip().splitlines()
+    return lines[-1][:200] if lines else ""
+
+
+if __name__ == "__main__":
+    sys.exit(main(tyro.cli(Args, description=__doc__)))
