@@ -15,6 +15,8 @@ the ones that ignore --help and do their work:
 
 - no network: a network namespace of its own (unshare -n). The uid is kept, so a script
   that re-runs itself under sudo when it is not root still tries to.
+- no other processes: a PID namespace of its own, so a kill or pkill reaches only what the
+  script started, and all of that ends with it
 - a scratch HOME, working directory, TMPDIR and XDG_RUNTIME_DIR, all empty
 - stubs first on PATH for every bin/ script and every command that acts outward (STUBS
   below). A stub records the call and fails.
@@ -23,7 +25,8 @@ the ones that ignore --help and do their work:
 - no display, D-Bus session or tmux server
 
 Scripts reached by absolute path, and unix sockets (tailscaled's, the system bus), stay
-reachable; the stubs cover the clients that talk to them.
+reachable; the stubs cover the clients that talk to them. A write to a literal path outside
+HOME and the repo (/tmp/x.lock) goes unseen.
 
 uv resolves each uv script's dependencies first, with the network and without running
 the script, so the runs themselves work offline from the uv cache.
@@ -42,7 +45,6 @@ Examples:
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -70,6 +72,9 @@ STUBS = """
     wl-copy xclip xsel vim nvim
 """.split()
 
+# The script is the PID namespace's first process, so everything it started dies with it, and
+# --kill-child takes it down with unshare.
+SANDBOX = ["unshare", "--net", "--pid", "--fork", "--kill-child", "--mount-proc", "--map-current-user"]
 USAGE = re.compile(r"^\s*usage:", re.IGNORECASE | re.MULTILINE)
 UV_LOCK = re.compile(r"uv-[0-9a-f]+\.lock")
 
@@ -90,8 +95,8 @@ class Args:
 
 
 def main(args: Args) -> int:
-    if subprocess.run(["unshare", "-n", "--map-current-user", "true"], capture_output=True).returncode != 0:
-        print("cli-help.test: unshare -n refused; this kernel gives no unprivileged user namespaces,"
+    if subprocess.run([*SANDBOX, "true"], capture_output=True).returncode != 0:
+        print("cli-help.test: unshare refused; this kernel gives no unprivileged user namespaces,"
               " and without one the scripts would run with the network", file=sys.stderr)
         return 2
     scripts = [p for p in sorted(BIN.iterdir()) if p.is_file() and os.access(p, os.X_OK)]
@@ -174,7 +179,7 @@ def check(root: Path, stubs: Path, script: Path, flag: str) -> list[str]:
     }
     stdin_read, stdin_write = os.pipe()
     proc = subprocess.Popen(
-        ["unshare", "-n", "--map-current-user", str(script), flag],
+        [*SANDBOX, str(script), flag],
         cwd=scratch["work"], env=env, stdin=stdin_read, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, start_new_session=True,
     )
@@ -183,16 +188,11 @@ def check(root: Path, stubs: Path, script: Path, flag: str) -> list[str]:
     try:
         out, err = proc.communicate(timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
+        proc.kill()
         out, err = proc.communicate()
         problems.append(f"timed out after {TIMEOUT}s, waiting on stdin or doing its work")
     finally:
         os.close(stdin_write)
-        # Whatever it left running in its session goes too.
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
     if proc.returncode != 0 and not problems:
         problems.append(f"exited {proc.returncode}: {last_line(err)}")
     if not problems and not USAGE.search(out):
