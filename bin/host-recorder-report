@@ -1,0 +1,518 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro"]
+# ///
+"""What the host recorder wrote, on this host or another: a window around a moment, or CPU per unit.
+
+With --at, the window question: which cgroups held memory, and how memory
+pressure rose, in the --minutes before that moment and the minute after it.
+Holders come from the recorder's per-minute memory rankings (YYYY-MM-DD.top.csv);
+a holder's memory is what the kernel cannot simply drop (anonymous, shared and
+swapped), in MB, and a unit below the ranking's threshold in some minute is
+missing from that minute. The (rest) row is everything no row names. Pressure
+comes from the samples every few seconds (YYYY-MM-DD.csv): the share of the
+last 10 s in which some task, or every task, stalled waiting for memory. Files
+in thermal-log's columns, the laptop's history from before the host recorder,
+give null there.
+
+Without --at, the CPU question: CPU time per unit over the last --hours,
+largest first, with what no unit accounts for. Two sources, merged: systemd's
+record of a unit's total CPU time when it stops (the journal's "Consumed ...
+CPU time" lines, system and the reading user's own), and the host recorder's
+hourly counters for units still running (YYYY-MM-DD.counters.csv).
+A unit is its name and the systemd manager that owns it: the system bus and
+each user's session bus are all dbus.service, and a name several managers use
+is listed with the manager beside it, system or user@<uid>.
+A unit that restarts, or a reboot, starts a new lifetime; each lifetime counts
+only its CPU inside the window. Units that were already running when the
+counters began count only from then. Some units are known only from their stop
+record, because the host recorder never scanned them. When such a unit's life
+began before the window, it counts the share of its CPU that falls inside the
+window, as if spent evenly over its wall-clock time. The last partial hour
+of a unit still running is not counted until the next hourly counter.
+
+systemd writes a stop record only for a run above 1 s of CPU, 64 MB of
+memory, 1 MB of disk I/O or any network traffic. A unit that stops, and whose
+runs all stay below those, has no record and is not listed: a frequent cheap
+timer counts only in the unattributed CPU. So does whatever ran in kernel
+threads, in cgroups the host recorder does not scan, and under another user's
+manager once it stopped, since only the reading user's journal is read. The
+last line gives it, from the root cgroup's counter, once the counters span the
+whole window; total_cpu_s is null until then.
+
+With --host, every file and journal is read on that host over ssh, and the
+answer is the one the reader would give there. HOST_RECORDER_SSH, when set, is
+the command run in place of ssh.
+
+JSON schema (--json), the window question; null where a reading is missing:
+
+    {"host": "str", "at": "str", "from": "str", "to": "str", "rankings": int,
+     "holders": [{"unit": "str", "manager": "str", "process": "str", "cwd": "str", "ranked": int,
+                  "first_mb": int, "last_mb": int, "peak_mb": int, "peak_at": "str",
+                  "cpu_pct_peak": int, "mem_some_avg60_peak": float, "mem_full_avg60_peak": float}],
+     "samples": [{"time": "str", "mem_avail_mb": int, "swap_used_mb": int,
+                  "mem_some_avg10": float, "mem_full_avg10": float, "load1": float}]}
+
+    "rankings" is how many rankings fall in the window, and a holder's "ranked"
+    how many of them list it; its process and cwd are those of its peak. A
+    holder's "manager" is the systemd manager that owns it, system or user@<uid>,
+    and a name several managers use is listed with the manager beside it.
+
+JSON schema (--json), the CPU question:
+
+    {"host": "str", "window_h": float, "total_cpu_s": float | null,
+     "units": [{"unit": "str", "cpu_s": float, "core_pct": float, "lifetimes": int}]}
+
+Examples:
+
+    host-recorder-report --host pc --at '2026-09-28 06:52:00'
+    host-recorder-report --host pc --at '2026-09-28 06:52:00' --json | jq '.holders[] | select(.peak_mb > 4000)'
+    host-recorder-report --at '2026-09-28 14:03:00' --minutes 30
+    host-recorder-report --hours 72 --top 40
+    host-recorder-report --no-group --json | jq '.units[] | select(.cpu_s > 60)'
+"""
+
+import csv
+import io
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Annotated, NoReturn
+
+import tyro
+
+
+@dataclass
+class Args:
+    host: Annotated[str | None, tyro.conf.arg(metavar="HOST")] = None
+    """Read the host recorder's files and journal on this host, over ssh. Default: this host."""
+    logdir: Annotated[Path | None, tyro.conf.arg(metavar="DIR")] = None
+    """The host recorder's directory on the host read. Default: /var/lib/host-recorder (where pc's system service
+    writes) if it exists there, else ~/.local/state/host-recorder."""
+    at: Annotated[str | None, tyro.conf.arg(metavar="'YYYY-MM-DD HH:MM:SS'")] = None
+    """Ask the window question about this moment, in the host's local time."""
+    minutes: float = 10
+    """With --at: how far before the moment the window starts. It ends a minute after."""
+    hours: float = 24
+    """Without --at: the CPU question's window length, ending now."""
+    top: int = 25
+    """Without --at: units to print, largest first. 0 prints all."""
+    group: bool = True
+    """Without --at: sum instances of one kind into a single line: tmux-spawn-*.scope, docker-*.scope,
+    app-*-*.scope, run-*.service."""
+    json: bool = False
+    """Emit JSON to stdout instead of a table."""
+
+
+def main(args: Args) -> None:
+    if args.at is None:
+        cpu(args)
+    else:
+        window(args)
+
+
+def fail(message: str) -> NoReturn:
+    raise SystemExit(f"host-recorder-report: {message}")
+
+
+# --- the host the files are on ---
+
+# Run on the host read, from the recorder's directory: packs whichever of the named files exist into a tar on stdout.
+FETCH = r"""
+dir=$1; shift
+if [ -z "$dir" ]; then
+    for dir in /var/lib/host-recorder "${XDG_STATE_HOME:-$HOME/.local/state}/host-recorder"; do
+        [ -d "$dir" ] && break
+    done
+fi
+if ! cd -- "$dir" 2>/dev/null; then
+    if [ -d "$dir" ]; then
+        echo "no permission to read $dir" >&2
+        [ "$dir" != /var/lib/host-recorder ] || echo "pc's host recorder files are readable by wheel only" >&2
+    else
+        echo "no host recorder directory at $dir" >&2
+    fi
+    exit 3
+fi
+n=$#
+for f; do [ -r "$f" ] && set -- "$@" "$f"; done
+shift "$n"
+[ "$#" -eq 0 ] && exit 0
+# The recorder appends to today's files while tar reads them. tar then exits 1,
+# having packed each file up to the size it had when tar began reading it.
+tar --warning=no-file-changed -cf - -- "$@"
+[ "$?" -le 1 ]
+"""
+
+
+def on_host(host: str | None, argv: list[str], stdin: str = "") -> subprocess.CompletedProcess[bytes]:
+    """Run argv on `host`, or here when there is none: the one place local and remote reads part ways."""
+    if host:
+        ssh = shlex.split(os.environ.get("HOST_RECORDER_SSH") or "ssh")
+        argv = [*ssh, "-o", "BatchMode=yes", host, shlex.join(argv)]
+    return subprocess.run(argv, input=stdin.encode(), capture_output=True, check=False)
+
+
+def read_files(host: str | None, logdir: Path | None, names: list[str]) -> dict[str, str]:
+    """The named files in the recorder's directory on `host` that exist there, by name."""
+    result = on_host(host, ["sh", "-c", FETCH, "sh", str(logdir or ""), *names])
+    if result.returncode:
+        fail(f"reading {host or 'this host'}'s files failed: {result.stderr.decode(errors='replace').strip()}")
+    if not result.stdout:
+        return {}
+    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as tar:
+        return {m.name: tar.extractfile(m).read().decode(errors="replace") for m in tar if m.isfile()}
+
+
+def days(first: date, last: date) -> list[str]:
+    return [(first + timedelta(days=n)).isoformat() for n in range((last - first).days + 1)]
+
+
+DAY = re.compile(r"\d{4}-\d\d-\d\d")
+
+
+def rows(files: dict[str, str], suffix: str, lo: str = "", hi: str | None = None) -> list[dict[str, str]]:
+    """Every row of the day files named YYYY-MM-DD`suffix`, stamped between lo and hi, oldest first. Each row
+    is read by the header above it, since a file begun under other columns carries the recorder's new header
+    where they change. A row cut short by a power cut keeps its whole fields and loses the one the cut landed
+    in. The recorder marks such a row ,torn when it next starts; the last line of a day it never reopened has no
+    newline, which this reads as the same mark."""
+    found = []
+    for name in sorted(n for n in files if n.endswith(suffix) and DAY.fullmatch(n.removesuffix(suffix))):
+        text = files[name]
+        # csv raises on a \r inside a field, which an older recorder let through from a process name or cwd.
+        lines = text.replace("\r", " ").split("\n")
+        if lines and not text.endswith("\n"):
+            lines[-1] += ",torn"
+        header: list[str] = []
+        for fields in csv.reader(lines):
+            if fields[-1:] == ["torn"]:
+                fields = fields[:-2]
+            if fields[:1] == ["time"]:
+                header = fields
+                continue
+            row = dict(zip(header, fields))
+            t = row.get("time") or ""
+            if len(t) == 19 and lo <= t and (hi is None or t <= hi):
+                found.append(row)
+    return found
+
+
+def number(text: str | None) -> int | float | None:
+    for kind in (int, float):
+        try:
+            return kind(text)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+# --- the window question ---
+
+SAMPLE_FIELDS = ("mem_avail_mb", "swap_used_mb", "mem_some_avg10", "mem_full_avg10", "load1")
+STAMP = "%Y-%m-%d %H:%M:%S"
+
+
+def window(args: Args) -> None:
+    try:
+        at = datetime.fromisoformat(args.at)
+    except ValueError:
+        fail(f"--at {args.at!r} is not a time like '2026-09-28 06:52:00'")
+    start, end = at - timedelta(minutes=args.minutes), at + timedelta(minutes=1)
+    lo, hi = start.strftime(STAMP), end.strftime(STAMP)
+    dates = days(start.date(), end.date())
+    files = read_files(args.host, args.logdir, [f"{d}{s}" for d in dates for s in (".csv", ".top.csv")])
+
+    samples = [{"time": r["time"], **{k: number(r.get(k)) for k in SAMPLE_FIELDS}} for r in rows(files, ".csv", lo, hi)]
+    ranked = rows(files, ".top.csv", lo, hi)
+    answer = {"host": args.host or socket.gethostname(), "at": at.strftime(STAMP), "from": lo, "to": hi,
+              "rankings": len({r["time"] for r in ranked}), "holders": holders(ranked), "samples": samples}
+    if args.json:
+        print(json.dumps(answer))
+    else:
+        print_window(answer)
+
+
+def holders(ranked: list[dict[str, str]]) -> list[dict]:
+    """One entry per unit the rankings list, the largest peak first. A unit is its manager and its name, as in
+    the CPU question. A row in thermal-log's columns names no manager: it joins the one unit of its name that
+    has one, and otherwise stands alone with a null manager."""
+    by_unit: dict[tuple[str | None, str], list[dict[str, str]]] = defaultdict(list)
+    for r in ranked:
+        if r.get("unit"):
+            by_unit[(r.get("manager") or None, r["unit"])].append(r)
+    for _, unit in [k for k in by_unit if k[0] is None]:
+        named = [k for k in by_unit if k[1] == unit and k[0] is not None]
+        if len(named) == 1:
+            by_unit[named[0]] = sorted(by_unit.pop((None, unit)) + by_unit[named[0]], key=lambda r: r["time"])
+    found = []
+    for (manager, unit), unit_rows in by_unit.items():
+        held = [sum(number(r.get(k)) or 0 for k in ("anon_mb", "shmem_mb", "swap_mb")) for r in unit_rows]
+        top = max(range(len(held)), key=lambda i: held[i])
+        found.append({
+            "unit": unit,
+            "manager": manager,
+            "process": unit_rows[top].get("process") or None,
+            "cwd": unit_rows[top].get("cwd") or None,
+            "ranked": len(unit_rows),
+            "first_mb": held[0], "last_mb": held[-1], "peak_mb": held[top], "peak_at": unit_rows[top]["time"],
+            **{f"{k}_peak": peak(number(r.get(k)) for r in unit_rows)
+               for k in ("cpu_pct", "mem_some_avg60", "mem_full_avg60")},
+        })
+    return sorted(found, key=lambda h: (-h["peak_mb"], h["unit"], h["manager"] or ""))
+
+
+def peak(values) -> int | float | None:
+    return max((v for v in values if v is not None), default=None)
+
+
+def print_window(answer: dict) -> None:
+    at_minute = answer["at"][:16]
+    print(f"{answer['host']}, {answer['from']} to {answer['to']}, around {answer['at']}")
+    if not answer["samples"] and not answer["holders"]:
+        print("\nnothing recorded in this window")
+        return
+    print("\nmemory by minute: least available, most swap, and the highest pressure (% of 10 s stalled)")
+    print(f"{'minute':>6} {'avail_mb':>9} {'swap_mb':>8} {'some_%':>7} {'full_%':>7} {'load1':>6}")
+    minutes: dict[str, list[dict]] = defaultdict(list)
+    for s in answer["samples"]:
+        minutes[s["time"][:16]].append(s)
+    for minute, samples in minutes.items():
+        avail = [s["mem_avail_mb"] for s in samples if s["mem_avail_mb"] is not None]
+        cells = [min(avail) if avail else None,
+                 *(peak(s[k] for s in samples) for k in ("swap_used_mb", "mem_some_avg10", "mem_full_avg10", "load1"))]
+        marker = "  <- --at" if minute == at_minute else ""
+        print(f"{minute[11:]:>6} " + " ".join(f"{cell(v):>{w}}" for v, w in zip(cells, (9, 8, 7, 7, 6))) + marker)
+
+    print(f"\nmemory holders over {answer['rankings']} rankings, in MB of anonymous + shared + swapped")
+    print(f"{'peak':>7} {'first':>7} {'last':>7} {'ranked':>6} {'peak at':>8} {'some_%':>6}  unit, process, cwd")
+    managers_of: dict[str, set] = defaultdict(set)
+    for h in answer["holders"]:
+        managers_of[h["unit"]].add(h["manager"])
+    for h in answer["holders"]:
+        name = re.sub(r"^tmux-spawn-(\w{8})[-\w]*\.scope$", r"tmux-spawn-\1…", h["unit"])
+        if h["manager"] and len(managers_of[h["unit"]]) > 1:
+            name += f" ({h['manager']})"
+        what = ", ".join(x for x in (name, h["process"], h["cwd"]) if x)
+        print(f"{h['peak_mb']:7d} {h['first_mb']:7d} {h['last_mb']:7d} {h['ranked']:6d} {h['peak_at'][11:]:>8} "
+              f"{cell(h['mem_some_avg60_peak']):>6}  {what}")
+
+
+def cell(v: int | float | None) -> str:  # noqa: PYI041
+    return "-" if v is None else f"{v:g}" if isinstance(v, float) else str(v)
+
+
+# --- the CPU question ---
+
+
+@dataclass
+class UnitCpu:
+    unit: str
+    cpu_s: float
+    core_pct: float
+    lifetimes: int
+
+
+@dataclass
+class Lifetime:
+    samples: list[tuple[float, int]] = field(default_factory=list)  # (epoch s, usage usec)
+    stop: tuple[float, int, float] | None = None  # (epoch s, lifetime usage usec, wall-clock s) from the journal
+
+
+INSTANCE_PATTERNS = [
+    (re.compile(r"^tmux-spawn-[0-9a-f-]{36}\.scope$"), "tmux-spawn-*.scope"),
+    (re.compile(r"^docker-[0-9a-f]{64}\.scope$"), "docker-*.scope"),
+    (re.compile(r"^run-[0-9a-z]+\.(service|scope)$"), r"run-*.\1"),
+    (re.compile(r"^(.*)-\d+\.scope$"), r"\1-*.scope"),
+]
+
+DURATION = re.compile(r"([\d.]+)(d|h|min|ms|us|s)")
+DURATION_S = {"d": 86400, "h": 3600, "min": 60, "s": 1, "ms": 1e-3, "us": 1e-6}
+STOP_LINE = re.compile(r"^(\S+): Consumed (.+?) CPU time")
+WALL_CLOCK = re.compile(r"over (.+?) wall clock time")
+
+
+def group_name(unit: str) -> str:
+    for pattern, replacement in INSTANCE_PATTERNS:
+        if pattern.match(unit):
+            return pattern.sub(replacement, unit)
+    return unit
+
+
+Unit = tuple[str, str]  # (manager, unit name)
+
+
+def counter_rows(files: dict[str, str]) -> list[dict[str, str]]:
+    """The hourly counters' rows whole enough to read."""
+    return [r for r in rows(files, ".counters.csv")
+            if r.get("manager") and r.get("unit") and isinstance(number(r.get("usage_usec")), int)]
+
+
+def host_clock(host: str | None, stamps: list[str]) -> tuple[str, dict[str, float]]:
+    """The reading user's manager on `host`, and each of the host's local-time stamps in epoch seconds. The host
+    converts them, so its own time zone and daylight saving apply whichever machine reads."""
+    result = on_host(host, ["sh", "-c", "id -u && date -f - +%s"], stdin="".join(f"{s}\n" for s in stamps))
+    lines = result.stdout.decode().split()
+    if result.returncode or len(lines) != len(stamps) + 1:
+        fail(f"reading {host or 'this host'}'s clock failed: {result.stderr.decode(errors='replace').strip()}")
+    return f"user@{lines[0]}", {s: float(e) for s, e in zip(stamps, lines[1:])}
+
+
+def read_counters(counter: list[dict[str, str]], user: str,
+                  epoch: dict[str, float]) -> tuple[dict[Unit, list[tuple[float, int]]], float | None]:
+    """Every unit's hourly counter samples, and the earliest sample time. Counters written before the recorder
+    named a user manager by its uid say `user`, and are read as `user`'s: on a host with one user manager,
+    the one they were."""
+    series: dict[Unit, list[tuple[float, int]]] = defaultdict(list)
+    for row in counter:
+        manager = user if row["manager"] == "user" else row["manager"]
+        series[(manager, row["unit"])].append((epoch[row["time"]], int(row["usage_usec"])))
+    earliest = min((s[0][0] for s in series.values() if s), default=None)
+    return series, earliest
+
+
+def seconds(duration: str) -> float:
+    return sum(float(v) * DURATION_S[u] for v, u in DURATION.findall(duration))
+
+
+def read_stops(host: str | None, since: float, user: str) -> dict[Unit, list[tuple[float, int, float]]]:
+    """Every unit stop the journal recorded since `since`: (epoch s, lifetime usage usec, wall-clock s)."""
+    stops: dict[Unit, list[tuple[float, int, float]]] = defaultdict(list)
+    for manager, scope in ((user, "--user"), ("system", "--system")):
+        result = on_host(host, ["journalctl", scope, "-o", "json", "--output-fields=MESSAGE",
+                                "--since", f"@{int(since)}", "--grep", "Consumed .* CPU time"])
+        if result.returncode not in (0, 1):  # 1: no matching entries
+            print(f"host-recorder-report: journalctl {scope} failed: {result.stderr.decode().strip()}",
+                  file=sys.stderr)
+        for line in result.stdout.decode(errors="replace").splitlines():
+            entry = json.loads(line)
+            message = entry.get("MESSAGE")
+            match = STOP_LINE.match(message) if isinstance(message, str) else None
+            if not match:
+                continue
+            wall = WALL_CLOCK.search(message)
+            stops[(manager, match.group(1))].append((int(entry["__REALTIME_TIMESTAMP"]) / 1e6,
+                                          round(seconds(match.group(2)) * 1e6),
+                                          seconds(wall.group(1)) if wall else 0.0))
+    return stops
+
+
+def lifetimes(samples: list[tuple[float, int]], stops: list[tuple[float, int, float]]) -> list[Lifetime]:
+    """A unit's samples and stops in time order: a stop ends the current lifetime, and a sample after a stop,
+    or one whose counter dropped (restart, reboot), begins a new one. A stop with no lifetime open is a unit
+    that lived and ended between two samples."""
+    runs: list[Lifetime] = []
+    events = sorted([(t, 0, u, 0.0) for t, u in samples] + [(t, 1, u, wall) for t, u, wall in stops])
+    for t, is_stop, usage, wall in events:
+        current = runs[-1] if runs and runs[-1].stop is None else None
+        if is_stop:
+            if current:
+                current.stop = (t, usage, wall)
+            else:
+                runs.append(Lifetime(stop=(t, usage, wall)))
+        else:
+            if current is None or usage < current.samples[-1][1]:
+                current = Lifetime()
+                runs.append(current)
+            current.samples.append((t, usage))
+    return runs
+
+
+def usage_in_window(run: Lifetime, t0: float, t1: float, earliest: float | None) -> int:
+    end_t, end = run.stop[:2] if run.stop else run.samples[-1]
+    if end_t < t0:
+        return 0
+    if run.stop and not run.samples:
+        # Its life began at end_t - wall; of one begun before t0, only the share after t0 counts.
+        wall = run.stop[2]
+        return round(end * (end_t - t0) / wall) if wall and end_t - wall < t0 else end
+    before = [u for t, u in run.samples if t <= t0]
+    if before:
+        start = before[-1]
+    elif run.samples and run.samples[0][0] == earliest:
+        start = run.samples[0][1]  # already running when the counters began: its past is unknown
+    else:
+        start = 0  # born inside the window
+    if not run.stop:
+        inside = [u for t, u in run.samples if t <= t1]
+        end = inside[-1] if inside else start
+    return max(0, end - start)
+
+
+def cpu(args: Args) -> None:
+    t1 = time.time()
+    t0 = t1 - args.hours * 3600
+    # From the day before the window, since a lifetime's baseline is its last counter before the window
+    # starts, to the day after, for a host whose date is already ahead of this one's.
+    files = read_files(args.host, args.logdir, [f"{d}.counters.csv" for d in days(
+        date.fromtimestamp(t0) - timedelta(days=1), date.fromtimestamp(t1) + timedelta(days=1))])
+    counter = counter_rows(files)
+    user, epoch = host_clock(args.host, sorted({r["time"] for r in counter}))
+    counters, earliest = read_counters(counter, user, epoch)
+    stops = read_stops(args.host, t0, user)
+
+    per_unit: dict[Unit, int] = defaultdict(int)
+    count: dict[Unit, int] = defaultdict(int)
+    for manager, unit in set(counters) | set(stops):
+        if unit == "(root)":
+            continue
+        key = (manager, group_name(unit) if args.group else unit)
+        for run in lifetimes(counters.get((manager, unit), []), stops.get((manager, unit), [])):
+            used = usage_in_window(run, t0, t1, earliest)
+            if used:
+                per_unit[key] += used
+                count[key] += 1
+    managers_of: dict[str, set[str]] = defaultdict(set)
+    for manager, name in per_unit:
+        managers_of[name].add(manager)
+
+    def shown_name(key: Unit) -> str:
+        manager, name = key
+        return f"{name} ({manager})" if len(managers_of[name]) > 1 else name
+
+    # The root counter only means something against the units once it spans the whole window: stop
+    # records reach back to the window's start whether or not the counters do.
+    root = counters.get(("system", "(root)"), [])
+    spans = bool(root) and earliest is not None and earliest <= t0
+    total = sum(usage_in_window(r, t0, t1, earliest) for r in lifetimes(root, [])) if spans else None
+
+    window_s = t1 - t0
+    ranked = sorted(per_unit.items(), key=lambda kv: (-kv[1], kv[0]))
+    units = [UnitCpu(shown_name(u), round(us / 1e6, 1), round(us / 1e6 / window_s * 100, 3), count[u])
+             for u, us in ranked]
+    total_s = round(total / 1e6, 1) if total is not None else None
+
+    if args.json:
+        print(json.dumps({"host": args.host or socket.gethostname(), "window_h": args.hours, "total_cpu_s": total_s,
+                          "units": [asdict(u) for u in units]}))
+        return
+    shown = units[: args.top] if args.top else units
+    print(f"{'cpu_min':>9} {'core_%':>7} {'lives':>6}  unit")
+    for u in shown:
+        print(f"{u.cpu_s / 60:9.1f} {u.core_pct:7.2f} {u.lifetimes:6d}  {u.unit}")
+    listed = sum(u.cpu_s for u in units)
+    hidden = len(units) - len(shown)
+    tail = f", {hidden} smaller units not shown" if hidden else ""
+    if total_s is not None:
+        system = f" of {total_s / 60:.1f} system-wide, {(total_s - listed) / 60:.1f} unattributed"
+    elif earliest is not None:
+        started_h = (t1 - earliest) / 3600
+        system = f"; no system-wide total until the counters span the window (they start {started_h:.0f} h ago)"
+    else:
+        system = "; no counters yet, so no system-wide total"
+    print(f"\n{listed / 60:.1f} CPU-min across {len(units)} units over {args.hours:g} h{system}{tail}")
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__, config=(tyro.conf.OmitArgPrefixes,)))

@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# Drive bin/host-recorder at a fixture root and check what it writes: that its
+# sampling loop starts no process (host-recorder#P1, under strace), and the
+# values of its rows against the fixture's readings, worked out by hand. Run it
+# directly; no framework.
+#
+# Starting up may fork (mkdir, the pruning find, the idle pipe); the loop may
+# not. The loop begins where the recorder first opens a CSV, so every process
+# the trace shows starting after that line is a fork the header's cost
+# argument says is not there. The run lasts three rankings or more, which is
+# where the heavier reads are (every cgroup, a pane's largest process and its
+# cwd), and a helper changes the machine under it after the first: a driver
+# loads, and a service starts burning CPU.
+
+set -uo pipefail
+
+recorder="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/host-recorder"
+work=$(mktemp -d)
+feeder=
+trap '[ -z "$feeder" ] || kill "$feeder" 2>/dev/null; rm -rf "$work"' EXIT
+root=$work/root
+
+# Resolved before the timed run, so fetching it does not eat the recorder's time.
+strace=$(command -v strace || echo "$(nix build --no-link --print-out-paths nixpkgs#strace^out)/bin/strace")
+
+failures=0
+check() {
+    local what="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what"
+        echo "       expected: $expected"
+        echo "       actual:   $actual"
+        failures=$((failures + 1))
+    fi
+}
+
+put() {  # put <path under root> <content>
+    mkdir -p "$(dirname "$root/$1")"
+    printf '%s\n' "$2" > "$root/$1.tmp" && mv "$root/$1.tmp" "$root/$1"
+}
+cgroup() {  # cgroup <dir under root> <memory MB> <cpu usec>: a cgroup whose memory is all anonymous
+    put "$1/memory.current" $(($2 << 20))
+    put "$1/memory.stat" "$(printf 'anon %d\nshmem 0' $(($2 << 20)))"
+    put "$1/cpu.stat" "usage_usec $3"
+}
+process() {  # process <pid> <resident pages> <comm> <cwd under root>
+    put "proc/$1/statm" "460800 $2 57600 100 0 230400 0"
+    put "proc/$1/comm" "$3"
+    mkdir -p "$root/$4"
+    ln -sfn "$root/$4" "$root/proc/$1/cwd"
+}
+
+# --- the machine ---
+
+put proc/loadavg "1.37 1.12 0.98 3/1204 482211"
+put proc/meminfo "$(printf 'MemTotal: 65536000 kB\nMemAvailable: 20971520 kB\nSwapTotal: 8388608 kB\nSwapFree: 7340032 kB')"
+put proc/pressure/memory "$(printf 'some avg10=1.52 avg60=0.83 avg300=0.21 total=4817352\nfull avg10=0.94 avg60=0.51 avg300=0.12 total=2941185')"
+put sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 3400000
+put sys/devices/system/cpu/cpufreq/policy1/scaling_cur_freq 4800000
+# Both sensor sets' devices, so whichever host the run is reads them all.
+put sys/class/thermal/thermal_zone0/type x86_pkg_temp
+put sys/class/thermal/thermal_zone0/temp 67000
+put sys/class/thermal/thermal_zone1/type acpitz
+put sys/class/thermal/thermal_zone1/temp 16800
+put sys/class/thermal/thermal_zone2/type TCPU
+put sys/class/thermal/thermal_zone2/temp 61500
+put sys/class/hwmon/hwmon0/name asus
+put sys/class/hwmon/hwmon0/fan1_input 3100
+put sys/class/hwmon/hwmon0/fan2_input 2900
+put sys/firmware/acpi/platform_profile balanced
+attrs=sys/class/firmware-attributes/asus-armoury/attributes
+put $attrs/ppt_pl1_spl/current_value 45
+put $attrs/ppt_pl2_sppt/current_value 65
+put $attrs/dgpu_disable/current_value 0
+put sys/class/power_supply/AC0/type Mains
+put sys/class/power_supply/AC0/online 1
+put sys/class/power_supply/BAT0/type Battery
+put sys/class/power_supply/BAT0/capacity 80
+put sys/class/power_supply/BAT0/power_now 12345678
+put sys/bus/pci/devices/0000:00:01.0/power_state D0
+mkdir -p "$root/sys/bus/pci/devices/0000:01:00.0" "$root/sys/bus/pci/drivers/nvidia"
+ln -s "$root/sys/bus/pci/drivers/nvidia" "$root/sys/bus/pci/devices/0000:01:00.0/driver"
+put sys/class/hwmon/hwmon1/name k10temp
+put sys/class/hwmon/hwmon1/temp1_input 54875
+put sys/class/hwmon/hwmon1/temp3_input 49250
+# hwmon2, the NVMe drive, appears once the recorder runs: see feed.
+put sys/class/hwmon/hwmon3/name gigabyte_wmi
+i=0
+for t in 36000 42000 30000 33000 51000 28000; do
+    put sys/class/hwmon/hwmon3/temp$((++i))_input $t
+done
+
+# The cgroups, with the memory each holds and its CPU counter.
+put sys/fs/cgroup/memory.stat "$(printf 'anon %d\nshmem 0' $((64 << 30)))"
+put sys/fs/cgroup/cpu.stat "usage_usec 5000000"
+# A pc worker's pane, directly under its user manager, with two processes.
+pane=sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/tmux-spawn-04a022ba-0a66-4f6d-8220-46e4b6481a45.scope
+cgroup "$pane" 900 4000000
+put "$pane/memory.swap.current" 0
+put "$pane/memory.pressure" "$(printf 'some avg10=0.00 avg60=0.12 avg300=0.40 total=81234\nfull avg10=0.00 avg60=0.05 avg300=0.20 total=41234')"
+put "$pane/cgroup.procs" "$(printf '1301\n1300')"
+process 1300 230400 claude home/agent/repos/project
+process 1301 1000 bash home/agent
+# A laptop's pane, in its user manager's app.slice, smaller than ten services
+# over the threshold: the pane rule keeps it a row past the ten.
+laptop_pane=sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-aaaaaaaa-0a66-4f6d-8220-46e4b6481a45.scope
+cgroup "$laptop_pane" 600 2000000
+for i in 0 1 2 3 4 5 6 7 8 9; do
+    cgroup "sys/fs/cgroup/system.slice/big$i.service" $((1000 + 100 * i)) 0
+done
+cgroup sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-1234.scope 100 7000000
+cgroup sys/fs/cgroup/user.slice/user-1000.slice/session-3.scope 10 250000
+cgroup sys/fs/cgroup/system.slice/sshd.service 10 300000
+# Idle at the first ranking; feed makes it burn.
+cgroup sys/fs/cgroup/system.slice/build.service 10 0
+put sys/fs/cgroup/system.slice/build.service/cgroup.procs 1400
+# Its process names itself with a comma and a carriage return, and works in a
+# directory with a line break in its name.
+process 1400 5000 $'cc1\r,x' $'srv/bu\nild'
+
+# feed <state dir>: once the first ranking is written, the NVMe driver loads
+# and build.service burns a core's worth of CPU and more.
+feed() {
+    local use=0
+    until grep -qs ',(rest),' "$1"/*.top.csv; do sleep 0.02; done
+    put sys/class/hwmon/hwmon2/name nvme
+    put sys/class/hwmon/hwmon2/temp1_input 38850
+    while :; do
+        use=$((use + 1000000000))
+        put sys/fs/cgroup/system.slice/build.service/cpu.stat "usage_usec $use"
+        sleep 0.1
+    done
+}
+
+# --- what each host's rows hold ---
+
+core=4800,1.37,20480,1024,1.52,0.94
+declare -A SAMPLE=(
+    [zephylux]=$core,67,61,16,3100,2900,balanced,45,65,1,80,12.3,0,D0,1
+    [pc]=$core,54,49,38,16,36,42,30,33,51,28
+)
+declare -A FIRST_SAMPLE=(
+    [zephylux]=${SAMPLE[zephylux]}
+    [pc]=$core,54,49,,16,36,42,30,33,51,28
+)
+declare -A HEADER=(
+    [zephylux]=time,mhz_max,load1,mem_avail_mb,swap_used_mb,mem_some_avg10,mem_full_avg10,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv
+    [pc]=time,mhz_max,load1,mem_avail_mb,swap_used_mb,mem_some_avg10,mem_full_avg10,cpu_c,ccd1_c,nvme_c,board_c,wmi1_c,wmi2_c,wmi3_c,wmi4_c,wmi5_c,wmi6_c
+)
+# The first hourly dump: every cgroup's counter as it stood then.
+counters=$(printf '%s\n' "system,(root),5000000" "system,sshd.service,300000" "system,build.service,0" \
+    "system,session-3.scope,250000" "user@1000,app-firefox-1234.scope,7000000" \
+    "user@1000,${laptop_pane##*/},2000000" "user@1001,${pane##*/},4000000" \
+    big{0..9}.service | sed 's/^big/system,big/; s/service$/service,0/' | LC_ALL=C sort)
+
+# A day file the recorder finds when it starts: thermal-log's columns, and a
+# last row a power cut cut short.
+old_header=time,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,mhz_max,load1,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv,mem_avail_mb,swap_used_mb
+torn="$(date +%F) 00:00:01,67,6"
+
+# run <host> <how>: zephylux or pc as a user service, or pc as its system
+# service, which has no HOME and a STATE_DIRECTORY.
+for run in "zephylux user" "pc user" "pc system"; do
+    read -r host how <<<"$run"
+    name="$host as a $how service"
+    put proc/sys/kernel/hostname "$host"
+    rm -rf "$work/state" "$root/sys/class/hwmon/hwmon2"
+    put sys/fs/cgroup/system.slice/build.service/cpu.stat "usage_usec 0"
+    if [ "$how" = user ]; then
+        dir=$work/state/host-recorder env=(-u STATE_DIRECTORY HOME=$root/home/agent XDG_STATE_HOME=$work/state)
+        home='~'
+    else
+        dir=$work/state/lib env=(-u HOME -u XDG_STATE_HOME STATE_DIRECTORY=$work/state/lib)
+        home=$root/home/agent
+    fi
+    mkdir -p "$dir"
+    printf '%s\n%s' "$old_header" "$torn" > "$dir/$(date +%F).csv"
+
+    feed "$dir" & feeder=$!
+    env "${env[@]}" HOST_RECORDER_ROOT="$root" \
+        timeout -s INT 5 "$strace" -f -qq -o "$work/trace" \
+        -e trace=clone,clone3,fork,vfork,execve,execveat,openat -e signal=none \
+        "$recorder" 0.05 > /dev/null 2> "$work/stderr"
+    kill "$feeder"; wait "$feeder" 2>/dev/null; feeder=
+
+    rankings=$(cat "$dir"/*.top.csv 2>/dev/null | grep -c '^[^,]*,,(rest),')
+    if [ "${rankings:-0}" -lt 3 ]; then
+        check "$name: at least 3 rankings in 5 s" "3 or more" "${rankings:-0}"
+        sed 's/^/       /' "$work/stderr" | tail -20
+        continue
+    fi
+    started=$(awk '/openat\(.*\.csv"/ { loop = 1 } loop && /(clone|clone3|fork|vfork|execve|execveat)\(/' "$work/trace")
+    check "$name: the sampling loop starts no process, over $rankings rankings" "" "$started"
+
+    # Below the thermal-log rows and the new header, the samples this run wrote.
+    samples=$(tail -n +4 "$dir/$(date +%F).csv" | cut -d, -f2-)
+    check "$name: the day file begun by thermal-log keeps its rows, its torn row marked on a line of its own, then the new header" \
+        "$old_header|$torn,torn|${HEADER[$host]}" "$(head -3 "$dir/$(date +%F).csv" | paste -sd'|')"
+    check "$name: the first sample, before the NVMe driver loads" "${FIRST_SAMPLE[$host]}" "$(head -1 <<<"$samples")"
+    check "$name: the last sample, every reading" "${SAMPLE[$host]}" "$(tail -1 <<<"$samples")"
+
+    top=$(cat "$dir"/*.top.csv)
+    check "$name: the pane's first row names its manager, memory, processes, largest process, cwd and pressure" \
+        "user@1001,${pane##*/},,900,0,0,2,claude,$home/repos/project,0.12,0.05" \
+        "$(grep -m1 ",${pane##*/}," <<<"$top" | cut -d, -f2-)"
+    check "$name: a laptop's pane over the threshold is a row past ten larger holders" 1 \
+        "$(grep -m1 '^[^,]*,,(rest),' -B20 <<<"$top" | grep -c ",${laptop_pane##*/},,600,0,0,0,,,,$")"
+    check "$name: a service that burns CPU is a row once it does" 1 \
+        "$(grep -cm1 "^[^,]*,system,build.service,[0-9][0-9]*,10,0,0,1,cc1  x,$root/srv/bu ild,,$" <<<"$top")"
+
+    first=$(grep -v '^time,' "$dir"/*.counters.csv | head -1 | cut -d, -f1)
+    check "$name: the first hourly counters, each unit's manager and cumulative usage" "$counters" \
+        "$(grep "^$first," "$dir"/*.counters.csv | cut -d, -f2- | LC_ALL=C sort)"
+done
+
+if [ "$failures" -gt 0 ]; then
+    echo "$failures failed"
+    exit 1
+fi
+echo "all passed"

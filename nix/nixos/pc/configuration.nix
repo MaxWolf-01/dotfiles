@@ -10,6 +10,7 @@
     ./tailnet-lock.nix
     ./hd-idle.nix
     ./agent-user.nix
+    ./host-recorder.nix
   ];
 
   # Boot

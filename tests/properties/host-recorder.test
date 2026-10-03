@@ -1,0 +1,1039 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["hypothesis"]
+# ///
+"""The host recorder's properties, checked over generated machines. Run it directly; no framework.
+
+P1 to P6 are the properties of agent/tickets/host-recorder.md in the agent repo. P1 is checked by
+tests/host-recorder.test under strace, P5 by review.
+
+P2, P3 and P4 drive bin/host-recorder at its fixture root: HOST_RECORDER_ROOT names a directory that
+stands in for `/`, so every `/sys` and `/proc` path the recorder reads is read under it. Hypothesis draws
+the tree: a host's sensor set with its devices numbered in any order, the cgroups of a laptop or of pc
+with the memory each one holds, the processes in them. The recorder runs as it does on a host, with a
+short interval, and writes its CSVs under XDG_STATE_HOME; the checks read what it wrote while it runs. It
+picks its sensor set by the host name it reads at `proc/sys/kernel/hostname`.
+
+P6 drives bin/host-recorder-report at a directory of recorder files, in the columns a run of
+bin/host-recorder writes and in thermal-log's before it, once reading it locally and once
+through HOST_RECORDER_SSH, a stand-in `ssh` that runs its command here, in a scrubbed environment as a
+login would. Both reads name the same directory. It holds the files only while the stand-in runs a
+command or while the local read runs, so a reader that ignores the host it is asked about answers from
+an empty directory.
+
+A property marked as an expected failure is not meant to hold yet. It passes only by failing the way its
+mark names, and the run fails the moment it holds; the ticket that makes it hold deletes the mark.
+"""
+
+import functools
+import itertools
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from collections import Counter
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
+from pathlib import Path
+from random import Random
+
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
+from hypothesis.database import DirectoryBasedExampleDatabase
+
+REPO = Path(__file__).resolve().parents[2]
+RECORDER = REPO / "bin" / "host-recorder"
+READER = REPO / "bin" / "host-recorder-report"
+
+INTERVAL = 0.05
+"""Seconds between the recorder's samples in these checks."""
+
+THRESHOLD_MB = 512
+"""The memory ranking's threshold: a cgroup holding more than this, in memory the kernel cannot simply drop
+(anonymous, shared and swapped), is a memory holder."""
+
+MiB = 1 << 20
+PAGE = 4096
+SCRATCH = Path(tempfile.mkdtemp(prefix="host-recorder-properties."))
+
+PROPERTIES = []
+
+
+class Missing(Exception):
+    """The script a property drives does not exist yet."""
+
+
+class Late(Exception):
+    """What the recorder was waited for did not come in time, and it is still running."""
+
+
+def prop(fn):
+    PROPERTIES.append(fn)
+    return fn
+
+
+def expected_failure(ticket: str, raises: type[Exception] | tuple[type[Exception], ...]):
+    """Mark a property that holds only once `ticket` lands. Until then it must fail with `raises`."""
+
+    def mark(fn):
+        fn.expected = (ticket, raises)
+        return fn
+
+    return mark
+
+
+def needs(script: Path):
+    """Fail with Missing before generating anything, while `script` does not exist."""
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        def run():
+            if not script.exists():
+                raise Missing(f"{script.relative_to(REPO)} does not exist")
+            fn()
+
+        return run
+
+    return wrap
+
+
+def checked(examples: int):
+    return settings(
+        max_examples=examples,
+        deadline=None,
+        report_multiple_bugs=False,
+        database=DirectoryBasedExampleDatabase(Path(__file__).resolve().parent / ".hypothesis"),
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+    )
+
+
+def scratch(name: str) -> Path:
+    """A fresh directory under this run's scratch directory."""
+    path = SCRATCH / name
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True)
+    return path
+
+
+# --------------------------------------------------------------------------
+# machines
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Link:
+    """A symlink in the tree, to a path relative to the fixture root."""
+
+    target: str
+
+
+def write(root: Path, files: dict[str, "str | Link"]) -> None:
+    for rel, content in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, Link):
+            (root / content.target).mkdir(parents=True, exist_ok=True)
+            path.symlink_to(root / content.target)
+        else:
+            # A file in /sys or /proc ends in a newline, and `read` in a shell fails on one that does not.
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(content if content.endswith(("\n", "\0")) else content + "\n")
+            tmp.rename(path)
+
+
+@dataclass(frozen=True)
+class Sensor:
+    """One device of a sensor set: the files it shows in /sys, and the paths that go when it vanishes.
+    `{z}`, `{z2}` stand for thermal zone numbers and `{h}` for a hwmon number, which are not stable
+    across boots."""
+
+    files: dict[str, "str | Link"]
+    gone: tuple[str, ...]
+
+
+def zone(key: str, kind: str, millideg: int) -> dict[str, str]:
+    return {f"sys/class/thermal/thermal_zone{{{key}}}/type": kind,
+            f"sys/class/thermal/thermal_zone{{{key}}}/temp": str(millideg)}
+
+
+def hwmon(name: str, readings: dict[str, str]) -> dict[str, str]:
+    return {"sys/class/hwmon/hwmon{h}/name": name} | {f"sys/class/hwmon/hwmon{{h}}/{k}": v
+                                                     for k, v in readings.items()}
+
+
+ARMOURY = "sys/class/firmware-attributes/asus-armoury/attributes"
+DGPU = "sys/bus/pci/devices/0000:01:00.0"
+DGPU_PORT = "sys/bus/pci/devices/0000:00:01.0"
+
+SENSORS: dict[str, dict[str, Sensor]] = {
+    "zephylux": {
+        "pkg": Sensor(zone("z", "x86_pkg_temp", 67000), ("sys/class/thermal/thermal_zone{z}",)),
+        "tcpu": Sensor(zone("z", "TCPU", 64000), ("sys/class/thermal/thermal_zone{z}",)),
+        "board": Sensor(zone("z", "acpitz", 45000), ("sys/class/thermal/thermal_zone{z}",)),
+        "fans": Sensor(hwmon("asus", {"fan1_input": "3100", "fan2_input": "2900"}),
+                       ("sys/class/hwmon/hwmon{h}",)),
+        "profile": Sensor({"sys/firmware/acpi/platform_profile": "balanced"},
+                          ("sys/firmware/acpi/platform_profile",)),
+        "spl": Sensor({f"{ARMOURY}/ppt_pl1_spl/current_value": "45"}, (f"{ARMOURY}/ppt_pl1_spl",)),
+        "sppt": Sensor({f"{ARMOURY}/ppt_pl2_sppt/current_value": "65"}, (f"{ARMOURY}/ppt_pl2_sppt",)),
+        "dgpu_disable": Sensor({f"{ARMOURY}/dgpu_disable/current_value": "0"}, (f"{ARMOURY}/dgpu_disable",)),
+        "ac": Sensor({"sys/class/power_supply/AC0/type": "Mains", "sys/class/power_supply/AC0/online": "1"},
+                     ("sys/class/power_supply/AC0",)),
+        "battery": Sensor({"sys/class/power_supply/BAT0/type": "Battery",
+                           "sys/class/power_supply/BAT0/capacity": "87",
+                           "sys/class/power_supply/BAT0/power_now": "15300000",
+                           "sys/class/power_supply/BAT0/status": "Discharging"},
+                          ("sys/class/power_supply/BAT0",)),
+        "dgpu": Sensor({f"{DGPU}/power_state": "D0", f"{DGPU}/vendor": "0x10de",
+                        f"{DGPU}/driver": Link("sys/bus/pci/drivers/nvidia")}, (DGPU,)),
+        "dgpu_port": Sensor({f"{DGPU_PORT}/power_state": "D0"}, (DGPU_PORT,)),
+    },
+    "pc": {
+        "k10temp": Sensor(hwmon("k10temp", {"temp1_input": "54875", "temp1_label": "Tctl",
+                                            "temp3_input": "49250", "temp3_label": "Tccd1"}),
+                          ("sys/class/hwmon/hwmon{h}",)),
+        "nvme": Sensor(hwmon("nvme", {"temp1_input": "38850", "temp1_label": "Composite",
+                                      "temp3_input": "44850", "temp3_label": "Sensor 2"}),
+                       ("sys/class/hwmon/hwmon{h}",)),
+        "gigabyte_wmi": Sensor(hwmon("gigabyte_wmi", {f"temp{i}_input": str(t) for i, t in enumerate(
+            [36000, 42000, 30000, 33000, 51000, 28000], start=1)}), ("sys/class/hwmon/hwmon{h}",)),
+        "acpitz": Sensor(hwmon("acpitz", {"temp1_input": "16800", "temp2_input": "16800"})
+                         | zone("z", "acpitz", 16800) | zone("z2", "acpitz", 16800),
+                         ("sys/class/hwmon/hwmon{h}", "sys/class/thermal/thermal_zone{z}",
+                          "sys/class/thermal/thermal_zone{z2}")),
+    },
+}
+"""Each host's sensor set, with fixed readings: a field of the recorder's row is a reading's value or empty,
+so the full set's row is the one every row is held against."""
+
+
+def core(host: str) -> dict[str, str]:
+    """What every host shows in /proc and /sys besides its sensors and cgroups."""
+    pressure = "some avg10=1.52 avg60=0.83 avg300=0.21 total=4817352\nfull avg10=0.94 avg60=0.51 avg300=0.12 total=2941185\n"
+    return {
+        "proc/sys/kernel/hostname": host,
+        "proc/loadavg": "1.37 1.12 0.98 3/1204 482211",
+        "proc/uptime": "81234.56 1253321.12",
+        "proc/stat": "cpu  2255 34 2290 22625563 6290 127 456 0 0 0\ncpu0 1132 34 1441 11311718 3675 127 438 0 0 0\n",
+        "proc/pressure/memory": pressure,
+        "proc/pressure/cpu": pressure.replace("full avg10=0.94", "full avg10=0.00"),
+        "proc/pressure/io": pressure,
+    } | {f"sys/devices/system/cpu/cpufreq/policy{i}/scaling_cur_freq": str(khz)
+         for i, khz in enumerate([3400000, 2100000, 4800000, 1800000])}
+
+
+def meminfo(swap_total_kb: int, swap_free_kb: int) -> str:
+    return (f"MemTotal:       65536000 kB\nMemFree:         3276800 kB\nMemAvailable:   20971520 kB\n"
+            f"Buffers:           81920 kB\nCached:         16777216 kB\nSwapCached:            0 kB\n"
+            f"Active:         30000000 kB\nInactive:       20000000 kB\nUnevictable:        4096 kB\n"
+            f"Mlocked:            4096 kB\nSwapTotal:      {swap_total_kb} kB\nSwapFree:       {swap_free_kb} kB\n"
+            f"Zswap:                 0 kB\nZswapped:              0 kB\nDirty:              512 kB\n"
+            f"Shmem:           1048576 kB\n")
+
+
+@dataclass
+class Cgroup:
+    """A leaf cgroup, its path relative to /sys/fs/cgroup, what it holds in bytes, and its processes."""
+
+    path: str
+    anon: int = 0
+    shmem: int = 0
+    file: int = 0
+    kernel: int = 0
+    swap: int = 0
+    usage: int = 0
+    pids: list[int] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return self.path.rsplit("/", 1)[-1]
+
+    @property
+    def held(self) -> int:
+        return self.anon + self.shmem + self.swap
+
+
+@dataclass
+class Machine:
+    """The cgroup tree of a host: its leaves, and what the root holds outside them (the kernel's, and the
+    processes of cgroups the recorder does not walk are leaves too)."""
+
+    host: str
+    leaves: list[Cgroup]
+    outside: Cgroup
+    swap_total_kb: int
+
+    def totals(self) -> Cgroup:
+        total = Cgroup("")
+        for c in [*self.leaves, self.outside]:
+            for k in ("anon", "shmem", "file", "kernel", "swap", "usage"):
+                setattr(total, k, getattr(total, k) + getattr(c, k))
+        return total
+
+    def swap_used_kb(self) -> int:
+        return self.totals().swap // 1024
+
+
+def cgroup_files(m: Machine) -> dict[str, str | Link]:
+    """Every cgroup's files: the leaves', their ancestors' (each the sum of what is below it) and the root's."""
+    nodes: dict[str, Cgroup] = {}
+    for leaf in m.leaves:
+        parts = leaf.path.split("/")
+        for i in range(1, len(parts) + 1):
+            node = nodes.setdefault("/".join(parts[:i]), Cgroup("/".join(parts[:i])))
+            for k in ("anon", "shmem", "file", "kernel", "swap", "usage"):
+                setattr(node, k, getattr(node, k) + getattr(leaf, k))
+            if i == len(parts):
+                node.pids = leaf.pids
+    pressure = "some avg10=0.00 avg60=0.12 avg300=0.40 total=81234\nfull avg10=0.00 avg60=0.05 avg300=0.20 total=41234\n"
+    files: dict[str, str | Link] = {}
+    for path, c in [*nodes.items(), ("", m.totals())]:
+        d = f"sys/fs/cgroup/{path}/" if path else "sys/fs/cgroup/"
+        files[f"{d}memory.stat"] = memory_stat(c)
+        files[f"{d}cpu.stat"] = cpu_stat(c.usage)
+        files[f"{d}memory.pressure"] = pressure
+        files[f"{d}cgroup.procs"] = "".join(f"{pid}\n" for pid in c.pids)
+        if path:
+            files[f"{d}memory.current"] = str(c.anon + c.file + c.kernel)
+            files[f"{d}memory.swap.current"] = str(c.swap)
+            files[f"{d}memory.max"] = "max"
+    for leaf in m.leaves:
+        for i, pid in enumerate(leaf.pids):
+            rss = (leaf.anon + leaf.shmem) // PAGE // (i + 1)
+            files[f"proc/{pid}/statm"] = f"{rss * 2} {rss} {rss // 4} 100 0 {rss} 0"
+            files[f"proc/{pid}/comm"] = ["claude", "node", "python3", "bash"][pid % 4]
+            files[f"proc/{pid}/cmdline"] = files[f"proc/{pid}/comm"] + "\0"
+            files[f"proc/{pid}/status"] = f"Name:\t{files[f'proc/{pid}/comm']}\nVmRSS:\t{rss * 4} kB\nVmSwap:\t0 kB\n"
+            files[f"proc/{pid}/cwd"] = Link(f"home/agent/repos/project-{pid % 7}")
+    files["proc/meminfo"] = meminfo(m.swap_total_kb, m.swap_total_kb - m.swap_used_kb())
+    return files
+
+
+def memory_stat(c: Cgroup) -> str:
+    """memory.stat in the kernel's order: anon first, shmem tenth."""
+    rows = [("anon", c.anon), ("file", c.file), ("kernel", c.kernel), ("kernel_stack", c.kernel // 8),
+            ("pagetables", c.kernel // 4), ("sec_pagetables", 0), ("percpu", PAGE), ("sock", 0),
+            ("vmalloc", 0), ("shmem", c.shmem), ("zswap", 0), ("zswapped", 0), ("file_mapped", c.file // 2),
+            ("file_dirty", 0), ("file_writeback", 0), ("swapcached", 0), ("anon_thp", 0),
+            ("inactive_anon", c.anon // 2), ("active_anon", c.anon - c.anon // 2),
+            ("inactive_file", c.file // 2), ("active_file", c.file - c.file // 2), ("unevictable", 0)]
+    return "".join(f"{k} {v}\n" for k, v in rows)
+
+
+def cpu_stat(usage: int) -> str:
+    return (f"usage_usec {usage}\nuser_usec {usage * 2 // 3}\nsystem_usec {usage - usage * 2 // 3}\n"
+            f"nr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n")
+
+
+def pages(n: int) -> int:
+    return n // PAGE * PAGE
+
+
+@st.composite
+def holding(draw, size: str, swap: bool) -> dict[str, int]:
+    """What one cgroup holds: small, near the ranking's threshold, over it, or large."""
+    total = draw({
+        "small": st.integers(0, 200 * MiB),
+        "near": st.integers(400 * MiB, 700 * MiB),
+        "over": st.integers((THRESHOLD_MB + 1) * MiB, 3 << 30),
+        "large": st.integers(1 << 30, 8 << 30),
+    }[size])
+    shmem = draw(st.integers(0, total // 3))
+    swapped = draw(st.integers(0, total // 4)) if swap else 0
+    return {"anon": pages(total - shmem - swapped),
+            "shmem": pages(shmem), "swap": pages(swapped),
+            "file": pages(draw(st.integers(0, 2 << 30))) + pages(shmem), "kernel": pages(draw(st.integers(0, 64 * MiB)))}
+
+
+SERVICES = ["sshd.service", "nix-daemon.service", "docker.service", "restic-backup.service", "sftpgo.service",
+            "tailscaled.service", "systemd-journald.service", "zfs-zed.service", "ollama.service"]
+APPS = ["dbus.socket", "ssh-agent.service", "docker.service", "app-org.chromium.Chromium-2259014.scope",
+        "dispatch-.dotfiles-a-1790632787-a3-2192874.scope", "run-p2243412-i6436926.scope",
+        "app-gnome-firefox-4412.scope", "app-ghostty-transient-9921.scope"]
+
+
+@st.composite
+def machines(draw, host: str | None = None, panes_over: int = 0) -> tuple[Machine, set[str]]:
+    """A cgroup tree in the shapes pc and a laptop give it, and the names of the tmux panes that hold more than
+    the threshold. A laptop's panes sit under app.slice, pc's workers' directly under their user manager;
+    either host may have both. On pc, `panes_over` panes are over the threshold, among other cgroups over it
+    that may outnumber the ranking's rows."""
+    host = host or draw(st.sampled_from(["pc", "zephylux"]))
+    swap = draw(st.booleans())
+    sizes = st.sampled_from(["small", "small", "near", "over", "large"])
+    pid = iter(range(1000, 100000))
+    uuids = iter(draw(st.lists(st.uuids(), min_size=30, max_size=30, unique=True)))
+    leaves: list[Cgroup] = []
+
+    def leaf(path: str, size: str | None = None) -> Cgroup:
+        c = Cgroup(path, **draw(holding(size or draw(sizes), swap)))
+        c.usage = draw(st.integers(0, 10**12))
+        c.pids = [next(pid) for _ in range(draw(st.integers(0, 3)))]
+        leaves.append(c)
+        return c
+
+    for name in draw(st.lists(st.sampled_from(SERVICES), max_size=6, unique=True)):
+        leaf(f"system.slice/{name}")
+    if draw(st.booleans()):
+        leaf(f"system.slice/docker-{draw(st.text('0123456789abcdef', min_size=64, max_size=64))}.scope")
+    leaf("init.scope", "small")
+    panes: set[str] = set()
+    uids = draw(st.lists(st.sampled_from([1000, 1001, 1002]), min_size=1, max_size=3, unique=True))
+    for uid in uids:
+        user = f"user.slice/user-{uid}.slice"
+        manager = f"{user}/user@{uid}.service"
+        for n in draw(st.lists(st.integers(2, 99999), max_size=2, unique=True)):
+            leaf(f"{user}/session-{n}.scope")
+        leaf(f"{manager}/init.scope", "small")
+        leaf(f"{manager}/session.slice/dbus-broker.service", "small")
+        for name in draw(st.lists(st.sampled_from(APPS), max_size=4, unique=True)):
+            leaf(f"{manager}/{draw(st.sampled_from(['app.slice', 'app.slice', 'background.slice']))}/{name}")
+        for _ in range(draw(st.integers(0, 3))):
+            leaf(f"{manager}/app.slice/tmux-spawn-{next(uuids)}.scope")
+        for _ in range(draw(st.integers(0, 4))):
+            leaf(f"{manager}/tmux-spawn-{next(uuids)}.scope", draw(st.sampled_from(["small", "near"])))
+    for _ in range(panes_over):
+        uid = draw(st.sampled_from(uids))
+        panes.add(leaf(f"user.slice/user-{uid}.slice/user@{uid}.service/tmux-spawn-{next(uuids)}.scope",
+                       draw(st.sampled_from(["over", "large"]))).name)
+    if panes_over:
+        for i in range(draw(st.integers(0, 8))):
+            leaf(f"system.slice/holder-{i}.service", draw(st.sampled_from(["over", "large"])))
+    outside = Cgroup("", **draw(holding(draw(st.sampled_from(["small", "large"])), swap)))
+    outside.usage = draw(st.integers(0, 10**12))
+    total_swap = sum(c.swap for c in [*leaves, outside]) // 1024
+    swap_total_kb = total_swap + (draw(st.integers(0, 8 << 20)) // 4 * 4 if swap else 0)
+    return Machine(host, leaves, outside, swap_total_kb), panes
+
+
+# --------------------------------------------------------------------------
+# the recorder
+# --------------------------------------------------------------------------
+
+
+TOP_FILE = r"\d{4}-\d\d-\d\d\.top\.csv"
+
+
+class Recorder:
+    """bin/host-recorder running at a fixture root, and what it has written so far."""
+
+    def __init__(self, root: Path, state: Path):
+        self.state = state
+        self.err = state.parent / "stderr"
+        (root / "home/agent").mkdir(parents=True, exist_ok=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("HOST_RECORDER", "STATE_DIRECTORY"))}
+        env |= {"HOST_RECORDER_ROOT": str(root), "HOME": str(root / "home/agent"), "XDG_STATE_HOME": str(state)}
+        with self.err.open("w") as err:
+            self.proc = subprocess.Popen([str(RECORDER), str(INTERVAL)], env=env, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.proc.wait()
+
+    def said(self) -> str:
+        return f"its stderr:\n{self.err.read_text()[-2000:]}"
+
+    def table(self, pattern: str) -> tuple[list[str], list[list[str]]]:
+        """The header and the complete rows of every file whose name matches, in date order."""
+        header: list[str] = []
+        rows: list[list[str]] = []
+        for path in sorted(p for p in self.state.rglob("*.csv") if re.fullmatch(pattern, p.name)):
+            text = path.read_text()
+            lines = text[: text.rfind("\n") + 1].splitlines()
+            if lines:
+                header = lines[0].split(",")
+                rows += [line.split(",") for line in lines[1:]]
+        return header, rows
+
+    def samples(self) -> tuple[list[str], list[list[str]]]:
+        return self.table(r"\d{4}-\d\d-\d\d\.csv")
+
+    def rankings(self) -> list[list[dict[str, str]]]:
+        """Each memory ranking's rows, the (rest) row that closes it included."""
+        header, rows = self.table(TOP_FILE)
+        blocks, block = [], []
+        for row in rows:
+            block.append(dict(zip(header, row)))
+            if block[-1].get("unit") == "(rest)":
+                blocks.append(block)
+                block = []
+        return blocks
+
+    def wait(self, what: str, until, timeout: float = 10) -> None:
+        end = time.monotonic() + timeout
+        while not until():
+            if self.proc.poll() is not None:
+                raise AssertionError(f"the recorder exited ({self.proc.returncode}) waiting for {what}; {self.said()}")
+            if time.monotonic() > end:
+                raise Late(f"no {what} after {timeout} s; {self.said()}")
+            time.sleep(INTERVAL / 2)
+
+    def rows(self, n: int) -> int:
+        """Wait for the n-th sample row; how many there are then."""
+        self.wait(f"sample row {n}", lambda: len(self.samples()[1]) >= n)
+        return len(self.samples()[1])
+
+
+def numbered(sensors: dict[str, Sensor], zones: list[int], hwmons: list[int]) -> dict[str, tuple[dict, list[str]]]:
+    """Each sensor's files and vanishing paths with its zone and hwmon numbers filled in."""
+    zs, hs = iter(zones), iter(hwmons)
+    out = {}
+    for name, s in sensors.items():
+        text = " ".join([*s.files, *s.gone])
+        numbers = {"z": next(zs) if "{z}" in text else 0, "z2": next(zs) if "{z2}" in text else 0,
+                   "h": next(hs) if "{h}" in text else 0}
+        out[name] = ({k.format(**numbers): v for k, v in s.files.items()}, [g.format(**numbers) for g in s.gone])
+    return out
+
+
+def counts(sensors: dict[str, Sensor]) -> tuple[int, int]:
+    """How many thermal zones and hwmon devices a sensor set has."""
+    text = [" ".join(s.files) for s in sensors.values()]
+    return sum(("{z}" in t) + ("{z2}" in t) for t in text), sum("{h}" in t for t in text)
+
+
+QUIET = Machine("", [Cgroup("system.slice/sshd.service", anon=40 * MiB, file=10 * MiB, pids=[1200]),
+                     Cgroup("user.slice/user-1001.slice/user@1001.service/tmux-spawn-"
+                            "04a022ba-0a66-4f6d-8220-46e4b6481a45.scope", anon=900 * MiB, pids=[1300])],
+                Cgroup("", anon=300 * MiB), 0)
+"""The cgroups under P2's sensors: one small service, one pane over the threshold."""
+
+
+def machine_tree(root: Path, host: str, sensors: dict[str, tuple[dict, list[str]]], absent: set[str]) -> None:
+    write(root, core(host) | cgroup_files(QUIET))
+    for name, (files, _) in sensors.items():
+        if name not in absent:
+            write(root, files)
+
+
+@dataclass(frozen=True)
+class Written:
+    """What the recorder writes on a host with its whole sensor set present: the samples' header, a sample,
+    and the ranking's header."""
+
+    header: list[str]
+    row: list[str]
+    top_header: list[str]
+
+
+WRITTEN: dict[str, Written] = {}
+
+
+def written(host: str) -> Written:
+    if host not in WRITTEN:
+        sensors = SENSORS[host]
+        z, h = counts(sensors)
+        work = scratch(f"full-{host}")
+        machine_tree(work / "root", host, numbered(sensors, list(range(z)), list(range(h))), set())
+        with Recorder(work / "root", work / "state") as r:
+            r.rows(3)
+            r.wait("memory ranking", lambda: r.rankings())
+            header, rows = r.samples()
+            top_header, _ = r.table(TOP_FILE)
+        WRITTEN[host] = Written(header, rows[-1], top_header)
+    return WRITTEN[host]
+
+
+@st.composite
+def sensor_runs(draw):
+    """A host, its sensors numbered in any order, those absent from the start, and up to three moments at which
+    some of the present ones vanish."""
+    host = draw(st.sampled_from(sorted(SENSORS)))
+    sensors = SENSORS[host]
+    z, h = counts(sensors)
+    zones = draw(st.permutations(range(z)))
+    hwmons = draw(st.permutations(range(h)))
+    names = sorted(sensors)
+    absent = draw(st.sets(st.sampled_from(names), max_size=len(names) - 1))
+    remaining = [n for n in names if n not in absent]
+    steps = []
+    for _ in range(draw(st.integers(1, 3))):
+        if not remaining:
+            break
+        gone = draw(st.sets(st.sampled_from(remaining), min_size=1, max_size=2))
+        steps.append(sorted(gone))
+        remaining = [n for n in remaining if n not in gone]
+    return host, numbered(sensors, list(zones), list(hwmons)), absent, steps
+
+
+@prop
+@needs(RECORDER)
+@checked(25)
+@given(sensor_runs())
+def p2(run):
+    """P2 A reading that is missing or vanishes is an empty field; the recorder never dies of a sensor.
+
+    Over trees where sensors are present, absent from the start, or vanish between samples, the recorder keeps
+    writing rows with every field of its header. Each field is what it is with every sensor present, or empty,
+    and a sensor that vanishes empties the fields it gave."""
+    host, sensors, absent, steps = run
+    full_header, full = written(host).header, written(host).row
+    work = scratch("p2")
+    root = work / "root"
+    machine_tree(root, host, sensors, absent)
+    told = f"on {host}, absent from the start {sorted(absent)}, vanishing {steps}"
+    with Recorder(root, work / "state") as r:
+        r.rows(3)
+        for gone in steps:
+            before = len(r.samples()[1])
+            for name in gone:
+                for path in sensors[name][1]:
+                    target = root / path
+                    shutil.rmtree(target) if target.is_dir() else target.unlink()
+            after = len(r.samples()[1])
+            r.rows(after + 3)
+            _, rows = r.samples()
+            old, new = rows[before - 1], rows[after + 1]
+            assert any(o and not n for i, (o, n) in enumerate(zip(old, new)) if full_header[i] != "time"), (
+                f"{told}: when {gone} vanished no field emptied\n  before: {old}\n  after:  {new}")
+        assert r.proc.poll() is None, f"{told}: the recorder exited; {r.said()}"
+        header, rows = r.samples()
+    assert header == full_header, f"{told}: the header is {header}, with every sensor present {full_header}"
+    for row in rows:
+        assert len(row) == len(header), f"{told}: a row of {len(row)} fields under a header of {len(header)}: {row}"
+        for name, got, want in zip(header, row, full):
+            assert name == "time" or got in ("", want), (
+                f"{told}: {name} is {got!r}, with every sensor present {want!r}\n  row: {row}")
+
+
+def machine_root(m: Machine) -> tuple[Path, Path]:
+    work = scratch("cgroups")
+    write(work / "root", core(m.host) | cgroup_files(m))
+    return work / "root", work / "state"
+
+
+def mb(row: dict[str, str], column: str) -> int:
+    return int(row[column] or 0)
+
+
+def rankings(r: Recorder, root: Path, m: Machine, burning: list[Cgroup]) -> list[list[dict[str, str]]]:
+    """The first ranking, and the next one if it comes within 1.5 s, after `burning` used half a second of CPU
+    each, so that CPU users compete with the memory holders for its rows."""
+    r.wait("memory ranking", lambda: r.rankings())
+    for c in burning:
+        c.usage += 500_000
+    write(root, {k: v for k, v in cgroup_files(m).items() if k.endswith("cpu.stat")})
+    try:
+        r.wait("second memory ranking", lambda: len(r.rankings()) > 1, timeout=1.5)
+    except Late:
+        pass
+    return r.rankings()
+
+
+def burners(m: Machine) -> st.SearchStrategy[list[Cgroup]]:
+    return st.lists(st.sampled_from(m.leaves), max_size=4, unique_by=lambda c: c.path)
+
+
+@prop
+@needs(RECORDER)
+@checked(30)
+@given(machines(), st.data())
+def p3(drawn, data):
+    """P3 Each memory ranking's rows, the rest row included, add up to the host's total.
+
+    Over cgroup trees in pc's shape and a laptop's, each ranking's anonymous, shared and swapped memory add up
+    to the root cgroup's, and swap to what /proc/meminfo says is used; each row rounds down to a MiB. Between
+    the first ranking and the next some cgroups burn CPU, so a second ranking lists CPU users too."""
+    m, _ = drawn
+    total = m.totals()
+    root, state = machine_root(m)
+    with Recorder(root, state) as r:
+        ranked = rankings(r, root, m, data.draw(burners(m)))
+    expected = {"anon_mb": total.anon // MiB, "shmem_mb": total.shmem // MiB, "swap_mb": m.swap_used_kb() // 1024}
+    for ranking in ranked:
+        for column, want in expected.items():
+            got = sum(mb(row, column) for row in ranking)
+            assert want - len(ranking) <= got <= want, (
+                f"on {m.host}, {column} sums to {got}, the host's total is {want}:\n"
+                + "\n".join(f"  {row}" for row in ranking))
+
+
+@st.composite
+def pc_with_panes(draw):
+    return draw(machines("pc", draw(st.integers(1, 6))))
+
+
+@prop
+@needs(RECORDER)
+@checked(30)
+@given(pc_with_panes(), st.data())
+def p4(drawn, data):
+    """P4 On pc, a worker's tmux pane that holds more than the ranking's threshold is a row of its own, never
+    folded into the rest row.
+
+    Over pc-shaped trees whose worker panes sit directly under a user manager, among other cgroups over the
+    threshold that can outnumber the ranking's rows, every pane over it is one row of each ranking, holding
+    what the pane holds. Between the first ranking and the next some cgroups burn CPU."""
+    m, panes = drawn
+    by_name = {c.name: c for c in m.leaves}
+    root, state = machine_root(m)
+    with Recorder(root, state) as r:
+        ranked = rankings(r, root, m, data.draw(burners(m)))
+    for n, ranking in enumerate(ranked, start=1):
+        for pane in sorted(panes):
+            c = by_name[pane]
+            rows = [row for row in ranking if row.get("unit") == pane]
+            assert len(rows) == 1, (f"pane {pane}, holding {c.held // MiB} MiB, is {len(rows)} rows of ranking {n}:\n"
+                                    + "\n".join(f"  {row}" for row in ranking))
+            got = (mb(rows[0], "anon_mb"), mb(rows[0], "shmem_mb"), mb(rows[0], "swap_mb"))
+            assert got == (c.anon // MiB, c.shmem // MiB, c.swap // MiB), (
+                f"pane {pane} holds anon, shmem, swap {(c.anon // MiB, c.shmem // MiB, c.swap // MiB)} MiB, "
+                f"its row in ranking {n} says {got}")
+
+
+# --------------------------------------------------------------------------
+# the reader
+# --------------------------------------------------------------------------
+
+OLD_SAMPLE_HEADER = ("time,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,mhz_max,load1,profile,spl_w,sppt_w,ac,bat_pct,bat_w,"
+                     "dgpu_disable,dgpu_port,dgpu_drv,mem_avail_mb,swap_used_mb")
+OLD_TOP_HEADER = "time,unit,cpu_pct,anon_mb,shmem_mb,swap_mb,procs,process,cwd"
+"""thermal-log's columns, which the laptop's history from before the host recorder is in."""
+
+MANAGERS = ["system", "user@1000", "user@1001", "user@1002"]
+TZ = "Europe/Berlin"
+
+READINGS = {
+    "mhz_max": lambda rng: str(rng.randint(400, 5200)),
+    "load1": lambda rng: f"{rng.uniform(0, 30):.2f}",
+    "mem_avail_mb": lambda rng: str(rng.randint(100, 60000)),
+    "swap_used_mb": lambda rng: str(rng.randint(0, 8000)),
+    "profile": lambda rng: rng.choice(["quiet", "balanced", "performance"]),
+    "bat_w": lambda rng: f"{rng.uniform(0, 90):.1f}",
+    "dgpu_port": lambda rng: rng.choice(["D0", "D3cold"]),
+    "dgpu_drv": lambda rng: rng.choice(["", "0", "1"]),
+}
+"""A sample column's reading, by name; a column not named here reads as a whole number, a pressure column as
+a share, a temperature as degrees."""
+
+
+def reading(column: str, rng: Random) -> str:
+    if rng.random() < 0.05:
+        return ""
+    if column in READINGS:
+        return READINGS[column](rng)
+    if column.startswith("mem_") and "_avg" in column:
+        return f"{rng.uniform(0, 40):.2f}"
+    if column.endswith("_c"):
+        return str(rng.randint(15, 95))
+    return str(rng.randint(0, 6000))
+
+
+@dataclass(frozen=True)
+class Run:
+    """One life of the recorder: the samples it wrote, by number, whether it was the host recorder or
+    thermal-log before it, and whether a power cut ended it partway through a row."""
+
+    first: int
+    last: int
+    current: bool
+    cut: bool
+
+
+@dataclass(frozen=True)
+class Recording:
+    host: str
+    start: datetime
+    runs: list[Run]
+    units: list[tuple[str, str]]
+    seed: int
+    at: str
+
+
+CASES = ("a day file that switches columns", "a unit under several managers", "a row a power cut ended")
+COVERED: Counter = Counter()
+"""How many P6 examples asked about a window holding each of CASES, so a run that met one too rarely fails."""
+
+
+@st.composite
+def recordings(draw) -> Recording:
+    """How a host's recorder ran: a sample every five seconds, over a few minutes to an hour and a half,
+    across midnight at times, in two to four runs with the host down between them. On the laptop the first
+    runs may be thermal-log's, the rest the host recorder's. The units its rankings name, a name under one to
+    three managers. And a moment to ask about, aimed at one of CASES or at any sample."""
+    aim = draw(st.sampled_from([*CASES, "any sample"]))
+    switching, managed, cut = (aim == c for c in CASES)
+    host = "zephylux" if switching else draw(st.sampled_from(["pc", "zephylux"]))
+    start = datetime(2026, 9, draw(st.integers(20, 27)), draw(st.sampled_from([0, 7, 13, 23])),  # noqa: DTZ001
+                     draw(st.integers(0, 59)), draw(st.integers(0, 59)))  # the recorder stamps local time
+    total = draw(st.integers(3, 90)) * 12
+    bounds = [0, *sorted(draw(st.lists(st.integers(1, total - 1), min_size=1, max_size=3, unique=True))), total]
+    count = len(bounds) - 1
+    old = 0
+    if switching:
+        old = draw(st.integers(1, count - 1))
+    elif host == "zephylux":
+        old = draw(st.integers(0, count - 1 if managed else count))
+    lives = []
+    for i, (a, b) in enumerate(itertools.pairwise(bounds)):
+        short = st.integers(0, min(24, b - a - 1))
+        down = 0 if not i else draw(short if switching and i == old else short | st.integers(0, min(240, b - a - 1)))
+        lives.append(Run(a + down, b - 1, current=i >= old, cut=draw(st.booleans())))
+    names = draw(st.lists(st.sampled_from(SERVICES + APPS) | st.uuids().map(lambda u: f"tmux-spawn-{u}.scope"),
+                          min_size=1, max_size=6, unique=True))
+    units = [(m, name) for i, name in enumerate(names) for m in draw(
+        st.lists(st.sampled_from(MANAGERS), min_size=2 if managed and not i else 1, max_size=3, unique=True))]
+    if switching:
+        near = lives[old].first
+    elif managed:
+        near = draw(st.integers(lives[-1].first, lives[-1].last))
+    elif cut:
+        k = draw(st.integers(0, count - 1))
+        lives[k] = replace(lives[k], cut=True)
+        near = lives[k].last
+    else:
+        near = draw(st.integers(0, total - 1))
+    at = start + timedelta(seconds=5 * near + draw(st.integers(-60, 120)))
+    return Recording(host, start, lives, units, draw(st.integers(0, 2**32)), at.strftime("%Y-%m-%d %H:%M:%S"))
+
+
+@dataclass
+class Directory:
+    """The recorder's directory as the runs of a Recording leave it."""
+
+    lines: dict[str, list[str]] = field(default_factory=dict)
+    unterminated: set[str] = field(default_factory=set)
+    """Files whose last line a power cut left without its newline."""
+    rows: list[tuple[str, str, bool]] = field(default_factory=list)
+    """Every sample row: its time, its day file, and whether the host recorder wrote it."""
+    ranked: list[tuple[str, str, str]] = field(default_factory=list)
+    """Every ranking row that names its manager: its time, manager and unit."""
+
+    def append(self, name: str, header: list[str], row: str) -> None:
+        """What either recorder does: a new file starts with its header, and a row written after a power cut
+        and no repair joins the cut one."""
+        lines = self.lines.setdefault(name, [",".join(header)])
+        if name in self.unterminated:
+            lines[-1] += row
+            self.unterminated.discard(name)
+        else:
+            lines.append(row)
+
+    def continue_day(self, name: str, header: list[str]) -> None:
+        """What the host recorder does to a day file it continues: a cut row gets ,torn and its newline, and the
+        file gets this run's header when it was last under other columns."""
+        if name not in self.lines:
+            return
+        lines = self.lines[name]
+        if name in self.unterminated:
+            lines[-1] += ",torn"
+            self.unterminated.discard(name)
+        if [line for line in lines if line.startswith("time,")][-1] != ",".join(header):
+            lines.append(",".join(header))
+
+    def cut(self, name: str, rng: Random) -> None:
+        line = self.lines[name][-1]
+        self.lines[name][-1] = line[: rng.randint(1, len(line) - 1)]
+        self.unterminated.add(name)
+
+    def files(self) -> dict[str, str]:
+        return {name: "\n".join(lines) + ("" if name in self.unterminated else "\n")
+                for name, lines in self.lines.items()}
+
+
+def directory(recording: Recording) -> Directory:
+    """The files a Recording's runs write, in the columns the host recorder writes on its host today and in
+    thermal-log's before it."""
+    current = written(recording.host)
+    rng = Random(recording.seed)
+    d = Directory()
+    for run in recording.runs:
+        sample_header = current.header if run.current else OLD_SAMPLE_HEADER.split(",")
+        top_header = current.top_header if run.current else OLD_TOP_HEADER.split(",")
+        day = f"{recording.start + timedelta(seconds=5 * run.first):%Y-%m-%d}"
+        if run.current:
+            d.continue_day(f"{day}.csv", sample_header)
+            d.continue_day(f"{day}.top.csv", top_header)
+        last = ""
+        for n in range(run.first, run.last + 1):
+            t = recording.start + timedelta(seconds=5 * n)
+            stamp, day = f"{t:%Y-%m-%d %H:%M:%S}", f"{t:%Y-%m-%d}"
+            d.append(f"{day}.csv", sample_header,
+                     ",".join([stamp, *(reading(c, rng) for c in sample_header[1:])]))
+            d.rows.append((stamp, f"{day}.csv", run.current))
+            last = f"{day}.csv"
+            if (n - run.first) % 12:
+                continue
+            for manager, unit in rng.sample(recording.units, rng.randint(1, len(recording.units))):
+                row = ranking_row(rng, stamp, unit, old=not run.current) | {"manager": manager}
+                d.append(f"{day}.top.csv", top_header, ",".join(row.get(c, "") for c in top_header))
+                if run.current:
+                    d.ranked.append((stamp, manager, unit))
+            rest = {k: v for k, v in ranking_row(rng, stamp, "(rest)", old=not run.current).items()
+                    if k in ("time", "unit", "cpu_pct", "anon_mb", "shmem_mb", "swap_mb")}
+            d.append(f"{day}.top.csv", top_header, ",".join(rest.get(c, "") for c in top_header))
+            last = f"{day}.top.csv"
+        if run.cut:
+            d.cut(last, rng)
+    return d
+
+
+def ranking_row(rng: Random, stamp: str, unit: str, old: bool) -> dict[str, str]:
+    """A ranking row's fields by column. thermal-log let a carriage return through from a process name."""
+    process = rng.choice(["claude", "node", "python3", "bash", *(["tmux: client\r"] if old else [])])
+    return {"time": stamp, "unit": unit, "cpu_pct": rng.choice(["", str(rng.randint(10, 800))]),
+            "anon_mb": str(rng.randint(0, 9000)), "shmem_mb": str(rng.randint(0, 2000)),
+            "swap_mb": str(rng.randint(0, 1000)), "procs": str(rng.randint(1, 40)), "process": process,
+            "cwd": f"~/repos/project {rng.randint(0, 6)}", "mem_some_avg60": f"{rng.uniform(0, 40):.2f}",
+            "mem_full_avg60": f"{rng.uniform(0, 20):.2f}"}
+
+
+STAND_IN = """#!/usr/bin/env bash
+# ssh, standing in: runs the command it is given here, as a login on the host would, with the recorder
+# files at {logs} while it runs.
+echo "$*" >> {calls}
+while getopts 46AaCfGgKkMNnqsTtVvXxYyB:b:c:D:E:e:F:I:i:J:L:l:m:O:o:P:p:Q:R:S:W:w: _; do :; done
+shift $((OPTIND - 1))
+host=$1; shift
+ln -sfn {full} {flip} && mv -T {flip} {logs}
+env -i HOME="$HOME" USER="$USER" TZ={tz} LANG=C.UTF-8 PATH={path} bash -c "$*"
+status=$?
+ln -sfn {empty} {flip} && mv -T {flip} {logs}
+exit $status
+"""
+
+
+@functools.cache
+def reader_scene() -> dict[str, Path]:
+    """The directories and stand-ins every P6 example shares. The directory both reads name has a space and a
+    quote in its name, which the command sent through ssh has to carry."""
+    base = scratch("reader")
+    paths = {k: base / k for k in ("full", "empty", "stubs", "calls", "flip")}
+    paths["logs"] = base / "recorder files, max's"
+    paths["empty"].mkdir()
+    paths["stubs"].mkdir()
+    paths["logs"].symlink_to(paths["empty"])
+    stubs = paths["stubs"]
+    (stubs / "journalctl").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (stubs / "ssh").write_text("#!/usr/bin/env bash\necho 'ssh: the reader ran ssh from PATH, not "
+                               "$HOST_RECORDER_SSH' >&2\nexit 255\n")
+    paths["stand_in"] = base / "ssh-stand-in"
+    paths["stand_in"].write_text(STAND_IN.format(
+        **{k: shlex.quote(str(paths[k])) for k in ("logs", "full", "empty", "calls", "flip")}, tz=TZ,
+        path=shlex.quote(f"{stubs}:{REPO / 'bin'}:{os.environ['PATH']}")))
+    for script in (stubs / "journalctl", stubs / "ssh", paths["stand_in"]):
+        script.chmod(0o755)
+    paths["path"] = Path(f"{stubs}:{os.environ['PATH']}")
+    return paths
+
+
+def flip(s: dict[str, Path], to: Path) -> None:
+    s["flip"].unlink(missing_ok=True)
+    s["flip"].symlink_to(to)
+    s["flip"].replace(s["logs"])
+
+
+def answer(s: dict[str, Path], *host: str, at: str) -> dict:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HOST_RECORDER")}
+    env |= {"PATH": str(s["path"]), "TZ": TZ, "HOST_RECORDER_SSH": str(s["stand_in"])}
+    result = subprocess.run([str(READER), *host, "--logdir", str(s["logs"]), "--at", at, "--json"],
+                            env=env, capture_output=True, text=True, timeout=120, check=False)
+    how = f"read {'through ssh from ' + host[1] if host else 'locally'}"
+    assert result.returncode == 0, f"{how}, the reader exited {result.returncode}:\n{result.stderr[-2000:]}"
+    try:
+        out = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"{how}, the reader's --json is not JSON ({e}):\n{result.stdout[:2000]}") from None
+    if isinstance(out, dict):
+        out.pop("host", None)
+    return out
+
+
+def covered(recording: Recording, d: Directory, local: dict) -> None:
+    lo, hi = local.get("from") or "", local.get("to") or ""
+    inside = [(name, current) for stamp, name, current in d.rows if lo <= stamp <= hi]
+    if any((name, not current) in inside for name, current in inside):
+        COVERED[CASES[0]] += 1
+    managers = {(manager, unit) for stamp, manager, unit in d.ranked if lo <= stamp <= hi}
+    if any(n > 1 for n in Counter(unit for _, unit in managers).values()):
+        COVERED[CASES[1]] += 1
+    ends = [f"{recording.start + timedelta(seconds=5 * r.last):%Y-%m-%d %H:%M:%S}" for r in recording.runs if r.cut]
+    if any(lo <= end <= hi for end in ends):
+        COVERED[CASES[2]] += 1
+
+
+@prop
+@needs(READER)
+@needs(RECORDER)
+@checked(40)
+@given(recordings())
+def p6(recording):
+    """P6 The reader gives the same answer for the same files whether it reads them locally or over ssh.
+
+    Over directories of recorder files, in the host recorder's columns and thermal-log's, with day files the
+    host recorder continued after a restart or a power cut, the reader's answer about a moment is the same
+    read locally and read from pc through the stand-in ssh, apart from a `host` field naming where it read."""
+    d = directory(recording)
+    s = reader_scene()
+    shutil.rmtree(s["full"], ignore_errors=True)
+    s["full"].mkdir()
+    for name, text in d.files().items():
+        (s["full"] / name).write_text(text)
+    s["calls"].unlink(missing_ok=True)
+    flip(s, s["full"])
+    try:
+        local = answer(s, at=recording.at)
+    finally:
+        flip(s, s["empty"])
+    remote = answer(s, "--host", "pc", at=recording.at)
+    assert s["calls"].exists(), "asked about pc, the reader never ran the stand-in ssh"
+    assert local == remote, (f"about {recording.at}, read locally:\n{json.dumps(local, indent=1)[:3000]}\n"
+                             f"read through ssh:\n{json.dumps(remote, indent=1)[:3000]}")
+    covered(recording, d, local)
+
+
+# --------------------------------------------------------------------------
+# running them
+# --------------------------------------------------------------------------
+
+
+def main() -> int:
+    failures = 0
+    try:
+        for p in PROPERTIES:
+            title = " ".join(p.__doc__.split("\n\n")[0].split())
+            expected = getattr(p, "expected", None)
+            try:
+                p()
+            except Exception as e:
+                if expected and isinstance(e, expected[1]):
+                    print(f"xfail {title}\n      (holds once {expected[0]} lands: {e})")
+                    continue
+                failures += 1
+                print(f"FAIL  {title}")
+                print("".join("      " + row for row in "".join(traceback.format_exception(e)).splitlines(True)))
+                continue
+            if expected:
+                failures += 1
+                print(f"FAIL  {title}\n      holds, but is still marked as an expected failure naming "
+                      f"{expected[0]}: delete the mark")
+            elif p is p6 and (rare := [c for c in CASES if COVERED[c] < 3]):
+                failures += 1
+                print(f"FAIL  {title}\n      holds, but fewer than 3 examples asked about a window with "
+                      f"{' or '.join(rare)}, too few for it to say anything ({dict(COVERED)})")
+            else:
+                print(f"ok    {title}")
+    finally:
+        shutil.rmtree(SCRATCH, ignore_errors=True)
+    print()
+    print("FAILED" if failures else "all ok")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

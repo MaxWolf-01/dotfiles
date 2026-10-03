@@ -90,7 +90,7 @@ The driver's own view: `cat /proc/driver/nvidia/gpus/0000:01:00.0/power`.
 `dgpu`'s runs at boot and on a driver load: `journalctl -b -u dgpu-auto`; after
 a wake: `journalctl -b -u dgpu-resume`, and the sleep hook's unlock under
 `journalctl -b -u 'systemd-*suspend*' -u 'systemd-*hibernate*'`.
-History: thermal-log's `dgpu_port` column (D3cold or D0 every 5 s).
+History: the host recorder's `dgpu_port` column (D3cold or D0 every 5 s).
 
 ### Traps
 

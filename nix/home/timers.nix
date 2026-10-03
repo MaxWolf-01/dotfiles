@@ -23,8 +23,8 @@ let
     bash coreutils gnugrep git gh openssh jq # jq: bin/run-log builds its line with it
   ]);
 
-  thermalPath = lib.makeBinPath (with pkgs; [
-    bash coreutils findutils gawk
+  recorderPath = lib.makeBinPath (with pkgs; [
+    bash coreutils findutils
   ]);
 
   lockSignPath = lib.makeBinPath (with pkgs; [
@@ -754,15 +754,15 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Thermal history ---
+  # --- Host recorder ---
   # Runs continuously rather than on a timer: the point is the seconds before a
-  # hard power cut, which a timer's granularity would miss.
+  # hang or a hard power cut, which a timer's granularity would miss.
 
-  systemd.user.services.thermal-log = {
-    Unit.Description = "Sample temperatures, fans and CPU power caps to CSV";
+  systemd.user.services.host-recorder = {
+    Unit.Description = "Record memory, CPU and sensors to CSV";
     Service = {
-      Environment = [ "PATH=${thermalPath}" ];
-      ExecStart = "${dotfiles}/bin/thermal-log";
+      Environment = [ "PATH=${recorderPath}" ];
+      ExecStart = "${dotfiles}/bin/host-recorder";
       Restart = "always";
       RestartSec = 10;
       Nice = 19;
