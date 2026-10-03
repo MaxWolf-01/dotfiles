@@ -134,6 +134,9 @@
 
   .pane { display: flex; flex-direction: column; width: 100%; height: 100%; }
   .pane iframe { flex: 1; width: 100%; border: 0; display: block; background: var(--ground); }
+  .figure { flex: 1; position: relative; overflow: hidden; background: var(--ground); cursor: grab; touch-action: none; }
+  .figure.dragging { cursor: grabbing; }
+  .figure img { position: absolute; max-width: none; user-select: none; }
 </style>
 <div class="side" id="rail-side">
 <aside id="rail">
@@ -159,7 +162,10 @@
       <kbd>ctrl+alt+d</kbd><span>done: mark the page seen, open the next unseen</span>
       <kbd>ctrl+alt+n</kbd><span>next unseen page after this one</span>
       <kbd>ctrl+alt+ +/-</kbd><span>zoom the focused page alone</span>
-      <kbd>ctrl+alt+#</kbd><span>its zoom back to 100%</span>
+      <kbd>ctrl+alt+#</kbd><span>its zoom back to 100%; a figure back to fit</span>
+      <kbd>wheel, drag</kbd><span>zoom, pan a figure</span>
+      <kbd>double-click</kbd><span>a figure at 100%, and back to fit</span>
+      <kbd>ctrl+alt+o</kbd><span>the focused page as a browser tab</span>
       <kbd>ctrl+alt+0</kbd><span>overview</span>
       <kbd>ctrl+alt+b</kbd><span>board, over everything</span>
       <kbd>ctrl+alt+m</kbd><span>minimize ruled, on and off</span>
@@ -167,7 +173,7 @@
       <kbd>ctrl+alt+shift+k</kbd><span>fold this list open and shut</span>
       <kbd>ctrl+alt+w</kbd><span>close the page</span>
       <kbd>click</kbd><span>link as a panel</span>
-      <kbd>ctrl+click</kbd><span>link as a tab</span>
+      <kbd>ctrl+click</kbd><span>link or sheet row as a tab</span>
     </div>
   </details>
   <div class="v-meta log" id="log"></div>
@@ -367,7 +373,7 @@ function apply({ select } = {}) {
   ws.setDocument(doc, { animate: false });
   labelTabs();
   for (const v of ws.views()) { // a new document drops the tabs' badges
-    const z = zooms[v.params.url];
+    const z = figures.has(v.id) ? figures.get(v.id).scale() : zooms[v.params.url];
     ws.view(v.id)?.setBadge(z ? `${Math.round(z * 100)}%` : null);
   }
   if (wholeGroup && viewsOf(current).length) ws.navigation.frame(viewsOf(current));
@@ -491,6 +497,14 @@ function route(href, G) {
 // A browser tab cannot open file:// from an http page; the hub serves the same file.
 const tabUrl = (href) => (href.startsWith("file://") ? `${location.origin}/f${new URL(href).pathname}` : href);
 
+// A page on its own, where the browser's zoom, save and print act on it rather than on the container.
+const openInTab = (url) => window.open(tabUrl(new URL(url, location.href).href), "_blank");
+function openFocusedInTab() {
+  const view = ws.view(ws.getSnapshot().focusedView ?? "");
+  if (!view) return note("focus a page first (click it, or ctrl+alt+h/j/k/l)");
+  openInTab(view.params.url);
+}
+
 function onKey(e) {
   if (!(e.ctrlKey && e.altKey)) return false;
   const letter = /^[a-z]$/i.test(e.key) ? e.key.toLowerCase() : e.code.startsWith("Key") ? e.code.slice(3).toLowerCase() : null;
@@ -508,6 +522,7 @@ function onKey(e) {
   else if (letter === "b") toggleBoard();
   else if (letter === "z") toggleMaximize();
   else if (letter === "w") closeFocused();
+  else if (letter === "o") openFocusedInTab();
   else if (letter === "m") setHideRuled(!hideRuled);
   else if (letter === "a") toggleSide("rail");
   else if (letter === "s") toggleSide("sheet");
@@ -627,6 +642,7 @@ function applyZoom(view) {
 function zoomFocused(step) {
   const view = ws.view(ws.getSnapshot().focusedView ?? "");
   if (!view) return note("focus a page first (click it, or ctrl+alt+h/j/k/l)");
+  if (figures.has(view.id)) return figures.get(view.id).step(step);
   const i = STEPS.indexOf(zooms[view.params.url] ?? 1);
   const z = step === 0 ? 1 : STEPS[Math.max(0, Math.min(STEPS.length - 1, i + step))];
   if (z === 1) delete zooms[view.params.url];
@@ -688,6 +704,88 @@ function wire(iframe, view) {
   }, true);
 }
 
+// ---- a figure: an image in a pane of its own, fitted to it, zoomed with the wheel and panned by dragging
+
+const FIGURE = /\.(svg|png|jpe?g|gif|webp|avif)$/i;
+const isFigure = (url) => FIGURE.test(new URL(url, location.href).pathname);
+const figures = new Map(); // view id -> { step(n), scale() }: what the zoom keys and the tab's badge reach
+
+// An SVG drawn to fill its page (width="100%", as mermaid writes it) has no size of its own; its viewBox gives one.
+async function naturalSize(img, url) {
+  if (!/\.svg$/i.test(new URL(url, location.href).pathname)) return { w: img.naturalWidth, h: img.naturalHeight };
+  const svg = new DOMParser().parseFromString(await (await fetch(url)).text(), "image/svg+xml").documentElement;
+  const box = (svg.getAttribute("viewBox") || "").trim().split(/[\s,]+/).map(Number);
+  const px = (a) => (/^[\d.]+(px)?$/.test(svg.getAttribute(a) || "") ? parseFloat(svg.getAttribute(a)) : 0);
+  return box.length === 4 && box[2] > 0 ? { w: box[2], h: box[3] } : { w: px("width") || img.naturalWidth, h: px("height") || img.naturalHeight };
+}
+
+function figure(element, view) {
+  const pane = Object.assign(document.createElement("div"), { className: "pane" });
+  const box = Object.assign(document.createElement("div"), { className: "figure" });
+  const img = Object.assign(document.createElement("img"), { src: view.params.url, alt: view.title, draggable: false });
+  box.append(img);
+  pane.append(box);
+  element.append(pane);
+  // Sized rather than CSS-transformed, so an SVG is drawn again at every zoom and stays sharp.
+  let size = null, s = 1, x = 0, y = 0, fitted = true;
+  const draw = () => {
+    Object.assign(img.style, { width: `${size.w * s}px`, height: `${size.h * s}px`, left: `${x}px`, top: `${y}px` });
+    view.setBadge(fitted ? null : `${Math.round(s * 100)}%`);
+  };
+  const fit = () => {
+    if (!size || !box.clientWidth) return;
+    s = Math.min(box.clientWidth / size.w, box.clientHeight / size.h);
+    x = (box.clientWidth - size.w * s) / 2;
+    y = (box.clientHeight - size.h * s) / 2;
+    fitted = true;
+    draw();
+  };
+  const zoomTo = (next, cx = box.clientWidth / 2, cy = box.clientHeight / 2) => {
+    if (!size) return;
+    next = Math.max(0.05, Math.min(40, next));
+    x = cx - ((cx - x) * next) / s;
+    y = cy - ((cy - y) * next) / s;
+    s = next;
+    fitted = false;
+    draw();
+  };
+  img.addEventListener("load", async () => {
+    size = await naturalSize(img, view.params.url);
+    fit();
+  });
+  new ResizeObserver(() => fitted && fit()).observe(box);
+  box.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    e.stopPropagation(); // the workspace would pan its camera
+    const r = box.getBoundingClientRect();
+    zoomTo(s * Math.exp(-e.deltaY * (e.deltaMode === 1 ? 16 : 1) * 0.0015), e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  box.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    const start = { px: e.clientX, py: e.clientY, x, y };
+    box.setPointerCapture(e.pointerId);
+    box.classList.add("dragging");
+    box.onpointermove = (m) => {
+      x = start.x + m.clientX - start.px;
+      y = start.y + m.clientY - start.py;
+      fitted = false;
+      draw();
+    };
+    box.onpointerup = () => { box.onpointermove = box.onpointerup = null; box.classList.remove("dragging"); };
+  });
+  box.addEventListener("dblclick", (e) => {
+    const r = box.getBoundingClientRect();
+    if (fitted) zoomTo(1, e.clientX - r.left, e.clientY - r.top);
+    else fit();
+  });
+  figures.set(view.id, {
+    step: (n) => (n === 0 ? fit() : zoomTo(s * (n > 0 ? 1.25 : 0.8))),
+    scale: () => (fitted ? null : s),
+  });
+  const offGuard = view.guardClose(() => { close(view.id); return false; });
+  return () => { offGuard(); figures.delete(view.id); pane.remove(); };
+}
+
 // ---- the view types
 
 function frame(element, view, { onClose } = {}) {
@@ -702,15 +800,20 @@ function frame(element, view, { onClose } = {}) {
   return () => { offGuard(); pane.remove(); };
 }
 
+const tabMenu = (view) => [{ id: "tab", label: "Open in a browser tab", shortcut: "Ctrl+Alt+O", run: () => openInTab(view.params.url) }];
 const types = {
-  page: { title: (v) => v.title, minSize: { width: 720, height: 480 }, mount: (el, view) => frame(el, view) },
+  page: {
+    title: (v) => v.title, minSize: { width: 720, height: 480 }, menu: tabMenu,
+    mount: (el, view) => (isFigure(view.params.url) ? figure(el, view) : frame(el, view)),
+  },
   // A diffview reflows badly when narrow, so it lays out wide and scales down instead.
-  diff: { title: (v) => v.title, minSize: { width: 1180, height: 640 }, mount: (el, view) => frame(el, view) },
-  session: { title: (v) => v.title, minSize: { width: 420, height: 360 }, mount: (el, view) => frame(el, view) },
+  diff: { title: (v) => v.title, minSize: { width: 1180, height: 640 }, menu: tabMenu, mount: (el, view) => frame(el, view) },
+  session: { title: (v) => v.title, minSize: { width: 420, height: 360 }, menu: tabMenu, mount: (el, view) => frame(el, view) },
   // The board is the whole tree's: one, floating over every group, toggled rather than closed.
   board: {
     title: "board",
     minSize: { width: 900, height: 560 },
+    menu: tabMenu,
     mount: (el, view) => frame(el, view, { onClose: () => { toggleBoard(); return false; } }),
   },
 };
@@ -796,7 +899,8 @@ function artRow(a, snap, inLayout, label) {
   row.querySelector(".t").title = a.kind === "diff" ? a.title : decodeURIComponent(a.url.replace(/^\/f/, ""));
   row.querySelector(".st").textContent = where;
   row.querySelector("button.tick")?.addEventListener("click", () => markSeen(a.url, !seen));
-  row.querySelector(".t").onclick = () => userOpen(a, current);
+  row.querySelector(".t").onclick = (e) => (e.ctrlKey || e.metaKey || e.shiftKey ? openInTab(a.url) : userOpen(a, current));
+  row.querySelector(".t").onauxclick = (e) => e.button === 1 && openInTab(a.url);
   return row;
 }
 
@@ -922,13 +1026,25 @@ events.onopen = () => {
   lost = false;
   for (const p of pending) if (p.unsent) send(p);
   refresh().then(() => apply()); // events sent while away are gone
-  note("hub back; caught up");
+  if (saidDown) note("hub back; caught up");
+  saidDown = false;
 };
+// The stream drops for more than the hub going away (the browser's save dialog drops it, say), and reconnects on
+// its own; the hub counts as down only once the stream is still closed and the hub does not answer either.
+let checking = false, saidDown = false;
 events.onerror = () => {
-  lost = true;
-  status.innerHTML = "hub: down, retrying. start it with<br><code></code>";
-  status.querySelector("code").textContent = RESTART;
-  status.classList.add("lost");
+  lost = true; // whatever dropped the stream, the events sent meanwhile are gone: onopen reads again
+  if (checking) return;
+  checking = true;
+  setTimeout(async () => {
+    checking = false;
+    if (events.readyState === EventSource.OPEN) return;
+    if (await fetch("/.health", { cache: "no-store" }).then((r) => r.ok, () => false)) return;
+    saidDown = true;
+    status.innerHTML = "hub: down, retrying. start it with<br><code></code>";
+    status.querySelector("code").textContent = RESTART;
+    status.classList.add("lost");
+  }, 1500);
 };
 events.onmessage = async (e) => {
   const ev = JSON.parse(e.data);
