@@ -3,8 +3,9 @@
 # requires-python = ">=3.12"
 # dependencies = ["playwright"]
 # ///
-"""Drive a container's view (bin/container-hub.html) in headless Chromium and check what it promises: keys
-that answer with the hub frozen, rulings from the tracker, links and keys inside a page. Run it directly; no
+"""Drive the hub tab (bin/container-hub.html) in headless Chromium and check what it promises: keys that answer
+with the hub frozen, rulings from the tracker, links and keys inside a page, the rail's numbers following the
+sessions' turns while focus stays put, and a page that still loads with many units open. Run it directly; no
 framework. Skips when no chromium is on PATH ($CHROMIUM overrides).
 
 GNOME takes its own bindings before a browser sees them, so a key that clashes with one passes here and
@@ -34,6 +35,7 @@ SCRATCH = Path(tempfile.mkdtemp(prefix="container-hub-view-test."))
 HOME = SCRATCH / "home"
 ORCHESTRATOR = "aaaaaaaa-0000-4000-8000-000000000001"
 SECOND = "bbbbbbbb-0000-4000-8000-000000000002"  # an orchestrator of another subtree of the same tree
+SELF_STARTED = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
 
 failures = 0
 
@@ -72,6 +74,15 @@ def git(cwd: Path, *args: str) -> None:
 def ticket(slug: str, status: str = "open", parent: str | None = None) -> None:
     (AGENT / "tickets" / f"{slug}.md").write_text(
         TICKET.format(status=status, parent=f"parent: {parent}\n" if parent else "", slug=slug))
+
+
+def registered(session: str, at: float, status: str = "idle") -> None:
+    """The session's file in the registry, as Claude Code writes it while the session's process runs: here this
+    test's own process, which runs for as long as the hub reads it."""
+    path = HOME / ".claude" / "sessions" / f"{session[:8]}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": os.getpid(), "procStart": SELF_STARTED, "sessionId": session, "status": status,
+                                "statusUpdatedAt": int(at * 1000)}))
 
 
 def page(rel: str, body: str) -> Path:
@@ -156,9 +167,12 @@ def api(path: str, body: dict | None = None) -> dict:
 
 try:
     hub = start_hub()
+    t0 = time.time()
+    os.utime(pages[0], (t0 - 100, t0 - 100))  # the session page's render: when ORCHESTRATOR last finished a turn
+    registered(ORCHESTRATOR, t0 - 100)
     opened = [api("/api/open", {"target": str(p), "session": ORCHESTRATOR}) for p in pages]
-    key, view_path = opened[0]["container"], opened[0]["view"]
-    ids = {p.parent.name: o["id"] for p, o in zip(pages, opened)}
+    mids = {p.parent.name: o["id"] for p, o in zip(pages, opened)}
+    ids = {k: f"{ORCHESTRATOR}~{v}" for k, v in mids.items()}  # a page's view in the hub tab is its unit's
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(executable_path=CHROMIUM)
@@ -166,7 +180,7 @@ try:
         view = context.new_page()
         errors = []
         view.on("pageerror", lambda e: errors.append(str(e)))
-        view.goto(ORIGIN + view_path)
+        view.goto(ORIGIN + "/")
         view.wait_for_function("window.wc && ws.views().length === 3", timeout=30000)
         docked = lambda: sorted(view.evaluate("ws.views().filter(v => v.placement === 'docked').map(v => v.id)"))
         focused = lambda: view.evaluate("ws.getSnapshot().focusedView")
@@ -199,19 +213,19 @@ try:
         settles("ctrl+alt+1 goes into the first orchestrator", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
 
         # the keys answer with the hub frozen: it gets the change once it runs again
-        hub_view = lambda: api("/api/c/" + urllib.parse.quote(key, safe=""))
-        csv_import = lambda: next(m for m in hub_view()["members"] if m["id"] == ids["csv-import"])
-        events, listening = [], threading.Event()  # what the hub broadcasts on the container
+        hub_view = lambda: api("/api/u/" + ORCHESTRATOR)
+        csv_import = lambda: next(m for m in hub_view()["members"] if m["id"] == mids["csv-import"])
+        events, listening = [], threading.Event()  # what the hub broadcasts
 
         def listen() -> None:
-            with urllib.request.urlopen(ORIGIN + "/events/" + urllib.parse.quote(key, safe="")) as r:
+            with urllib.request.urlopen(ORIGIN + "/events") as r:
                 for line in r:
                     listening.set()
                     if line.startswith(b"data:"):
                         events.append(json.loads(line[5:]))
 
         threading.Thread(target=listen, daemon=True).start()
-        check("the test hears the container's events", True, listening.wait(30))
+        check("the test hears the hub's events", True, listening.wait(30))
         # the close is held back on its way, so a reopen sent without waiting on it would reach the hub first
         view.route("**/api/close", lambda r: (time.sleep(1), r.continue_()))
         os.killpg(hub.pid, signal.SIGSTOP)
@@ -228,7 +242,7 @@ try:
             view.unroute("**/api/close")
         # closed reads False before the close arrives too, so the read waits until the hub has applied both
         settles("the hub has the close and the reopen once it runs again", {"close", "reopened"},
-                lambda: {e["type"] for e in events if e.get("id") == ids["csv-import"]})
+                lambda: {e["type"] for e in events if e.get("id") == mids["csv-import"]})
         check("...in that order", False, csv_import()["closed"])
         settles("...and the seen mark", True, lambda: any(u.endswith("/map-columns/index.html") for u in hub_view()["seen"]))
 
@@ -252,7 +266,7 @@ try:
         frame_of("map-columns").click("#link")
         view.wait_for_function("ws.views().some(v => v.params.url.endsWith('/other.html'))", timeout=10000)
         other = view.evaluate("ws.views().find(v => v.params.url.endsWith('/other.html')).params")
-        check("a plain click on a link opens it as a panel in the page's group", (ORCHESTRATOR, "map-columns"),
+        check("a plain click on a link opens it as a panel in the page's unit", (ORCHESTRATOR, "map-columns"),
               (other["group"], other["ticket"]))
         focus("map-columns")  # other.html took its panel's front tab
         with context.expect_page(timeout=30000) as tab:
@@ -282,7 +296,7 @@ try:
         settles("ctrl+alt+0 from inside a page goes to the overview", None, lambda: view.evaluate("wc.current"))
 
         # maximize: ctrl+alt+z takes the focused panel to the whole workspace and back
-        diff_id = api("/api/open", {"target": str(DIFF), "session": ORCHESTRATOR})["id"]
+        diff_id = f"{ORCHESTRATOR}~" + api("/api/open", {"target": str(DIFF), "session": ORCHESTRATOR})["id"]
         view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(diff_id)} && v.placement === 'docked')", timeout=10000)
         diff_panel = view.evaluate(f"ws.view({json.dumps(diff_id)}).panelId")
         diff_frame = frame_at("/diffviews/map-columns.html")
@@ -321,9 +335,9 @@ try:
         in_diff("Control+Alt+m")
         settles("ctrl+alt+m turns minimize ruled off, and the checkbox follows", (False, True),
                 lambda: (view.is_checked("#hide-ruled"), ids["csv-import"] in docked()))
-        in_diff("Control+Alt+k")
-        settles("ctrl+alt+k still focuses the panel above, the ruled ticket's row on top again", "csv-import",
-                lambda: view.evaluate("ws.getSnapshot().focusedPanel").split(":")[2])
+        in_diff("Control+Alt+l")
+        settles("ctrl+alt+l focuses the panel right of the diff, the ruled ticket's page back in it", f"p:{ORCHESTRATOR}:pages",
+                lambda: view.evaluate("ws.getSnapshot().focusedPanel"))
         settles("...and the keyboard goes with it", True, lambda: view.evaluate(holds_keyboard))
         tab.click()
         view.keyboard.press("Control+Alt+m")
@@ -365,48 +379,108 @@ try:
         seen_before = lambda: sorted(u for u in hub_view()["seen"])
         marks = seen_before()
         focus(ORCHESTRATOR)
+        first_unseen = view.evaluate("[...document.querySelectorAll('#sheet .row.art')]"
+                                     ".find(r => r.querySelector('button.tick:not(.seen)'))?.querySelector('.t').title")
         view.keyboard.press("Control+Alt+n")
-        settles("ctrl+alt+n goes to the next unseen page", ids["csv-import"], focused)
+        settles("ctrl+alt+n goes from the session page to the sheet's first unseen page", first_unseen,
+                lambda: view.evaluate("decodeURIComponent(ws.view(ws.getSnapshot().focusedView)?.params.url.replace(/^\\/f/, '') ?? '')"))
         check("...and marks nothing seen", marks, seen_before())
         view.keyboard.press("Control+Alt+b")
-        settles("ctrl+alt+b shows the board, floating over the container", "floating",
+        settles("ctrl+alt+b shows the board, floating over the units", "floating",
                 lambda: view.evaluate("ws.views().find(v => v.id === 'board')?.placement ?? null"))
         frame_at("/board.html")  # a key pressed into a page still loading goes nowhere
         view.keyboard.press("Control+Alt+b")
         settles("...and hides it again", None, lambda: view.evaluate("ws.views().find(v => v.id === 'board')?.placement ?? null"))
 
-        # two orchestrators on one tree: the keys tell them apart
+        # two orchestrators on one tree: the rail numbers them by when each last finished a turn
         ticket("drop-zone", "claimed", "map-columns")
         view.keyboard.press("Control+Alt+0")
         settles("in the overview", None, lambda: view.evaluate("wc.current"))
+        registered(SECOND, t0 - 50)
         second = api("/api/open", {"target": str(page("show/drop-zone/index.html", "<h1>drop zone</h1>")), "session": SECOND})
-        check("a second orchestrator's page lands in the same container", key, second["container"])
-        view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(second['id'])})", timeout=10000)
+        second_id = f"{SECOND}~{second['id']}"
+        check("a second orchestrator's page lands in its own unit", SECOND, second["unit"])
+        view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(second_id)})", timeout=10000)
         api("/api/open", {"target": str(pages[2]), "session": ORCHESTRATOR})
-        settles("the view has both pages as new", 2, lambda: view.evaluate(
-            "wc.state.groups.filter(g => wc.state.members.some(m => m.group === g.id && m.by === 'agent' && m.at > g.visited)).length"))
+        settles("the hub tab has both pages as new", 2, lambda: view.evaluate(
+            "wc.state.units.filter(u => wc.state.members.some(m => m.group === u.unit && m.by === 'agent' && m.at > u.visited)).length"))
         view.keyboard.press("Control+Alt+Enter")
         settles("ctrl+alt+enter goes to the orchestrator whose news is oldest", SECOND, lambda: view.evaluate("wc.current"))
-        view.keyboard.press("Control+Alt+1")
-        settles("ctrl+alt+1 goes to the first orchestrator", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
         view.keyboard.press("Control+Alt+2")
-        settles("ctrl+alt+2 to the second", SECOND, lambda: view.evaluate("wc.current"))
-
-        # the hub gone: the view says so with the command that brings it back, and sends what changed meanwhile
+        settles("ctrl+alt+2 goes to the orchestrator that finished a turn before the last", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
         view.keyboard.press("Control+Alt+1")
+        settles("ctrl+alt+1 to the one that finished a turn last", SECOND, lambda: view.evaluate("wc.current"))
+        view.keyboard.press("Control+Alt+BracketRight")
+        settles("ctrl+alt+] to the next on the rail", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
+        view.keyboard.press("Control+Alt+BracketLeft")
+        settles("ctrl+alt+[ back to the one before", SECOND, lambda: view.evaluate("wc.current"))
+
+        # one-hub-tab#P6: a reorder of the rail never changes which session has the user's focus
+        rail = lambda: view.evaluate("wc.state.units.filter(u => u.number).map(u => u.unit)")
+        view.evaluate(f"ws.focus({json.dumps(second_id)})")
+        view.wait_for_function(holds_keyboard, timeout=10000)
+        registered(ORCHESTRATOR, time.time())  # the other orchestrator finishes a turn
+        settles("an orchestrator finishing a turn becomes 1 on the rail", [ORCHESTRATOR, SECOND], rail)
+        check("...while the unit you are in stays the one you are in", SECOND, view.evaluate("wc.current"))
+        check("...and the page you are on keeps the focus, and the keyboard", (second_id, True), (focused(), view.evaluate(holds_keyboard)))
+        check("...the rail's keys naming the new order", ["ctrl+alt+1", "ctrl+alt+2"],
+              view.evaluate("[...document.querySelectorAll('#units .how')].map(e => e.textContent.split(' · ').pop())"))
+
+        # the ✕: out of the numbers until the session next finishes a turn
+        view.locator("#units .unit", has=view.locator(f'button[title="session {SECOND}"]')).locator(".dismiss").click(force=True)
+        settles("the ✕ takes an orchestrator out of the numbers", [ORCHESTRATOR], rail)
+        check("...to the list of those set aside", True, f"session {SECOND[:8]}" in view.inner_text("#aside-units"))
+        check("...and leaves you where you are", (SECOND, True), (view.evaluate("wc.current"), second_id in docked()))
+        view.keyboard.press("Control+Alt+1")
+        settles("ctrl+alt+1 goes to the one left in the numbers", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
+        settles("...the one set aside leaving the layout with you", False, lambda: second_id in docked())
+        registered(SECOND, time.time() + 1)
+        settles("its session finishing a turn brings it back, as 1", [SECOND, ORCHESTRATOR], rail)
+
+        # the address of the hub tab at a unit, which the Stop hook's line links
+        at_unit = context.new_page()
+        at_unit.goto(f"{ORIGIN}/u/{ORCHESTRATOR}#{mids['csv-import']}")
+        at_unit.wait_for_function("window.wc && ws.views().length > 0", timeout=30000)
+        settles("the hub tab opened at a unit and a page is in that unit, on that page", [ORCHESTRATOR, ids["csv-import"]],
+                lambda: at_unit.evaluate("[wc.current, ws.getSnapshot().focusedView]"))
+        check("...its address back at the hub's root, so a reload stays where you are then", "/", at_unit.evaluate("location.pathname + location.hash"))
+        at_unit.close()
+
+        # the hub gone: the tab says so with the command that brings it back, and sends what changed meanwhile
+        view.keyboard.press("Control+Alt+2")
+        settles("in the first orchestrator again", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
         focus("map-columns")
         kill_hub()
-        settles("a view cut off from the hub says so, with the command that restarts it", " ".join(["setsid", "-f", *HUB_ARGS]),
+        settles("a hub tab cut off from the hub says so, with the command that restarts it", " ".join(["setsid", "-f", *HUB_ARGS]),
                 lambda: view.evaluate("document.querySelector('#status code')?.textContent ?? null"))
         view.keyboard.press("Control+Alt+w")
         settles("a key still answers while the hub is down", False, lambda: ids["map-columns"] in docked())
         hub = start_hub()
-        settles("the view hears the hub is back", True, lambda: view.evaluate("document.getElementById('status').textContent === 'hub: connected'"), within=20)
+        settles("the hub tab hears the hub is back", True, lambda: view.evaluate("document.getElementById('status').textContent === 'hub: connected'"), within=20)
         settles("...and the hub gets the close made while it was down", True,
-                lambda: next(m for m in hub_view()["members"] if m["id"] == ids["map-columns"])["closed"])
+                lambda: next(m for m in hub_view()["members"] if m["id"] == mids["map-columns"])["closed"])
+
+        # one-hub-tab#P1: many orchestrators' pages open in one tab, and a page opened then still loads
+        many = [f"{n:08x}-0000-4000-8000-{n:012x}" for n in range(0x10, 0x18)]
+        for n, session in enumerate(many):
+            registered(session, t0 - 300 - n)
+            api("/api/open", {"target": str(page(f"show/unit-{n}/index.html", f"<h1>unit {n}</h1>")), "session": session})
+        view.keyboard.press("Control+Alt+0")
+        settles("ten orchestrators' pages are open in the one tab", 10, lambda: view.evaluate(
+            "new Set(ws.views().filter(v => v.placement === 'docked').map(v => v.params.group)).size"), within=30)
+        for n in range(len(many)):
+            frame_at(f"/unit-{n}/index.html")
+        api("/api/open", {"target": str(page("show/unit-0/late.html", "<h1 id=late>late</h1>")), "session": many[0]})
+        try:
+            late = frame_at("/unit-0/late.html").inner_text("#late")
+        except (PlaywrightError, RuntimeError) as e:
+            late = f"not loaded: {e}"[:200]
+        check("...and a page opened then still loads", "late", late)
+        check("...as does a read of the hub", True, view.evaluate(
+            "Promise.race([fetch('/api/hub').then(r => r.ok), new Promise(r => setTimeout(() => r(false), 10000))])"))
 
         check("no script errors", [], errors)
-        check("closing the container's tab asks first", True,
+        check("closing the hub tab asks first", True,
               view.evaluate("(e => (dispatchEvent(e), e.defaultPrevented))(new Event('beforeunload', { cancelable: true }))"))
         browser.close()
 finally:
