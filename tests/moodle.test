@@ -1,0 +1,234 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro", "requests", "beautifulsoup4", "lxml"]
+# ///
+"""Drive bin/moodle without Moodle. Run it directly; no framework.
+
+The promises here: the tool never sends a request that could act on Moodle (a page outside
+the ones it reads, a parameter that turns a view into an action, an AJAX function outside its
+read-only list, a download that is not a Moodle file); it never opens an activity whose view
+requirement is still open; two equal snapshots diff to nothing and a changed due date, a new
+announcement or a removed file each show as one change, named the way Moodle names them; a
+file already downloaded is not fetched again, and a file of max's under the same name is never
+overwritten.
+
+The HTML fixtures are cut down from moodle.jku.at's pages as they were on 2026-10-04, keeping
+the markup the parser reads: a course page's activity card with its completion dialog, and an
+assignment overview table.
+"""
+
+import importlib.util
+import json
+import sys
+import tempfile
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True  # importing bin/ must not leave a __pycache__ on $PATH
+loader = SourceFileLoader("moodle", str(ROOT / "bin" / "moodle"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec
+moodle = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = moodle  # dataclasses resolve string annotations through it
+loader.exec_module(moodle)
+
+failures = 0
+
+
+def check(what: str, expected, actual) -> None:
+    global failures
+    if expected == actual:
+        print(f"ok   {what}")
+    else:
+        print(f"FAIL {what}\n       expected: {expected!r}\n       actual:   {actual!r}")
+        failures += 1
+
+
+class Wire:
+    """Stands in for the network: records every request, answers from a table of path -> body."""
+
+    def __init__(self, pages: dict[str, str] | None = None):
+        self.sent: list[tuple[str, str]] = []
+        self.pages = pages or {}
+        self.headers: dict = {}
+
+    def _answer(self, method: str, url: str, **kw):
+        self.sent.append((method, url))
+        path = url.removeprefix(moodle.MOODLE).split("?")[0]
+        body = self.pages.get(path, "")
+
+        class R:
+            status_code, text, headers = 200, body, {}
+
+            def raise_for_status(self): ...
+            def json(self): return [{"error": False, "data": {}}]
+            def iter_content(self, n): yield b"pdf bytes"
+            def __enter__(self): return self
+            def __exit__(self, *a): ...
+        return R()
+
+    def get(self, url, **kw): return self._answer("GET", url, **kw)
+    def post(self, url, **kw): return self._answer("POST", url, **kw)
+
+
+def session(pages: dict[str, str] | None = None) -> tuple[object, Wire]:
+    m = moodle.Moodle()
+    m.s = Wire(pages)
+    m.sesskey = "k"
+    moodle.PAUSE = 0
+    return m, m.s
+
+
+def refused(fn) -> bool:
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+# --- nothing it sends can act on Moodle (ticket: "nothing the CLI does changes anything on Moodle")
+
+m, wire = session()
+check("a submission action on an assignment page is refused",
+      True, refused(lambda: m.page("/mod/assign/view.php", id=1, action="savesubmission")))
+check("a page outside the ones it reads is refused", True, refused(lambda: m.page("/course/modedit.php", id=1)))
+check("the logout page is refused", True, refused(lambda: m.page("/login/logout.php")))
+check("a write AJAX function is refused", True, refused(lambda: m.ajax("mod_assign_submit_for_grading", assignmentid=1)))
+check("marking forum posts read through AJAX is refused", True, refused(lambda: m.ajax("mod_forum_get_discussion_posts", discussionid=1)))
+check("a download from outside pluginfile.php is refused", True,
+      refused(lambda: m.download(f"{moodle.MOODLE}/mod/resource/view.php?id=1", Path(tempfile.mkdtemp()) / "x")))
+check("no refused call reached the wire", [], wire.sent)
+m.page("/mod/resource/view.php", follow=False, id=1, redirect=1)
+m.ajax("core_courseformat_get_state", courseid=1)
+check("reads go out: a resource redirect and a read-only AJAX call", ["GET", "POST"], [s[0] for s in wire.sent])
+
+# --- an activity whose view requirement is still open is never opened
+
+COURSE_PAGE = """
+<ul>
+<li class="section course-section main" data-for="section" data-id="1002002" data-number="2" data-sectionname="Forums">
+ <div data-for="sectioninfo"><div class="summarytext"><p>Exercise sheets go <a href="https://moodle.jku.at/pluginfile.php/9/course/section/1002002/rules.pdf">here</a>.</p></div></div>
+ <li class="activity resource modtype_resource" data-id="11" id="module-11">
+  <div data-region="completionrequirements"><button class="btn dropdown-toggle btn-subtle-secondary">Zu erledigen</button>
+   <div class="completion-dialog"><div role="list">
+    <div class="d-flex mt-2" role="listitem"><span class="visually-hidden">Zu erledigen:</span><span>Anzeigen</span></div>
+   </div></div></div>
+ </li>
+ <li class="activity resource modtype_resource" data-id="12" id="module-12">
+  <div data-region="completionrequirements"><button class="btn dropdown-toggle btn-subtle-success">Erledigt</button>
+   <div class="completion-dialog"><div role="list">
+    <div class="d-flex mt-2 text-success" role="listitem"><span class="visually-hidden">Erledigt:</span><span>Anzeigen</span></div>
+   </div></div></div>
+ </li>
+ <li class="activity assign modtype_assign" data-id="13" id="module-13">
+  <div data-region="activity-dates">Geöffnet: Dienstag, 3. März 2026, 18:00 Fällig: Donnerstag, 5. März 2026, 07:00</div>
+  <div data-region="completionrequirements"><button class="btn dropdown-toggle btn-subtle-secondary">Zu erledigen</button>
+   <div class="completion-dialog"><div role="list">
+    <div class="d-flex mt-2" role="listitem"><span class="visually-hidden">Zu erledigen:</span><span>Abgabe einreichen</span></div>
+   </div></div></div>
+ </li>
+</li></ul>"""
+
+m, wire = session({"/course/view.php": COURSE_PAGE})
+sections, cards = moodle.course_page(m, 1)
+check("a section's summary links its files", {"rules.pdf": "https://moodle.jku.at/pluginfile.php/9/course/section/1002002/rules.pdf"},
+      sections["1002002"]["files"])
+check("an assignment card keeps Moodle's dates", "Geöffnet: Dienstag, 3. März 2026, 18:00 Fällig: Donnerstag, 5. März 2026, 07:00", cards["13"]["dates"])
+wire.sent.clear()
+held = moodle.activity_detail(m, {"name": "Sheet", "module": "resource", **cards["11"]}, "11", None, set())
+check("an unfinished view requirement holds the activity back", True, "held" in held)
+check("and its page is not opened", [], wire.sent)
+moodle.activity_detail(m, {"name": "Done", "module": "resource", **cards["12"]}, "12", None, set())
+check("a view requirement already met lets the page open", 1, len(wire.sent))
+wire.sent.clear()
+moodle.activity_detail(m, {"name": "Sheet 0", "module": "assign", **cards["13"]}, "13", None, set())
+check("a requirement viewing does not tick (a submission) lets the page open", 1, len(wire.sent))
+
+# --- an activity page is opened again only when something says it changed
+
+wire.sent.clear()
+before = {"name": "Notes", "module": "resource", "files": {"a.pdf": "u"}}
+check("an unchanged activity carries its files over", {"files": {"a.pdf": "u"}},
+      moodle.activity_detail(m, {"name": "Notes", "module": "resource"}, "20", before, set()))
+check("without opening its page", [], wire.sent)
+moodle.activity_detail(m, {"name": "Notes", "module": "resource"}, "20", before, {"20"})
+check("one Moodle reports changed is opened again", 1, len(wire.sent))
+wire.sent.clear()
+forum_before = {"name": "Announcements", "module": "forum", "topics": 38, "posts": 41, "discussions": {}}
+moodle.activity_detail(m, {"name": "Announcements", "module": "forum", "topics": 39, "posts": 42}, "21", forum_before, set())
+check("a forum whose topic count grew is opened again", 1, len(wire.sent))
+
+# --- the assignment overview reads as Moodle shows it
+
+ASSIGN_INDEX = """
+<table class="generaltable"><thead><tr><th>Name</th><th>Fälligkeitsdatum</th><th>Abgabestatus</th><th>Bewertung</th></tr></thead>
+<tbody>
+<tr><td><a href="https://moodle.jku.at/mod/assign/view.php?id=12819680">Submit homework assignment 1 (13 points)</a> Exercise</td>
+    <td>Donnerstag, 12. März, 08:00</td><td>Zur Bewertung abgegeben</td><td>10,50</td></tr>
+<tr><td><a href="https://moodle.jku.at/mod/assign/view.php?id=13002690">Submit homework assignment 9</a></td>
+    <td>Donnerstag, 11. Juni, 08:00</td><td>Keine Abgabe</td><td>-</td></tr>
+</tbody></table>"""
+m, wire = session({"/mod/assign/index.php": ASSIGN_INDEX})
+check("the assignment overview gives due date, submission status and grade per activity", {
+    "12819680": {"due": "Donnerstag, 12. März, 08:00", "submission": "Zur Bewertung abgegeben", "grade": "10,50"},
+    "13002690": {"due": "Donnerstag, 11. Juni, 08:00", "submission": "Keine Abgabe"},
+}, moodle.index_rows(m, "assign", 1))
+
+# --- course folders
+
+check("a course folder is its semester and title", "2026S-vl-statistics-for-ai",
+      moodle.course_folder("366.590, VL Statistics for AI, Thomas Forstner, 2026S"))
+check("a combined course keeps both types", "2026W-vl-ue-mathematics-for-ai-iii",
+      moodle.course_folder("357.260/531940/531941, VL / UE Mathematics for AI III, Luca Gerardo-Giorda et al., 2026W"))
+check("umlauts fold", "2025W-ue-algorithmen-und-datenstrukturen-2",
+      moodle.course_folder("340.320-31, UE Algorithmen und Datenstrukturen 2, Miguel Vazquez Pufleau et al., 2025W"))
+
+# --- diff
+
+SNAP = {"taken": "2026-10-04T10:00:00+00:00", "courses": {"42634": {
+    "name": "UE Statistics for AI", "folder": "2026S-ue-statistics-for-ai",
+    "sections": {"996967": {"name": "Homework", "items": {
+        "301": {"name": "Sheet 1", "module": "resource", "files": {"sheet1.pdf": "https://moodle.jku.at/pluginfile.php/1/mod_resource/content/1/sheet1.pdf"}},
+        "302": {"name": "Announcements", "module": "forum", "discussions": {"9": {"name": "Welcome", "replies": 0}}}}}},
+    "assignments": {"401": {"name": "Homework 1", "module": "assign", "due": "Donnerstag, 12. März, 08:00", "submission": "Keine Abgabe"}}}}}
+
+later = json.loads(json.dumps(SNAP))
+later["taken"] = "2026-10-05T10:00:00+00:00"
+check("two snapshots of an unchanged Moodle diff to nothing", [], moodle.diff(SNAP, later))
+later["courses"]["42634"]["assignments"]["401"]["due"] = "Donnerstag, 19. März, 08:00"
+later["courses"]["42634"]["sections"]["996967"]["items"]["302"]["discussions"]["10"] = {"name": "Exam date", "replies": 0}
+del later["courses"]["42634"]["sections"]["996967"]["items"]["301"]["files"]["sheet1.pdf"]
+changes = moodle.diff(SNAP, later)
+check("each change shows once, located by name", [
+    ("removed", "UE Statistics for AI", "Homework › Sheet 1 › files › sheet1.pdf"),
+    ("added", "UE Statistics for AI", "Homework › Announcements › discussions › Exam date"),
+    ("changed", "UE Statistics for AI", "assignments › Homework 1 › due"),
+], [(c["change"], c["course"], c["where"]) for c in changes])
+check("a changed due date carries both values", ("Donnerstag, 12. März, 08:00", "Donnerstag, 19. März, 08:00"),
+      (changes[2]["before"], changes[2]["after"]))
+
+# --- downloads
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    course = {"name": "UE Statistics for AI", "folder": "stats", "sections": {"1": {"name": "S", "items": {
+        "301": {"name": "Sheet 1", "module": "resource", "files": {"sheet1.pdf": "https://moodle.jku.at/pluginfile.php/1/mod_resource/content/1/sheet1.pdf"}},
+        "302": {"name": "Old exams", "module": "folder", "files": {"2022/exam.pdf": "https://moodle.jku.at/pluginfile.php/2/mod_folder/content/0/2022/exam.pdf"}}}}}}
+    (root / "stats").mkdir()
+    (root / "stats" / "sheet1.pdf").write_text("max's annotated copy")
+    m, wire = session()
+    check("first run fetches every file", 2, moodle.download(m, course, root)[0])
+    check("max's own file under the same name is untouched", "max's annotated copy", (root / "stats" / "sheet1.pdf").read_text())
+    check("the download lands beside it under another name", True, (root / "stats" / "sheet1 (1).pdf").exists())
+    check("a folder's files go under the folder's name", True, (root / "stats" / "Old exams" / "2022" / "exam.pdf").exists())
+    wire.sent.clear()
+    check("a second run fetches nothing", (0, []), (moodle.download(m, course, root)[0], wire.sent))
+    course["sections"]["1"]["items"]["301"]["files"]["sheet1.pdf"] = "https://moodle.jku.at/pluginfile.php/1/mod_resource/content/2/sheet1.pdf"
+    moodle.download(m, course, root)
+    check("a resource replaced on Moodle overwrites its own old download, not max's file",
+          ("max's annotated copy", False), ((root / "stats" / "sheet1.pdf").read_text(), (root / "stats" / "sheet1 (2).pdf").exists()))
+
+sys.exit(1 if failures else 0)
