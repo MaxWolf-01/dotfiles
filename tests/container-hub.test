@@ -67,7 +67,21 @@ def env(**extra: str) -> dict:
     return {**keep, "HOME": str(HOME), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", **extra}
 
 
-ENV = env(TMPDIR=str(TEMP), TMUX_TMPDIR=str(SCRATCH / "tmux"))  # the hub's tmux is a scratch server of the test's own
+# Every tmux call, the hub's and the test's, goes through a tmux that passes on only those naming the test's own
+# server's socket, and records the rest: nothing here may reach a server the test did not start.
+TMUX_SOCKET = SCRATCH / "tmux.sock"
+TMUX_REFUSED = SCRATCH / "tmux-refused"
+TMUX = SCRATCH / "shim" / "tmux"
+TMUX.parent.mkdir()
+TMUX.write_text(f"""#!/usr/bin/env bash
+[ "$1" = -S ] && [ "$2" = {shlex.quote(str(TMUX_SOCKET))} ] && exec {shlex.quote(shutil.which("tmux"))} "$@"
+printf '%s\\n' "$*" >> {shlex.quote(str(TMUX_REFUSED))}
+exit 1
+""")
+TMUX.chmod(0o755)
+ENV = env(TMPDIR=str(TEMP))
+ENV["PATH"] = f"{TMUX.parent}:{ENV['PATH']}"
+HUB_FLAGS = ["--tmux-socket", str(TMUX_SOCKET)]
 
 
 def git(cwd: Path, *args: str) -> None:
@@ -206,7 +220,7 @@ alpha = repo("alpha", [("map-columns", None, ORCHESTRATOR), ("csv-import", "map-
 beta = repo("beta", [("map-columns", None, STRANGER)])
 gamma = repo("gamma", [("one-flow", None, WORKER)])  # opened only through claude-browser
 agent = alpha / "agent"
-hub = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(SCRATCH / "state")],
+hub = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(SCRATCH / "state"), *HUB_FLAGS],
                        env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("w"), start_new_session=True)
 try:
     deadline = time.monotonic() + 60
@@ -511,8 +525,7 @@ try:
     recorder = SCRATCH / "recorder.py"
     recorder.write_text("import os, sys, tty\ntty.setraw(0)\nos.write(1, b'\\x1b[?2004h')\nout = open(sys.argv[1], 'ab', buffering=0)\n"
                         "while data := os.read(0, 4096):\n    out.write(data)\n")
-    (SCRATCH / "tmux").mkdir(mode=0o700)
-    tmux = lambda *args: subprocess.run(["tmux", *args], env=ENV, capture_output=True, text=True, check=True).stdout.strip()
+    tmux = lambda *args: subprocess.run([TMUX, "-S", TMUX_SOCKET, *args], env=ENV, capture_output=True, text=True, check=True).stdout.strip()
     tmux("new-session", "-d", "-s", "answering", "-x", "100", "-y", "20", shlex.join(["exec", sys.executable, str(recorder), str(received)]))
     try:
         pane, pane_pid = tmux("display-message", "-p", "-t", "answering:", "#{pane_id} #{pane_pid}").split()
@@ -567,7 +580,7 @@ try:
         check("a pane that does not hold the session's process is sent nothing", (409, True, b""),
               (status_code, "no longer holds" in answer.get("error", ""), arrives(b"")))
     finally:
-        subprocess.run(["tmux", "kill-server"], env=ENV, capture_output=True, check=False)
+        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
     registered(ANSWERER, pid=gone_process.pid, started=None, tmux=f"answering:@0.{pane}")
     status_code, answer = typed({"text": "hello"})
     check("an ended session is sent nothing", (409, True), (status_code, "ended" in answer.get("error", "")))
@@ -935,7 +948,7 @@ try:
                 time.sleep(0.05)
             except ProcessLookupError:
                 break
-        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(SCRATCH / "state")],
+        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(SCRATCH / "state"), *HUB_FLAGS],
                                    env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("a"), start_new_session=True)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and started.poll() is None:
@@ -1011,7 +1024,7 @@ try:
         (cache / version / "skills/tracker/tracker.py").chmod(0o755)
     service_port = free_port()
     service_hub = subprocess.Popen(
-        [lone_bin / "container-hub", "--port", str(service_port), "--state", str(SCRATCH / "service-state")],
+        [lone_bin / "container-hub", "--port", str(service_port), "--state", str(SCRATCH / "service-state"), *HUB_FLAGS],
         env={**ENV, "HOME": str(service_home), "PATH": ":".join(d for d in ENV["PATH"].split(":") if not (Path(d) / "tracker").exists())},
         stdout=subprocess.DEVNULL, stderr=(SCRATCH / "service-hub.log").open("w"), start_new_session=True)
     try:
@@ -1033,6 +1046,8 @@ try:
     finally:
         os.killpg(service_hub.pid, signal.SIGKILL)
         service_hub.wait()
+    check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
+          TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
 finally:
     os.killpg(hub.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
     hub.wait()
