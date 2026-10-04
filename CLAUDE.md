@@ -38,7 +38,7 @@ NEVER include any work related details whatsoever in commit messages, PRs, issue
 
 ## Issue Tracker
 
-`agent/` is the mx agent repo: a private git repo of its own (branch `dotfiles` of `MaxWolf-01/agent-repos`), which this public repo ignores. The tickets, show directories, prototypes, research, the ADRs (`agent/decisions/`) and the glossary (`agent/CONTEXT.md`) are committed there with `git -C agent`, never here; `decisions` and `CONTEXT.md` at this repo's root are links into it. The mx `tracker` skill has the conventions.
+`agent/` is the mx agent repo: a private git repo of its own (branch `dotfiles` of `MaxWolf-01/agent-repos`), which this public repo ignores. The tickets, show directories, prototypes, research, the ADRs (`agent/decisions/`) and the glossary (`agent/GLOSSARY.md`) are committed there with `git -C agent`, never here; `decisions` and `GLOSSARY.md` at this repo's root are links into it. The mx `tracker` skill has the conventions.
 
 ## Claude Code Config
 
