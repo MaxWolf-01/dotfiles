@@ -9,11 +9,15 @@
 # and is a uv script too. diffview, which renders a ticket's recorded ranges,
 # sits beside the hub in bin/.
 #
+# tmux types the user's answers into a session's pane: the client of the very
+# tmux the sessions run under, since a client speaks only its own server's
+# protocol, and on the socket tmux.nix's server uses (TMUX_TMPDIR=%t).
+#
 # Restart=always, not on-failure: the hub never exits on its own, so any exit,
 # a clean one included, leaves every agent's pages opening as plain tabs.
 { config, pkgs, lib, ... }:
 let
-  scriptPath = lib.makeBinPath (with pkgs; [ bash coreutils uv git curl ]);
+  scriptPath = lib.makeBinPath ((with pkgs; [ bash coreutils uv git curl ]) ++ [ config.programs.tmux.package ]);
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
 in
 {
@@ -21,7 +25,7 @@ in
     Unit.Description = "The container hub: every page an agent opens, in its orchestrator's unit";
     Service = {
       ExecStart = "${dotfiles}/bin/container-hub";
-      Environment = [ "PATH=${scriptPath}" ];
+      Environment = [ "PATH=${scriptPath}" "TMUX_TMPDIR=%t" ];
       Restart = "always";
       RestartSec = 2;
     };

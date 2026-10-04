@@ -19,6 +19,7 @@ import http.server
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -43,6 +44,7 @@ STRANGER = "cccccccc-0000-4000-8000-000000000003"
 SPIKER = "dddddddd-0000-4000-8000-000000000004"
 NOVICE = "eeeeeeee-0000-4000-8000-000000000005"  # commits on nothing
 RETIRER = "ffffffff-0000-4000-8000-000000000006"
+ANSWERER = "abababab-0000-4000-8000-000000000007"  # runs in a tmux pane
 
 failures = 0
 
@@ -58,14 +60,14 @@ def check(what: str, expected, actual) -> None:
 
 def env(**extra: str) -> dict:
     keep = {k: v for k, v in os.environ.items()
-            if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB"))}
+            if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB", "TMUX"))}
     for k in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR"):  # uv's own, which would otherwise move into HOME
         keep[k] = subprocess.run(["uv", *(("cache", "dir") if k == "UV_CACHE_DIR" else ("python", "dir"))],
                                  capture_output=True, text=True, check=True).stdout.strip()
     return {**keep, "HOME": str(HOME), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", **extra}
 
 
-ENV = env(TMPDIR=str(TEMP))
+ENV = env(TMPDIR=str(TEMP), TMUX_TMPDIR=str(SCRATCH / "tmux"))  # the hub's tmux is a scratch server of the test's own
 
 
 def git(cwd: Path, *args: str) -> None:
@@ -109,12 +111,14 @@ SELF_STARTED = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
 
 
 def registered(session: str, status: str = "idle", at: float | None = None, pid: int | None = None,
-               started: str | None = SELF_STARTED, name: str | None = None) -> None:
+               started: str | None = SELF_STARTED, name: str | None = None, tmux: str | None = None,
+               waiting_for: str | None = None) -> None:
     """The session's file in the registry, as Claude Code writes it while the session's process runs: by default
     this test's own process, which runs for as long as the hub reads it."""
     entry = {"pid": pid or os.getpid(), "sessionId": session, "status": status,
              "statusUpdatedAt": int((at or time.time()) * 1000), **({"procStart": started} if started else {}),
-             **({"name": name} if name else {})}
+             **({"name": name} if name else {}), **({"tmux": tmux} if tmux else {}),
+             **({"waitingFor": waiting_for} if waiting_for else {})}
     path = HOME / ".claude" / "sessions" / f"{session[:8]}.json"  # named by the pid there; any name reads alike
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entry))
@@ -132,8 +136,8 @@ TEMP_PAGE = TEMP / f"container-hub-test-{PORT}.html"  # directly in the temp dir
 
 
 def request(method: str, path: str, body: dict | None = None, headers: dict | None = None,
-            origin: str = ORIGIN) -> tuple[int, dict | bytes]:
-    data = None if body is None else json.dumps(body).encode()
+            origin: str = ORIGIN, data: bytes | None = None) -> tuple[int, dict | bytes]:
+    data = data if body is None else json.dumps(body).encode()
     req = urllib.request.Request(origin + path, data=data, method=method,
                                  headers={"Content-Type": "application/json", **(headers or {})})
     try:
@@ -498,6 +502,87 @@ try:
     check("...and its session finishing a turn does, as 1", (1, False),
           (view(ORCHESTRATOR)[1]["number"], view(ORCHESTRATOR)[1]["dismissed"]))
     check("a dismissal is refused for a unit that does not exist", 404, request("POST", "/api/dismiss", {"unit": "no-such-unit"})[0])
+
+    # --- answering a session from its unit: the hub tab's input box types into the session's tmux pane
+
+    # The session's program, standing in for Claude Code: it asks its terminal for bracketed paste as Claude Code
+    # does, and records every byte that reaches it, so what arrives is what typing in the pane would have sent.
+    received = SCRATCH / "received"
+    recorder = SCRATCH / "recorder.py"
+    recorder.write_text("import os, sys, tty\ntty.setraw(0)\nos.write(1, b'\\x1b[?2004h')\nout = open(sys.argv[1], 'ab', buffering=0)\n"
+                        "while data := os.read(0, 4096):\n    out.write(data)\n")
+    (SCRATCH / "tmux").mkdir(mode=0o700)
+    tmux = lambda *args: subprocess.run(["tmux", *args], env=ENV, capture_output=True, text=True, check=True).stdout.strip()
+    tmux("new-session", "-d", "-s", "answering", "-x", "100", "-y", "20", shlex.join(["exec", sys.executable, str(recorder), str(received)]))
+    try:
+        pane, pane_pid = tmux("display-message", "-p", "-t", "answering:", "#{pane_id} #{pane_pid}").split()
+        deadline = time.monotonic() + 10
+        while not received.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        started = Path(f"/proc/{pane_pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        in_pane = lambda status="idle", **extra: registered(ANSWERER, status, pid=int(pane_pid), started=started, **extra)
+        in_pane(tmux=f"answering:@0.{pane}")
+        open_page(page(HOME / "notes" / "answering.html"), ANSWERER)
+        check("a unit names the tmux pane its session runs in, as the registry does", (f"answering:@0.{pane}", "idle"),
+              (view(ANSWERER)[1]["pane"], view(ANSWERER)[1]["state"]))
+
+        tab_html = lambda dest: request("GET", "/", headers={"Sec-Fetch-Dest": dest})[1].decode()
+        token_in = lambda page_html: re.search(r'<meta name="hub-token" content="([^"]*)">', page_html)[1]
+        token = token_in(tab_html("document"))
+        check("the hub tab loaded as a tab carries the token that lets it type", True, len(token) > 20)
+        check("...a page in it that fetches the tab, or frames it, gets none", ("", ""), (token_in(tab_html("empty")), token_in(tab_html("iframe"))))
+        typed = lambda body, token=token: request("POST", "/api/type", {"unit": ANSWERER, **body}, {"Origin": ORIGIN, "X-Hub-Token": token})
+        arrived = lambda: received.read_bytes() if received.exists() else b""
+
+        def arrives(expected: bytes) -> bytes:
+            deadline = time.monotonic() + 5
+            while arrived() != expected and time.monotonic() < deadline:
+                time.sleep(0.05)
+            return arrived()
+
+        check("a page the hub serves cannot type into a session without the tab's token", ((403, 403), b""),
+              ((typed({"text": "rm -rf ~"}, "")[0], typed({"text": "rm -rf ~"}, "guessed")[0]), arrives(b"")))
+        status_code, answer = typed({"text": "go on, but\nleave the tests"})
+        # a paste of the text, then Enter: what a terminal sends for the same text pasted in and Enter pressed
+        check("the box's text arrives in the session's pane as a paste, then Enter", (200, pane, b"\x1b[200~go on, but\rleave the tests\x1b[201~\r"),
+              (status_code, answer.get("pane"), arrives(b"\x1b[200~go on, but\rleave the tests\x1b[201~\r")))
+        received.write_bytes(b"")
+        check("nothing but whitespace is not sent", 400, typed({"text": " \n "})[0])
+        in_pane("busy", tmux=f"answering:@0.{pane}")
+        check("a working session takes it too, as its pane would queue it", (200, b"\x1b[200~and then this\x1b[201~\r"),
+              (typed({"text": "and then this"})[0], arrives(b"\x1b[200~and then this\x1b[201~\r")))
+        received.write_bytes(b"")
+        in_pane("waiting", tmux=f"answering:@0.{pane}", waiting_for="permission prompt")
+        check("a session blocked in its terminal shows as such, on what", ("waiting", "permission prompt"),
+              (view(ANSWERER)[1]["state"], view(ANSWERER)[1]["waiting_for"]))
+        status_code, answer = typed({"text": "yes"})
+        check("...and is sent nothing, the hub saying why", (409, True, b""),
+              (status_code, "permission prompt" in answer.get("error", ""), arrives(b"")))
+        in_pane()
+        check("a session with no tmux pane in the registry has none in its unit", None, view(ANSWERER)[1]["pane"])
+        status_code, answer = typed({"text": "hello"})
+        check("...and is sent nothing, the hub saying why", (409, True, b""), (status_code, "no tmux pane" in answer.get("error", ""), arrives(b"")))
+        registered(ANSWERER, tmux=f"answering:@0.{pane}")  # the pane, but a process outside it
+        status_code, answer = typed({"text": "hello"})
+        check("a pane that does not hold the session's process is sent nothing", (409, True, b""),
+              (status_code, "no longer holds" in answer.get("error", ""), arrives(b"")))
+    finally:
+        subprocess.run(["tmux", "kill-server"], env=ENV, capture_output=True, check=False)
+    registered(ANSWERER, pid=gone_process.pid, started=None, tmux=f"answering:@0.{pane}")
+    status_code, answer = typed({"text": "hello"})
+    check("an ended session is sent nothing", (409, True), (status_code, "ended" in answer.get("error", "")))
+
+    screenshot = b"\x89PNG\r\n\x1a\n not really a png"
+    dropped = lambda name, token=token: request(
+        "POST", f"/api/drop?unit={ANSWERER}&name={urllib.parse.quote(name)}", None,
+        {"Origin": ORIGIN, "X-Hub-Token": token, "Content-Type": "application/octet-stream"}, data=screenshot)
+    status_code, answer = dropped("Screenshot from today.png")
+    saved = Path(answer.get("path", "/nonexistent"))
+    check("a file pasted or dropped into the box is saved where the session can read it, under its own name, typed bare",
+          (200, HOME / ".cache/container-hub/drops" / ANSWERER, True, screenshot),
+          (status_code, saved.parent, saved.name.endswith("-Screenshot-from-today.png"), saved.read_bytes() if saved.is_file() else None))
+    check("...a second of the same name kept beside it", True, dropped("Screenshot from today.png")[1].get("path") != str(saved))
+    check("...and not without the tab's token", 403, dropped("x.png", "")[0])
 
     # --- serving
 

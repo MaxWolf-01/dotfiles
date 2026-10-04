@@ -40,6 +40,15 @@ their links and keys. A diffview page served here saves its comments through dif
 `diffview --open`, `--watch` and `--serve` hand their pages here to be served. Worker reports and diffviews of
 nothing but ticket files are for agents and never open.
 
+A unit's session page carries an input box that types into the session's tmux pane, the one the registry names,
+so the user answers a turn where they read it, and the terminal and the hub show one conversation. The text goes in
+as a paste followed by Enter, as if typed there. Nothing goes to a session blocked in its terminal (the registry's
+`waiting`: a permission prompt, a question, a dialog), to one that runs in no tmux pane, or to a pane that no longer
+holds the session's process. A file pasted or dropped into the box is saved under the cache's `container-hub/drops/`
+and its path typed in its place. Both routes answer only the hub tab itself, which carries the token the hub hands
+to a top-level load of / alone: a page the hub serves shares its origin, but cannot type with the user's authority
+by fetching these routes.
+
 The line the Stop hook prints under a finished turn links the hub tab at that session's unit, /u/<session id> on
 this hub (http://127.0.0.1:8377/u/<session id> on the default port), wherever the hub answers; where none does,
 the session page's file:// link.
@@ -60,11 +69,15 @@ the session page's file:// link.
     POST /api/seen            {"url", "seen"}: the user's seen mark on a page.
     POST /api/visit           {"unit"}: the user looked at a unit; what was new there is not.
     POST /api/dismiss         {"unit"}: out of the numbers until its session next finishes a turn.
+    POST /api/type            {"unit", "text"}, from the hub tab with its X-Hub-Token: type the text into the unit's
+                              session and press Enter. 409 {"error": why} where nothing may be typed.
+    POST /api/drop?unit=&name=   a file's bytes, from the hub tab with its X-Hub-Token: saved, answers {"path"}.
     POST /api/serve           {"path"}: from a local tool only, serve a page with what sits beside it, or a
                               directory with everything under it, without making it a member. Answers {"url"}.
     GET  /api/hub             {"units": [...], "seen": {url: when}}: every unit, the numbered ones first in the
                               rail's order, then the dismissed, then the ended, each the latest turn first.
-    GET  /api/u/<key>         one unit: {"unit", "session", "title", "tree", "repo", "state", "last", "number",
+    GET  /api/u/<key>         one unit: {"unit", "session", "title", "tree", "repo", "state", "waiting_for", "pane",
+                              "last", "number",
                               "dismissed", "members": [{"id", "url", "closed", "lane", ...}], "pages", "seen", ...}.
                               A member's url is where the hub serves it, relative to here. "pages" is every page
                               of the unit as its session page lists it: [{"url", "artefact", "linked", ...}];
@@ -97,6 +110,7 @@ import queue
 import re
 import select
 import shlex
+import secrets
 import shutil
 import socket
 import subprocess
@@ -768,7 +782,8 @@ def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dic
     title = (session_dir and session_title(session_dir)) or (entry or {}).get("name") or (f"session {session[:8]}" if session else "loose pages")
     board = tracker.agent / "board.html" if tracker else None
     return {"unit": key, "session": session, "title": title, "tree": tree, "repo": tracker.repo if tracker else "",
-            "state": state, "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
+            "state": state, "waiting_for": (entry or {}).get("waitingFor"), "pane": (entry or {}).get("tmux"),
+            "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
             "first": min(m["first"] for m in kept), "visited": data.get("visited") or 0,
             "resume": resume_command(session) if session else "", "tickets": tickets, "pages": pages, "members": members,
             "seen": {u: seen[u] for u in {*(p["url"] for p in pages), *(m["url"] for m in kept)} if u in seen},
@@ -856,6 +871,105 @@ LISTING = """<!doctype html><meta charset="utf-8"><title>__TITLE__</title>
 </style>
 <h1>__HEAD__</h1><ul>__ROWS__</ul>
 """
+
+
+# --------------------------------------------------------------------------
+# answering a session from its unit: what the user types in the hub tab goes into the session's tmux pane
+# --------------------------------------------------------------------------
+
+TOKEN = ""
+"""What the hub tab sends with every write that acts with the user's authority; kept in --state, so a tab left
+open across a restart of the hub still sends."""
+PANE = re.compile(r"%\d+$")  # the registry names a pane as session:@window.%pane; the pane's id alone survives a move
+DROP_LIMIT = 200 * 2**20
+
+
+def load_token() -> str:
+    path = STATE / "token"
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        token = secrets.token_urlsafe(24)
+        path.touch(0o600)
+        path.write_text(token)
+        return token
+
+
+def top_level(headers) -> bool:
+    """A load of the hub tab itself, not a fetch or a frame from a page it shows: the browser says which, in a header
+    no page can set. A client that says nothing is no page either."""
+    return headers.get("Sec-Fetch-Dest") in (None, "document")
+
+
+def tmux(*args: str, given: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], input=given, capture_output=True, text=True, check=False, timeout=10)
+
+
+def descends(pid: int, ancestor: int) -> bool:
+    seen = set()
+    while pid > 1 and pid not in seen:
+        if pid == ancestor:
+            return True
+        seen.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+def pane_of(key: str) -> tuple[str | None, str]:
+    """The tmux pane a unit's session takes the user's words in, or None and why it takes none now."""
+    entry = registry().get(key) if key != LOOSE else None
+    if not entry:
+        return None, "the session has ended"
+    if entry.get("status") == "waiting":
+        return None, f"the session is blocked in its terminal ({entry.get('waitingFor') or 'waiting'}); answer it in its pane"
+    if not (found := PANE.search(str(entry.get("tmux") or ""))):
+        return None, "the session runs in no tmux pane"
+    pane = found[0]
+    # a pane id is reused once tmux restarts, so the pane has to hold the session's own process
+    shown = tmux("display-message", "-p", "-t", pane, "#{pane_pid}")
+    if shown.returncode != 0 or not shown.stdout.strip().isdigit() or not descends(int(entry["pid"]), int(shown.stdout)):
+        return None, f"tmux pane {pane} no longer holds the session"
+    return pane, ""
+
+
+def type_into(body: dict) -> tuple[int, dict]:
+    text = body["text"]
+    if not isinstance(text, str) or not text.strip():
+        return 400, {"error": "nothing to send"}
+    try:
+        pane, why = pane_of(body["unit"])
+        if not pane:
+            return 409, {"error": why}
+        # a paste, so a newline stays a newline rather than sending the message early; tmux types it as plain keys
+        # where the program asked for no bracketed paste
+        buffer = f"container-hub-{secrets.token_hex(4)}"
+        for args, given in ((("load-buffer", "-b", buffer, "-"), text), (("paste-buffer", "-p", "-d", "-b", buffer, "-t", pane), None),
+                            (("send-keys", "-t", pane, "Enter"), None)):
+            run = tmux(*args, given=given)
+            if run.returncode != 0:
+                tmux("delete-buffer", "-b", buffer)
+                return 502, {"error": f"tmux {args[0]} into {pane}: {run.stderr.strip()}"}
+    except (OSError, subprocess.TimeoutExpired) as e:  # no tmux on PATH, or a server that does not answer
+        return 502, {"error": f"tmux: {e}"}
+    return 200, {"ok": True, "pane": pane}
+
+
+def drop(key: str, name: str, data: bytes) -> tuple[int, dict]:
+    """A file pasted or dropped into a unit's box, saved where the session can read it, under the name it had."""
+    directory = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "container-hub" / "drops" / key_path(key)
+    stem = re.sub(r"[^\w.+-]+", "-", Path(name).name).strip(".-") or "pasted"  # a path typed bare, with no quoting
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = directory / f"{stamp}-{stem}"
+    n = 1
+    while path.exists():  # several files of one name in one second
+        n += 1
+        path = directory / f"{stamp}-{n}-{stem}"
+    path.write_bytes(data)
+    return 200, {"path": str(path)}
 
 
 # --------------------------------------------------------------------------
@@ -982,6 +1096,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(302, b"", "text/plain", {"Location": "/"})
         if path == "/" or path.startswith("/u/"):
             tab = (HERE / "container-hub.html").read_text().replace('"__RESTART__"', json.dumps(restart_command()))
+            tab = tab.replace("__TOKEN__", TOKEN if top_level(self.headers) else "")
             return self.send(200, tab.encode(), "text/html; charset=utf-8")
         if path.startswith("/static/trellis/") and (name := path.rsplit("/", 1)[-1]) in TRELLIS:
             try:
@@ -1082,6 +1197,20 @@ class Handler(BaseHTTPRequestHandler):
         # a page on another site can POST to loopback; only this origin's pages and local tools (no Origin) may write
         if self.headers.get("Origin") not in (None, f"http://127.0.0.1:{self.port()}", f"http://localhost:{self.port()}"):
             return self.send(403, b"forbidden", "text/plain")
+        if path in ("/api/type", "/api/drop") and not secrets.compare_digest(self.headers.get("X-Hub-Token") or "", TOKEN):
+            return self.send_json({"error": "only the hub tab itself types into a session; reload the tab if it is one"}, 403)
+        if path == "/api/drop":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            size = int(self.headers.get("Content-Length") or 0)
+            if size > DROP_LIMIT:
+                return self.send_json({"error": f"over {DROP_LIMIT // 2**20} MB; give the session its path instead"}, 413)
+            if not query.get("unit"):
+                return self.send_json({"error": "no unit"}, 400)
+            try:
+                code, answer = drop(query["unit"][0], query.get("name", [""])[0], self.rfile.read(size))
+            except OSError as e:
+                code, answer = 500, {"error": f"{type(e).__name__}: {e}"}
+            return self.send_json(answer, code)
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
             if path == "/api/open":
@@ -1089,6 +1218,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/serve":
                 # a page in the hub tab must not widen what it can read
                 code, answer = (403, {"error": "only a local tool may share"}) if self.headers.get("Origin") else share(body)
+            elif path == "/api/type":
+                code, answer = type_into(body)
             elif path in ("/api/close", "/api/seen", "/api/visit", "/api/dismiss"):
                 code, answer = mark(path.removeprefix("/api/"), body)
             else:
@@ -1170,9 +1301,10 @@ def migrate() -> None:
 
 
 def main(args: Args) -> None:
-    global STATE
+    global STATE, TOKEN
     STATE = args.state.expanduser().resolve()
     STATE.mkdir(parents=True, exist_ok=True)
+    TOKEN = load_token()
     try:
         migrate()
     except OSError as e:  # the hub starts on what units there are; the containers stay where they are
