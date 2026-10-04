@@ -404,8 +404,9 @@ in
   systemd.user.timers.calendar-collect = {
     Unit.Description = "Calendars collection (every 3 hours)";
     Timer = {
-      # Ten to: the other hourly uv jobs have the hour, ten, twenty and forty past
-      # and quarter to.
+      # Ten to: the hourly uv jobs have the hour, ten and twenty past, twenty to
+      # and quarter to, and each resolves a uv environment on a laptop that has
+      # just woken up.
       OnCalendar = "00/3:50:00";
       Persistent = true;
     };
