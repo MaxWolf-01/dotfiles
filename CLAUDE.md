@@ -170,7 +170,9 @@ when one of them goes red: `docs/monitoring.md`.
 
 max's Proton mailbox is mirrored to `~/data/proton-mail` (zephylux only, every
 15 min) and searchable with `notmuch` (`notmuch search`, `notmuch show`;
-`proton-mail-mirror` pulls now). Read the local copy; never talk to Bridge's
+`proton-mail-mirror` pulls now). `lifelog mail` reads it as one row per
+message, its body as text; Jarvis reads the same view of the copy `jarvis-sync`
+ships. Read the local copy; never talk to Bridge's
 IMAP or SMTP directly, and never send mail. Setup and limits:
 `nix/home/proton-mail.nix`.
 
