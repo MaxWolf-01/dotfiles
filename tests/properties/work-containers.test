@@ -12,7 +12,7 @@ tests/container-hub-view.test drives it in headless Chromium.
 Every check starts its own bin/container-hub on a free port, never 8377, with HOME and the hub's state in
 a scratch directory, so a hub already running on this machine is never touched; claude-browser and diffview
 find it through $CONTAINER_HUB_PORT. Which container a page went to is read from the hub's answer: the key
-is the hub's to choose.
+is the hub's to choose. A container here is a unit of the hub: one orchestrator session's pages.
 
 Hypothesis draws whole worlds: one or two repos, each with an agent repo of ticket trees, every ticket
 committed by one of a few sessions (a `Session:` trailer), pages under the tickets' show, prototype and
@@ -37,6 +37,7 @@ import contextlib
 import itertools
 import json
 import os
+import random
 import shutil
 import signal
 import socket
@@ -52,7 +53,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from hypothesis import HealthCheck, Phase, given, settings
+from hypothesis import HealthCheck, Phase, example, given, settings
 from hypothesis import strategies as st
 from hypothesis.database import DirectoryBasedExampleDatabase
 
@@ -318,12 +319,18 @@ class Hub:
         return json.loads(raw) if raw else None
 
     def open(self, target: str, session: str) -> tuple[str, str]:
-        """The container the page went to, and its member id there."""
+        """The unit the page went to, and its member id there."""
         answer = self.api("POST", "/api/open", {"target": target, "session": session})
-        return answer["container"], answer["id"]
+        return answer["unit"], answer["id"]
 
-    def container(self, key: str) -> dict:
-        return self.api("GET", "/api/c/" + urllib.parse.quote(key, safe=""))
+    def unit(self, key: str) -> dict:
+        return self.api("GET", "/api/u/" + urllib.parse.quote(key, safe=""))
+
+    def rail(self, sessions: list[str]) -> list[tuple]:
+        """What the hub derives of these sessions' units from disk: each one's title, tree and repo, its session's
+        state, and its number."""
+        return sorted((u["unit"], u["title"], u["tree"], u["repo"], u["state"], u["number"])
+                      for u in self.api("GET", "/api/hub")["units"] if u["unit"] in sessions)
 
 
 HUBS: list[Hub] = []
@@ -391,16 +398,16 @@ def p1(world, steps):
             if i not in last:
                 continue
             key, mid = last[i]
-            hub.api("POST", "/api/close", {"container": key, "id": mid})
+            hub.api("POST", "/api/close", {"unit": key, "id": mid})
             done.append(f"close {world.pages[i]} in {key}")
         else:
-            url = member(hub.container(last[i][0]), last[i][1])["url"] if how == "served" and i in last else None
+            url = member(hub.unit(last[i][0]), last[i][1])["url"] if how == "served" and i in last else None
             target = spell(placed, i, how, hub, url)
             key, mid = hub.open(target, session)
             last[i] = (key, mid)
             into.setdefault(key, set()).add(i)
             done.append(f"open {target} as session {s} -> {key} {mid}")
-        view = hub.container(key)
+        view = hub.unit(key)
         assert len(view["members"]) == len(into[key]), (
             f"container {key} holds {len(view['members'])} members after these steps, but only "
             f"{len(into[key])} distinct pages were opened into it:\n      " + "\n      ".join(done)
@@ -432,13 +439,13 @@ def p2(world, openers, marks):
     for op, i in marks:
         key, mid = ids[i % len(world.pages)]
         if op == "close":
-            hub.api("POST", "/api/close", {"container": key, "id": mid})
+            hub.api("POST", "/api/close", {"unit": key, "id": mid})
             closed.add(mid)
         else:
-            url = member(hub.container(key), mid)["url"]
-            hub.api("POST", "/api/seen", {"container": key, "url": url, "seen": op == "seen"})
+            url = member(hub.unit(key), mid)["url"]
+            hub.api("POST", "/api/seen", {"url": url, "seen": op == "seen"})
             seen[(key, url)] = op == "seen"
-    before = {key: snapshot(hub.container(key)) for key, _ in ids.values()}
+    before = {key: snapshot(hub.unit(key)) for key, _ in ids.values()}
     for key, mid in ids.values():
         members, _ = before[key]
         assert mid in {m[0] for m in members}, f"{mid} is not a member of {key} before the restart: {members}"
@@ -448,7 +455,7 @@ def p2(world, openers, marks):
         assert (url in before[key][1]) == is_seen, f"{url} in {key} should{'' if is_seen else ' not'} be seen before the restart"
     hub.restart()
     for key, was in before.items():
-        now = snapshot(hub.container(key))
+        now = snapshot(hub.unit(key))
         assert now == was, f"container {key} changed across the restart:\n      before {was}\n      after  {now}"
 
 
@@ -615,12 +622,18 @@ def p4():
 @prop
 @checked(8, shrink=False)
 @given(worlds(), st.lists(st.integers(0, 2), min_size=1, max_size=8), st.randoms(use_true_random=False))
+# a session that committed on neither of two trees, opening a page of each: the tree beside its unit follows from
+# disk, not from which page it opened last
+@example(World((Ticket("alpha", "map-columns", None, 0), Ticket("alpha", "csv-import", None, 0)),
+               ("repos/alpha/agent/show/map-columns/index.html", "repos/alpha/agent/show/csv-import/index.html"), 2),
+         [1], random.Random(1))
 def p6(world, openers, rng):
     """P6 The container is derived from files on disk: the hub's own state can go.
 
     Each page is opened by one or two of the world's sessions. The hub is killed, its state directory
     deleted, and it is started again; opening the same pages by the same sessions, in another order,
-    answers the same container for each."""
+    answers the same unit for each, and the rail derives the same of each unit: its title, its tree and repo,
+    its session's state and its number."""
     hub = shared_hub()
     placed = place(world, hub.home)
     opens = []
@@ -630,6 +643,7 @@ def p6(world, openers, rng):
         if (second := openers[(i + 1) % len(openers)] % world.sessions) != first:
             opens.append((i, placed.sessions[second]))
     before = {(i, s): hub.open(str(placed.page(i)), s)[0] for i, s in opens}
+    rail = hub.rail(placed.sessions)
     hub.kill()
     shutil.rmtree(hub.state, ignore_errors=True)
     hub.start()
@@ -638,6 +652,9 @@ def p6(world, openers, rng):
         now = hub.open(str(placed.page(i)), s)[0]
         assert now == before[(i, s)], (
             f"{world.pages[i]} opened by {s} went to {before[(i, s)]}, and to {now} once the hub's state was gone")
+    again = hub.rail(placed.sessions)
+    assert again == rail, (f"the rail derived other units once the hub's state was gone and the pages were opened in another"
+                           f" order:\n      before {rail}\n      after  {again}")
 
 
 # --------------------------------------------------------------------------
