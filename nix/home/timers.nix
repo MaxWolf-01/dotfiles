@@ -53,6 +53,12 @@ let
     bash coreutils uv jq git fd
   ]);
 
+  # with-secrets runs sops exec-env for the feeds, and the collector sops for the
+  # service account's key; jq for bin/run-log.
+  calendarPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv sops jq
+  ]);
+
   # sops for the Bridge password, uv for lifelog's header index, jq for bin/run-log.
   mailPath = lib.makeBinPath (with pkgs; [
     bash coreutils isync notmuch sops uv jq
@@ -365,6 +371,43 @@ in
       # Quarter to: the backups dashboard has the hour and brave-archive twenty to,
       # and each resolves a uv environment on a laptop that has just woken up.
       OnCalendar = "*:45:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Calendars → the lifelog record ---
+  # What it reads and records: secrets/scripts/calendar-collect --help. with-secrets
+  # puts the three feeds' addresses into its environment; the collector decrypts the
+  # service account's key itself.
+
+  systemd.user.services.calendar-collect = {
+    Unit = {
+      Description = "Record the events of max's calendar feeds and Jarvis's calendars";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${calendarPath}"
+        # A unit's environment does not say where the age key is; a shell's does.
+        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
+      ];
+      ExecStart = "${dotfiles}/bin/with-secrets gcal,kusss,moodle ${secrets}/scripts/calendar-collect --record";
+      # oneshot has no start timeout of its own; a hung run would leave every later
+      # firing a silent no-op.
+      TimeoutStartSec = "10min";
+    };
+  };
+
+  systemd.user.timers.calendar-collect = {
+    Unit.Description = "Calendars collection (every 3 hours)";
+    Timer = {
+      # Ten to: the hourly uv jobs have the hour, ten and twenty past, twenty to
+      # and quarter to, and each resolves a uv environment on a laptop that has
+      # just woken up.
+      OnCalendar = "00/3:50:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
