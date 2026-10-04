@@ -53,9 +53,9 @@ let
     bash coreutils uv jq git fd
   ]);
 
-  # sops for the Bridge password, jq for bin/run-log.
+  # sops for the Bridge password, uv for lifelog's header index, jq for bin/run-log.
   mailPath = lib.makeBinPath (with pkgs; [
-    bash coreutils isync notmuch sops jq
+    bash coreutils isync notmuch sops uv jq
   ]);
 
   # bin/officebuddy-invoice is a uv script reading the mail with notmuch and the

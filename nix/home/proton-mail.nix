@@ -1,8 +1,11 @@
 # The Proton mailbox as a local Maildir: Proton Mail Bridge decrypts it and
 # serves it over IMAP on 127.0.0.1:1143, mbsync pulls it into ~/data/proton-mail
 # (bin/proton-mail-mirror, on a timer in timers.nix), and notmuch indexes it.
-# The Maildir is plain files, one per message with its attachments inside, so
-# it reads without Proton or Bridge, and restic backs it up.
+# The mirror also writes ~/data/proton-mail.headers.jsonl, the headers lifelog's
+# mail view reads, outside the Maildir and so outside the backup: deleting it
+# costs the next pull a full read. The Maildir is plain files, one per message
+# with its attachments inside, so it reads without Proton or Bridge, and restic
+# backs it up.
 #
 # The mirror only pulls: nothing done to the local copy reaches Proton. Bridge
 # itself still accepts IMAP writes and SMTP (127.0.0.1:1025) from anything
