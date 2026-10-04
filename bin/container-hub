@@ -21,7 +21,7 @@ again when the session is resumed; one dismissed with its ✕ is out of them unt
 turn. The loose pages, of no session, have no number. A unit goes once its tree is retired, or, with no tree,
 once every page of it is deleted.
 
-Membership, closes, visits and dismissals live in one JSON file per unit under --state, the seen marks in one
+Membership, minimized pages, visits and dismissals live in one JSON file per unit under --state, the seen marks in one
 file for all; everything else is read from disk on every request, so the hub's state can go and only those
 marks go with it.
 
@@ -29,6 +29,11 @@ Inside a unit, the pages sit in four lanes, from the highest level to the lowest
 code. A page's lane follows from what it is: a session page goes to session, a diffview page to code, an image
 to concept, a page on another site to output, any other page in a show directory to concept, and anything else
 to output. An agent's `lane` overrides that, and holds until another names a lane.
+
+A unit's session page is the list of its pages: the artefacts the page's column links, then every page of the unit
+no turn links, which the hub tab adds at the column's end. The hub tab marks each line open, minimized or seen. A
+page the user closes is minimized: it stays a member, and comes back from its line in that list, or when an agent
+opens it again.
 
 Pages are served from here (`/f/<absolute path>`), so the hub tab shares their origin and reaches into them:
 their links and keys. A diffview page served here saves its comments through diffview's own code;
@@ -51,7 +56,7 @@ the session page's file:// link.
                               hub tab at the member; {"skipped": why} for an agent's page; {"tab": why} for a page
                               on another site, which the hub tab could not reach into, and open is that URL as
                               given. "unit" is the hub tab's own: the unit a link was clicked in.
-    POST /api/close           {"unit", "id"}: hide a member; it stays a member, and an open brings it back.
+    POST /api/close           {"unit", "id"}: minimize a member; it stays a member, and an open brings it back.
     POST /api/seen            {"url", "seen"}: the user's seen mark on a page.
     POST /api/visit           {"unit"}: the user looked at a unit; what was new there is not.
     POST /api/dismiss         {"unit"}: out of the numbers until its session next finishes a turn.
@@ -60,8 +65,9 @@ the session page's file:// link.
     GET  /api/hub             {"units": [...], "seen": {url: when}}: every unit, the numbered ones first in the
                               rail's order, then the dismissed, then the ended, each the latest turn first.
     GET  /api/u/<key>         one unit: {"unit", "session", "title", "tree", "repo", "state", "last", "number",
-                              "dismissed", "members": [{"id", "url", "closed", "lane", ...}], "artefacts", "seen", ...}.
-                              A member's url is where the hub serves it, relative to here.
+                              "dismissed", "members": [{"id", "url", "closed", "lane", ...}], "pages", "seen", ...}.
+                              A member's url is where the hub serves it, relative to here. "pages" is every page
+                              of the unit as its session page lists it: [{"url", "artefact", "linked", ...}].
     GET  /diff?tracker=&ticket=   a ticket's recorded `code@` ranges, rendered by diffview on first open
     GET  /f/<path>            a file under $HOME or the temp dir; a shared directory without an index.html lists
                               its pages
@@ -647,7 +653,7 @@ def mark(what: str, body: dict) -> tuple[int, dict]:
                 found = [m for m in data["members"] if m["id"] == body["id"]]
                 if not found:
                     return 404, {"error": f"no member {body['id']} in {key}"}
-                found[0]["closed"] = True
+                found[0].update(closed=True, closed_at=time.time())
             elif what == "visit":
                 data["visited"] = time.time()
             elif what == "dismiss":
@@ -661,43 +667,44 @@ def mark(what: str, body: dict) -> tuple[int, dict]:
 # a unit as the hub tab draws it, derived again on every read
 # --------------------------------------------------------------------------
 
-SKIP_DIRS = {"out", "run", "records", "sample", "pages", "vendor", "node_modules", "PROTOTYPE-wipe-me"}
+# The column of a session page that lists every artefact its turns link, and the attribute each link to an artefact
+# carries there: the absolute path of the file it opens, or the URL as written. The renderer is the mx plugin's.
+COLUMN = re.compile(rb'<aside\b[^>]*\bid="artefacts"[^>]*>(.*?)</aside>', re.DOTALL)
+ARTEFACT = re.compile(rb'\bdata-artefact="([^"]*)"')
+SESSION_LINKS: dict[Path, tuple[tuple[int, int], list[tuple[str, Page]]]] = {}
 
 
-def show_files(root: Path, depth: int = 0):
-    """A directory with an index.html is one artefact; otherwise its pages and figures are, one each.
-    Markdown counts only at the top, and report.md never: it is the worker's, for agents."""
-    if (root / "index.html").is_file():
-        yield root / "index.html"
-        return
-    for p in sorted(root.iterdir()):
-        if p.is_dir() and p.name not in SKIP_DIRS and not p.name.startswith("."):
-            yield from show_files(p, depth + 1)
-        elif p.suffix in (".html", ".svg", ".png", ".pdf") or (p.suffix == ".md" and depth == 0 and p.name != "report.md"):
-            yield p
-
-
-def artefact(page: Page, ticket: str | None, title: str | None = None) -> dict:
-    mtime = page.path.stat().st_mtime if page.path and page.path.exists() else 0
-    return {"url": page.url, "id": member_id(page.url), "ticket": ticket, "kind": page.kind,
-            "title": title or title_of(page), "mtime": mtime, "lane": lane_of(page)}
-
-
-def ticket_artefacts(tracker: Tracker, slug: str) -> list[dict]:
-    """What a ticket brings to its unit's sheet: one diff, the review page where there is one, else the render
-    of its code ranges; then its show files and prototypes."""
-    found = []
-    review = tracker.agent / "diffviews" / f"{slug}.html"
-    ranges = code_ranges(tracker, slug)
-    if review.is_file():
-        found.append(artefact(page_of_path(review), slug, "review"))
-    elif ranges:
-        found.append({"url": diff_url(tracker.root, slug), "id": member_id(diff_url(tracker.root, slug)), "ticket": slug,
-                      "kind": "diff", "title": "diff · " + ", ".join(ranges), "mtime": tracker.tickets[slug]["mtime"], "lane": "code"})
-    for base in (tracker.agent / "show" / slug, tracker.agent / "prototypes" / slug):
-        if base.is_dir():
-            found += [artefact(page_of_path(p), slug) for p in show_files(base)]
+def session_links(path: Path | None) -> list[tuple[str, Page]]:
+    """What a session page's artefact column links, in its order, once each: every `data-artefact` value with the
+    page it names. Read again only once the file has changed; nothing for a page with no column."""
+    if not path or not path.is_file():
+        return []
+    stat = path.stat()
+    if (hit := SESSION_LINKS.get(path)) and hit[0] == (stat.st_mtime_ns, stat.st_size):
+        return hit[1]
+    column = COLUMN.search(path.read_bytes())
+    values = dict.fromkeys(html.unescape(v.decode(errors="replace")) for v in ARTEFACT.findall(column[1] if column else b""))
+    found = [(v, page_of_path(Path(v)) if v.startswith("/") else Page(url=v.split("#")[0])) for v in values if v]
+    SESSION_LINKS[path] = (stat.st_mtime_ns, stat.st_size), found
     return found
+
+
+def unit_pages(session_page: Path | None, members: list[dict]) -> list[dict]:
+    """Every page of a unit as its session page lists it: the column's links in the column's order, opened or not,
+    then the members no turn links, in the order they were opened. The session page itself is the list, and is
+    not on it."""
+    by_url = {m["url"]: m for m in members}
+    pages = []
+    for value, page in session_links(session_page):
+        m = by_url.get(page.url)
+        pages.append({"url": page.url, "id": member_id(page.url), "artefact": value, "linked": True,
+                      "title": m["title"] if m else title_of(page), "kind": page.kind,
+                      "lane": m["lane"] if m else lane_of(page), "ticket": m["ticket"] if m else None})
+    linked = {p["url"] for p in pages}
+    pages += [{"url": m["url"], "id": m["id"], "artefact": m.get("path") or m["url"], "linked": False, "title": m["title"],
+               "kind": m["kind"], "lane": m["lane"], "ticket": m["ticket"]}
+              for m in sorted(members, key=lambda m: m["first"]) if m["url"] not in linked and m["kind"] != "session"]
+    return pages
 
 
 def resume_command(session: str) -> str:
@@ -745,21 +752,12 @@ def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dic
             save(data)
     home = str(tracker.root) if tracker else None
     slugs = list(dict.fromkeys([*committed, *(m["ticket"] for m in kept if m["ticket"] and m.get("tracker", data.get("tracker")) == home)]))
-    arts = []
     session_dir = tracker.agent / "sessions" / session if tracker and session else None
     session_page = session_dir / "index.html" if session_dir else None
-    if session_page and session_page.is_file():
-        arts.append(artefact(page_of_path(session_page), None))
-    for slug in slugs:
-        arts += ticket_artefacts(tracker, slug) if tracker and slug in tracker.tickets else []
-    listed = {a["url"] for a in arts}
-    # a render of a ticket's ranges is listed only while it is the ticket's one diff, opened or not
-    arts += [{"url": m["url"], "id": m["id"], "ticket": m["ticket"], "kind": m["kind"], "title": m["title"],
-              "mtime": m["first"]} for m in kept if m["url"] not in listed and not m["url"].startswith("/diff?")]
-    # a member's lane is the one its artefact row shows, so a page opened from the sheet lands where it was
+    if session and not (session_page and session_page.is_file()):  # opened from a repo whose tracker is not the unit's
+        session_page = next((Path(m["path"]) for m in kept if m["kind"] == "session" and Path(m["path"]).parent.name == session), session_page)
     members = [{**m, "lane": member_lane(m)} for m in kept]
-    lanes = {m["url"]: m["lane"] for m in members}
-    arts = [{**a, "lane": lanes.get(a["url"]) or a["lane"]} for a in arts]
+    pages = unit_pages(session_page, members)
     tickets = [{"slug": s, **({k: tracker.tickets[s][k] for k in ("status", "title", "diff")} if tracker and s in tracker.tickets
                                else {"status": "gone", "title": s, "diff": []}),
                 "ruled_at": tracker.tickets[s]["mtime"] if tracker and s in tracker.tickets else 0} for s in slugs]
@@ -771,8 +769,8 @@ def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dic
     return {"unit": key, "session": session, "title": title, "tree": tree, "repo": tracker.repo if tracker else "",
             "state": state, "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
             "first": min(m["first"] for m in kept), "visited": data.get("visited") or 0,
-            "resume": resume_command(session) if session else "", "tickets": tickets, "artefacts": arts, "members": members,
-            "seen": {u: seen[u] for u in {*listed, *(m["url"] for m in kept), *(a["url"] for a in arts)} if u in seen},
+            "resume": resume_command(session) if session else "", "tickets": tickets, "pages": pages, "members": members,
+            "seen": {u: seen[u] for u in {*(p["url"] for p in pages), *(m["url"] for m in kept)} if u in seen},
             "board": page_of_path(board).url if board and board.is_file() else None}
 
 
@@ -857,7 +855,7 @@ LISTING = """<!doctype html><meta charset="utf-8"><title>__TITLE__</title>
 
 def code_ranges(tracker: Tracker, ticket: str) -> list[str]:
     """The `code@` ranges a ticket's `diff:` field records. Its `agent@` ranges are left out: on a worker's branch
-    they hold its report and the show files the sheet lists on their own."""
+    they hold its report and its show files, which are pages of their own."""
     return [r for r in tracker.tickets.get(ticket, {}).get("diff") or [] if r.startswith("code@")]
 
 
