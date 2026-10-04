@@ -7,18 +7,20 @@
 
 The promises here: the tool never sends a request that could act on Moodle (a page outside
 the ones it reads, a parameter that turns a view into an action, an AJAX function outside its
-read-only list, a download that is not a Moodle file); it never opens an activity whose view
-requirement is still open; two equal snapshots diff to nothing and a changed due date, a new
-announcement or a removed file each show as one change, named the way Moodle names them; a
-file already downloaded is not fetched again, and a file of max's under the same name is never
-overwritten.
+read-only list, a download that is not a Moodle file); text keeps every link's target beside
+its text; a forum's discussions come with all their posts, read again only when a discussion
+got a post; everything a snapshot could not read is listed in it with the reason, and printed;
+two equal snapshots diff to nothing and a changed due date, a new announcement or a removed
+file each show as one change, named the way Moodle names them; a file already downloaded is
+not fetched again, and a file of max's under the same name is never overwritten.
 
-The HTML fixtures are cut down from moodle.jku.at's pages as they were on 2026-10-04, keeping
-the markup the parser reads: a course page's activity card with its completion dialog, and an
-assignment overview table.
+The HTML fixtures and the forum post are cut down from moodle.jku.at's pages and AJAX answers
+as they were on 2026-10-04, keeping the markup the parser reads.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -49,23 +51,33 @@ def check(what: str, expected, actual) -> None:
 class Wire:
     """Stands in for the network: records every request, answers from a table of path -> body."""
 
-    def __init__(self, pages: dict[str, str] | None = None, ajax: dict[str, object] | None = None):
+    def __init__(self, pages: dict[str, str] | None = None, ajax: dict[str, object] | None = None, broken: set[str] | None = None):
         self.sent: list[tuple[str, str]] = []
         self.pages = pages or {}
         self.ajax = ajax or {}
+        self.broken = broken or set()  # paths and AJAX functions that answer with an error
         self.headers: dict = {}
+        self.drops = 0  # how many of the next requests lose their connection
 
     def _answer(self, method: str, url: str, **kw):
         self.sent.append((method, url))
+        if self.drops:
+            self.drops -= 1
+            raise moodle.requests.ConnectionError("Remote end closed connection without response")
         path = url.removeprefix(moodle.MOODLE).split("?")[0]
         body = self.pages.get(path, "")
-        data = self.ajax.get(kw.get("params", {}).get("info"), {})
+        info = kw.get("params", {}).get("info")
+        data = self.ajax.get(info, {})
+        page_broken = any(path.startswith(b) for b in self.broken if b.startswith("/"))
+        ajax_broken = info in self.broken
 
         class R:
-            status_code, text, headers = 200, body, {}
+            status_code, text, headers = (500 if page_broken else 200), body, {}
 
-            def raise_for_status(self): ...
-            def json(self): return [{"error": False, "data": data}]
+            def raise_for_status(self):
+                if page_broken:
+                    raise moodle.requests.HTTPError(f"500 Server Error for {path}")
+            def json(self): return [{"error": True, "exception": {"message": "Fehler beim Lesen der Datenbank"}} if ajax_broken else {"error": False, "data": data}]
             def iter_content(self, n): yield b"pdf bytes"
             def __enter__(self): return self
             def __exit__(self, *a): ...
@@ -75,9 +87,9 @@ class Wire:
     def post(self, url, **kw): return self._answer("POST", url, **kw)
 
 
-def session(pages: dict[str, str] | None = None, ajax: dict[str, object] | None = None) -> tuple[object, Wire]:
+def session(pages: dict[str, str] | None = None, ajax: dict[str, object] | None = None, broken: set[str] | None = None) -> tuple[object, Wire]:
     m = moodle.Moodle()
-    m.s = Wire(pages, ajax)
+    m.s = Wire(pages, ajax, broken)
     m.sesskey = "k"
     moodle.PAUSE = 0
     return m, m.s
@@ -96,93 +108,167 @@ def refused(fn) -> bool:
 m, wire = session()
 check("a submission action on an assignment page is refused",
       True, refused(lambda: m.page("/mod/assign/view.php", id=1, action="savesubmission")))
+check("a session key on a page is refused", True, refused(lambda: m.page("/mod/forum/view.php", id=1, sesskey="k")))
 check("a page outside the ones it reads is refused", True, refused(lambda: m.page("/course/modedit.php", id=1)))
+check("an activity type that may act on opening (an LTI launch) is refused", True, refused(lambda: m.page("/mod/lti/view.php", id=1)))
 check("the logout page is refused", True, refused(lambda: m.page("/login/logout.php")))
 check("a write AJAX function is refused", True, refused(lambda: m.ajax("mod_assign_submit_for_grading", assignmentid=1)))
-check("marking forum posts read through AJAX is refused", True, refused(lambda: m.ajax("mod_forum_get_discussion_posts", discussionid=1)))
+check("posting to a forum is refused", True, refused(lambda: m.ajax("mod_forum_add_discussion_post", postid=1, subject="x", message="y")))
 check("a download from outside pluginfile.php is refused", True,
       refused(lambda: m.download(f"{moodle.MOODLE}/mod/resource/view.php?id=1", Path(tempfile.mkdtemp()) / "x")))
 check("no refused call reached the wire", [], wire.sent)
 m.page("/mod/resource/view.php", follow=False, id=1, redirect=1)
 m.ajax("core_courseformat_get_state", courseid=1)
-check("reads go out: a resource redirect and a read-only AJAX call", ["GET", "POST"], [s[0] for s in wire.sent])
+m.ajax("mod_forum_get_discussion_posts", discussionid=1)
+check("reads go out: a resource redirect, a read-only AJAX call, a forum's posts", ["GET", "POST", "POST"], [s[0] for s in wire.sent])
 
-# --- an activity whose view requirement is still open is never opened
+# --- the course page: summaries and labels keep their links, an unfinished view requirement no longer holds a page back
 
 COURSE_PAGE = """
 <ul>
 <li class="section course-section main" data-for="section" data-id="1002002" data-number="2" data-sectionname="Forums">
- <div data-for="sectioninfo"><div class="summarytext"><p>Exercise sheets go <a href="https://moodle.jku.at/pluginfile.php/9/course/section/1002002/rules.pdf">here</a>.</p></div></div>
+ <div data-for="sectioninfo"><div class="summarytext"><p>Exercise sheets go <a href="https://moodle.jku.at/pluginfile.php/9/course/section/1002002/rules.pdf">here</a>.</p>
+  <p>Live stream on <strong>Tuesday</strong> via <a href="https://jku.zoom.us/j/64011030340?pwd=V3wW">Zoom</a>, schedule in <a href="https:\\kusss.jku.at">KUSSS</a>.</p></div></div>
+ <li class="activity label modtype_label" data-id="10" id="module-10">
+  <div class="activity-altcontent"><div class="no-overflow"><p>Q&amp;A sessions: <a href="https://jku.zoom.us/j/98349106604">https://jku.zoom.us/j/98349106604</a></p></div></div>
+ </li>
  <li class="activity resource modtype_resource" data-id="11" id="module-11">
   <div data-region="completionrequirements"><button class="btn dropdown-toggle btn-subtle-secondary">Zu erledigen</button>
    <div class="completion-dialog"><div role="list">
     <div class="d-flex mt-2" role="listitem"><span class="visually-hidden">Zu erledigen:</span><span>Anzeigen</span></div>
    </div></div></div>
  </li>
- <li class="activity resource modtype_resource" data-id="12" id="module-12">
-  <div data-region="completionrequirements"><button class="btn dropdown-toggle btn-subtle-success">Erledigt</button>
-   <div class="completion-dialog"><div role="list">
-    <div class="d-flex mt-2 text-success" role="listitem"><span class="visually-hidden">Erledigt:</span><span>Anzeigen</span></div>
-   </div></div></div>
+ <li class="activity page modtype_page" data-id="14" id="module-14">
+  <div class="activity-availability availabilityinfo isrestricted" data-region="availabilityinfo"><div class="showmore-container collapsed" data-region="showmore">
+   <button class="showmore-button" type="button"><span class="collapsed-content">Mehr anzeigen</span><span class="expanded-content">Weniger anzeigen</span></button>
+   <div class="collapsed-content text-truncate"><span class="availability-excerpt">Nicht verfügbar, außer: Sie sind in <strong>Kurs 365.215, UE Hands-on AI I, Mohammed Abbass / Rainer ...</strong> ...</span></div>
+   <div class="expanded-content py-2">Nicht verfügbar, außer: Sie sind in <strong>Kurs 365.215, UE Hands-on AI I, Mohammed Abbass / Rainer Dangl, 2025W</strong></div>
+  </div></div>
  </li>
  <li class="activity assign modtype_assign" data-id="13" id="module-13">
   <div data-region="activity-dates">Geöffnet: Dienstag, 3. März 2026, 18:00 Fällig: Donnerstag, 5. März 2026, 07:00</div>
-  <div data-region="completionrequirements"><button class="btn dropdown-toggle btn-subtle-secondary">Zu erledigen</button>
-   <div class="completion-dialog"><div role="list">
-    <div class="d-flex mt-2" role="listitem"><span class="visually-hidden">Zu erledigen:</span><span>Abgabe einreichen</span></div>
-   </div></div></div>
  </li>
 </li></ul>"""
 
 m, wire = session({"/course/view.php": COURSE_PAGE})
 sections, cards = moodle.course_page(m, 1)
+check("a section summary keeps each link's target beside its text", "\n".join([
+    "Exercise sheets go here <https://moodle.jku.at/pluginfile.php/9/course/section/1002002/rules.pdf>.",
+    "Live stream on Tuesday via Zoom <https://jku.zoom.us/j/64011030340?pwd=V3wW>, schedule in KUSSS <https://kusss.jku.at>.",
+]), sections["1002002"]["summary"])
 check("a section's summary links its files", {"rules.pdf": "https://moodle.jku.at/pluginfile.php/9/course/section/1002002/rules.pdf"},
       sections["1002002"]["files"])
-check("an assignment card keeps Moodle's dates", "Geöffnet: Dienstag, 3. März 2026, 18:00 Fällig: Donnerstag, 5. März 2026, 07:00", cards["13"]["dates"])
+check("a label whose link text is its target says it once", "Q&A sessions: <https://jku.zoom.us/j/98349106604>", cards["10"]["text"])
+check("an assignment card keeps Moodle's dates", "Geöffnet: Dienstag, 3. März 2026, 18:00 Fällig: Donnerstag, 5. March 2026, 07:00".replace("March", "März"), cards["13"]["dates"])
+check("a restriction reads once, in full", "Nicht verfügbar, außer: Sie sind in Kurs 365.215, UE Hands-on AI I, Mohammed Abbass / Rainer Dangl, 2025W",
+      cards["14"]["restrictions"])
 wire.sent.clear()
-held = moodle.activity_detail(m, {"name": "Sheet", "module": "resource", **cards["11"]}, "11", None, set())
-check("an unfinished view requirement holds the activity back", True, "held" in held)
-check("and its page is not opened", [], wire.sent)
-moodle.activity_detail(m, {"name": "Done", "module": "resource", **cards["12"]}, "12", None, set())
-check("a view requirement already met lets the page open", 1, len(wire.sent))
-wire.sent.clear()
-moodle.activity_detail(m, {"name": "Sheet 0", "module": "assign", **cards["13"]}, "13", None, set())
-check("a requirement viewing does not tick (a submission) lets the page open", 1, len(wire.sent))
+moodle.activity_detail(m, {"name": "Sheet", "module": "resource", **cards["11"]}, "11", None, set(), [], "Forums › Sheet")
+check("an unfinished view requirement no longer keeps the page closed", 1, len(wire.sent))
+
+# --- an activity's own page: its text with links, without the countdown that changes by the minute
+
+ASSIGN_PAGE = """<div id="region-main"><div class="activity-header"><div id="intro"><p>Submit before Thursday 8:00.
+ Template: <a href="https://moodle.jku.at/pluginfile.php/5/mod_assign/introattachment/0/template.tex">template.tex</a></p></div></div>
+<div role="main"><table class="generaltable"><tr><th>Abgabestatus</th><td>Zur Bewertung abgegeben</td></tr>
+<tr><th>Verbleibende Zeit</th><td>213 Tage 11 Stunden zu spät</td></tr>
+<tr><th>Feedback als Kommentar</th><td>See <a href="view.php?id=13&amp;action=grading">the grading notes</a></td></tr></table>
+<div class="comment-area"><span>___picture___ ___name___ - ___time___</span></div></div></div>"""
+m, wire = session({"/mod/assign/view.php": ASSIGN_PAGE})
+got = moodle.detail(m, "assign", "13")
+check("an assignment's description, status and feedback, links kept, relative ones made absolute", "\n".join([
+    "Submit before Thursday 8:00. Template: template.tex <https://moodle.jku.at/pluginfile.php/5/mod_assign/introattachment/0/template.tex>",
+    "Abgabestatus Zur Bewertung abgegeben",
+    "Feedback als Kommentar See the grading notes <https://moodle.jku.at/mod/assign/view.php?id=13&action=grading>",
+]), got["content"])
+check("and its files", {"template.tex": "https://moodle.jku.at/pluginfile.php/5/mod_assign/introattachment/0/template.tex"}, got["files"])
+check("a session key in a link is dropped, the rest kept", "https://moodle.jku.at/filter/opencast/ltilaunch.php?courseid=42975&episodeid=8b47",
+      moodle.absolute("https://moodle.jku.at/filter/opencast/ltilaunch.php?courseid=42975&sesskey=1EwtB8zIjh&episodeid=8b47"))
 
 # --- an activity page is opened again only when something says it changed
 
-wire.sent.clear()
+m, wire = session()
 before = {"name": "Notes", "module": "resource", "files": {"a.pdf": "u"}}
 check("an unchanged activity carries its files over", {"files": {"a.pdf": "u"}},
-      moodle.activity_detail(m, {"name": "Notes", "module": "resource"}, "20", before, set()))
+      moodle.activity_detail(m, {"name": "Notes", "module": "resource"}, "20", before, set(), [], ""))
 check("without opening its page", [], wire.sent)
-moodle.activity_detail(m, {"name": "Notes", "module": "resource"}, "20", before, {"20"})
+moodle.activity_detail(m, {"name": "Notes", "module": "resource"}, "20", before, {"20"}, [], "")
 check("one Moodle reports changed is opened again", 1, len(wire.sent))
 wire.sent.clear()
-forum_before = {"name": "Announcements", "module": "forum", "topics": 38, "posts": 41, "discussions": {}}
-moodle.activity_detail(m, {"name": "Announcements", "module": "forum", "topics": 38, "posts": 42}, "21", forum_before, set())
-check("a forum with a new reply and no new topic is opened again", 1, len(wire.sent))
+moodle.activity_detail(m, {"name": "Notes", "module": "resource"}, "20", before, None, [], "")
+check("in a course whose update check fails, it is opened every run", 1, len(wire.sent))
 
-# --- a course that hides its completion requirements opens no activity page
+# --- a forum: every discussion with all its posts
 
-STATE = json.dumps({"course": {"id": "7"}, "section": [{"id": "70", "title": "Material", "cmlist": ["71"], "visible": True}],
-                    "cm": [{"id": "71", "name": "Sheet 1", "module": "resource", "url": "https://moodle.jku.at/mod/resource/view.php?id=71",
-                            "visible": True, "uservisible": True}]})
-m, wire = session({"/course/view.php": "<ul></ul>"}, {"core_courseformat_get_state": STATE})
-course = {"id": 7, "name": "C", "folder": "c", "url": "u", "hidden": False, "completion": "hidden"}
-snap = moodle.scrape_course(m, course, None, None)
-check("its activities are held", True, "held" in snap["sections"]["70"]["items"]["71"])
-check("and no activity page went out", [], [u for _, u in wire.sent if "/mod/" in u])
+FORUM_PAGE = """<div id="region-main"><div role="main"><table>
+<tr class="discussion" data-discussionid="173014"><th class="topic"><a href="https://moodle.jku.at/mod/forum/discuss.php?d=173014">Results of VL exam 03.07.2026</a></th>
+ <td class="author"><div class="author-info"><div class="text-truncate">Luca Gerardo-Giorda</div><time data-timestamp="1784482375"></time></div></td>
+ <td><time data-timestamp="1784482375"></time></td><td class="p-0 text-center"><span>1</span></td></tr>
+</table></div></div>"""
+POSTS = {"posts": [
+    {"id": 340221, "subject": "Results of VL exam 03.07.2026 ", "author": {"fullname": "Luca Gerardo-Giorda"}, "parentid": None,
+     "timecreated": 1784482375, "timemodified": 1784482375,
+     "message": "<p>Dear all, </p>\r\n<p>The results are available on <a href=\"https://kusss.jku.at\">KUSSS</a>. </p>",
+     "attachments": [{"filename": "grades.pdf", "url": "https://moodle.jku.at/webservice/pluginfile.php/13916849/mod_forum/attachment/340221/grades.pdf"}],
+     "messageinlinefiles": []},
+    {"id": 340300, "subject": "Re: Results", "author": {"fullname": "A Student"}, "parentid": 340221,
+     "timecreated": 1784490000, "timemodified": 1784490000, "message": "<p>Thanks!</p>", "attachments": [], "messageinlinefiles": []}]}
+m, wire = session({"/mod/forum/view.php": FORUM_PAGE}, {"mod_forum_get_discussion_posts": POSTS})
+forum = moodle.activity_detail(m, {"name": "Announcements", "module": "forum", "topics": 1, "posts": 2}, "21", None, set(), [], "Forums › Announcements")
+check("each discussion comes with every post, the message's links kept", {
+    "340221": {"subject": "Results of VL exam 03.07.2026", "author": "Luca Gerardo-Giorda", "created": "2026-07-19T17:32+00:00",
+               "modified": "2026-07-19T17:32+00:00", "message": "Dear all,\nThe results are available on KUSSS <https://kusss.jku.at>.",
+               "files": {"grades.pdf": "https://moodle.jku.at/pluginfile.php/13916849/mod_forum/attachment/340221/grades.pdf"}},
+    "340300": {"subject": "Re: Results", "author": "A Student", "created": "2026-07-19T19:40+00:00", "modified": "2026-07-19T19:40+00:00",
+               "parent": "340221", "message": "Thanks!"},
+}, forum["discussions"]["173014"]["posts"])
 wire.sent.clear()
-moodle.scrape_course(m, course | {"completion": "off"}, None, None)
-check("a course tracking no completion opens it", 1, len([u for _, u in wire.sent if "/mod/resource/view.php" in u]))
+again = moodle.activity_detail(m, {"name": "Announcements", "module": "forum", "topics": 1, "posts": 3},
+                               "21", {"name": "Announcements", "module": "forum", "topics": 1, "posts": 2, **forum}, set(), [], "")
+check("a forum with a new reply is opened again, but a discussion whose last post is unchanged is not reread",
+      (1, 0), (len([u for _, u in wire.sent if "view.php" in u]), len([u for _, u in wire.sent if "service.php" in u])))
+check("and keeps its posts", forum["discussions"]["173014"]["posts"], again["discussions"]["173014"]["posts"])
 
-# --- a requirement the tool cannot place holds the activity (fail closed)
+# --- a dropped connection is tried again; one that keeps dropping is a gap, not a crash
 
-m, wire = session({"/course/view.php": COURSE_PAGE.replace("<span>Anzeigen</span></div>\n   </div></div></div>\n </li>\n <li class=\"activity resource modtype_resource\" data-id=\"12\"",
-                                                         "<span>Zeit verbringen: 5 Minuten</span></div>\n   </div></div></div>\n </li>\n <li class=\"activity resource modtype_resource\" data-id=\"12\"")})
-check("an unfinished requirement of unknown wording holds the activity", (True, False),
-      ("Zeit verbringen" in m.s.pages["/course/view.php"], "_hold" not in moodle.course_page(m, 1)[1]["11"]))
+moodle.RETRIES = (0, 0)
+m, wire = session({"/mod/page/view.php": "<div id='region-main'><div role='main'><p>Exam on 3 July</p></div></div>"})
+wire.drops = 2
+check("a page whose connection dropped twice is read on the third try", "Exam on 3 July", moodle.detail(m, "page", "5")["content"])
+wire.drops = 3
+gaps = []
+moodle.activity_detail(m, {"name": "Rules", "module": "page"}, "5", None, set(), gaps, "Info › Rules")
+check("one that drops three times is a gap", ["Info › Rules"], [g["where"] for g in gaps])
+check("names arrive unescaped", "Q&A Forum", moodle.name_of("Q&amp;A  Forum"))
+
+# --- what a snapshot could not read, it lists with the reason
+
+STATE = json.dumps({"course": {"id": "7"}, "section": [{"id": "70", "title": "Material", "cmlist": ["71", "72", "73", "74"], "visible": True}],
+                    "cm": [{"id": "71", "name": "Sheet 1", "module": "resource", "url": "https://moodle.jku.at/mod/resource/view.php?id=71", "visible": True, "uservisible": True},
+                           {"id": "72", "name": "Exam registration", "module": "page", "url": "https://moodle.jku.at/mod/page/view.php?id=72", "visible": True, "uservisible": False},
+                           {"id": "73", "name": "Tutor tool", "module": "lti", "url": "https://moodle.jku.at/mod/lti/view.php?id=73", "visible": True, "uservisible": True},
+                           {"id": "74", "name": "Recordings", "module": "opencast", "url": "https://moodle.jku.at/mod/opencast/view.php?id=74", "visible": True, "uservisible": True}]})
+course = {"id": 7, "name": "C", "folder": "c", "url": "u", "hidden": False}
+m, wire = session({"/course/view.php": "<ul></ul>"}, {"core_courseformat_get_state": STATE}, broken={"/mod/resource/view.php", "core_course_get_updates_since"})
+gaps: list[dict] = []
+snap = moodle.scrape_course(m, course, {"sections": {}}, 1790000000, gaps)
+reasons = {g["where"]: g["reason"] for g in gaps}
+check("each thing it could not read is a gap", ["", "Material › Exam registration", "Material › Sheet 1", "Material › Tutor tool"], sorted(reasons))
+check("a page that failed says why", True, reasons["Material › Sheet 1"].startswith("its page could not be read (500 Server Error"))
+check("an unavailable activity says Moodle withholds it", "Moodle shows it to max as unavailable", reasons["Material › Exam registration"])
+check("an activity type it does not open says so", "its page is not opened: lti activities are not among the types this tool reads", reasons["Material › Tutor tool"])
+check("the failing update check and the streamed recordings are course-wide gaps", 2, sum(g["where"] == "" for g in gaps))
+check("and no LTI page went out", [], [u for _, u in wire.sent if "/mod/lti/" in u])
+
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    moodle.show([], [{"course": 7, "name": "C", "folder": "c"} | g for g in gaps], False)
+check("snapshot and diff print the gaps after the changes", True,
+      out.getvalue().startswith("no changes\n\nmissing from the snapshot (5):\n") and "  c › Material › Tutor tool: its page is not opened" in out.getvalue())
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    moodle.show([], [], True)
+check("as JSON, changes and gaps side by side", {"changes": [], "gaps": []}, json.loads(out.getvalue()))
 
 # --- the forum overview gives topic and post counts, without the unread count Moodle appends
 
@@ -258,6 +344,16 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a folder's files go under the folder's name", True, (root / "stats" / "Old exams" / "2022" / "exam.pdf").exists())
     wire.sent.clear()
     check("a second run fetches nothing", (0, []), (moodle.download(m, course, root)[0], wire.sent))
+    forum = {"name": "C", "folder": "forum", "sections": {"1": {"name": "S", "items": {"21": {"name": "Announcements", "module": "forum", "discussions": {
+        "173014": {"name": "Results", "posts": {"340221": {"files": {"grades.pdf": "https://moodle.jku.at/pluginfile.php/1/mod_forum/attachment/340221/grades.pdf"}}}}}}}}}}
+    moodle.download(m, forum, root)
+    check("a post's attachment goes under the forum's and the discussion's name", True, (root / "forum" / "Announcements" / "Results" / "grades.pdf").exists())
+    m, wire = session(broken={"/pluginfile.php"})
+    lost = {"name": "C", "folder": "lost", "sections": {"1": {"name": "S", "files": {"x.pdf": "https://moodle.jku.at/pluginfile.php/7/x.pdf"}}}}
+    fetched, _, failed = moodle.download(m, lost, root)
+    check("a file that fails to download is a gap, and is not marked fetched", (0, ["x.pdf"], False),
+          (fetched, [g["where"] for g in failed], (root / "lost" / moodle.LEDGER).exists()))
+    m, wire = session()
     two = {"name": "C", "folder": "two", "sections": {
         "1": {"name": "Week 1", "files": {"Uebung.pdf": "https://moodle.jku.at/pluginfile.php/3/course/section/1/Uebung.pdf"}},
         "2": {"name": "Week 2", "files": {"Uebung.pdf": "https://moodle.jku.at/pluginfile.php/3/course/section/2/Uebung.pdf"}}}}
