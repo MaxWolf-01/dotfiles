@@ -93,7 +93,7 @@
       minimize = [ "<Super>m" ];
       maximize = [ "<Shift><Super>m" "<Super>Up" ];
       unmaximize = [ "<Super>Down" ];
-      # Ubuntu's default adds <Primary><Alt>d, which the agent containers use (done, next page).
+      # Ubuntu's default adds <Primary><Alt>d, which the hub tab uses (done, next unseen page).
       show-desktop = [ "<Primary><Super>d" "<Super>d" ];
       switch-to-workspace-1 = [ "<Super>1" ];
       switch-to-workspace-2 = [ "<Super>2" ];
@@ -176,7 +176,7 @@
       span-window-right = [ "<Control><Super>Right" ];
       span-window-up = [ "<Control><Super>Up" ];
       # Directional focus is off: Ctrl+Alt+hjkl and their Shift forms belong to the
-      # agent containers' view in the browser (bin/container-hub.html).
+      # hub tab in the browser (bin/container-hub.html).
       focus-window-down = [];
       focus-window-left = [];
       focus-window-right = [];

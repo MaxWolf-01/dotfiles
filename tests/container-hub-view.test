@@ -3,17 +3,22 @@
 # requires-python = ">=3.12"
 # dependencies = ["playwright"]
 # ///
-"""Drive a container's view (bin/container-hub.html) in headless Chromium and check what it promises: keys
-that answer with the hub frozen, rulings from the tracker, links and keys inside a page. Run it directly; no
-framework. Skips when no chromium is on PATH ($CHROMIUM overrides).
+"""Drive the hub tab (bin/container-hub.html) in headless Chromium and check what it promises: keys that answer
+with the hub frozen, rulings from the tracker, links and keys inside a page, the rail's numbers following the
+sessions' turns while focus stays put, a unit's lanes and the user's arrangement of them, the session page as the
+list of a unit's pages that brings a minimized one back, a page on another origin framed or opened as a tab on a click,
+and a page that still loads with many units open. Run it directly; no framework. Skips when no chromium is on PATH
+($CHROMIUM overrides).
 
 GNOME takes its own bindings before a browser sees them, so a key that clashes with one passes here and
 fails on the desktop: this is no substitute for driving the view in Brave.
 """
 
+import http.server
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -34,6 +39,7 @@ SCRATCH = Path(tempfile.mkdtemp(prefix="container-hub-view-test."))
 HOME = SCRATCH / "home"
 ORCHESTRATOR = "aaaaaaaa-0000-4000-8000-000000000001"
 SECOND = "bbbbbbbb-0000-4000-8000-000000000002"  # an orchestrator of another subtree of the same tree
+SELF_STARTED = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
 
 failures = 0
 
@@ -49,14 +55,27 @@ def check(what: str, expected, actual) -> None:
 
 def settles(what: str, expected, read, within: float = 10) -> None:
     """check() on what read() returns once it equals expected, or at the deadline: the view moves the keyboard a
-    frame after a key, renders the sheet after the layout, and the hub catches up after a thaw."""
+    frame after a key, marks the session page after the layout, and the hub catches up after a thaw."""
     deadline = time.monotonic() + within
     while (actual := read()) != expected and time.monotonic() < deadline:
         time.sleep(0.05)
     check(what, expected, actual)
 
 
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB"))}
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB", "TMUX"))}
+# Every tmux call, the hub's and the test's, goes through a tmux that passes on only those naming the test's own
+# server's socket, and records the rest: nothing here may reach a server the test did not start.
+TMUX_SOCKET = SCRATCH / "tmux.sock"
+TMUX_REFUSED = SCRATCH / "tmux-refused"
+TMUX = SCRATCH / "shim" / "tmux"
+TMUX.parent.mkdir()
+TMUX.write_text(f"""#!/usr/bin/env bash
+[ "$1" = -S ] && [ "$2" = {shlex.quote(str(TMUX_SOCKET))} ] && exec {shlex.quote(shutil.which("tmux"))} "$@"
+printf '%s\\n' "$*" >> {shlex.quote(str(TMUX_REFUSED))}
+exit 1
+""")
+TMUX.chmod(0o755)
+ENV["PATH"] = f"{TMUX.parent}:{ENV['PATH']}"
 for k, args in (("UV_CACHE_DIR", ("cache", "dir")), ("UV_PYTHON_INSTALL_DIR", ("python", "dir"))):
     ENV[k] = subprocess.run(["uv", *args], capture_output=True, text=True, check=True).stdout.strip()
 ENV.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
@@ -72,6 +91,16 @@ def git(cwd: Path, *args: str) -> None:
 def ticket(slug: str, status: str = "open", parent: str | None = None) -> None:
     (AGENT / "tickets" / f"{slug}.md").write_text(
         TICKET.format(status=status, parent=f"parent: {parent}\n" if parent else "", slug=slug))
+
+
+def registered(session: str, at: float, status: str = "idle", pid: int | None = None, started: str = SELF_STARTED,
+               **extra) -> None:
+    """The session's file in the registry, as Claude Code writes it while the session's process runs: by default
+    this test's own process, which runs for as long as the hub reads it."""
+    path = HOME / ".claude" / "sessions" / f"{session[:8]}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": pid or os.getpid(), "procStart": started, "sessionId": session, "status": status,
+                                "statusUpdatedAt": int(at * 1000), **extra}))
 
 
 def page(rel: str, body: str) -> Path:
@@ -96,11 +125,30 @@ ticket("map-columns")
 ticket("csv-import", "claimed", "map-columns")
 git(AGENT, "add", "tickets")
 git(AGENT, "commit", "-q", "-m", "file the tree", "-m", f"Session: {ORCHESTRATOR}")
-pages = [page(f"sessions/{ORCHESTRATOR}/index.html", "<h1>session</h1>"),
+# The session page as the mx renderer writes it, cut to what the hub reads: the artefact column (#artefacts), each
+# link to an artefact carrying the absolute path it opens (data-artefact), on a collapsed turn's chips too, and the
+# page's keys 1 to 9, which click the focused turn's links in the column.
+SESSION_PAGE = f"""<h1>session</h1>
+<details class="turn" id="t01" data-block><summary>turn 1 <span class="chip"><a class="chip-link" href="../../show/csv-import/index.html"
+  data-artefact="{AGENT}/show/csv-import/index.html" target="_blank">csv import</a></span></summary></details>
+<aside class="column" id="artefacts"><section class="group" id="a01"><a class="turn-ref" href="#t01">01</a><ol>
+  <li><kbd class="n">1</kbd><a class="artefact" href="../../show/csv-import/index.html" data-artefact="{AGENT}/show/csv-import/index.html" target="_blank">csv import</a></li>
+  <li><kbd class="n">2</kbd><a class="artefact" href="../../show/map-columns/index.html" data-artefact="{AGENT}/show/map-columns/index.html" target="_blank">map columns</a></li>
+</ol></section></aside>
+<script>document.addEventListener("keydown", (e) => {{
+  if (!e.ctrlKey && !e.altKey && /^[1-9]$/.test(e.key)) document.querySelectorAll("#a01 a[data-artefact]")[+e.key - 1]?.click()
+}})</script>"""
+pages = [page(f"sessions/{ORCHESTRATOR}/index.html", SESSION_PAGE),
          page("show/csv-import/index.html", "<h1>csv import</h1>"),
          page("show/map-columns/index.html", "<h1>map columns</h1><a id=link href='other.html'>other</a>")]
 page("show/map-columns/other.html", "<h1>other</h1>")
-page("board.html", "<h1>board</h1>")
+# The board as the tracker renders it, cut to what the hub reads: a row per ticket, carrying its slug
+# (details.ticket[data-slug]), in groups the done of which is folded. The rows before ORCHESTRATOR's open ticket push
+# it out of view; csv-import is done by the time the board opens. drop-zone is SECOND's.
+row = lambda slug: f'<details class="ticket" id="t-{slug}" data-slug="{slug}"><summary style="height:60px">{slug}</summary></details>'
+page("board.html", '<details class="grp" id="grp-frontier" open><summary>frontier</summary>'
+     + "".join(row(f"filler-{n}") for n in range(30)) + row("map-columns") + row("drop-zone")
+     + '</details><details class="grp" id="grp-done"><summary>done</summary>' + row("csv-import") + "</details>")
 HLJS = HOME / ".cache/diffview" / ("hljs-" + re.search(r'HLJS_VERSION = "(.+)"', (BIN / "diffview").read_text())[1])
 HLJS.mkdir(parents=True)
 (HLJS / "highlight.min.js").write_text("")  # fails its pin, so diffview neither fetches nor highlights
@@ -116,7 +164,7 @@ with socket.socket() as s:
     s.bind(("127.0.0.1", 0))
     PORT = s.getsockname()[1]
 ORIGIN = f"http://127.0.0.1:{PORT}"
-HUB_ARGS = [str(BIN / "container-hub"), "--port", str(PORT), "--state", str(SCRATCH / "state")]
+HUB_ARGS = [str(BIN / "container-hub"), "--port", str(PORT), "--state", str(SCRATCH / "state"), "--tmux-socket", str(TMUX_SOCKET)]
 
 
 def start_hub() -> subprocess.Popen:
@@ -147,6 +195,27 @@ def kill_hub() -> None:
 hub = None
 
 
+class Elsewhere(http.server.BaseHTTPRequestHandler):
+    """A local server on another origin than the hub's: /deny and /self refuse framing, any other path allows it."""
+
+    def do_GET(self):
+        self.send_response(200)
+        if self.path == "/deny":
+            self.send_header("X-Frame-Options", "DENY")
+        if self.path == "/self":
+            self.send_header("Content-Security-Policy", "frame-ancestors 'self'")
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<!doctype html><h1>an app</h1>")
+
+    def log_message(self, *_):
+        pass
+
+
+elsewhere = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Elsewhere)
+threading.Thread(target=elsewhere.serve_forever, daemon=True).start()
+
+
 def api(path: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(ORIGIN + path, data=json.dumps(body).encode() if body else None,
                                  method="POST" if body else "GET")
@@ -156,9 +225,12 @@ def api(path: str, body: dict | None = None) -> dict:
 
 try:
     hub = start_hub()
+    t0 = time.time()
+    os.utime(pages[0], (t0 - 100, t0 - 100))  # the session page's render: when ORCHESTRATOR last finished a turn
+    registered(ORCHESTRATOR, t0 - 100)
     opened = [api("/api/open", {"target": str(p), "session": ORCHESTRATOR}) for p in pages]
-    key, view_path = opened[0]["container"], opened[0]["view"]
-    ids = {p.parent.name: o["id"] for p, o in zip(pages, opened)}
+    mids = {p.parent.name: o["id"] for p, o in zip(pages, opened)}
+    ids = {k: f"{ORCHESTRATOR}~{v}" for k, v in mids.items()}  # a page's view in the hub tab is its unit's
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(executable_path=CHROMIUM)
@@ -166,7 +238,7 @@ try:
         view = context.new_page()
         errors = []
         view.on("pageerror", lambda e: errors.append(str(e)))
-        view.goto(ORIGIN + view_path)
+        view.goto(ORIGIN + "/")
         view.wait_for_function("window.wc && ws.views().length === 3", timeout=30000)
         docked = lambda: sorted(view.evaluate("ws.views().filter(v => v.placement === 'docked').map(v => v.id)"))
         focused = lambda: view.evaluate("ws.getSnapshot().focusedView")
@@ -183,9 +255,18 @@ try:
             return f
 
         frame_of = lambda member: frame_at(f"/{member}/index.html")
-        seen_in_sheet = lambda suffix: view.evaluate(
-            f"[...document.querySelectorAll('#sheet .row.art')].find(r => r.querySelector('.t').title.endsWith({json.dumps(suffix)}))"
-            "?.querySelector('.tick').classList.contains('seen') ?? null")
+        def line(suffix: str):
+            """How the session page's column marks the page whose path ends so: open, minimized or "" for neither, and
+            whether its seen mark is set. None while the page is reloading, or lists no such page."""
+            try:
+                return frame_of(ORCHESTRATOR).evaluate("""s => {
+                    const a = [...document.querySelectorAll('#artefacts a[data-artefact]')].find(a => a.dataset.artefact.endsWith(s));
+                    const mark = a?.previousElementSibling;
+                    return a && mark?.classList.contains('hub-mark') ? [a.dataset.hub ?? "", mark.hasAttribute('data-seen')] : null }""", suffix)
+            except PlaywrightError:
+                return None
+        line_link = lambda suffix: f'#artefacts a[data-artefact$="{suffix}"]'
+        line_mark = lambda suffix: f'#artefacts li:has(a[data-artefact$="{suffix}"]) .hub-mark'
         holds_keyboard = "document.activeElement === ws.view(ws.getSnapshot().focusedView)?.element.querySelector('iframe')"
 
         def focus(member: str) -> None:
@@ -197,21 +278,37 @@ try:
             frame_of(member)
         view.keyboard.press("Control+Alt+1")
         settles("ctrl+alt+1 goes into the first orchestrator", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
+        # a unit's columns left to right, each the panels in it
+        lanes = lambda page=view: page.evaluate(f"""(() => {{
+            const d = ws.getDocument(), panels = (n) => n.kind === "panel" ? [n] : n.children.flatMap(panels);
+            const mine = (n) => d.views[panels(n)[0].views[0]]?.params.group === "{ORCHESTRATOR}";
+            const top = d.root.id === "root" ? d.root.children.find(mine) : d.root;
+            return (top.kind === "split" && top.axis === "x" ? top.children : [top]).map((c) => panels(c).map((p) => p.id).join("+"));
+        }})()""")
+        lane = lambda name: f"p:{ORCHESTRATOR}:{name}"
+        # the panels the camera shows, left to right
+        on_screen = lambda: view.evaluate("""(() => { const app = document.getElementById("app").getBoundingClientRect();
+            return [...document.querySelectorAll('[data-trellis-part="panel"]')].map((e) => [e.dataset.panel, e.getBoundingClientRect()])
+              .filter(([, r]) => r.width > 40 && r.left >= app.left - 4 && r.right <= app.right + 4).sort((a, b) => a[1].left - b[1].left).map(([id]) => id); })()""")
+        check("a unit's pages sit in lanes: the session page, then concept", [lane("session"), lane("concept")], lanes())
+        check("...the show pages of two tickets tabs in the concept lane", [lane("concept")] * 2,
+              [view.evaluate(f"ws.view({json.dumps(ids[k])}).panelId") for k in ("csv-import", "map-columns")])
+        settles("...both on screen, being two", [lane("session"), lane("concept")], on_screen)
 
         # the keys answer with the hub frozen: it gets the change once it runs again
-        hub_view = lambda: api("/api/c/" + urllib.parse.quote(key, safe=""))
-        csv_import = lambda: next(m for m in hub_view()["members"] if m["id"] == ids["csv-import"])
-        events, listening = [], threading.Event()  # what the hub broadcasts on the container
+        hub_view = lambda: api("/api/u/" + ORCHESTRATOR)
+        csv_import = lambda: next(m for m in hub_view()["members"] if m["id"] == mids["csv-import"])
+        events, listening = [], threading.Event()  # what the hub broadcasts
 
         def listen() -> None:
-            with urllib.request.urlopen(ORIGIN + "/events/" + urllib.parse.quote(key, safe="")) as r:
+            with urllib.request.urlopen(ORIGIN + "/events") as r:
                 for line in r:
                     listening.set()
                     if line.startswith(b"data:"):
                         events.append(json.loads(line[5:]))
 
         threading.Thread(target=listen, daemon=True).start()
-        check("the test hears the container's events", True, listening.wait(30))
+        check("the test hears the hub's events", True, listening.wait(30))
         # the close is held back on its way, so a reopen sent without waiting on it would reach the hub first
         view.route("**/api/close", lambda r: (time.sleep(1), r.continue_()))
         os.killpg(hub.pid, signal.SIGSTOP)
@@ -221,18 +318,19 @@ try:
             settles("ctrl+alt+w takes the page out of the layout with the hub frozen", False, lambda: ids["csv-import"] in docked())
             focus("map-columns")
             view.keyboard.press("Control+Alt+d")
-            settles("ctrl+alt+d marks the page seen in the sheet with the hub frozen", True, lambda: seen_in_sheet("/map-columns/index.html"))
+            settles("ctrl+alt+d marks the page seen in the session page's column with the hub frozen", ["open", True],
+                    lambda: line("/map-columns/index.html"))
             settles("...and moves on to the next unseen page", ids["csv-import"], focused)
         finally:
             os.killpg(hub.pid, signal.SIGCONT)
             view.unroute("**/api/close")
         # closed reads False before the close arrives too, so the read waits until the hub has applied both
         settles("the hub has the close and the reopen once it runs again", {"close", "reopened"},
-                lambda: {e["type"] for e in events if e.get("id") == ids["csv-import"]})
+                lambda: {e["type"] for e in events if e.get("id") == mids["csv-import"]})
         check("...in that order", False, csv_import()["closed"])
         settles("...and the seen mark", True, lambda: any(u.endswith("/map-columns/index.html") for u in hub_view()["seen"]))
 
-        # a ruling in the tracker minimizes the ticket's pages, and the session page stays
+        # a ruling in the tracker minimizes the ticket's pages you marked seen, and the session page stays
         # A page opened after its ticket's ruling stays up. The kernel stamps the ticket file from a clock a few
         # milliseconds behind the hub's, so a ruling written right after the reopen can read as older than it; it is
         # written again until it reads as newer.
@@ -242,17 +340,21 @@ try:
             time.sleep(0.01)
             ticket("csv-import", "done", "map-columns")
         check("the ruling reads as newer than the reopen", True, (AGENT / "tickets/csv-import.md").stat().st_mtime > reopened_at)
+        view.wait_for_function(f"wc.state.units.find(u => u.unit === {json.dumps(ORCHESTRATOR)}).tickets"
+                               ".find(t => t.slug === 'csv-import')?.status === 'done'", timeout=10000)
+        check("ruling a ticket leaves its page up while you have not marked it seen", True, ids["csv-import"] in docked())
+        frame_of(ORCHESTRATOR).click(line_mark("/csv-import/index.html"))
         view.wait_for_function(f"!ws.views().some(v => v.id === {json.dumps(ids['csv-import'])} && v.placement === 'docked')",
                                timeout=10000)
-        check("ruling a ticket in the tracker takes its pages out of the layout", sorted([ids["map-columns"], ids[ORCHESTRATOR]]),
-              sorted(x for x in docked()))
-        settles("...and the sheet lists them as minimized", True, lambda: "ruled · minimized" in view.inner_text("#sheet"))
+        check("...and marking it seen by its mark in the session page's column takes it out of the layout",
+              sorted([ids["map-columns"], ids[ORCHESTRATOR]]), sorted(x for x in docked()))
+        settles("...the column marking it minimized and seen", ["minimized", True], lambda: line("/csv-import/index.html"))
 
         # links and keys inside a page
         frame_of("map-columns").click("#link")
         view.wait_for_function("ws.views().some(v => v.params.url.endsWith('/other.html'))", timeout=10000)
         other = view.evaluate("ws.views().find(v => v.params.url.endsWith('/other.html')).params")
-        check("a plain click on a link opens it as a panel in the page's group", (ORCHESTRATOR, "map-columns"),
+        check("a plain click on a link opens it as a panel in the page's unit", (ORCHESTRATOR, "map-columns"),
               (other["group"], other["ticket"]))
         focus("map-columns")  # other.html took its panel's front tab
         with context.expect_page(timeout=30000) as tab:
@@ -272,17 +374,64 @@ try:
         link(f"http://localhost:{PORT}/f{urllib.parse.quote(str(third))}")
         settles("a link to the hub by its other name opens as a panel too", True,
                 lambda: view.evaluate("ws.views().some(v => v.params.url.endsWith('/third.html'))"))
-        with context.expect_page(timeout=30000) as tab:
-            link("https://example.invalid/elsewhere")
-        tab.value.close()
-        check("a plain click on a link to another site opens a browser tab, and no panel", False,
-              view.evaluate("ws.views().some(v => v.params.url.includes('example.invalid'))"))
         focus("map-columns")
         frame_of("map-columns").press("#link", "Control+Alt+0")
         settles("ctrl+alt+0 from inside a page goes to the overview", None, lambda: view.evaluate("wc.current"))
 
+        # one-hub-tab#P2: a page minimized is listed in its unit's session page, and one key or click brings it back
+        view.keyboard.press("Control+Alt+1")
+        settles("in the orchestrator again, its session page framed", True, lambda: lane("session") in on_screen())
+        check("the hub tab has no sheet of its own", None, view.evaluate("document.getElementById('sheet')"))
+        check("the column marks an open page open, seen or not", (["open", True], ["minimized", True]),
+              (line("/map-columns/index.html"), line("/csv-import/index.html")))
+        check("...and so does a collapsed turn's chip, csv import's", "minimized",
+              frame_of(ORCHESTRATOR).evaluate("document.querySelector('.chip a[data-artefact]').dataset.hub"))
+        unlinked = lambda: frame_of(ORCHESTRATOR).evaluate("[...document.querySelectorAll('#hub-unlinked a[data-artefact]')].map(a => a.dataset.artefact.split('/').pop())")
+        settles("the pages no turn links are listed at the column's end, in the order they were opened", ["other.html", "third.html"], unlinked)
+        check("...after every line the renderer wrote", True, frame_of(ORCHESTRATOR).evaluate(
+            "document.querySelector('#artefacts').lastElementChild.id === 'hub-unlinked'"))
+        focus("map-columns")
+        view.keyboard.press("Control+Alt+w")
+        settles("ctrl+alt+w minimizes the page: out of the layout, its line marked minimized", (False, ["minimized", True]),
+                lambda: (ids["map-columns"] in docked(), line("/map-columns/index.html")))
+        settles("...still a member, minimized", True, lambda: next(m for m in hub_view()["members"] if m["id"] == mids["map-columns"])["closed"])
+        frame_of(ORCHESTRATOR).click(line_link("/map-columns/index.html"))
+        settles("a click on its line in the column brings it back to its lane, focused", (lane("concept"), ids["map-columns"]),
+                lambda: (view.evaluate(f"ws.view({json.dumps(ids['map-columns'])})?.panelId ?? null"), focused()))
+        settles("...its line marked open again", ["open", True], lambda: line("/map-columns/index.html"))
+        view.keyboard.press("Control+Alt+w")
+        settles("minimized again", False, lambda: ids["map-columns"] in docked())
+        frame_of(ORCHESTRATOR).press("#t01 > summary", "2")
+        settles("the session page's key 2 brings back the focused turn's second page", (lane("concept"), ids["map-columns"]),
+                lambda: (view.evaluate(f"ws.view({json.dumps(ids['map-columns'])})?.panelId ?? null"), focused()))
+        other_id = view.evaluate("ws.views().find(v => v.params.url.endsWith('/other.html')).id")
+        view.evaluate(f"ws.focus({json.dumps(other_id)})")
+        view.wait_for_function(holds_keyboard, timeout=10000)
+        view.keyboard.press("Control+Alt+w")
+        settles("a page no turn links, minimized, is marked so at the column's end", (False, ["minimized", False]),
+                lambda: (other_id in docked(), line("/other.html")))
+        frame_of(ORCHESTRATOR).click(line_link("/other.html"))
+        settles("...and a click on its line there brings it back", True, lambda: other_id in docked())
+        view.evaluate(f"ws.focus({json.dumps(other_id)})")
+        view.wait_for_function(holds_keyboard, timeout=10000)
+        view.keyboard.press("Control+Alt+w")
+        settles("minimized again", False, lambda: other_id in docked())
+        view.keyboard.press("Control+Alt+Shift+W")
+        settles("ctrl+alt+shift+w brings back the page minimized last, not the ruled one", (True, False),
+                lambda: (other_id in docked(), ids["csv-import"] in docked()))
+        focus(ORCHESTRATOR)
+        view.keyboard.press("Control+Alt+w")
+        settles("the session page minimizes too", False, lambda: ids[ORCHESTRATOR] in docked())
+        view.keyboard.press("Control+Alt+0")
+        view.keyboard.press("Control+Alt+1")
+        settles("...and entering its unit brings it back, the list of every other page", True, lambda: ids[ORCHESTRATOR] in docked())
+        keys = view.text_content("#keys")
+        check("the keys list says how to bring a minimized page back", True,
+              "minimize" in keys and "click its line" in keys and "ctrl+alt+shift+w" in keys)
+        view.keyboard.press("Control+Alt+0")
+
         # maximize: ctrl+alt+z takes the focused panel to the whole workspace and back
-        diff_id = api("/api/open", {"target": str(DIFF), "session": ORCHESTRATOR})["id"]
+        diff_id = f"{ORCHESTRATOR}~" + api("/api/open", {"target": str(DIFF), "session": ORCHESTRATOR})["id"]
         view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(diff_id)} && v.placement === 'docked')", timeout=10000)
         diff_panel = view.evaluate(f"ws.view({json.dumps(diff_id)}).panelId")
         diff_frame = frame_at("/diffviews/map-columns.html")
@@ -290,11 +439,22 @@ try:
         settle = lambda: view.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))")  # trellis places panels a frame later
         panel_box = lambda: settle() or box(f'[data-trellis-part="panel"][data-panel="{diff_panel}"]')
         fills = lambda b, a: abs(b[0] - a[0]) <= 8 and abs(b[1] - a[1]) <= 8 and abs(b[2] - a[2]) <= 8 and abs(b[3] - a[3]) <= 8
+        check("a diffview page goes to the code lane, the last", [lane("session"), lane("concept"), lane("code")], lanes())
+        window = lambda *names: list(map(lane, names))
+        framed = on_screen
         view.keyboard.press("Control+Alt+1")
+        settles("of three lanes, the camera frames two: the session page and concept", window("session", "concept"), framed)
+        view.keyboard.press("Control+Alt+l")
+        settles("ctrl+alt+l pans one lane right", window("concept", "code"), framed)
+        settles("...the keyboard on the lane that came into view", diff_panel, lambda: view.evaluate("ws.getSnapshot().focusedPanel"))
+        view.keyboard.press("Control+Alt+l")
+        settle()
+        check("...and at the last lane the camera stays", (window("concept", "code"), diff_panel),
+              (framed(), view.evaluate("ws.getSnapshot().focusedPanel")))
         before = panel_box()
-        # into the diff, over to the session page and back by a click: trellis hears no focus move between two pages
+        # into the diff, over to the concept lane and back by a click: trellis hears no focus move between two pages
         diff_frame.click("body", position={"x": 300, "y": 200})
-        diff_frame.press("body", "Control+Alt+h")
+        view.mouse.click(*view.evaluate(f"(r => [r.x + r.width / 2, r.y + r.height / 2])(document.querySelector('[data-panel=\"{lane("concept")}\"]').getBoundingClientRect())"))
         diff_frame.click("body", position={"x": 300, "y": 200})
         settles("a click into a page focuses its panel, before any key", diff_panel, lambda: view.evaluate("ws.getSnapshot().focusedPanel"))
         diff_frame.press("body", "Control+Alt+z")
@@ -321,10 +481,14 @@ try:
         in_diff("Control+Alt+m")
         settles("ctrl+alt+m turns minimize ruled off, and the checkbox follows", (False, True),
                 lambda: (view.is_checked("#hide-ruled"), ids["csv-import"] in docked()))
-        in_diff("Control+Alt+k")
-        settles("ctrl+alt+k still focuses the panel above, the ruled ticket's row on top again", "csv-import",
-                lambda: view.evaluate("ws.getSnapshot().focusedPanel").split(":")[2])
-        settles("...and the keyboard goes with it", True, lambda: view.evaluate(holds_keyboard))
+        check("...the ruled ticket's page back in its lane", lane("concept"), view.evaluate(f"ws.view({json.dumps(ids['csv-import'])}).panelId"))
+        in_diff("Control+Alt+h")
+        settles("ctrl+alt+h from inside a page pans one lane left", window("session", "concept"), framed)
+        settles("...the keyboard on the session page", (lane("session"), True),
+                lambda: (view.evaluate("ws.getSnapshot().focusedPanel"), view.evaluate(holds_keyboard)))
+        view.keyboard.press("Control+Alt+l")
+        settles("...and ctrl+alt+l back", (window("concept", "code"), diff_panel),
+                lambda: (framed(), view.evaluate("ws.getSnapshot().focusedPanel")))
         tab.click()
         view.keyboard.press("Control+Alt+m")
         settles("ctrl+alt+m in the workspace turns it back on", (True, False),
@@ -338,6 +502,62 @@ try:
         settles("...and in the workspace shut", False, lambda: view.evaluate("document.getElementById('keys').open"))
         keys = view.text_content("#keys")
         check("the keys list names ctrl+alt+m and ctrl+alt+shift+k", True, "ctrl+alt+m" in keys and "ctrl+alt+shift+k" in keys)
+        check("...the lanes on ctrl+alt+h / l, the rail on ctrl+alt+j / k, and no ctrl+alt+[ or ]", (True, True, False),
+              ("ctrl+alt+h / l" in keys and "lane" in keys, "ctrl+alt+j / k" in keys, "ctrl+alt+[" in keys or "ctrl+alt+]" in keys))
+
+        # the user's arrangement holds: a lane resized and a page put beside another survive a reload of the hub tab,
+        # and an agent opening another page
+        divider = view.evaluate(f"""(() => {{ const app = document.getElementById("app").getBoundingClientRect();
+            const d = [...document.querySelectorAll('[data-trellis-part="divider"][data-split="g:{ORCHESTRATOR}"]')]
+              .map((e) => e.getBoundingClientRect()).find((r) => r.height > 100 && r.left > app.left + 50 && r.right < app.right - 50);
+            return d && [d.left + d.width / 2, d.top + d.height / 2]; }})()""")
+        weights = lambda page=view: page.evaluate(f"(function find(n) {{ return !n ? null : n.id === 'g:{ORCHESTRATOR}' ? n.weights.map((w) => Math.round(w * 1000)) : n.children?.map(find).find(Boolean) ?? null; }})(ws.getDocument().root)")
+        dragged_from = weights()
+        view.mouse.move(*divider)
+        view.mouse.down()
+        view.mouse.move(divider[0] - 120, divider[1], steps=8)
+        view.mouse.move(divider[0] - 240, divider[1], steps=8)
+        view.mouse.up()
+        settles("dragging the divider between two framed lanes resizes them", True,
+                lambda: weights()[1] < dragged_from[1] and weights()[2] > dragged_from[2])
+        figure = page("show/map-columns/plot.svg", "")  # an image, written as one below
+        figure.write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 20"><rect width="40" height="20"/></svg>')
+        figure_id = f"{ORCHESTRATOR}~" + api("/api/open", {"target": str(figure), "session": ORCHESTRATOR})["id"]
+        settles("an agent's figure lands in the concept lane", lane("concept"),
+                lambda: view.evaluate(f"ws.view({json.dumps(figure_id)})?.panelId ?? null"))
+        view.evaluate(f"ws.dock({json.dumps(figure_id)}, {{ beside: {json.dumps(diff_panel)}, edge: 'right' }})")
+        def beside_diff() -> bool:
+            at, cols = view.evaluate(f"ws.view({json.dumps(figure_id)}).panelId"), lanes()
+            code = next(i for i, c in enumerate(cols) if lane("code") in c.split("+"))
+            return at != lane("concept") and at in "+".join(cols[code:code + 2]).split("+")
+        settles("a page dragged beside the diff sits beside it", True, beside_diff)
+        arranged = lanes(), weights()
+        reloaded = context.new_page()
+        reloaded.goto(ORIGIN + "/")
+        reloaded.wait_for_function(f"window.wc && ws.view({json.dumps(figure_id)})", timeout=30000)
+        check("a reloaded hub tab keeps both", arranged, (lanes(reloaded), weights(reloaded)))
+        reloaded.close()
+        late = api("/api/open", {"target": str(page("show/map-columns/late.html", "<h1>late</h1>")), "session": ORCHESTRATOR})
+        late_id = f"{ORCHESTRATOR}~{late['id']}"
+        settles("a page an agent opens later goes to its lane", lane("concept"),
+                lambda: view.evaluate(f"ws.view({json.dumps(late_id)})?.panelId ?? null"))
+        check("...and the arrangement holds", arranged, (lanes(), weights()))
+        api("/api/open", {"target": str(AGENT / "show/map-columns/late.html"), "session": ORCHESTRATOR, "lane": "output"})
+        settles("a page an agent puts in another lane moves there", lane("output"),
+                lambda: view.evaluate(f"ws.view({json.dumps(late_id)})?.panelId ?? null"))
+        check("...a lane of its own between concept and code", True,
+              lanes().index(lane("concept")) + 1 == lanes().index(lane("output")) == next(i for i, c in enumerate(lanes()) if lane("code") in c) - 1)
+        for _ in lanes():  # to the last lanes, then left until the window starts at output
+            view.keyboard.press("Control+Alt+l")
+        for _ in lanes():
+            if settle() or on_screen()[0] == lane("output"):
+                break
+            view.keyboard.press("Control+Alt+h")
+        check("...panned to with ctrl+alt+h", lane("output"), on_screen()[0])
+        view.evaluate(f"ws.focus({json.dumps(late_id)})")
+        view.wait_for_function(holds_keyboard, timeout=10000)
+        view.keyboard.press("Control+Alt+w")
+        settles("the window's first lane going, the window starts at the lane after it", lane("code"), lambda: on_screen()[0])
 
         # an agent opening a page again reloads it, though never over what the page says it would lose
         def reloaded() -> bool:
@@ -365,48 +585,299 @@ try:
         seen_before = lambda: sorted(u for u in hub_view()["seen"])
         marks = seen_before()
         focus(ORCHESTRATOR)
+        settles("a page focused outside the framed lanes pans its lane into view", window("session", "concept"), on_screen)
+        first_unseen = os.path.realpath(frame_of(ORCHESTRATOR).evaluate(
+            "[...document.querySelectorAll('#artefacts .hub-mark')].find(m => !m.hasAttribute('data-seen')).nextElementSibling.dataset.artefact"))
         view.keyboard.press("Control+Alt+n")
-        settles("ctrl+alt+n goes to the next unseen page", ids["csv-import"], focused)
+        settles("ctrl+alt+n goes from the session page to the first unseen page its column lists", first_unseen,
+                lambda: view.evaluate("decodeURIComponent(ws.view(ws.getSnapshot().focusedView)?.params.url.replace(/^\\/f/, '') ?? '')"))
         check("...and marks nothing seen", marks, seen_before())
+        board_placement = lambda: view.evaluate("ws.views().find(v => v.params.kind === 'board')?.placement ?? null")
+        frame_at("/" + os.path.relpath(first_unseen, os.path.realpath(AGENT)))  # the keys go into the page ctrl+alt+n focused
         view.keyboard.press("Control+Alt+b")
-        settles("ctrl+alt+b shows the board, floating over the container", "floating",
-                lambda: view.evaluate("ws.views().find(v => v.id === 'board')?.placement ?? null"))
-        frame_at("/board.html")  # a key pressed into a page still loading goes nowhere
+        settles("ctrl+alt+b shows the board, floating over the units", "floating", board_placement)
+        board = frame_at("/board.html")  # a key pressed into a page still loading goes nowhere
+        check("csv-import is done by now", "done", next(t["status"] for t in hub_view()["tickets"] if t["slug"] == "csv-import"))
+        settles("...marking the tickets the unit's session claimed or committed on and not done, and no other", ["map-columns"],
+                lambda: board.evaluate("[...document.querySelectorAll('[data-hub-unit]')].map(r => r.dataset.slug)"))
+        check("...the first of them scrolled into view", True,
+              board.evaluate("(r => r.top >= 0 && r.bottom <= innerHeight)(document.getElementById('t-map-columns').getBoundingClientRect())"))
         view.keyboard.press("Control+Alt+b")
-        settles("...and hides it again", None, lambda: view.evaluate("ws.views().find(v => v.id === 'board')?.placement ?? null"))
+        settles("...and hides it again", None, board_placement)
+        api("/api/open", {"target": str(AGENT / "board.html"), "session": ORCHESTRATOR})
+        settles("a board an agent hands the hub opens over the hub tab", "floating", board_placement)
+        check("...as a page of no unit", False, any(m["kind"] == "board" for m in hub_view()["members"]))
+        view.keyboard.press("Control+Alt+b")
+        settles("...and ctrl+alt+b hides it", None, board_placement)
 
-        # two orchestrators on one tree: the keys tell them apart
+        # two orchestrators on one tree: the rail numbers them by when each last finished a turn
         ticket("drop-zone", "claimed", "map-columns")
+        git(AGENT, "add", "tickets/drop-zone.md")
+        git(AGENT, "commit", "-q", "-m", "claim drop-zone", "-m", f"Session: {SECOND}")
         view.keyboard.press("Control+Alt+0")
         settles("in the overview", None, lambda: view.evaluate("wc.current"))
+        registered(SECOND, t0 - 50)
         second = api("/api/open", {"target": str(page("show/drop-zone/index.html", "<h1>drop zone</h1>")), "session": SECOND})
-        check("a second orchestrator's page lands in the same container", key, second["container"])
-        view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(second['id'])})", timeout=10000)
+        second_id = f"{SECOND}~{second['id']}"
+        check("a second orchestrator's page lands in its own unit", SECOND, second["unit"])
+        view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(second_id)})", timeout=10000)
         api("/api/open", {"target": str(pages[2]), "session": ORCHESTRATOR})
-        settles("the view has both pages as new", 2, lambda: view.evaluate(
-            "wc.state.groups.filter(g => wc.state.members.some(m => m.group === g.id && m.by === 'agent' && m.at > g.visited)).length"))
+        settles("the rail marks both orchestrators as having something new", 2,
+                lambda: view.evaluate("document.querySelectorAll('#units .new').length"))
         view.keyboard.press("Control+Alt+Enter")
         settles("ctrl+alt+enter goes to the orchestrator whose news is oldest", SECOND, lambda: view.evaluate("wc.current"))
-        view.keyboard.press("Control+Alt+1")
-        settles("ctrl+alt+1 goes to the first orchestrator", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
+        frame_at(f"/pages/{SECOND}")  # entering it opened its stand-in for a session page, which takes the keys once loaded
+        view.wait_for_function(holds_keyboard, timeout=10000)
         view.keyboard.press("Control+Alt+2")
-        settles("ctrl+alt+2 to the second", SECOND, lambda: view.evaluate("wc.current"))
-
-        # the hub gone: the view says so with the command that brings it back, and sends what changed meanwhile
+        settles("ctrl+alt+2 goes to the orchestrator that finished a turn before the last", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
         view.keyboard.press("Control+Alt+1")
+        settles("ctrl+alt+1 to the one that finished a turn last", SECOND, lambda: view.evaluate("wc.current"))
+        view.keyboard.press("Control+Alt+j")
+        settles("ctrl+alt+j to the next down the rail", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
+        view.keyboard.press("Control+Alt+k")
+        settles("ctrl+alt+k back up to the one before", SECOND, lambda: view.evaluate("wc.current"))
+
+        # the board over one of two orchestrators on one tree marks that one's tickets
+        marked = lambda: frame_at("/board.html").evaluate("[...document.querySelectorAll('[data-hub-unit]')].map(r => r.dataset.slug)")
+        view.keyboard.press("Control+Alt+b")
+        settles("the board over the second orchestrator marks its tickets, not the first's", ["drop-zone"], marked)
+        view.keyboard.press("Control+Alt+j")
+        settles("...and the marks follow you to the other orchestrator", ["map-columns"], marked)
+        view.keyboard.press("Control+Alt+k")
+        settles("...and back", ["drop-zone"], marked)
+        view.keyboard.press("Control+Alt+b")
+        settles("...the board hidden again", None, board_placement)
+
+        # one-hub-tab#P6: a reorder of the rail never changes which session has the user's focus
+        rail = lambda: view.evaluate("wc.state.units.filter(u => u.number).map(u => u.unit)")
+        view.evaluate(f"ws.focus({json.dumps(second_id)})")
+        view.wait_for_function(holds_keyboard, timeout=10000)
+        registered(ORCHESTRATOR, time.time())  # the other orchestrator finishes a turn
+        settles("an orchestrator finishing a turn becomes 1 on the rail", [ORCHESTRATOR, SECOND], rail)
+        view.wait_for_timeout(2500)  # past the hub's next look at the disk, and whatever the tab does on its news
+        check("...while the unit you are in stays the one you are in", SECOND, view.evaluate("wc.current"))
+        check("...and the page you are on keeps the focus, and the keyboard", (second_id, True), (focused(), view.evaluate(holds_keyboard)))
+        check("...the rail's keys naming the new order", ["ctrl+alt+1", "ctrl+alt+2"],
+              view.evaluate("[...document.querySelectorAll('#units .cap')].map(e => e.title)"))
+
+        # the ✕: out of the numbers until the session next finishes a turn
+        view.locator("#units .unit", has=view.locator(f'button[title="session {SECOND}"]')).locator(".dismiss").click(force=True)
+        settles("the ✕ takes an orchestrator out of the numbers", [ORCHESTRATOR], rail)
+        check("...to the list of those set aside", True, f"session {SECOND[:8]}" in view.inner_text("#aside-units"))
+        check("...and leaves you where you are", (SECOND, True), (view.evaluate("wc.current"), second_id in docked()))
+        view.keyboard.press("Control+Alt+j")
+        settles("ctrl+alt+j from outside the numbers goes to the first in them", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
+        settles("...the one set aside leaving the layout with you", False, lambda: second_id in docked())
+        registered(SECOND, time.time() + 1)
+        settles("its session finishing a turn brings it back, as 1", [SECOND, ORCHESTRATOR], rail)
+
+        # one-hub-tab#P2 for the loose pages. No session page lists them, so a stand-in in the session lane does.
+        loose_note = HOME / "notes" / "loose.html"
+        loose_note.parent.mkdir(parents=True, exist_ok=True)
+        loose_note.write_text("<!doctype html><h1>a loose note</h1>")
+        loose_id = f"loose~{api('/api/open', {'target': str(loose_note)})['id']}"
+        view.locator("#aside-units button.nav[title='pages no session opened']").click()
+        settles("the loose pages, entered, have a stand-in for a session page in the session lane", ["loose", True],
+                lambda: view.evaluate("[wc.current, ws.views().some(v => v.params.url === '/pages/loose' && v.placement === 'docked')]"))
+        stand_in = frame_at("/pages/loose")
+        def stand_line():
+            try:
+                return stand_in.evaluate("""() => { const a = document.querySelector('#artefacts a[data-artefact$="/loose.html"]');
+                    return a && a.previousElementSibling?.classList.contains('hub-mark') ? a.dataset.hub ?? "" : null }""")
+            except PlaywrightError:
+                return None
+        settles("...listing the unit's page as the column does, marked open", "open", stand_line)
+        view.evaluate(f"ws.focus({json.dumps(loose_id)})")
+        view.wait_for_function(holds_keyboard, timeout=10000)
+        view.keyboard.press("Control+Alt+w")
+        settles("...marked minimized once you minimize it", (False, "minimized"), lambda: (loose_id in docked(), stand_line()))
+        stand_in.click('#artefacts a[data-artefact$="/loose.html"]')
+        settles("...and a click on its line brings it back", (True, "open"), lambda: (loose_id in docked(), stand_line()))
+
+        # the address of the hub tab at a unit, which the Stop hook's line links
+        api("/api/close", {"unit": ORCHESTRATOR, "id": mids[ORCHESTRATOR]})
+        at_unit = context.new_page()
+        at_unit.goto(f"{ORIGIN}/u/{ORCHESTRATOR}#{mids['csv-import']}")
+        at_unit.wait_for_function("window.wc && ws.views().length > 0", timeout=30000)
+        settles("the hub tab opened at a unit and a page is in that unit, on that page", [ORCHESTRATOR, ids["csv-import"]],
+                lambda: at_unit.evaluate("[wc.current, ws.getSnapshot().focusedView]"))
+        check("...its session page brought back, the list of every other", True,
+              at_unit.evaluate(f"ws.views().some(v => v.id === {json.dumps(ids[ORCHESTRATOR])} && v.placement === 'docked')"))
+        check("...its address back at the hub's root, so a reload stays where you are then", "/", at_unit.evaluate("location.pathname + location.hash"))
+        at_unit.close()
+
+        # the hub gone: the tab says so with the command that brings it back, and sends what changed meanwhile
+        view.keyboard.press("Control+Alt+2")
+        settles("in the first orchestrator again", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
         focus("map-columns")
         kill_hub()
-        settles("a view cut off from the hub says so, with the command that restarts it", " ".join(["setsid", "-f", *HUB_ARGS]),
+        settles("a hub tab cut off from the hub says so, with the command that restarts it", " ".join(["setsid", "-f", *HUB_ARGS]),
                 lambda: view.evaluate("document.querySelector('#status code')?.textContent ?? null"))
         view.keyboard.press("Control+Alt+w")
         settles("a key still answers while the hub is down", False, lambda: ids["map-columns"] in docked())
         hub = start_hub()
-        settles("the view hears the hub is back", True, lambda: view.evaluate("document.getElementById('status').textContent === 'hub: connected'"), within=20)
+        settles("the hub tab hears the hub is back", True, lambda: view.evaluate("document.getElementById('status').textContent === 'hub: connected'"), within=20)
         settles("...and the hub gets the close made while it was down", True,
-                lambda: next(m for m in hub_view()["members"] if m["id"] == ids["map-columns"])["closed"])
+                lambda: next(m for m in hub_view()["members"] if m["id"] == mids["map-columns"])["closed"])
+
+        # one-hub-tab#P1: many orchestrators' pages open in one tab, and a page opened then still loads
+        many = [f"{n:08x}-0000-4000-8000-{n:012x}" for n in range(0x10, 0x18)]
+        for n, session in enumerate(many):
+            registered(session, t0 - 300 - n)
+            api("/api/open", {"target": str(page(f"show/unit-{n}/index.html", f"<h1>unit {n}</h1>")), "session": session})
+        view.keyboard.press("Control+Alt+0")
+        settles("ten orchestrators' pages are open in the one tab", 10, lambda: view.evaluate(
+            "new Set(ws.views().filter(v => v.placement === 'docked').map(v => v.params.group)).size"), within=30)
+        try:
+            for n in range(len(many)):
+                frame_at(f"/unit-{n}/index.html")
+            view.wait_for_timeout(2000)  # whatever connections the tab holds open for its units, it holds by now
+            api("/api/open", {"target": str(page("show/unit-0/late.html", "<h1 id=late>late</h1>")), "session": many[0]})
+            late = frame_at("/unit-0/late.html").inner_text("#late")
+        except (PlaywrightError, RuntimeError) as e:
+            late = f"not loaded: {e}"[:200]
+        check("...and a page opened then still loads", "late", late)
+        check("...as does a read of the hub", True, view.evaluate(
+            "Promise.race([fetch('/api/hub').then(r => r.ok), new Promise(r => setTimeout(() => r(false), 10000))])"))
+
+        # a unit whose session page nobody opened: entering it opens that page, the list of its pages
+        unopened = page(f"sessions/{many[1]}/index.html", "<h1>unit 1's session</h1>")
+        os.utime(unopened, (t0 - 301, t0 - 301))  # its last turn, as registered, so the rail keeps its order
+        view.wait_for_function(f"wc.state.units.find(u => u.unit === {json.dumps(many[1])})?.session_page?.url.startsWith('/f/')", timeout=10000)
+        view.locator(f'#units button[title="session {many[1]}"]').click()
+        settles("entering a unit whose session page nobody opened opens it", True, lambda: view.evaluate(
+            f"ws.views().some(v => v.params.group === {json.dumps(many[1])} && v.params.kind === 'session' && v.placement === 'docked')"))
+        check("...saying nothing of nothing being open", False, "nothing open" in view.inner_text("#log"))
+
+        # the input box under a unit's session page, typing into the session's tmux pane. The session's program stands
+        # in for Claude Code: it asks for bracketed paste, and records every byte typed into its pane.
+        answering = many[1]
+        received, recorder = SCRATCH / "received", SCRATCH / "recorder.py"
+        recorder.write_text("import os, sys, tty\ntty.setraw(0)\nos.write(1, b'\\x1b[?2004h')\nout = open(sys.argv[1], 'ab', buffering=0)\n"
+                            "while data := os.read(0, 4096):\n    out.write(data)\n")
+        tmux = lambda *args: subprocess.run([TMUX, "-S", TMUX_SOCKET, *args], env=ENV, capture_output=True, text=True, check=True).stdout.strip()
+        tmux("new-session", "-d", "-s", "answering", "-x", "100", "-y", "20", f"exec {sys.executable} {recorder} {received}")
+        try:
+            pane, pane_pid = tmux("display-message", "-p", "-t", "answering:", "#{pane_id} #{pane_pid}").split()
+            started = Path(f"/proc/{pane_pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            in_pane = lambda status="idle", **extra: registered(answering, t0 - 301, status, pid=int(pane_pid), started=started, **extra)
+            in_pane(tmux=f"answering:@0.{pane}")
+            box = f"ws.view(ws.views().find(v => v.params.group === {json.dumps(answering)} && v.params.kind === 'session').id).element.querySelector('.reply')"
+            box_says = lambda: view.evaluate(f"(b => b && [b.dataset.state, b.querySelector('.how').textContent])({box})")
+            area_value = lambda: view.evaluate(f"{box}.querySelector('textarea').value")
+            arrived = lambda: received.read_bytes() if received.exists() else b""
+            settles("a unit whose session runs in a tmux pane has an input box under its session page, saying it waits on you",
+                    ["waiting", "waiting on you · enter types into tmux session answering"], box_says)
+            check("the token that lets the tab type is out of its document before any page is framed", None,
+                  view.evaluate("document.querySelector('meta[name=\"hub-token\"]')"))
+            view.keyboard.press("Control+Alt+r")
+            settles("ctrl+alt+r puts the keyboard in the box", True, lambda: view.evaluate(f"document.activeElement === {box}.querySelector('textarea')"))
+            view.keyboard.type("go on")
+            view.keyboard.press("Shift+Enter")
+            view.keyboard.type("but leave the tests")
+            check("shift+enter is a new line in the box, sending nothing", ("go on\nbut leave the tests", b""), (area_value(), arrived()))
+            view.evaluate(f"{box}.querySelector('textarea').dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', bubbles: true, cancelable: true }}))")
+            view.wait_for_timeout(500)
+            check("an Enter a page made up sends nothing", ("go on\nbut leave the tests", b""), (area_value(), arrived()))
+            view.keyboard.press("Enter")
+            settles("enter types the box's text into the session's pane, a paste and then Enter",
+                    b"\x1b[200~go on\rbut leave the tests\x1b[201~\r", arrived)
+            settles("...and empties the box", "", area_value)
+            view.keyboard.press("Control+z")
+            check("...which ctrl+z undoes, the browser's own editing having emptied it", "go on\nbut leave the tests", area_value())
+            view.keyboard.press("Control+a")
+            view.keyboard.type("then ")
+            check("select-all selects the box's text", "then ", area_value())
+
+            # a file pasted, and one dropped: each saved by the hub, its path typed where the cursor is
+            view.evaluate(f"""(() => {{
+                const area = {box}.querySelector('textarea'), dt = new DataTransfer();
+                dt.items.add(new File([new Uint8Array([137, 80, 78, 71])], 'image.png', {{ type: 'image/png' }}));
+                area.dispatchEvent(new ClipboardEvent('paste', {{ clipboardData: dt, bubbles: true, cancelable: true }}));
+            }})()""")
+            drops = HOME / ".cache/container-hub/drops" / answering
+            pasted = lambda: re.fullmatch(rf"then ({re.escape(str(drops))}/\S+-image\.png)", area_value())
+            settles("a pasted screenshot goes in as its path, at the cursor", True, lambda: bool(pasted()))
+            check("...the file saved there with what was pasted", b"\x89PNG", Path(pasted()[1]).read_bytes() if pasted() else None)
+            view.evaluate(f"""(() => {{
+                const area = {box}.querySelector('textarea'), dt = new DataTransfer();
+                area.setSelectionRange(5, 5);
+                dt.items.add(new File(['notes'], 'my notes.txt', {{ type: 'text/plain' }}));
+                area.dispatchEvent(new DragEvent('drop', {{ dataTransfer: dt, bubbles: true, cancelable: true }}));
+            }})()""")
+            settles("a dropped file goes in as its path at the cursor, set apart from the words around it", True,
+                    lambda: bool(re.fullmatch(rf"then {re.escape(str(drops))}/\S+-my-notes\.txt {re.escape(str(drops))}/\S+-image\.png", area_value())))
+
+            received.write_bytes(b"")
+            in_pane("waiting", tmux=f"answering:@0.{pane}", waitingFor="permission prompt")
+            settles("a session blocked in its terminal: the box says so, on what, and where to go", [
+                "blocked", "blocked in its terminal (permission prompt). Answer it in tmux session answering; nothing is sent from here meanwhile."],
+                box_says)
+            view.evaluate(f"{box}.querySelector('textarea').focus()")
+            view.keyboard.press("Enter")
+            view.wait_for_timeout(500)
+            check("...and sends it nothing, keeping the text", (b"", True), (arrived(), area_value().startswith("then ")))
+            in_pane()
+            settles("a session with no tmux pane in the registry: no box, and the unit says why",
+                    ["none", "No input box. The session runs in no tmux pane, so the hub has nowhere to type; answer it in its terminal."],
+                    box_says)
+            check("...the box's text area hidden", False, view.evaluate(f"{box}.querySelector('textarea').checkVisibility()"))
+        finally:
+            subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
+              TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
+
+        # pages on another origin: framed in the output lane where they allow it, listed and opened as a tab on a click
+        # where they refuse
+        app = f"http://127.0.0.1:{elsewhere.server_address[1]}"
+        view.locator(f'#units button[title="session {ORCHESTRATOR}"]').click()
+        settles("in the first orchestrator once more", ORCHESTRATOR, lambda: view.evaluate("wc.current"))
+        framed_at = lambda url: view.evaluate(f"ws.views().find(v => v.params.url === {json.dumps(url)})?.panelId ?? null")
+        api("/api/open", {"target": f"{app}/deny", "session": ORCHESTRATOR})
+        settles("a page an agent opens that refuses framing is listed at the column's end, marked as one that opens as a tab",
+                ["tab", False], lambda: line(f"{app}/deny"))
+        check("...and is in no panel", None, framed_at(f"{app}/deny"))
+        with context.expect_page(timeout=30000) as tab:
+            view.keyboard.press("Control+Alt+Shift+W")
+        check("...until ctrl+alt+shift+w opens it as a browser tab, it being the page minimized last", f"{app}/deny", tab.value.url)
+        tab.value.close()
+        view.bring_to_front()  # back from the tab the key opened, as a person would be before the next key
+        tabs = len(context.pages)
+        view.keyboard.press("Control+Alt+Shift+W")
+        settles("...and the key again brings back the page minimized before it, in its lane, and no second tab", (True, tabs),
+                lambda: (ids["map-columns"] in docked(), len(context.pages)))
+        focus(ORCHESTRATOR)  # the session page in view again, past the page the key brought back
+        with context.expect_page(timeout=30000) as tab:
+            frame_of(ORCHESTRATOR).click(line_link("/deny"))
+        check("...as does a click on its line", f"{app}/deny", tab.value.url)
+        tab.value.close()
+        view.bring_to_front()
+        api("/api/open", {"target": f"{app}/app", "session": ORCHESTRATOR})
+        settles("a local server that allows framing opens in the output lane of the opening session's unit", lane("output"),
+                lambda: framed_at(f"{app}/app"))
+        settles("...showing the page", True, lambda: any(f.url == f"{app}/app" for f in view.frames))
+
+        def clicked(href: str) -> None:
+            """A link in the session page, clicked as a person would: with the page in view, which a page opened in
+            another lane may have panned out of it."""
+            focus(ORCHESTRATOR)
+            frame_of(ORCHESTRATOR).evaluate(
+                "href => { const a = Object.assign(document.createElement('a'), { id: 'added', href, textContent: 'added' });"
+                " document.getElementById('added')?.remove(); document.body.prepend(a); }", href)
+            frame_of(ORCHESTRATOR).click("#added")
+
+        with context.expect_page(timeout=30000) as tab:
+            clicked(f"{app}/self")
+        check("a plain click on a link to a page that refuses framing opens a browser tab", f"{app}/self", tab.value.url)
+        tab.value.close()
+        check("...and no panel", None, framed_at(f"{app}/self"))
+        clicked(f"{app}/app2")
+        settles("a plain click on a link to one that allows it opens it in the unit's output lane", lane("output"),
+                lambda: framed_at(f"{app}/app2"))
+        elsewhere.shutdown()
 
         check("no script errors", [], errors)
-        check("closing the container's tab asks first", True,
+        check("closing the hub tab asks first", True,
               view.evaluate("(e => (dispatchEvent(e), e.defaultPrevented))(new Event('beforeunload', { cancelable: true }))"))
         browser.close()
 finally:
