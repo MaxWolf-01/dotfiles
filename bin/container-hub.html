@@ -305,28 +305,45 @@ const LANE_WEIGHT = { session: 1, concept: 1, output: 1, code: 1.4 }; // a diffv
 const TYPES = { session: "session", code: "diff" };
 
 // The user's arrangement of a unit (lanes resized, a page dragged beside another) is the unit's subtree of the
-// document, kept in localStorage at every change. A rebuild starts from it: a page no longer shown leaves it, and
-// a page not in it goes to its lane's panel.
+// document, kept in localStorage at every change with the lane each page was in. A rebuild starts from it: a page
+// no longer shown leaves it, a page not in it goes to its lane's panel, and so does one an agent has put in another
+// lane since, unless it sits in a panel of the user's own.
 const leaves = (n) => (n.kind === "panel" ? n.views : n.children.flatMap(leaves));
-const groupOf = (doc, n) => doc.views[leaves(n)[0]]?.params.group ?? null;
+// The unit most of a subtree's pages are of, its own ids breaking a tie: a page dragged in from another unit does
+// not take the subtree over.
+function groupOf(doc, n) {
+  const score = new Map();
+  for (const v of leaves(n)) {
+    const g = doc.views[v]?.params.group;
+    if (g) score.set(g, (score.get(g) ?? (n.id === `g:${g}` || n.id.startsWith(`p:${g}:`) ? 0.5 : 0)) + 1);
+  }
+  return [...score].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+}
 const nodeOf = (doc, U) => (doc.root?.id === "root" ? doc.root.children : [doc.root]).find((n) => n && groupOf(doc, n) === U) ?? null;
 const stored = (U) => { try { return JSON.parse(localStorage.getItem(`hub:lanes:${U}`)); } catch { return null; } };
+const arrangementIn = (doc, U) => {
+  const n = nodeOf(doc, U);
+  const own = n ? leaves(n).filter((v) => doc.views[v]?.params.group === U) : [];
+  const tree = n && prune(n, (v) => own.includes(v));
+  return tree && { tree, lanes: Object.fromEntries(own.map((v) => [v, doc.views[v].params.lane])) };
+};
 function keep() {
   const doc = ws.getDocument();
   for (const u of laidOut()) {
-    const n = nodeOf(doc, u.unit);
-    if (n) localStorage.setItem(`hub:lanes:${u.unit}`, JSON.stringify(n));
+    const kept = arrangementIn(doc, u.unit);
+    if (kept) localStorage.setItem(`hub:lanes:${u.unit}`, JSON.stringify(kept));
   }
 }
 
-// What is left of a tree holding only these views: a panel with none goes, and a split of one child is that child.
-function prune(n, shown) {
+// What is left of a tree holding only the views stays(view, panel) keeps: a panel with none goes, and a split of
+// one child is that child.
+function prune(n, stays) {
   if (n?.kind === "panel") {
-    const views = n.views.filter((v) => shown.has(v));
+    const views = n.views.filter((v) => stays(v, n));
     return views.length ? { ...n, views, selected: views.includes(n.selected) ? n.selected : views[0] } : null;
   }
   if (n?.kind !== "split") return null;
-  const kids = n.children.map((c) => prune(c, shown));
+  const kids = n.children.map((c) => prune(c, stays));
   const children = kids.filter(Boolean);
   return children.length > 1 ? { ...n, children, weights: n.weights.filter((_, i) => kids[i]) } : children[0] ?? null;
 }
@@ -363,7 +380,9 @@ function place(tree, U, m, laneOf) {
 function unitTree(U, ms, before) {
   const lanes = new Map(ms.map((m) => [m.id, m.lane]));
   const laneOf = (v) => lanes.get(v);
-  let tree = prune(nodeOf(before, U) ?? stored(U), new Set(lanes.keys()));
+  const kept = arrangementIn(before, U) ?? stored(U);
+  const moved = (v, panel) => panel.id.startsWith(`p:${U}:`) && kept.lanes?.[v] && kept.lanes[v] !== lanes.get(v);
+  let tree = kept && prune(kept.tree, (v, panel) => lanes.has(v) && !moved(v, panel));
   for (const m of ms) if (!tree || !leaves(tree).includes(m.id)) tree = place(tree, U, m, laneOf);
   return tree;
 }
@@ -397,17 +416,23 @@ function unitAt(id) {
 
 // ---- the camera in a unit: two lanes side by side, or one where the unit has one, panned a lane at a time
 
-const pans = {}; // unit -> the column its window starts at
+const pans = {}; // unit -> where its window starts: the column, and its lane's rank for when that column is gone
 let windowFramed = null; // what the camera framed for the window last, to tell it from a framing of the user's
 const columns = (U) => {
   const n = nodeOf(ws.getDocument(), U);
   return !n ? [] : n.kind === "split" && n.axis === "x" ? n.children : [n];
 };
+const columnRank = (c) => laneRank(c, (v) => ws.getDocument().views[v]?.params.lane);
+const windowAt = (U, cols) => {
+  const found = cols.findIndex((c) => c.id === pans[U]?.id);
+  const later = cols.findIndex((c) => columnRank(c) >= (pans[U]?.rank ?? 0));
+  return Math.max(0, Math.min(cols.length - 2, found >= 0 ? found : later >= 0 ? later : cols.length));
+};
 function frameLanes(U, start) {
   const cols = columns(U);
   if (!cols.length) return false;
-  const i = Math.max(0, Math.min(cols.length - 2, start ?? Math.max(0, cols.findIndex((c) => c.id === pans[U]))));
-  pans[U] = cols[i].id;
+  const i = Math.max(0, Math.min(cols.length - 2, start ?? windowAt(U, cols)));
+  pans[U] = { id: cols[i].id, rank: columnRank(cols[i]) };
   ws.navigation.frame(cols.slice(i, i + 2).map((c) => c.id));
   windowFramed = ws.navigation.framed;
   return true;
@@ -418,7 +443,7 @@ function reveal(viewId) {
   const panel = viewId && ws.view(viewId)?.panelId;
   const cols = unit(current) && panel ? columns(current) : [];
   const at = cols.findIndex((c) => leaves(c).includes(viewId));
-  const i = Math.max(0, cols.findIndex((c) => c.id === pans[current]));
+  const i = windowAt(current, cols);
   if (at >= 0 && (at < i || at > i + 1) && ws.navigation.framed === windowFramed) frameLanes(current, at < i ? at : at - 1);
 }
 
@@ -427,7 +452,7 @@ function pan(step) {
   if (!unit(current)) return note("go into an orchestrator first (ctrl+alt+1…9)");
   const cols = columns(current);
   if (!cols.length) return note(`${unit(current).title}: nothing open; its pages are in the sheet`);
-  const i = Math.max(0, cols.findIndex((c) => c.id === pans[current]));
+  const i = windowAt(current, cols);
   const next = Math.max(0, Math.min(cols.length - 2, i + step));
   frameLanes(current, next);
   let lane = cols[step > 0 ? Math.min(next + 1, cols.length - 1) : next];
@@ -437,8 +462,9 @@ function pan(step) {
 
 const boardOf = () => unit(current)?.board ?? state.units.find((u) => u.board)?.board ?? null;
 
-// Rebuild the workspace from the state. The framing survives: the lanes a unit's window framed stay framed, a lane
-// arriving or leaving shifting the window no further than it must; anything else keeps the panels it framed.
+// Rebuild the workspace from the state. The framing survives: the lanes a unit's window framed stay framed, the
+// window starting at the same lane, or at the next one where that lane is gone; anything else keeps the panels it
+// framed.
 function apply({ select } = {}) {
   const before = ws.getDocument();
   // a unit alone in the layout framed whole reads as no framing at all, as the overview does
