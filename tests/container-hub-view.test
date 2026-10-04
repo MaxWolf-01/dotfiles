@@ -16,6 +16,7 @@ fails on the desktop: this is no substitute for driving the view in Brave.
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -59,7 +60,20 @@ def settles(what: str, expected, read, within: float = 10) -> None:
     check(what, expected, actual)
 
 
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB"))}
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB", "TMUX"))}
+# Every tmux call, the hub's and the test's, goes through a tmux that passes on only those naming the test's own
+# server's socket, and records the rest: nothing here may reach a server the test did not start.
+TMUX_SOCKET = SCRATCH / "tmux.sock"
+TMUX_REFUSED = SCRATCH / "tmux-refused"
+TMUX = SCRATCH / "shim" / "tmux"
+TMUX.parent.mkdir()
+TMUX.write_text(f"""#!/usr/bin/env bash
+[ "$1" = -S ] && [ "$2" = {shlex.quote(str(TMUX_SOCKET))} ] && exec {shlex.quote(shutil.which("tmux"))} "$@"
+printf '%s\\n' "$*" >> {shlex.quote(str(TMUX_REFUSED))}
+exit 1
+""")
+TMUX.chmod(0o755)
+ENV["PATH"] = f"{TMUX.parent}:{ENV['PATH']}"
 for k, args in (("UV_CACHE_DIR", ("cache", "dir")), ("UV_PYTHON_INSTALL_DIR", ("python", "dir"))):
     ENV[k] = subprocess.run(["uv", *args], capture_output=True, text=True, check=True).stdout.strip()
 ENV.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
@@ -77,13 +91,14 @@ def ticket(slug: str, status: str = "open", parent: str | None = None) -> None:
         TICKET.format(status=status, parent=f"parent: {parent}\n" if parent else "", slug=slug))
 
 
-def registered(session: str, at: float, status: str = "idle") -> None:
-    """The session's file in the registry, as Claude Code writes it while the session's process runs: here this
-    test's own process, which runs for as long as the hub reads it."""
+def registered(session: str, at: float, status: str = "idle", pid: int | None = None, started: str = SELF_STARTED,
+               **extra) -> None:
+    """The session's file in the registry, as Claude Code writes it while the session's process runs: by default
+    this test's own process, which runs for as long as the hub reads it."""
     path = HOME / ".claude" / "sessions" / f"{session[:8]}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": os.getpid(), "procStart": SELF_STARTED, "sessionId": session, "status": status,
-                                "statusUpdatedAt": int(at * 1000)}))
+    path.write_text(json.dumps({"pid": pid or os.getpid(), "procStart": started, "sessionId": session, "status": status,
+                                "statusUpdatedAt": int(at * 1000), **extra}))
 
 
 def page(rel: str, body: str) -> Path:
@@ -141,7 +156,7 @@ with socket.socket() as s:
     s.bind(("127.0.0.1", 0))
     PORT = s.getsockname()[1]
 ORIGIN = f"http://127.0.0.1:{PORT}"
-HUB_ARGS = [str(BIN / "container-hub"), "--port", str(PORT), "--state", str(SCRATCH / "state")]
+HUB_ARGS = [str(BIN / "container-hub"), "--port", str(PORT), "--state", str(SCRATCH / "state"), "--tmux-socket", str(TMUX_SOCKET)]
 
 
 def start_hub() -> subprocess.Popen:
@@ -657,6 +672,81 @@ try:
         settles("entering a unit whose session page nobody opened opens it", True, lambda: view.evaluate(
             f"ws.views().some(v => v.params.group === {json.dumps(many[1])} && v.params.kind === 'session' && v.placement === 'docked')"))
         check("...saying nothing of nothing being open", False, "nothing open" in view.inner_text("#log"))
+
+        # the input box under a unit's session page, typing into the session's tmux pane. The session's program stands
+        # in for Claude Code: it asks for bracketed paste, and records every byte typed into its pane.
+        answering = many[1]
+        received, recorder = SCRATCH / "received", SCRATCH / "recorder.py"
+        recorder.write_text("import os, sys, tty\ntty.setraw(0)\nos.write(1, b'\\x1b[?2004h')\nout = open(sys.argv[1], 'ab', buffering=0)\n"
+                            "while data := os.read(0, 4096):\n    out.write(data)\n")
+        tmux = lambda *args: subprocess.run([TMUX, "-S", TMUX_SOCKET, *args], env=ENV, capture_output=True, text=True, check=True).stdout.strip()
+        tmux("new-session", "-d", "-s", "answering", "-x", "100", "-y", "20", f"exec {sys.executable} {recorder} {received}")
+        try:
+            pane, pane_pid = tmux("display-message", "-p", "-t", "answering:", "#{pane_id} #{pane_pid}").split()
+            started = Path(f"/proc/{pane_pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            in_pane = lambda status="idle", **extra: registered(answering, t0 - 301, status, pid=int(pane_pid), started=started, **extra)
+            in_pane(tmux=f"answering:@0.{pane}")
+            box = f"ws.view(ws.views().find(v => v.params.group === {json.dumps(answering)} && v.params.kind === 'session').id).element.querySelector('.reply')"
+            box_says = lambda: view.evaluate(f"(b => b && [b.dataset.state, b.querySelector('.how').textContent])({box})")
+            area_value = lambda: view.evaluate(f"{box}.querySelector('textarea').value")
+            arrived = lambda: received.read_bytes() if received.exists() else b""
+            settles("a unit whose session runs in a tmux pane has an input box under its session page, saying it waits on you",
+                    ["waiting", "waiting on you · enter types into tmux session answering"], box_says)
+            check("the token that lets the tab type is out of its document before any page is framed", None,
+                  view.evaluate("document.querySelector('meta[name=\"hub-token\"]')"))
+            view.keyboard.press("Control+Alt+r")
+            settles("ctrl+alt+r puts the keyboard in the box", True, lambda: view.evaluate(f"document.activeElement === {box}.querySelector('textarea')"))
+            view.keyboard.type("go on")
+            view.keyboard.press("Shift+Enter")
+            view.keyboard.type("but leave the tests")
+            check("shift+enter is a new line in the box, sending nothing", ("go on\nbut leave the tests", b""), (area_value(), arrived()))
+            view.keyboard.press("Enter")
+            settles("enter types the box's text into the session's pane, a paste and then Enter",
+                    b"\x1b[200~go on\rbut leave the tests\x1b[201~\r", arrived)
+            settles("...and empties the box", "", area_value)
+            view.keyboard.press("Control+z")
+            check("...which ctrl+z undoes, the browser's own editing having emptied it", "go on\nbut leave the tests", area_value())
+            view.keyboard.press("Control+a")
+            view.keyboard.type("then ")
+            check("select-all selects the box's text", "then ", area_value())
+
+            # a file pasted, and one dropped: each saved by the hub, its path typed where the cursor is
+            view.evaluate(f"""(() => {{
+                const area = {box}.querySelector('textarea'), dt = new DataTransfer();
+                dt.items.add(new File([new Uint8Array([137, 80, 78, 71])], 'image.png', {{ type: 'image/png' }}));
+                area.dispatchEvent(new ClipboardEvent('paste', {{ clipboardData: dt, bubbles: true, cancelable: true }}));
+            }})()""")
+            drops = HOME / ".cache/container-hub/drops" / answering
+            pasted = lambda: re.fullmatch(rf"then ({re.escape(str(drops))}/\S+-image\.png)", area_value())
+            settles("a pasted screenshot goes in as its path, at the cursor", True, lambda: bool(pasted()))
+            check("...the file saved there with what was pasted", b"\x89PNG", Path(pasted()[1]).read_bytes() if pasted() else None)
+            view.evaluate(f"""(() => {{
+                const area = {box}.querySelector('textarea'), dt = new DataTransfer();
+                area.setSelectionRange(5, 5);
+                dt.items.add(new File(['notes'], 'my notes.txt', {{ type: 'text/plain' }}));
+                area.dispatchEvent(new DragEvent('drop', {{ dataTransfer: dt, bubbles: true, cancelable: true }}));
+            }})()""")
+            settles("a dropped file goes in as its path at the cursor, set apart from the words around it", True,
+                    lambda: bool(re.fullmatch(rf"then {re.escape(str(drops))}/\S+-my-notes\.txt {re.escape(str(drops))}/\S+-image\.png", area_value())))
+
+            received.write_bytes(b"")
+            in_pane("waiting", tmux=f"answering:@0.{pane}", waitingFor="permission prompt")
+            settles("a session blocked in its terminal: the box says so, on what, and where to go", [
+                "blocked", "blocked in its terminal (permission prompt): answer it in tmux session answering. Nothing is sent from here meanwhile."],
+                box_says)
+            view.evaluate(f"{box}.querySelector('textarea').focus()")
+            view.keyboard.press("Enter")
+            view.wait_for_timeout(500)
+            check("...and sends it nothing, keeping the text", (b"", True), (arrived(), area_value().startswith("then ")))
+            in_pane()
+            settles("a session with no tmux pane in the registry: no box, and the unit says why",
+                    ["none", "no input box: the session runs in no tmux pane, so the hub has nowhere to type. Answer it in its terminal."],
+                    box_says)
+            check("...the box's text area hidden", False, view.evaluate(f"{box}.querySelector('textarea').checkVisibility()"))
+        finally:
+            subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
+              TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
 
         check("no script errors", [], errors)
         check("closing the hub tab asks first", True,
