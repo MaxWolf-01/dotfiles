@@ -93,7 +93,7 @@
       minimize = [ "<Super>m" ];
       maximize = [ "<Shift><Super>m" "<Super>Up" ];
       unmaximize = [ "<Super>Down" ];
-      # Ubuntu's default adds <Primary><Alt>d, which the agent containers use (done, next page).
+      # Ubuntu's default adds <Primary><Alt>d, which the hub tab uses (done, next unseen page).
       show-desktop = [ "<Primary><Super>d" "<Super>d" ];
       switch-to-workspace-1 = [ "<Super>1" ];
       switch-to-workspace-2 = [ "<Super>2" ];
