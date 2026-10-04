@@ -11,8 +11,9 @@ It only reads. Its requests are GETs of course, index and activity pages, three 
 functions, and the sign-in itself.
 
 Reading leaves traces Moodle keeps anyway for a browser: access logs, "recently accessed", the
-course's last access. What it never does is open a page whose viewing would tick an unfinished
-"view" completion requirement; such an activity is recorded with "held" instead of its contents.
+course's last access. What it never does is open an activity page that might tick an unfinished
+completion requirement: one whose requirement it cannot rule out as needing more than a view, or any
+in a course that hides its requirements. Such an activity is recorded with "held" instead of its contents.
 Forum posts are never opened, since that marks them read: a forum's snapshot is its discussion list.
 
 A snapshot holds, per course: its sections (summary, the files they link), every activity (dates,
@@ -31,11 +32,11 @@ again; a resource replaced on Moodle under the same name overwrites its old down
 
 JSON schema (courses --json):
 
-    [{"id": 0, "name": "str", "folder": "str", "hidden": false, "url": "str"}]
+    [{"id": 0, "name": "str", "folder": "str", "hidden": false, "url": "str", "completion": "off|shown|hidden"}]
 
 JSON schema (snapshot file):
 
-    {"taken": "ISO time", "courses": {"<course id>": {"name": "str", "folder": "str", "url": "str", "hidden": true,
+    {"taken": "ISO time", "scraped": {"<course id>": "ISO time"}, "courses": {"<course id>": {"name": "str", "folder": "str", "url": "str", "hidden": true,
       "sections": {"<section id>": {"name": "str", "visible": false, "summary": "str", "files": {"<name>": "url"},
         "items": {"<cm id>": {"name": "str", "module": "assign|resource|folder|forum|...", "url": "str", "visible": false,
           "text": "str", "content": "str", "dates": "str", "completion": "done|todo", "requires": ["str"], "restrictions": "str",
@@ -94,7 +95,9 @@ READ_ONLY_AJAX = {
 READ_PAGES = re.compile(r"^/(my/courses\.php|course/view\.php|mod/\w+/index\.php|mod/(resource|folder|assign|page|url|forum)/view\.php)$")
 READ_PARAMS = {"id", "redirect"}  # an action= or sesskey= would turn a view page into a request to act
 DETAIL_MODULES = ("resource", "folder", "assign", "page", "url", "forum")
-VIEW_REQUIREMENT = re.compile(r"\b(anzeigen|ansehen|view)\b", re.I)
+# Completion requirements opening a page cannot tick. Any other unfinished one, viewing included, holds the activity.
+NOT_BY_VIEWING = re.compile(r"abgabe|einreich|submi|bewertung|grade|feedback|beitr|post|diskussion|discussion|antwort|repl|bestanden|pass"
+                            r"|auswahl|choice|erledigt markieren|mark as done", re.I)
 PAUSE = 0.2
 
 app = SubcommandApp()
@@ -113,6 +116,7 @@ class Moodle:
     def sign_in(self, username: str, password: str) -> None:
         """Walk Shibboleth's forms: local-storage probe, username/password, then the SAML response back to Moodle."""
         r = self.s.get(f"{MOODLE}/login/index.php", timeout=60)
+        password_page = None
         for _ in range(6):
             if r.url.startswith(MOODLE + "/") and "SAMLResponse" not in r.text:
                 break
@@ -125,9 +129,9 @@ class Moodle:
                 sys.exit(f"moodle: sign-in hit an unexpected form posting to {host.hostname}{host.path}; not following it")
             data = {i["name"]: i.get("value", "") for i in form.find_all("input") if i.get("name")}
             if "j_username" in data:
-                if r.url == getattr(self, "_password_page", None):
+                if r.url == password_page:
                     break  # the IdP showed the password form again: the credentials were refused
-                self._password_page = r.url
+                password_page = r.url
                 data |= {"j_username": username, "j_password": password}
             data["_eventId_proceed"] = ""
             r = self.s.post(target, data=data, timeout=60)
@@ -145,8 +149,7 @@ class Moodle:
             raise ValueError(f"refusing to open {path} with {sorted(params)}: not a page this tool reads")
         time.sleep(PAUSE)
         r = self.s.get(MOODLE + path, params=params, timeout=60, allow_redirects=follow)
-        if r.status_code >= 400:
-            r.raise_for_status()
+        r.raise_for_status()
         return r
 
     def soup(self, path: str, **params: Any) -> BeautifulSoup:
@@ -241,7 +244,9 @@ def enrolled(m: Moodle) -> list[dict]:
         if folder in folders:  # two courses with one title in one semester
             folder = f"{folder}-{c['id']}"
         folders[folder] = c["id"]
-        out.append({"id": c["id"], "name": name, "folder": folder, "hidden": bool(c.get("hidden")), "url": f"{MOODLE}/course/view.php?id={c['id']}"})
+        out.append({"id": c["id"], "name": name, "folder": folder, "hidden": bool(c.get("hidden")), "url": f"{MOODLE}/course/view.php?id={c['id']}",
+                    # Moodle sets this null exactly when the course tracks no completion at all
+                    "completion": {None: "off", True: "shown", False: "hidden"}[c.get("showcompletionconditions")]})
     return out
 
 
@@ -263,9 +268,8 @@ def course_page(m: Moodle, cid: int) -> tuple[dict, dict]:
             item["completion"] = "done" if button and "success" in " ".join(button.get("class", [])) else "todo"
             reqs = req.select("[role=listitem]")
             item["requires"] = [text_of(r) for r in reqs]
-            # an unfinished requirement Moodle would tick by our opening the page
-            if any("text-success" not in r.get("class", []) and VIEW_REQUIREMENT.search(text_of(r)) for r in reqs):
-                item["_view_pending"] = True
+            if any("text-success" not in r.get("class", []) and not NOT_BY_VIEWING.search(text_of(r)) for r in reqs):
+                item["_hold"] = "it has an unfinished completion requirement that opening it might tick"
         items[li["data-id"]] = item
     return sections, items
 
@@ -369,7 +373,9 @@ def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None)
                 continue
             seen = cm_page.get(str(cmid), {})
             item = {"name": clean(cm["name"]), "module": cm["module"], "url": cm.get("url"), "visible": None if cm.get("visible") else False}
-            item |= {k: v for k, v in seen.items()}
+            item |= seen
+            if course["completion"] == "hidden":  # the course page shows no requirements to check
+                item["_hold"] = "its course hides completion requirements, so opening it might tick one"
             item |= {k: index["forum"][str(cmid)][k] for k in ("topics", "posts") if cm["module"] == "forum" and k in index["forum"].get(str(cmid), {})}
             if cm["module"] in DETAIL_MODULES and cm.get("uservisible", True) and cm.get("url"):
                 item |= activity_detail(m, item, str(cmid), prev_items.get(str(cmid)), changed)
@@ -394,8 +400,8 @@ def activity_detail(m: Moodle, item: dict, cmid: str, before: dict | None, chang
              or (item["module"] == "forum" and (before.get("topics"), before.get("posts")) != (item.get("topics"), item.get("posts"))))
     if not fresh:
         return carried
-    if item.get("_view_pending"):
-        return {"held": "opening it would tick its unfinished view requirement"}
+    if item.get("_hold"):
+        return {"held": item["_hold"]}
     try:
         got = detail(m, item["module"], cmid)
     except requests.RequestException as e:
@@ -478,9 +484,9 @@ def short(v: Any, n: int = 160) -> str:
 
 def files_of(course: dict) -> Iterator[tuple[str, str, str]]:
     """(url, path under the course folder, owner) for every file the snapshot links."""
-    for sec in course.get("sections", {}).values():
+    for sid, sec in course.get("sections", {}).items():
         for name, url in sec.get("files", {}).items():
-            yield url, name, "course page"
+            yield url, name, f"section {sid}"
         for cmid, it in sec.get("items", {}).items():
             for rel, url in it.get("files", {}).items():
                 into = file_name(it["name"]) + "/" if it["module"] in ("folder", "assign", "page") else ""
@@ -555,7 +561,6 @@ def snapshot(args: Snapshot) -> None:
     m = connect()
     previous = snapshots(args.state)
     prev = load(previous[-1]) if previous else {"courses": {}}
-    since = int(datetime.fromisoformat(prev["taken"]).timestamp()) - 600 if previous else None
     now = datetime.now(timezone.utc)
     listed = enrolled(m)
     if args.course:
@@ -563,15 +568,23 @@ def snapshot(args: Snapshot) -> None:
         if unknown:
             sys.exit(f"moodle: not enrolled in course(s) {sorted(unknown)}; `moodle courses` lists them")
     out: dict[str, dict] = {}
+    scraped: dict[str, str] = {}
     for i, course in enumerate(listed, 1):
         key = str(course["id"])
-        if args.course and course["id"] not in args.course:
-            if key in prev["courses"]:
-                out[key] = prev["courses"][key]
-            continue
-        print(f"[{i}/{len(listed)}] {course['name']}", file=sys.stderr)
-        out[key] = scrape_course(m, course, prev["courses"].get(key), since)
-    snap = {"taken": now.isoformat(timespec="seconds"), "courses": out}
+        last = prev.get("scraped", {}).get(key, prev.get("taken"))
+        if not args.course or course["id"] in args.course:
+            print(f"[{i}/{len(listed)}] {course['name']}", file=sys.stderr)
+            since = int(datetime.fromisoformat(last).timestamp()) - 600 if last and key in prev["courses"] else None
+            started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            try:
+                out[key] = scrape_course(m, course, prev["courses"].get(key), since)
+                scraped[key] = started
+                continue
+            except (MoodleError, requests.RequestException) as e:
+                print(f"moodle: {course['name']}: {e}; keeping what the last snapshot had", file=sys.stderr)
+        if key in prev["courses"]:
+            out[key], scraped[key] = prev["courses"][key], last
+    snap = {"taken": now.isoformat(timespec="seconds"), "scraped": scraped, "courses": out}
     (args.state / "snapshots").mkdir(parents=True, exist_ok=True)
     path = args.state / "snapshots" / f"{now:%Y-%m-%dT%H-%M-%SZ}.json"
     path.write_text(jsonlib.dumps(snap, indent=1, ensure_ascii=False))
@@ -611,4 +624,7 @@ def diff_cmd(args: Diff) -> None:
 
 
 if __name__ == "__main__":
-    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
+    try:
+        app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
+    except (MoodleError, requests.RequestException) as e:
+        sys.exit(f"moodle: {e}\nIs {MOODLE} up? A failure right after sign-in usually means Moodle changed its pages.")
