@@ -8,7 +8,7 @@
 It signs in through JKU's Shibboleth login with the username and password in the sops file `jku`
 (JKU__USERNAME, JKU__PASSWORD); started without them, it re-runs itself under `with-secrets jku`.
 It reads as max's own visit does, and nothing it sends can act: its requests are GETs of course,
-overview and activity pages, four read-only AJAX functions, Moodle file downloads, and the sign-in.
+overview and activity pages, the read-only AJAX functions it lists, Moodle file downloads, and the sign-in.
 Opening a page leaves what max's visit leaves: access logs, "recently accessed", a ticked "view"
 completion requirement, and forum posts marked read.
 
@@ -107,7 +107,14 @@ READ_ONLY_AJAX = {
 }
 # Activity types whose page is a page to read. An unlisted one (an LTI tool, say) may launch or act on opening.
 OPENED = ("resource", "url", "folder", "page", "assign", "forum", "quiz", "zoom", "choice", "feedback", "checkmark",
-          "attendance", "grouptool", "offlinequiz", "opencast", "streamurl")
+          "attendance", "grouptool", "offlinequiz", "opencast", "streamurl", "book", "glossary", "wiki")
+# Activity types whose opening does more than show a page: why each stays closed.
+LIMITED = {"lti": "opening launches an outside tool with max's identity, which may act in his name",
+           "lesson": "opening starts or continues a lesson attempt",
+           "scorm": "opening starts a SCORM attempt",
+           "h5pactivity": "opening may record an H5P attempt",
+           "hvp": "opening may record an H5P attempt"}
+PARTLY_READ = {"book": "only the chapter its page opens on is read; the other chapters are linked from it"}
 ON_COURSE_PAGE = ("label",)  # shown whole on the course page; no page of its own
 STREAMED = ("opencast", "streamurl")
 # Every page the scraper opens; anything else is refused before a request goes out.
@@ -283,6 +290,13 @@ def readable(node: Tag | None, base: str = MOODLE + "/") -> str:
         a.replace_with(f"{text} <{url}>" if text and text != url else f"<{url}>")
     for f in node.find_all(["iframe", "video", "source", "embed"], src=True):
         f.replace_with(f" <{absolute(f['src'], base)}> ")
+    for img in node.find_all("img", src=True):
+        src = absolute(img["src"], base)
+        if "/theme/" in src or "/user/icon/" in src or src.startswith("data:"):
+            img.decompose()
+        else:
+            alt = clean(img.get("alt") or "")
+            img.replace_with(f" image{': ' + alt if alt else ''} <{src}> ")
     for br in node.find_all("br"):
         br.replace_with("\n")
     for b in node.find_all(BLOCKS):
@@ -307,12 +321,28 @@ def file_name(s: str) -> str:
 
 
 def pluginfiles(node: Tag | None) -> dict[str, str]:
-    """Files a piece of content links to (not the images it shows), by file name."""
+    """Files a piece of content links to or shows, by file name."""
     out: dict[str, str] = {}
-    for a in node.select("a[href*='/pluginfile.php/']") if node else []:
-        url = moodle_file(a["href"])
+    for tag in node.select("a[href*='/pluginfile.php/'], img[src*='/pluginfile.php/']") if node else []:
+        url = moodle_file(tag.get("href") or tag["src"])
         if "/user/icon/" not in url and "/theme_" not in url:
-            out.setdefault(file_name(url.rsplit("/", 1)[-1]), url)
+            out = merge_files(out, {file_name(url.rsplit("/", 1)[-1]): url})
+    return out
+
+
+def merge_files(*parts: dict[str, str]) -> dict[str, str]:
+    """Files by name; a second file under a name already taken gets a number, as 'x (2).pdf'."""
+    out: dict[str, str] = {}
+    for files in parts:
+        for name, url in files.items():
+            if url in out.values():
+                continue
+            stem, dot, ext = name.rpartition(".")
+            key, n = name, 2
+            while key in out:
+                key = f"{stem} ({n}).{ext}" if dot and stem else f"{name} ({n})"
+                n += 1
+            out[key] = url
     return out
 
 
@@ -411,7 +441,7 @@ def detail(m: Moodle, module: str, cmid: str) -> dict:
         return {"content": readable(intro, base), "files": files}
     if module == "forum":
         return {"content": readable(intro, base), "discussions": discussion_list(m, cmid, soup)}
-    return {"content": "\n".join(filter(None, [readable(intro, base), readable(main, base)])), "files": pluginfiles(main) | pluginfiles(intro)}
+    return {"content": "\n".join(filter(None, [readable(intro, base), readable(main, base)])), "files": merge_files(pluginfiles(intro), pluginfiles(main))}
 
 
 def discussion_list(m: Moodle, cmid: str, soup: BeautifulSoup) -> dict:
@@ -441,12 +471,12 @@ def posts(m: Moodle, did: str) -> dict:
     out = {}
     for p in data["posts"]:
         message = BeautifulSoup(p.get("message") or "", "lxml")
-        files = {file_name(f.get("filename") or f["url"].rsplit("/", 1)[-1]): moodle_file(f.get("url") or f["fileurl"])
-                 for f in p.get("attachments", []) + p.get("messageinlinefiles", []) if f.get("url") or f.get("fileurl")}
+        files = merge_files(*({file_name(f.get("filename") or (f.get("url") or f["fileurl"]).rsplit("/", 1)[-1]): moodle_file(f.get("url") or f["fileurl"])}
+                              for f in p.get("attachments", []) + p.get("messageinlinefiles", []) if f.get("url") or f.get("fileurl")))
         out[str(p["id"])] = prune({"subject": name_of(p.get("subject")), "author": name_of((p.get("author") or {}).get("fullname")),
                                    "created": iso(p.get("timecreated")), "modified": iso(p.get("timemodified")),
                                    "parent": str(p["parentid"]) if p.get("parentid") else None,
-                                   "message": readable(message.body), "files": pluginfiles(message) | files})
+                                   "message": readable(message.body), "files": merge_files(files, pluginfiles(message))})
     return out
 
 
@@ -470,14 +500,15 @@ def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None,
             changed = None
             gaps.append({"where": "", "reason": f"Moodle's update check fails here ({e}); every activity page was read again instead"})
 
+    prev_items = {cmid: it for s in (prev or {}).get("sections", {}).values() for cmid, it in s.get("items", {}).items()}
     index = {}
     for mod in ("assign", "checkmark", "quiz", "forum"):
         if mod in modules:
             try:
                 index[mod] = index_rows(m, mod, cid)
             except requests.RequestException as e:
-                gaps.append({"where": f"{mod} overview", "reason": f"not read ({e}); due dates, statuses and grades of these activities are missing"})
-    prev_items = {cmid: it for s in (prev or {}).get("sections", {}).values() for cmid, it in s.get("items", {}).items()}
+                index[mod] = last_overview(prev or {}, prev_items, mod)
+                gaps.append({"where": f"{mod} overview", "reason": f"not read ({e}); due dates, statuses, grades and counts are the last snapshot's"})
 
     cms = {str(cm["id"]): cm for cm in state["cm"]}
     sections = {}
@@ -496,7 +527,10 @@ def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None,
             elif cm["module"] in OPENED and cm.get("url"):
                 item |= activity_detail(m, item, cmid, prev_items.get(cmid), changed, gaps, where)
             elif cm["module"] not in ON_COURSE_PAGE and cm.get("url"):  # one without a url shows whole on the course page
-                gaps.append({"where": where, "reason": f"its page is not opened: {cm['module']} activities are not among the types this tool reads"})
+                why = LIMITED.get(cm["module"], f"{cm['module']} activities are not among the types this tool reads")
+                gaps.append({"where": where, "reason": f"its page is not opened: {why}"})
+            if cm["module"] in PARTLY_READ and cm.get("uservisible", True):
+                gaps.append({"where": where, "reason": PARTLY_READ[cm["module"]]})
             items[cmid] = prune(item)
         page = sec_page.get(str(sec["id"]), {})
         sections[str(sec["id"])] = prune({"name": name_of(sec.get("title", "")), "visible": None if sec.get("visible", True) else False,
@@ -509,6 +543,14 @@ def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None,
                    for mod in ("assign", "checkmark") for cmid, row in index.get(mod, {}).items() if cmid in cms}
     quizzes = {cmid: prune({"name": name_of(cms[cmid]["name"]), **row}) for cmid, row in index.get("quiz", {}).items() if cmid in cms}
     return prune({**{k: course[k] for k in ("name", "folder", "url", "hidden")}, "sections": sections, "assignments": assignments, "quizzes": quizzes})
+
+
+def last_overview(prev: dict, prev_items: dict, module: str) -> dict[str, dict]:
+    """What the last snapshot read off a module's overview page, as index_rows returns it."""
+    if module == "forum":
+        return {cmid: {k: it[k] for k in ("topics", "posts") if k in it} for cmid, it in prev_items.items() if it.get("module") == "forum"}
+    rows = prev.get("quizzes", {}) if module == "quiz" else {c: r for c, r in prev.get("assignments", {}).items() if r.get("module") == module}
+    return {cmid: {k: r[k] for k in ("due", "submission", "grade") if k in r} for cmid, r in rows.items()}
 
 
 DETAIL_KEYS = ("files", "content", "link", "discussions")
@@ -544,7 +586,8 @@ def discussion_posts(m: Moodle, discussions: dict, before: dict, gaps: list[dict
             out[did] = d | {"posts": posts(m, did)}
         except (MoodleError, requests.RequestException) as e:
             gaps.append({"where": f"{where} › {d.get('name', did)}", "reason": f"its posts could not be read ({e})"})
-            out[did] = d | ({"posts": old["posts"]} if "posts" in old else {})
+            # keep what the old posts were read against, so the next run sees the new post and reads them again
+            out[did] = d | {k: old[k] for k in ("modified", "replies", "posts") if k in old}
     return out
 
 
@@ -638,9 +681,9 @@ def files_of(course: dict) -> Iterator[tuple[str, str, str]]:
             for rel, url in it.get("files", {}).items():
                 yield url, into + rel, cmid
             for did, d in it.get("discussions", {}).items():
-                for post in d.get("posts", {}).values():
+                for pid, post in d.get("posts", {}).items():
                     for name, url in post.get("files", {}).items():
-                        yield url, f"{into}{file_name(d.get('name', did))}/{name}", f"{cmid}/{did}"
+                        yield url, f"{into}{file_name(d.get('name', did))}/{name}", f"{cmid}/{did}/{pid}"
 
 
 def download(m: Moodle, course: dict, root: Path) -> tuple[int, int, list[dict]]:
