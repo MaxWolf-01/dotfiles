@@ -91,7 +91,7 @@ Host tiers:
 Setup flow:
 - `./setup host <name>` — sets NIX_HOST, creates dirs. On non-NixOS: also installs Nix + runs first HM switch.
 - Non-NixOS (zephyrus): `hmswitch` for subsequent changes
-- NixOS (pc, xmg19): `nswitch` (alias for `sudo nixos-rebuild switch --flake ...`) — rebuilds system + HM together
+- NixOS (pc, xmg19): `nswitch` (`sudo nixos-rebuild switch --flake ...`; refuses on a non-NixOS host) — rebuilds system + HM together
 
 ### Key Nix Concepts
 
