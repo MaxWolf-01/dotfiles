@@ -27,8 +27,15 @@ marks go with it.
 
 Inside a unit, the pages sit in four lanes, from the highest level to the lowest: session, concept, output,
 code. A page's lane follows from what it is: a session page goes to session, a diffview page to code, an image
-to concept, a page on another site to output, any other page in a show directory to concept, and anything else
+to concept, a page on another origin to output, any other page in a show directory to concept, and anything else
 to output. An agent's `lane` overrides that, and holds until another names a lane.
+
+A page on another origin (a running app, a local server) is framed in its lane where it allows framing, and the hub
+tab's keys and link handling do not reach inside it. A page refuses framing by its X-Frame-Options, or by a
+Content-Security-Policy whose frame-ancestors leaves out http://127.0.0.1:<port>. Such a page is a member all the
+same, though laid out nowhere. Its unit's session page lists it, and a click on its line, or ctrl+alt+shift+w, opens
+it as a browser tab. Nothing else opens one: a link to such a page clicked in the hub tab opens as a tab, an agent's
+opens none. The hub asks the page at every open, and frames one that does not answer.
 
 A unit's session page is the list of its pages: the artefacts the page's column links, then every page of the unit
 no turn links, which the hub tab adds at the column's end. The hub tab marks each line open, minimized or seen. A
@@ -67,10 +74,10 @@ the session page's file:// link.
                               carries "say", the line the caller prints, and "open", the absolute URL the caller
                               opens in the browser, or null to open nothing. Beside them: {"unit", "id", "action",
                               "view", "launch"} for a member, where launch says no hub tab listens and open is the
-                              hub tab at the member; {"skipped": why} for an agent's page; {"tab": why} for a page
-                              on another site, which the hub tab could not reach into, and open is that URL as
-                              given; {"board": its url, "launch"} for a board, which opens over the hub tab. "unit"
-                              is the hub tab's own: the unit a link was clicked in.
+                              hub tab at the member; {"skipped": why} for an agent's page; {"tab": why} for a link
+                              clicked in the hub tab to a page that refuses framing, which joins no unit, and open
+                              is that URL as given; {"board": its url, "launch"} for a board, which opens over the
+                              hub tab. "unit" is the hub tab's own: the unit a link was clicked in.
     POST /api/close           {"unit", "id"}: minimize a member; it stays a member, and an open brings it back.
     POST /api/seen            {"url", "seen"}: the user's seen mark on a page.
     POST /api/visit           {"unit"}: the user looked at a unit; what was new there is not.
@@ -84,8 +91,9 @@ the session page's file:// link.
                               rail's order, then the dismissed, then the ended, each the latest turn first.
     GET  /api/u/<key>         one unit: {"unit", "session", "title", "tree", "repo", "state", "waiting_for", "pane",
                               "last", "number", "board", "worked_on" (the tickets the board marks),
-                              "dismissed", "members": [{"id", "url", "closed", "lane", ...}], "pages", "seen", ...}.
-                              A member's url is where the hub serves it, relative to here. "pages" is every page
+                              "dismissed", "members": [{"id", "url", "closed", "lane", "tab"?, ...}], "pages", "seen",
+                              ...}. A member's url is where the hub serves it, relative to here, and its "tab" why it
+                              refuses to be framed, where it does. "pages" is every page
                               of the unit as its session page lists it: [{"url", "artefact", "linked", ...}];
                               "session_page" {"url", "id"} where that page is, null while it is not rendered.
     GET  /diff?tracker=&ticket=   a ticket's recorded `code@` ranges, rendered by diffview on first open
@@ -373,11 +381,18 @@ def read_target(target: str, cwd: str | None, port: int) -> Page:
         tracker, ticket = query.get("tracker", [""])[0], query.get("ticket", [""])[0]
         return Page(url=diff_url(Path(tracker), ticket), agent=Path(tracker).parent, slug=ticket, kind="diff")
     if parts.scheme:
-        return Page(url=target.split("#")[0])
+        return page_of_url(target)
     path = Path(target).expanduser()
     if not path.is_absolute():
         path = Path(cwd or ".") / path
     return page_of_path(path)
+
+
+def page_of_url(url: str) -> Page:
+    """A page on another origin, spelled as a browser spells it, so a link to it in a page names the same member. The
+    fragment stays: in a running app it is often the screen the app opens at."""
+    parts = urllib.parse.urlsplit(url)
+    return Page(url=urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", parts.query, parts.fragment)))
 
 
 def diff_url(tracker_root: Path, ticket: str) -> str:
@@ -617,9 +632,9 @@ def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
     if (lane := body.get("lane")) is not None and lane not in LANES:
         return 400, {"error": f"no lane {lane}; the lanes are {', '.join(LANES)}"}
     page = read_target(body["target"], body.get("cwd"), port)
-    if not page.path and not page.url.startswith("/"):
-        why = "a page on another site opens as a browser tab: the hub tab cannot reach into it, and many sites refuse to be framed"
-        return 200, {"tab": why, "say": why, "open": body["target"]}
+    refused = framing_refusal(page.url, port) if not page.path and not page.url.startswith("/") else None
+    if refused and from_page:  # a link the user clicked, and a click is what may open a tab
+        return 200, {"tab": refused, "say": f"opens as a browser tab: {refused}", "open": body["target"]}
     if page.path and not page.path.exists():
         return 404, {"error": f"{page.path} does not exist"}
     if page.path and from_page and not (page.path.is_file() and servable(page.path)):
@@ -647,6 +662,10 @@ def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
                       "kind": page.kind, "title": body.get("title") or title_of(page), "first": now}
             data["members"].append(member)
         member.update(closed=False, at=now, by=by)
+        if refused:
+            member["tab"] = refused
+        else:  # asked again at every open: a server restarted may have changed its mind
+            member.pop("tab", None)
         if lane:
             member["lane"] = lane
         if not from_page:
@@ -656,9 +675,49 @@ def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
             OPENED.add(page.path)
         launch = announce({"type": action, "unit": key, "id": mid, "by": by})
     view = "/u/" + key_path(key)
-    return 200, {"unit": key, "id": mid, "action": action, "launch": launch, "view": view,
-                 "say": f"in unit {key}, lane {member_lane(member)}; " + ("the hub tab opens at the page" if launch else "the open hub tab shows the page"),
+    if refused:
+        say = (f"in unit {key}, listed on its session page, where a click opens it as a browser tab ({refused}); "
+               + ("the hub tab opens at the unit" if launch else "the open hub tab lists it"))
+    else:
+        say = f"in unit {key}, lane {member_lane(member)}; " + ("the hub tab opens at the page" if launch else "the open hub tab shows the page")
+    return 200, {"unit": key, "id": mid, "action": action, "launch": launch, "view": view, "say": say,
                  "open": f"http://127.0.0.1:{port}{view}#{mid}" if launch else None}
+
+
+def framing_refusal(url: str, port: int) -> str | None:
+    """Why a page on another origin refuses to be framed in the hub tab, read off the headers it answers with, since
+    the browser tells the tab nothing of a frame it refused. None where it allows framing, and where it does not
+    answer at all: a server not up yet is framed, and shows once it is opened again."""
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        return "a frame shows only a page at an http or https address"
+    try:  # curl rather than urllib: uv's Python finds no CA bundle on NixOS
+        run = subprocess.run(["curl", "-sS", "-L", "--max-redirs", "5", "--max-time", "4", "-o", os.devnull, "-D", "-", url],
+                             capture_output=True, text=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # a block of headers per response, a redirect's before the page's own
+    last = next((b for b in reversed(re.split(r"\r?\n\r?\n", run.stdout.strip())) if b.startswith("HTTP/")), "")
+    fields = [(k.strip().lower(), v.strip()) for k, _, v in (line.partition(":") for line in last.splitlines()[1:])]
+    ancestors = [d.split()[1:] for k, v in fields if k == "content-security-policy"
+                 for d in re.split(r"[;,]", v) if d.split()[:1] and d.split()[0].lower() == "frame-ancestors"]
+    if ancestors:  # where a page sets frame-ancestors, the browser ignores its X-Frame-Options
+        shut = next((s for s in ancestors if not any(admits_hub(x, port) for x in s)), None)
+        return None if shut is None else f"its Content-Security-Policy has frame-ancestors {' '.join(shut) or "'none'"}"
+    options = [v for k, v in fields if k == "x-frame-options"]
+    refuses = {o.strip().lower() for v in options for o in v.split(",")} & {"deny", "sameorigin"}
+    return f"its X-Frame-Options is {', '.join(options)}" if refuses else None
+
+
+ANCESTOR = re.compile(r"(?:(?P<scheme>[a-z][a-z0-9+.-]*)://)?(?P<host>[^/:]+)(?::(?P<port>\*|\d+))?(?:/.*)?")
+
+
+def admits_hub(source: str, port: int) -> bool:
+    """A frame-ancestors source the hub tab's origin, http://127.0.0.1:<port>, matches. Read loosely where CSP is
+    strict: a source with no scheme counts whatever the page's own scheme, and a path never narrows it."""
+    source = source.lower()
+    found = ANCESTOR.fullmatch(source)
+    return source in ("*", "http:") or bool(found and found["scheme"] in (None, "http") and found["host"] == "127.0.0.1"
+                                              and found["port"] in ("*", str(port)))
 
 
 def announce(event: dict) -> bool:
@@ -731,7 +790,7 @@ def session_links(path: Path | None) -> list[tuple[str, Page]]:
         return hit[1]
     column = COLUMN.search(path.read_bytes())
     values = dict.fromkeys(html.unescape(v.decode(errors="replace")) for v in ARTEFACT.findall(column[1] if column else b""))
-    found = [(v, page_of_path(Path(v)) if v.startswith("/") else Page(url=v.split("#")[0])) for v in values if v]
+    found = [(v, page_of_path(Path(v)) if v.startswith("/") else page_of_url(v)) for v in values if v]
     SESSION_LINKS[path] = (stat.st_mtime_ns, stat.st_size), found
     return found
 
@@ -741,6 +800,7 @@ def unit_pages(session_page: Path | None, members: list[dict]) -> list[dict]:
     then the members no turn links, in the order they were opened. The session page itself is the list, and is
     not on it."""
     by_url = {m["url"]: m for m in members}
+    tab = lambda m: {"tab": m["tab"]} if m and m.get("tab") else {}  # why it refuses to be framed, where it does
     pages = []
     for value, page in session_links(session_page):
         if page.kind == "board":  # the rail's, never a unit's
@@ -748,10 +808,11 @@ def unit_pages(session_page: Path | None, members: list[dict]) -> list[dict]:
         m = by_url.get(page.url)
         pages.append({"url": page.url, "id": member_id(page.url), "artefact": value, "linked": True,
                       "title": m["title"] if m else title_of(page), "kind": page.kind,
-                      "lane": m["lane"] if m else lane_of(page), "ticket": m["ticket"] if m else None})
+                      "lane": m["lane"] if m else lane_of(page), "ticket": m["ticket"] if m else None,
+                      **tab(m)})
     linked = {p["url"] for p in pages}
     pages += [{"url": m["url"], "id": m["id"], "artefact": m.get("path") or m["url"], "linked": False, "title": m["title"],
-               "kind": m["kind"], "lane": m["lane"], "ticket": m["ticket"]}
+               "kind": m["kind"], "lane": m["lane"], "ticket": m["ticket"], **tab(m)}
               for m in sorted(members, key=lambda m: m["first"]) if m["url"] not in linked and m["kind"] != "session"]
     return pages
 

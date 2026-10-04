@@ -4,7 +4,8 @@
 # tab at http://127.0.0.1:8377/ is the way back to every unit after a reboot.
 #
 # The hub is a uv PEP 723 script, so uv resolves its deps at run. git reads the
-# sessions' commits; curl fetches trellis on first use; the tracker it reads
+# sessions' commits; curl fetches trellis on first use, and asks a page on
+# another origin whether it allows framing; the tracker it reads
 # comes from the mx plugin under ~/.claude*/plugins, found by the hub itself,
 # and is a uv script too. diffview, which renders a ticket's recorded ranges,
 # sits beside the hub in bin/.
