@@ -176,7 +176,7 @@
       span-window-right = [ "<Control><Super>Right" ];
       span-window-up = [ "<Control><Super>Up" ];
       # Directional focus is off: Ctrl+Alt+hjkl and their Shift forms belong to the
-      # agent containers' view in the browser (bin/container-hub.html).
+      # hub tab in the browser (bin/container-hub.html).
       focus-window-down = [];
       focus-window-left = [];
       focus-window-right = [];
