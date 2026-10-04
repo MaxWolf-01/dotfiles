@@ -40,7 +40,9 @@ the page at every open, and frames one that does not answer.
 A unit's session page is the list of its pages: the artefacts the page's column links, then every page of the unit
 no turn links, which the hub tab adds at the column's end. The hub tab marks each line open, minimized or seen. A
 page the user closes is minimized: it stays a member, and comes back from its line in that list, or when an agent
-opens it again.
+opens it again. A unit whose session has rendered no session page yet, and the loose pages, have a stand-in in the
+session lane, served by the hub: a page with an empty column, which the hub tab fills the same way. It goes once
+the session page exists.
 
 The board (a tracker's `agent/board.html`) is no page of a unit. Handed to the hub, by an agent or by a link clicked
 in a page, it opens over the hub tab, as ctrl+alt+b does there, and a unit never lists it. Over a unit, the board is
@@ -69,6 +71,7 @@ the session page's file:// link.
     GET  /u/<key>             the hub tab at a unit: a session id, or `loose`. A container view's old address,
                               /c/<key>, is sent to the hub tab.
     GET  /events              server-sent events: something in the hub changed. One stream per hub tab.
+    GET  /pages/<key>         a unit's stand-in for its session page, while it has none.
     POST /api/open            {"target", "session"?, "cwd"?, "unit"?, "title"?, "by"?, "lane"?}: a path, file:// URL or
                               URL becomes a member of its unit, or comes forward again if it is one. Every answer
                               carries "say", the line the caller prints, and "open", the absolute URL the caller
@@ -95,7 +98,7 @@ the session page's file:// link.
                               ...}. A member's url is where the hub serves it, relative to here, and its "tab" why it
                               refuses to be framed, where it does. "pages" is every page
                               of the unit as its session page lists it: [{"url", "artefact", "linked", ...}];
-                              "session_page" {"url", "id"} where that page is, null while it is not rendered.
+                              "session_page" {"url", "id"} where that page is, or its stand-in while it has none.
     GET  /diff?tracker=&ticket=   a ticket's recorded `code@` ranges, rendered by diffview on first open
     GET  /f/<path>            a file under $HOME or the temp dir; a shared directory without an index.html lists
                               its pages
@@ -376,6 +379,9 @@ def read_target(target: str, cwd: str | None, port: int) -> Page:
         return page_of_path(Path(urllib.parse.unquote(parts.path)), parts.query)
     if not parts.scheme and target.startswith("/f/"):
         return page_of_path(Path(urllib.parse.unquote(parts.path.removeprefix("/f"))), parts.query)
+    if not parts.scheme and parts.path.startswith(STAND_IN):
+        key = urllib.parse.unquote(parts.path.removeprefix(STAND_IN))
+        return Page(url=stand_in_url(key), kind="session", session=key)
     if not parts.scheme and parts.path == "/diff":
         query = urllib.parse.parse_qs(parts.query)
         tracker, ticket = query.get("tracker", [""])[0], query.get("ticket", [""])[0]
@@ -863,7 +869,7 @@ def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dic
         # The loose pages belong to no session's tree, and go only once every one of them is deleted.
         known = roots.get(str(tracker.root)) if tracker else None
         retired = session and (gone or (tracker and known and not tree and known not in tracker.tickets))
-        if retired or not kept:
+        if retired or not [m for m in kept if not stand_in(m)]:
             state_file(key).unlink(missing_ok=True)
             return None
         if len(kept) != len(data["members"]) or (tree and tree != known):
@@ -876,7 +882,20 @@ def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dic
     session_dir = tracker.agent / "sessions" / session if tracker and session else None
     session_page = session_dir / "index.html" if session_dir else None
     if session and not (session_page and session_page.is_file()):  # opened from a repo whose tracker is not the unit's
-        session_page = next((Path(m["path"]) for m in kept if m["kind"] == "session" and Path(m["path"]).parent.name == session), session_page)
+        session_page = next((Path(m["path"]) for m in kept if m["kind"] == "session" and m.get("path")
+                             and Path(m["path"]).parent.name == session), session_page)
+    if session_page and session_page.is_file() and any(map(stand_in, kept)):
+        # the stand-in goes once the session page is there, which takes its place as it stood: open or minimized
+        real = page_of_path(session_page)
+        with lock:
+            if held := load(key):
+                was = next((m for m in held["members"] if stand_in(m)), None)
+                held["members"] = [m for m in held["members"] if not stand_in(m)]
+                if was and all(m["url"] != real.url for m in held["members"]):
+                    held["members"].append({**was, "id": member_id(real.url), "url": real.url, "path": str(real.path),
+                                            "title": title_of(real), "tracker": str(tracker.root) if tracker else was.get("tracker")})
+                save(held)
+                kept = [m for m in held["members"] if stays(m)]
     members = [{**m, "lane": member_lane(m)} for m in kept]
     pages = unit_pages(session_page, members)
     tickets = [{"slug": s, **({k: tracker.tickets[s][k] for k in ("status", "title", "diff")} if tracker and s in tracker.tickets
@@ -895,7 +914,7 @@ def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dic
             "seen": {u: seen[u] for u in {*(p["url"] for p in pages), *(m["url"] for m in kept)} if u in seen},
             "board": page_of_path(board).url if board and board.is_file() else None,
             "worked_on": [s for s in committed if tracker.tickets[s]["status"] != "done"],  # what is done is worked on no more
-            "session_page": session_entry(session_page)}
+            "session_page": session_entry(session_page) or {"url": stand_in_url(key), "id": member_id(stand_in_url(key))}}
 
 
 def session_entry(path: Path | None) -> dict | None:
@@ -904,6 +923,47 @@ def session_entry(path: Path | None) -> dict | None:
         return None
     url = page_of_path(path).url
     return {"url": url, "id": member_id(url)}
+
+
+STAND_IN = "/pages/"
+
+
+def stand_in_url(key: str) -> str:
+    return STAND_IN + key_path(key)
+
+
+def stand_in(member: dict) -> bool:
+    return member["url"].startswith(STAND_IN)
+
+
+def stand_in_page(view: dict) -> bytes:
+    """The page that lists a unit's pages while it has no session page: the session page's column, empty, for the
+    hub tab to fill."""
+    why = ("Pages no session opened. The hub lists them here, as a session page lists its own." if not view["session"]
+           else "This session has rendered no session page yet. The hub lists its pages here until it does.")
+    where = " · ".join(x for x in (view["tree"], view["repo"]) if x)
+    return (STAND_IN_PAGE.replace("__TITLE__", html.escape(view["title"])).replace("__WHERE__", html.escape(where))
+            .replace("__WHY__", html.escape(why)).encode())
+
+
+STAND_IN_PAGE = """<!doctype html><meta charset="utf-8"><title>__TITLE__</title>
+<style>
+  :root { color-scheme: light dark; --ground: light-dark(#f4e4cd, #1a1714); --body: light-dark(#37261d, #ede3d2);
+    --muted: light-dark(#5e5650, #b0a89e); --accent: light-dark(#426724, #6ea444); --edge: light-dark(#cfbca3, #4a433b); }
+  body { margin: 0; padding: 2rem 1.5rem; background: var(--ground); color: var(--body); font: 15px/1.6 Newsreader, Georgia, serif; }
+  h1 { font: 600 17px/1.4 Newsreader, Georgia, serif; margin: 0; }
+  .meta { font: 12px/1.5 "IBM Plex Mono", ui-monospace, monospace; color: var(--muted); margin: 2px 0 1.25rem; }
+  #artefacts { font: 13px/1.5 "IBM Plex Mono", ui-monospace, monospace; max-width: 40rem; }
+  #artefacts .turn-ref { color: var(--muted); }
+  #artefacts ol { list-style: none; padding: 0; margin: 4px 0 0; }
+  #artefacts li { display: grid; grid-template-columns: 1.2rem minmax(0, 1fr); gap: 0 6px; align-items: baseline; padding: 4px 0;
+    border-bottom: 1px solid var(--edge); }
+  #artefacts a { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; } #artefacts a:hover { text-decoration: underline; }
+</style>
+<h1>__TITLE__</h1>
+<p class="meta">__WHERE__<br>__WHY__</p>
+<aside class="column" id="artefacts"></aside>
+"""
 
 
 def unit_tracker(kept: list[dict], session: str | None, memo: dict) -> tuple[Tracker | None, bool]:
@@ -1240,6 +1300,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(view) if view else self.send_json({"error": "no such unit"}, 404)
         if path == "/events":
             return self.stream()
+        if path.startswith(STAND_IN):
+            key = urllib.parse.unquote(path.removeprefix(STAND_IN))
+            view = next((u for u in hub_view()["units"] if u["unit"] == key), None)
+            return self.send(200, stand_in_page(view), "text/html; charset=utf-8") if view else self.send(404, b"no such unit", "text/plain")
         if path == "/diff":
             query = urllib.parse.parse_qs(parts.query)
             page, status, why = render_diff(Path(query.get("tracker", [""])[0]), query.get("ticket", [""])[0])
