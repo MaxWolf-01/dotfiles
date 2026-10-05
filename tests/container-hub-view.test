@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from playwright.sync_api import Error as PlaywrightError, sync_playwright
+from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeout, sync_playwright
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 CHROMIUM = os.environ.get("CHROMIUM") or shutil.which("chromium")
@@ -195,10 +195,16 @@ def kill_hub() -> None:
 hub = None
 
 
+HELD = threading.Event()  # set, /slow answers
+
+
 class Elsewhere(http.server.BaseHTTPRequestHandler):
-    """A local server on another origin than the hub's: /deny and /self refuse framing, any other path allows it."""
+    """A local server on another origin than the hub's: /deny and /self refuse framing, /slow answers only once HELD is
+    set, so a page fetching it has not loaded until then, and any other path allows framing."""
 
     def do_GET(self):
+        if self.path == "/slow":
+            HELD.wait(60)
         self.send_response(200)
         if self.path == "/deny":
             self.send_header("X-Frame-Options", "DENY")
@@ -941,6 +947,38 @@ try:
         clicked(f"{app}/app2")
         settles("a plain click on a link to one that allows it opens it in the unit's output lane", lane("output"),
                 lambda: framed_at(f"{app}/app2"))
+
+        # a link clicked before its page has loaded, the page's image still on its way, and one in a page framed inside it
+        page("show/map-columns/inner.html", f'<a id="nested" href="{app}/self">self</a>')
+        early = page("show/map-columns/early.html", f'<a id="early" href="{app}/deny">deny</a>'
+                     f'<iframe src="inner.html"></iframe><img src="{app}/slow">')
+        view.evaluate(f"ws.focus({json.dumps(ORCHESTRATOR + '~' + api('/api/open', {'target': str(early), 'session': ORCHESTRATOR})['id'])})")
+        deadline = time.monotonic() + 30
+        while not (outer := next((f for f in view.frames if f.url.endswith("/early.html")), None)) and time.monotonic() < deadline:
+            view.wait_for_timeout(50)
+        outer.wait_for_selector("#early")
+        inner = next(f for f in outer.child_frames if f.url.endswith("/inner.html"))
+        inner.wait_for_selector("#nested")
+
+        def tab_on(frame, selector: str) -> str | None:
+            """The address of the browser tab a click on the link opens, None for no tab."""
+            try:
+                with context.expect_page(timeout=10000) as tab:
+                    frame.click(selector)
+                url = tab.value.url
+                tab.value.close()
+                return url
+            except PlaywrightTimeout:
+                return None
+
+        check("the page has not loaded", "interactive", outer.evaluate("document.readyState"))
+        check("...and what the hub put in the page leaves it in standards mode", "CSS1Compat", outer.evaluate("document.compatMode"))
+        check("a link in a page framed inside it, clicked, opens the page that refuses framing as a browser tab",
+              f"{app}/self", tab_on(inner, "#nested"))
+        check("a link clicked before its page has loaded opens a page that refuses framing as a browser tab", f"{app}/deny",
+              tab_on(outer, "#early"))
+        check("...and the pane still shows the page", True, outer.url.endswith("/early.html"))
+        HELD.set()
         elsewhere.shutdown()
         focus(ORCHESTRATOR)  # out of the page on another origin, which the hub tab's keys do not reach
 
@@ -1012,6 +1050,7 @@ try:
               view.evaluate("(e => (dispatchEvent(e), e.defaultPrevented))(new Event('beforeunload', { cancelable: true }))"))
         browser.close()
 finally:
+    HELD.set()
     if hub:
         os.killpg(hub.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
         hub.wait()
