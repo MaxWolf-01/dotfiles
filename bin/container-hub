@@ -68,6 +68,10 @@ The line the Stop hook prints under a finished turn links the hub tab at that se
 this hub (http://127.0.0.1:8377/u/<session id> on the default port), wherever the hub answers; where none does,
 the session page's file:// link.
 
+The rail shows what the statusline shows: each running session's context use, and each account's 5h and weekly
+usage, read from what the statusline keeps under `~/.cache/claude-statusline/`. A session with no file there shows
+none.
+
     GET  /                    the hub tab
     GET  /u/<key>             the hub tab at a unit: a session id, or `loose`. A container view's old address,
                               /c/<key>, is sent to the hub tab.
@@ -91,10 +95,12 @@ the session page's file:// link.
     POST /api/drop?unit=&name=   a file's bytes, from the hub tab with its X-Hub-Token: saved, answers {"path"}.
     POST /api/serve           {"path"}: from a local tool only, serve a page with what sits beside it, or a
                               directory with everything under it, without making it a member. Answers {"url"}.
-    GET  /api/hub             {"units": [...], "seen": {url: when}}: every unit, the numbered ones first in the
-                              rail's order, then the dismissed, then the ended, each the latest turn first.
+    GET  /api/hub             {"units": [...], "seen": {url: when}, "usage": [...]}: every unit, the numbered ones
+                              first in the rail's order, then the dismissed, then the ended, each the latest turn
+                              first; and each account's 5h and weekly usage, as the statusline last had them.
     GET  /api/u/<key>         one unit: {"unit", "session", "title", "short", "tree", "repo", "state", "waiting_for",
-                              "pane", "last", "number", "board", "worked_on" (the tickets the board marks),
+                              "pane", "context" (its running session's context use, as the statusline last had it),
+                              "last", "number", "board", "worked_on" (the tickets the board marks),
                               "dismissed", "members": [{"id", "url", "closed", "lane", "tab"?, ...}], "pages", "seen",
                               ...}. A member's url is where the hub serves it, relative to here, and its "tab" why it
                               refuses to be framed, where it does. "pages" is every page
@@ -147,6 +153,7 @@ import tyro
 HERE = Path(__file__).resolve().parent
 HOME = Path.home().resolve()
 TEMP = Path(tempfile.gettempdir()).resolve()
+STATUSLINE = HOME / ".cache" / "claude-statusline"
 
 TRELLIS = {  # fetched, not committed: its licence asks a sponsorship for commercial use
     "index.js": "239bc6506cdc4b4391a34a091d87fe4dc7ab46a2152f24781bd261621a652220",
@@ -307,6 +314,48 @@ def registry() -> dict[str, dict]:
         if running(pid, entry.get("procStart")):
             found[sid] = entry
     return found
+
+
+def statusline_inputs() -> list[dict]:
+    """What Claude Code last handed each session's statusline, which the statusline keeps as
+    `~/.cache/claude-statusline/<session id>.json` with `config_dir` (the account's `CLAUDE_CONFIG_DIR`) and
+    `written_at` added. Claude Code keeps these numbers nowhere else."""
+    found = []
+    for path in STATUSLINE.glob("*.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            found.append(data)
+    return found
+
+
+def context_use(inputs: list[dict]) -> dict[str, dict]:
+    """Each session's context use, by its id: `used_percentage` and `total_input_tokens`."""
+    found = {}
+    for d in inputs:
+        window = d.get("context_window")
+        if isinstance(d.get("session_id"), str) and isinstance(window, dict):
+            found[d["session_id"]] = {k: window.get(k) for k in ("used_percentage", "total_input_tokens")}
+    return found
+
+
+def usage(inputs: list[dict]) -> list[dict]:
+    """Each account's 5h and weekly usage, from its newest statusline input: [{"account", "at", "five_hour",
+    "seven_day"}], each window {"used_percentage", "resets_at"}, or null where the input carries none."""
+    newest = {}
+    for d in inputs:
+        at = d.get("written_at")
+        if not isinstance(d.get("config_dir"), str) or not isinstance(at, (int, float)):
+            continue
+        account = str(Path(d["config_dir"]))  # ~/.claude-work/ and ~/.claude-work are one account
+        if at > newest.get(account, {}).get("written_at", -1):
+            newest[account] = d
+    window = lambda w: {k: w.get(k) for k in ("used_percentage", "resets_at")} if isinstance(w, dict) else None
+    return [{"account": account, "at": d["written_at"],
+             **{name: window((d.get("rate_limits") or {}).get(name)) for name in ("five_hour", "seven_day")}}
+            for account, d in sorted(newest.items())]
 
 
 def running(pid: int, started: str | None) -> bool:
@@ -486,10 +535,10 @@ def ticket_of(page: Page, session: str | None, cwd: str | None) -> tuple[str | N
 STATE = Path()
 lock = threading.RLock()
 listeners: list[queue.Queue] = []
-# The digest of the hub each listener last saw, taken when it starts listening and moved on by every round of the
+# The digests of the hub each listener last saw, taken when it starts listening and moved on by every round of the
 # disk watch: a listener hears of every change made since it started, and of nothing else. What changed before is
 # the listener's to read once its stream is open.
-seen_by: weakref.WeakKeyDictionary[queue.Queue, str] = weakref.WeakKeyDictionary()
+seen_by: weakref.WeakKeyDictionary[queue.Queue, tuple[str, str]] = weakref.WeakKeyDictionary()
 launched_at = 0.0
 """When an open last had its caller open the hub tab: a tab just opened has not listened yet."""
 unheard: list[tuple[float, dict]] = []
@@ -844,7 +893,7 @@ def present(path: Path) -> bool:
     return path.exists() and not (diffview and diffview.watched_repo_gone(path))
 
 
-def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dict) -> dict | None:
+def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dict, contexts: dict[str, dict]) -> dict | None:
     """Everything the hub tab draws of a unit, but its number, which hub_view gives it among the others. None
     once the unit is gone: its tree retired, or every page of it deleted. A member whose file is gone leaves it
     here."""
@@ -909,6 +958,7 @@ def unit_view(key: str, live: dict[str, dict], seen: dict[str, float], memo: dic
     return {"unit": key, "session": session, "title": title, "short": (entry or {}).get("name") or (session or "")[:8],
             "tree": tree, "repo": tracker.repo if tracker else "",
             "state": state, "waiting_for": (entry or {}).get("waitingFor"), "pane": (entry or {}).get("tmux"),
+            "context": contexts.get(session) if entry else None,
             "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
             "first": min(m["first"] for m in kept), "visited": data.get("visited") or 0,
             "resume": resume_command(session) if session else "", "tickets": tickets, "pages": pages, "members": members,
@@ -1004,11 +1054,12 @@ def last_turn(session_page: Path | None, entry: dict | None) -> float:
 
 def hub_view() -> dict:
     """Every unit that is still there, in the rail's order, as the module's docstring gives it."""
-    live, seen, memo = registry(), load_seen(), {}
+    live, seen, memo, inputs = registry(), load_seen(), {}, statusline_inputs()
+    contexts = context_use(inputs)
     units = []
     for path in sorted((STATE / "units").glob("*.json")):
         try:
-            view = unit_view(urllib.parse.unquote(path.stem), live, seen, memo)
+            view = unit_view(urllib.parse.unquote(path.stem), live, seen, memo, contexts)
         except OSError as e:
             print(f"listing {path}: {e}", file=sys.stderr, flush=True)
             continue
@@ -1021,7 +1072,7 @@ def hub_view() -> dict:
     # the dismissed, then the loose pages, then the ended, each the latest first
     rest = sorted((u for u in units if u["number"] is None),
                   key=lambda u: (2 if u["state"] == "ended" else 0 if u["dismissed"] else 1, -u["last"]))
-    return {"units": [*numbered, *rest], "seen": seen}
+    return {"units": [*numbered, *rest], "seen": seen, "usage": usage(inputs)}
 
 
 def listing(directory: Path) -> bytes:
@@ -1432,8 +1483,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(answer, code)
 
 
-def view_digest() -> str:
-    return hashlib.sha1(json.dumps(hub_view(), sort_keys=True).encode()).hexdigest()
+def view_digest() -> tuple[str, str]:
+    """The hub's digest in two parts: what the layout is built from, and the statusline's numbers, which change at
+    every step of a session's turn and redraw only the rail."""
+    view = hub_view()
+    numbers = {"usage": view.pop("usage"), "context": {u["unit"]: u.pop("context") for u in view["units"]}}
+    return tuple(hashlib.sha1(json.dumps(x, sort_keys=True).encode()).hexdigest() for x in (view, numbers))
 
 
 def restart_command() -> str:
@@ -1461,8 +1516,11 @@ def watch_disk() -> None:
             print(f"watching: {e}", file=sys.stderr, flush=True)
             continue
         for q in watching:
-            if seen_by.get(q) != digest:
+            heard = seen_by.get(q)
+            if not heard or heard[0] != digest[0]:
                 q.put({"type": "disk"})
+            elif heard[1] != digest[1]:
+                q.put({"type": "numbers"})
             seen_by[q] = digest
 
 
