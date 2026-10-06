@@ -16,6 +16,10 @@
   # Boot
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
+  # A boot entry, not a default: one boot into it is
+  # `sudo systemctl reboot --boot-loader-entry=memtest86.conf`, and its results
+  # show only on a screen attached to pc.
+  boot.loader.systemd-boot.memtest86.enable = true;
 
   boot.supportedFilesystems = [ "zfs" ];
   boot.zfs = {
