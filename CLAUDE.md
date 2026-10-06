@@ -154,7 +154,8 @@ Mullvad exit node: `vpn` (`bin/vpn`). Its watcher service (`vpn watch`) is the
 one process that changes the exit node, and the `vpn` commands are its clients.
 It moves off a node Cloudflare blocks for Chrome-family clients (Electron apps
 break, browsers work), one that reports itself offline, and one that goes
-silent; what it does and why: `vpn --help`.
+silent; what it does and why: `vpn --help`. A slow node it never moves off; it
+turns the dot amber instead.
 The watcher also publishes the exit node's state, shown as a dot in the top bar
 by the GNOME extension in `desktop/vpn-dot`.
 

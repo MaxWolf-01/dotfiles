@@ -12,7 +12,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 
 const STATE_FILE = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'vpn-state.json']);
-const STATES = ['up', 'down', 'off', 'unknown'];
+const STATES = ['up', 'slow', 'down', 'off', 'unknown'];
 // The unit deletes the file when the watcher stops.
 const NOT_RUNNING = {state: 'unknown', reason: 'vpn-watch is not running'};
 
@@ -70,7 +70,7 @@ class Dot extends PanelMenu.Button {
     // stops once it sees the exit node gone, and its failure goes unreported.
     _toggle() {
         const {state} = this._shown;
-        if (this._running?.argv === ON || (!this._running && ['up', 'down'].includes(state)))
+        if (this._running?.argv === ON || (!this._running && ['up', 'slow', 'down'].includes(state)))
             this._run(OFF, 'turning off');
         else if (!this._running && state === 'off')
             this._run(ON, 'turning on');
@@ -156,7 +156,7 @@ const MODES = {
     pinned: 'pinned (stays on this node)',
 };
 
-function describe({state, reason, mode, node, city, country, since}, running) {
+function describe({state, reason, mode, node, city, country, delay, since}, running) {
     const age = since ? ` for ${ago(Date.parse(since))}` : '';
     const lines = [`${state}${age}${reason ? `: ${reason}` : ''}`];
     if (node) {
@@ -166,6 +166,8 @@ function describe({state, reason, mode, node, city, country, since}, running) {
             lines.push(`location: ${place}`);
         lines.push(`mode: ${MODES[mode] ?? mode}`);
     }
+    if (delay !== null && delay !== undefined)
+        lines.push(`delay: ${delay} ms added by the node`);
     if (running)
         lines.push(`${running}…`);
     return lines.join('\n');

@@ -18,7 +18,9 @@ Where a move goes from a node: the rest of its city, then the rest of its countr
 
 The watcher moves off a node the same way when Cloudflare blocks it, when it reports itself offline, and when it goes silent. After a move of its own that pinned nothing it starts none for 5 minutes. When no node answers the probe of a move off a silent node, it stays on that node, and probes again every 30 s while the silence lasts. It never turns the VPN off, and a node it moved to stays pinned until `vpn on`.
 
-Every change of exit node, the watcher's own and every one made outside vpn, is one line in ~/logs/runs/vpn.jsonl (bin/run-log), and so is a silence the watcher did not move off. `vpn rewrite-log` brings lines from before the watcher was the one controller into that vocabulary. The watcher also writes an hourly heartbeat to ~/logs/runs/vpn-watch.jsonl.
+A slow node is shown, never moved off: the top-bar dot turns amber while the node adds more than 150 ms to every round trip, and `vpn next` is the way off it. The delay a node adds is how much longer a TCP connect to Mullvad's resolver (194.242.2.4) takes through it than past it, on the interface of the main routing table's default route. So a slow network under a fast node does not read as slow. The watcher measures it once a minute and calls the node slow on the median of its last few measurements; `vpn watch --help` has the numbers.
+
+Every change of exit node, the watcher's own and every one made outside vpn, is one line in ~/logs/runs/vpn.jsonl (bin/run-log), and so is a silence the watcher did not move off, and a node turning slow and turning fast again. `vpn rewrite-log` brings lines from before the watcher was the one controller into that vocabulary. The watcher also writes an hourly heartbeat to ~/logs/runs/vpn-watch.jsonl.
 
 Needs the tailscale operator grant (no sudo).
 
@@ -48,11 +50,12 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from itertools import zip_longest
 from pathlib import Path
+from statistics import median
 from typing import Annotated, Literal, TypeGuard, get_args
 
 import tyro
@@ -122,6 +125,28 @@ PROOF_CONNECT_SECS = 1.0
 PROOF_RETRY_SECS = 0.5
 """How long the traffic proof waits before it connects again, unless an engine update shows bytes going to the
 node sooner."""
+DELAY_TARGET = ("194.242.2.4", 443)
+"""Where the delay measurement connects to: Mullvad's resolver. The connect past the exit node leaves from this
+machine's real IP every minute, and Mullvad, which terminates the tunnel, sees that IP already; a third party
+such as Cloudflare would learn it."""
+DELAY_SECS = 60
+"""How often the watcher measures the delay the exit node adds, at the first look due after that."""
+DELAY_CONNECT_SECS = 2.0
+"""The longest one of the delay measurement's connects waits. One that takes longer says nothing."""
+SLOW_SAMPLES = 5
+"""How many delay measurements the slow verdict rests on: the last ones whose connects both succeeded."""
+SLOW_MS = 150
+"""The median extra delay above which the exit node counts as slow."""
+FAST_MS = 100
+"""The median extra delay below which a slow exit node counts as fast again."""
+DELAY_SHOWN_MS = 20
+"""How far the median extra delay may move before the dot's tooltip shows the new one. A healthy node's
+medians wander by a few ms, and each one shown is a write of STATE_FILE and a wakeup of the dot."""
+STATUS_DELAYS = 3
+"""The most delay measurements `vpn status` takes."""
+DELAYS_KEPT = 2 * SLOW_SAMPLES
+"""Delay measurements the watcher keeps. Failed ones push out the oldest, and while fewer than SLOW_SAMPLES
+succeeded among them the slow verdict stays as it was."""
 PICK_SECS = 5
 """How long `vpn on`, and a move that stayed and put automatic mode back, wait for tailscaled to name the node
 automatic mode picked."""
@@ -168,9 +193,10 @@ Stop = Literal["superseded", "cancelled", "outside"]
 STOPPED: dict[Stop, str] = {"outside": "superseded by a change of exit node outside vpn",
                             "superseded": "superseded by a newer request", "cancelled": "cancelled"}
 """The words that begin the final line of a request that a stop ended."""
-Event = Literal["moved", "on", "off", "changed", "stayed", "silent"]
-"""What a node-log line records: a change of exit node, or a silence the watcher observed."""
-State = Literal["up", "down", "off", "unknown"]
+Event = Literal["moved", "on", "off", "changed", "stayed", "silent", "slow"]
+"""What a node-log line records: a change of exit node, a silence the watcher observed, or the exit node turning
+slow or fast again."""
+State = Literal["up", "slow", "down", "off", "unknown"]
 Asked = Literal["on", "off", "next", "to"]
 """What a client can ask the watcher for."""
 Command = Literal[Asked, "watch"]
@@ -268,9 +294,10 @@ def mode(prefs: dict | None) -> Literal["off", "automatic", "pinned", "unknown"]
     return "off"
 
 
-def vpn_state(prefs: dict | None, status: dict | None, silent: bool, stranded: bool = False) -> tuple[State, str]:
+def vpn_state(prefs: dict | None, status: dict | None, silent: bool, stranded: bool = False,
+              slow: bool = False) -> tuple[State, str]:
     """The state the dot shows, and why: what prefs ask for against what status delivers. `stranded`: no
-    Mullvad node answered the probe of the watcher's last move off a silent node.
+    Mullvad node answered the probe of the watcher's last move off a silent node. `slow`: the slow verdict.
 
     Off comes from prefs alone. A status with no exit node while prefs name one
     is an outage, as when Tailnet Lock dropped every peer from the netmap.
@@ -291,7 +318,45 @@ def vpn_state(prefs: dict | None, status: dict | None, silent: bool, stranded: b
         return "down", "the node reports itself offline"
     if silent:
         return "down", "no Mullvad node answers" if stranded else "the node stopped answering"
+    if slow:
+        return "slow", "`vpn next` moves off it"
     return "up", ""
+
+
+@dataclass(frozen=True)
+class Delay:
+    """One delay measurement: how long a TCP connect to DELAY_TARGET took through the exit node and past it, in
+    ms; None for a connect that failed."""
+
+    tunnel: float | None
+    direct: float | None
+
+    @property
+    def extra(self) -> float | None:
+        """The delay the exit node adds; None when either connect failed, which says nothing about the node."""
+        return None if self.tunnel is None or self.direct is None else self.tunnel - self.direct
+
+
+def extras(delays: Iterable[Delay]) -> list[float]:
+    """The extra delays of the last SLOW_SAMPLES measurements, oldest first, whose connects both succeeded."""
+    return [d.extra for d in delays if d.extra is not None][-SLOW_SAMPLES:]
+
+
+def extra_delay(delays: Iterable[Delay]) -> float | None:
+    """The median of `extras`; None when there are none."""
+    found = extras(delays)
+    return median(found) if found else None
+
+
+def slow(delays: Iterable[Delay], was: bool) -> bool:
+    """Whether the exit node is slow, from its delay measurements, oldest first, and the verdict before them.
+
+    It is once the median of `extras` exceeds SLOW_MS, and stays slow until that median falls below FAST_MS.
+    While there are fewer than SLOW_SAMPLES of them, the verdict stays as it was."""
+    found = extras(delays)
+    if len(found) < SLOW_SAMPLES:
+        return was
+    return median(found) >= FAST_MS if was else median(found) > SLOW_MS
 
 
 def grown(new: int, old: int) -> int:
@@ -469,13 +534,15 @@ def log_run(unit: str, outcome: str, reason: str = "", stats: dict | None = None
 
 
 def log_node(outcome: str, event: Event, by: By, frm: str | None, to: str | None, why: str | None = None,
-             tried: int = 0, reason: str = "", secs: int | None = None) -> None:
+             tried: int = 0, reason: str = "", secs: int | None = None, slow: bool | None = None,
+             delay_ms: int | None = None) -> None:
     """One node-log line, in the shape the dns/vpn dashboard reads. `from` and
     `to` are the exit node before and after the line, null for none; `why` is
-    the cause of a move; `secs` how long a silent node went unanswered."""
+    the cause of a move; `secs` how long a silent node went unanswered; `slow`
+    the verdict a slow line records, and `delay_ms` the median extra delay it
+    rests on. Each of the last three appears only when given."""
     stats = {"event": event, "by": by, "from": frm, "to": to, "why": why, "tried": tried}
-    if secs is not None:
-        stats["secs"] = secs
+    stats |= {k: v for k, v in (("secs", secs), ("slow", slow), ("delay_ms", delay_ms)) if v is not None}
     log_run(NODE_UNIT, outcome, reason, stats)
 
 
@@ -510,6 +577,8 @@ class Network:
     """The traffic proof's TCP connect out. Returns whether it succeeded within the seconds given."""
     discord: Callable[[], Verdict]
     egress: Callable[[], dict]
+    delay: Callable[[], Delay]
+    """One delay measurement, its two connects at once."""
 
 
 @dataclass(frozen=True)
@@ -1053,6 +1122,14 @@ class Watch:
     """The silence verdict as the last look had it."""
     silence: Silence | None = None
     """The silence in progress."""
+    measured: str = ""
+    """The exit node `delays` measure."""
+    delays: deque[Delay] = field(default_factory=deque)
+    """Its last DELAYS_KEPT delay measurements, oldest first."""
+    measure_at: float = 0.0
+    """When its next delay measurement is due."""
+    slow: bool = False
+    """The slow verdict on it."""
     shown: dict = field(default_factory=dict)
     """What STATE_FILE says, apart from since when."""
     shown_since: float = 0.0
@@ -1533,10 +1610,14 @@ def look(w: Watch, ports: Ports) -> float:
 
     w.looked_silent = live.silent()
     record_silence(w, live)
+    if state.id and state.online is not False and not w.looked_silent:
+        measure(w, state.id, ports)
     prefs = ports.tailscaled.prefs()
     silence = w.silence
-    publish(w, *vpn_state(prefs, poll, w.looked_silent, silence is not None and silence.stranded), node,
-            mode(prefs), now)
+    shows = vpn_state(prefs, poll, w.looked_silent, silence is not None and silence.stranded,
+                      w.slow and state.id == w.measured)
+    delay = extra_delay(w.delays) if shows[0] in ("up", "slow") else None
+    publish(w, *shows, node, mode(prefs), now, shown_delay(delay, w.shown.get("delay")))
 
     if not state.id or now < w.backoff_until:
         return wait_until_due(w, now, live.streaming(), state)
@@ -1572,6 +1653,25 @@ def look(w: Watch, ports: Ports) -> float:
     return wait_until_due(w, now, live.streaming(), state)
 
 
+def measure(w: Watch, node_id: str, ports: Ports) -> None:
+    """Measure the delay the exit node adds, once DELAY_SECS have passed since its last measurement, and take
+    the slow verdict from what is measured so far. A new exit node starts over, and is measured at once.
+    Printed when a node turns slow and when it is fast again."""
+    if node_id != w.measured:
+        w.measured, w.delays, w.measure_at, w.slow = node_id, deque(maxlen=DELAYS_KEPT), ports.clock.now(), False
+    if ports.clock.now() < w.measure_at:
+        return
+    w.measure_at = ports.clock.now() + DELAY_SECS
+    w.delays.append(ports.network.delay())
+    was, w.slow = w.slow, slow(w.delays, w.slow)
+    if w.slow != was:
+        name, delay = w.names.get(node_id), round(median(extras(w.delays)))
+        reason = (f"{name or 'the exit node'} {'is slow' if w.slow else 'is fast again'}: it adds {delay} ms to "
+                  f"every round trip, the median of its last {SLOW_SAMPLES} delay measurements")
+        print(reason)
+        log_node("ok", "slow", "watch", name, name, reason=reason, slow=w.slow, delay_ms=delay)
+
+
 def checked(w: Watch, node: Node, now: float) -> None:
     """Remember the node a recovery checked clean."""
     w.verified_id, w.last_check = node.id, now
@@ -1598,7 +1698,8 @@ def record_silence(w: Watch, live: Liveness) -> None:
             log_node("ok", "silent", "watch", ended.node, ended.node, reason=reason, secs=secs)
 
 
-def publish(w: Watch, state: State, reason: str, node: Node | None, how: str, now: float) -> None:
+def publish(w: Watch, state: State, reason: str, node: Node | None, how: str, now: float,
+            delay: int | None = None) -> None:
     """Write what the dot shows to STATE_FILE, when it changed. `since` moves
     only when the state does."""
     shown = {
@@ -1608,6 +1709,7 @@ def publish(w: Watch, state: State, reason: str, node: Node | None, how: str, no
         "node": node.name if node else None,
         "city": node.city if node else None,
         "country": node.country if node else None,
+        "delay": delay,
     }
     if shown == w.shown:
         return
@@ -1618,6 +1720,13 @@ def publish(w: Watch, state: State, reason: str, node: Node | None, how: str, no
     partial = STATE_FILE.with_suffix(".partial")
     partial.write_text(json.dumps(shown | {"since": since}) + "\n")
     partial.replace(STATE_FILE)
+
+
+def shown_delay(delay: float | None, shown: int | None) -> int | None:
+    """The delay the dot shows: `shown` while `delay` stays within DELAY_SHOWN_MS of it, else `delay` rounded."""
+    if delay is None or shown is None or abs(delay - shown) >= DELAY_SHOWN_MS:
+        return None if delay is None else round(delay)
+    return shown
 
 
 def wait_until_due(w: Watch, now: float, streaming: bool, state: ExitState) -> float:
@@ -1810,6 +1919,62 @@ def connect_out(timeout: float) -> bool:
             sock.close()
 
 
+def measure_delay() -> Delay:
+    """Time a TCP connect to DELAY_TARGET through the exit node, and one past it, both at once.
+
+    The one past it is bound to the interface of the main routing table's default route. Tailscale's exit node
+    routes through a table of its own, whose route over tailscale0 a socket bound to another interface cannot
+    take, so that connect leaves as it would with no exit node set."""
+    tunnel, direct = (socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(2))
+    with tunnel, direct:
+        try:
+            device = main_interface(Path("/proc/net/route").read_text())
+            if device is None:
+                raise OSError("no default route in the main table")
+            direct.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, device.encode())
+            paths = [tunnel, direct]
+        except OSError:
+            paths = [tunnel]
+        took = connect_times(paths, DELAY_TARGET, DELAY_CONNECT_SECS)
+        return Delay(took.get(tunnel), took.get(direct))
+
+
+def main_interface(routes: str) -> str | None:
+    """The interface of the default IPv4 route with the lowest metric, from /proc/net/route, which lists the
+    main routing table alone."""
+    found = []
+    for line in routes.splitlines()[1:]:
+        iface, destination, _, flags, _, _, metric, *_ = line.split()
+        if destination == "00000000" and int(flags, 16) & 1:  # RTF_UP
+            found.append((int(metric), iface))
+    return min(found)[1] if found else None
+
+
+def connect_times(socks: list[socket.socket], target: tuple[str, int], timeout: float) -> dict[socket.socket, float]:
+    """How long each of `socks` took to connect to `target`, in ms, all of them at once. One that failed, or
+    took longer than `timeout`, is missing."""
+    selector = selectors.DefaultSelector()
+    began: dict[socket.socket, float] = {}
+    took: dict[socket.socket, float] = {}
+    try:
+        for sock in socks:
+            sock.setblocking(False)
+            began[sock] = time.monotonic()
+            if sock.connect_ex(target) in (0, errno.EINPROGRESS):
+                selector.register(sock, selectors.EVENT_WRITE)
+        deadline = time.monotonic() + timeout
+        while selector.get_map() and (left := deadline - time.monotonic()) > 0:
+            for key, _ in selector.select(left):
+                sock = key.fileobj
+                assert isinstance(sock, socket.socket)
+                if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                    took[sock] = (time.monotonic() - began[sock]) * 1000
+                selector.unregister(sock)
+        return took
+    finally:
+        selector.close()
+
+
 def real_ports(mask: int | None = None, arrivals: "queue.Queue[Arrival] | None" = None) -> Ports:
     """The real ports. With `mask`, a bus reader thread feeds the event bus under
     that mask to `Clock.wait`, as do whatever else puts into `arrivals`; without,
@@ -1828,7 +1993,8 @@ def real_ports(mask: int | None = None, arrivals: "queue.Queue[Arrival] | None" 
 
     return Ports(
         tailscaled=tailscaled,
-        network=Network(probe=send_probe, connect=connect_out, discord=discord_check, egress=egress),
+        network=Network(probe=send_probe, connect=connect_out, discord=discord_check, egress=egress,
+                        delay=measure_delay),
         clock=Clock(now=time.time, wait=wait),
         vesktop=vesktop_running,
     )
@@ -2043,20 +2209,24 @@ class StatusArgs:
 
 @app.command(name="status")
 def status(args: StatusArgs) -> None:
-    """Show the exit node, how it was chosen, the public IP, the Discord check's verdict, and whether the watcher runs.
+    """Show the exit node, how it was chosen, the delay it adds, the public IP, the Discord check's verdict, and whether the watcher runs.
 
-    The public IP and the Discord check go over the network; the rest is read from tailscaled.
+    The delay, the public IP and the Discord check go over the network; the rest is read from tailscaled. While an exit node is set, the delay is measured 3 times, as `vpn --help` describes, or until a connect fails: how long a TCP connect to Mullvad's resolver (194.242.2.4) takes through the exit node and past it, and the difference, each the median of the connects that succeeded. A slow network slows both connects; a slow node only the first.
 
     JSON schema (--json):
 
         {"node": "str|null", "country": "str|null", "city": "str|null",
          "mode": "off|automatic|pinned|unknown", "online": bool|null,
+         "delay": {"extra_ms": int|null, "tunnel_ms": int|null, "direct_ms": int|null} | null,
          "egress": {"ip": "str", "country": "str", "city": "str", "node": "str|null"} | null,
          "discord": "clean|blocked|unreachable|null", "watcher": "str"}
     """
     ports = real_ports()
     reading = ports.tailscaled.status()
     node = current_node(reading)
+    delays: list[Delay] = []
+    while exit_state(reading).id and len(delays) < STATUS_DELAYS and (not delays or delays[-1].extra is not None):
+        delays.append(ports.network.delay())  # a failed connect waits DELAY_CONNECT_SECS; one is enough
     seen = ports.network.egress()
     through_mullvad = bool(seen.get("mullvad_exit_ip_hostname"))
     report = {
@@ -2065,6 +2235,7 @@ def status(args: StatusArgs) -> None:
         "city": node.city if node else None,
         "mode": mode(ports.tailscaled.prefs()),
         "online": exit_state(reading).online,
+        "delay": delay_report(delays) if delays else None,
         "egress": {
             "ip": seen.get("ip"),
             "country": seen.get("country"),
@@ -2087,6 +2258,8 @@ def status(args: StatusArgs) -> None:
     else:
         offline = " · reporting itself offline" if report["online"] is False else ""
         print(f"exit node  {node.name} · {node.city}, {node.country} · {report['mode']}{offline}")
+    if reading is not None:
+        print(f"delay      {delay_line(report['delay'])}")
     if report["egress"]:
         e = report["egress"]
         print(f"egress     {e['ip']} · {e['city']}, {e['country']} · {e['node'] or 'not a Mullvad node'}")
@@ -2094,6 +2267,29 @@ def status(args: StatusArgs) -> None:
         print("egress     unknown, am.i.mullvad.net did not answer")
     print(f"discord    {report['discord'] or 'not checked: egress is not through Mullvad'}")
     print(f"watcher    {report['watcher']}")
+
+
+def delay_report(delays: list[Delay]) -> dict:
+    """What `vpn status` says about its delay measurements: each figure the median of those that were measured."""
+
+    def middle(values: Iterable[float | None]) -> int | None:
+        found = [v for v in values if v is not None]
+        return round(median(found)) if found else None
+
+    return {"extra_ms": middle(d.extra for d in delays), "tunnel_ms": middle(d.tunnel for d in delays),
+            "direct_ms": middle(d.direct for d in delays)}
+
+
+def delay_line(delay: dict | None) -> str:
+    if delay is None:
+        return "not measured: no exit node"
+    tunnel, direct = delay["tunnel_ms"], delay["direct_ms"]
+    if delay["extra_ms"] is None:
+        paths = (("through the exit node", tunnel), ("past it", direct))
+        failed = " and ".join(path for path, ms in paths if ms is None)
+        return (f"unknown: every connect to {DELAY_TARGET[0]} {failed} failed" if failed
+                else "unknown: no measurement had both its connects succeed")
+    return f"{delay['extra_ms']:+d} ms added by the exit node · {tunnel} ms through it, {direct} ms past it"
 
 
 def watcher_state() -> str:
@@ -2230,15 +2426,16 @@ def watch() -> None:
     - The exit node reports itself offline: it moves off it, as `vpn --help` describes, with the Discord check only while Vesktop runs.
     - While Vesktop runs: it runs the Discord check on every new node and every 10 minutes. When a 403 persists past the confirmation wait, or the check gets no answer and the node fails the traffic proof, it moves off the node.
     - The exit node goes silent (traffic went into its tunnel 20 s ago and nothing has come back since): it moves off it. When no node answers that move's probe, it stays, the dot says no Mullvad node answers, and it probes again every 30 s until the silence ends or a probe finds a node. A gap between engine updates longer than 20 s, a suspend for one, starts the count over, and while the stream is closed no node counts as silent.
+    - The exit node is slow: it stays on it, and the dot turns amber. At the first look a minute after the last, it measures the delay the node adds, as `vpn --help` describes, and a new node at its first look. A measurement with a connect that failed, or took over 2 s, says nothing, and none is taken while the node is silent or reports itself offline. The node turns slow once the median of its last 5 measurements that said something exceeds 150 ms, and fast again once it falls below 100 ms; with fewer than 5 the verdict stays as it was. When a node turns slow and when it is fast again, the node log gets a line, event `slow`, whose stats carry the verdict (`slow`) and the median extra delay (`delay_ms`).
 
     After a move of its own that pinned nothing, other than one off a silent node that no node answered, it starts no other for 5 minutes. It records every exit-node change it did not make itself, once, and writes an hourly heartbeat, which fails when an exit node is set and no engine update has come for 60 seconds.
 
     It publishes the state for the top-bar dot to $XDG_RUNTIME_DIR/vpn-state.json whenever it changes:
 
-        {"state": "up|down|off|unknown", "reason": "str", "mode": "off|automatic|pinned|unknown",
-         "node": "str|null", "city": "str|null", "country": "str|null", "since": "ISO 8601"}
+        {"state": "up|slow|down|off|unknown", "reason": "str", "mode": "off|automatic|pinned|unknown",
+         "node": "str|null", "city": "str|null", "country": "str|null", "delay": int|null, "since": "ISO 8601"}
 
-    off: no exit node set, or tailscale stopped. down: an exit node is set, and tailscale is not running, or the node is missing from its status, reports itself offline, or is silent (reason "no Mullvad node answers" once a move off it found none answering). unknown: tailscaled does not answer. Nothing is published while a move runs.
+    up: an exit node is set and works. slow: it works, and the watcher calls it slow. `delay`, while up or slow: the median extra delay in ms of the node's last 5 measurements that said something, null before the first, and moved only once it has moved by 20 ms. off: no exit node set, or tailscale stopped. down: an exit node is set, and tailscale is not running, or the node is missing from its status, reports itself offline, or is silent (reason "no Mullvad node answers" once a move off it found none answering). unknown: tailscaled does not answer. Nothing is published while a move runs.
     """
     arrivals: queue.Queue[Arrival] = queue.Queue()
     run_watcher(real_ports(WATCH_MASK, arrivals), arrivals.put, REQUEST_SOCKET)
