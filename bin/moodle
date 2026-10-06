@@ -1,0 +1,830 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro", "requests", "beautifulsoup4", "lxml"]
+# ///
+"""Read every JKU Moodle course max is enrolled in: list them, snapshot them, diff the snapshots, download their files.
+
+It signs in through JKU's Shibboleth login with the username and password in the sops file `jku`
+(JKU__USERNAME, JKU__PASSWORD); started without them, it re-runs itself under `with-secrets jku`.
+It reads as max's own visit does, and nothing it sends can act: its requests are GETs of course,
+overview and activity pages, the read-only AJAX functions it lists, Moodle file downloads, and the sign-in.
+Opening a page leaves what max's visit leaves: access logs, "recently accessed", a ticked "view"
+completion requirement, and forum posts marked read.
+
+A snapshot holds, per course: its sections (summary, the files they link), every activity (dates,
+completion, restrictions, and what its own page shows: a file's or folder's files, a link's target,
+the text of a page, an assignment, a quiz, a Zoom meeting and the rest, and every forum discussion
+with all its posts), and the assignments, checkmark sheets and quizzes with due date, submission
+status and grade as Moodle's overview pages show them. Text keeps each link's target beside the
+link's text, as "text <url>". Dates and statuses are Moodle's own text, in max's Moodle language.
+
+An activity's page is opened when the activity is new or Moodle reports it changed since the last
+snapshot, and in a course whose update check fails, every run; a forum's discussion list when its
+topic or post count changed; a discussion's posts when it got a new post. Otherwise the contents
+carry over from the last snapshot.
+
+What a snapshot lacks, it lists under "gaps" with the reason: a course, page, forum or file that
+could not be read, activities Moodle shows max as unavailable, activity types this tool does not
+open, recordings that only stream. `snapshot` and `diff` print that list after the changes.
+
+Snapshots live in --state/snapshots/, one JSON file each. Files go to --root/<course folder>/,
+where the course folder is the semester and course title, e.g. 2026S-vl-statistics-for-ai: a
+resource's file flat in it, any other activity's files under the activity's name, a forum post's
+under the forum's and the discussion's.
+<course folder>/.moodle-downloads.json records what was fetched, and a file in it is never fetched
+again; a resource replaced on Moodle under the same name overwrites its old download.
+
+JSON schema (courses --json):
+
+    [{"id": 0, "name": "str", "folder": "str", "hidden": false, "url": "str"}]
+
+JSON schema (snapshot file):
+
+    {"taken": "ISO time", "scraped": {"<course id>": "ISO time"},
+     "gaps": [{"course": 0, "name": "str", "folder": "str", "where": "str", "reason": "str"}],
+     "courses": {"<course id>": {"name": "str", "folder": "str", "url": "str", "hidden": true,
+      "sections": {"<section id>": {"name": "str", "visible": false, "summary": "str", "files": {"<name>": "url"},
+        "items": {"<cm id>": {"name": "str", "module": "assign|resource|folder|forum|zoom|...", "url": "str", "visible": false,
+          "text": "str", "content": "str", "dates": "str", "completion": "done|todo", "requires": ["str"], "restrictions": "str",
+          "files": {"<path>": "url"}, "link": "str", "topics": 0, "posts": 0, "unread": "why its page could not be read",
+          "discussions": {"<id>": {"name": "str", "author": "str", "created": "ISO", "modified": "ISO", "replies": 0,
+            "posts": {"<id>": {"subject": "str", "author": "str", "created": "ISO", "modified": "ISO", "parent": "<id>",
+              "message": "str", "files": {"<name>": "url"}}}}}}}}},
+      "assignments": {"<cm id>": {"name": "str", "module": "assign|checkmark", "due": "str", "submission": "str", "grade": "str"}},
+      "quizzes": {"<cm id>": {"name": "str", "due": "str", "grade": "str"}}}}}
+
+    "text" is what the course page shows of an activity (a label's text); "content" what its own page
+    shows. Fields with no value are left out; "gaps" is [] when nothing is missing.
+
+JSON schema (snapshot --json, diff --json):
+
+    {"changes": [{"change": "added|removed|changed", "course": "str", "folder": "str", "where": "str", "path": ["key"],
+                  "before": any, "after": any}],
+     "gaps": [...as in the snapshot file]}
+
+Examples:
+
+    moodle courses
+    moodle snapshot                       # scrape, download, print what changed and what is missing
+    moodle snapshot --json | jq '.changes[] | select(.path | index("assignments"))'
+    moodle snapshot --course 42634 --no-download
+    moodle diff                           # the last two snapshots again
+    jq '.courses[] | {name, assignments}' "$(ls -d ~/.local/state/moodle/snapshots/* | tail -1)"
+"""
+
+from __future__ import annotations
+
+import html
+import json as jsonlib
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Annotated, Any, Iterator
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlsplit
+
+import requests
+import tyro
+from bs4 import BeautifulSoup, Tag
+from tyro.extras import SubcommandApp
+
+MOODLE = "https://moodle.jku.at"
+IDP_HOST = "shibboleth.im.jku.at"
+SECRETS = "jku"
+STATE = Path.home() / ".local/state/moodle"
+ROOT = Path.home() / "repos/github/MaxWolf-01/jku"
+LEDGER = ".moodle-downloads.json"
+
+READ_ONLY_AJAX = {
+    "core_course_get_enrolled_courses_by_timeline_classification",
+    "core_courseformat_get_state",
+    "core_course_get_updates_since",
+    "mod_forum_get_discussion_posts",
+}
+# Activity types whose page is a page to read. An unlisted one (an LTI tool, say) may launch or act on opening.
+OPENED = ("resource", "url", "folder", "page", "assign", "forum", "quiz", "zoom", "choice", "feedback", "checkmark",
+          "attendance", "grouptool", "offlinequiz", "opencast", "streamurl", "book", "glossary", "wiki")
+# Activity types whose opening does more than show a page: why each stays closed.
+LIMITED = {"lti": "opening launches an outside tool with max's identity, which may act in his name",
+           "lesson": "opening starts or continues a lesson attempt",
+           "scorm": "opening starts a SCORM attempt",
+           "h5pactivity": "opening may record an H5P attempt",
+           "hvp": "opening may record an H5P attempt"}
+PARTLY_READ = {"book": "only the chapter its page opens on is read; the other chapters are linked from it"}
+ON_COURSE_PAGE = ("label",)  # shown whole on the course page; no page of its own
+STREAMED = ("opencast", "streamurl")
+# Every page the scraper opens; anything else is refused before a request goes out.
+READ_PAGES = re.compile(rf"^/(my/courses\.php|course/view\.php|mod/\w+/index\.php|mod/({'|'.join(OPENED)})/view\.php)$")
+READ_PARAMS = {"id", "redirect", "p"}  # an action= or sesskey= would turn a view page into a request to act
+# Rows whose value changes by the minute, not when anything happens on Moodle.
+TICKING = re.compile(r"^(verbleibende zeit|time remaining)", re.I)
+PAUSE = 0.2
+RETRIES = (2, 10)  # seconds before each retry of a request whose connection dropped; JKU's Moodle drops one now and then
+
+app = SubcommandApp()
+
+
+# ----------------------------------------------------------------------------- session
+
+class Moodle:
+    """A signed-in session that can only read: GETs of READ_PAGES, pluginfile downloads, READ_ONLY_AJAX calls."""
+
+    def __init__(self) -> None:
+        self.s = requests.Session()
+        self.s.headers["User-Agent"] = "Mozilla/5.0 (moodle cli; read-only)"
+        self.sesskey = ""
+
+    def sign_in(self, username: str, password: str) -> None:
+        """Walk Shibboleth's forms: local-storage probe, username/password, then the SAML response back to Moodle."""
+        r = self.s.get(f"{MOODLE}/login/index.php", timeout=60)
+        password_page = None
+        for _ in range(6):
+            if r.url.startswith(MOODLE + "/") and "SAMLResponse" not in r.text:
+                break
+            form = BeautifulSoup(r.text, "lxml").find("form")
+            if not form:
+                break
+            target = urljoin(r.url, form.get("action", ""))
+            host = urlparse(target)
+            if host.hostname != IDP_HOST and not (target.startswith(MOODLE + "/Shibboleth.sso/")):
+                sys.exit(f"moodle: sign-in hit an unexpected form posting to {host.hostname}{host.path}; not following it")
+            data = {i["name"]: i.get("value", "") for i in form.find_all("input") if i.get("name")}
+            if "j_username" in data:
+                if r.url == password_page:
+                    break  # the IdP showed the password form again: the credentials were refused
+                password_page = r.url
+                data |= {"j_username": username, "j_password": password}
+            data["_eventId_proceed"] = ""
+            r = self.s.post(target, data=data, timeout=60)
+        page = self.s.get(f"{MOODLE}/my/courses.php", timeout=60)
+        key = re.search(r'"sesskey":"(\w+)"', page.text)
+        if not key or 'data-userid="' not in page.text:
+            idp_error = BeautifulSoup(r.text, "lxml").select_one(".output--failure, .form-error, .alert-danger")
+            why = clean(idp_error.get_text(" ")) if idp_error else "Moodle still shows the guest page after the sign-in"
+            sys.exit(f"moodle: sign-in to {MOODLE} failed: {why}\n"
+                     f"Check the username and password in the sops file `{SECRETS}` (sops-editor), and that JKU's login works in a browser.")
+        self.sesskey = key.group(1)
+
+    def page(self, path: str, follow: bool = True, **params: Any) -> requests.Response:
+        if not READ_PAGES.match(path) or set(params) - READ_PARAMS:
+            raise ValueError(f"refusing to open {path} with {sorted(params)}: not a page this tool reads")
+        r = self._send(lambda: self.s.get(MOODLE + path, params=params, timeout=60, allow_redirects=follow))
+        r.raise_for_status()
+        return r
+
+    def _send(self, request):
+        for wait in (*RETRIES, None):
+            time.sleep(PAUSE)
+            try:
+                return request()
+            except requests.ConnectionError:
+                if wait is None:
+                    raise
+                time.sleep(wait)
+
+    def soup(self, path: str, **params: Any) -> BeautifulSoup:
+        return BeautifulSoup(self.page(path, **params).text, "lxml")
+
+    def ajax(self, method: str, **args: Any) -> Any:
+        """The result's data, or raises MoodleError with Moodle's message."""
+        if method not in READ_ONLY_AJAX:
+            raise ValueError(f"refusing to call {method}: not a read-only function this tool knows")
+        r = self._send(lambda: self.s.post(f"{MOODLE}/lib/ajax/service.php", params={"sesskey": self.sesskey, "info": method},
+                                           json=[{"index": 0, "methodname": method, "args": args}], timeout=60))
+        r.raise_for_status()
+        out = r.json()
+        out = out[0] if isinstance(out, list) else out
+        if out.get("error"):
+            raise MoodleError(f"{method}: {out.get('exception', out).get('message', out)}")
+        return out["data"]
+
+    def download(self, url: str, dest: Path) -> int:
+        if not urlparse(url).path.startswith("/pluginfile.php/"):
+            raise ValueError(f"refusing to download {url}: not a Moodle file")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
+        with self._send(lambda: self.s.get(url, timeout=300, stream=True)) as r:
+            r.raise_for_status()
+            with tmp.open("wb") as f:
+                for chunk in r.iter_content(1 << 16):
+                    f.write(chunk)
+        tmp.replace(dest)
+        return dest.stat().st_size
+
+
+class MoodleError(Exception):
+    pass
+
+
+def connect() -> Moodle:
+    """Sign in with the credentials from the environment, re-running under with-secrets when they are missing."""
+    user, password = os.environ.get("JKU__USERNAME"), os.environ.get("JKU__PASSWORD")
+    if not (user and password):
+        if os.environ.get("MOODLE_CLI_REEXEC"):
+            sys.exit(f"moodle: JKU__USERNAME / JKU__PASSWORD missing even under `with-secrets {SECRETS}`; check the sops file `{SECRETS}`")
+        os.environ["MOODLE_CLI_REEXEC"] = "1"
+        os.execvp("with-secrets", ["with-secrets", SECRETS, sys.argv[0], *sys.argv[1:]])
+    m = Moodle()
+    m.sign_in(user, password)
+    return m
+
+
+# ----------------------------------------------------------------------------- reading Moodle
+
+def clean(s: str) -> str:
+    return re.sub(r"\s+", " ", s.replace("\xa0", " ")).strip()
+
+
+def name_of(s: str) -> str:
+    """A name from Moodle's AJAX, which arrives HTML-escaped ('Q&amp;A Forum')."""
+    return clean(html.unescape(s or ""))
+
+
+def text_of(node: Tag | None) -> str:
+    return clean(node.get_text(" ", strip=True)) if node else ""
+
+
+# Link parameters Moodle mints afresh on every page view: the session key, an assignment's list of graded users.
+VOLATILE_PARAMS = {"sesskey", "useridlistid"}
+
+
+def absolute(href: str, base: str = MOODLE + "/") -> str:
+    """A link as max would follow it: absolute, without the parameters that differ on every visit."""
+    href = re.sub(r"^(https?):[/\\]*", r"\1://", href.strip(), flags=re.I)  # browsers read https:\\host as https://host
+    parts = urlsplit(urljoin(base, href))
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(k in VOLATILE_PARAMS for k, _ in query):
+        return parts.geturl()
+    return parts._replace(query=urlencode([(k, v) for k, v in query if k not in VOLATILE_PARAMS])).geturl()
+
+
+BLOCKS = ["p", "div", "li", "tr", "table", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "dt", "dd", "section", "dl"]
+
+
+def readable(node: Tag | None, base: str = MOODLE + "/") -> str:
+    """A piece of Moodle HTML as text, one line per block, each link's target after its text as <url>."""
+    if node is None:
+        return ""
+    node = BeautifulSoup(str(node), "lxml")
+    for t in node(["script", "style", "noscript", "template", "button"]):
+        t.decompose()
+    # a "show more" box holds its text twice, cut short and in full; .accesshide repeats a heading for screen readers
+    for t in node.select(".showmore-container .collapsed-content, .accesshide"):
+        t.decompose()
+    for text in node.find_all(string=True):
+        if not text.find_parent("pre"):
+            text.replace_with(re.sub(r"\s+", " ", text))  # a line break in the HTML source is a space on the page
+    for tr in node.find_all("tr"):
+        first = tr.find(["th", "td"])
+        if first and TICKING.match(text_of(first)):
+            tr.decompose()
+    for a in node.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("#", "javascript:")) or not href:
+            continue
+        url, text = absolute(href, base), a.get_text(" ", strip=True)
+        a.replace_with(f"{text} <{url}>" if text and text != url else f"<{url}>")
+    for f in node.find_all(["iframe", "video", "source", "embed"], src=True):
+        f.replace_with(f" <{absolute(f['src'], base)}> ")
+    for img in node.find_all("img", src=True):
+        src = absolute(img["src"], base)
+        if "/theme/" in src or "/user/icon/" in src or src.startswith("data:"):
+            img.decompose()
+        else:
+            alt = clean(img.get("alt") or "")
+            img.replace_with(f" image{': ' + alt if alt else ''} <{src}> ")
+    for br in node.find_all("br"):
+        br.replace_with("\n")
+    for b in node.find_all(BLOCKS):
+        b.insert_before("\n")
+        b.insert_after("\n")
+    for cell in node.find_all(["td", "th"]):
+        cell.insert_after(" ")
+    lines = (clean(line) for line in node.get_text("").split("\n"))
+    return "\n".join(line for line in lines if line and "___" not in line)  # ___name___: a comment widget's template
+
+
+def course_folder(fullname: str) -> str:
+    """'366.590, VL Statistics for AI, Thomas Forstner, 2026S' -> '2026S-vl-statistics-for-ai'."""
+    m = re.match(r"^[^,]+, (?P<title>.+), [^,]*, (?P<sem>\d{4}[WS])$", fullname)
+    sem, title = (m["sem"], m["title"]) if m else ("", fullname)
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower().translate(str.maketrans("äöüß", "aous"))).strip("-")
+    return f"{sem}-{slug}" if sem else slug
+
+
+def file_name(s: str) -> str:
+    return clean(unquote(s)).replace("/", "-").strip(". ") or "unnamed"
+
+
+def pluginfiles(node: Tag | None) -> dict[str, str]:
+    """Files a piece of content links to or shows, by file name."""
+    out: dict[str, str] = {}
+    for tag in node.select("a[href*='/pluginfile.php/'], img[src*='/pluginfile.php/']") if node else []:
+        url = moodle_file(tag.get("href") or tag["src"])
+        if "/user/icon/" not in url and "/theme_" not in url:
+            out = merge_files(out, {file_name(url.rsplit("/", 1)[-1]): url})
+    return out
+
+
+def merge_files(*parts: dict[str, str]) -> dict[str, str]:
+    """Files by name; a second file under a name already taken gets a number, as 'x (2).pdf'."""
+    out: dict[str, str] = {}
+    for files in parts:
+        for name, url in files.items():
+            if url in out.values():
+                continue
+            stem, dot, ext = name.rpartition(".")
+            key, n = name, 2
+            while key in out:
+                key = f"{stem} ({n}).{ext}" if dot and stem else f"{name} ({n})"
+                n += 1
+            out[key] = url
+    return out
+
+
+def moodle_file(url: str) -> str:
+    return url.split("?")[0].replace("/webservice/pluginfile.php/", "/pluginfile.php/")
+
+
+def iso(ts: int | str | None) -> str | None:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat(timespec="minutes") if ts else None
+
+
+def enrolled(m: Moodle) -> list[dict]:
+    data = m.ajax("core_course_get_enrolled_courses_by_timeline_classification", classification="allincludinghidden", limit=0, offset=0)
+    courses = sorted(data["courses"], key=lambda c: c["id"])
+    folders: dict[str, int] = {}
+    out = []
+    for c in courses:
+        name = clean(c["fullname"])
+        folder = course_folder(name)
+        if folder in folders:  # two courses with one title in one semester
+            folder = f"{folder}-{c['id']}"
+        folders[folder] = c["id"]
+        out.append({"id": c["id"], "name": name, "folder": folder, "hidden": bool(c.get("hidden")), "url": f"{MOODLE}/course/view.php?id={c['id']}"})
+    return out
+
+
+def course_page(m: Moodle, cid: int) -> tuple[dict, dict]:
+    """(section id -> summary and linked files, cm id -> what the course page shows of the activity)."""
+    soup = m.soup("/course/view.php", id=cid)
+    sections, items = {}, {}
+    for sec in soup.select("li.section[data-id]"):
+        summary = sec.select_one("[data-for=sectioninfo] .summarytext")
+        sections[sec["data-id"]] = {"summary": readable(summary, f"{MOODLE}/course/view.php"), "files": pluginfiles(summary)}
+    for li in soup.select("li.activity[data-id]"):
+        alt = li.select_one(".activity-altcontent")
+        item = {"text": readable(alt, f"{MOODLE}/course/view.php"), "files": pluginfiles(alt),
+                "dates": text_of(li.select_one("[data-region=activity-dates]")),
+                "restrictions": readable(li.select_one("[data-region=availabilityinfo]"))}
+        req = li.select_one("[data-region=completionrequirements]")
+        if req:
+            button = req.select_one("button")
+            item["completion"] = "done" if button and "success" in " ".join(button.get("class", [])) else "todo"
+            item["requires"] = [text_of(r) for r in req.select("[role=listitem]")]
+        items[li["data-id"]] = item
+    return sections, items
+
+
+INDEX_FIELDS = [("due", re.compile(r"fällig|abgabeende|due|schließ|close", re.I)),
+                ("submission", re.compile(r"abgabestatus|abgegeben|submission", re.I)),
+                ("grade", re.compile(r"bewertung|grade", re.I)),
+                ("topics", re.compile(r"^(themen|discussions)$", re.I)),
+                ("posts", re.compile(r"^(beiträge|posts)$", re.I))]
+
+
+def index_rows(m: Moodle, module: str, cid: int) -> dict[str, dict]:
+    """A module's overview page for a course (mod/<module>/index.php): cm id -> its columns, under INDEX_FIELDS names."""
+    out: dict[str, dict] = {}
+    for table in m.soup(f"/mod/{module}/index.php", id=cid).select("table"):
+        heads = [text_of(th) for th in table.select("thead th")] or [text_of(c) for c in table.select_one("tr").find_all(["th", "td"])]
+        cols = {i: name for i, h in enumerate(heads) for name, rx in INDEX_FIELDS if rx.search(h)}
+        for tr in table.select("tr"):
+            link = tr.find("a", href=re.compile(rf"/mod/{module}/view\.php\?id=\d+|^view\.php\?id=\d+"))
+            if not link:
+                continue
+            cells = tr.find_all(["td", "th"])
+            row = {}
+            for i, name in cols.items():
+                if i < len(cells) and text_of(cells[i]) not in ("", "-"):
+                    v = text_of(cells[i])
+                    row[name] = int(re.match(r"\d+", v)[0]) if name in ("topics", "posts") and re.match(r"\d+", v) else v
+            out[re.search(r"id=(\d+)", link["href"])[1]] = row
+    return out
+
+
+def detail(m: Moodle, module: str, cmid: str) -> dict:
+    """What an activity's own page holds, but a forum's posts (see posts)."""
+    path = f"/mod/{module}/view.php"
+    if module in ("resource", "url"):
+        r = m.page(path, follow=False, id=cmid, redirect=1)
+        target = r.headers.get("location", "")
+        if module == "url" and target:
+            return {"link": absolute(target)}
+        if "/pluginfile.php/" in target:
+            url = moodle_file(target)
+            return {"files": {file_name(url.rsplit("/", 1)[-1]): url}}
+        main = BeautifulSoup(r.text, "lxml").select_one("#region-main [role=main]")
+        return {"content": readable(main, f"{MOODLE}{path}"), "files": pluginfiles(main)}
+    soup = m.soup(path, id=cmid)
+    base = f"{MOODLE}{path}"
+    intro, main = soup.select_one("#region-main #intro"), soup.select_one("#region-main [role=main]")
+    if module == "folder":
+        files = {}
+        for url in pluginfiles(main).values():
+            rel = re.sub(r"^.*/mod_folder/content/\d+/", "", url)
+            files["/".join(file_name(p) for p in rel.split("/"))] = url
+        return {"content": readable(intro, base), "files": files}
+    if module == "forum":
+        return {"content": readable(intro, base), "discussions": discussion_list(m, cmid, soup)}
+    return {"content": "\n".join(filter(None, [readable(intro, base), readable(main, base)])), "files": merge_files(pluginfiles(intro), pluginfiles(main))}
+
+
+def discussion_list(m: Moodle, cmid: str, soup: BeautifulSoup) -> dict:
+    """Every discussion of a forum, following its pages until one adds nothing new."""
+    discussions: dict[str, dict] = {}
+    page = 0
+    while True:
+        rows = soup.select("tr.discussion[data-discussionid]")
+        fresh = [tr for tr in rows if tr["data-discussionid"] not in discussions]
+        for tr in fresh:
+            stamps = [t.get("data-timestamp") for t in tr.select("time[data-timestamp]")]
+            replies = tr.select("td.p-0.text-center span")
+            discussions[tr["data-discussionid"]] = prune({
+                "name": text_of(tr.select_one("th.topic a")),
+                "author": text_of(tr.select_one("td.author .author-info .text-truncate")),
+                "created": iso(stamps[0]) if stamps else None, "modified": iso(stamps[-1]) if stamps else None,
+                "replies": int(text_of(replies[-1])) if replies and text_of(replies[-1]).isdigit() else None})
+        if not fresh or not soup.select_one(f"a[href*='p={page + 1}']"):
+            return discussions
+        page += 1
+        soup = m.soup(f"/mod/forum/view.php", id=cmid, p=page)
+
+
+def posts(m: Moodle, did: str) -> dict:
+    """A discussion's posts, oldest first. Moodle marks them read, as max's visit to the discussion would."""
+    data = m.ajax("mod_forum_get_discussion_posts", discussionid=int(did), sortby="created", sortdirection="ASC")
+    out = {}
+    for p in data["posts"]:
+        message = BeautifulSoup(p.get("message") or "", "lxml")
+        files = merge_files(*({file_name(f.get("filename") or (f.get("url") or f["fileurl"]).rsplit("/", 1)[-1]): moodle_file(f.get("url") or f["fileurl"])}
+                              for f in p.get("attachments", []) + p.get("messageinlinefiles", []) if f.get("url") or f.get("fileurl")))
+        out[str(p["id"])] = prune({"subject": name_of(p.get("subject")), "author": name_of((p.get("author") or {}).get("fullname")),
+                                   "created": iso(p.get("timecreated")), "modified": iso(p.get("timemodified")),
+                                   "parent": str(p["parentid"]) if p.get("parentid") else None,
+                                   "message": readable(message.body), "files": merge_files(files, pluginfiles(message))})
+    return out
+
+
+def prune(d: dict) -> dict:
+    return {k: v for k, v in d.items() if v is not None and v is not False and v not in ("", {}, []) and not k.startswith("_")}
+
+
+def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None, gaps: list[dict]) -> dict:
+    """One course's snapshot. What it could not read goes into gaps as {"where", "reason"}."""
+    cid = course["id"]
+    state = jsonlib.loads(m.ajax("core_courseformat_get_state", courseid=cid))
+    sec_page, cm_page = course_page(m, cid)
+    modules = {cm["module"] for cm in state["cm"]}
+
+    changed: set[str] | None = set()
+    if prev is not None and since is not None:
+        try:
+            ups = m.ajax("core_course_get_updates_since", courseid=cid, since=since)
+            changed = {str(i["id"]) for i in ups["instances"] if i["contextlevel"] == "module"}
+        except (MoodleError, requests.RequestException) as e:
+            changed = None
+            gaps.append({"where": "", "reason": f"Moodle's update check fails here ({e}); every activity page was read again instead"})
+
+    prev_items = {cmid: it for s in (prev or {}).get("sections", {}).values() for cmid, it in s.get("items", {}).items()}
+    index = {}
+    for mod in ("assign", "checkmark", "quiz", "forum"):
+        if mod in modules:
+            try:
+                index[mod] = index_rows(m, mod, cid)
+            except requests.RequestException as e:
+                index[mod] = last_overview(prev or {}, prev_items, mod)
+                gaps.append({"where": f"{mod} overview", "reason": f"not read ({e}); due dates, statuses, grades and counts are the last snapshot's"})
+
+    cms = {str(cm["id"]): cm for cm in state["cm"]}
+    sections = {}
+    for sec in state["section"]:
+        items = {}
+        for cmid in map(str, sec["cmlist"]):
+            cm = cms.get(cmid)
+            if not cm:
+                continue
+            item = {"name": name_of(cm["name"]), "module": cm["module"], "url": cm.get("url"), "visible": None if cm.get("visible") else False}
+            item |= cm_page.get(cmid, {})
+            item |= {k: v for k, v in index.get("forum", {}).get(cmid, {}).items() if cm["module"] == "forum"}
+            where = f"{name_of(sec.get('title', ''))} › {item['name']}"
+            if not cm.get("uservisible", True):
+                gaps.append({"where": where, "reason": "Moodle shows it to max as unavailable" + (f": {item['restrictions']}" if item.get("restrictions") else "")})
+            elif cm["module"] in OPENED and cm.get("url"):
+                item |= activity_detail(m, item, cmid, prev_items.get(cmid), changed, gaps, where)
+            elif cm["module"] not in ON_COURSE_PAGE and cm.get("url"):  # one without a url shows whole on the course page
+                why = LIMITED.get(cm["module"], f"{cm['module']} activities are not among the types this tool reads")
+                gaps.append({"where": where, "reason": f"its page is not opened: {why}"})
+            if cm["module"] in PARTLY_READ and cm.get("uservisible", True):
+                gaps.append({"where": where, "reason": PARTLY_READ[cm["module"]]})
+            items[cmid] = prune(item)
+        page = sec_page.get(str(sec["id"]), {})
+        sections[str(sec["id"])] = prune({"name": name_of(sec.get("title", "")), "visible": None if sec.get("visible", True) else False,
+                                          "summary": page.get("summary"), "files": page.get("files"), "items": items})
+    streamed = sum(cm["module"] in STREAMED for cm in state["cm"])
+    if streamed:
+        gaps.append({"where": "", "reason": f"{streamed} recording(s) not downloaded: Opencast only streams them; their links are in the snapshot"})
+
+    assignments = {cmid: prune({"name": name_of(cms[cmid]["name"]), "module": mod, **row})
+                   for mod in ("assign", "checkmark") for cmid, row in index.get(mod, {}).items() if cmid in cms}
+    quizzes = {cmid: prune({"name": name_of(cms[cmid]["name"]), **row}) for cmid, row in index.get("quiz", {}).items() if cmid in cms}
+    return prune({**{k: course[k] for k in ("name", "folder", "url", "hidden")}, "sections": sections, "assignments": assignments, "quizzes": quizzes})
+
+
+def last_overview(prev: dict, prev_items: dict, module: str) -> dict[str, dict]:
+    """What the last snapshot read off a module's overview page, as index_rows returns it."""
+    if module == "forum":
+        return {cmid: {k: it[k] for k in ("topics", "posts") if k in it} for cmid, it in prev_items.items() if it.get("module") == "forum"}
+    rows = prev.get("quizzes", {}) if module == "quiz" else {c: r for c, r in prev.get("assignments", {}).items() if r.get("module") == module}
+    return {cmid: {k: r[k] for k in ("due", "submission", "grade") if k in r} for cmid, r in rows.items()}
+
+
+DETAIL_KEYS = ("files", "content", "link", "discussions")
+
+
+def activity_detail(m: Moodle, item: dict, cmid: str, before: dict | None, changed: set[str] | None, gaps: list[dict], where: str) -> dict:
+    """The activity page's contents: read when new or changed, else carried over from the last snapshot."""
+    carried = {k: before[k] for k in DETAIL_KEYS if before and k in before}
+    fresh = (before is None or changed is None or cmid in changed or "unread" in before
+             or (item["module"] == "forum" and (before.get("topics"), before.get("posts")) != (item.get("topics"), item.get("posts"))))
+    got = carried
+    if fresh:
+        try:
+            got = detail(m, item["module"], cmid)
+        except requests.RequestException as e:
+            reason = f"its page could not be read ({e})" + ("; the snapshot keeps what the last one had" if carried else "")
+            gaps.append({"where": where, "reason": reason})
+            got = carried | {"unread": reason}  # read again next run, whatever Moodle's update check says
+    if item["module"] == "forum" and "discussions" in got:
+        got = got | {"discussions": discussion_posts(m, got["discussions"], (before or {}).get("discussions", {}), gaps, where)}
+    return got
+
+
+def discussion_posts(m: Moodle, discussions: dict, before: dict, gaps: list[dict], where: str) -> dict:
+    """Each discussion with its posts: read when the discussion is new or got a post, else carried over."""
+    out = {}
+    for did, d in discussions.items():
+        old = before.get(did, {})
+        if "posts" in old and (old.get("modified"), old.get("replies")) == (d.get("modified"), d.get("replies")):
+            out[did] = d | {"posts": old["posts"]}
+            continue
+        try:
+            out[did] = d | {"posts": posts(m, did)}
+        except (MoodleError, requests.RequestException) as e:
+            gaps.append({"where": f"{where} › {d.get('name', did)}", "reason": f"its posts could not be read ({e})"})
+            # keep what the old posts were read against, so the next run sees the new post and reads them again
+            out[did] = d | {k: old[k] for k in ("modified", "replies", "posts") if k in old}
+    return out
+
+
+# ----------------------------------------------------------------------------- snapshots and diff
+
+def snapshots(state: Path) -> list[Path]:
+    return sorted((state / "snapshots").glob("*.json"))
+
+
+def load(path: Path) -> dict:
+    return jsonlib.loads(path.read_text())
+
+
+def walk(a: Any, b: Any, path: tuple[str, ...] = ()) -> Iterator[tuple[str, tuple[str, ...], Any, Any]]:
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in list(a) + [k for k in b if k not in a]:
+            if k not in b:
+                yield "removed", path + (k,), a[k], None
+            elif k not in a:
+                yield "added", path + (k,), None, b[k]
+            else:
+                yield from walk(a[k], b[k], path + (k,))
+    elif a != b:
+        yield "changed", path, a, b
+
+
+CONTAINERS = {"courses", "sections", "items", "assignments", "quizzes", "discussions", "files", "posts"}
+
+
+def diff(old: dict, new: dict) -> list[dict]:
+    """Every difference between two snapshots' courses, located by name as well as by key path."""
+    out = []
+    for change, path, before, after in walk(old.get("courses", {}), new.get("courses", {})):
+        names, node_old, node_new = [], old.get("courses", {}), new.get("courses", {})
+        for i, k in enumerate(path):
+            node_old = node_old.get(k) if isinstance(node_old, dict) else None
+            node_new = node_new.get(k) if isinstance(node_new, dict) else None
+            node = node_new if isinstance(node_new, dict) else node_old
+            if k in CONTAINERS and i % 2 == 1:
+                if k not in ("sections", "items"):
+                    names.append(k)
+                continue
+            names.append((node.get("name") or node.get("subject") or k) if isinstance(node, dict) else k)
+        course = new.get("courses", {}).get(path[0]) or old["courses"][path[0]]
+        out.append({"change": change, "course": names[0], "folder": course.get("folder"), "where": " › ".join(names[1:]), "path": list(path), "before": before, "after": after})
+    return out
+
+
+def show(changes: list[dict] | None, gaps: list[dict], as_json: bool) -> None:
+    """The changes (None: there was nothing to compare with), then what the snapshot lacks."""
+    if as_json:
+        print(jsonlib.dumps({"changes": changes or [], "gaps": gaps}, indent=1, ensure_ascii=False))
+        return
+    if changes is not None and not changes:
+        print("no changes")
+    course = None
+    for c in changes or []:
+        if c["course"] != course:
+            course = c["course"]
+            print(f"\n{c['folder'] or course}")
+        value = c["after"] if c["change"] == "added" else c["before"]
+        if c["change"] == "changed":
+            print(f"  ~ {c['where']}: {short(c['before'])} → {short(c['after'])}")
+        else:
+            mark = {"added": "+", "removed": "-"}[c["change"]]
+            print(f"  {mark} {c['where'] or '(whole course)'}" + ("" if isinstance(value, dict) else f": {short(value)}"))
+    if not gaps:
+        print("\nnothing missing from the snapshot")
+        return
+    print(f"\nmissing from the snapshot ({len(gaps)}):")
+    for g in gaps:
+        where = " › ".join(filter(None, [g.get("folder") or g.get("name"), g.get("where")])) or "(whole run)"
+        print(f"  {where}: {clean(g['reason'])}")
+
+
+def short(v: Any, n: int = 160) -> str:
+    s = v if isinstance(v, str) else jsonlib.dumps(v, ensure_ascii=False)
+    s = s.replace("\n", " ⏎ ")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# ----------------------------------------------------------------------------- downloads
+
+def files_of(course: dict) -> Iterator[tuple[str, str, str]]:
+    """(url, path under the course folder, owner) for every file the snapshot links."""
+    for sid, sec in course.get("sections", {}).items():
+        for name, url in sec.get("files", {}).items():
+            yield url, name, f"section {sid}"
+        for cmid, it in sec.get("items", {}).items():
+            into = "" if it["module"] in ("resource", "label") else file_name(it["name"]) + "/"
+            for rel, url in it.get("files", {}).items():
+                yield url, into + rel, cmid
+            for did, d in it.get("discussions", {}).items():
+                for pid, post in d.get("posts", {}).items():
+                    for name, url in post.get("files", {}).items():
+                        yield url, f"{into}{file_name(d.get('name', did))}/{name}", f"{cmid}/{did}/{pid}"
+
+
+def download(m: Moodle, course: dict, root: Path) -> tuple[int, int, list[dict]]:
+    """Fetch every file of the course not yet in its ledger. Returns (files fetched, bytes, gaps for files that failed)."""
+    folder = root / course["folder"]
+    ledger_path = folder / LEDGER
+    ledger: dict[str, dict] = jsonlib.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+    owned = {v["path"]: v.get("owner") for v in ledger.values()}
+    count = size = 0
+    failed = []
+    for url, rel, owner in files_of(course):
+        if url in ledger:
+            continue
+        path = rel
+        n = 1
+        while (folder / path).exists() and owned.get(path) != owner:  # someone else's file under this name
+            stem, dot, ext = rel.rpartition(".")
+            path = f"{stem} ({n}).{ext}" if dot and stem else f"{rel} ({n})"
+            n += 1
+        try:
+            size += m.download(url, folder / path)
+        except requests.RequestException as e:
+            failed.append({"where": rel, "reason": f"file not downloaded ({e}); the next snapshot tries again"})
+            continue
+        count += 1
+        ledger[url] = {"path": path, "owner": owner}
+        owned[path] = owner
+        print(f"  {course['folder']}/{path}", file=sys.stderr)
+        ledger_path.write_text(jsonlib.dumps(ledger, indent=1, ensure_ascii=False))
+    return count, size, failed
+
+
+# ----------------------------------------------------------------------------- subcommands
+
+@dataclass
+class Courses:
+    json: bool = False
+    """Emit JSON to stdout."""
+
+
+@app.command(name="courses")
+def courses(args: Courses) -> None:
+    """Every course max is enrolled in, old ones and ones hidden from his dashboard included."""
+    rows = enrolled(connect())
+    if args.json:
+        print(jsonlib.dumps(rows, indent=1, ensure_ascii=False))
+        return
+    for c in rows:
+        print(f"{c['id']:>6}  {c['folder']:<48} {c['name']}{'  (hidden)' if c['hidden'] else ''}")
+
+
+@dataclass
+class Snapshot:
+    course: list[int] = field(default_factory=list)
+    """Scrape only these course ids; the others carry over from the last snapshot."""
+    download: bool = True
+    """Download the files the snapshot links that were not downloaded before."""
+    json: bool = False
+    """Print the changes and gaps as JSON."""
+    state: Path = STATE
+    """Where snapshots are kept (snapshots/<time>.json)."""
+    root: Path = ROOT
+    """Where course folders go."""
+
+
+@app.command(name="snapshot")
+def snapshot(args: Snapshot) -> None:
+    """Scrape every course into a new snapshot, download new files, and print what changed since the last snapshot and what the new one lacks."""
+    m = connect()
+    previous = snapshots(args.state)
+    prev = load(previous[-1]) if previous else {"courses": {}}
+    now = datetime.now(timezone.utc)
+    listed = enrolled(m)
+    if args.course:
+        unknown = set(args.course) - {c["id"] for c in listed}
+        if unknown:
+            sys.exit(f"moodle: not enrolled in course(s) {sorted(unknown)}; `moodle courses` lists them")
+    out: dict[str, dict] = {}
+    scraped: dict[str, str] = {}
+    gaps: list[dict] = []
+    for i, course in enumerate(listed, 1):
+        key = str(course["id"])
+        last = prev.get("scraped", {}).get(key, prev.get("taken"))
+        named = {"course": course["id"], "name": course["name"], "folder": course["folder"]}
+        carried_gaps = [g for g in prev.get("gaps", []) if g.get("course") == course["id"]]
+        if not args.course or course["id"] in args.course:
+            print(f"[{i}/{len(listed)}] {course['name']}", file=sys.stderr)
+            since = int(datetime.fromisoformat(last).timestamp()) - 600 if last and key in prev["courses"] else None
+            started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            found: list[dict] = []
+            try:
+                out[key] = scrape_course(m, course, prev["courses"].get(key), since, found)
+                if args.download:
+                    found += download(m, out[key], args.root)[2]
+                scraped[key] = started
+                gaps += [named | g for g in found]
+                continue
+            except (MoodleError, requests.RequestException) as e:
+                gaps.append(named | {"where": "", "reason": f"not read this run ({e}); the snapshot keeps what the one of {last} had"
+                                     if key in prev["courses"] else f"not read ({e})"})
+        if key in prev["courses"]:
+            out[key], scraped[key] = prev["courses"][key], last
+            gaps += carried_gaps
+    if not args.download:
+        gaps.append({"course": None, "where": "", "reason": "files not downloaded: run with --no-download"})
+    snap = {"taken": now.isoformat(timespec="seconds"), "scraped": scraped, "gaps": gaps, "courses": out}
+    (args.state / "snapshots").mkdir(parents=True, exist_ok=True)
+    path = args.state / "snapshots" / f"{now:%Y-%m-%dT%H-%M-%SZ}.json"
+    path.write_text(jsonlib.dumps(snap, indent=1, ensure_ascii=False))
+    print(f"wrote {path}", file=sys.stderr)
+    if not previous:
+        print(f"first snapshot: {len(out)} courses; the next one reports what changed", file=sys.stderr)
+    show(diff(prev, snap) if previous else None, gaps, args.json)
+
+
+@dataclass
+class Diff:
+    old: Annotated[Path | None, tyro.conf.Positional] = None
+    """Earlier snapshot file. Default: the second-newest."""
+    new: Annotated[Path | None, tyro.conf.Positional] = None
+    """Later snapshot file. Default: the newest."""
+    json: bool = False
+    """Emit JSON to stdout."""
+    state: Path = STATE
+    """Where snapshots are kept."""
+
+
+@app.command(name="diff")
+def diff_cmd(args: Diff) -> None:
+    """What changed between two snapshots, and what the later one lacks, without contacting Moodle."""
+    have = snapshots(args.state)
+    new = args.new or (have[-1] if have else None)
+    old = args.old or (have[-2] if len(have) > 1 else None)
+    if not (old and new):
+        sys.exit(f"moodle: need two snapshots to diff, {args.state / 'snapshots'} has {len(have)}; run `moodle snapshot`")
+    later = load(new)
+    show(diff(load(old), later), later.get("gaps", []), args.json)
+
+
+if __name__ == "__main__":
+    try:
+        app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
+    except (MoodleError, requests.RequestException) as e:
+        sys.exit(f"moodle: {e}\nIs {MOODLE} up? A failure right after sign-in usually means Moodle changed its pages.")
