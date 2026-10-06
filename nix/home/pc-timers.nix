@@ -244,8 +244,9 @@ in
   # --- Instagram saved posts, logged out ---
   # Instagram blocks this IP for logged-out requests after a few thousand of
   # them, so the job stops itself and the next hour picks up what is left; the
-  # ledger in ~/instagram-saves decides what that is. The job is finite: its run
-  # log carries `remaining`, and mails once it reaches zero.
+  # ledger beside the downloads decides what that is. The job is finite: its run
+  # log carries `remaining`, and mails once it reaches zero. The downloads live
+  # in the encrypted dataset, and while it is locked every run records a skip.
 
   systemd.user.services.instagram-saves = {
     Unit = {
@@ -263,7 +264,7 @@ in
         "PATH=${igSavesPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
       ];
-      ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/instagram-saves/saved.tsv --dest ${home}/instagram-saves --record";
+      ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/data/encrypted/instagram-saves/saved.tsv --dest ${home}/data/encrypted/instagram-saves --require-mount ${home}/data/encrypted --record";
     };
   };
 
