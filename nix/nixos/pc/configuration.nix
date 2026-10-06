@@ -35,6 +35,12 @@
   networking.hostName = "pc";
   networking.hostId = "92d38672"; # required for ZFS — from /etc/machine-id
 
+  # DHCP on the wired port only. dhcpcd watching every interface crashes when
+  # a container's veth goes away within 17 s of appearing (dhcpcd 10.3.x,
+  # fixed upstream in 10.5.1).
+  networking.useDHCP = false;
+  networking.interfaces.enp4s0.useDHCP = true;
+
   networking.firewall = {
     enable = true;
     allowedTCPPorts = [ 22 ];
