@@ -39,6 +39,9 @@ in
     description = "Download YouTube playlists";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
+    # Paused since 2026-10-06: pc's RAM flips bits in what it writes. The path
+    # never exists, so every start is skipped. Remove once the RAM passes.
+    unitConfig.ConditionPathExists = "/run/pc-ram-verified";
     serviceConfig = {
       Type = "oneshot";
       User = "max";
