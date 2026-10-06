@@ -4,8 +4,8 @@ A World is tailscaled, the network, the clock and Vesktop as one simulation,
 in tailscaled's own shapes. It serves full status and prefs, sends a Prefs bus
 message for every change of preferences, and pushes an engine update every
 2 s with each live peer's byte counters and last handshake. Its Mullvad nodes
-are Hosts. Each answers handshakes or not, carries traffic or not, and is
-blocked by Cloudflare or not. Time is the World's own. Waiting advances it,
+are Hosts. Each answers handshakes or not, carries traffic or not, is
+blocked by Cloudflare or not, and adds some delay to a round trip. Time is the World's own. Waiting advances it,
 and nothing sleeps.
 
 The World records what happens in it as Entries, in order. There is one for
@@ -151,6 +151,8 @@ class Host:
     late: bool = False
     """Completes a handshake only on WireGuard's first retry, RETRY_SECS after it began, as a node does whose
     first initiation was lost."""
+    adds_ms: float = 10.0
+    """How much longer a TCP connect takes through it than past it, in ms."""
 
     @property
     def fqdn(self) -> str:
@@ -360,6 +362,10 @@ class World:
         per look, and `vpn on` asking which node automatic mode picked reads it too."""
         self.egress_asks = 0
         """How often bin/vpn asked am.i.mullvad.net."""
+        self.direct_ms: float | None = 15.0
+        """How long a TCP connect past the exit node takes, in ms; None for one that fails, as with no network."""
+        self.delays: list[float] = []
+        """When bin/vpn measured the delay the exit node adds, in seconds after the first moment."""
         self._runs: Path | None = None
         self.at(self.now + phase, self.engine_update)
         if self.exit is not None and self.answers(self.exit):
@@ -367,7 +373,8 @@ class World:
         self.ports = vpn.Ports(
             tailscaled=vpn.Tailscaled(status=self.read_status, peerless=self.peerless, prefs=self.read_prefs,
                                       set_exit_node=self.watcher_sets, bus=self.bus),
-            network=vpn.Network(probe=self.probe, connect=self.connect, discord=self.discord, egress=self.egress),
+            network=vpn.Network(probe=self.probe, connect=self.connect, discord=self.discord, egress=self.egress,
+                                delay=self.delay),
             clock=vpn.Clock(now=lambda: self.now, wait=self.wait),
             vesktop=lambda: self.vesktop,
         )
@@ -611,6 +618,20 @@ class World:
         self.advance(self.now + 0.2)
         self.step("discord", before, began=began, what=verdict)
         return verdict
+
+    def delay(self) -> Any:
+        """The Network port's delay measurement. The connect through the exit node takes as much longer than
+        `direct_ms` as the node adds, and fails without a network or through a node that carries nothing. A
+        measurement whose connects succeed takes no time, since they take milliseconds; one that fails takes the
+        connect timeout."""
+        self.delays.append(round(self.now - T0, 2))
+        direct = self.direct_ms
+        host = self.hosts.get(self.exit or "")
+        through = self.exit is None or self.carries(self.exit)
+        tunnel = None if direct is None or not through else direct + (host.adds_ms if host else 0.0)
+        if tunnel is None or direct is None:
+            self.advance(self.now + vpn.DELAY_CONNECT_SECS)
+        return vpn.Delay(tunnel, direct)
 
     def egress(self) -> dict:
         self.egress_asks += 1
