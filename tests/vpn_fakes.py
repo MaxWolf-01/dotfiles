@@ -715,7 +715,7 @@ def line(stats: dict) -> Line:
     """Read a node-log line. `to` is where the exit node was after it, so a line from one node to another
     records a change."""
     event, frm, to = stats.get("event", ""), stats.get("from"), stats.get("to")
-    return Line(event, event != "silent" and frm != to, stats.get("by") == "outside", frm, to)
+    return Line(event, event not in ("silent", "slow") and frm != to, stats.get("by") == "outside", frm, to)
 
 
 # --------------------------------------------------------------------------
