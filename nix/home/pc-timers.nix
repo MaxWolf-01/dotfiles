@@ -275,7 +275,9 @@ in
       Persistent = true;
       RandomizedDelaySec = "10m";
     };
-    Install.WantedBy = [ "timers.target" ];
+    # Paused since 2026-10-06: pc's RAM flips bits in what it writes. Put
+    # timers.target back once memtest passes.
+    Install.WantedBy = [ ];
   };
 
   # --- Overdue watchdog ---
