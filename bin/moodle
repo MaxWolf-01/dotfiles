@@ -35,7 +35,8 @@ course is not. `snapshot` writes the snapshot all the same, then exits 1 when a 
 What it lacks by design is no gap: an activity Moodle shows max as unavailable (restricted to
 another group, or until a date) is listed under "withheld" with Moodle's restriction, and a note
 under "notes" says what else is left out and why: recordings that only stream, activity types this
-tool does not open, a book read only in part, files not downloaded. `snapshot` and `diff` print the
+tool does not open, a book read only in part, a file Moodle answers 404 or 410 for (gone from
+Moodle, tried again each run), files not downloaded. `snapshot` and `diff` print the
 gaps, the withheld activities and the notes after the changes.
 
 Snapshots live in --state/snapshots/, one JSON file each. Files go to --root/<course folder>/,
@@ -734,14 +735,18 @@ def files_of(course: dict) -> Iterator[tuple[str, str, str]]:
                         yield url, f"{into}{file_name(d.get('name', did))}/{name}", f"{cmid}/{did}/{pid}"
 
 
-def download(m: Moodle, course: dict, root: Path) -> tuple[int, int, list[dict]]:
-    """Fetch every file of the course not yet in its ledger. Returns (files fetched, bytes, gaps for files that failed)."""
+def download(m: Moodle, course: dict, root: Path) -> tuple[int, int, Lacks]:
+    """Fetch every file of the course not yet in its ledger. Returns (files fetched, bytes, what was not fetched).
+
+    A file Moodle answers 404 or 410 for is gone from Moodle, a note; any other failure is a failed read, a gap.
+    Neither goes into the ledger, so the next snapshot tries both again.
+    """
     folder = root / course["folder"]
     ledger_path = folder / LEDGER
     ledger: dict[str, dict] = jsonlib.loads(ledger_path.read_text()) if ledger_path.exists() else {}
     owned = {v["path"]: v.get("owner") for v in ledger.values()}
     count = size = 0
-    failed = []
+    lacks = Lacks()
     for url, rel, owner in files_of(course):
         if url in ledger:
             continue
@@ -754,14 +759,17 @@ def download(m: Moodle, course: dict, root: Path) -> tuple[int, int, list[dict]]
         try:
             size += m.download(url, folder / path)
         except requests.RequestException as e:
-            failed.append({"where": rel, "reason": f"file not downloaded ({e}); the next snapshot tries again", "failed": True})
+            if getattr(e.response, "status_code", None) in (404, 410):
+                lacks.notes.append({"where": rel, "note": f"file gone from Moodle ({e.response.status_code}); the next snapshot tries again"})
+            else:
+                lacks.gaps.append({"where": rel, "reason": f"file not downloaded ({e}); the next snapshot tries again", "failed": True})
             continue
         count += 1
         ledger[url] = {"path": path, "owner": owner}
         owned[path] = owner
         print(f"  {course['folder']}/{path}", file=sys.stderr)
         ledger_path.write_text(jsonlib.dumps(ledger, indent=1, ensure_ascii=False))
-    return count, size, failed
+    return count, size, lacks
 
 
 # ----------------------------------------------------------------------------- subcommands
@@ -844,7 +852,7 @@ def take(m: Moodle, args: Snapshot, prev: dict | None, now: datetime) -> tuple[d
             try:
                 out[key] = scrape_course(m, course, prev["courses"].get(key), since, found)
                 if args.download:
-                    found.gaps += download(m, out[key], args.root)[2]
+                    found.merge(download(m, out[key], args.root)[2])
                 scraped[key] = started
                 lacks.merge(found, named)
                 failed += sum(bool(g.get("failed")) for g in found.gaps)
