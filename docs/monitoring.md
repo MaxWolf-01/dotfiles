@@ -154,8 +154,8 @@ From there:
    path to whatever log it left behind.
 2. `journalctl --user -u <unit>.service` — what the process printed, when the
    job run log line is missing or says nothing useful. On pc, prefix with
-   `ssh pc`, and drop `--user` for the YouTube download, which is the one
-   watched unit that runs as a system service.
+   `ssh pc`, and drop `--user` for the YouTube download and the memory test,
+   the watched units that run as system services.
 3. `/backup-audit [unit|host]` — the deep pass for backups, and the only thing
    here that opens the repositories: are the snapshots the job run logs claim
    really there, is anything damaged, what changed. It costs minutes, so it

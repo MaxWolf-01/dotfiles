@@ -1,7 +1,5 @@
 # Hardware faults that otherwise stay silent reach max through the alert
 # channel (bin/alert-send): a weekly RAM stress test, and ZFS's own events.
-# pc's RAM flipped bits for 11 days in 2026-09/10 before anyone noticed, while
-# ZFS logged corrupted data and nothing mailed it.
 { pkgs, lib, ... }:
 
 let
@@ -14,11 +12,14 @@ let
   alertPath = lib.makeBinPath (with pkgs; [ bash coreutils gnused gnugrep gawk jq sops curl ]);
 
   # zed runs as root and hands each notification's subject as the argument and
-  # its body on stdin; the channel's config and key are max's.
+  # its body on stdin; the channel's config and key are max's. zed discards the
+  # program's output, so an undelivered mail is logged here or nowhere:
+  # `journalctl -t zed-alert-send`.
   zedMail = pkgs.writeShellScript "zed-alert-send" ''
-    exec ${pkgs.util-linux}/bin/runuser -u max -- ${pkgs.coreutils}/bin/env \
+    ${pkgs.util-linux}/bin/runuser -u max -- ${pkgs.coreutils}/bin/env \
       HOME=/home/max SOPS_AGE_KEY_FILE=${ageKeyFile} PATH=${alertPath} \
-      ${dotfiles}/bin/alert-send "🗄️ $1"
+      ${dotfiles}/bin/alert-send "🗄️ $1" \
+      || { ${pkgs.util-linux}/bin/logger -t zed-alert-send "undelivered: $1"; exit 1; }
   '';
 in
 {
@@ -41,6 +42,9 @@ in
       Type = "oneshot";
       User = "max";
       Group = "users";
+      # If memory runs short mid-test, the OOM killer takes the test, never a
+      # worker or max's session.
+      OOMScoreAdjust = 1000;
       Environment = [
         "PATH=${alertPath}:${lib.makeBinPath [ pkgs.stressapptest ]}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
