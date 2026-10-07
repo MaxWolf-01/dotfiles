@@ -42,6 +42,8 @@ Everything that can send one, and where it points:
 | `❌ / ✅ yapit deploy: <commit>` | `scripts/deploy.sh`, run by hand from the yapit repo | a production deploy failed partway, or shipped — deploys are rare and hand-run, so completion mails too | the deploy terminal output and `.deploys.log` in the repo |
 | `✅ / ❌ / ⚠️ instagram-saves: ...` | `secrets/scripts/instagram-saves --record`, hourly on pc | every saved Instagram post is downloaded and the unit can go (`✅`), the run broke (`❌`), or Instagram has refused this IP for a day (`⚠️`, at most one a day) | the job run log, then `ledger.tsv` in `~/data/encrypted/instagram-saves` on pc: one line per attempt, with the reason it ended that way |
 | `💶 Officebuddy <invoice>: <amount> due <date>` / `⚠️ Officebuddy invoice unreadable: <subject>` | `bin/officebuddy-invoice`, daily on zephylux | not an alarm: a new Officebuddy invoice to pay, with a QR code George scans (`💶`), or one whose PDF could not be read for certain, so it carries no code and is paid by hand (`⚠️`) | the invoice PDF attached to the mail; `⚠️` names the message to `notmuch show` |
+| `❌ memory-test: <host>'s RAM fails, <n> errors` | `bin/memory-test --record`, weekly on pc (`nix/nixos/pc/hardware-alerts.nix`) | `stressapptest` found bits the RAM did not keep: everything the host writes, backups included, may be silently wrong until the RAM is replaced | the failing addresses in the mail; the run in `~/logs/runs/memory-test.jsonl` |
+| `🗄️ ZFS … for <pool> on <host>` / `🗄️ ZFS device fault for pool <pool> on <host>` | zed on pc, through `nix/nixos/pc/hardware-alerts.nix` | ZFS found data errors, a scrub or resilver finished on an unhealthy pool, or a disk faulted, degraded or went missing; at most one per event class an hour | `zpool status -v <pool>` on the host |
 | `CF firewall sync failed` | `scripts/sync-cf-firewall.sh`, hourly cron on yapit-prod | the Hetzner firewall could not be updated with current Cloudflare IPs | `/var/log/cf-firewall-sync.log` on the VPS |
 
 Nothing else sends on its own. A green backup, a skipped one, an integrity
@@ -152,8 +154,8 @@ From there:
    path to whatever log it left behind.
 2. `journalctl --user -u <unit>.service` — what the process printed, when the
    job run log line is missing or says nothing useful. On pc, prefix with
-   `ssh pc`, and drop `--user` for the YouTube download, which is the one
-   watched unit that runs as a system service.
+   `ssh pc`, and drop `--user` for the YouTube download and the memory test,
+   the watched units that run as system services.
 3. `/backup-audit [unit|host]` — the deep pass for backups, and the only thing
    here that opens the repositories: are the snapshots the job run logs claim
    really there, is anything damaged, what changed. It costs minutes, so it

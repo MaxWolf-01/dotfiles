@@ -11,6 +11,7 @@
     ./hd-idle.nix
     ./agent-user.nix
     ./host-recorder.nix
+    ./hardware-alerts.nix
   ];
 
   # Boot
