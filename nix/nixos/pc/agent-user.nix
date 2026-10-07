@@ -70,10 +70,10 @@ in
   # The workers' memory ceiling. logind parents every user's slice to
   # user.slice, so it holds max's sessions too. At the ceiling the OOM killer
   # ranks by size plus oom_score_adj; the workers' 500 puts them before max's
-  # processes (200 or less) up to 7 GiB larger. No swap: a swapping cgroup
+  # processes (200 or less) up to 3 GiB larger. No swap: a swapping cgroup
   # stalls pc long before the killer acts.
   systemd.slices.user.sliceConfig = {
-    MemoryMax = "24G";
+    MemoryMax = "10G";
     MemorySwapMax = 0;
   };
 
