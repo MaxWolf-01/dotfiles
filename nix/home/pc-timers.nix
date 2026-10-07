@@ -69,11 +69,6 @@ in
       Description = "Sync phone data via rsync over Tailscale";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
-      # Paused since 2026-10-06: pc's RAM flips bits in what it writes. A
-      # condition rather than the timer, because the phone backups and
-      # backup-catchup start this unit too. The path never exists, so every
-      # start is skipped. Remove once the RAM passes.
-      ConditionPathExists = "/run/pc-ram-verified";
     };
     Service = {
       Type = "oneshot";
@@ -280,9 +275,7 @@ in
       Persistent = true;
       RandomizedDelaySec = "10m";
     };
-    # Paused since 2026-10-06: pc's RAM flips bits in what it writes. Put
-    # timers.target back once memtest passes.
-    Install.WantedBy = [ ];
+    Install.WantedBy = [ "timers.target" ];
   };
 
   # --- Overdue watchdog ---
