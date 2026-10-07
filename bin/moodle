@@ -24,9 +24,15 @@ snapshot, and in a course whose update check fails, every run; a forum's discuss
 topic or post count changed; a discussion's posts when it got a new post. Otherwise the contents
 carry over from the last snapshot.
 
+--past-every reads a course of a semester that has ended only once its last read is that many hours
+old; in between, the snapshot carries it over, and "scraped" says when each course was last read.
+JKU's winter semester runs from October to February, its summer semester from March to September.
+
 What a snapshot lacks, it lists under "gaps" with the reason: a course, page, forum or file that
 could not be read, activities Moodle shows max as unavailable, activity types this tool does not
-open, recordings that only stream. `snapshot` and `diff` print that list after the changes.
+open, recordings that only stream. `snapshot` and `diff` print that list after the changes. A gap
+is "failed" where a read failed this run: Moodle refused it, answered with an error, or did not
+answer in time. `snapshot` writes the snapshot all the same, then exits 1 when one did.
 
 Snapshots live in --state/snapshots/, one JSON file each. Files go to --root/<course folder>/,
 where the course folder is the semester and course title, e.g. 2026S-vl-statistics-for-ai: a
@@ -42,7 +48,7 @@ JSON schema (courses --json):
 JSON schema (snapshot file):
 
     {"taken": "ISO time", "scraped": {"<course id>": "ISO time"},
-     "gaps": [{"course": 0, "name": "str", "folder": "str", "where": "str", "reason": "str"}],
+     "gaps": [{"course": 0, "name": "str", "folder": "str", "where": "str", "reason": "str", "failed": true}],
      "courses": {"<course id>": {"name": "str", "folder": "str", "url": "str", "hidden": true,
       "sections": {"<section id>": {"name": "str", "visible": false, "summary": "str", "files": {"<name>": "url"},
         "items": {"<cm id>": {"name": "str", "module": "assign|resource|folder|forum|zoom|...", "url": "str", "visible": false,
@@ -59,9 +65,13 @@ JSON schema (snapshot file):
 
 JSON schema (snapshot --json, diff --json):
 
-    {"changes": [{"change": "added|removed|changed", "course": "str", "folder": "str", "where": "str", "path": ["key"],
+    {"taken": "ISO time", "since": "ISO time of the earlier snapshot, null for the first",
+     "courses": [{"course": 0, "name": "str", "folder": "str", "scraped": "ISO time"}],
+     "changes": [{"change": "added|removed|changed", "course": "str", "folder": "str", "where": "str", "path": ["key"],
                   "before": any, "after": any}],
      "gaps": [...as in the snapshot file]}
+
+    "changes" is [] for a first snapshot, which has nothing to compare with.
 
 Examples:
 
@@ -69,6 +79,7 @@ Examples:
     moodle snapshot                       # scrape, download, print what changed and what is missing
     moodle snapshot --json | jq '.changes[] | select(.path | index("assignments"))'
     moodle snapshot --course 42634 --no-download
+    moodle snapshot --past-every 24        # courses of past semesters at most once a day
     moodle diff                           # the last two snapshots again
     jq '.courses[] | {name, assignments}' "$(ls -d ~/.local/state/moodle/snapshots/* | tail -1)"
 """
@@ -82,7 +93,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Iterator
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlsplit
@@ -508,7 +519,8 @@ def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None,
                 index[mod] = index_rows(m, mod, cid)
             except requests.RequestException as e:
                 index[mod] = last_overview(prev or {}, prev_items, mod)
-                gaps.append({"where": f"{mod} overview", "reason": f"not read ({e}); due dates, statuses, grades and counts are the last snapshot's"})
+                gaps.append({"where": f"{mod} overview", "reason": f"not read ({e}); due dates, statuses, grades and counts are the last snapshot's",
+                             "failed": True})
 
     cms = {str(cm["id"]): cm for cm in state["cm"]}
     sections = {}
@@ -567,7 +579,7 @@ def activity_detail(m: Moodle, item: dict, cmid: str, before: dict | None, chang
             got = detail(m, item["module"], cmid)
         except requests.RequestException as e:
             reason = f"its page could not be read ({e})" + ("; the snapshot keeps what the last one had" if carried else "")
-            gaps.append({"where": where, "reason": reason})
+            gaps.append({"where": where, "reason": reason, "failed": True})
             got = carried | {"unread": reason}  # read again next run, whatever Moodle's update check says
     if item["module"] == "forum" and "discussions" in got:
         got = got | {"discussions": discussion_posts(m, got["discussions"], (before or {}).get("discussions", {}), gaps, where)}
@@ -585,7 +597,7 @@ def discussion_posts(m: Moodle, discussions: dict, before: dict, gaps: list[dict
         try:
             out[did] = d | {"posts": posts(m, did)}
         except (MoodleError, requests.RequestException) as e:
-            gaps.append({"where": f"{where} › {d.get('name', did)}", "reason": f"its posts could not be read ({e})"})
+            gaps.append({"where": f"{where} › {d.get('name', did)}", "reason": f"its posts could not be read ({e})", "failed": True})
             # keep what the old posts were read against, so the next run sees the new post and reads them again
             out[did] = d | {k: old[k] for k in ("modified", "replies", "posts") if k in old}
     return out
@@ -636,10 +648,14 @@ def diff(old: dict, new: dict) -> list[dict]:
     return out
 
 
-def show(changes: list[dict] | None, gaps: list[dict], as_json: bool) -> None:
-    """The changes (None: there was nothing to compare with), then what the snapshot lacks."""
+def show(old: dict | None, new: dict, as_json: bool) -> None:
+    """What changed from old to new (old None: there was nothing to compare with), then what new lacks."""
+    changes, gaps = diff(old, new) if old else None, new.get("gaps", [])
     if as_json:
-        print(jsonlib.dumps({"changes": changes or [], "gaps": gaps}, indent=1, ensure_ascii=False))
+        courses = [{"course": int(cid), "name": c.get("name"), "folder": c.get("folder"), "scraped": new.get("scraped", {}).get(cid)}
+                   for cid, c in new.get("courses", {}).items()]
+        print(jsonlib.dumps({"taken": new.get("taken"), "since": old.get("taken") if old else None, "courses": courses,
+                             "changes": changes or [], "gaps": gaps}, indent=1, ensure_ascii=False))
         return
     if changes is not None and not changes:
         print("no changes")
@@ -706,7 +722,7 @@ def download(m: Moodle, course: dict, root: Path) -> tuple[int, int, list[dict]]
         try:
             size += m.download(url, folder / path)
         except requests.RequestException as e:
-            failed.append({"where": rel, "reason": f"file not downloaded ({e}); the next snapshot tries again"})
+            failed.append({"where": rel, "reason": f"file not downloaded ({e}); the next snapshot tries again", "failed": True})
             continue
         count += 1
         ledger[url] = {"path": path, "owner": owner}
@@ -742,11 +758,13 @@ class Snapshot:
     download: bool = True
     """Download the files the snapshot links that were not downloaded before."""
     json: bool = False
-    """Print the changes and gaps as JSON."""
+    """Print the courses' read times, the changes and the gaps as JSON."""
     state: Path = STATE
     """Where snapshots are kept (snapshots/<time>.json)."""
     root: Path = ROOT
     """Where course folders go."""
+    past_every: float = 0
+    """Hours: read a course of a semester that has ended only once its last read is this old. 0 reads every course."""
 
 
 @app.command(name="snapshot")
@@ -754,8 +772,22 @@ def snapshot(args: Snapshot) -> None:
     """Scrape every course into a new snapshot, download new files, and print what changed since the last snapshot and what the new one lacks."""
     m = connect()
     previous = snapshots(args.state)
-    prev = load(previous[-1]) if previous else {"courses": {}}
-    now = datetime.now(timezone.utc)
+    prev = load(previous[-1]) if previous else None
+    snap, failed = take(m, args, prev, datetime.now(timezone.utc))
+    (args.state / "snapshots").mkdir(parents=True, exist_ok=True)
+    path = args.state / "snapshots" / f"{datetime.fromisoformat(snap['taken']):%Y-%m-%dT%H-%M-%SZ}.json"
+    path.write_text(jsonlib.dumps(snap, indent=1, ensure_ascii=False))
+    print(f"wrote {path}", file=sys.stderr)
+    if prev is None:
+        print(f"first snapshot: {len(snap['courses'])} courses; the next one reports what changed", file=sys.stderr)
+    show(prev, snap, args.json)
+    if failed:
+        sys.exit(f"moodle: {failed} read(s) failed this run; the snapshot lists them under gaps, marked failed")
+
+
+def take(m: Moodle, args: Snapshot, prev: dict | None, now: datetime) -> tuple[dict, int]:
+    """The new snapshot, and how many of its reads failed this run."""
+    prev = prev or {"courses": {}}
     listed = enrolled(m)
     if args.course:
         unknown = set(args.course) - {c["id"] for c in listed}
@@ -764,12 +796,16 @@ def snapshot(args: Snapshot) -> None:
     out: dict[str, dict] = {}
     scraped: dict[str, str] = {}
     gaps: list[dict] = []
+    failed = 0
     for i, course in enumerate(listed, 1):
         key = str(course["id"])
         last = prev.get("scraped", {}).get(key, prev.get("taken"))
         named = {"course": course["id"], "name": course["name"], "folder": course["folder"]}
-        carried_gaps = [g for g in prev.get("gaps", []) if g.get("course") == course["id"]]
-        if not args.course or course["id"] in args.course:
+        # A gap carried over still holds, but no read failed in this run.
+        carried_gaps = [{k: v for k, v in g.items() if k != "failed"} for g in prev.get("gaps", []) if g.get("course") == course["id"]]
+        recent = (key in prev["courses"] and last and ended(course["folder"], now.date())
+                  and now - datetime.fromisoformat(last) < timedelta(hours=args.past_every))
+        if (not args.course or course["id"] in args.course) and not recent:
             print(f"[{i}/{len(listed)}] {course['name']}", file=sys.stderr)
             since = int(datetime.fromisoformat(last).timestamp()) - 600 if last and key in prev["courses"] else None
             started = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -780,23 +816,27 @@ def snapshot(args: Snapshot) -> None:
                     found += download(m, out[key], args.root)[2]
                 scraped[key] = started
                 gaps += [named | g for g in found]
+                failed += sum(bool(g.get("failed")) for g in found)
                 continue
             except (MoodleError, requests.RequestException) as e:
                 gaps.append(named | {"where": "", "reason": f"not read this run ({e}); the snapshot keeps what the one of {last} had"
-                                     if key in prev["courses"] else f"not read ({e})"})
+                                     if key in prev["courses"] else f"not read ({e})", "failed": True})
+                failed += 1
         if key in prev["courses"]:
             out[key], scraped[key] = prev["courses"][key], last
             gaps += carried_gaps
     if not args.download:
         gaps.append({"course": None, "where": "", "reason": "files not downloaded: run with --no-download"})
-    snap = {"taken": now.isoformat(timespec="seconds"), "scraped": scraped, "gaps": gaps, "courses": out}
-    (args.state / "snapshots").mkdir(parents=True, exist_ok=True)
-    path = args.state / "snapshots" / f"{now:%Y-%m-%dT%H-%M-%SZ}.json"
-    path.write_text(jsonlib.dumps(snap, indent=1, ensure_ascii=False))
-    print(f"wrote {path}", file=sys.stderr)
-    if not previous:
-        print(f"first snapshot: {len(out)} courses; the next one reports what changed", file=sys.stderr)
-    show(diff(prev, snap) if previous else None, gaps, args.json)
+    return {"taken": now.isoformat(timespec="seconds"), "scraped": scraped, "gaps": gaps, "courses": out}, failed
+
+
+def ended(folder: str, today: date) -> bool:
+    """Whether the semester a course folder is named for ended before today's; a folder naming none has not."""
+    m = re.match(r"(\d{4})([WS])-", folder)
+    if not m:
+        return False
+    year, winter = today.year - (today.month <= 2), today.month >= 10 or today.month <= 2
+    return (int(m[1]), m[2] == "W") < (year, winter)
 
 
 @dataclass
@@ -819,8 +859,7 @@ def diff_cmd(args: Diff) -> None:
     old = args.old or (have[-2] if len(have) > 1 else None)
     if not (old and new):
         sys.exit(f"moodle: need two snapshots to diff, {args.state / 'snapshots'} has {len(have)}; run `moodle snapshot`")
-    later = load(new)
-    show(diff(load(old), later), later.get("gaps", []), args.json)
+    show(load(old), load(new), args.json)
 
 
 if __name__ == "__main__":

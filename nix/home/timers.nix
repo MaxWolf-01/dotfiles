@@ -59,6 +59,12 @@ let
     bash coreutils uv sops jq
   ]);
 
+  # with-secrets runs sops exec-env for the JKU login; kusss and moodle are uv
+  # scripts; jq for bin/run-log.
+  jkuPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv sops jq
+  ]);
+
   # sops for the Bridge password, uv for lifelog's header index, jq for bin/run-log.
   mailPath = lib.makeBinPath (with pkgs; [
     bash coreutils isync notmuch sops uv jq
@@ -408,6 +414,40 @@ in
       # and quarter to, and each resolves a uv environment on a laptop that has
       # just woken up.
       OnCalendar = "00/3:50:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- KUSSS and Moodle → the lifelog record ---
+  # What it reads, records and counts as a failed run: secrets/scripts/jku-collect --help.
+
+  systemd.user.services.jku-collect = {
+    Unit = {
+      Description = "Read max's KUSSS and Moodle into the lifelog record";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${jkuPath}"
+        # A unit's environment does not say where the age key is; a shell's does.
+        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
+      ];
+      ExecStart = "${dotfiles}/bin/with-secrets jku ${secrets}/scripts/jku-collect --record";
+      # jku-collect's own budgets add up to 155 min (KUSSS_BUDGET 5, MOODLE_FIRST_BUDGET
+      # 150); the rest is for the collector itself hanging.
+      TimeoutStartSec = "165min";
+    };
+  };
+
+  systemd.user.timers.jku-collect = {
+    Unit.Description = "KUSSS and Moodle collection (every 3 hours)";
+    Timer = {
+      # Ten to, in the hours between calendar-collect's, which signs in to neither
+      # but reads the KUSSS and Moodle feeds.
+      OnCalendar = "01/3:50:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
