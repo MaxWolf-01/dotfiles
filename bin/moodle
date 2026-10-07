@@ -28,11 +28,15 @@ carry over from the last snapshot.
 old; in between, the snapshot carries it over, and "scraped" says when each course was last read.
 JKU's winter semester runs from October to February, its summer semester from March to September.
 
-What a snapshot lacks, it lists under "gaps" with the reason: a course, page, forum or file that
-could not be read, activities Moodle shows max as unavailable, activity types this tool does not
-open, recordings that only stream. `snapshot` and `diff` print that list after the changes. A gap
-is "failed" where a read failed this run: Moodle refused it, answered with an error, or did not
-answer in time. `snapshot` writes the snapshot all the same, then exits 1 when one did.
+What a snapshot lacks because a read failed, it lists under "gaps" with the reason: a course, page,
+overview, forum or file Moodle refused, answered with an error, or did not answer in time. A gap is
+"failed" where the read failed this run, and carried over from the run that last read the course
+where not. `snapshot` writes the snapshot all the same, then exits 1 when a read failed this run.
+What it lacks by design is no gap: an activity Moodle shows max as unavailable (restricted to
+another group, or until a date) is listed under "withheld" with Moodle's restriction, and a note
+under "notes" says what else is left out and why: recordings that only stream, activity types this
+tool does not open, a book read only in part, files not downloaded. `snapshot` and `diff` print the
+gaps, the withheld activities and the notes after the changes.
 
 Snapshots live in --state/snapshots/, one JSON file each. Files go to --root/<course folder>/,
 where the course folder is the semester and course title, e.g. 2026S-vl-statistics-for-ai: a
@@ -49,6 +53,8 @@ JSON schema (snapshot file):
 
     {"taken": "ISO time", "scraped": {"<course id>": "ISO time"},
      "gaps": [{"course": 0, "name": "str", "folder": "str", "where": "str", "reason": "str", "failed": true}],
+     "withheld": [{"course": 0, "name": "str", "folder": "str", "where": "str", "restrictions": "str"}],
+     "notes": [{"course": 0, "name": "str", "folder": "str", "where": "str", "note": "str"}],
      "courses": {"<course id>": {"name": "str", "folder": "str", "url": "str", "hidden": true,
       "sections": {"<section id>": {"name": "str", "visible": false, "summary": "str", "files": {"<name>": "url"},
         "items": {"<cm id>": {"name": "str", "module": "assign|resource|folder|forum|zoom|...", "url": "str", "visible": false,
@@ -61,7 +67,7 @@ JSON schema (snapshot file):
       "quizzes": {"<cm id>": {"name": "str", "due": "str", "grade": "str"}}}}}
 
     "text" is what the course page shows of an activity (a label's text); "content" what its own page
-    shows. Fields with no value are left out; "gaps" is [] when nothing is missing.
+    shows. Fields with no value are left out; "gaps", "withheld" and "notes" are [] when they hold nothing.
 
 JSON schema (snapshot --json, diff --json):
 
@@ -69,7 +75,7 @@ JSON schema (snapshot --json, diff --json):
      "courses": [{"course": 0, "name": "str", "folder": "str", "scraped": "ISO time"}],
      "changes": [{"change": "added|removed|changed", "course": "str", "folder": "str", "where": "str", "path": ["key"],
                   "before": any, "after": any}],
-     "gaps": [...as in the snapshot file]}
+     "gaps": [...], "withheld": [...], "notes": [...] as in the snapshot file}
 
     "changes" is [] for a first snapshot, which has nothing to compare with.
 
@@ -495,8 +501,22 @@ def prune(d: dict) -> dict:
     return {k: v for k, v in d.items() if v is not None and v is not False and v not in ("", {}, []) and not k.startswith("_")}
 
 
-def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None, gaps: list[dict]) -> dict:
-    """One course's snapshot. What it could not read goes into gaps as {"where", "reason"}."""
+@dataclass
+class Lacks:
+    """What a snapshot lacks, by kind: gaps {"where", "reason", "failed"}, withheld {"where", "restrictions"}, notes {"where", "note"}."""
+
+    gaps: list[dict] = field(default_factory=list)
+    withheld: list[dict] = field(default_factory=list)
+    notes: list[dict] = field(default_factory=list)
+
+    def merge(self, other: Lacks, named: dict | None = None) -> None:
+        """Add other's entries, each with the course's id, name and folder where named gives them."""
+        for kind in ("gaps", "withheld", "notes"):
+            getattr(self, kind).extend((named or {}) | e for e in getattr(other, kind))
+
+
+def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None, lacks: Lacks) -> dict:
+    """One course's snapshot. What it lacks goes into lacks."""
     cid = course["id"]
     state = jsonlib.loads(m.ajax("core_courseformat_get_state", courseid=cid))
     sec_page, cm_page = course_page(m, cid)
@@ -509,7 +529,7 @@ def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None,
             changed = {str(i["id"]) for i in ups["instances"] if i["contextlevel"] == "module"}
         except (MoodleError, requests.RequestException) as e:
             changed = None
-            gaps.append({"where": "", "reason": f"Moodle's update check fails here ({e}); every activity page was read again instead"})
+            lacks.notes.append({"where": "", "note": f"Moodle's update check fails here ({e}); every activity page was read again instead"})
 
     prev_items = {cmid: it for s in (prev or {}).get("sections", {}).values() for cmid, it in s.get("items", {}).items()}
     index = {}
@@ -519,7 +539,7 @@ def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None,
                 index[mod] = index_rows(m, mod, cid)
             except requests.RequestException as e:
                 index[mod] = last_overview(prev or {}, prev_items, mod)
-                gaps.append({"where": f"{mod} overview", "reason": f"not read ({e}); due dates, statuses, grades and counts are the last snapshot's",
+                lacks.gaps.append({"where": f"{mod} overview", "reason": f"not read ({e}); due dates, statuses, grades and counts are the last snapshot's",
                              "failed": True})
 
     cms = {str(cm["id"]): cm for cm in state["cm"]}
@@ -535,21 +555,21 @@ def scrape_course(m: Moodle, course: dict, prev: dict | None, since: int | None,
             item |= {k: v for k, v in index.get("forum", {}).get(cmid, {}).items() if cm["module"] == "forum"}
             where = f"{name_of(sec.get('title', ''))} › {item['name']}"
             if not cm.get("uservisible", True):
-                gaps.append({"where": where, "reason": "Moodle shows it to max as unavailable" + (f": {item['restrictions']}" if item.get("restrictions") else "")})
+                lacks.withheld.append(prune({"where": where, "restrictions": item.get("restrictions")}))
             elif cm["module"] in OPENED and cm.get("url"):
-                item |= activity_detail(m, item, cmid, prev_items.get(cmid), changed, gaps, where)
+                item |= activity_detail(m, item, cmid, prev_items.get(cmid), changed, lacks.gaps, where)
             elif cm["module"] not in ON_COURSE_PAGE and cm.get("url"):  # one without a url shows whole on the course page
                 why = LIMITED.get(cm["module"], f"{cm['module']} activities are not among the types this tool reads")
-                gaps.append({"where": where, "reason": f"its page is not opened: {why}"})
+                lacks.notes.append({"where": where, "note": f"its page is not opened: {why}"})
             if cm["module"] in PARTLY_READ and cm.get("uservisible", True):
-                gaps.append({"where": where, "reason": PARTLY_READ[cm["module"]]})
+                lacks.notes.append({"where": where, "note": PARTLY_READ[cm["module"]]})
             items[cmid] = prune(item)
         page = sec_page.get(str(sec["id"]), {})
         sections[str(sec["id"])] = prune({"name": name_of(sec.get("title", "")), "visible": None if sec.get("visible", True) else False,
                                           "summary": page.get("summary"), "files": page.get("files"), "items": items})
     streamed = sum(cm["module"] in STREAMED for cm in state["cm"])
     if streamed:
-        gaps.append({"where": "", "reason": f"{streamed} recording(s) not downloaded: Opencast only streams them; their links are in the snapshot"})
+        lacks.notes.append({"where": "", "note": f"{streamed} recording(s) not downloaded: Opencast only streams them; their links are in the snapshot"})
 
     assignments = {cmid: prune({"name": name_of(cms[cmid]["name"]), "module": mod, **row})
                    for mod in ("assign", "checkmark") for cmid, row in index.get(mod, {}).items() if cmid in cms}
@@ -651,11 +671,12 @@ def diff(old: dict, new: dict) -> list[dict]:
 def show(old: dict | None, new: dict, as_json: bool) -> None:
     """What changed from old to new (old None: there was nothing to compare with), then what new lacks."""
     changes, gaps = diff(old, new) if old else None, new.get("gaps", [])
+    withheld, notes = new.get("withheld", []), new.get("notes", [])
     if as_json:
         courses = [{"course": int(cid), "name": c.get("name"), "folder": c.get("folder"), "scraped": new.get("scraped", {}).get(cid)}
                    for cid, c in new.get("courses", {}).items()]
         print(jsonlib.dumps({"taken": new.get("taken"), "since": old.get("taken") if old else None, "courses": courses,
-                             "changes": changes or [], "gaps": gaps}, indent=1, ensure_ascii=False))
+                             "changes": changes or [], "gaps": gaps, "withheld": withheld, "notes": notes}, indent=1, ensure_ascii=False))
         return
     if changes is not None and not changes:
         print("no changes")
@@ -670,13 +691,13 @@ def show(old: dict | None, new: dict, as_json: bool) -> None:
         else:
             mark = {"added": "+", "removed": "-"}[c["change"]]
             print(f"  {mark} {c['where'] or '(whole course)'}" + ("" if isinstance(value, dict) else f": {short(value)}"))
-    if not gaps:
-        print("\nnothing missing from the snapshot")
-        return
-    print(f"\nmissing from the snapshot ({len(gaps)}):")
-    for g in gaps:
-        where = " › ".join(filter(None, [g.get("folder") or g.get("name"), g.get("where")])) or "(whole run)"
-        print(f"  {where}: {clean(g['reason'])}")
+    print("\nnothing missing from the snapshot" if not gaps else f"\nmissing from the snapshot ({len(gaps)}):")
+    for heading, entries, says in ((None, gaps, "reason"), ("withheld from max", withheld, "restrictions"), ("notes", notes, "note")):
+        if heading and entries:
+            print(f"\n{heading} ({len(entries)}):")
+        for e in entries:
+            where = " › ".join(filter(None, [e.get("folder") or e.get("name"), e.get("where")])) or "(whole run)"
+            print(f"  {where}" + (f": {clean(e[says])}" if e.get(says) else ""))
 
 
 def short(v: Any, n: int = 160) -> str:
@@ -758,7 +779,7 @@ class Snapshot:
     download: bool = True
     """Download the files the snapshot links that were not downloaded before."""
     json: bool = False
-    """Print the courses' read times, the changes and the gaps as JSON."""
+    """Print the courses' read times, the changes and what the snapshot lacks as JSON."""
     state: Path = STATE
     """Where snapshots are kept (snapshots/<time>.json)."""
     root: Path = ROOT
@@ -795,39 +816,41 @@ def take(m: Moodle, args: Snapshot, prev: dict | None, now: datetime) -> tuple[d
             sys.exit(f"moodle: not enrolled in course(s) {sorted(unknown)}; `moodle courses` lists them")
     out: dict[str, dict] = {}
     scraped: dict[str, str] = {}
-    gaps: list[dict] = []
+    lacks = Lacks()
     failed = 0
     for i, course in enumerate(listed, 1):
         key = str(course["id"])
         last = prev.get("scraped", {}).get(key, prev.get("taken"))
         named = {"course": course["id"], "name": course["name"], "folder": course["folder"]}
-        # A gap carried over still holds, but no read failed in this run.
-        carried_gaps = [{k: v for k, v in g.items() if k != "failed"} for g in prev.get("gaps", []) if g.get("course") == course["id"]]
+        # What a course carried over lacks still holds, but no read of it failed in this run.
+        carried = Lacks(*([{k: v for k, v in e.items() if k != "failed"} for e in prev.get(kind, []) if e.get("course") == course["id"]]
+                          for kind in ("gaps", "withheld", "notes")))
         recent = (key in prev["courses"] and last and ended(course["folder"], now.date())
                   and now - datetime.fromisoformat(last) < timedelta(hours=args.past_every))
         if (not args.course or course["id"] in args.course) and not recent:
             print(f"[{i}/{len(listed)}] {course['name']}", file=sys.stderr)
             since = int(datetime.fromisoformat(last).timestamp()) - 600 if last and key in prev["courses"] else None
             started = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            found: list[dict] = []
+            found = Lacks()
             try:
                 out[key] = scrape_course(m, course, prev["courses"].get(key), since, found)
                 if args.download:
-                    found += download(m, out[key], args.root)[2]
+                    found.gaps += download(m, out[key], args.root)[2]
                 scraped[key] = started
-                gaps += [named | g for g in found]
-                failed += sum(bool(g.get("failed")) for g in found)
+                lacks.merge(found, named)
+                failed += sum(bool(g.get("failed")) for g in found.gaps)
                 continue
             except (MoodleError, requests.RequestException) as e:
-                gaps.append(named | {"where": "", "reason": f"not read this run ({e}); the snapshot keeps what the one of {last} had"
+                lacks.gaps.append(named | {"where": "", "reason": f"not read this run ({e}); the snapshot keeps what the one of {last} had"
                                      if key in prev["courses"] else f"not read ({e})", "failed": True})
                 failed += 1
         if key in prev["courses"]:
             out[key], scraped[key] = prev["courses"][key], last
-            gaps += carried_gaps
+            lacks.merge(carried)
     if not args.download:
-        gaps.append({"course": None, "where": "", "reason": "files not downloaded: run with --no-download"})
-    return {"taken": now.isoformat(timespec="seconds"), "scraped": scraped, "gaps": gaps, "courses": out}, failed
+        lacks.notes.append({"course": None, "where": "", "note": "files not downloaded: run with --no-download"})
+    return {"taken": now.isoformat(timespec="seconds"), "scraped": scraped, "gaps": lacks.gaps, "withheld": lacks.withheld,
+            "notes": lacks.notes, "courses": out}, failed
 
 
 def ended(folder: str, today: date) -> bool:
