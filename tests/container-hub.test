@@ -47,6 +47,9 @@ RETIRER = "ffffffff-0000-4000-8000-000000000006"
 ANSWERER = "abababab-0000-4000-8000-000000000007"  # runs in a tmux pane
 LATECOMER = "cdcdcdcd-0000-4000-8000-000000000008"  # renders its session page late
 ASKER = "efefefef-0000-4000-8000-000000000009"  # writes turn records with questions, and chat turns
+CONTINUER = "12121212-0000-4000-8000-00000000000a"  # continues from its handoff
+CONTINUED = "34343434-0000-4000-8000-00000000000b"  # the session its /clear starts
+STALLED = "56565656-0000-4000-8000-00000000000c"  # a session a /clear starts blocked
 
 failures = 0
 
@@ -83,7 +86,7 @@ exit 1
 TMUX.chmod(0o755)
 ENV = env(TMPDIR=str(TEMP))
 ENV["PATH"] = f"{TMUX.parent}:{ENV['PATH']}"
-HUB_FLAGS = ["--tmux-socket", str(TMUX_SOCKET)]
+HUB_FLAGS = ["--tmux-socket", str(TMUX_SOCKET), "--clear-wait", "2"]
 
 
 def git(cwd: Path, *args: str) -> None:
@@ -128,13 +131,13 @@ SELF_STARTED = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
 
 def registered(session: str, status: str = "idle", at: float | None = None, pid: int | None = None,
                started: str | None = SELF_STARTED, name: str | None = None, tmux: str | None = None,
-               waiting_for: str | None = None) -> None:
+               waiting_for: str | None = None, cwd: Path | None = None) -> None:
     """The session's file in the registry, as Claude Code writes it while the session's process runs: by default
     this test's own process, which runs for as long as the hub reads it."""
     entry = {"pid": pid or os.getpid(), "sessionId": session, "status": status,
              "statusUpdatedAt": int((at or time.time()) * 1000), **({"procStart": started} if started else {}),
              **({"name": name} if name else {}), **({"tmux": tmux} if tmux else {}),
-             **({"waitingFor": waiting_for} if waiting_for else {})}
+             **({"waitingFor": waiting_for} if waiting_for else {}), **({"cwd": str(cwd)} if cwd else {})}
     path = HOME / ".claude" / "sessions" / f"{session[:8]}.json"  # named by the pid there; any name reads alike
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entry))
@@ -735,6 +738,112 @@ try:
         request("POST", "/api/drop?unit=no-such-unit&name=x.png", None, {"Origin": ORIGIN, "X-Hub-Token": token}, data=b"x")[0],
         request("POST", "/api/drop?unit=..&name=x.png", None, {"Origin": ORIGIN, "X-Hub-Token": token}, data=b"x")[0],
         any((HOME / ".cache/container-hub").glob("*x.png"))))
+
+    # --- hub-continues-a-session-from-its-handoff: a unit continues its session from its handoff, by /clear in its pane
+    if not READER:
+        print("skip: no mx plugin here, whose handoff hook finds the handoff a /clear picks up")
+    else:
+        kappa = repo("kappa", [("hand-off", None, CONTINUER)])
+        handoffs = kappa / "agent/handoffs"
+        handoffs.mkdir()
+        handoff = handoffs / "2026-10-07-hand-off.md"
+        handoff.write_text(f"---\nsession: {CONTINUER}\npurpose: continuation\n---\n\n# Continue the hand-off\n")
+        git(kappa / "agent", "add", "handoffs")
+        git(kappa / "agent", "commit", "-q", "-m", "handoff")
+        offer = {"path": str(handoff.resolve()), "url": "/f" + urllib.parse.quote(str(handoff.resolve()))}
+        # The session's program, standing in for Claude Code: it records every byte that reaches it, and a `/clear`
+        # typed into it rewrites its registry entry as `then` says, which is how Claude Code names the new session.
+        typed_in, then = SCRATCH / "typed-in", SCRATCH / "then.json"
+        entry = HOME / ".claude/sessions" / f"{CONTINUER[:8]}.json"
+        fake = SCRATCH / "fake-claude.py"
+        fake.write_text(f"""import json, os, sys, tty
+tty.setraw(0)
+os.write(1, b'\\x1b[?2004h')
+out, line = open({str(typed_in)!r}, 'ab', buffering=0), b''
+while data := os.read(0, 4096):
+    out.write(data)
+    line += data
+    while b'\\r' in line:
+        typed, line = line.split(b'\\r', 1)
+        if typed == b'\\x1b[200~/clear\\x1b[201~' and (change := json.loads(open({str(then)!r}).read())):
+            entry = {{**json.load(open({str(entry)!r})), **change}}
+            open({str(entry)!r} + '.tmp', 'w').write(json.dumps(entry))
+            os.replace({str(entry)!r} + '.tmp', {str(entry)!r})
+""")
+        tmux("-f", "/dev/null", "new-session", "-d", "-s", "continuing", "-x", "100", "-y", "20", shlex.join(["exec", sys.executable, str(fake)]))
+        try:
+            pane, pane_pid = tmux("display-message", "-p", "-t", "continuing:", "#{pane_id} #{pane_pid}").split()
+            deadline = time.monotonic() + 10
+            while not typed_in.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            started = Path(f"/proc/{pane_pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            where = f"continuing:@0.{pane}"
+            idle_in_pane = lambda status="idle", **extra: registered(CONTINUER, status, pid=int(pane_pid), started=started, tmux=where,
+                                                                     cwd=kappa, **extra)
+            idle_in_pane()
+            open_page(page(HOME / "notes" / "continuing.html"), CONTINUER)
+            offered = lambda key=CONTINUER: view(key)[1].get("handoff")
+            check("hub-continues-a-session-from-its-handoff#P1: a unit whose session runs idle in a pane and committed a "
+                  "continuation handoff offers it", offer, offered())
+            fork = handoffs / "2026-10-07-side-quest.md"
+            fork.write_text(f"---\nsession: {CONTINUER}\npurpose: fork\n---\n\n# A side quest\n")
+            git(kappa / "agent", "add", "handoffs")
+            git(kappa / "agent", "commit", "-q", "-m", "a fork's handoff")
+            check("...a fork's handoff by the same session, written since, is not one to continue from", offer, offered())
+            handoff.write_text(handoff.read_text() + "\nOne more thing.\n")
+            check("...one edited since it was committed is offered no more", None, offered())
+            git(kappa / "agent", "checkout", "--", "handoffs")
+            idle_in_pane("busy")
+            check("...nor while the session works", None, offered())
+            idle_in_pane("waiting", waiting_for="permission prompt")
+            check("...nor while it is blocked", None, offered())
+            registered(CONTINUER, tmux=where, cwd=kappa)  # the pane, but a process outside it
+            check("...nor where the pane does not hold the session's process", None, offered())
+            idle_in_pane()
+            check("...and again once it is idle in its pane", offer, offered())
+
+            continued = lambda token=token: request("POST", "/api/continue", {"unit": CONTINUER}, {"Origin": ORIGIN, "X-Hub-Token": token})
+            got = lambda: typed_in.read_bytes()
+            pasted = lambda *lines: b"".join(b"\x1b[200~" + line + b"\x1b[201~\r" for line in lines)
+            then.write_text(json.dumps({"sessionId": CONTINUED}))
+            check("a page the hub serves cannot continue a session without the tab's token", (403, b""), (continued("")[0], got()))
+            # the session went busy, or blocked, or its pane came to hold another process, since the control showed
+            for case, registers, why in (("working", lambda: idle_in_pane("busy"), "working"),
+                                         ("blocked", lambda: idle_in_pane("waiting", waiting_for="dialog open"), "dialog open"),
+                                         ("out of its pane", lambda: registered(CONTINUER, tmux=where, cwd=kappa), "no longer holds")):
+                registers()
+                status_code, answer = continued()
+                check(f"hub-continues-a-session-from-its-handoff#P3: a session {case} is refused before anything is typed, the hub saying why",
+                      (409, True, b""), (status_code, why in answer.get("error", ""), got()))
+            idle_in_pane()
+            then.write_text("{}")
+            status_code, answer = continued()
+            check("hub-continues-a-session-from-its-handoff#P3: no new session in the registry within the wait is refused, with only "
+                  "the /clear typed", (409, True, pasted(b"/clear")), (status_code, "no new session" in answer.get("error", ""), got()))
+            typed_in.write_bytes(b"")
+            then.write_text(json.dumps({"sessionId": STALLED, "status": "waiting", "waitingFor": "dialog open"}))
+            status_code, answer = continued()
+            check("...and so is a new session that starts blocked, the /clear typed and nothing after it", (409, True, pasted(b"/clear")),
+                  (status_code, "dialog open" in answer.get("error", ""), got()))
+            typed_in.write_bytes(b"")
+            idle_in_pane()
+            then.write_text(json.dumps({"sessionId": CONTINUED, "status": "idle"}))
+            status_code, answer = continued()
+            check("hub-continues-a-session-from-its-handoff#P2: a click types /clear, then, once the registry names the new "
+                  "session, `continue`, and nothing else", (200, CONTINUED, f"/u/{CONTINUED}", pasted(b"/clear", b"continue")),
+                  (status_code, answer.get("unit"), answer.get("view"), got()))
+            new = view(CONTINUED)
+            check("hub-continues-a-session-from-its-handoff#P4: the new session is a unit at once, its session page a stand-in, "
+                  "in the pane the old one was", (200, f"/pages/{CONTINUED}", where, "idle"),
+                  (new[0], new[1].get("session_page", {}).get("url"), new[1].get("pane"), new[1].get("state")))
+            old = view(CONTINUER)[1]
+            check("hub-continues-a-session-from-its-handoff#P5: the old session's unit is among the ended, and offers nothing",
+                  ("ended", None, None), (old["state"], old["number"], old["handoff"]))
+            rendered = page(kappa / f"agent/sessions/{CONTINUED}/index.html")
+            check("...and the new session's page takes the stand-in's place once it is rendered",
+                  "/f" + urllib.parse.quote(str(rendered.resolve())), view(CONTINUED)[1]["session_page"]["url"])
+        finally:
+            subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
 
     # --- serving
 
