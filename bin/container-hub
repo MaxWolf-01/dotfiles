@@ -1044,7 +1044,7 @@ def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, d
     account = entry["account"] if entry else account_of(kept_at.parent.parent.parent) if kept_at else None
     state = None if not session else entry.get("status", "idle") if entry else "ended"
     last = last_turn(session_page, entry)
-    said = page_says(session_page.parent if session_page and session_page.is_file() else None)
+    said = page_says(session_page.parent if session_page and session_page.is_file() else None, page_reader(memo))
     title = ((session_dir and session_title(session_dir)) or (session and claude_title(session, memo)) or (entry or {}).get("name")
              or (f"session {session[:8]}" if session else "loose pages"))
     board = tracker.agent / "board.html" if tracker else None
@@ -1150,36 +1150,49 @@ PAGE_SAYS: dict[Path, tuple[tuple, dict]] = {}
 NOTHING_SAID = {"questions": 0, "recorded": 0, "status_line": ""}
 
 
-def page_says(directory: Path | None) -> dict:
+def page_says(directory: Path | None, reader) -> dict:
     """What a session's page directory says it needs: how many questions are open, by the reader's own rule, when
     the newest turn record was written, and the status line, the newest turn's headline: a turn record's H1, or
     the first line of a chat turn's reply. A record's time is its file's, which the transcript would only confirm
-    at the cost of reading all of it. Read again only once a record has changed."""
-    if not page_reader or not directory:
+    at the cost of reading all of it. Read again only once a record, or the reader, has changed."""
+    if not reader or not directory:
         return NOTHING_SAID
     try:
         records = {p: p.stat() for p in sorted((directory / "turns").glob("*.md"))}
     except OSError:  # one gone between the glob and the stat: read at the next look
         return PAGE_SAYS.get(directory, ((), NOTHING_SAID))[1]
-    signature = tuple((p.name, st.st_mtime_ns, st.st_size) for p, st in records.items())
+    signature = (reader.__file__, *((p.name, st.st_mtime_ns, st.st_size) for p, st in records.items()))
     if (hit := PAGE_SAYS.get(directory)) and hit[0] == signature:
         return hit[1]
+    written = lambda t: datetime.fromtimestamp(records[t.path].st_mtime, UTC) if t.path in records else None
     try:
-        session = page_reader.read_session(directory, Path(os.devnull))
-    except Exception as e:  # a record the reader refuses, which the session's own hooks send back
+        session = reader.read_session(directory, Path(os.devnull))
+        turns = [replace(t, written=written(t)) for t in session.turns]
+        newest = reader.in_order(turns, list(session.chats))[-1:]
+    except (reader.RecordError, OSError) as e:  # a record the reader refuses, which the session's own hooks send back
         print(f"reading {directory}: {e}", file=sys.stderr, flush=True)
         said = NOTHING_SAID
     else:
-        written = lambda t: datetime.fromtimestamp(records[t.path].st_mtime, UTC) if t.path in records else None
-        turns = [replace(t, written=written(t)) for t in session.turns]
-        newest = page_reader.in_order(turns, list(session.chats))[-1:]
-        line = lambda text: next((l.strip().lstrip("#").strip() for l in text.splitlines() if l.strip()), "")
-        said = {"questions": len(page_reader.open_questions(session)),
+        said = {"questions": len(reader.open_questions(session)),
                 "recorded": max((t.written.timestamp() for t in turns if t.written), default=0),
-                "status_line": "" if not newest else line(newest[0].reply) if isinstance(newest[0], page_reader.Chat)
+                "status_line": "" if not newest else first_line(newest[0].reply) if isinstance(newest[0], reader.Chat)
                 else newest[0].headline}
     PAGE_SAYS[directory] = signature, said
     return said
+
+
+MARKUP = re.compile(r"^(?:#+|>|[-*+]|\d+\.)\s+|\*\*|`")
+
+
+def first_line(markdown: str) -> str:
+    """A chat reply's first line of prose, its markdown markers dropped: nothing in a code block is prose."""
+    fenced = False
+    for line in map(str.strip, markdown.splitlines()):
+        if line.startswith("```"):
+            fenced = not fenced
+        elif line and not fenced:
+            return MARKUP.sub("", line).strip()
+    return ""
 
 
 def needs_you(state: str | None, said: dict, visited: float) -> dict | None:
@@ -1433,25 +1446,40 @@ def load_diffview():
 diffview = load_diffview()
 
 
-def load_page_reader():
+READERS: dict[Path, object] = {}
+"""The session page's reader, by the path it was loaded from, or None where that one could not be used."""
+loading = threading.Lock()
+READS = ("read_session", "in_order", "open_questions", "Chat", "RecordError")
+"""What the hub uses of the reader: an mx plugin from before chat turns has no `in_order` and no `Chat`."""
+
+
+def page_reader(memo: dict):
     """The session page's own reader, from the newest mx plugin, so that the rail counts a question open as the page
-    shows it."""
-    path = mx_script("session-page/session_page.py")
-    if not path:
-        print("no mx plugin: the rail marks no session as needing you, and shows no status line", file=sys.stderr)
-        return None
+    shows it. Looked for once per read of the hub, so a plugin update reaches the rail without a restart; None
+    where no plugin has one the hub can use."""
+    if "reader" not in memo:
+        path = mx_script("session-page/session_page.py")
+        with loading:  # two reads of the hub at once load it once
+            if path and path not in READERS:
+                READERS[path] = load_page_reader(path)
+        memo["reader"] = READERS.get(path)
+    return memo["reader"]
+
+
+def load_page_reader(path: Path):
     spec = importlib.util.spec_from_file_location("session_page", path)
     module = importlib.util.module_from_spec(spec)
     sys.dont_write_bytecode = True  # its cache would land in the plugin's directory
+    sys.modules.pop("tracker", None)  # the reader imports its own plugin's tracker, not an older one's
     try:
         spec.loader.exec_module(module)
     except Exception as e:
-        print(f"loading {path}: {e}", file=sys.stderr)
+        print(f"loading {path}: {e}", file=sys.stderr, flush=True)
+        return None
+    if missing := [name for name in READS if not hasattr(module, name)]:
+        print(f"{path} has no {', '.join(missing)}: the rail marks no session as needing you", file=sys.stderr, flush=True)
         return None
     return module
-
-
-page_reader = load_page_reader()
 
 
 # First in every page the hub serves, so the hub tab (wcCatch) has the page's links before any of them can be clicked.
