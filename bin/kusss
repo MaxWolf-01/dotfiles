@@ -3,13 +3,18 @@
 # requires-python = ">=3.12"
 # dependencies = ["tyro", "requests", "beautifulsoup4", "lxml"]
 # ///
-"""Read JKU's KUSSS course catalogue and Studienhandbuch without logging in.
+"""Read JKU's KUSSS: the course catalogue and Studienhandbuch without logging in, and max's own registrations signed in.
 
 KUSSS (kusss.jku.at) publishes the whole course catalogue anonymously: the curriculum tree,
 each course's classes, every LVA (group) with dates, rooms, lecturer, seats and today's
-registration counts. Only the act of registering needs a login. This tool turns those pages
-into JSON, answers "is there a seat" for given course classes, and can watch full courses
-for a freed seat.
+registration counts. This tool turns those pages into JSON, answers "is there a seat" for
+given course classes, and can watch full courses for a freed seat.
+
+`mine` signs in as max through JKU's Shibboleth login with the username and password in the
+sops file `jku` (JKU__USERNAME, JKU__PASSWORD); started without them, it re-runs itself under
+`with-secrets jku`. It keeps no session on disk. It reads, and nothing it sends can act: besides
+the sign-in's form posts, its requests are GETs of the pages it lists in READS, with exactly the
+parameters listed there; anything else is refused before it goes out.
 
 Vocabulary (KUSSS German → what it is):
 - Kursklasse / courseclass: one course as it appears in a curriculum (e.g. "UE Reinforcement Learning");
@@ -44,11 +49,14 @@ Examples:
     kusss seats 46721 --json | jq '.[] | select(.free)'
     kusss watch 37357 37359 --once --until 2026-10-08 --run-log kusss-watch
     kusss check --curriculum 376
+    kusss mine | jq '.courses[] | {lva_nr, title, group, status, deregistration_deadline}'
+    kusss mine --semester 2026S | jq '.exams[] | select(.status == "registered")'
 """
 
 from __future__ import annotations
 
 import json as jsonlib
+import os
 import re
 import subprocess
 import sys
@@ -58,10 +66,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urljoin, urlparse
 
 import requests
 import tyro
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from tyro.extras import SubcommandApp
 
 KUSSS = "https://kusss.jku.at/kusss/"
@@ -487,6 +496,320 @@ def check(args: Check) -> None:
         print("\n".join("! " + p for p in problems))
         sys.exit(1)
     print("no parser surprises")
+
+
+# ----------------------------------------------------------------------------- signed in as max
+
+SECRETS = "jku"
+ME = "https://www.kusss.jku.at/kusss/"  # the sign-in lands on www.; its session cookie is not sent to kusss.jku.at
+MYJKU = "https://my.jku.at"
+IDP_HOST = "shibboleth.im.jku.at"
+SEMESTER = r"\d{4}[WS]"
+# Every page the signed-in session opens, with the parameters each must carry: name -> pattern its
+# value must match. Anything else is refused before the request goes out. KUSSS acts through pages
+# of the same kind (results-cancel-assignment.action deregisters from a course, examinationreg.action
+# registers for an exam), and select-term.action runs whichever action its reloadAction names.
+READS: dict[str, dict[str, str]] = {
+    ME + "login.action": {},
+    ME + "assignment-results.action": {},
+    ME + "select-term.action": {"term": SEMESTER, "reloadAction": r"assignment-results\.action"},
+    ME + "szsearchexam.action": {"search": "true", "searchType": "mylvas"},
+    ME + "gradeinfo.action": {},
+    ME + "outbound/myjku/fee": {},
+    MYJKU + "/api2/student/fee": {},
+}
+# Where the sign-in's forms may post: the JKU login, and the SAML endpoints of KUSSS and myJKU.
+SIGN_IN_POSTS = (f"https://{IDP_HOST}/idp/profile/SAML2/", "https://www.kusss.jku.at/Shibboleth.sso/SAML2/POST",
+                 MYJKU + "/Shibboleth.sso/SAML2/POST")
+DATE = re.compile(r"(\d\d)\.(\d\d)\.(\d{4}|\d\d)(?:\s+(\d\d:\d\d))?")
+EXAM_COURSE = re.compile(r"^(.*?)\s*\((\w{6}),(" + SEMESTER + r")\)\s*(.*)$")
+
+
+class Unreadable(Exception):
+    """A page that does not look the way this tool reads it: KUSSS changed, or showed something else."""
+
+
+class Session:
+    """Signed in as max, and able only to read: GETs of READS, and the sign-in's form posts."""
+
+    def __init__(self) -> None:
+        self.s = requests.Session()
+        self.s.headers["User-Agent"] = "Mozilla/5.0 (kusss cli; read-only)"
+
+    def get(self, url: str, **params: str) -> requests.Response:
+        allowed = READS.get(url)
+        if allowed is None or set(params) != set(allowed) or not all(re.fullmatch(allowed[k], v) for k, v in params.items()):
+            raise ValueError(f"refusing to open {url} with {params}: not a page this tool reads")
+        r = self.s.get(url, params=params, timeout=60)
+        r.raise_for_status()
+        return r
+
+    def soup(self, url: str, **params: str) -> BeautifulSoup:
+        """From the bytes: these pages are ISO-8859-1, which BeautifulSoup reads off their meta tag."""
+        return BeautifulSoup(self.get(url, **params).content, "lxml")
+
+    def through_login(self, r: requests.Response, username: str, password: str) -> requests.Response:
+        """Post the JKU login's forms (local-storage probe, username/password, SAML response) until a page off the login is reached.
+
+        Returns early on the login page when it shows the password form a second time: the credentials were refused.
+        """
+        password_page = None
+        for _ in range(6):
+            form = BeautifulSoup(r.text, "lxml").find("form")
+            if urlparse(r.url).hostname != IDP_HOST or not form:
+                return r
+            target = urljoin(r.url, form.get("action", ""))
+            if not target.startswith(SIGN_IN_POSTS):
+                raise ValueError(f"refusing to post the sign-in form to {target}: not JKU's login or a SAML endpoint")
+            data = {i["name"]: i.get("value", "") for i in form.find_all("input") if i.get("name")}
+            if "j_username" in data:
+                if r.url == password_page:
+                    return r
+                password_page = r.url
+                data |= {"j_username": username, "j_password": password}
+            data["_eventId_proceed"] = ""
+            r = self.s.post(target, data=data, timeout=60)
+        return r
+
+    def sign_in(self, username: str, password: str) -> None:
+        r = self.through_login(self.get(ME + "login.action"), username, password)
+        if "logout-confirm.action" not in r.text:
+            error = BeautifulSoup(r.text, "lxml").select_one(".output--failure, .form-error, .alert-danger")
+            why = clean(error.get_text(" ")) if error else f"the sign-in ended on {r.url}, not on a KUSSS page"
+            sys.exit(f"kusss: sign-in failed: {why}\n"
+                     f"Check the username and password in the sops file `{SECRETS}` (sops-editor), and that JKU's login works in a browser.")
+
+    def fee(self, username: str, password: str) -> dict:
+        """myJKU's answer for the fee: its sign-in, which KUSSS's Studienbeitrag link starts, then its API."""
+        r = self.through_login(self.get(ME + "outbound/myjku/fee"), username, password)
+        if not r.url.startswith(MYJKU + "/"):
+            raise Unreadable(f"the myJKU sign-in ended on {r.url}")
+        return self.get(MYJKU + "/api2/student/fee").json()
+
+
+def connect() -> tuple[Session, tuple[str, str]]:
+    """Sign in with the credentials from the environment, re-running under with-secrets when they are missing."""
+    user, password = os.environ.get("JKU__USERNAME"), os.environ.get("JKU__PASSWORD")
+    if not (user and password):
+        if os.environ.get("KUSSS_CLI_REEXEC"):
+            sys.exit(f"kusss: JKU__USERNAME / JKU__PASSWORD missing even under `with-secrets {SECRETS}`; check the sops file `{SECRETS}`")
+        os.environ["KUSSS_CLI_REEXEC"] = "1"
+        os.execvp("with-secrets", ["with-secrets", SECRETS, sys.argv[0], *sys.argv[1:]])
+    k = Session()
+    k.sign_in(user, password)
+    return k, (user, password)
+
+
+def iso(text: str) -> str | None:
+    """'Do. 15.10.26 09:15' -> '2026-10-15T09:15', '04.02.2027' -> '2027-02-04'; None when the text holds no date."""
+    m = DATE.search(text)
+    if not m:
+        return None
+    d, mo, y, t = m.groups()
+    return f"{y if len(y) == 4 else '20' + y}-{mo}-{d}" + (f"T{t}" if t else "")
+
+
+def number(text: str) -> float | None:
+    return float(text.replace(",", ".")) if re.fullmatch(r"\d+(,\d+)?", text) else None
+
+
+def lva_nr(digits: str) -> str:
+    return f"{digits[:3]}.{digits[3:]}"
+
+
+def header_rows(table: Tag) -> list[dict[str, Tag]]:
+    """Each row of a KUSSS list as header -> cell. A header keeps its words only: 'ECTS*' is 'ECTS', 'Warte- bonus**' 'Warte-bonus'.
+    Rows that span the table ('Keine offenen Anmeldungen!') are not rows of it."""
+    head = [re.sub(r"[^\w.]+$", "", re.sub(r"-\s+", "-", clean(th.get_text(" ")))) for th in table.find("tr").find_all("th")]
+    rows = []
+    for tr in table.find_all("tr")[1:]:
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) == len(head):
+            rows.append(dict(zip(head, tds)))
+    return rows
+
+
+def text(cell: Tag | None) -> str:
+    return clean(cell.get_text(" ")) if cell else ""
+
+
+# ----------------------------------------------------------------------------- what the pages say
+
+def shown_semester(soup: BeautifulSoup) -> str:
+    h = soup.find("h3", string=re.compile(r"Zugeteilte Lehrveranstaltungen für das Semester"))
+    m = re.search(SEMESTER, text(h))
+    if not m:
+        raise Unreadable("'Meine Anmeldungen' has no 'Zugeteilte Lehrveranstaltungen für das Semester' heading")
+    return m.group(0)
+
+
+def courses(soup: BeautifulSoup) -> list[dict]:
+    """'Meine Anmeldungen': the courses under 'Angemeldete' (registered, not yet allocated) and 'Zugeteilte Lehrveranstaltungen'."""
+    out = []
+    for h in soup.find_all("h3", string=re.compile(r"(Angemeldete|Zugeteilte) Lehrveranstaltungen für das Semester")):
+        pending = text(h).startswith("Angemeldete")
+        for row in header_rows(h.find_next("table")):
+            title = row["Titel"]
+            link = title.find("a")
+            name = text(link) if link else text(title)
+            rest = text(title).removeprefix(name).strip()
+            cc = re.search(r"courseclass=(\d+)", link.get("href", "")) if link else None
+            act = row.get("Abmelden") or row.get("Anmeldung löschen")
+            out.append({
+                "lva_nr": text(row.get("LVA-Nr.")) or None,
+                "type": text(row.get("Typ")),
+                "title": name,
+                "group": re.sub(r"^\((.*)\)$", r"\1", rest) or None,
+                "lecturers": [clean(s) for s in row["LeiterIn"].get_text("\n").split("\n") if clean(s)] if "LeiterIn" in row else [],
+                "ects": number(text(row.get("ECTS"))),
+                "status": text(row.get("Status")) or ("Angemeldet" if pending else None),
+                "since": iso(text(row.get("Zuteilung") or row.get("Anmeldedatum"))),
+                "course_class": text(row.get("Klasse")) or None,
+                "courseclass": cc.group(1) if cc else None,
+                "skz": text(row.get("SKZ")) or None,
+                "deregistration_deadline": iso(text(row.get("Abmeldefrist"))),
+                "can_deregister": bool(act and act.find(["input", "button"])),
+                "registration_deadline": iso(text(row.get("Anmeldeschluss"))),
+                "rank": text(row.get("Ränge")) or None,
+            })
+    return out
+
+
+def exams(soup: BeautifulSoup) -> list[dict]:
+    """The exam page after the search for max's courses: the exams he could register for (form examinationreg.action,
+    'Auswahl' a checkbox when he can, '--' when not) and the ones he is registered for (form examinationregunreg.action)."""
+    if not soup.find("h3", string=re.compile("Aktuelle Prüfungsanmeldungen")):
+        raise Unreadable("the exam page has no 'Aktuelle Prüfungsanmeldungen' heading")
+    out = []
+    for action, registered in (("examinationreg.action", False), ("examinationregunreg.action", True)):
+        form = soup.find("form", action=action)
+        if not form:
+            continue
+        exam = None
+        for tr in form.find_all("tr"):
+            m = EXAM_COURSE.match(text(tr.find("strong")))
+            if m:
+                tds = [text(td) for td in tr.find_all("td", recursive=False)]
+                day = next((t for t in tds if re.fullmatch(r"\d\d\.\d\d\.\d{4}", t)), "")
+                slot = re.search(r"(\d\d:\d\d)\s*-\s*(\d\d:\d\d)\s*Uhr\s*/\s*(.*)", next((t for t in tds if "Uhr" in t), ""))
+                exam = {"course": m.group(1), "lva_nr": lva_nr(m.group(2)), "semester": m.group(3), "date": iso(day),
+                        "start": f"{iso(day)}T{slot.group(1)}" if slot else None, "end": f"{iso(day)}T{slot.group(2)}" if slot else None,
+                        "place": slot.group(3) if slot else None, "capacity": None, "registrations": None,
+                        "registration_opens": None, "registration_closes": None, "deregistration_deadline": None,
+                        "status": "registered" if registered else "open" if tr.find("input", type="checkbox") else "closed", "notes": []}
+                out.append(exam)
+            elif exam and "TeilnehmerInnenzahl" in text(tr):
+                about = text(tr)
+                cap = re.search(r"TeilnehmerInnenzahl:\s*(\d+)", about)
+                count = re.search(r"Bisherige Anmeldungen:\s*(\d+)", about)
+                window = re.search(r"Anmeldezeitraum:\s*(.*?\d\d:\d\d)\s*-\s*(.*?\d\d:\d\d)", about)
+                exam |= {"capacity": int(cap.group(1)) if cap else None, "registrations": int(count.group(1)) if count else None,
+                         "registration_opens": iso(window.group(1)) if window else None,
+                         "registration_closes": iso(window.group(2)) if window else None,
+                         "deregistration_deadline": iso(about.split("Abmeldeschluss:", 1)[1]) if "Abmeldeschluss:" in about else None}
+                why = text(tr.find(class_="error_icon"))
+                if exam["status"] == "closed" and why:
+                    exam["status"] = "outside-window" if "Anmeldezeitraum" in why else "full"
+            elif exam and text(tr):
+                exam["notes"].append(text(tr))
+    return out
+
+
+def grades(soup: BeautifulSoup) -> list[dict]:
+    """'Notenauskunft', all months: each list (provisional, course grades, exams, recognised ones) under its own heading."""
+    out = []
+    for table in soup.find_all("table"):
+        first = table.find("tr")
+        if not first or [text(th) for th in first.find_all("th")][:3] != ["Datum", "Titel", "Note"]:
+            continue
+        kind = text(table.find_previous("h3"))
+        for row in header_rows(table):
+            m = EXAM_COURSE.match(text(row["Titel"]))
+            out.append({"kind": kind, "date": iso(text(row["Datum"])), "title": m.group(1) if m else text(row["Titel"]),
+                        "lva_nr": lva_nr(m.group(2)) if m else None, "semester": m.group(3) if m else None,
+                        "info": (m.group(4) or None) if m else None, "grade": text(row["Note"]),
+                        "course_class": text(row.get("Kurzbez.")) or None, "type": text(row.get("Typ")),
+                        "ects": number(text(row.get("ECTS"))), "sws": number(text(row.get("SWSt"))), "skz": text(row.get("SKZ")) or None})
+    if not out and "Keine Noten vorhanden" not in soup.get_text():
+        raise Unreadable("'Notenauskunft' has neither a grade list nor 'Keine Noten vorhanden'")
+    return out
+
+
+def fee(answer: dict) -> dict:
+    return {"semester": answer.get("termId"), "state": answer.get("state"), "paid": answer.get("state") == "PAID",
+            "owed": answer.get("obligationToPay"), "amount": answer.get("totalFeeAmount"), "payment_deadline": answer.get("paymentPeriodEnd")}
+
+
+def read_mine(k: Session, credentials: tuple[str, str], semester: str = "") -> dict:
+    """Everything `mine` prints. A part that cannot be read is left empty and listed under "gaps" with the reason."""
+    out: dict = {"semester": None, "courses": [], "exams": [], "fee": None, "grades": [], "gaps": []}
+
+    def part(name: str, read):
+        try:
+            return read()
+        except (requests.RequestException, Unreadable) as e:
+            out["gaps"].append({"where": name, "reason": str(e)})
+
+    def my_courses() -> tuple[str, list[dict]]:
+        soup = k.soup(ME + "assignment-results.action")
+        if semester and shown_semester(soup) != semester:
+            soup = k.soup(ME + "select-term.action", term=semester, reloadAction="assignment-results.action")
+            if shown_semester(soup) != semester:
+                raise Unreadable(f"KUSSS still shows {shown_semester(soup)} after switching to {semester}; it may not offer {semester}")
+        return shown_semester(soup), courses(soup)
+
+    out["semester"], out["courses"] = part("courses", my_courses) or (semester or None, [])
+    out["exams"] = part("exams", lambda: exams(k.soup(ME + "szsearchexam.action", search="true", searchType="mylvas"))) or []
+    out["grades"] = part("grades", lambda: grades(k.soup(ME + "gradeinfo.action"))) or []
+    out["fee"] = part("fee", lambda: fee(k.fee(*credentials)))
+    return out
+
+
+@dataclass
+class Mine:
+    semester: str = ""
+    """Semester whose courses to read, e.g. 2026S. Empty: the one KUSSS opens on, the current one."""
+
+
+@app.command(name="mine")
+def mine(args: Mine) -> None:
+    """Sign in as max and print, as JSON, his courses of a semester, his exams, his grades and the semester fee.
+
+    courses are 'Meine Anmeldungen' for the semester: allocated ones with KUSSS's status ("Zugeteilt"), and ones
+    registered but not yet allocated ("Angemeldet"). exams are every exam of his courses KUSSS offers, whatever
+    the semester, with his status: registered, open (he can register), full, outside-window, closed (KUSSS gives
+    no reason). grades are 'Notenauskunft' over all months. fee is myJKU's answer for the semester it is
+    collecting, which may not be --semester; paid is true only when myJKU says PAID.
+
+    Times are KUSSS's local time, as YYYY-MM-DD or YYYY-MM-DDTHH:MM. A part that could not be read is empty and
+    listed under gaps; then the command exits 1.
+
+    JSON schema:
+
+        {"semester": "2026W",
+         "courses": [{"lva_nr": "344.125", "type": "UE", "title": "str", "group": "str|null", "lecturers": ["str"],
+           "ects": 1.5, "status": "Zugeteilt|Angemeldet|...", "since": "time allocated or registered",
+           "course_class": "536MLPEREIU20", "courseclass": "46721", "skz": "536", "deregistration_deadline": "time|null",
+           "can_deregister": false, "registration_deadline": "time|null", "rank": "str|null"}],
+         "exams": [{"course": "str", "lva_nr": "365.074", "semester": "2026W", "date": "2027-02-04", "start": "time",
+           "end": "time", "place": "str", "capacity": "int|null (unlimited)", "registrations": 0,
+           "registration_opens": "time", "registration_closes": "time", "deregistration_deadline": "time",
+           "status": "registered|open|full|outside-window|closed", "notes": ["str"]}],
+         "fee": {"semester": "2026W", "state": "PAID|NOT_PAID|...", "paid": true, "owed": false, "amount": 0.0,
+           "payment_deadline": "str|null"},
+         "grades": [{"kind": "the list's heading", "date": "2026-07-27", "title": "str", "lva_nr": "str|null",
+           "semester": "str|null", "info": "str|null", "grade": "sehr gut", "course_class": "str", "type": "UE",
+           "ects": 1.5, "sws": 1.0, "skz": "536"}],
+         "gaps": [{"where": "courses|exams|grades|fee", "reason": "str"}]}
+    """
+    if args.semester and not re.fullmatch(SEMESTER, args.semester):
+        sys.exit(f"kusss: --semester {args.semester!r} is not a semester like 2026W or 2027S")
+    k, credentials = connect()
+    out = read_mine(k, credentials, args.semester)
+    print(jsonlib.dumps(out, indent=1, ensure_ascii=False))
+    for g in out["gaps"]:
+        print(f"kusss: {g['where']} could not be read: {g['reason']}", file=sys.stderr)
+    sys.exit(1 if out["gaps"] else 0)
 
 
 if __name__ == "__main__":

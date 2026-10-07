@@ -1,0 +1,323 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro", "requests", "beautifulsoup4", "lxml"]
+# ///
+"""Drive `kusss mine` without KUSSS. Run it directly; no framework.
+
+The promises here: signed in, the tool sends nothing that could act on KUSSS or myJKU (a
+course or exam (de)registration, a group pick, a change of study code, a deregistration from
+the degree, a logout, or a page it reads turned into one of those by a parameter), and posts
+no form but the sign-in's; "Meine Anmeldungen" reads as max's screenshot of it shows it, the
+distance-learning group and a course without sessions included; every exam of his courses
+comes with its window, its deregistration deadline and his status; a semester other than the
+current one is switched to, and one KUSSS does not switch to is a gap.
+
+The HTML fixtures are cut down from KUSSS's pages as they were on 2026-10-07, keeping the
+markup the parser reads; names and numbers that are max's own are replaced, and so are his
+grades.
+"""
+
+import importlib.util
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True  # importing bin/ must not leave a __pycache__ on $PATH
+loader = SourceFileLoader("kusss", str(ROOT / "bin" / "kusss"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec
+kusss = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = kusss  # dataclasses resolve string annotations through it
+loader.exec_module(kusss)
+ME, MYJKU = kusss.ME, kusss.MYJKU
+
+failures = 0
+
+
+def check(what: str, expected, actual) -> None:
+    global failures
+    if expected == actual:
+        print(f"ok   {what}")
+    else:
+        print(f"FAIL {what}\n       expected: {expected!r}\n       actual:   {actual!r}")
+        failures += 1
+
+
+def page(body: str) -> bytes:
+    """A KUSSS page as KUSSS sends it: ISO-8859-1, declared in a meta tag."""
+    return ('<html><head><meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" /></head><body>'
+            + body + "</body></html>").encode("iso-8859-1")
+
+
+class Wire:
+    """Stands in for the network: records every request, answers from a table of (method, url) -> (landing url, body)."""
+
+    def __init__(self, answers: dict[tuple[str, str], tuple[str, bytes | str]] | None = None):
+        self.sent: list[tuple[str, str, dict]] = []
+        self.answers = answers or {}
+        self.headers: dict = {}
+
+    def _answer(self, method: str, url: str, **kw):
+        sent = kw.get("params") or kw.get("data") or {}
+        self.sent.append((method, url, sent))
+        landing, body = self.answers.get((method, url), (url, b""))
+        if callable(body):
+            body = body(sent)
+        raw = body.encode() if isinstance(body, str) else body
+
+        class R:
+            def __init__(self):
+                self.url, self.content, self.status_code, self.encoding = landing, raw, 200, "iso-8859-1"
+
+            @property
+            def text(self):  # as requests decodes it: by .encoding, which a caller may overwrite
+                return raw.decode(self.encoding, errors="replace")
+
+            def raise_for_status(self): ...
+
+            def json(self):
+                import json
+                return json.loads(raw)
+        return R()
+
+    def get(self, url, **kw): return self._answer("GET", url, **kw)
+    def post(self, url, **kw): return self._answer("POST", url, **kw)
+
+
+def session(answers=None) -> tuple[object, Wire]:
+    k = kusss.Session()
+    k.s = Wire(answers)
+    return k, k.s
+
+
+def refused(fn) -> bool:
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+# --- nothing it sends can act (jarvis uni-and-admin-automation P2: it reads and never acts)
+
+k, wire = session()
+check("deregistering from a course is refused", True,
+      refused(lambda: k.get(ME + "results-cancel-assignment.action", courseId="344221,2026W")))
+check("registering for an exam is refused", True, refused(lambda: k.get(ME + "examinationreg.action", token="t")))
+check("deregistering from an exam is refused", True,
+      refused(lambda: k.get(ME + "examinationregunreg.action", **{"signoff_registration_action.1569853": "Abmelden"})))
+check("picking a course group is refused", True, refused(lambda: k.get(ME + "selectcoursegroup.action", coursegroupid="1")))
+check("changing a course registration's study code is refused", True,
+      refused(lambda: k.get(ME + "change-curriculum-of-lva-registration.action")))
+check("changing an exam registration's study code is refused", True,
+      refused(lambda: k.get(ME + "change-curr-of-student-examreg.action", examRegId="1569853")))
+check("deregistering from the degree is refused", True, refused(lambda: k.get(ME + "disenroll-study.action")))
+check("logging out is refused", True, refused(lambda: k.get(ME + "logout-confirm.action")))
+check("a semester switch that would run an action after it is refused", True,
+      refused(lambda: k.get(ME + "select-term.action", term="2026W", reloadAction="results-cancel-assignment.action")))
+check("a page it reads, with a parameter it does not send, is refused", True,
+      refused(lambda: k.get(ME + "assignment-results.action", courseId="344221,2026W")))
+check("a myJKU call other than the fee is refused", True, refused(lambda: k.get(MYJKU + "/api2/student/fee/payment")))
+check("no refused call reached the wire", [], wire.sent)
+
+IDP = "https://shibboleth.im.jku.at/idp/profile/SAML2/Redirect/SSO?execution=e1s1"
+k, wire = session({("GET", ME + "login.action"): (IDP, page(f'<form action="{ME}results-cancel-assignment.action?courseId=1" method="post"><input name="x"/></form>'))})
+check("a sign-in form that posts anywhere but JKU's login or a SAML endpoint is refused",
+      True, refused(lambda: k.sign_in("k12345678", "pw")))
+check("and is not posted", ["GET"], [m for m, _, _ in wire.sent])
+k, wire = session({("GET", ME + "assignment-results.action"): (ME + "assignment-results.action",
+                    page('<form action="results-cancel-assignment.action?courseId=1" method="post"><input type="submit" value="Abmelden"/></form>'))})
+r = k.get(ME + "assignment-results.action")
+wire.sent.clear()
+k.through_login(r, "k12345678", "pw")
+check("a KUSSS page's own forms are never posted by the sign-in", [], wire.sent)
+
+# --- the sign-in walks the JKU login's forms and nothing else
+
+SAML = "https://shibboleth.im.jku.at/idp/profile/SAML2/Redirect/SSO?execution=e1s2"
+k, wire = session({
+    ("GET", ME + "login.action"): (IDP, page('<form action="/idp/profile/SAML2/Redirect/SSO?execution=e1s1" method="post">'
+                                              '<input name="csrf_token" value="c"/><input name="j_username"/><input name="j_password"/></form>')),
+    ("POST", "https://shibboleth.im.jku.at/idp/profile/SAML2/Redirect/SSO?execution=e1s1"):
+        (SAML, page('<form action="https://www.kusss.jku.at/Shibboleth.sso/SAML2/POST" method="post"><input name="SAMLResponse" value="s"/><input name="RelayState" value="r"/></form>')),
+    ("POST", "https://www.kusss.jku.at/Shibboleth.sso/SAML2/POST"):
+        (ME + "studentwelcome.action", page('Username: K12345678 <a href="logout-confirm.action">Logout</a>')),
+})
+k.sign_in("k12345678", "pw")
+check("the sign-in posts the username to JKU's login, then the SAML response to KUSSS",
+      [("POST", "https://shibboleth.im.jku.at/idp/profile/SAML2/Redirect/SSO?execution=e1s1"), ("POST", "https://www.kusss.jku.at/Shibboleth.sso/SAML2/POST")],
+      [(m, u) for m, u, _ in wire.sent if m == "POST"])
+check("with the credentials", ("k12345678", "pw"), (wire.sent[1][2]["j_username"], wire.sent[1][2]["j_password"]))
+
+# --- "Meine Anmeldungen": what max's screenshot of 2026W shows
+
+MEINE_ANMELDUNGEN = """
+<h3><a name="reg">Angemeldete Lehrveranstaltungen für das Semester 2026W</a></h3>
+<table summary="Liste aller zugeteilten Lehrveranstaltungen">
+ <tr><th>Nr.</th><th><a href="#">Anmeldedatum</a></th><th><a href="#">SKZ</a></th><th><a href="#">Klasse</a></th><th><a href="#">Typ</a></th>
+  <th><a href="#">Titel</a></th><th>Ränge</th><th><a href="#">ECTS*</a></th><th><a href="#">Anmeldeschluss</a></th><th>Anmeldung löschen</th></tr>
+ <tr class="darkcell"><td colspan="10">Keine offenen Anmeldungen!</td></tr>
+</table>
+<h3><a name="fix">Zugeteilte Lehrveranstaltungen für das Semester  2026W</a></h3>
+<table>
+ <tr><th>Nr.</th><th><a href="#"><img src="/common/kusss/pics/sort_down.gif"/>Zuteilung</a></th><th><a href="#">SKZ</a></th><th><a href="#">Klasse</a></th>
+  <th><a href="#">Typ</a></th><th><a href="#">Titel</a></th><th nowrap="nowrap"><a href="#">LVA-Nr.</a></th><th>LeiterIn</th><th><a href="#">ECTS</a></th>
+  <th nowrap="nowrap"><a href="#">Status</a></th><th nowrap="nowrap"><a href="#ass_bonus">Warte-<br/>bonus**</a></th><th><a href="#">Abmeldefrist</a></th><th><a href="#abmeldinfo">Abmelden***</a></th></tr>
+ <tr class="darkcell"><td></td><td><nobr>30.09.26 13:34</nobr></td><td align="center">536</td><td>536MLPEREIU20</td><td align="center">UE </td>
+  <td><strong><a href="lvaregistrationlist.action?courseclass=46721" class="normallinkcyan">
+     Reinforcement Learning</a></strong>
+     (distance-learning group, Thursday 17:15 - 18:00)</td>
+  <td align="center"> 344.125 </td><td width="10%">Suhit Chiruthapudi</td><td align="center">1,50</td>
+  <td><span class="assignment-active">Zugeteilt</span></td><td align="center">= 1</td><td nowrap="nowrap">Keine Termine</td>
+  <td align="center"> Abmeldung nicht möglich! </td></tr>
+ <tr class="lightcell"><td></td><td><nobr>30.09.26 13:34</nobr></td><td align="center">536</td><td>536MATHAI3V19</td><td align="center">VL </td>
+  <td><strong><a href="lvaregistrationlist.action?courseclass=44793" class="normallinkcyan">Mathematics for AI III</a></strong></td>
+  <td align="center"> 357.260 </td><td width="10%">Luca Gerardo-Giorda</td><td align="center">6,00</td>
+  <td><span class="assignment-active">Zugeteilt</span></td><td align="center">= 1</td><td nowrap="nowrap">Di. 06.10.26 10:15</td>
+  <td align="center"> Abmeldung nicht möglich! </td></tr>
+ <tr class="darkcell"><td></td><td><nobr>30.09.26 13:34</nobr></td><td align="center">536</td><td>536MLPEMSTU19</td><td align="center">UE </td>
+  <td><strong><a href="lvaregistrationlist.action?courseclass=37358" class="normallinkcyan">Machine Learning: Supervised Techniques</a></strong></td>
+  <td align="center"> 365.304 </td><td width="10%">
+      Gianluca Galletti
+      <br/>
+      Maximilian Plattner
+  </td><td align="center">1,50</td>
+  <td><span class="assignment-active">Zugeteilt</span></td><td align="center">= 1</td><td nowrap="nowrap">Do. 15.10.26 10:15</td>
+  <td align="center"><form action="results-cancel-assignment.action?courseId=365304%2C2026W" method="post"><input type="submit" value="Abmelden" class="dangerousbuttonstyle"/></form></td></tr>
+</table>"""
+
+k, wire = session({("GET", ME + "assignment-results.action"): (ME + "assignment-results.action", page(MEINE_ANMELDUNGEN))})
+out = kusss.read_mine(k, ("k12345678", "pw"))
+check("the semester is the one the page shows, read through KUSSS's ISO-8859-1", "2026W", out["semester"])
+check("the 'no open registrations' row is no course", 3, len(out["courses"]))
+rl, maths, ml = out["courses"]
+check("the distance-learning UE reads as the screenshot shows it, its group text kept", {
+    "lva_nr": "344.125", "type": "UE", "title": "Reinforcement Learning", "group": "distance-learning group, Thursday 17:15 - 18:00",
+    "lecturers": ["Suhit Chiruthapudi"], "ects": 1.5, "status": "Zugeteilt", "since": "2026-09-30T13:34", "course_class": "536MLPEREIU20",
+    "courseclass": "46721", "skz": "536", "deregistration_deadline": None, "can_deregister": False, "registration_deadline": None, "rank": None}, rl)
+check("a course whose deadline passed has its deadline and cannot be deregistered", ("2026-10-06T10:15", False),
+      (maths["deregistration_deadline"], maths["can_deregister"]))
+check("a course with two lecturers lists both", ["Gianluca Galletti", "Maximilian Plattner"], ml["lecturers"])
+check("one with an Abmelden button can be deregistered until its deadline", ("2026-10-15T10:15", True),
+      (ml["deregistration_deadline"], ml["can_deregister"]))
+
+# A registration not yet allocated: no row of one was on KUSSS on 2026-10-07, so this one follows the table's header.
+PENDING = MEINE_ANMELDUNGEN.replace('<tr class="darkcell"><td colspan="10">Keine offenen Anmeldungen!</td></tr>',
+    '<tr class="darkcell"><td></td><td>08.09.26 07:01</td><td>536</td><td>536DASCMLTK24</td><td>KV</td>'
+    '<td><strong><a href="lvaregistrationlist.action?courseclass=37357">Machine Learning: Basic Techniques</a></strong></td>'
+    '<td>1</td><td>3,00</td><td>Fr. 25.09.26 23:59</td><td><form action="x" method="post"><input type="submit" value="Löschen"/></form></td></tr>')
+k, wire = session({("GET", ME + "assignment-results.action"): (ME + "assignment-results.action", page(PENDING))})
+pending = kusss.read_mine(k, ("k12345678", "pw"))["courses"][0]
+check("a registration not yet allocated is Angemeldet, with its rank and registration deadline",
+      ("Angemeldet", "Machine Learning: Basic Techniques", "1", "2026-09-25T23:59", True, None),
+      (pending["status"], pending["title"], pending["rank"], pending["registration_deadline"], pending["can_deregister"], pending["lva_nr"]))
+
+# --- another semester is switched to, and one KUSSS does not switch to is a gap
+
+k, wire = session({
+    ("GET", ME + "assignment-results.action"): (ME + "assignment-results.action", page(MEINE_ANMELDUNGEN)),
+    ("GET", ME + "select-term.action"): (ME + "assignment-results.action",
+                                          lambda sent: page(MEINE_ANMELDUNGEN.replace("2026W", sent["term"] if sent["term"] == "2026S" else "2026W"))),
+})
+check("--semester 2026S reads 2026S", "2026S", kusss.read_mine(k, ("k", "pw"), "2026S")["semester"])
+check("by switching to it", {"term": "2026S", "reloadAction": "assignment-results.action"},
+      next(p for m, u, p in wire.sent if u == ME + "select-term.action"))
+gone = kusss.read_mine(k, ("k", "pw"), "1999W")
+check("a semester KUSSS does not switch to leaves the courses empty and says why",
+      ([], ["courses"]), (gone["courses"], [g["where"] for g in gone["gaps"] if g["where"] == "courses"]))
+wire.sent.clear()
+kusss.read_mine(k, ("k", "pw"), "2026W")
+check("the current semester needs no switch", [], [u for _, u, _ in wire.sent if "select-term" in u])
+
+# --- exams: every exam of his courses, with his status
+
+EXAMS = """
+<h3>LVA-Prüfungsübersicht</h3>
+<form action="examinationreg.action" method="post"><input type="hidden" name="token" value="t"/>
+<table><tr align="left"><th>Auswahl</th><th>Prüfung</th><th>Datum</th><th>Zeit/Ort</th><th>SKZ</th></tr>
+ <tr class="darkcell"><td valign="top" rowspan="2"><input type="checkbox" name="examreg_action.273351"/></td>
+  <td><strong>Machine Learning: Basic Techniques
+     (365074,2026W)</strong></td><td>04.02.2027</td><td>15:30 - 17:00 Uhr/HS 1 </td>
+  <td><select name="skz.273351"><option value="376" selected="selected">033 536</option></select></td></tr>
+ <tr class="darkcell"><td colspan="4"><small>Maximale TeilnehmerInnenzahl: 200 &#8226; Bisherige Anmeldungen: 87
+   &#8226; Abmeldeschluss: Mo. 01.02.2027 23:59 <br/> Anmeldezeitraum: 03.08.2026 00:00 - 01.02.2027 23:59</small></td></tr>
+ <tr class="darkcell"><td colspan="5"></td></tr>
+ <tr class="lightcell"><td valign="top" rowspan="2">--</td>
+  <td><strong>Reinforcement Learning (344156,2026W)</strong></td><td>25.02.2027</td><td>13:45 - 15:15 Uhr/Linz/ Vienna/ Bregenz </td><td>--</td></tr>
+ <tr class="lightcell"><td colspan="4"><small>Maximale TeilnehmerInnenzahl: 100 &#8226; Bisherige Anmeldungen: 0
+   <span class="error_icon">&#8226; Abmeldeschluss: Do. 25.02.2027 13:45 <br/> Anmeldezeitraum: 04.02.2027 18:00 - 18.02.2027 13:45</span></small></td></tr>
+ <tr class="lightcell"><td colspan="5"></td></tr>
+ <tr class="darkcell"><td valign="top" rowspan="2">--</td>
+  <td><strong>Statistics for AI (366590,2026S)</strong></td><td>30.10.2026</td><td>12:00 - 13:30 Uhr/Vienna </td><td>--</td></tr>
+ <tr class="darkcell"><td colspan="4"><small><span class="error_icon">Maximale TeilnehmerInnenzahl: 65 &#8226; Bisherige Anmeldungen: 65</span>
+   &#8226; Abmeldeschluss: So. 25.10.2026 23:59 <br/> Anmeldezeitraum: 27.07.2026 00:00 - 25.10.2026 23:59</small></td></tr>
+ <tr class="darkcell"><td colspan="5">Gilt für [536]:<br/><span class="info_icon">Ein Hinweis zum Antritt.</span></td></tr>
+ <tr><td colspan="5" align="right"><input type="submit" value="Zur ausgewählten Prüfung ANMELDEN"/></td></tr>
+</table></form>
+<h3>Aktuelle Prüfungsanmeldungen</h3>
+<form action="examinationregunreg.action" method="post"><input type="hidden" name="token" value="t"/>
+<table><tr><td colspan="5"><a href="ical-multi-form-sz.action"><img src="/common/kusss/pics/icon_ical.gif"/></a></td></tr>
+ <tr align="left"><th>Prüfung</th><th>Datum</th><th>Zeit/Ort</th><th>SKZ</th><th>An-/Abmelden</th></tr>
+ <tr class="darkcell"><td><strong>Statistics for AI  (366595,2026S)</strong></td><td><o>30.10.2026<o></td>
+  <td><o>14:45 -
+     16:15 Uhr/JKU HS1 <o></td><td><o>033 536 <a href="change-curr-of-student-examreg.action?examRegId=1569853"><img/></a><o></td>
+  <td><input type="submit" name="signoff_registration_action.1569853" value="Abmelden"/></td></tr>
+ <tr class="darkcell"><td colspan="5"><o>Maximale TeilnehmerInnenzahl: unbeschränkt &#8226; Bisherige Anmeldungen: 37
+   &#8226; Abmeldeschluss: So. 25.10.2026 23:59 Anmeldezeitraum: Mo. 27.07.2026 00:00 - So. 25.10.2026 23:59</o></td></tr>
+ <tr class="darkcell"><td colspan="5"></td></tr>
+</table></form>"""
+
+k, wire = session({("GET", ME + "szsearchexam.action"): (ME + "szsearchexam.action", page(EXAMS))})
+got = kusss.read_mine(k, ("k", "pw"))["exams"]
+check("an exam he can register for, with its window and deregistration deadline", {
+    "course": "Machine Learning: Basic Techniques", "lva_nr": "365.074", "semester": "2026W", "date": "2027-02-04",
+    "start": "2027-02-04T15:30", "end": "2027-02-04T17:00", "place": "HS 1", "capacity": 200, "registrations": 87,
+    "registration_opens": "2026-08-03T00:00", "registration_closes": "2027-02-01T23:59", "deregistration_deadline": "2027-02-01T23:59",
+    "status": "open", "notes": []}, got[0])
+check("one whose window has not opened is outside-window", ("outside-window", "2027-02-04T18:00", "2027-02-18T13:45"),
+      (got[1]["status"], got[1]["registration_opens"], got[1]["registration_closes"]))
+check("a full one is full, and keeps KUSSS's note", ("full", 65, ["Gilt für [536]: Ein Hinweis zum Antritt."]),
+      (got[2]["status"], got[2]["registrations"], got[2]["notes"]))
+check("one he is registered for is registered, unlimited seats as null", {
+    "course": "Statistics for AI", "lva_nr": "366.595", "semester": "2026S", "date": "2026-10-30", "start": "2026-10-30T14:45",
+    "end": "2026-10-30T16:15", "place": "JKU HS1", "capacity": None, "registrations": 37, "registration_opens": "2026-07-27T00:00",
+    "registration_closes": "2026-10-25T23:59", "deregistration_deadline": "2026-10-25T23:59", "status": "registered", "notes": []}, got[3])
+check("the exam search goes out as a GET with exactly its two parameters",
+      [{"search": "true", "searchType": "mylvas"}], [p for m, u, p in wire.sent if u == ME + "szsearchexam.action" and m == "GET"])
+
+# --- grades and the fee
+
+GRADES = """
+<h3>Vorläufige Lehrveranstaltungsbeurteilungen</h3>
+<table><tr><th><abbr>Datum</abbr></th><th><strong><abbr><strong>Titel</strong></abbr></strong></th><th><abbr>Note</abbr></th><th><abbr>Kurzbez.</abbr></th>
+ <th><abbr>Typ</abbr></th><th><abbr>ECTS</abbr></th><th><abbr>SWSt</abbr></th><th><abbr>SKZ</abbr></th></tr>
+ <tr class="darkcell"><td colspan="8">Keine Noten vorhanden</td></tr></table>
+<h3>Lehrveranstaltungsbeurteilungen</h3>
+<table><tr><th>Datum</th><th>Titel</th><th>Note</th><th>Kurzbez.</th><th>Typ</th><th>ECTS</th><th>SWSt</th><th>SKZ</th></tr>
+ <tr><td>30.01.2026</td><td>Algorithmen und Datenstrukturen 2 (340328,2025W) Programmiersprache: Python</td><td>gut</td><td>INBIPUEALG2</td><td>UE</td><td>1,50</td><td>1,00</td><td>536</td></tr></table>
+<h3>Anerkannte Beurteilungen</h3>
+<table><tr><th>Datum</th><th>Titel</th><th>Note</th><th>Kurzbez.</th><th>Typ</th><th>ECTS</th><th>SWSt</th><th>SKZ</th></tr>
+ <tr><td>24.11.2025</td><td>Technology and Society (anerkannt)</td><td>mit Erfolg teilgenommen</td><td>536AISOTASK19</td><td>KV</td><td>3,00</td><td>2,00</td><td>536</td></tr></table>"""
+FEE = '{"state":"PAID","urlZulassung":"","termId":"2026W","obligationToPay":false,"totalFeeAmount":0.0,"paymentPeriodEnd":null}'
+k, wire = session({
+    ("GET", ME + "gradeinfo.action"): (ME + "gradeinfo.action", page(GRADES)),
+    ("GET", ME + "outbound/myjku/fee"): (MYJKU + "/fee", "<html>myJKU</html>"),
+    ("GET", MYJKU + "/api2/student/fee"): (MYJKU + "/api2/student/fee", FEE),
+})
+out = kusss.read_mine(k, ("k", "pw"))
+check("each grade carries its list, its course number and semester, and what follows them", [
+    {"kind": "Lehrveranstaltungsbeurteilungen", "date": "2026-01-30", "title": "Algorithmen und Datenstrukturen 2", "lva_nr": "340.328",
+     "semester": "2025W", "info": "Programmiersprache: Python", "grade": "gut", "course_class": "INBIPUEALG2", "type": "UE", "ects": 1.5, "sws": 1.0, "skz": "536"},
+    {"kind": "Anerkannte Beurteilungen", "date": "2025-11-24", "title": "Technology and Society (anerkannt)", "lva_nr": None, "semester": None,
+     "info": None, "grade": "mit Erfolg teilgenommen", "course_class": "536AISOTASK19", "type": "KV", "ects": 3.0, "sws": 2.0, "skz": "536"},
+], out["grades"])
+check("the fee as myJKU reports it", {"semester": "2026W", "state": "PAID", "paid": True, "owed": False, "amount": 0.0, "payment_deadline": None}, out["fee"])
+check("pages that are not what it reads are gaps, not empty lists passed off as none",
+      ["courses", "exams"], [g["where"] for g in out["gaps"]])
+k, wire = session({("GET", ME + "outbound/myjku/fee"): ("https://shibboleth.im.jku.at/idp/profile/SAML2/Redirect/SSO?execution=e2s1", page("Login to myJKU"))})
+out = kusss.read_mine(k, ("k", "pw"))
+check("a myJKU sign-in that does not reach myJKU is a gap", (None, True), (out["fee"], any(g["where"] == "fee" for g in out["gaps"])))
+
+sys.exit(1 if failures else 0)
