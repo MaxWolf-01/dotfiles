@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Stress this machine's RAM with stressapptest and say whether it held.
+#
+# stressapptest fills a block of RAM with known bit patterns, copies it between
+# regions on every core at full memory bandwidth, and checks each block after
+# each copy. A miscompare is a bit the RAM did not keep. Faulty RAM writes
+# silently wrong data into everything the machine saves, backups included, and
+# nothing else here notices: pc's failing SODIMMs (2026-09/10) went 11 days
+# before anyone looked, and this test found them within 2 seconds.
+
+set -uo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: memory-test [--mb N] [--seconds N] [--record]
+
+Runs stressapptest on N MB (default 6000) for N seconds (default 600). It
+claims at most what /proc/meminfo calls available minus 2 GiB, so whatever
+else runs keeps its memory; with less than 1 GiB left to claim it skips.
+
+  --record  append the run to ~/logs/runs/memory-test.jsonl (bin/run-log) and
+            mail a failure through bin/alert-send. The weekly unit passes it.
+
+Exits 0 when the RAM held or the run skipped, 1 when stressapptest found
+errors, 2 when the test itself could not run or gave no verdict.
+EOF
+}
+
+mb=6000
+seconds=600
+record=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --mb) mb="${2:?--mb needs a value}"; shift 2 ;;
+        --seconds) seconds="${2:?--seconds needs a value}"; shift 2 ;;
+        --record) record=1; shift ;;
+        *) echo "memory-test: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+# Reached relative to this script: the unit pins its own PATH without ~/bin.
+bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+host=$(uname -n)
+
+log_run() {  # outcome reason stats
+    [ "$record" = 1 ] || return 0
+    local args=(memory-test "$1" --stats "$3")
+    [ -n "$2" ] && args+=(--reason "$2")
+    "$bin_dir/run-log" "${args[@]}" || true
+}
+
+avail_mb=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
+if [ "$mb" -gt $((avail_mb - 2048)) ]; then
+    mb=$((avail_mb - 2048))
+fi
+if [ "$mb" -lt 1024 ]; then
+    reason="only ${avail_mb} MB available, too little to test"
+    echo "memory-test: skipping: $reason"
+    log_run skip "$reason" "$(jq -nc --argjson available_mb "$avail_mb" '$ARGS.named')"
+    exit 0
+fi
+
+if ! command -v stressapptest >/dev/null; then
+    echo "memory-test: stressapptest is not on PATH" >&2
+    log_run fail "stressapptest is not on PATH" '{}'
+    exit 2
+fi
+
+echo "memory-test: ${mb} MB for ${seconds} s"
+out=$(stressapptest -M "$mb" -s "$seconds" 2>&1)
+status=$(grep -m1 -o 'Status: [A-Z]*' <<<"$out" | cut -d' ' -f2)
+incidents=$(sed -nE 's/.*with ([0-9]+) hardware incidents.*/\1/p' <<<"$out" | tail -1)
+stats=$(jq -nc --argjson mb "$mb" --argjson seconds "$seconds" --argjson incidents "${incidents:-null}" '$ARGS.named')
+grep -E 'Status|Stats: Completed' <<<"$out"
+
+case "$status" in
+    PASS)
+        log_run ok "" "$stats"
+        exit 0 ;;
+    FAIL)
+        if [ "$record" = 1 ]; then
+            {
+                echo "stressapptest found ${incidents} errors in ${mb} MB over ${seconds} s on ${host}."
+                echo "Everything ${host} writes may carry flipped bits until its RAM is replaced."
+                echo
+                grep -m 20 'Hardware Error' <<<"$out"
+            } | "$bin_dir/alert-send" "❌ memory-test: ${host}'s RAM fails, ${incidents} errors" \
+                && alert=fail || alert="fail (undelivered)"
+            stats=$(jq -c --arg alert "$alert" '. + {alert: $alert}' <<<"$stats")
+        fi
+        log_run fail "stressapptest found ${incidents} errors" "$stats"
+        exit 1 ;;
+    *)
+        echo "memory-test: stressapptest gave no verdict:" >&2
+        tail -5 <<<"$out" >&2
+        log_run fail "stressapptest gave no verdict" "$stats"
+        exit 2 ;;
+esac
