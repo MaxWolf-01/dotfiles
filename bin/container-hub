@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["tyro"]  # diffview's too, whose module this loads
+# dependencies = ["tyro", "pyyaml", "markdown-it-py"]  # diffview's and the session page reader's too, whose modules this loads
 # ///
 """The container hub: one local server for every page an agent opens, and the one hub tab that shows them, a unit per orchestrator.
 
@@ -15,13 +15,22 @@ of the ticket a page of it names (`agent/show/<slug>/`, `agent/prototypes/<slug>
 `agent/tickets/<slug>.md`), its short id (its name in the registry while it runs), and the first 8 characters of its
 session id, the whole id on hover and copied by a click.
 
-The hub tab (`/`) shows every unit, switched between on its rail. The rail numbers the units whose sessions run
-by recency: 1 is the session that most recently finished a turn, busy sessions after idle ones. A turn's end is
-when the session's page was last rendered, or when the registry (`~/.claude*/sessions/<pid>.json`) last marked
-the session idle. A unit whose session's process has exited leaves the numbers for the ended list, and gets one
-again when the session is resumed; one dismissed with its ✕, or with ctrl+alt+d while in it, is out of them until its
-session next finishes a turn. The loose pages, of no session, have no number. A unit goes once its tree is retired,
-or, with no tree, once every page of it is deleted.
+The hub tab (`/`) shows every unit, switched between on its rail. The rail numbers the units whose sessions run:
+first the idle sessions that need you (below), then the rest of those not at work, then the busy, each the latest
+turn's end first. 1 is the session that most recently finished a turn of those that need you, or, where
+none does, of those not at work. A turn's end is when the session's page was last rendered, or when the registry
+(`~/.claude*/sessions/<pid>.json`) last marked the session idle. A unit whose session's process has exited leaves
+the numbers for the ended list, and gets one again when the session is resumed; one dismissed with its ✕, or with
+ctrl+alt+d while in it, is out of them until its session next finishes a turn. The loose pages, of no session, have
+no number. A unit goes once its tree is retired, or, with no tree, once every page of it is deleted.
+
+A unit's mark on the rail is its session's state: a ring while it works, red while it is blocked in its terminal,
+and while it is idle, a filled dot where it needs you and a hollow one where it does not. An idle session needs you
+when its session page has a question no later turn answered or superseded, or a turn record written since you last
+visited its unit; a session idle on a worker or a run, whose turns since were chat turns, does not. Under its title
+is its status line: the headline of its newest turn, a turn record's heading or the first line of a chat turn. Both
+are read from the session's page directory by the newest mx plugin's own reader; with no plugin installed, every
+idle session's dot is hollow and none has a status line.
 
 The rail's search box (ctrl+alt+f) finds a unit, ended ones included, as fzf finds a line of its title, short id and
 session id, a prefix of either id first, and enter goes to the one picked.
@@ -119,7 +128,8 @@ none.
                               first; and each account's 5h and weekly usage, as the statusline last had them.
     GET  /api/u/<key>         one unit: {"unit", "session", "account", "title", "short", "tree", "repo", "state", "waiting_for",
                               "pane", "context" (its running session's context use, as the statusline last had it),
-                              "last", "number", "board", "worked_on" (the tickets the board marks),
+                              "last", "number", "status_line", "needs_you" ({"questions", "unseen"}, where it
+                              needs you), "board", "worked_on" (the tickets the board marks),
                               "dismissed", "members": [{"id", "url", "closed", "lane", "tab"?, ...}], "pages",
                               ...}. A member's url is where the hub serves it, relative to here, and its "tab" why it
                               refuses to be framed, where it does. "pages" is every page
@@ -163,7 +173,8 @@ import threading
 import time
 import urllib.parse
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -241,9 +252,14 @@ def tracker_command() -> str | None:
     """`tracker` from the mx plugin: on PATH inside a Claude Code session, under the plugin cache otherwise."""
     if found := shutil.which("tracker"):
         return found
-    scripts = HOME.glob(".claude*/plugins/cache/*/mx/*/skills/tracker/tracker.py")
+    return str(mx_script("tracker/tracker.py") or "") or None
+
+
+def mx_script(script: str) -> Path | None:
+    """A script of the newest mx plugin under the plugin cache, by its path under the plugin's `skills/`."""
+    scripts = HOME.glob(f".claude*/plugins/cache/*/mx/*/skills/{script}")
     version = lambda p: tuple(int(x) if x.isdigit() else 0 for x in p.parents[2].name.split("."))
-    return str(max(scripts, key=version, default="")) or None
+    return max(scripts, key=version, default=None)
 
 
 def signature(root: Path) -> tuple:
@@ -1032,6 +1048,7 @@ def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, d
     account = entry["account"] if entry else account_of(kept_at.parent.parent.parent) if kept_at else None
     state = None if not session else entry.get("status", "idle") if entry else "ended"
     last = last_turn(session_page, entry)
+    said = page_says(session_page.parent if session_page and session_page.is_file() else None, page_reader(memo))
     title = ((session_dir and session_title(session_dir)) or (session and claude_title(session, memo)) or (entry or {}).get("name")
              or (f"session {session[:8]}" if session else "loose pages"))
     board = tracker.agent / "board.html" if tracker else None
@@ -1042,6 +1059,7 @@ def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, d
             "context": contexts.get(session) if entry else None,
             "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
             "first": min(m["first"] for m in kept), "visited": data.get("visited") or 0,
+            "status_line": said["status_line"], "needs_you": needs_you(state, said, data.get("visited") or 0),
             "resume": resume_command(session) if session else "", "tickets": tickets, "pages": pages, "members": members,
             "board": page_of_path(board).url if board and board.is_file() else None,
             "worked_on": [s for s in committed if tracker.tickets[s]["status"] != "done"],  # what is done is worked on no more
@@ -1132,6 +1150,69 @@ def last_turn(session_page: Path | None, entry: dict | None) -> float:
     return max(times, default=0)
 
 
+PAGE_SAYS: dict[Path, tuple[tuple, dict]] = {}
+NOTHING_SAID = {"questions": 0, "recorded": 0, "status_line": ""}
+
+
+def page_says(directory: Path | None, reader) -> dict:
+    """What a session's page directory says it needs: how many questions are open, by the reader's own rule, when
+    the newest turn record was written, and the status line, the newest turn's headline: a turn record's H1, or
+    the first line of a chat turn's reply. A record's time is its file's, which the transcript would only confirm
+    at the cost of reading all of it. Read again only once a record, or the reader, has changed."""
+    if not reader or not directory:
+        return NOTHING_SAID
+    try:
+        records = {p: p.stat() for p in sorted((directory / "turns").glob("*.md"))}
+    except OSError:  # one gone between the glob and the stat: read at the next look
+        return PAGE_SAYS.get(directory, ((), NOTHING_SAID))[1]
+    signature = (reader.__file__, *((p.name, st.st_mtime_ns, st.st_size) for p, st in records.items()))
+    if (hit := PAGE_SAYS.get(directory)) and hit[0] == signature:
+        return hit[1]
+    written = lambda t: datetime.fromtimestamp(records[t.path].st_mtime, UTC) if t.path in records else None
+    try:
+        session = reader.read_session(directory, Path(os.devnull))
+        turns = [replace(t, written=written(t)) for t in session.turns]
+        newest = reader.in_order(turns, list(session.chats))[-1:]
+    except (reader.RecordError, OSError) as e:  # a record the reader refuses, which the session's own hooks send back
+        print(f"reading {directory}: {e}", file=sys.stderr, flush=True)
+        said = NOTHING_SAID
+    else:
+        said = {"questions": len(reader.open_questions(session)),
+                "recorded": max((t.written.timestamp() for t in turns if t.written), default=0),
+                "status_line": "" if not newest else plain(reader, first_line(newest[0].reply) if isinstance(newest[0], reader.Chat)
+                                                           else newest[0].headline)}
+    PAGE_SAYS[directory] = signature, said
+    return said
+
+
+BLOCK_MARKER = re.compile(r"^(?:#+|>|[-*+]|\d+\.)\s+")
+
+
+def first_line(markdown: str) -> str:
+    """A chat reply's first line of prose, without the heading, list or quote marker it opens with: nothing in a code
+    block is prose."""
+    fenced = False
+    for line in map(str.strip, markdown.splitlines()):
+        if line.startswith("```"):
+            fenced = not fenced
+        elif line and not fenced:
+            return BLOCK_MARKER.sub("", line)
+    return ""
+
+
+def plain(reader, markdown: str) -> str:
+    """One line of markdown as text, rendered as the session page renders a headline, then stripped of its tags."""
+    return reader.strip_tags(reader.inline(markdown, paths=False)).strip()
+
+
+def needs_you(state: str | None, said: dict, visited: float) -> dict | None:
+    """Why an idle session needs the user: its open questions, and whether a turn record was written since they last
+    visited its unit. None where nothing does, and for a session in any other state: a busy one shows busy, and a
+    blocked one its block."""
+    unseen = said["recorded"] > visited
+    return {"questions": said["questions"], "unseen": unseen} if state == "idle" and (said["questions"] or unseen) else None
+
+
 def hub_view() -> dict:
     """Every unit that is still there, in the rail's order, as the module's docstring gives it."""
     live, memo, inputs = registry(), {}, statusline_inputs()
@@ -1146,7 +1227,7 @@ def hub_view() -> dict:
         if view:
             units.append(view)
     numbered = sorted((u for u in units if u["session"] and u["state"] != "ended" and not u["dismissed"]),
-                      key=lambda u: (u["state"] in WORKING, -u["last"]))
+                      key=lambda u: (not u["needs_you"], u["state"] in WORKING, -u["last"]))
     for n, u in enumerate(numbered, 1):
         u["number"] = n
     # the dismissed, then the loose pages, then the ended, each the latest first
@@ -1373,6 +1454,42 @@ def load_diffview():
 
 
 diffview = load_diffview()
+
+
+READERS: dict[Path, object] = {}
+"""The session page's reader, by the path it was loaded from, or None where that one could not be used."""
+loading = threading.Lock()
+READS = ("read_session", "in_order", "open_questions", "Chat", "RecordError", "inline", "strip_tags")
+"""What the hub uses of the reader: an mx plugin from before chat turns has no `in_order` and no `Chat`."""
+
+
+def page_reader(memo: dict):
+    """The session page's own reader, from the newest mx plugin, so that the rail counts a question open as the page
+    shows it. Looked for once per read of the hub, so a plugin update reaches the rail without a restart; None
+    where no plugin has one the hub can use."""
+    if "reader" not in memo:
+        path = mx_script("session-page/session_page.py")
+        with loading:  # two reads of the hub at once load it once
+            if path and path not in READERS:
+                READERS[path] = load_page_reader(path)
+        memo["reader"] = READERS.get(path)
+    return memo["reader"]
+
+
+def load_page_reader(path: Path):
+    spec = importlib.util.spec_from_file_location("session_page", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True  # its cache would land in the plugin's directory
+    sys.modules.pop("tracker", None)  # the reader imports its own plugin's tracker, not an older one's
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        print(f"loading {path}: {e}", file=sys.stderr, flush=True)
+        return None
+    if missing := [name for name in READS if not hasattr(module, name)]:
+        print(f"{path} has no {', '.join(missing)}: the rail marks no session as needing you", file=sys.stderr, flush=True)
+        return None
+    return module
 
 
 # First in every page the hub serves, so the hub tab (wcCatch) has the page's links before any of them can be clicked.
