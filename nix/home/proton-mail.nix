@@ -3,7 +3,10 @@
 # (bin/proton-mail-mirror, on a timer in timers.nix), and notmuch indexes it.
 # The mirror also writes ~/data/proton-mail.headers.jsonl, the headers lifelog's
 # mail view reads, outside the Maildir and so outside the backup: deleting it
-# costs the next pull a full read. The Maildir is plain files, one per message
+# costs the next pull a full read. Beside it, proton-mail.arrivals.jsonl keeps
+# when each mail first reached the mirror, which no copy says once a mail has
+# moved folders; deleting it makes each mail moved before then arrive anew once,
+# and Jarvis read it again as unread. The Maildir is plain files, one per message
 # with its attachments inside, so it reads without Proton or Bridge, and restic
 # backs it up.
 #
