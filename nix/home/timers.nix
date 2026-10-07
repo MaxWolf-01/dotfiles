@@ -436,8 +436,8 @@ in
         "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets jku ${secrets}/scripts/jku-collect --record";
-      # The collector stops each read at its own budget, the longest Moodle's first
-      # snapshot; this is for the collector itself hanging.
+      # jku-collect's own budgets add up to 155 min (KUSSS_BUDGET 5, MOODLE_FIRST_BUDGET
+      # 150); the rest is for the collector itself hanging.
       TimeoutStartSec = "165min";
     };
   };
