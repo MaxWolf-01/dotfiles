@@ -137,10 +137,6 @@
         event = "prepare-commit-msg";
         command = "${../../git/hooks/claude-session-trailer}";
       };
-      hook.dispatch-fuzz-forward = {
-        event = "pre-push";
-        command = "${../../git/hooks/dispatch-fuzz-forward-pre-push}";
-      };
     };
   };
 
