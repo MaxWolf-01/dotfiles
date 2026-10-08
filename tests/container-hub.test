@@ -50,6 +50,8 @@ ASKER = "efefefef-0000-4000-8000-000000000009"  # writes turn records with quest
 CONTINUER = "12121212-0000-4000-8000-00000000000a"  # continues from its handoff
 CONTINUED = "34343434-0000-4000-8000-00000000000b"  # the session its /clear starts
 STALLED = "56565656-0000-4000-8000-00000000000c"  # a session a /clear starts blocked
+DOUBLED = "78787878-0000-4000-8000-000000000010"  # runs in two tmux panes at once
+STRAY = "9a9a9a9a-0000-4000-8000-000000000011"  # in the registry alone, with no unit
 
 failures = 0
 
@@ -73,12 +75,15 @@ def env(**extra: str) -> dict:
 
 
 # Every tmux call, the hub's and the test's, goes through a tmux that passes on only those naming the test's own
-# server's socket, and records the rest: nothing here may reach a server the test did not start.
+# server's socket, and records the rest: nothing here may reach a server the test did not start. It logs the command
+# of each it passes on, so a check can say which the hub ran.
 TMUX_SOCKET = SCRATCH / "tmux.sock"
 TMUX_REFUSED = SCRATCH / "tmux-refused"
+TMUX_CALLS = SCRATCH / "tmux-calls"
 TMUX = SCRATCH / "shim" / "tmux"
 TMUX.parent.mkdir()
 TMUX.write_text(f"""#!/usr/bin/env bash
+[ "$1" = -S ] && printf '%s\\n' "$3" >> {shlex.quote(str(TMUX_CALLS))}
 [ "$1" = -S ] && [ "$2" = {shlex.quote(str(TMUX_SOCKET))} ] && exec {shlex.quote(shutil.which("tmux"))} "$@"
 printf '%s\\n' "$*" >> {shlex.quote(str(TMUX_REFUSED))}
 exit 1
@@ -131,14 +136,15 @@ SELF_STARTED = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
 
 def registered(session: str, status: str = "idle", at: float | None = None, pid: int | None = None,
                started: str | None = SELF_STARTED, name: str | None = None, tmux: str | None = None,
-               waiting_for: str | None = None, cwd: Path | None = None) -> None:
+               waiting_for: str | None = None, cwd: Path | None = None, file: str | None = None) -> None:
     """The session's file in the registry, as Claude Code writes it while the session's process runs: by default
-    this test's own process, which runs for as long as the hub reads it."""
+    this test's own process, which runs for as long as the hub reads it. A second process of the session has a file
+    of its own."""
     entry = {"pid": pid or os.getpid(), "sessionId": session, "status": status,
              "statusUpdatedAt": int((at or time.time()) * 1000), **({"procStart": started} if started else {}),
              **({"name": name} if name else {}), **({"tmux": tmux} if tmux else {}),
              **({"waitingFor": waiting_for} if waiting_for else {}), **({"cwd": str(cwd)} if cwd else {})}
-    path = HOME / ".claude" / "sessions" / f"{session[:8]}.json"  # named by the pid there; any name reads alike
+    path = HOME / ".claude" / "sessions" / f"{file or session[:8]}.json"  # named by the pid there; any name reads alike
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entry))
 
@@ -740,6 +746,111 @@ try:
     registered(ANSWERER, pid=gone_process.pid, started=None, tmux=f"answering:@0.{pane}")
     status_code, answer = typed({"text": "hello"})
     check("an ended session is sent nothing", (409, True), (status_code, "ended" in answer.get("error", "")))
+
+    # --- going to a session's tmux pane from its unit, and closing it there. DOUBLED runs in two panes: under a shell
+    # in one, as Claude Code runs under the pane's zsh, and as the pane's own process in another. A third pane holds
+    # neither, and the clients start out in another tmux session.
+    tmux("-f", "/dev/null", "new-session", "-d", "-s", "working", "-x", "100", "-y", "20", "sh -c 'sleep 600; true'")
+    clients = []
+    try:
+        tmux("new-window", "-d", "-t", "working:", "sleep 600")
+        tmux("new-window", "-d", "-t", "working:", "sleep 600")
+        tmux("new-session", "-d", "-s", "elsewhere", "-x", "100", "-y", "20", "sleep 600")
+        rows = [r.split() for r in tmux("list-panes", "-s", "-t", "working", "-F", "#{window_id} #{pane_id} #{pane_pid}").splitlines()]
+        (shell_window, shell_pane, shell_pid), (own_window, own_pane, own_pid), (_, bystander, _) = rows
+        deadline = time.monotonic() + 10
+        while not (child := subprocess.run(["pgrep", "-P", shell_pid], capture_output=True, text=True).stdout.split()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        under_shell = int(child[0])
+        start_of = lambda pid: Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+        def doubled(first: str = "idle", second: str = "idle", **extra) -> None:
+            registered(DOUBLED, first, pid=under_shell, started=start_of(under_shell), tmux=f"working:{shell_window}.{shell_pane}", file="first", **extra)
+            registered(DOUBLED, second, pid=int(own_pid), started=start_of(own_pid), tmux=f"working:{own_window}.{own_pane}", file="second")
+
+        doubled()
+        open_page(page(HOME / "notes" / "doubled.html"), DOUBLED)
+        check("a unit names every tmux pane its session runs in, in the order of their ids",
+              [f"working:{shell_window}.{shell_pane}", f"working:{own_window}.{own_pane}"], view(DOUBLED)[1]["panes"])
+        panes = lambda: sorted(tmux("list-panes", "-a", "-F", "#{session_name} #{window_id} #{pane_id}").splitlines())
+        on_client = lambda name: next(
+            (r.split()[1:] for r in tmux("list-clients", "-F", "#{client_name} #{session_name} #{pane_id}").splitlines() if r.split()[0] == name), None)
+        acted = lambda: {"switch-client", "kill-pane", "load-buffer", "paste-buffer", "send-keys", "select-pane", "select-window",
+                         "kill-window", "kill-session", "kill-server"} & set(TMUX_CALLS.read_text().split())
+        pane_route = lambda route, unit=DOUBLED, token=token: request("POST", route, {"unit": unit}, {"Origin": ORIGIN, "X-Hub-Token": token})
+
+        def refused(what: str, route: str, words: str, unit: str = DOUBLED) -> None:
+            """The route refuses, says why in words the unit shows, and runs nothing in tmux that changes anything."""
+            TMUX_CALLS.write_text("")
+            status_code, answer = pane_route(route, unit)
+            check(what, (409, True, set()), (status_code, words in answer.get("error", ""), acted()))
+
+        all_panes = panes()
+        refused("a jump with no tmux client attached goes nowhere, and says so", "/api/jump", "no tmux client")
+        check("...and changes no pane", all_panes, panes())
+
+        def attach() -> str:
+            """A tmux client on the elsewhere session, under `script` for the terminal a client needs, as the user's
+            terminal is one. Its name is its terminal's."""
+            known = set(tmux("list-clients", "-F", "#{client_name}").split())
+            clients.append(subprocess.Popen(["timeout", "300", "script", "-qfc", shlex.join([str(TMUX), "-S", str(TMUX_SOCKET), "attach", "-t", "elsewhere"]), "/dev/null"],
+                                            env={**ENV, "TERM": "xterm"}, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
+            deadline = time.monotonic() + 10
+            while not (new := set(tmux("list-clients", "-F", "#{client_name}").split()) - known) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            return new.pop()
+
+        earlier = attach()
+        time.sleep(1.1)  # tmux keeps a client's last activity in whole seconds
+        latest = attach()
+        status_code, answer = pane_route("/api/jump")
+        check("a jump puts the client used last on the session's first pane, its tmux session and window with it",
+              (200, ["working", shell_pane], ["working", shell_window, shell_pane]),
+              (status_code, on_client(latest), tmux("display-message", "-p", "-c", latest, "#{session_name} #{window_id} #{pane_id}").split()))
+        check("...and leaves the other client, and every pane, where they were", (["elsewhere", tmux("display-message", "-p", "-t", "elsewhere:", "#{pane_id}")], all_panes),
+              (on_client(earlier), panes()))
+        check("the next jump goes to the session's second pane, the unit saying it runs in two", (200, own_pane, 2, ["working", own_pane]),
+              (*(lambda r: (r[0], r[1].get("pane"), r[1].get("of")))(pane_route("/api/jump")), on_client(latest)))
+        check("...and the one after that back to the first", (200, ["working", shell_pane]), (pane_route("/api/jump")[0], on_client(latest)))
+        doubled("waiting", waiting_for="permission prompt")
+        check("a blocked session is gone to all the same, to answer it there", (200, ["working", own_pane]), (pane_route("/api/jump")[0], on_client(latest)))
+
+        TMUX_CALLS.write_text("")
+        check("a page the hub serves can neither jump nor close without the tab's token", ((403, 403, 403, 403), set(), all_panes),
+              ((pane_route("/api/jump", token="")[0], pane_route("/api/jump", token="guessed")[0],
+                pane_route("/api/close-panes", token="")[0], pane_route("/api/close-panes", token="guessed")[0]), acted(), panes()))
+
+        for first, second in (("busy", "idle"), ("idle", "shell")):
+            doubled(first, second)
+            refused(f"a close refuses a session at work in one of its panes ({first}, {second}), saying why", "/api/close-panes", "at work")
+        check("...and kills no pane", all_panes, panes())
+
+        registered(STRAY, pid=gone_process.pid, started=None, tmux=f"working:{shell_window}.{shell_pane}")
+        refused("a close of a session that has ended kills nothing, saying why", "/api/close-panes", "has ended", STRAY)
+        refused("...nor does a jump to it go anywhere", "/api/jump", "has ended", STRAY)
+        registered(STRAY)
+        refused("a session in no tmux pane is closed nowhere, saying why", "/api/close-panes", "no tmux pane", STRAY)
+        refused("...nor jumped to", "/api/jump", "no tmux pane", STRAY)
+        registered(STRAY, tmux=f"working:{shell_window}.{bystander}")  # a pane, but this test's process is in none of them
+        refused("a pane that does not hold the session's process is not closed, saying why", "/api/close-panes", "no longer holds", STRAY)
+        refused("...nor jumped to", "/api/jump", "no longer holds", STRAY)
+        (HOME / ".claude/sessions" / f"{STRAY[:8]}.json").unlink()
+        check("...and every pane is still there", all_panes, panes())
+
+        doubled("waiting", "idle", waiting_for="permission prompt")
+        status_code, answer = pane_route("/api/close-panes")
+        check("a close of an idle or blocked session kills every pane holding one of its processes, the shell's too, and no other",
+              (200, [shell_pane, own_pane], sorted(r for r in all_panes if r.split()[2] not in (shell_pane, own_pane))),
+              (status_code, answer.get("closed"), panes()))
+        deadline = time.monotonic() + 10
+        while view(DOUBLED)[1].get("state") != "ended" and time.monotonic() < deadline:
+            time.sleep(0.1)
+        check("...after which its unit is an ended one, as any whose process exited", "ended", view(DOUBLED)[1]["state"])
+    finally:
+        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        for c in clients:
+            os.killpg(c.pid, signal.SIGKILL)
+            c.wait()
 
     screenshot = b"\x89PNG\r\n\x1a\n not really a png"
     dropped = lambda name, token=token: request(
