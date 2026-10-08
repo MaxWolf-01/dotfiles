@@ -40,9 +40,9 @@ runs, else the one its transcript (`~/.claude*/projects/<project>/<session id>.j
 account's name on the rail, or Enter or Space on it, hides the account, and another shows it again; each browser
 profile keeps its own choice, and leaves a hidden account's units out of everything but the hub's state.
 
-Membership, minimized pages, visits and dismissals live in one JSON file per unit under --state; everything else is
-read from disk on every request, so the hub's state can go and only those marks go with it. What it read of Claude
-Code's transcripts, which only grow, it keeps in memory and reads on from.
+Membership, minimized pages, visits, dismissals and the session a hand-off came from live in one JSON file per unit
+under --state; everything else is read from disk on every request, so the hub's state can go and only those marks go
+with it. What it read of Claude Code's transcripts, which only grow, it keeps in memory and reads on from.
 
 Every page has a lane, its level of abstraction, from the highest to the lowest: session, concept, output, code. A
 page's lane follows from what it is: a session page goes to session, a diffview page to code, an image to concept,
@@ -95,6 +95,30 @@ and its path typed in its place. Both routes want the token the hub hands to a t
 the hub serves cannot type into a session by fetching them. It shares the tab's origin all the same, so a page that
 scripts the tab itself is not stopped; only a page served from another origin would be.
 
+A unit's box can also hand its session off to a new session in the same pane, from the session's handoff
+(/mx:handoff). It does so where the session runs idle in a pane the box can type into, in a project with an agent
+repo. The handoff is the continuation handoff a /clear would hand the new session. It sits in the agent repo of the
+session's working directory, and the newest mx plugin's own hook (`handoff/checkpoint.py`) finds it.
+
+The box offers one of three things, the handoff linked beside it where there is one:
+
+- hand off, while the handoff is fresh. It is fresh while it is committed, unedited since, and last committed after
+  the user's last prompt to the session. A prompt is a line of the session's transcript the user sent; a tool's
+  result, text a hook or a skill put in, and a task notification are none. The rail marks such a session ready to
+  hand off.
+- update handoff, where the handoff is stale.
+- write handoff, where there is none.
+
+A click on update or write types one request, `/mx:handoff` with what to do, and the user reads what the session
+commits before the next click hands off. A click on hand off types `/clear` into the pane. It waits up to --clear-wait
+seconds for the registry entry of the same process to name a new session that is not working, then types `continue`,
+which that session answers by picking the handoff up. Those two lines are all it types. The new session is a unit from
+then, its session page a stand-in until it renders one, and the hub tab goes to it; the old one is among the ended.
+
+A step is refused, said in the box, and nothing more typed, where the session is working or blocked, its pane no
+longer holds it, its handoff is another or was committed again since the box offered it, or no new session starts in
+time.
+
 The line the Stop hook prints under a finished turn links the hub tab at that session's unit, /u/<session id> on
 this hub (http://127.0.0.1:8377/u/<session id> on the default port), wherever the hub answers; where none does,
 the session page's file:// link.
@@ -126,6 +150,11 @@ none.
     POST /api/dismiss         {"unit"}: out of the numbers until its session next finishes a turn.
     POST /api/type            {"unit", "text"}, from the hub tab with its X-Hub-Token: type the text into the unit's
                               session and press Enter. 409 {"error": why} where nothing may be typed.
+    POST /api/hand-off        {"unit", "offer", "path"?, "at"?}, from the hub tab with its X-Hub-Token: what the unit's box
+                              offered, as /api/u/<key> gave its "handoff". "hand-off" answers {"unit", "view", "pane", "handoff"},
+                              "unit" the new session's;
+                              "write" or "update" answers {"asked", "pane"};
+                              409 {"error": why, "unit"?} where a step is refused, "unit" the new session's once it started.
     POST /api/drop?unit=&name=   a file's bytes, from the hub tab with its X-Hub-Token: saved, answers {"path"}.
     POST /api/serve           {"path"}: from a local tool only, serve a page with what sits beside it, or a
                               directory with everything under it, without making it a member. Answers {"url"}.
@@ -136,7 +165,8 @@ none.
                               "pane", "context" (its running session's context use, as the statusline last had it),
                               "last", "number", "status_line", "needs_you" ({"questions", "unseen"}, where it
                               needs you), "board", "worked_on" (the tickets the board marks),
-                              "dismissed", "members": [{"id", "url", "closed", "lane", "tab"?, ...}], "pages",
+                              "dismissed", "handoff" (what its box offers: {"offer", "path"?, "url"?, "at"?, its last commit}, as above),
+                              "members": [{"id", "url", "closed", "lane", "tab"?, ...}], "pages",
                               ...}. A member's url is where the hub serves it, relative to here, and its "tab" why it
                               refuses to be framed, where it does. "pages" is every page
                               of the unit as its session page lists it: [{"url", "artefact", "linked", ...}];
@@ -215,6 +245,8 @@ class Args:
     """Directory the hub keeps each unit's members and the user's marks in."""
     tmux_socket: Path | None = None
     """Socket of the tmux server the sessions run under; tmux's default one ($TMUX_TMPDIR) when unset."""
+    clear_wait: float = 30.0
+    """Seconds a hand-off waits, after the /clear it typed, for the new session to start."""
 
 
 # --------------------------------------------------------------------------
@@ -372,8 +404,8 @@ transcripts: dict[str, Path] = {}
 looked_at: tuple = ()
 """What `~/.claude*/projects/` held at that look: each project directory and when it last changed, which a new
 transcript changes."""
-titles: dict[Path, tuple] = {}
-"""What a transcript's title lines said, by its path: (size, mtime, bytes read, the user's title, the AI's title)."""
+transcripts_read: dict[Path, tuple] = {}
+"""What the hub read of a transcript, by its path: (size, mtime, bytes read, what `transcript_read` found in them)."""
 
 
 def transcript(session: str, memo: dict) -> Path | None:
@@ -394,8 +426,19 @@ def transcript(session: str, memo: dict) -> Path | None:
 
 def claude_title(session: str, memo: dict) -> str | None:
     """The title Claude Code keeps for a session in its transcript: the last one the user gave it with /rename (a
-    `custom-title` line), else the last it made up itself (`ai-title`). A transcript only grows, so what was read
-    of it is kept while it grows, and a read takes only what was added since."""
+    `custom-title` line), else the last it made up itself (`ai-title`)."""
+    read = transcript_read(session, memo)
+    return read["custom"] or read["ai"]
+
+
+USER_LINE = re.compile(rb'^\{.*"type":"user".*$', re.MULTILINE)
+NOTHING_READ = {"custom": None, "ai": None, "prompted": None}
+
+
+def transcript_read(session: str, memo: dict) -> dict:
+    """What the hub reads of a session's transcript: its titles, and when the user last sent it a prompt
+    (`prompted_at`). A transcript only grows, so what was read of it is kept while it grows, and a read takes only what
+    was added since."""
     path = transcript(session, memo)
     try:
         st = path.stat() if path else None
@@ -403,26 +446,59 @@ def claude_title(session: str, memo: dict) -> str | None:
         transcripts.pop(session, None)
         st = None
     if not st:
-        return None
-    size, mtime, read, custom, ai = titles.get(path, (0, 0, 0, None, None))
+        return NOTHING_READ
+    size, mtime, read, found = transcripts_read.get(path, (0, 0, 0, NOTHING_READ))
     if (st.st_size, st.st_mtime) != (size, mtime):
         if st.st_size < read:  # rewritten, not grown
-            read, custom, ai = 0, None, None
+            read, found = 0, NOTHING_READ
         with path.open("rb") as f:
             f.seek(read)
             added = f.read(st.st_size - read)
         whole = added[:added.rfind(b"\n") + 1]  # a line still being written is read again once it is whole
+        found = dict(found)
         for m in TITLE_LINE.finditer(whole):
             try:
                 line = json.loads(m[0])
             except ValueError:
                 continue
             if line["type"] == "custom-title":
-                custom = line.get("customTitle") or custom
+                found["custom"] = line.get("customTitle") or found["custom"]
             else:
-                ai = line.get("aiTitle") or ai
-        titles[path] = (st.st_size, st.st_mtime, read + len(whole), custom, ai)
-    return custom or ai
+                found["ai"] = line.get("aiTitle") or found["ai"]
+        # a tool's result is most of a transcript's user lines, and the largest: never parsed
+        prompts = [at for m in USER_LINE.finditer(whole) if b'"toolUseResult"' not in m[0] and (at := prompted_at(m[0]))]
+        found["prompted"] = max([found["prompted"] or 0, *prompts]) or None
+        transcripts_read[path] = (st.st_size, st.st_mtime, read + len(whole), found)
+    return found
+
+
+def prompted_at(raw: bytes) -> float | None:
+    """When a transcript line is a prompt the user sent the session: a `user` line that is no tool result, nothing a
+    hook or a skill put in (`isMeta`), no subagent's, and no task notification or SDK caller's, which Claude Code
+    2.1.29x tells apart by the line's `origin` and `promptSource`. An earlier Claude Code writes neither, and its task
+    notifications and command output are told apart by how they start."""
+    try:
+        line = json.loads(raw)
+    except ValueError:
+        return None
+    content = (line.get("message") or {}).get("content")
+    if line.get("type") != "user" or line.get("isMeta") or line.get("isSidechain"):
+        return None
+    if isinstance(content, list):
+        if any(isinstance(p, dict) and p.get("type") == "tool_result" for p in content):
+            return None
+        content = "".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+    if not isinstance(content, str):
+        return None
+    if "origin" in line or "promptSource" in line:
+        if (line.get("origin") or {}).get("kind") != "human":
+            return None
+    elif content.lstrip().startswith(("<task-notification", "<local-command")):
+        return None
+    try:
+        return datetime.fromisoformat(line["timestamp"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def statusline_inputs() -> list[dict]:
@@ -1043,10 +1119,12 @@ def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, d
         kept = [m for m in data["members"] if stays(m)]
         roots = data.setdefault("roots", {})
         # a tree once known and no longer in its tracker is retired; a tracker that refuses to read retires nothing.
-        # The loose pages belong to no session's tree, and go only once every one of them is deleted.
+        # The loose pages belong to no session's tree, and go only once every one of them is deleted. A session a
+        # hand-off started has its stand-in alone until it renders its page, and stays while it runs.
         known = roots.get(str(tracker.root)) if tracker else None
         retired = session and (gone or (tracker and known and not tree and known not in tracker.tickets))
-        if retired or not [m for m in kept if not stand_in(m)]:
+        started = data.get("handed_from") and session in live
+        if retired or not (started or [m for m in kept if not stand_in(m)]):
             state_file(key).unlink(missing_ok=True)
             return None
         if len(kept) != len(data["members"]) or (tree and tree != known):
@@ -1094,6 +1172,7 @@ def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, d
             "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
             "first": min(m["first"] for m in kept), "visited": data.get("visited") or 0,
             "status_line": said["status_line"], "needs_you": needs_you(state, said, data.get("visited") or 0),
+            "handoff": handoff_offer(entry, memo),
             "resume": resume_command(session) if session else "", "tickets": tickets, "pages": pages, "members": members,
             "board": page_of_path(board).url if board and board.is_file() else None,
             "worked_on": [s for s in committed if tracker.tickets[s]["status"] != "done"],  # what is done is worked on no more
@@ -1361,6 +1440,11 @@ def pane_of(key: str) -> tuple[str | None, str]:
     entry = registry().get(key) if key != LOOSE else None
     if not entry:
         return None, "the session has ended"
+    return pane_in(entry)
+
+
+def pane_in(entry: dict) -> tuple[str | None, str]:
+    """The tmux pane a running session's registry entry takes the user's words in, or None and why it takes none."""
     if entry.get("status") == "waiting":
         return None, f"the session is blocked in its terminal ({entry.get('waitingFor') or 'waiting'}); answer it in its pane"
     if not (found := PANE.search(str(entry.get("tmux") or ""))):
@@ -1381,18 +1465,25 @@ def type_into(body: dict) -> tuple[int, dict]:
         pane, why = pane_of(body["unit"])
         if not pane:
             return 409, {"error": why}
-        # a paste, so a newline stays a newline rather than sending the message early; tmux types it as plain keys
-        # where the program asked for no bracketed paste
-        buffer = f"container-hub-{secrets.token_hex(4)}"
-        for args, given in ((("load-buffer", "-b", buffer, "-"), text), (("paste-buffer", "-p", "-d", "-b", buffer, "-t", pane), None),
-                            (("send-keys", "-t", pane, "Enter"), None)):
-            run = tmux(*args, given=given)
-            if run.returncode != 0:
-                tmux("delete-buffer", "-b", buffer)
-                return 502, {"error": f"tmux {args[0]} into {pane}: {run.stderr.strip()}"}
+        if failed := paste(pane, text):
+            return 502, {"error": failed}
     except (OSError, subprocess.TimeoutExpired) as e:  # no tmux on PATH, or a server that does not answer
         return 502, {"error": f"tmux: {e}"}
     return 200, {"ok": True, "pane": pane}
+
+
+def paste(pane: str, text: str) -> str:
+    """Type the text into the pane and press Enter; why tmux refused, else nothing. A paste, so a newline stays a
+    newline rather than sending the message early; tmux types it as plain keys where the program asked for no
+    bracketed paste."""
+    buffer = f"container-hub-{secrets.token_hex(4)}"
+    for args, given in ((("load-buffer", "-b", buffer, "-"), text), (("paste-buffer", "-p", "-d", "-b", buffer, "-t", pane), None),
+                        (("send-keys", "-t", pane, "Enter"), None)):
+        run = tmux(*args, given=given)
+        if run.returncode != 0:
+            tmux("delete-buffer", "-b", buffer)
+            return f"tmux {args[0]} into {pane}: {run.stderr.strip()}"
+    return ""
 
 
 def drop(key: str, name: str, data: bytes) -> tuple[int, dict]:
@@ -1410,6 +1501,197 @@ def drop(key: str, name: str, data: bytes) -> tuple[int, dict]:
         path = directory / f"{stamp}-{n}-{stem}"
     path.write_bytes(data)
     return 200, {"path": str(path)}
+
+
+# --------------------------------------------------------------------------
+# handing a session off: its handoff written and read, then /clear in its pane, and the new session picks it up
+# --------------------------------------------------------------------------
+
+CLEAR_WAIT = Args.clear_wait
+FIRST_TURN = "continue"
+"""What starts the new session's first turn: the mx plugin's SessionStart hook has already told it which handoff to
+pick up, and how."""
+REQUESTS = {
+    "write": "/mx:handoff continuation: write the continuation handoff for the session that takes over from this one, "
+             "and commit it",
+    "update": "/mx:handoff continuation: update the continuation handoff you wrote, {path}, to where the work stands now, "
+              "and commit it; if nothing has changed, add a line saying it is still current, so that it is committed after this "
+              "message",
+}
+"""What a click types into a session with no fresh handoff, by what the box offered. The request is itself a prompt,
+so a handoff is fresh again only once a commit after it touches the file."""
+handing_off = threading.Lock()  # one at a time: a second click would type a second /clear into the new session
+HANDOFFS: dict[tuple[str, str], tuple[Path | None, float]] = {}
+"""The handoffs directory of a session's working directory, by the hook module that found it and that directory, with
+when it looked. A working directory's agent repo does not move; one in none is looked at again after a while."""
+COMMITS: dict[Path, tuple[tuple, float | None]] = {}
+"""When a handoff was last committed, None where it is not committed or is edited since, by its path, with the stat of
+it and of its repo's index then."""
+PANES_HELD: dict[tuple, float] = {}
+"""When a session's registry entry was last found to run in the tmux pane it names, by that entry's pane and process."""
+
+
+def handoff_offer(entry: dict | None, memo: dict) -> dict | None:
+    """What a unit's box offers its session, where it runs idle in a pane the hub can type into, in a project with an
+    agent repo: {"offer": "hand-off"} with its fresh handoff, {"offer": "update"} with its stale one, or {"offer":
+    "write"}; a handoff as {"path", "url"}. Looked for only where the registry says idle and names a pane."""
+    if not entry or entry.get("status") != "idle" or not PANE.search(str(entry.get("tmux") or "")):
+        return None
+    try:
+        offer = handoff_state(entry, memo)
+        return offer if offer and pane_held(entry) else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def handoff_state(entry: dict, memo: dict) -> dict | None:
+    """The session's continuation handoff, which a /clear in its process would hand the new session, and so what may be
+    done with it: the newest one in the agent repo of its working directory naming it, as the mx plugin's own hook
+    (`checkpoint.py started`) finds it. It is fresh, and handed off from, while it is committed, unedited since, and
+    its last commit is newer than the user's last prompt to the session. None in no project with an agent repo."""
+    hooks = handoff_hooks(memo)
+    if not hooks or not entry.get("cwd"):
+        return None
+    handoffs = handoffs_dir(hooks, str(entry["cwd"]))
+    if not handoffs:
+        return None
+    try:
+        written = [p for p in handoffs.glob("*.md") if hooks.continuation_of(p, str(entry["sessionId"]))]
+        newest = max(written, key=lambda p: p.stat().st_mtime, default=None)
+    except OSError:  # one picked up between the glob and the read: looked at again at the next read
+        return None
+    if not newest:
+        return {"offer": "write"}
+    newest = newest.resolve()
+    at, prompted = committed_at(newest), transcript_read(str(entry["sessionId"]), memo)["prompted"]
+    fresh = at is not None and (prompted is None or at > prompted)
+    return {"offer": "hand-off" if fresh else "update", "path": str(newest), "url": page_of_path(newest).url, "at": at}
+
+
+def handoffs_dir(hooks, cwd: str) -> Path | None:
+    key = (hooks.__file__, cwd)
+    hit = HANDOFFS.get(key)
+    if hit and (hit[0] or time.time() - hit[1] < 300):
+        return hit[0]
+    try:
+        found = hooks.handoffs_of(Path(cwd))
+    except OSError:  # the working directory is gone
+        found = None
+    HANDOFFS[key] = found, time.time()
+    return found
+
+
+def committed_at(handoff: Path) -> float | None:
+    """When the handoff was last committed in its agent repo; None where it never was, or is edited since, which
+    `pickup.py` refuses. Asked of git again only once the file or the repo's index has changed, so a handoff left
+    standing costs the rail's reads no git."""
+    agent = handoff.parent.parent
+    try:
+        key = tuple((s.st_mtime_ns, s.st_size) for s in (handoff.stat(), (agent / ".git" / "index").stat()))
+    except OSError:  # no index of its own to watch (a worktree's agent repo): asked every time
+        key = None
+    if key and (hit := COMMITS.get(handoff)) and hit[0] == key:
+        return hit[1]
+    name = f"handoffs/{handoff.name}"
+    when = git(agent, "log", "-1", "--format=%ct", "--", name).strip()
+    at = float(when) if when.isdigit() and not git(agent, "status", "--porcelain", "--", name).strip() else None
+    if key:
+        COMMITS[handoff] = key, at
+    return at
+
+
+def pane_held(entry: dict) -> bool:
+    """The session runs in the pane its registry entry names, as `pane_in` checks it, which a click checks again: the
+    rail's reads ask tmux once a minute per session."""
+    key = (entry.get("tmux"), entry.get("pid"), entry.get("procStart"))
+    if time.time() - PANES_HELD.get(key, 0) < 60:
+        return True
+    if not pane_in(entry)[0]:
+        return False
+    PANES_HELD[key] = time.time()
+    return True
+
+
+def hand_off(body: dict) -> tuple[int, dict]:
+    if not handing_off.acquire(blocking=False):
+        return 409, {"error": "another hand-off is under way; try again once it is done"}
+    try:
+        return hand_off_in(body["unit"], {k: body.get(k) for k in ("offer", "path", "at")})
+    except (OSError, subprocess.TimeoutExpired) as e:  # no tmux on PATH, or a server that does not answer
+        return 502, {"error": f"tmux: {e}"}
+    finally:
+        handing_off.release()
+
+
+def hand_off_in(key: str, shown: dict) -> tuple[int, dict]:
+    """Do what the box offered, where the session and its handoff are still as they were then: hand off from a fresh
+    handoff, or ask for one. Each step is checked before it, and one refused types nothing more."""
+    entry = registry().get(key) if key != LOOSE else None
+    if not entry:
+        return 409, {"error": "the session has ended"}
+    if entry.get("status") != "idle":
+        doing = f"blocked in its terminal ({entry.get('waitingFor') or 'waiting'})" if entry.get("status") == "waiting" else "working"
+        return 409, {"error": f"the session is {doing}; try again once it is idle"}
+    state = handoff_state(entry, {})
+    if not state:
+        return 409, {"error": "the session's working directory is in no project with an agent repo, where its handoff would go"}
+    pane, why = pane_in(entry)
+    if not pane:
+        return 409, {"error": why}
+    offered = shown["offer"]
+    if {k: state.get(k) for k in shown} != shown:  # a handoff committed again since may say what the user never read
+        return 409, {"error": f"the session's handoff has changed since the box offered to {offered}; read what it offers now"}
+    if offered != "hand-off":
+        if failed := paste(pane, REQUESTS[offered].format(path=state.get("path"))):
+            return 502, {"error": failed}
+        return 200, {"asked": offered, "pane": pane}
+    if failed := paste(pane, "/clear"):
+        return 502, {"error": failed}
+    new, why = cleared(entry)
+    if not new:
+        return 409, {"error": f"/clear typed into {pane}, but {why}; nothing more typed"}
+    session = str(new["sessionId"])
+    adopt(session, key, Path(state["path"]))
+    pane, why = pane_in(new)
+    if not pane:
+        return 409, {"error": f"/clear typed, and session {session[:8]} started, but {why}; nothing more typed", "unit": session}
+    if failed := paste(pane, FIRST_TURN):
+        return 502, {"error": failed, "unit": session}
+    return 200, {"unit": session, "view": "/u/" + key_path(session), "pane": pane, "handoff": state["path"]}
+
+
+def cleared(entry: dict) -> tuple[dict | None, str]:
+    """The registry entry of the session's process once it names another session, and that session is not working
+    (its start's hooks run); else None and why, after CLEAR_WAIT seconds at most."""
+    pid, deadline, started = int(entry["pid"]), time.monotonic() + CLEAR_WAIT, None
+    while True:
+        now = next((e for e in registry().values() if int(e["pid"]) == pid), None)
+        if not now and not running(pid, entry.get("procStart")):
+            return None, "the session's process has exited"
+        if now and now["sessionId"] != entry["sessionId"]:
+            if now.get("status") not in WORKING:
+                return now, ""
+            started = now
+        if time.monotonic() > deadline:
+            return None, (f"session {str(started['sessionId'])[:8]} it started was still working after {CLEAR_WAIT:g} s" if started
+                          else f"the registry named no new session within {CLEAR_WAIT:g} s")
+        time.sleep(0.2)
+
+
+def adopt(session: str, handed_from: str, handoff: Path) -> None:
+    """The session a hand-off started is a unit from then on, before it opens any page: its stand-in for a session
+    page, under the tracker of the agent repo the handoff sits in, where its session page takes the stand-in's place
+    once rendered."""
+    url = stand_in_url(session)
+    with lock:
+        data = load(session) or new_unit(session)
+        data["handed_from"] = handed_from
+        if all(m["url"] != url for m in data["members"]):
+            now = time.time()
+            data["members"].append({"id": member_id(url), "url": url, "path": None, "tracker": str(handoff.parent.parent / "tickets"),
+                                    "ticket": None, "kind": "session", "title": title_of(Page(url=url, kind="session", session=session)),
+                                    "first": now, "closed": False, "at": now, "by": "user"})
+        save(data)
 
 
 # --------------------------------------------------------------------------
@@ -1491,27 +1773,42 @@ diffview = load_diffview()
 
 
 READERS: dict[Path, object] = {}
-"""The session page's reader, by the path it was loaded from, or None where that one could not be used."""
+"""The mx plugin's modules the hub uses, the session page's reader and the handoff hooks, by the path each was loaded
+from, or None where that one could not be used."""
 loading = threading.Lock()
 READS = ("read_session", "in_order", "open_questions", "Chat", "RecordError", "inline", "strip_tags")
 """What the hub uses of the reader: an mx plugin from before chat turns has no `in_order` and no `Chat`."""
+
+
+HOOK_USES = ("handoffs_of", "continuation_of")
+"""What the hub uses of the mx plugin's handoff hooks: an mx plugin from before /clear picked up a handoff has neither."""
 
 
 def page_reader(memo: dict):
     """The session page's own reader, from the newest mx plugin, so that the rail counts a question open as the page
     shows it. Looked for once per read of the hub, so a plugin update reaches the rail without a restart; None
     where no plugin has one the hub can use."""
-    if "reader" not in memo:
-        path = mx_script("session-page/session_page.py")
+    return plugin_module(memo, "session-page/session_page.py", READS, "the rail marks no session as needing you")
+
+
+def handoff_hooks(memo: dict):
+    """The mx plugin's handoff hooks (`checkpoint.py`), from the newest plugin, looked for as the reader is: the code
+    that finds the handoff a /clear picks up."""
+    return plugin_module(memo, "handoff/checkpoint.py", HOOK_USES, "no unit offers to hand off")
+
+
+def plugin_module(memo: dict, script: str, uses: tuple[str, ...], without: str):
+    if script not in memo:
+        path = mx_script(script)
         with loading:  # two reads of the hub at once load it once
             if path and path not in READERS:
-                READERS[path] = load_page_reader(path)
-        memo["reader"] = READERS.get(path)
-    return memo["reader"]
+                READERS[path] = load_plugin_module(path, uses, without)
+        memo[script] = READERS.get(path)
+    return memo[script]
 
 
-def load_page_reader(path: Path):
-    spec = importlib.util.spec_from_file_location("session_page", path)
+def load_plugin_module(path: Path, uses: tuple[str, ...], without: str):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     sys.dont_write_bytecode = True  # its cache would land in the plugin's directory
     sys.modules.pop("tracker", None)  # the reader imports its own plugin's tracker, not an older one's
@@ -1520,8 +1817,8 @@ def load_page_reader(path: Path):
     except Exception as e:
         print(f"loading {path}: {e}", file=sys.stderr, flush=True)
         return None
-    if missing := [name for name in READS if not hasattr(module, name)]:
-        print(f"{path} has no {', '.join(missing)}: the rail marks no session as needing you", file=sys.stderr, flush=True)
+    if missing := [name for name in uses if not hasattr(module, name)]:
+        print(f"{path} has no {', '.join(missing)}: {without}", file=sys.stderr, flush=True)
         return None
     return module
 
@@ -1705,7 +2002,7 @@ class Handler(BaseHTTPRequestHandler):
         # a page on another site can POST to loopback; only this origin's pages and local tools (no Origin) may write
         if self.headers.get("Origin") not in (None, f"http://127.0.0.1:{self.port()}", f"http://localhost:{self.port()}"):
             return self.send(403, b"forbidden", "text/plain")
-        if path in ("/api/type", "/api/drop") and not secrets.compare_digest(self.headers.get("X-Hub-Token") or "", TOKEN):
+        if path in ("/api/type", "/api/drop", "/api/hand-off") and not secrets.compare_digest(self.headers.get("X-Hub-Token") or "", TOKEN):
             return self.send_json({"error": "only the hub tab itself types into a session; reload the tab if it is one"}, 403)
         if path == "/api/drop":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -1730,6 +2027,8 @@ class Handler(BaseHTTPRequestHandler):
                 code, answer = (403, {"error": "only a local tool may share"}) if self.headers.get("Origin") else share(body)
             elif path == "/api/type":
                 code, answer = type_into(body)
+            elif path == "/api/hand-off":
+                code, answer = hand_off(body)
             elif path in ("/api/close", "/api/visit", "/api/dismiss"):
                 code, answer = mark(path.removeprefix("/api/"), body)
             else:
@@ -1827,9 +2126,10 @@ def repair(data: dict) -> bool:
 
 
 def main(args: Args) -> None:
-    global STATE, TOKEN, TMUX_SOCKET
+    global STATE, TOKEN, TMUX_SOCKET, CLEAR_WAIT
     STATE = args.state.expanduser().resolve()
     TMUX_SOCKET = args.tmux_socket
+    CLEAR_WAIT = args.clear_wait
     STATE.mkdir(parents=True, exist_ok=True)
     TOKEN = load_token()
     (STATE / "seen.json").unlink(missing_ok=True)  # the seen marks an earlier hub kept
