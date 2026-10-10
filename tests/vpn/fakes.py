@@ -54,7 +54,7 @@ atexit.register(shutil.rmtree, SCRATCH, ignore_errors=True)
 TAILSCALE_CALLS = SCRATCH / "tailscale-calls"
 (SCRATCH / "bin" / "tailscale").write_text(
     f"#!/bin/sh\necho \"$*\" >> '{TAILSCALE_CALLS}'\n"
-    "echo 'vpn_fakes: bin/vpn ran tailscale instead of its Tailscaled port' >&2\nexit 1\n")
+    "echo 'tests/vpn/fakes.py: bin/vpn ran tailscale instead of its Tailscaled port' >&2\nexit 1\n")
 (SCRATCH / "bin" / "tailscale").chmod(0o755)
 TAILSCALED_HITS: list[int] = [0]
 """Connections to the socket where bin/vpn looks for tailscaled. It hangs each up at once."""
@@ -86,7 +86,7 @@ def load(name: str, path: Path):
     return module
 
 
-vpn = load("vpn", Path(__file__).resolve().parent.parent / "bin" / "vpn")
+vpn = load("vpn", Path(__file__).resolve().parents[2] / "bin" / "vpn")
 
 T0 = float(int(time.time()))
 """The World's first moment: the wall clock when this module loads."""
