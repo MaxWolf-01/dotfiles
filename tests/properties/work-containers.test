@@ -30,12 +30,12 @@ Examples:
 
 import atexit
 import contextlib
-import importlib.util
 import io
 import itertools
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -50,22 +50,25 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 from hypothesis import HealthCheck, Phase, example, given, settings
 from hypothesis import strategies as st
 from hypothesis.database import DirectoryBasedExampleDatabase
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.dont_write_bytecode = True  # importing bin/ must not leave a __pycache__ on $PATH, nor tests/ one
+import container_hub_fakes as fakes  # noqa: E402  (the hub's module in this process, and its clock)
+
 BIN = Path(__file__).resolve().parents[2] / "bin"
-sys.dont_write_bytecode = True  # importing bin/ must not leave a __pycache__ on $PATH
 SCRATCH = Path(tempfile.mkdtemp(prefix="work-containers-test."))
 HOME = SCRATCH / "home"
 """The HOME of the hub's module in this process, which the worlds are placed in."""
 LIVE_HUB_PORT = 8377
 """The port of the hub this machine runs, which no check may touch."""
 PORT = 18377
-"""The port the hub's module answers for in this process: one of its own addresses names a page it serves."""
+"""The port the hub's module takes for its own in this process, so that one of its addresses names a page it serves.
+Nothing listens on it."""
 
 PROPERTIES = []
 
@@ -75,13 +78,12 @@ def prop(fn):
     return fn
 
 
-def checked(examples: int, shrink: bool = True):
+def checked(examples: int):
     """Hypothesis settings."""
-    phases = [Phase.explicit, Phase.reuse, Phase.generate] + ([Phase.target, Phase.shrink] if shrink else [])
     return settings(
         max_examples=examples,
         deadline=None,
-        phases=phases,
+        phases=[Phase.explicit, Phase.reuse, Phase.generate, Phase.target, Phase.shrink],
         report_multiple_bugs=False,
         database=DirectoryBasedExampleDatabase(Path(__file__).resolve().parent / ".hypothesis"),
         suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
@@ -247,33 +249,13 @@ def base_env(home: Path, **extra: str) -> dict[str, str]:
     return env
 
 
-class Clock:
-    """The hub's `time`, the wall-clock time the test's to set."""
-
-    def __init__(self, now: float):
-        self.now = now
-
-    def time(self) -> float:
-        return self.now
-
-    def __getattr__(self, name: str):
-        return getattr(time, name)
-
-
-HUB_LOADS = itertools.count()
-
-
 class Hub:
     """The hub's module, loaded anew in this process on a state directory, at the time its clock reads: what the hub
     decides, with no server. What a restart keeps is what is on disk, so a hub loaded anew on the same state is
     the hub restarted."""
 
-    def __init__(self, state: Path, clock: Clock):
-        loader = SourceFileLoader(f"container_hub_{next(HUB_LOADS)}", str(BIN / "container-hub"))
-        self.module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-        loader.exec_module(self.module)
-        self.module.STATE, self.module.time = state, clock
-        self.state, self.clock = state, clock
+    def __init__(self, state: Path, clock: fakes.Clock):
+        self.module, self.state, self.clock = fakes.load(clock, state), state, clock
 
     def restarted(self) -> "Hub":
         return Hub(self.state, self.clock)
@@ -288,8 +270,9 @@ class Hub:
         status, answer = self.module.mark("close", {"unit": key, "id": member_id})
         assert status == 200, f"closing {member_id} in {key} answered {status}: {answer}"
 
-    def unit(self, key: str) -> dict:
-        return self.module.unit_view(key, self.module.registry(), {}, {})
+    def unit(self, key: str) -> dict | None:
+        """A unit as the hub tab reads it (/api/u/<key>)."""
+        return next((u for u in self.view()["units"] if u["unit"] == key), None)
 
     def view(self) -> dict:
         return self.module.hub_view()
@@ -302,8 +285,8 @@ class Hub:
 
 
 def fresh_hub() -> Hub:
-    """A hub on a state directory no other property used, its clock at a fixed time."""
-    return Hub(Path(tempfile.mkdtemp(prefix="state.", dir=SCRATCH)), Clock(1_790_000_000.0))
+    """A hub on a state directory of its own, its clock at a fixed time: a read of every unit reads one world's."""
+    return Hub(Path(tempfile.mkdtemp(prefix="state.", dir=SCRATCH)), fakes.Clock(1_790_000_000.0))
 
 
 def spell(placed: Placed, i: int, how: str, member_url: str | None) -> str:
@@ -356,11 +339,11 @@ def p1():
     Whatever spelling the opener uses and whichever session opens it, a container holds one member per page
     opened into it: the first open adds one, every later one leaves the count as it was. A closed page is
     still held, so opening it again adds nothing either."""
-    hub = fresh_hub()
 
     @checked(25)
     @given(worlds(), st.lists(STEP, min_size=1, max_size=12))
     def holds(world, steps):
+        hub = fresh_hub()
         placed = place(world, HOME)
         into: dict[str, set[int]] = {}
         last: dict[int, tuple[str, str]] = {}
@@ -400,11 +383,11 @@ def p2():
     The hub is loaded anew on its state once the container has answered with every page opened and closed: what a
     restart keeps is what the hub wrote before it answered. Loaded anew, each container answers the same members and
     the same closed members."""
-    hub = fresh_hub()
 
     @checked(15)
     @given(worlds(), st.lists(st.integers(0, 2), min_size=1, max_size=8), st.lists(st.integers(0, 7), max_size=8))
     def survives(world, openers, closes):
+        hub = fresh_hub()
         placed = place(world, HOME)
         ids: dict[int, tuple[str, str]] = {}
         for i in range(len(world.pages)):
@@ -655,7 +638,6 @@ def p6():
     Each page is opened by one or two of the world's sessions. The hub's state directory is deleted, and the hub
     loaded anew; opening the same pages by the same sessions, in another order, answers the same unit for each, and
     the rail derives the same of each unit: its title, its tree and repo, its session's state and its number."""
-    hub = fresh_hub()
 
     @checked(15)
     @given(worlds(), st.lists(st.integers(0, 2), min_size=1, max_size=8), st.randoms(use_true_random=False))
@@ -665,7 +647,7 @@ def p6():
                    ("repos/alpha/agent/show/map-columns/index.html", "repos/alpha/agent/show/csv-import/index.html"), 2),
              [1], random.Random(1))
     def derived(world, openers, rng):
-        nonlocal hub
+        hub = fresh_hub()
         placed = place(world, HOME)
         registry = running(placed, rng)
         try:
@@ -700,24 +682,95 @@ def p6():
 # --------------------------------------------------------------------------
 
 
+CHANGES = ["status", "retire", "turn", "heading", "title", "page", "statusline"]
+"""What changes on disk under a running hub: a ticket's status, a ticket retired, a session finishing a turn or
+starting one, its session page's heading, its title in its transcript, a page deleted, what its statusline keeps."""
+
+
+def lived(placed: Placed, rng: random.Random) -> None:
+    """What the world's sessions leave besides their commits: a session page with its heading in the first repo, a
+    transcript with Claude Code's title for the session, and what the statusline keeps of its last render, each for
+    some of them."""
+    first = placed.root / "repos" / sorted({t.repo for t in placed.world.tickets})[0] / "agent"
+    for s in placed.sessions:
+        if rng.random() < 0.5:
+            heading(first / "sessions" / s, rng)
+        if rng.random() < 0.5:
+            titled(s, rng)
+        if rng.random() < 0.5:
+            statusline(s, rng)
+
+
+def heading(session_dir: Path, rng: random.Random) -> None:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "index.html").write_text("<!doctype html><p>a session page</p>\n")
+    (session_dir / "session.md").write_text(f"---\nsession: x\n---\n\n# Session {rng.randrange(10**6)}\n")
+
+
+def titled(session: str, rng: random.Random) -> None:
+    path = HOME / ".claude" / "projects" / "-world" / f"{session}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kind = rng.choice(["ai", "custom"])
+    with path.open("a") as f:
+        f.write(json.dumps({"type": f"{kind}-title", f"{kind}Title": f"title {rng.randrange(10**6)}", "sessionId": session}) + "\n")
+
+
+def statusline(session: str, rng: random.Random) -> None:
+    path = HOME / ".cache" / "claude-statusline" / f"{session}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    used = rng.randrange(100)
+    path.write_text(json.dumps({"session_id": session, "config_dir": str(HOME / ".claude"), "written_at": 1_790_000_000 + rng.randrange(10**6),
+                                "context_window": {"used_percentage": used, "total_input_tokens": used * 2000},
+                                "rate_limits": {"five_hour": {"used_percentage": used, "resets_at": 1_790_100_000}}}))
+
+
+def change(placed: Placed, registry: list[Path], what: str, rng: random.Random) -> None:
+    """One of CHANGES, to a ticket, session or page the world has."""
+    tickets = sorted(placed.root.glob("repos/*/agent/tickets/*.md"))
+    session = rng.choice(placed.sessions)
+    if what == "status" and tickets:
+        path = rng.choice(tickets)
+        path.write_text(re.sub(r"^status: .*$", f"status: {rng.choice(['open', 'claimed', 'review', 'done'])}", path.read_text(),
+                               count=1, flags=re.M))
+    elif what == "retire" and tickets:
+        rng.choice(tickets).unlink()
+    elif what == "turn":
+        path = rng.choice(registry)
+        entry = json.loads(path.read_text())
+        path.write_text(json.dumps({**entry, "status": rng.choice(["idle", "busy", "waiting"]),
+                                    "statusUpdatedAt": entry["statusUpdatedAt"] + rng.randrange(1, 10**6)}))
+    elif what == "heading":
+        heading(placed.root / "repos" / sorted({t.repo for t in placed.world.tickets})[0] / "agent" / "sessions" / session, rng)
+    elif what == "title":
+        titled(session, rng)
+    elif what == "page" and (pages := [p for p in map(placed.page, range(len(placed.world.pages))) if p.exists()]):
+        rng.choice(pages).unlink()
+    elif what == "statusline":
+        statusline(session, rng)
+
+
 @prop
 def view_of_disk():
     """hub-decisions-tested-at-the-module#P1 A hub unit's view and the rail are a function of what is on disk and the time.
 
-    The world's sessions run, and open and close its pages, at times a fixed clock gives. The hub's view of every unit
-    and of the rail, read twice, and read by a hub loaded anew on the same state at the same time, is the same each
-    time: nothing the hub holds in memory between two reads changes what it shows."""
+    The world's sessions run, and open and close its pages, at times a fixed clock gives, and leave session pages,
+    transcripts and statusline files behind them. The hub reads its view; then the disk changes under it, and the
+    clock moves on. Read again, by the hub that read the disk before and by a hub loaded anew on the same state at
+    the same time, the view is the same: nothing the hub keeps in memory from an earlier read changes what it shows.
+    No session here runs in a tmux pane, so the handoff a unit offers is not among what is compared."""
 
-    @checked(15)
-    @given(worlds(), st.lists(STEP, min_size=1, max_size=12), st.randoms(use_true_random=False))
-    def same(world, steps, rng):
+    @checked(25)
+    @given(worlds(), st.lists(STEP, min_size=1, max_size=12), st.lists(st.sampled_from(CHANGES), min_size=1, max_size=3),
+           st.randoms(use_true_random=False))
+    def same(world, steps, changes, rng):
         hub = fresh_hub()  # whose view is this world's alone
         placed = place(world, HOME)
         registry = running(placed, rng)
+        lived(placed, rng)
         try:
             last: dict[int, tuple[str, str]] = {}
             for op, i, how, s in steps:
-                hub.clock.now += 1
+                hub.clock.tick()
                 i, session = i % len(world.pages), placed.sessions[s % world.sessions]
                 if op == "close" and i in last:
                     hub.close(*last[i])
@@ -725,9 +778,12 @@ def view_of_disk():
                     last[i] = hub.open(spell(placed, i, how if how != "served" else "path", None), session)
             first = hub.view()
             assert hub.view() == first, "the hub's view changed between two reads of the same disk at the same time"
-            again = hub.restarted().view()
-            assert again == first, (f"a hub loaded anew on the same state at the same time shows otherwise:\n"
-                                    f"      before {json.dumps(first, sort_keys=True)}\n      after  {json.dumps(again, sort_keys=True)}")
+            for what in changes:
+                change(placed, registry, what, rng)
+            hub.clock.tick(rng.randrange(1, 10**5))
+            warm, cold = hub.view(), hub.restarted().view()
+            assert warm == cold, (f"after {', '.join(changes)}, the hub that read the disk before shows otherwise than a hub loaded "
+                                  f"anew:\n      read before {json.dumps(warm, sort_keys=True)}\n      loaded anew {json.dumps(cold, sort_keys=True)}")
         finally:
             for path in registry:
                 path.unlink(missing_ok=True)

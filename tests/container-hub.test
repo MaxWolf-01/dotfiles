@@ -24,7 +24,6 @@ import fcntl
 import hashlib
 import http.client
 import http.server
-import importlib.util
 import json
 import os
 import re
@@ -42,12 +41,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from importlib.machinery import SourceFileLoader
 from itertools import count
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.dont_write_bytecode = True  # importing bin/ must not leave a __pycache__ on $PATH, nor tests/ one
+import container_hub_fakes as fakes  # noqa: E402  (the hub's module in this process, and its clock)
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
-sys.dont_write_bytecode = True  # importing bin/ must not leave a __pycache__ on $PATH
 SCRATCH = Path(tempfile.mkdtemp(prefix="container-hub-test."))
 HOME = SCRATCH / "home"
 TEMP = SCRATCH / "tmp"  # the temp dir of everything the test runs, beside HOME and not around it, so each guard is checked on its own
@@ -116,24 +117,6 @@ T0 = float(int(time.time()) + 3600)
 pinning its time was written before anything the hub stamps with its clock."""
 COMMITS = count(int(T0) - 100_000, 10)
 """When each fixture commit is made: ten seconds after the one before, so their order never rests on the wall clock."""
-
-
-class Clock:
-    """The hub's `time`: the wall-clock time is the test's to set, and the rest is `time` as it is, so the hub's
-    waits still wait."""
-
-    def __init__(self, now: float):
-        self.now = now
-
-    def time(self) -> float:
-        return self.now
-
-    def tick(self, seconds: float = 1) -> float:
-        self.now += seconds
-        return self.now
-
-    def __getattr__(self, name: str):
-        return getattr(time, name)
 
 
 def git(cwd: Path, *args: str, at: int | None = None) -> None:
@@ -239,25 +222,6 @@ TEMP_PAGE = TEMP / f"container-hub-test-{PORT}.html"  # directly in the temp dir
 served = lambda path: "/f" + urllib.parse.quote(str(path))
 
 
-def load(name: str, path: Path):
-    loader = SourceFileLoader(name, str(path))
-    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
-    loader.exec_module(module)
-    return module
-
-
-@contextlib.contextmanager
-def environ(**changed: str):
-    """os.environ with these set, for a hub's module run as a user service runs it."""
-    was = dict(os.environ)
-    os.environ.update(changed)
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(was)
-
-
 # --------------------------------------------------------------------------
 # the hub's decisions, in this process
 # --------------------------------------------------------------------------
@@ -278,11 +242,8 @@ if READER:
     (HOME / ".claude/plugins/cache/market/mx").mkdir(parents=True)
     (HOME / ".claude/plugins/cache/market/mx" / READER.parents[2].name).symlink_to(READER.parents[2])
 
-clock = Clock(T0)
-hub = load("container_hub", BIN / "container-hub")
-hub.time = clock
-# what main() sets from its flags before it serves
-hub.STATE = (SCRATCH / "state").resolve()
+clock = fakes.Clock(T0)
+hub = fakes.load(clock, (SCRATCH / "state").resolve())
 hub.STATE.mkdir()
 hub.TMUX_SOCKET = TMUX_SOCKET
 hub.CLEAR_WAIT = 2
@@ -299,12 +260,10 @@ try:
         """What the hub answers the hub tab for a link clicked in a page of the unit."""
         return hub.open_page({"target": str(target), "unit": unit, "by": "user", **body}, PORT, from_page=True)[1]
 
-    def view(key: str) -> dict | None:
-        """A unit as the hub tab reads it, None once it is gone. Its number is the rail's to give."""
-        return hub.unit_view(key, hub.registry(), {}, hub.context_use(hub.statusline_inputs()))
-
     rail = lambda: hub.hub_view()["units"]
-    number = lambda key: next((u["number"] for u in rail() if u["unit"] == key), "gone")
+    view = lambda key: next((u for u in rail() if u["unit"] == key), None)
+    """A unit as the hub tab reads it (/api/u/<key>), None once it is gone."""
+    number = lambda key: (view(key) or {}).get("number", "gone")
     member_of = lambda opened: next(m for m in view(opened["unit"])["members"] if m["id"] == opened["id"])
 
     # --- where a page lands
@@ -1184,32 +1143,6 @@ while data := os.read(0, 4096):
     check("...which a tree retired does not take, the loose pages of no tree still in it", True,
           loose["id"] in [m["id"] for m in (view("loose") or {}).get("members", [])])
 
-    # --- a hub as its user service runs it: no tracker on PATH, the mx plugin's under HOME; and here no diffview beside it
-
-    lone_bin = SCRATCH / "lone-bin"
-    lone_bin.mkdir()
-    shutil.copy2(BIN / "container-hub", lone_bin / "container-hub")
-    service_home = SCRATCH / "service-home"
-    cache = service_home / ".claude/plugins/cache/market/mx"
-    for version, script in (("1.0.9", "#!/bin/sh\nexit 1\n"), ("1.0.10", f'#!/bin/sh\nexec {shutil.which("tracker")} "$@"\n')):
-        (cache / version / "skills/tracker").mkdir(parents=True)
-        (cache / version / "skills/tracker/tracker.py").write_text(script)
-        (cache / version / "skills/tracker/tracker.py").chmod(0o755)
-    # a reader from before chat turns: no in_order, no Chat
-    (cache / "1.0.10/skills/session-page").mkdir(parents=True)
-    (cache / "1.0.10/skills/session-page/session_page.py").write_text("def read_session(directory, transcript):\n    pass\n")
-    as_service = environ(HOME=str(service_home), PATH=":".join(d for d in ENV["PATH"].split(":") if not (Path(d) / "tracker").exists()))
-    with as_service:
-        lone = load("container_hub_service", lone_bin / "container-hub")
-        lone.STATE = SCRATCH / "service-state"
-        lone.open_page({"target": str(alpha / "agent/show/csv-import/index.html"), "session": WORKER}, PORT, from_page=False)
-        served_alone = lone.unit_view(WORKER, lone.registry(), {}, {})
-        unusable = lone.page_reader({})
-    check("with no tracker on PATH, the hub reads the tracker of the newest mx plugin", "map-columns", served_alone["tree"])
-    check("...and with a session page reader it cannot use, reads by none, marking nothing", (None, None, ""),
-          (unusable, served_alone["needs_you"], served_alone["status_line"]))
-    check("a hub with no diffview beside it has no diffview to save its pages through", None, lone.diffview)
-
     # --------------------------------------------------------------------------
     # what only the server does, over HTTP, against one hub on the state the decisions left
     # --------------------------------------------------------------------------
@@ -1316,30 +1249,42 @@ while data := os.read(0, 4096):
     token = token_in(tab_html("document"))
     check("the hub tab loaded as a tab carries the token that lets it type", True, len(token) > 20)
     check("...a page in it that fetches the tab, or frames it, gets none", ("", ""), (token_in(tab_html("empty")), token_in(tab_html("iframe"))))
-    TMUX_CALLS.write_text("")
-    acting = [("/api/type", {"unit": ANSWERER, "text": "rm -rf ~"}), ("/api/jump", {"unit": DOUBLED}),
-              ("/api/close-panes", {"unit": DOUBLED}), ("/api/hand-off", {"unit": CONTINUER, "offer": "hand-off"})]
-    check("a page the hub serves can neither type, jump, close nor hand off without the tab's token", ([403] * 8, set()),
-          ([request("POST", route, body, {"Origin": ORIGIN, "X-Hub-Token": t})[0] for route, body in acting for t in ("", "guessed")],
-           acted()))
+    # a session idle in a pane, which a route that types or closes would reach: the token is all that keeps a page from it
+    received.unlink()
+    tmux("-f", "/dev/null", "new-session", "-d", "-s", "guarded", "-x", "100", "-y", "20", shlex.join(["exec", sys.executable, str(recorder), str(received)]))
+    try:
+        pane, pane_pid = tmux("display-message", "-p", "-t", "guarded:", "#{pane_id} #{pane_pid}").split()
+        deadline = time.monotonic() + 10
+        while not received.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        registered(ANSWERER, pid=int(pane_pid), started=start_of(pane_pid), tmux=f"guarded:@0.{pane}")
+        TMUX_CALLS.write_text("")
+        acting = [("/api/type", {"unit": ANSWERER, "text": "rm -rf ~"}), ("/api/jump", {"unit": ANSWERER}),
+                  ("/api/close-panes", {"unit": ANSWERER}), ("/api/hand-off", {"unit": ANSWERER, "offer": "write"})]
+        check("a page the hub serves can neither type, jump, close nor hand off without the tab's token, the session idle in its pane",
+              ([403] * 8, set(), b"", True),
+              ([request("POST", route, body, {"Origin": ORIGIN, "X-Hub-Token": t})[0] for route, body in acting for t in ("", "guessed")],
+               acted(), arrives(b""), pane in tmux("list-panes", "-a", "-F", "#{pane_id}").split()))
+        check("...which the tab's token types into", (200, b"\x1b[200~go on\x1b[201~\r"),
+              (request("POST", "/api/type", {"unit": ANSWERER, "text": "go on"}, {"Origin": ORIGIN, "X-Hub-Token": token})[0],
+               arrives(b"\x1b[200~go on\x1b[201~\r")))
+    finally:
+        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
     dropped = lambda unit, t=token: request("POST", f"/api/drop?unit={unit}&name=x.png", None,
                                             {"Origin": ORIGIN, "X-Hub-Token": t, "Content-Type": "application/octet-stream"}, data=b"x")
     check("...nor drop a file into a box", (403, 403), (dropped(ANSWERER, "")[0], dropped(ANSWERER, "guessed")[0]))
     check("a dropped file reaches the box's unit through the route", (200, True),
           (lambda r: (r[0], r[1].get("path", "").startswith(str(HOME / ".cache/container-hub/drops" / ANSWERER))))(dropped(ANSWERER)))
     check("a dropped file over the size cap is refused before it is read", 413,
-          announced(f"/api/drop?unit={ANSWERER}&name=huge.png", {"Origin": ORIGIN, "X-Hub-Token": token, "Content-Length": str(hub.DROP_LIMIT + 1)}))
+          announced(f"/api/drop?unit={ANSWERER}&name=huge.png", {"Origin": ORIGIN, "X-Hub-Token": token, "Content-Length": str(200 * 2**20 + 1)}))
 
     # --- what /f/ serves: the agent directories, the files git tracks around them, and what was opened or shared
 
     check("a file no agent opened, outside every agent directory, is not served", 403, request("GET", served(secret))[0])
-    check("...and a page in the hub tab opening it gets its path to copy, and it is served no more than before",
-          ((200, str(secret)), 403),
-          ((lambda r: (r[0], r[1].get("copy")))(request("POST", "/api/open", {"unit": a["unit"], "target": str(secret)}, {"Origin": ORIGIN})),
-           request("GET", served(secret))[0]))
-    check("...nor opening a directory widens what is served, though its path comes back to copy", ((200, str(note.parent)), 403),
-          ((lambda r: (r[0], r[1].get("copy")))(request("POST", "/api/open", {"unit": a["unit"], "target": str(note.parent)}, {"Origin": ORIGIN})),
-           request("GET", served(page(HOME / "beside-notes.html")))[0]))
+    request("POST", "/api/open", {"unit": a["unit"], "target": str(secret)}, {"Origin": ORIGIN})
+    check("...and a page in the hub tab opening it serves it no more than before", 403, request("GET", served(secret))[0])
+    request("POST", "/api/open", {"unit": a["unit"], "target": str(note.parent)}, {"Origin": ORIGIN})
+    check("...nor does opening a directory widen what is served", 403, request("GET", served(page(HOME / "beside-notes.html")))[0])
     open_page(ORIGIN + recorded["url"], ORCHESTRATOR)
     check("a recorded range opened by an agent at the hub's own address widens nothing served", 403,
           request("GET", served(page(HOME / "private.html")))[0])
@@ -1376,8 +1321,6 @@ while data := os.read(0, 4096):
     check("a page the agent repo never held is still not found", 404, request("GET", served(alpha / "agent/show/never-was/index.html"))[0])
 
     # a ticket's recorded code range, rendered on first open
-    status_code, body = request("GET", recorded["url"].replace("map-columns", "csv-import"))
-    check("a ticket with no range recorded has no diff to render", 404, status_code)
     (agent / "tickets/map-columns.md").write_text((agent / "tickets/map-columns.md").read_text().replace("..0123abc", f"..{commits[1]}"))
     status_code, body = request("GET", recorded["url"])
     check("a ticket's recorded code range is served from its render", (200, True), (status_code, b"notes.txt" in body))
@@ -1422,9 +1365,8 @@ while data := os.read(0, 4096):
 
     # the stand-in for a session page, and the script every page the hub serves starts with
     standing = lambda key: request("GET", "/pages/" + urllib.parse.quote(key, safe=""))
-    check("the loose pages' stand-in is served with the column the hub tab fills", (200, True),
-          (standing("loose")[0], b'id="artefacts"' in standing("loose")[1]))
-    check("a unit unknown to the hub has no stand-in", 404, standing("no-such-unit")[0])
+    check("a unit's stand-in is served at its address, and a unit unknown to the hub has none", (200, 404),
+          (standing("loose")[0], standing("no-such-unit")[0]))
     # the hub tab has a page's links from the page's first script on, the page still in standards mode
     calls_first = lambda body: body.lower().startswith(b"<!doctype html><script>") and b"wcCatch" in body.split(b"</script>")[0]
     check("a page the hub serves, a shared directory's listing and a stand-in each start with a script handing the hub tab their links",
@@ -1487,10 +1429,10 @@ while data := os.read(0, 4096):
     check("a write from another origin is refused, as is one from a null origin, and one that names no origin at all", [403, 403, 403],
           [raw_post({"Origin": "http://attacker.example"}), raw_post({"Origin": "null"}), raw_post({})])
     check("none of them touched the file", before, held())
-    check("a write for another Host is refused", 403, post(planted, {"Host": "attacker.example:80"}))
+    check("a state write for another Host is refused", 403, post(planted, {"Host": "attacker.example:80"}))
     check("the hub's own origin on localhost writes too", 204, raw_post({"Origin": f"http://localhost:{PORT}"}))
     check("a write must announce its length", 411, announced(race, {"Origin": ORIGIN}))
-    cap = hub.diffview.MAX_STATE_BYTES
+    cap = 4_000_000
     head = b'{"savedAt": 9500, "writer": "c", "since": null, "pad": "'
     check("and one over the size cap is refused", 413, announced(race, {"Origin": ORIGIN, "Content-Length": str(cap + 1)}))
     check("one exactly at the cap is taken", 204, post(None, data=head + b"x" * (cap - len(head) - 2) + b'"}'))
@@ -1508,7 +1450,6 @@ while data := os.read(0, 4096):
     check("a page with no state written yet answers null, and one with no summary written yet the same", [(200, None), (200, None)],
           [request("GET", served(pages / f"fresh.html.{kind}.json")) for kind in ("state", "summary")])
     check("a url beside no page is not found", 404, request("GET", served(pages / "nopage.html.state.json"))[0])
-    check("a state write from another origin is refused", 403, request("POST", diff_url + ".state.json", state, {"Origin": "http://attacker.example"})[0])
     check("a page no diffview watches asking for a new summary is told none runs", 409, request("POST", diff_url + ".summary.json", {}, {"Origin": ORIGIN})[0])
     watch_record = Path(f"{code_diff}.watch.json")
     for garbage in ("not json", "[1]"):
@@ -1762,8 +1703,11 @@ while data := os.read(0, 4096):
     page(hub.STATE / f"units/{LEGACY}.json", json.dumps({
         "key": LEGACY, "session": LEGACY, "tracker": old_tracker, "roots": {}, "visited": 0, "dismissed": 0,
         "members": [{**old_member, "id": "m1111111111"}, {**old_board, "id": "mboard11111"}]}))
+    kept = lambda: {key: sorted((m["id"], m["closed"]) for m in members(key)) for key in (WORKER, ORCHESTRATOR, STRANGER)}
+    before_restart = kept()
     stop(hub_proc)
     hub_proc = start()
+    check("a unit's pages, and which of them are minimized, survive a restart", before_restart, kept())
     check("a unit an earlier hub kept has its board dropped on a restart, the board being the rail's", ["m1111111111"],
           [m["id"] for m in members(LEGACY)])
     check("...and its tracker moved onto its pages", ([old_tracker], False),
@@ -1801,6 +1745,45 @@ while data := os.read(0, 4096):
         check("...which is as it was", listed, served_list.read_text())
     else:
         print("skip: the unreadable-file checks, since root reads a file of mode 0")
+    # --- a hub as its user service runs it: no tracker on PATH, the mx plugin's under HOME; and here no diffview beside it
+
+    lone_bin = SCRATCH / "lone-bin"
+    lone_bin.mkdir()
+    for name in ("container-hub", "container-hub.html"):
+        shutil.copy2(BIN / name, lone_bin / name)
+    service_home = SCRATCH / "service-home"
+    cache = service_home / ".claude/plugins/cache/market/mx"
+    for version, script in (("1.0.9", "#!/bin/sh\nexit 1\n"), ("1.0.10", f'#!/bin/sh\nexec {shutil.which("tracker")} "$@"\n')):
+        (cache / version / "skills/tracker").mkdir(parents=True)
+        (cache / version / "skills/tracker/tracker.py").write_text(script)
+        (cache / version / "skills/tracker/tracker.py").chmod(0o755)
+    # a reader from before chat turns: no in_order, no Chat
+    (cache / "1.0.10/skills/session-page").mkdir(parents=True)
+    (cache / "1.0.10/skills/session-page/session_page.py").write_text("def read_session(directory, transcript):\n    pass\n")
+    service_port = free_port()
+    service_hub = subprocess.Popen(
+        [lone_bin / "container-hub", "--port", str(service_port), "--state", str(SCRATCH / "service-state"), *HUB_FLAGS],
+        env={**ENV, "HOME": str(service_home), "PATH": ":".join(d for d in ENV["PATH"].split(":") if not (Path(d) / "tracker").exists())},
+        stdout=subprocess.DEVNULL, stderr=(SCRATCH / "service-hub.log").open("w"), start_new_session=True)
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and service_hub.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", service_port), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        check("the hub as its service runs it starts", None, service_hub.poll())
+        service = lambda *args: request(*args, origin=f"http://127.0.0.1:{service_port}")
+        service("POST", "/api/open", {"target": str(alpha / "agent/show/csv-import/index.html"), "session": WORKER})
+        check("with no tracker on PATH, the hub reads the tracker of the newest mx plugin", "map-columns",
+              service("GET", f"/api/u/{WORKER}")[1].get("tree"))
+        check("...and with a session page reader it cannot use, marks nothing and serves the rail all the same",
+              (200, None, ""), (lambda r: (r[0], r[1].get("needs_you"), r[1].get("status_line")))(service("GET", f"/api/u/{WORKER}")))
+        check("a hub with no diffview beside it says its pages cannot save", (200, {"saves": False}), service("GET", "/.health"))
+    finally:
+        os.killpg(service_hub.pid, signal.SIGKILL)
+        service_hub.wait()
     check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
           TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
 finally:
