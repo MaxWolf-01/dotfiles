@@ -35,6 +35,7 @@ import io
 import itertools
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -770,6 +771,26 @@ def driving(world: World):
         os.environ["RUN_LOG_DIR"] = before
     around = bypassed()
     assert not around, f"bin/vpn went around its ports: {around}"
+
+
+def log_in_process() -> None:
+    """Point bin/vpn's run log at an in-process writer of bin/run-log's lines instead of the script itself, for a
+    test that makes thousands of them; starting bin/run-log for each costs more than the rest of a watcher run.
+    A call that bin/run-log would refuse fails the test. tests/vpn/examples.test keeps the real one."""
+
+    def log_run(unit: str, outcome: str, reason: str = "", stats: dict | None = None) -> None:
+        assert re.fullmatch(r"[a-z0-9][a-z0-9._-]*", unit), f"bin/run-log refuses the unit name {unit!r}"
+        assert outcome in ("ok", "skip", "fail"), f"bin/run-log refuses the outcome {outcome!r}"
+        assert outcome == "ok" or reason, f"bin/run-log refuses a {outcome} without a reason"
+        stats = json.loads(json.dumps({} if stats is None else stats))
+        assert isinstance(stats, dict), f"bin/run-log refuses stats that are not a JSON object: {stats!r}"
+        line = {"ts": iso(time.time()), "unit": unit, "outcome": outcome, "reason": reason or None, "stats": stats}
+        logs = Path(os.environ["RUN_LOG_DIR"])
+        logs.mkdir(parents=True, exist_ok=True)
+        with open(logs / f"{unit}.jsonl", "a") as f:
+            f.write(json.dumps(line) + "\n")
+
+    vpn.log_run = log_run
 
 
 def move(world: World, names: list[str], why: str, discord: bool) -> tuple[str, str | None]:
