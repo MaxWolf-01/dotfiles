@@ -1,7 +1,8 @@
 # Run inside the devShell, which carries the tools the tests need: `nix develop -c make test`.
 #
 # Every *.test file names its tier on a line of its own near its top, which is where these targets read it:
-#   # tier: fast                          in-process: no browser, desktop, tmux, systemd, network or sleeps
+#   # tier: fast                          nothing outside the checkout and a scratch directory:
+#                                         no browser, desktop, tmux, systemd, network or sleeps
 #   # tier: full-path (what it drives)    the real thing, end to end
 # `make test` runs the fast files, `make test-full-path` the rest, and both refuse a file that names neither.
 # A file exits 77 to skip, after a line `skip: <why>`; one that skips only some of its cases prints a line
