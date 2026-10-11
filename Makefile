@@ -4,7 +4,8 @@
 #   # tier: fast                          in-process: no browser, desktop, tmux, systemd, network or sleeps
 #   # tier: full-path (what it drives)    the real thing, end to end
 # `make test` runs the fast files, `make test-full-path` the rest, and both refuse a file that names neither.
-# A file exits 77 to skip, after a line `skip: <why>`; the run ends by naming every skip and failure.
+# A file exits 77 to skip, after a line `skip: <why>`; one that skips only some of its cases prints a line starting
+# `skip` for each and passes. The run ends by naming every skip, whole or in part, and every failure.
 
 SHELL := bash
 
@@ -22,7 +23,8 @@ SERIAL = backup/restic_backup.test tests/overdue-check.test
 
 .PHONY: install test test-full-path
 
-# Seconds a file may run before it is stopped and counted as failed.
+# Seconds a file may run before it is stopped and counted as failed. A script's dependencies install before its clock
+# starts, so a cold uv cache does not read as a hang.
 test: TIMEOUT = 60
 test:
 	@$(call run-tier,$(FAST))
@@ -37,9 +39,10 @@ $(if $(UNDECLARED),$(error these files name no tier: $(UNDECLARED)))
 results=$$(mktemp -d); \
 $(call run-files,-j$(JOBS) --output-sync=target,$(filter-out $(SERIAL),$(1))) \
 $(call run-files,-j1,$(filter $(SERIAL),$(1))) \
-skipped=$$(sort "$$results/skipped" 2>/dev/null); failed=$$(sort "$$results/failed" 2>/dev/null); \
-rm -rf "$$results"; \
+skipped=$$(sort "$$results/skipped" 2>/dev/null); partly=$$(sort "$$results/partly" 2>/dev/null); \
+failed=$$(sort "$$results/failed" 2>/dev/null); rm -rf "$$results"; \
 [ -z "$$skipped" ] || { echo; echo "skipped:"; sed 's/^/  /' <<<"$$skipped"; }; \
+[ -z "$$partly" ] || { echo; echo "skipped in part:"; sed 's/^/  /' <<<"$$partly"; }; \
 [ -z "$$failed" ] || { echo; echo "failed:"; sed 's/^/  /' <<<"$$failed"; exit 1; }
 endef
 
@@ -52,10 +55,14 @@ run-files = $(if $(2),$(MAKE) --no-print-directory -k $(1) RESULTS=$$results TIM
 
 run/%:
 	@$(if $(RESULTS),,$(error run/$* is run by `make test` or `make test-full-path`, which collect its result))
-	@echo "== $*"; start=$$(date +%s); log="$(RESULTS)/$$(tr / _ <<<'$*').log"; \
+	@echo "== $*"; log="$(RESULTS)/$$(tr / _ <<<'$*').log"; \
+	if grep -q '^# /// script' $* && ! uv sync --script $* --quiet; then \
+		echo "$*: its dependencies did not install" >> "$(RESULTS)/failed"; exit 0; \
+	fi; \
+	start=$$(date +%s); \
 	timeout -k 10 $(TIMEOUT) ./$* < /dev/null 2>&1 | tee "$$log"; rc=$${PIPESTATUS[0]}; \
 	case $$rc in \
-		0) ;; \
+		0) grep '^skip' "$$log" | sed 's|^|$*: |' >> "$(RESULTS)/partly" ;; \
 		77) echo "$*: $$(sed -n 's/^skip: //p' "$$log" | tail -1)" >> "$(RESULTS)/skipped" ;; \
 		124|137) echo "$*: stopped after $(TIMEOUT) s" >> "$(RESULTS)/failed" ;; \
 		*) echo "$*" >> "$(RESULTS)/failed" ;; \

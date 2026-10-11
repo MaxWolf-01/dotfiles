@@ -1,6 +1,7 @@
 # What every bash test file shares, sourced near its top. The runner reads only the exit code:
 # 0 passed, 77 skipped (the line `skip` printed is the reason it names), anything else failed.
 
+# How many checks have failed so far, for a file that prints more on a failure before it calls finish.
 failures=0
 
 check() {

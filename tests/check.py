@@ -24,7 +24,7 @@ failures = 0
 
 def check(what: str, expected, actual) -> None:
     if expected == actual:
-        print(f"ok   {what}", file=OUT)
+        passed(what)
     else:
         fail(what, f"expected: {expected!r}\nactual:   {actual!r}")
 
@@ -36,6 +36,10 @@ def settles(what: str, expected, read: Callable[[], object], within: float = 10)
     while (actual := read()) != expected and time.monotonic() < deadline:
         time.sleep(0.05)
     check(what, expected, actual)
+
+
+def passed(what: str) -> None:
+    print(f"ok   {what}", file=OUT)
 
 
 def fail(what: str, why: str = "") -> None:
@@ -117,19 +121,18 @@ def run_properties(run: Callable[[Callable[..., None]], None] = lambda check: ch
         except Exception:
             fail(p.says, traceback.format_exc())
         else:
-            print(f"ok   {p.says}", file=OUT)
+            passed(p.says)
 
 
 def checked(examples: int):
     """Hypothesis settings for a property: examples cases, no deadline, and the failing ones kept beside this file
     for the next run to try first."""
-    from hypothesis import HealthCheck, Phase, settings
+    from hypothesis import HealthCheck, settings
     from hypothesis.database import DirectoryBasedExampleDatabase
 
     return settings(
         max_examples=examples,
         deadline=None,
-        phases=[Phase.explicit, Phase.reuse, Phase.generate, Phase.target, Phase.shrink],
         report_multiple_bugs=False,
         database=DirectoryBasedExampleDatabase(Path(__file__).resolve().parent / ".hypothesis"),
         suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
