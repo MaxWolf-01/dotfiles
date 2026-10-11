@@ -1,4 +1,5 @@
 #!/usr/bin/env -S uv run --script --quiet
+# tier: full-path (dnsproxy against TLS stand-ins, against the clock)
 # /// script
 # requires-python = ">=3.11"
 # ///
@@ -19,9 +20,11 @@ queries, connections opened after it answer.
 
 import asyncio
 import base64
+import contextlib
 import os
 import re
 import shutil
+import socket
 import ssl
 import struct
 import subprocess
@@ -30,8 +33,34 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import fail, finish, needs, skip  # noqa: E402
+
 INSTALL = Path(__file__).resolve().parent.parent / "bin/dns-failover-install"
-UPSTREAM_PORT, FALLBACK_PORT, FRONT_PORT = 8853, 5391, 5390
+
+
+def free_ports() -> tuple[int, int, int]:
+    """Ports for the upstream (TCP), the fallback (UDP) and the front (both), all held until the three are
+    picked. They are released before the test binds them, so a clash with another process stays possible,
+    only unlikely."""
+    with contextlib.ExitStack() as held:
+
+        def bind(kind: socket.SocketKind, port: int = 0) -> int:
+            s = held.enter_context(socket.socket(socket.AF_INET, kind))
+            s.bind(("127.0.0.1", port))
+            return s.getsockname()[1]
+
+        upstream, fallback = bind(socket.SOCK_STREAM), bind(socket.SOCK_DGRAM)
+        while True:
+            front = bind(socket.SOCK_DGRAM)
+            try:
+                bind(socket.SOCK_STREAM, front)
+            except OSError:
+                continue
+            return upstream, fallback, front
+
+
+UPSTREAM_PORT, FALLBACK_PORT, FRONT_PORT = free_ports()
 RECONNECT_SECS = 1.0
 """What a fresh connection to a local stand-in may cost on top of --timeout."""
 
@@ -109,18 +138,18 @@ async def lookup(name: str) -> tuple[float, str]:
     return time.monotonic() - started, lines[0] if lines else "no answer"
 
 
-async def main() -> int:
+async def main() -> None:
     global silent_since
     dnsproxy = shutil.which("dnsproxy", path="/usr/local/bin:/usr/bin:" + os.environ.get("PATH", ""))
     if dnsproxy is None:
-        print("skip dnsproxy is not installed on this machine (bin/dns-failover-install puts it in /usr/local/bin)")
-        return 0
+        skip("dnsproxy is not installed on this machine (bin/dns-failover-install puts it in /usr/local/bin)")
+    needs("dig", "openssl")
     scheme, timeout = installed_front()
     handlers = {"tls": (dot_connection, f"tls://127.0.0.1:{UPSTREAM_PORT}"),
                 "https": (doh_connection, f"https://127.0.0.1:{UPSTREAM_PORT}/dns-query")}  # fmt: skip
     if scheme not in handlers:
-        print(f"FAIL no stand-in for a {scheme}:// upstream; this test knows {', '.join(handlers)}")
-        return 1
+        fail(f"no stand-in for a {scheme}:// upstream", f"this test knows {', '.join(handlers)}")
+        return
     handler, upstream = handlers[scheme]
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -142,8 +171,8 @@ async def main() -> int:
             # Several at once, so the front holds several connections, as it does in use.
             warm = await asyncio.gather(*(lookup(f"warm{i}.test") for i in range(4)))
             if any(ip != "192.0.2.1" for _, ip in warm):
-                print(f"FAIL the front did not answer through its upstream before the change: {warm}")
-                return 1
+                fail("the front answers through its upstream before the change", str(warm))
+                return
             silent_since = time.monotonic()
             after = [await lookup(f"after{i}.test") for i in range(6)]
         finally:
@@ -152,12 +181,13 @@ async def main() -> int:
     limit = timeout + RECONNECT_SECS
     slowest = max(took for took, _ in after)
     unanswered = [ip for _, ip in after if not ip.startswith("192.0.2.")]
-    ok = slowest <= limit and not unanswered
-    print(f"{'ok  ' if ok else 'FAIL'} a lookup landing on a silent {scheme}:// connection is answered within --timeout + {RECONNECT_SECS:g} s")
-    if not ok:
-        print(f"       expected: every lookup answered within {limit:g} s")
-        print(f"       actual:   slowest {slowest:.2f} s; answers {[ip for _, ip in after]}; fallback asked {fallback_answers}x")
-    return 0 if ok else 1
+    what = f"a lookup landing on a silent {scheme}:// connection is answered within --timeout + {RECONNECT_SECS:g} s"
+    if slowest <= limit and not unanswered:
+        print(f"ok   {what}")
+    else:
+        fail(what, f"expected: every lookup answered within {limit:g} s\n"
+                   f"actual:   slowest {slowest:.2f} s; answers {[ip for _, ip in after]}; fallback asked {fallback_answers}x")
 
 
-sys.exit(asyncio.run(main()))
+asyncio.run(main())
+finish()
