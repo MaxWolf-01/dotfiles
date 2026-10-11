@@ -18,6 +18,11 @@ passed() {
     echo "ok   $1"
 }
 
+# One case this host cannot check, while the rest of the file runs: skipped <what> <why>.
+skipped() {
+    echo "skip $1: $2"
+}
+
 # A check that failed for the reason given, for one that is not a comparison of two values.
 fail() {
     echo "FAIL $1"
