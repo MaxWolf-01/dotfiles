@@ -57,7 +57,8 @@ Guidelines:
 - Include informative error messages — especially for unattended scripts (timers, cron). Print what failed, why, and what to check.
 - Python CLIs: use tyro (load `/mx:tyro-cli` skill first).
 - Name a helper for the subsystem it serves, not for its verb: `restic-config-name`, not `config-name`. Everything here shares one flat namespace and one tab-completion list.
-- A test for a script in a `$PATH` directory (`bin/`, `secrets/scripts/`, `secrets/bin/`) lives in that repo's `tests/`, not beside it — a `.test` file on `$PATH` is autocomplete noise. Everywhere else (`backup/`, for one) a test sits beside what it tests.
+- A test for a script in a `$PATH` directory (`bin/`, `secrets/scripts/`, `secrets/bin/`) lives in that repo's `tests/`, not beside it — a `.test` file on `$PATH` is autocomplete noise. Everywhere else (`backup/`, for one) a test sits beside what it tests. A tool with one test file has `tests/<tool>.test`; one with several keeps them in `tests/<tool>/`.
+- `nix develop -c make test` runs the fast tests, on every change; `nix develop -c make test-full-path` runs the rest. Every `.test` file names its tier, and the Makefile's header says what each tier holds. A test sources `tests/check.sh` or imports `tests/check.py` rather than writing its own copy of what they hold.
 
 ## Tmux
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env -S uv run --script --quiet
+# tier: full-path (Chromium, a live hub)
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["playwright"]
@@ -12,9 +13,8 @@ dies mid-review loses nothing typed.
 The pages are served by a container hub of the test's own, on a free port, never 8377, with a home of its
 own so its state is the test's.
 
-Run it directly; no framework. Uses the chromium build playwright keeps in its cache
-(`uv run --with playwright playwright install chromium` once, if it is missing), or $CHROMIUM where that build
-cannot run (NixOS).
+Run it directly; no framework. The pages land in $DIFFVIEW_TEST_PAGES, else ~/Downloads/diffview/test.
+Drives the Chromium check.chromium finds, and skips with none.
 """
 
 import base64
@@ -22,6 +22,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import socket
 import struct
@@ -38,14 +39,10 @@ from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout, sync_playwright
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import Skip, check, chromium, finish, free_port, skip  # noqa: E402
+
 DIFFVIEW = Path(__file__).resolve().parent.parent / "bin" / "diffview"
-failures = 0
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 HUB_PORT = free_port()
@@ -77,21 +74,13 @@ def stop_hub() -> None:
         time.sleep(0.1)
 
 
-PAGES = Path.home() / "Downloads" / "diffview" / "test"   # the served tree must sit below home, not at it
+# the hub serves this tree whole, so it must not hold all of $HOME or the temp dir
+PAGES = Path(os.environ.get("DIFFVIEW_TEST_PAGES") or Path.home() / "Downloads" / "diffview" / "test")
 
 
 def served(path: Path) -> str:
     """Where the hub serves a page under PAGES."""
     return f"{HUB}/f{urllib.parse.quote(str(path))}"
-
-
-def check(what: str, expected, actual) -> None:
-    global failures
-    if expected == actual:
-        print(f"ok   {what}")
-    else:
-        print(f"FAIL {what}\n       expected: {expected!r}\n       actual:   {actual!r}")
-        failures += 1
 
 
 def git(repo: Path, *args: str) -> None:
@@ -277,49 +266,60 @@ def history_case(root: Path, base: str, pages: Path, browser) -> None:
     out = pages / f"history-{os.getpid()}.html"
     subprocess.run([str(DIFFVIEW), f"{repo}@start..main", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
 
-    page = browser.new_page(viewport={"width": 1600, "height": 1000})
+    state = Path(f"{out}.state.json")
+    page = browser.new_page(viewport={"width": 1600, "height": 1000}, permissions=["clipboard-read", "clipboard-write"])
     page.goto(f"{base}/{out.name}")
     page.wait_for_selector(".main .fcard")
-    added = lambda: sorted(page.evaluate("VIEW.sources.flatMap(s => s.files.flatMap(f => f.hunks.flatMap(h => h.lines.filter(l => l[0] === 1).map(l => l[3]))))"))
+
+    def added() -> list[str]:
+        """The added lines on the page, once the card has drawn them: a row of their own unified, the new half of a row split."""
+        rows = page.locator('.main tr.add td.code, .main tr.split td.no[data-side="new"] + td.code')
+        rows.first.wait_for()
+        return sorted(rows.all_inner_texts())
+
+    selected = lambda: page.locator("#commits .hc.sel .subj").all_inner_texts()
+    line = lambda n: page.locator(f'.main td.no[data-side="new"][data-no="{n}"] + td.code').inner_text()
     commit = lambda subject: page.locator("#commits .hc", has_text=subject).locator(".hc-head")   # the head, never a file row under it
     page.keyboard.press("h")
     check("the history lists the range's commits, merges left out, each with the file it changed on a line of its own",
           (3, ["notes.txt"] * 3), (page.locator("#commits .hc").count(), page.locator("#commits .hc-file .hc-p").all_inner_texts()))
 
     commit("late: line 25").click()
-    check("one commit selected shows its own change", (["n 25 late"], "0:" + page.evaluate("DATA.sources[0].commits.find(c => c.subject === 'late: line 25').short")),
-          (added(), page.evaluate("[...LENS][0]")))
-    check("and the page carries the file as that commit left it, to open context from", True, page.evaluate("!!ALL[0].f.content"))
+    check("one commit selected shows its own change", (["n 25 late"], ["late: line 25"]), (added(), selected()))
+    page.keyboard.press("j")
+    page.keyboard.press("F")
+    check("and opens context from the file as that commit left it: the change before it in, the one after it out",
+          ("n 20 main", "n 26", "n 5", "30"),
+          (line(20), line(26), line(5), page.locator('.main td.no[data-side="new"][data-no]').last.inner_text()))
 
     page.locator("#commits .hc").first.locator(".hc-head").click()
     page.locator("#commits .hc").last.locator(".hc-head").click(modifiers=["Shift"])
-    check("Shift-click selects the range, shown as one diff", (3, 1), (page.evaluate("LENS.size"), page.evaluate("VIEW.sources.length")))
+    check("Shift-click selects the range, shown as one diff", (3, 1), (len(selected()), page.locator(".main .fcard").count()))
     check("which holds every selected commit's change and none of the unselected one's", ["n 25 late", "n 26 late", "n 5 early"], added())
 
     commit("late: line 25").click()
     page.locator('.main td.no[data-side="new"][data-no="25"]').first.click()
     page.keyboard.type("asked on one commit")
     page.keyboard.press("Control+Enter")
-    key = page.evaluate("S.comments[0].fileKey")
-    check("a comment written with a commit selected is keyed to that commit", True, key.startswith("@") and key.endswith(":notes.txt"))
+    sha = commit("late: line 25").locator(".sha").inner_text()
+    eventually(lambda: state.is_file() and bool(json.loads(state.read_text())["comments"]))
+    key = json.loads(state.read_text())["comments"][0]["fileKey"]
+    check("a comment written with a commit selected is keyed to that commit", True, key.startswith("@") and key.endswith(":notes.txt") and sha in key)
     page.keyboard.press("H")
     page.wait_for_selector(".fcard .cbox.file")
     check("the full diff shows it on the file it is about, and says which commit it was written on",
           True, "written on commit" in page.locator(".cbox .cref").inner_text())
-    exported = page.evaluate("commentsMarkdown()")
+    exported = yanked(page, "C")
     check("the copied comments name that commit too", True,
-          "## on selected commits" in exported and f"new line 25 · in commit {key[1:].split(':')[0]}" in exported)
+          "## on selected commits" in exported and f"new line 25 · in commit {sha}" in exported)
     page.locator(".cbox .btn", has_text="show those commits").click()
     page.wait_for_timeout(100)
-    check("its button selects that commit again, with the comment back on its own line", (1, 25),
-          (page.evaluate("LENS.size"), page.evaluate("S.comments[0].start")))
+    check("its button selects that commit again, with the comment back on its own line", (["late: line 25"], "25"),
+          (selected(), page.locator('.main tr:has(+ tr.crow) td.no[data-side="new"]').inner_text()))
     page.keyboard.press("H")
     page.wait_for_selector(".fcard .cbox.file")
-    page.keyboard.press("Control+k")
-    page.keyboard.type(f"c{page.evaluate('S.comments[0].id')}")
-    page.keyboard.press("Enter")
-    check("and Ctrl+K on its id lands on it from the full diff", ("comment", 1),
-          (page.evaluate("S.ann && S.ann.kind"), page.locator(".cbox.focus-ann").count()))
+    jump(page, page.locator(".cbox[data-ann]").first.get_attribute("data-ann"))
+    check("and Ctrl+K on its id lands on it from the full diff", "C1", at(page))
     page.close()
 
 
@@ -338,7 +338,7 @@ def tree_page(root: Path, browser, name: str, base: dict[str, str], files: dict[
     notes_file.write_text(json.dumps({"notes": notes}))
     out = root / f"{name}.html"
     subprocess.run([str(DIFFVIEW), f"{repo}@HEAD~1..HEAD", "--notes", str(notes_file), "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
-    page = browser.new_page(viewport={"width": 1280, "height": height})
+    page = browser.new_page(viewport={"width": 1280, "height": height}, permissions=["clipboard-read", "clipboard-write"])
     page.goto(f"file://{out}")
     page.wait_for_selector(".main .fcard")
     return repo, page
@@ -349,8 +349,29 @@ def paths(page, selector: str) -> list[str]:
     return [key.split(":", 1)[1] for key in page.locator(selector).evaluate_all("els => els.map(e => e.dataset.key)")]
 
 
-def focused(page) -> str:
-    return page.evaluate("HUNKS[S.focus].x.f.path")
+def focus_at(page) -> list | None:
+    """What the keyboard focus outlines: [file path, hunk index], the index -1 for a card without hunks and None
+    for a folded card, whose header alone shows the focus; None for no focus at all."""
+    return page.evaluate("""() => {
+      const el = document.querySelector(".main tbody.hunk.focus, .main .fbody.focus, .main .fhead.focus-file");
+      if (!el) return null;
+      const path = el.closest(".fcard").dataset.key.replace(/^\\d+:/, "");
+      return [path, el.matches("tbody.hunk") ? +el.dataset.hi : el.matches(".fbody") ? -1 : null];
+    }""")
+
+
+def focused(page) -> str | None:
+    """The file the keyboard focus is on, or None."""
+    return (focus_at(page) or [None])[0]
+
+
+def yanked(page, key: str) -> str:
+    """What a key puts on the clipboard: y the diff as a patch, Y the same with the annotations inline, C the open
+    comments as markdown, for the authoring agent."""
+    page.evaluate("navigator.clipboard.writeText('')")
+    page.keyboard.press(key)
+    eventually(lambda: page.evaluate("navigator.clipboard.readText()") != "", 5)
+    return page.evaluate("navigator.clipboard.readText()")
 
 
 def walk(page, key: str, presses: int) -> list[str]:
@@ -385,7 +406,7 @@ def order_case(root: Path, browser) -> None:
         marked.append(paths(page, ".tree-file.current"))
     check("J walks the files in that order", listed, walked)
     check("and the tree marks the file J lands on, not the one above it on screen", [[rel] for rel in listed], marked)
-    heads = [line.split(" b/", 1)[1] for line in page.evaluate("diffText(false)").splitlines() if line.startswith("diff --git ")]
+    heads = [line.split(" b/", 1)[1] for line in yanked(page, "y").splitlines() if line.startswith("diff --git ")]
     check("y copies them in that order", tree, heads)
     page.keyboard.press("g"); page.keyboard.press("g")
     check("Ctrl+d goes a directory at a time, the untouched section on its own, and stops at the last",
@@ -428,11 +449,11 @@ def fold_case(root: Path, browser) -> None:
 
     directory("e/").click(); directory("c/").first.click()
     check("a directory folds inside a folded one", ["c/", "e/"], closed())
-    page.evaluate('openCard(CARDS.get("0:c/e/f.txt"))')
+    page.locator('.fcard[data-key="0:c/e/f.txt"] .fhead .path').click()
     check("opening a card inside both unfolds both", ([], []), (collapsed(), closed()))
 
     page.keyboard.press("g"); page.keyboard.press("g")
-    page.evaluate('scrollTo(0, CARDS.get("0:m/img.bin").getBoundingClientRect().top + scrollY - document.querySelector(".top").offsetHeight)')
+    page.locator('.fcard[data-key="0:m/img.bin"]').evaluate('el => scrollTo(0, el.getBoundingClientRect().top + scrollY - document.querySelector(".top").offsetHeight)')
     page.keyboard.press("z")
     check("z on a directory with no hunks in it moves on past it, not to the top of the page", (["m/"], "n/y.txt"), (closed(), focused(page)))
     directory("m/").click()
@@ -460,7 +481,6 @@ def mouse_case(root: Path, browser) -> None:
     base = {"a.txt": text, "b.txt": text, "m/img.bin": b"\x89PNG\r\n\x1a\n\x00\x01"}
     _, page = tree_page(root, browser, "moused", base,
                         {"a.txt": edited, "b.txt": edited, "m/img.bin": b"\x89PNG\r\n\x1a\n\x00\x02"}, [], 900)
-    at = lambda: page.evaluate("[HUNKS[S.focus].x.f.path, HUNKS[S.focus].hi]")
     hunk = lambda rel, hi: page.locator(f'.fcard[data-key="0:{rel}"] tbody.hunk[data-hi="{hi}"]')
 
     def show(locator):   # in view before the click, so the page moving afterwards is the page's own doing
@@ -469,22 +489,22 @@ def mouse_case(root: Path, browser) -> None:
         return page.evaluate("scrollY")
 
     page.locator('.tree-file[data-key="0:b.txt"]').click()
-    check("clicking a file in the tree focuses its first hunk", ["b.txt", 0], at())
+    check("clicking a file in the tree focuses its first hunk", ["b.txt", 0], focus_at(page))
     clear = page.evaluate('document.querySelector(\'.fcard[data-key="0:b.txt"]\').getBoundingClientRect().top'
                           ' >= document.querySelector(".top").getBoundingClientRect().bottom - 1')
     check("and stops the card under the sticky bar, not behind it", True, clear)
     page.keyboard.press("j")
-    check("and j carries on from there, inside that file", ["b.txt", 1], at())
+    check("and j carries on from there, inside that file", ["b.txt", 1], focus_at(page))
 
     y = show(hunk("a.txt", 1))
     hunk("a.txt", 1).locator("td.code").first.click()
-    check("clicking inside a hunk focuses it, and the page stays put", (["a.txt", 1], True), (at(), page.evaluate("scrollY") == y))
+    check("clicking inside a hunk focuses it, and the page stays put", (["a.txt", 1], True), (focus_at(page), page.evaluate("scrollY") == y))
 
     head = page.locator('.fcard[data-key="0:b.txt"] .fhead .path')
     head.click()
-    check("collapsing a file from its header leaves the focus where it is", ["a.txt", 1], at())
+    check("collapsing a file from its header leaves the focus where it is", ["a.txt", 1], focus_at(page))
     head.click()
-    check("opening one from its header focuses that file", ["b.txt", 0], at())
+    check("opening one from its header focuses that file", ["b.txt", 0], focus_at(page))
 
     show(hunk("a.txt", 0))
     box = hunk("a.txt", 0).locator("td.code").first.bounding_box()
@@ -492,17 +512,17 @@ def mouse_case(root: Path, browser) -> None:
     page.mouse.down()
     page.mouse.move(box["x"] + box["width"] * 0.7, box["y"] + box["height"] / 2)
     page.mouse.up()
-    check("a drag that selected text is reading, not arriving", (["b.txt", 0], True), (at(), page.evaluate("!!getSelection().toString()")))
+    check("a drag that selected text is reading, not arriving", (["b.txt", 0], True), (focus_at(page), page.evaluate("!!getSelection().toString()")))
 
     hunk("a.txt", 0).locator("td.no[data-no]").first.click()   # the gutter is user-select: none, so the drag above outlives this click
-    check("clicking a line number, the gesture that comments on it, focuses its hunk too", ["a.txt", 0], at())
+    check("clicking a line number, the gesture that comments on it, focuses its hunk too", ["a.txt", 0], focus_at(page))
 
     page.locator('.fcard[data-key="0:a.txt"] .fhead input').check()
     check("the viewed box marks the file without taking the focus", (["a.txt", 0], True),
-          (at(), page.evaluate('S.viewed.has("0:a.txt")')))
+          (focus_at(page), page.locator('.fcard.viewed[data-key="0:a.txt"]').count() == 1))
 
     page.locator('.fcard[data-key="0:m/img.bin"] .binmsg').click()
-    check("clicking a card without lines focuses the card itself", ["m/img.bin", -1], at())
+    check("clicking a card without lines focuses the card itself", ["m/img.bin", -1], focus_at(page))
     page.close()
 
 
@@ -526,6 +546,305 @@ def layer_case(root: Path, browser) -> None:
     drawing = sorted((l for l in tree.get("layers", []) if l.get("drawsContent")), key=lambda l: l["height"])
     too_tall = [f'{l["width"]:.0f}x{l["height"]:.0f}' for l in drawing[:-1] if l["height"] > 720]   # the tallest is the document
     check("the browser reported its layers, and none but the document's is taller than the window", (True, []), (bool(drawing), too_tall))
+    page.close()
+
+
+def threes(root: Path) -> Path:
+    """b.txt grown by a third line: the one hunk every review below annotates, at new line 3."""
+    repo = root / "threes"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "b.txt").write_text("one\ntwo\n")
+    git(repo, "add", "."); git(repo, "commit", "-qm", "base")
+    (repo / "b.txt").write_text("one\ntwo\nthree\n")
+    git(repo, "commit", "-qam", "a third line")
+    return repo
+
+
+def remark(cid: int, text: str, line: int = 3, **extra) -> dict:
+    """A review comment on b.txt's new line `line`, as a state file holds it."""
+    return {"id": cid, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": line, "end": line, "text": text,
+            "excerpt": [("+ " if line == 3 else "  ") + ["one", "two", "three"][line - 1]], **extra}
+
+
+def review(browser, repo: Path, out: Path, notes: dict, comments: list[dict] | None, summary: str = "", url: str = ""):
+    """repo's last commit rendered to `out` with `notes`, over a state file holding `comments` (None: the one
+    already there), and opened at `url` (the page as a file, when none is given). Returns the page."""
+    state = Path(f"{out}.state.json")
+    if comments is not None:
+        state.unlink(missing_ok=True)
+    if comments:
+        state.write_text(json.dumps({"savedAt": 1, "nextId": max(c["id"] for c in comments) + 1, "verdict": [], "comments": comments}))
+    notes_file = out.with_suffix(".notes.json")
+    notes_file.write_text(json.dumps(notes))
+    subprocess.run([str(DIFFVIEW), f"{repo}@HEAD~1..HEAD", "--notes", str(notes_file), "-o", str(out),
+                    *(["--summary", summary] if summary else ["--no-auto-summary"])], check=True, capture_output=True)
+    page = browser.new_page(viewport={"width": 1280, "height": 1600}, permissions=["clipboard-read", "clipboard-write"])
+    page.goto(url or f"file://{out}")
+    page.wait_for_selector("tbody.hunk")
+    return page
+
+
+def at(page) -> str:
+    """The annotation the keyboard is on, by the handle the page shows it under (C2, A9), or - for none."""
+    return " ".join(page.locator(".focus-ann").evaluate_all("els => els.map(e => e.dataset.ann.toUpperCase())")) or "-"
+
+
+def jump(page, target: str) -> None:
+    """Ctrl+K to an annotation by its handle."""
+    page.evaluate("document.activeElement && document.activeElement.blur()")   # keys are the page's only while no input has focus
+    page.keyboard.press("Control+k")
+    page.locator("#jump input").fill(target)
+    page.locator("#jump input").press("Enter")
+
+
+def folded(page, handle: str) -> bool:
+    """An annotation shows its one header line, its text folded away."""
+    return page.locator(f'[data-ann="{handle.lower()}"]').locator(".ctext, .atext").is_hidden()
+
+
+def eventually(cond, seconds: float = 10) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and not cond():
+        time.sleep(0.2)
+    return cond()
+
+
+def resolve_case(repo: Path, pages: Path, browser) -> None:
+    """A comment the agent called resolved folds away and leaves the count; Ctrl+K still reaches it, and r there
+    overrides the agent, in the state file too, so a rebuild cannot bring the agent's word back. Resolving the
+    comment you stand on folds it and lets the focus go; a click opens it again. Space stays the key that marks
+    the file viewed, even on a comment."""
+    out = pages / f"review-{os.getpid()}-resolve.html"
+    state = Path(f"{out}.state.json")
+    notes = {"notes": [{"id": 1, "path": "b.txt", "line": 3, "text": "kept the old order on purpose"}], "resolved": ["C1"]}
+    page = review(browser, repo, out, notes, [remark(1, "first thought"), remark(2, "second thought", re=1)], url=served(out))
+    label = lambda: page.locator("#copy-btn .lbl").inner_text()
+    verdicts = lambda: json.loads(state.read_text()).get("verdict")
+
+    check("the agent's resolution folds C1 away, and the copy button counts only the open comment",
+          (True, False, "copy 1 comment"), (folded(page, "C1"), folded(page, "C2"), label()))
+    page.keyboard.press("m")
+    check("m lands on the next open comment", "C2", at(page))
+    md = yanked(page, "C")
+    check("the copied comments name C2 as a reply to the note, and leave the resolved C1 out", (True, True, False),
+          ("**C2** · " in md, "reply to your note A1" in md, "**C1**" in md))
+    page.keyboard.press("r")
+    check("resolving the comment you stand on folds it and lets the focus go, nothing else being open",
+          (True, "-", "copy 0 comments"), (folded(page, "C2"), at(page), label()))
+    page.locator('[data-ann="c2"] .cref').click()
+    check("clicking a folded comment opens it back up", ("C2", False), (at(page), folded(page, "C2")))
+    page.keyboard.press("r")
+
+    jump(page, "c1")
+    check("Ctrl+K reaches a comment the agent resolved, and opens it", ("C1", False), (at(page), folded(page, "C1")))
+    page.keyboard.press("r")
+    check("r there overrides the agent's resolution", "copy 2 comments", label())
+    check("and the override is written to the state file beside the page", True, eventually(lambda: [1, False] in (verdicts() or [])))
+
+    page.keyboard.press(" ")
+    check("Space on a focused comment marks the file viewed, and never resolves it",
+          (True, "copy 2 comments", "-"), (page.locator('.fcard[data-key="0:b.txt"] .fhead input').is_checked(), label(), at(page)))
+    page.locator('.fcard[data-key="0:b.txt"] .fhead input').uncheck()
+
+    jump(page, "a1")
+    page.keyboard.press("r")
+    check("a note marked seen that has a reply is left to the reply: the copy does not list it as read",
+          (True, False), (folded(page, "A1"), "notes read, nothing needed" in yanked(page, "C")))
+    page.close()
+
+
+ORDERED = {"notes": [{"id": 9, "path": "b.txt", "line": 3, "text": "listed first, sits last"},
+                     {"id": 2, "path": "b.txt", "line": 1, "text": "listed second, sits first"}]}
+
+
+def motion_case(repo: Path, pages: Path, browser) -> None:
+    """n and m walk the annotations in the order the page shows them, whatever order the notes file lists them in,
+    and every hop is taken from where the reader stands, even when that is outside the ring being walked: a
+    comment just resolved, or a note while m walks the comments."""
+    out = pages / f"review-{os.getpid()}-motion.html"
+    page = review(browser, repo, out, ORDERED, [remark(1, "one", 1), remark(2, "two", 2), remark(3, "three", 2)], url=served(out))
+    trace = []
+    for keys in (["n"], ["n"], ["jump c2", "r"], ["n"], ["m"], ["m"]):
+        for k in keys:
+            jump(page, k.split()[1]) if k.startswith("jump") else page.keyboard.press(k)
+        trace.append(at(page))
+    # n, n: the notes in file order; resolving C2 moves on to C3; n from there is A9, the next note below;
+    # m from a note lands on the comment nearest behind when none is ahead, and stops at the end of its ring
+    check("motion follows the page's order, not the notes file's or the ring's", "A2 A9 C3 A9 C3 C3", " ".join(trace))
+    page.close()
+
+
+def seen_case(repo: Path, pages: Path, browser) -> None:
+    """r on a note the reader has nothing to say about marks it seen: it folds, n and N skip it, the focus moves on,
+    the copy names it, and the mark is tied to the note's text, so a note the agent rewrites comes back."""
+    out = pages / f"review-{os.getpid()}-seen.html"
+    state = Path(f"{out}.state.json")
+    page = review(browser, repo, out, ORDERED, [], url=served(out))
+    page.keyboard.press("n")
+    page.keyboard.press("r")
+    check("r on a note folds it and moves on to the next one", (True, "A9"), (folded(page, "A2"), at(page)))
+    page.keyboard.press("N")
+    check("N skips the seen note, and with nothing else behind, stays", "A9", at(page))
+    page.keyboard.press("r")
+    check("the last note seen, the focus is let go and the file's note count goes", ("-", True),
+          (at(page), page.locator('.fcard[data-key="0:b.txt"] .fhead .acount').is_hidden()))
+    check("the copy lists both as read with nothing needed", True, "## notes read, nothing needed\n\nA2, A9" in yanked(page, "C"))
+    seen = lambda: json.loads(state.read_text()).get("seen") if state.is_file() else None
+    check("the seen marks are written beside the page, each with the text it was given for", True,
+          eventually(lambda: seen() == [[2, "listed second, sits first"], [9, "listed first, sits last"]]))
+    page.close()
+
+    rewritten = {"notes": [ORDERED["notes"][0], {**ORDERED["notes"][1], "text": "listed second, sits first, said better"}]}
+    page = review(browser, repo, out, rewritten, None, url=served(out))
+    check("a note the agent rewrote since comes back unseen; the one it left alone stays seen", (False, True),
+          (folded(page, "A2"), folded(page, "A9")))
+    page.close()
+
+
+def thread_case(repo: Path, pages: Path, browser) -> None:
+    """A reply sits under what it answers, one step further in, and m walks the comments in that order. A reply to a
+    note nested in a thread is written at the thread's lines, right under that note."""
+    out = pages / f"review-{os.getpid()}-thread.html"
+    state = Path(f"{out}.state.json")
+    notes = {"notes": [{"id": 1, "path": "b.txt", "line": 3, "text": "root note"},
+                       {"id": 5, "re": "C1", "text": "answers the root comment"},
+                       {"id": 6, "re": "C3", "text": "answers the reply to the root note"}]}
+    page = review(browser, repo, out, notes, [remark(1, "root comment"), remark(2, "second root comment"), remark(3, "replies to A1", re=1)],
+                  url=served(out))
+
+    def shown() -> list[str]:   # each annotation in page order, with how far in it sits: 0 for a thread's root
+        boxes = page.locator("[data-ann]").evaluate_all("els => els.map(e => [e.dataset.ann.toUpperCase(), e.getBoundingClientRect().left])")
+        lefts = sorted({left for _, left in boxes})
+        return [f"{handle}:{lefts.index(left)}" for handle, left in boxes]
+
+    check("replies sit under what they answer, one step further in for each", ["A1:0", "C3:1", "A6:2", "C1:0", "A5:1", "C2:0"], shown())
+    trace = []
+    for _ in range(3):
+        page.keyboard.press("m")
+        trace.append(at(page))
+    check("m walks the comments in that order", "C3 C1 C2", " ".join(trace))
+    check("every note offers a reply and a seen mark, nested ones included", [["reply", "mark seen"]] * 3,
+          [page.locator(f'[data-ann="{a}"] .aref button').all_inner_texts() for a in ("a1", "a6", "a5")])
+    jump(page, "a5")
+    page.keyboard.press("c")
+    page.keyboard.type("answers A5")
+    page.keyboard.press("Control+Enter")
+    written = lambda: next((c for c in json.loads(state.read_text())["comments"] if c["text"] == "answers A5"), None)
+    check("c on a nested note writes the reply at the thread's lines", True,
+          eventually(lambda: (c := written()) is not None and (c["side"], c["start"], c["end"], c["re"]) == ("new", 3, 3, 5)))
+    check("and shows it right under that note", ["A5:1", "C4:2"], shown()[4:6])
+    page.close()
+
+
+def readonly_case(repo: Path, root: Path, browser) -> None:
+    """A page opened as a file has nowhere to write: it says so, names the command that serves it, and takes
+    no comment, resolution or seen mark."""
+    out = root / "readonly.html"
+    notes = {"notes": [{"id": 1, "path": "b.txt", "line": 3, "text": "kept the old order on purpose"}], "resolved": ["C1"]}
+    page = review(browser, repo, out, notes, [remark(1, "first thought"), remark(2, "second thought", re=1)])
+    check("a page opened as a file says it is read-only, with the command that enables comments", (True, f"diffview --serve {out}"),
+          ("read-only" in page.locator(".readonly").inner_text(), page.locator(".readonly code").inner_text()))
+    for key in ("j", "c", "m", "r", "n", "r"):
+        page.keyboard.press(key)
+    check("and opens no comment editor, resolves nothing, marks nothing seen", (0, "copy 1 comment", False, False),
+          (page.locator(".cbox[data-editing]").count(), page.locator("#copy-btn .lbl").inner_text(), folded(page, "C2"), folded(page, "A1")))
+    page.close()
+
+
+def markup_case(repo: Path, root: Path, browser) -> None:
+    """What a reviewer or an agent writes is shown, never run: markup in a comment, a note or the summary comes
+    out as the characters typed. The page raises no error over a ResizeObserver loop, which a resized panel makes
+    the browser report, and still raises any other."""
+    out = root / "markup.html"
+    notes = {"notes": [{"id": 1, "path": "b.txt", "line": 3, "text": "note with <iframe src=x></iframe> `and <u>code</u>`"}]}
+    page = review(browser, repo, out, notes, [remark(1, "quoting <b>bold</b> and <script>alert(1)</script>")],
+                  summary="a summary with <img src=x onerror=alert(2)> in it")
+    check("markup in a comment shows as typed", "quoting <b>bold</b> and <script>alert(1)</script>", page.locator(".ctext").inner_text())
+    check("in a note too, inside code as well", ("note with <iframe src=x></iframe> and <u>code</u>", "and <u>code</u>"),
+          (page.locator(".atext").inner_text(), page.locator(".atext code").inner_text()))
+    check("and in the summary", "a summary with <img src=x onerror=alert(2)> in it", page.locator(".summary").inner_text())
+    check("none of it became an element", 0, page.locator(".ctext b, .ctext script, .atext iframe, .atext u, .summary img").count())
+
+    toast = lambda: page.locator("#toast").text_content()
+    page.evaluate('dispatchEvent(new ErrorEvent("error", { message: "ResizeObserver loop completed with undelivered notifications" }))')
+    quiet = toast()
+    page.evaluate('dispatchEvent(new ErrorEvent("error", { message: "boom" }))')
+    check("a ResizeObserver loop raises no error, and any other error still does", ("", "JS error: boom"), (quiet, toast()))
+    page.close()
+
+
+def gap_case(root: Path, browser) -> None:
+    """A gap opened all the way joins its two hunks: the lower one's header becomes a hairline, not a row that
+    reads as more folded lines."""
+    lines = [f"line {n}" for n in range(1, 41)]
+    (root / "gap-old.txt").write_text("\n".join(lines) + "\n")
+    lines[11], lines[20] = "line 12 changed", "line 21 changed"   # hunks at 9-15 and 18-24: two lines apart
+    (root / "gap-new.txt").write_text("\n".join(lines) + "\n")
+    out = root / "gap.html"
+    subprocess.run([str(DIFFVIEW), f"{root}/gap-old.txt={root}/gap-new.txt", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
+    page = browser.new_page()
+    page.goto(f"file://{out}")
+    page.wait_for_selector("tbody.hunk")
+    shape = lambda: (page.locator("tr.gap").count(), round(page.locator('tbody.hunk[data-hi="1"] tr.hunkhdr').bounding_box()["height"]))
+    before = shape()
+    page.keyboard.press("j")
+    page.keyboard.press("]")   # 20 lines below the first hunk: the whole gap and beyond
+    check("a fully opened gap leaves the gaps above and below, and the lower hunk's header a 2px hairline",
+          (3, True, (2, 2)), (before[0], before[1] > 2, shape()))
+    page.close()
+
+
+def image_miss_case(root: Path, browser) -> None:
+    """An image the page cannot show says why on its card: bytes that do not decode, a version too big to bring
+    into the page, a version the source has no readable copy of."""
+    repo = root / "misses"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "readme.txt").write_text("read me\n")
+    git(repo, "add", "."); git(repo, "commit", "-qm", "base")
+    (repo / "bad.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x02\x03")
+    (repo / "huge.png").write_bytes(bytes(5 * 1024 * 1024 + 1))   # one byte over the most a page bakes
+    (repo / "broken.png").symlink_to("nowhere.png")
+    out = root / "misses.html"
+    subprocess.run([str(DIFFVIEW), f"{repo}@HEAD..", "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
+    page = browser.new_page(viewport={"width": 1280, "height": 2000})
+    page.goto(f"file://{out}")
+    page.locator(".imgmiss").nth(2).wait_for()   # the third is bad.png's, once the browser has failed to decode it
+    miss = lambda path: page.locator(f'.fcard[data-key="0:{path}"] .imgmiss').all_inner_texts()
+    check("an image whose bytes do not decode says so on its card", ["not shown: these bytes do not decode as PNG"], miss("bad.png"))
+    check("one too big to bake gives its size and the limit", ["not shown: 5,242,881 bytes, over the 5,242,880 an image may bring into the page"],
+          miss("huge.png"))
+    check("one with nothing to read says that", ["not shown: the source has no readable copy of this version"], miss("broken.png"))
+    page.close()
+
+
+def twins_case(root: Path, browser) -> None:
+    """Two sources showing the same path: a note naming its source lands in that source's section, one naming
+    none in the first section holding its path, and an untouched file a note brings in joins its source's section."""
+    for twin in ("twin1", "twin2"):
+        repo = root / twin
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        (repo / "README.md").write_text("title\n")
+        (repo / "same.txt").write_text("same everywhere\n")   # in both trees, in neither diff
+        git(repo, "add", "."); git(repo, "commit", "-qm", "base")
+        (repo / "README.md").write_text(f"{twin} title\n")
+        git(repo, "commit", "-qam", "edit")
+    notes = root / "twin-notes.json"
+    notes.write_text(json.dumps({"notes": [
+        {"id": 1, "path": "README.md", "line": 1, "text": "about twin2's readme", "source": str(root / "twin2")},
+        {"id": 2, "path": "same.txt", "text": "read in twin2, left alone", "source": f"{root / 'twin2'}/"},
+        {"id": 3, "path": "README.md", "line": 1, "text": "no source named"}]}))
+    out = root / "twins.html"
+    subprocess.run([str(DIFFVIEW), f"{root}/twin1@HEAD~1..HEAD", f"{root}/twin2@HEAD~1..HEAD", "--notes", str(notes),
+                    "--no-auto-summary", "-o", str(out)], check=True, capture_output=True)
+    page = browser.new_page(viewport={"width": 1280, "height": 2000})
+    page.goto(f"file://{out}")
+    page.wait_for_selector('[data-ann="a3"]')
+    card = lambda n: page.locator(f'[data-ann="a{n}"]').evaluate("el => el.closest('.fcard').dataset.key")
+    check("a note lands in its source's section, one without a source in the first holding its path",
+          ["1:README.md", "1:same.txt", "0:README.md"], [card(n) for n in (1, 2, 3)])
     page.close()
 
 
@@ -564,10 +883,10 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
         failed_requests: list[str] = []
         page.on("response", lambda r: failed_requests.append(f"{r.status} {r.url}") if r.status >= 400 else None)
         page.goto(w.url)
-        check("a watched page carries the command that started its watcher", True,
-              page.evaluate("DATA.restart").startswith(f"diffview {repo}@base.. --watch -o "))
         page.wait_for_selector(".summary .rewrite.stale")
-        check("and the page offers to try again", True, "try again" in title())
+        check("the page says why it has no summary, and offers to try again", (True, True, True),
+              (page.locator(".summary").inner_text().startswith("no summary — "), "shim refused" in page.locator(".summary").inner_text(),
+               "try again" in title()))
         mode.write_text("summary one")
         page.click(".summary .rewrite")
         check("↻ has the watcher try again", True, w.printed("summary rewritten", 20))
@@ -576,7 +895,7 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
               (first.get("summary"), first.get("for", {}).get("adds"), first.get("for", {}).get("dels")))
         page.wait_for_selector(".summary .rewrite:not(.stale)")
         check("↻ on a fresh summary says it is current", True, "for this diff" in title())
-        built = page.evaluate("DATA.generated")
+        built = build(page)
         (repo / "a.txt").write_text(original + "line 81 appended\n")
         check("more changes regenerate the page", True, w.printed("regenerated"))
         check("which reloads itself in the browser", True, rebuilt(page, built))
@@ -620,9 +939,10 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
             page.wait_for_selector(".watchgone", timeout=10_000)
         except PlaywrightTimeout:
             pass
-        check("a page whose watcher has stopped says so, with the command that restarts it", page.evaluate("DATA.restart"),
-              page.locator(".watchgone code").all_inner_texts()[0] if page.locator(".watchgone code").count() else None)
-        built = page.evaluate("DATA.generated")
+        check("a page whose watcher has stopped says so, with the command that started it", True,
+              page.locator(".watchgone code").count() > 0
+              and page.locator(".watchgone code").first.inner_text() == shlex.join(["diffview", f"{repo}@base..", "--watch", "-o", str(out)]))
+        built = build(page)
         w = Watcher(f"{repo}@base..", out, "--no-auto-summary", env=env)
         check("the watcher started again", True, w.printed("watching"))
         check("and the page catches up, the warning gone", (True, 0), (rebuilt(page, built), page.locator(".watchgone").count()))
@@ -634,8 +954,14 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
             p.unlink()
 
 
+def build(page) -> str:
+    """The build a page holds. A page global: a rebuild of an unchanged diff shows nothing new, so this stamp is the
+    one thing that tells the two builds apart."""
+    return page.evaluate("DATA.generated")
+
+
 def rebuilt(page, built: str) -> bool:
-    """The page reloaded itself into a build other than the one named."""
+    """The page reloaded itself into a build other than the one named, by the stamp `build` reads."""
     try:
         page.wait_for_function(f"typeof DATA !== 'undefined' && DATA.generated !== {json.dumps(built)}", timeout=15_000)
         return True
@@ -702,8 +1028,9 @@ def outage_case(repo: Path, pages: Path, browser) -> None:
     page.wait_for_selector("tbody.hunk")
     check("a fresh tab merges the local copy into the file: the hand restore and the outage's comment both land", True,
           wait_for(lambda: on_disk() == ["saved while the server lived", "typed while it was gone", "restored by hand", "typed during the second outage"]))
-    check("with no bar, and the local copy spent", (4, 0, None),
-          (page.locator(".cbox .ctext").count(), page.locator(".savefail").count(), page.evaluate("localStorage.getItem(LOCAL_KEY)")))
+    check("with no bar, and the local copy spent", (4, 0, False),
+          (page.locator(".cbox .ctext").count(), page.locator(".savefail").count(),
+           page.evaluate("texts => Object.values(localStorage).some(v => texts.some(t => v.includes(t)))", on_disk())))
     page.reload()
     page.wait_for_selector("tbody.hunk")
     check("and the next reload reads the file, quietly", (4, 0), (page.locator(".cbox .ctext").count(), page.locator(".savefail").count()))
@@ -781,12 +1108,6 @@ def tabs_case(repo: Path, pages: Path, browser, notes: Path) -> None:
             racer(**race["pending"])
             race["pending"] = None
         route.continue_()
-
-    def jump(page, target: str) -> None:
-        page.evaluate("document.activeElement && document.activeElement.blur()")   # keys are the page's only while no input has focus
-        page.keyboard.press("Control+k")
-        page.locator("#jump input").fill(target)
-        page.locator("#jump input").press("Enter")
 
     viewport = {"width": 1280, "height": 720}
     one, other = browser.new_context(viewport=viewport), browser.new_context(viewport=viewport)   # two browsers: nothing in common but the server
@@ -870,16 +1191,18 @@ def tabs_case(repo: Path, pages: Path, browser, notes: Path) -> None:
 
     # a merge changes nothing on screen but the annotation it brought: the row under the header stays the same
     # element at the same place, and a fetch that finds the file unchanged touches nothing at all
-    check("A has taken everything the file holds", True, wait_for(lambda: a.evaluate("SINCE") == json.loads(state.read_text())["savedAt"]))
-    a.evaluate("hunkTbody('0:a.txt', 1).scrollIntoView()")
+    check("A shows everything the file holds", True, wait_for(lambda: sorted(texts(a)) == sorted(t for _, t in on_disk())))
+    a.locator('tbody.hunk[data-key="0:a.txt"][data-hi="1"]').evaluate("el => el.scrollIntoView()")
     a.wait_for_timeout(100)
     top_before = a.evaluate("""() => {
       const under = document.querySelector(".top").offsetHeight + document.querySelector(".fhead").offsetHeight;
-      const row = [...hunkTbody("0:a.txt", 1).querySelectorAll("tr")].find(tr => tr.getBoundingClientRect().top >= under);   // the first row fully below the sticky headers
+      const hunk = hi => document.querySelector(`tbody.hunk[data-key="0:a.txt"][data-hi="${hi}"]`);
+      const row = [...hunk(1).querySelectorAll("tr")].find(tr => tr.getBoundingClientRect().top >= under);   // the first row fully below the sticky headers
       row.dataset.probe = "row";
-      hunkTbody("0:a.txt", 0).dataset.probe = "hunk";
-      ensureRendered("0:b.txt");
-      document.querySelector('.fcard[data-key="0:b.txt"] .abox').dataset.probe = "note";   // a card the merge does not touch
+      hunk(0).dataset.probe = "hunk";
+      const untouched = document.querySelector('.fcard[data-key="0:b.txt"]');   // a card the merge does not touch
+      untouched.dispatchEvent(new Event("render"));
+      untouched.querySelector(".abox").dataset.probe = "note";
       return row.getBoundingClientRect().top;
     }""")
     a.evaluate("""window.mutations = 0;
@@ -905,7 +1228,7 @@ def tabs_case(repo: Path, pages: Path, browser, notes: Path) -> None:
     # the case the browser's own scroll anchoring cannot hold: the thing right under the header is a comment
     # row, which the merge makes again, while a new comment lands above it. The code row above the comment
     # is what must stay put
-    cid = a.evaluate("S.comments.find(c => c.text === 'from B, above what A reads').id")
+    cid = next(n for n, t in on_disk() if t == "from B, above what A reads")
     top_before = a.evaluate(f"""() => {{
       const crow = document.querySelector('tr.crow[data-cid="{cid}"]');
       scrollBy(0, crow.getBoundingClientRect().top - (document.querySelector(".top").offsetHeight + document.querySelector(".fhead").offsetHeight + 2));
@@ -1054,7 +1377,7 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     subprocess.run([str(DIFFVIEW), f"{repo}@HEAD~1..HEAD", "--notes", str(notes), "--no-auto-summary", "-o", str(out)],
                    check=True, capture_output=True)
 
-    page = browser.new_page(viewport={"width": 1280, "height": 1600})
+    page = browser.new_page(viewport={"width": 1280, "height": 1600}, permissions=["clipboard-read", "clipboard-write"])
     # an SVG whose script runs anywhere on the page, frames included, reports it here
     page.add_init_script('window.svgRan = false; addEventListener("message", e => { if (e.data === "svg ran") window.svgRan = true; });')
     page.goto(f"{base}/{out.name}")
@@ -1081,25 +1404,23 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     check("a note on an image outside the diff puts that image on the page", [50, 40], natural("still.png", "new"))
     check("a binary file that is no image says what it is", "binary file", card("data.bin").locator(".binmsg").inner_text())
 
-    focused = lambda: page.evaluate("S.focus < 0 ? null : HUNKS[S.focus].x.f.path")
-
     def walk(key: str) -> list:
-        seen = {focused()}
+        seen = {focused(page)}
         for _ in range(16):
             page.keyboard.press(key)
-            seen.add(focused())
+            seen.add(focused(page))
         return sorted(seen - {None})
 
     def focus(path: str) -> None:
         page.keyboard.press("g"); page.keyboard.press("g")
         for _ in range(12):
             page.keyboard.press("J")
-            if focused() == path:
+            if focused(page) == path:
                 return
 
     check("the fixture has a card without hunks of every kind", ["added.png", "data.bin", "gone.png", "new-name.txt", "run.sh", "shot.png", "still.png", "tall.png", "wide.png"],
-          page.evaluate("ALL.filter(x => !x.f.hunks.length).map(x => x.f.path).sort()"))
-    every = sorted(page.evaluate("ALL.map(x => x.f.path)"))
+          sorted(paths(page, ".main .fcard:not(:has(tbody.hunk))")))   # every card is rendered, above
+    every = sorted(paths(page, ".main .fcard"))
     page.keyboard.press("g"); page.keyboard.press("g")
     check("J lands on every card, each one without hunks included", every, walk("J"))
     check("and K on every one back", every, walk("K"))
@@ -1189,8 +1510,8 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     check("a ring in the old version marks the pointer's spot in the new", (True, "translate(450px, 60px)"),
           ("on" in ring.get_attribute("class"), ring.evaluate("el => el.style.transform")))
     # across only: the window grows to hold the taller drawing, so down the page there is nothing to scroll
-    under = lambda: page.evaluate("(() => { const f = ALL.find(x => x.f.path === 'shot.png').f, w = document.querySelector('.fcard[data-key=\"0:shot.png\"] .imgside.new .imgframe');"
-                                  " return (w.scrollLeft + 50) / f.scale; })()")
+    under = lambda: card("shot.png").locator(".imgside.new .imgframe").evaluate(
+        "w => { const img = w.querySelector('img'); return (w.scrollLeft + 50) / (img.getBoundingClientRect().width / img.naturalWidth); }")
     before = under()
     page.keyboard.down("Control"); page.mouse.wheel(0, -40); page.keyboard.up("Control")
     check("Ctrl+scroll zooms around the pointer: the image point under it stays, to a pixel", (True, True),
@@ -1215,7 +1536,7 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     first = (saved(lambda cs: len(cs) == 1) or [{}])[0]
     check("c on an image card comments on the whole file, above the image", ("file", -1, 1),
           (first.get("side"), first.get("hi"), card("wide.png").locator(".fbody > .cbox.file + .imgblock").count()))
-    exported = page.evaluate("commentsMarkdown()")
+    exported = yanked(page, "C")
     check("the export describes each version where a line comment quotes lines", True,
           "**C1** · whole file" in exported and "  old PNG 900×60" in exported and "  new PNG 960×60" in exported)
     page.keyboard.press("e")                  # saving left the focus on C1
@@ -1224,7 +1545,7 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     page.keyboard.press("Control+Enter")
     edited = (saved(lambda cs: bool(cs) and cs[0]["text"].endswith("wanted")) or [{}])[0]
     check("e edits it in place", ("the strip is new, and wanted", 1), (edited.get("text"), card("wide.png").locator(".cbox.file").count()))
-    check("and Y puts it at the top of the file's diff", True, "## C1 · reviewer · whole file\n#  the strip is new, and wanted" in page.evaluate("diffText(true)"))
+    check("and Y puts it at the top of the file's diff", True, "## C1 · reviewer · whole file\n#  the strip is new, and wanted" in yanked(page, "Y"))
     card("added.png").locator(".abox button", has_text="reply").click()
     page.keyboard.type("looks right")
     page.keyboard.press("Control+Enter")
@@ -1235,7 +1556,7 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     focus("gone.png")
     page.keyboard.press(" ")
     check("Space marks an image card viewed, folds its image away, and moves on to the next file", (True, False, "logo.svg"),
-          (page.evaluate("S.viewed.has('0:gone.png')"), card("gone.png").locator(".imgblock").is_visible(), focused()))
+          ("viewed" in card("gone.png").get_attribute("class").split(), card("gone.png").locator(".imgblock").is_visible(), focused(page)))
     page.close()
 
     # a zoomed page has more screen pixels per CSS pixel; sizes held in CSS pixels grow with it, as text does
@@ -1249,7 +1570,12 @@ def image_case(root: Path, base: str, pages: Path, browser) -> None:
     zoomed.close()
 
 
-def main() -> int:
+def main() -> None:
+    with sync_playwright() as p:
+        try:
+            chromium(p).close()
+        except Skip as e:
+            skip(str(e))
     root = Path(tempfile.mkdtemp(prefix="diffview-test-"))
     repo = fixture(root)
     pages = PAGES
@@ -1280,7 +1606,7 @@ def main() -> int:
         serve = subprocess.run([str(DIFFVIEW), "--serve", str(pages)], env=HUB_ENV, capture_output=True, text=True, timeout=120)
         url = serve.stdout.split(" at ")[-1].split()[0].rstrip("/") + "/" + out.name
         with sync_playwright() as p:
-            browser = p.chromium.launch(executable_path=os.environ.get("CHROMIUM") or None)
+            browser = chromium(p)
             page = browser.new_page(viewport={"width": 1280, "height": 2400},   # tall: every hunk fits, so j/k only move
                                     permissions=["clipboard-read", "clipboard-write"])
             page.on("dialog", lambda d: d.dismiss())
@@ -1331,35 +1657,32 @@ def main() -> int:
             page.locator('tbody.hunk[data-key="0:a.txt"][data-hi="0"] td.no[data-side="new"][data-no="3"]').click()
             page.keyboard.type("comment on an expanded line")
             page.keyboard.press("Control+Enter")
-            md = page.evaluate("commentsMarkdown()")
+            md = yanked(page, "C")
             check("a comment on an expanded line exports with its line and text", True, "new line 3" in md and "  line 3" in md)
-            raw = page.evaluate("diffText(false)")
+            raw = yanked(page, "y")
+            check("y says it copied", "copied ✓", page.locator("#diff-btn").inner_text())
             check("y copies a patch with git's file and hunk headers", ["diff --git a/a.txt b/a.txt", "--- a/a.txt", "+++ b/a.txt", "@@ -1,43 +1,44 @@ line 16"], raw.splitlines()[:4])
             check("a hunk widened on the page is counted as shown", True, "@@ -44,20 +45,20 @@ line 56" in raw)
             check("the untouched file is not part of the plain diff", False, "b.txt" in raw)
             (root / "copied.patch").write_text(raw)
             applies = subprocess.run(["git", "-C", str(repo), "apply", "--check", "-R", str(root / "copied.patch")], capture_output=True, text=True)
             check("and git applies it (in reverse, onto the tree it describes)", "", applies.stderr.strip())
-            ann = page.evaluate("diffText(true)")
+            ann = yanked(page, "Y")
             check("Y puts the comment under its line", True, " line 3\n## C1 · reviewer · new L3\n#  comment on an expanded line\n line 4\n" in ann)
             check("and an untouched file with a note on it, the note under the note's last line", True,
                   "diff --git a/b.txt b/b.txt\n# untouched" in ann and " other 6\n## A1 · agent · new L5–6\n#  read this, left it alone\n other 7\n" in ann)
             page.keyboard.press("a")
-            check("notes hidden with a stay out, and take the untouched file with them", False, "b.txt" in page.evaluate("diffText(true)"))
+            check("notes hidden with a stay out, and take the untouched file with them", False, "b.txt" in yanked(page, "Y"))
             page.keyboard.press("a")
-            page.keyboard.press("y")
-            page.wait_for_timeout(100)
-            check("y says it copied", "copied ✓", page.locator("#diff-btn").inner_text())
-            check("and the clipboard holds the patch", raw, page.evaluate("navigator.clipboard.readText()"))
             # an added and a deleted file: without their mode lines git reads /dev/null as a path and the patch fails
             (repo / "c.txt").write_text("fresh\n")
             (repo / "b.txt").unlink()
             churn = root / "churn.html"
             subprocess.run([str(DIFFVIEW), f"{repo}@HEAD..", "--no-auto-summary", "-o", str(churn)], check=True, capture_output=True)
-            other = browser.new_page()
+            other = browser.new_page(permissions=["clipboard-read", "clipboard-write"])
             other.goto(f"file://{churn}")
             other.wait_for_selector("tbody.hunk")
-            churned = other.evaluate("diffText(false)")
+            churned = yanked(other, "y")
             other.close()
             check("added and deleted files carry their mode lines", True,
                   "new file mode 100644\n--- /dev/null\n+++ b/c.txt\n" in churned and "deleted file mode 100644\n--- a/b.txt\n+++ /dev/null\n" in churned)
@@ -1387,25 +1710,25 @@ def main() -> int:
             page.keyboard.press("F")          # every gap open: a.txt is two tall hunks
             page.keyboard.press("g"); page.keyboard.press("g")
             page.keyboard.press("j")
-            focused = lambda: page.evaluate("S.focus")
-            top = lambda: page.evaluate('hunkTbody("0:a.txt", 0).getBoundingClientRect().top - stickyHeight(hunkTbody("0:a.txt", 0))')
-            check("j lands a tall hunk with its first line under the sticky headers", True, focused() == 0 and abs(top()) < 2)
+            top = lambda: page.locator('tbody.hunk[data-key="0:a.txt"][data-hi="0"]').evaluate(   # below the bar and the file's header
+                'el => el.getBoundingClientRect().top - document.querySelector(".top").offsetHeight - el.closest(".fcard").querySelector(".fhead").offsetHeight')
+            check("j lands a tall hunk with its first line under the sticky headers", True, focus_at(page) == ["a.txt", 0] and abs(top()) < 2)
             y0 = page.evaluate("scrollY")
             page.keyboard.press("j")
-            check("j inside a tall hunk pages down and keeps the focus", True, focused() == 0 and page.evaluate("scrollY") > y0 + 200)
+            check("j inside a tall hunk pages down and keeps the focus", True, focus_at(page) == ["a.txt", 0] and page.evaluate("scrollY") > y0 + 200)
             page.keyboard.press("k")
-            check("k pages back up rather than leaving the hunk", True, focused() == 0 and page.evaluate("scrollY") == y0)
+            check("k pages back up rather than leaving the hunk", True, focus_at(page) == ["a.txt", 0] and page.evaluate("scrollY") == y0)
             presses = 0
-            while focused() == 0 and presses < 12:
+            while focus_at(page) == ["a.txt", 0] and presses < 12:
                 page.keyboard.press("j"); presses += 1
-            check("j moves on once the hunk's bottom has been on screen", True, focused() == 1 and 2 <= presses <= 6)
+            check("j moves on once the hunk's bottom has been on screen", True, focus_at(page) == ["a.txt", 1] and 2 <= presses <= 6)
 
             # where am I: the sticky file header names the hunk under it, the tree marks the file
             pos = lambda: page.locator('.fcard[data-key="0:a.txt"] .fhead .pos').inner_text()
             check("the file header names the hunk under it", "hunk 2/2 · @@ −57 +58 line 56", pos())
             check("the tree marks the file under the header", ["0:a.txt"], page.locator(".tree-file.current").evaluate_all("els => els.map(e => e.dataset.key)"))
             page.keyboard.press("k")          # pages up inside hunk 1 until its top shows, then lands on hunk 0
-            while focused() == 1:
+            while focus_at(page) == ["a.txt", 1]:
                 page.keyboard.press("k")
             page.wait_for_timeout(50)         # the spy runs on the next frame
             check("the header follows the keyboard back to hunk 1/2", "hunk 1/2 · @@ −17 +17 line 16", pos())
@@ -1419,7 +1742,8 @@ def main() -> int:
             page.wait_for_selector("tbody.hunk")
             page.wait_for_timeout(200)
             no_side = lambda: page.evaluate("document.body.classList.contains('no-side')")
-            check("a narrow window starts unified and without the tree", (False, True), (page.evaluate("S.split"), no_side()))
+            check("a narrow window starts unified and without the tree", (True, True),
+                  (page.locator(".main tr.add").count() > 0 and page.locator(".main tr.split").count() == 0, no_side()))
             bar_height = lambda: page.evaluate("document.querySelector('.top').offsetHeight")
             check("the bar folds to one row", (True, True), (bar_height() < 60, page.locator("#split-btn").is_hidden()))
             check("one control at a time: copy comments, folded last, stays in the bar", True, page.locator("#copy-btn").is_visible())
@@ -1445,15 +1769,25 @@ def main() -> int:
             check("picking a file closes it again", True, no_side())
             page.keyboard.press("b")
             page.keyboard.press("n")           # to the note on b.txt, which the tree would otherwise cover
-            check("so does going to an annotation", (True, "note"), (no_side(), page.evaluate("S.ann && S.ann.kind")))
+            check("so does going to an annotation", (True, "A1"), (no_side(), at(page)))
             page.keyboard.press("b")
             page.keyboard.press("Escape")
-            check("Esc closes the tree first, the annotation focus stays", (True, "note"), (no_side(), page.evaluate("S.ann && S.ann.kind")))
+            check("Esc closes the tree first, the annotation focus stays", (True, "A1"), (no_side(), at(page)))
             check("no toast from the resize", "", page.locator("#toast").inner_text())
             order_case(root, browser)
             fold_case(root, browser)
             mouse_case(root, browser)
             layer_case(root, browser)
+            reviewed = threes(root)
+            resolve_case(reviewed, pages, browser)
+            motion_case(reviewed, pages, browser)
+            seen_case(reviewed, pages, browser)
+            thread_case(reviewed, pages, browser)
+            readonly_case(reviewed, root, browser)
+            markup_case(reviewed, root, browser)
+            gap_case(root, browser)
+            image_miss_case(root, browser)
+            twins_case(root, browser)
             heartbeat_case(url, browser)
             quiet_case(root, repo, pages, url.rsplit("/", 1)[0], browser)
             image_case(root, url.rsplit("/", 1)[0], pages, browser)
@@ -1465,12 +1799,11 @@ def main() -> int:
     finally:
         stop_hub()
         shutil.rmtree(HUB_HOME, ignore_errors=True)
-        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"tabs-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*"), *pages.glob(f"quiet-{os.getpid()}*"), *pages.glob(f"history-{os.getpid()}*"), *pages.glob(f"watch-{os.getpid()}*"), *pages.glob(f"request-{os.getpid()}*")]:
+        for p in [*pages.glob(f"{out.stem}*"), *pages.glob(f"outage-{os.getpid()}*"), *pages.glob(f"tabs-{os.getpid()}*"), *pages.glob(f"images-{os.getpid()}*"), *pages.glob(f"quiet-{os.getpid()}*"), *pages.glob(f"history-{os.getpid()}*"), *pages.glob(f"watch-{os.getpid()}*"), *pages.glob(f"request-{os.getpid()}*"), *pages.glob(f"review-{os.getpid()}*")]:
             p.unlink()
         shutil.rmtree(root, ignore_errors=True)
-    print(f"\n{failures} failure(s)")
-    return 1 if failures else 0
+    finish()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

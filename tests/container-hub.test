@@ -1,14 +1,23 @@
 #!/usr/bin/env -S uv run --script --quiet
+# tier: full-path (a live hub, tmux)
 # /// script
 # requires-python = ">=3.12"
+# dependencies = ["tyro", "pyyaml", "markdown-it-py"]  # the hub's own, whose module this loads
 # ///
-"""Drive bin/container-hub and bin/claude-browser over HTTP and check what the hub promises beyond the
-work-containers properties: which unit a page lands in, how the rail numbers the units, what never opens, what
-leaves. Run it directly; no framework.
+"""Drive bin/container-hub and check what the hub promises beyond the work-containers properties: which unit a page
+lands in, its lane and title, a unit's pages, how the rail numbers the units, what never opens, what leaves. Run it
+directly; no framework.
 
-One hub on a free port, never 8377, with HOME and its state in a scratch directory. Two repos, alpha and
-beta, each with an agent repo whose tickets were committed by sessions (a `Session:` trailer). Which sessions
-run is what the scratch HOME's session registry (`.claude/sessions/`) says.
+The hub's decisions are checked in this process, as tests/vpn/examples.test checks bin/vpn: the hub's module is loaded with
+HOME in a scratch directory, its functions are called on fixture files there, and its clock is the test's. Two
+repos, alpha and beta, each with an agent repo whose tickets were committed by sessions (a `Session:` trailer).
+Which sessions run is what the scratch HOME's session registry (`.claude/sessions/`) says; this process stands in
+for each. The tmux the hub types into is a real server on a socket of the test's own.
+
+What only the server does is checked last, over HTTP, against one hub on a free port, never 8377, in the same HOME
+and on the state the decisions left: its routes, the Host, Origin and token guards, what /f/ serves, the size caps,
+the event stream, the state-write protocol a diffview page saves by, claude-browser and diffview handing it pages,
+and a restart.
 """
 
 import contextlib
@@ -32,9 +41,16 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from itertools import count
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import container_hub_fakes as fakes  # noqa: E402  (the hub's module in this process, and its clock)
+from check import check, finish, free_port, needs, skipped  # noqa: E402
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
+needs("tmux")
 SCRATCH = Path(tempfile.mkdtemp(prefix="container-hub-test."))
 HOME = SCRATCH / "home"
 TEMP = SCRATCH / "tmp"  # the temp dir of everything the test runs, beside HOME and not around it, so each guard is checked on its own
@@ -52,18 +68,6 @@ CONTINUED = "34343434-0000-4000-8000-00000000000b"  # the session its /clear sta
 STALLED = "56565656-0000-4000-8000-00000000000c"  # a session a /clear starts blocked
 DOUBLED = "78787878-0000-4000-8000-000000000010"  # runs in two tmux panes at once
 STRAY = "9a9a9a9a-0000-4000-8000-000000000011"  # in the registry alone, with no unit
-
-failures = 0
-
-
-def check(what: str, expected, actual) -> None:
-    global failures
-    if expected == actual:
-        print(f"ok   {what}")
-    else:
-        failures += 1
-        print(f"FAIL {what}\n       expected: {expected!r}\n       actual:   {actual!r}")
-
 
 def env(**extra: str) -> dict:
     keep = {k: v for k, v in os.environ.items()
@@ -89,14 +93,26 @@ printf '%s\\n' "$*" >> {shlex.quote(str(TMUX_REFUSED))}
 exit 1
 """)
 TMUX.chmod(0o755)
+REAL_HOME = Path.home()
 ENV = env(TMPDIR=str(TEMP))
 ENV["PATH"] = f"{TMUX.parent}:{ENV['PATH']}"
 HUB_FLAGS = ["--tmux-socket", str(TMUX_SOCKET), "--clear-wait", "2"]
+# the hub's module runs in this process, so what it runs (git, tracker, tmux, curl) gets this environment
+os.environ.clear()
+os.environ.update(ENV)
+tempfile.tempdir = None
+
+T0 = float(int(time.time()) + 3600)
+"""The hub's clock at the start. It reads an hour ahead of the wall clock, so a file the test writes without
+pinning its time was written before anything the hub stamps with its clock."""
+COMMITS = count(int(T0) - 100_000, 10)
+"""When each fixture commit is made: ten seconds after the one before, so their order never rests on the wall clock."""
 
 
-def git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, env=ENV,
-                   check=True, capture_output=True)
+def git(cwd: Path, *args: str, at: int | None = None) -> None:
+    when = f"@{at or next(COMMITS)} +0000"
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd,
+                   env={**ENV, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}, check=True, capture_output=True)
 
 
 TICKET = "---\nstatus: {status}\n{parent}priority: 2\nsize: S\n---\n\n# {slug}\n\n## Brief\n\n{slug}.\n\n## Acceptance criteria\n\n## Comments\n"
@@ -138,10 +154,10 @@ def registered(session: str, status: str = "idle", at: float | None = None, pid:
                started: str | None = SELF_STARTED, name: str | None = None, tmux: str | None = None,
                waiting_for: str | None = None, cwd: Path | None = None, file: str | None = None) -> None:
     """The session's file in the registry, as Claude Code writes it while the session's process runs: by default
-    this test's own process, which runs for as long as the hub reads it. A second process of the session has a file
-    of its own."""
+    this test's own process, which runs for as long as the hub reads it, marked at the hub's clock. A second process
+    of the session has a file of its own."""
     entry = {"pid": pid or os.getpid(), "sessionId": session, "status": status,
-             "statusUpdatedAt": int((at or time.time()) * 1000), **({"procStart": started} if started else {}),
+             "statusUpdatedAt": int((at or clock.now) * 1000), **({"procStart": started} if started else {}),
              **({"name": name} if name else {}), **({"tmux": tmux} if tmux else {}),
              **({"waitingFor": waiting_for} if waiting_for else {}), **({"cwd": str(cwd)} if cwd else {})}
     path = HOME / ".claude" / "sessions" / f"{file or session[:8]}.json"  # named by the pid there; any name reads alike
@@ -166,16 +182,15 @@ def statusline(session: str, at: float, config_dir: Path | str = HOME / ".claude
 
 def turn_record(session_dir: Path, number: int, headline: str, questions: tuple[str, ...] = (), at: float | None = None,
                 **front: dict[str, str]) -> None:
-    """A turn record in the shape the mx plugin's RULES.md gives it, written at `at`: its frontmatter's `answered`
-    and `superseded` each a mapping of question tags."""
+    """A turn record in the shape the mx plugin's RULES.md gives it, written at `at`, else at the hub's clock: its
+    frontmatter's `answered` and `superseded` each a mapping of question tags."""
     path = session_dir / "turns" / f"{number:02d}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     tables = "".join(f"{name}:\n" + "".join(f"  {tag}: {value}\n" for tag, value in table.items()) for name, table in front.items())
     asked = "\n## Questions\n\n" + "".join(f"- [{q}] **Which way, {q}?** A call only the user can make.\n  - (a) this way *my pick*\n  - (b) that way\n"
                                                 for q in questions) if questions else ""
     path.write_text(f"---\ndate: 2026-10-07\n{tables}---\n\n# {headline}\n{asked}")
-    if at:
-        os.utime(path, (at, at))
+    os.utime(path, (at or clock.now,) * 2)
 
 
 def chat_turn(session_dir: Path, reply: str, at: float) -> None:
@@ -185,77 +200,14 @@ def chat_turn(session_dir: Path, reply: str, at: float) -> None:
     path.write_text(f"---\ndate: 2026-10-07\nchat: {time.strftime('%Y-%m-%dT%H:%M:%S+00:00', when)}\n---\n\n{reply}\n")
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 PORT = free_port()
 ORIGIN = f"http://127.0.0.1:{PORT}"
 TEMP_PAGE = TEMP / f"container-hub-test-{PORT}.html"  # directly in the temp dir
+served = lambda path: "/f" + urllib.parse.quote(str(path))
 
 
-def request(method: str, path: str, body: dict | None = None, headers: dict | None = None,
-            origin: str = ORIGIN, data: bytes | None = None) -> tuple[int, dict | bytes]:
-    data = data if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(origin + path, data=data, method=method,
-                                 headers={"Content-Type": "application/json", **(headers or {})})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            status, raw = r.status, r.read()
-    except urllib.error.HTTPError as e:
-        status, raw = e.code, e.read()
-    try:
-        return status, json.loads(raw)
-    except ValueError:
-        return status, raw
-
-
-def open_page(target, session: str | None = None, **extra) -> dict:
-    return request("POST", "/api/open", {"target": str(target), **({"session": session} if session else {}), **extra})[1]
-
-
-def view(key: str) -> tuple[int, dict]:
-    return request("GET", "/api/u/" + urllib.parse.quote(key, safe=""))
-
-
-def rail() -> list[dict]:
-    return request("GET", "/api/hub")[1]["units"]
-
-
-def listening_ports(root: int) -> list[int]:
-    """The TCP ports a process and every process under it listen on, read from /proc."""
-    children: dict[int, list[int]] = {}
-    for stat in Path("/proc").glob("[0-9]*/stat"):
-        try:
-            pid, rest = stat.read_text().split(" ", 1)
-        except OSError:
-            continue
-        children.setdefault(int(rest.rsplit(")", 1)[1].split()[1]), []).append(int(pid))
-    tree, todo = set(), [root]
-    while todo:
-        tree.add(pid := todo.pop())
-        todo += children.get(pid, [])
-    sockets = set()
-    for pid in tree:
-        for fd in Path(f"/proc/{pid}/fd").glob("*"):
-            with contextlib.suppress(OSError):
-                if (link := os.readlink(fd)).startswith("socket:["):
-                    sockets.add(link[len("socket:["):-1])
-    return [int(f[1].rsplit(":", 1)[1], 16) for table in ("/proc/net/tcp", "/proc/net/tcp6")
-            for f in (line.split() for line in Path(table).read_text().splitlines()[1:]) if f[3] == "0A" and f[9] in sockets]
-
-
-def tab_came_and_went() -> None:
-    """A hub tab that opens and closes again, as the one claude-browser last opened would: the next open with none
-    listening opens one at once, however recently the last did."""
-    tab = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
-    tab.readline()
-    tab.close()
-    time.sleep(2)  # the hub looks for a closed tab once a second
-
-
+# --------------------------------------------------------------------------
+# the hub's decisions, in this process
 # --------------------------------------------------------------------------
 
 HOME.mkdir()
@@ -268,84 +220,74 @@ beta = repo("beta", [("map-columns", None, STRANGER)])
 gamma = repo("gamma", [("one-flow", None, WORKER)])  # opened only through claude-browser
 agent = alpha / "agent"
 # the session page's reader, which the hub loads from the newest mx plugin: the one this machine has
-READER = max(Path.home().glob(".claude*/plugins/cache/*/mx/*/skills/session-page/session_page.py"),
+READER = max(REAL_HOME.glob(".claude*/plugins/cache/*/mx/*/skills/session-page/session_page.py"),
              key=lambda p: tuple(int(x) if x.isdigit() else 0 for x in p.parents[2].name.split(".")), default=None)
 if READER:
     (HOME / ".claude/plugins/cache/market/mx").mkdir(parents=True)
     (HOME / ".claude/plugins/cache/market/mx" / READER.parents[2].name).symlink_to(READER.parents[2])
-hub = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(SCRATCH / "state"), *HUB_FLAGS],
-                       env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("w"), start_new_session=True)
+
+clock = fakes.Clock(T0)
+hub = fakes.load(clock, (SCRATCH / "state").resolve())
+hub.STATE.mkdir()
+hub.TMUX_SOCKET = TMUX_SOCKET
+hub.CLEAR_WAIT = 2
+hub_said = (SCRATCH / "module.log").open("w")
+sys.stderr = hub_said  # what the hub prints on the way, as its log would hold it; check() prints to stdout
+
+hub_proc = None
 try:
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        try:
-            socket.create_connection(("127.0.0.1", PORT), timeout=1).close()
-            break
-        except OSError:
-            time.sleep(0.1)
-    member_of = lambda opened: next(m for m in view(opened["unit"])[1]["members"] if m["id"] == opened["id"])
+    def opened(target, session: str | None = None, **body) -> dict:
+        """What the hub answers an agent that opens a page, as claude-browser asks it."""
+        return hub.open_page({"target": str(target), **({"session": session} if session else {}), **body}, PORT, from_page=False)[1]
+
+    def clicked(target, unit: str, **body) -> dict:
+        """What the hub answers the hub tab for a link clicked in a page of the unit."""
+        return hub.open_page({"target": str(target), "unit": unit, "by": "user", **body}, PORT, from_page=True)[1]
+
+    rail = lambda: hub.hub_view()["units"]
+    view = lambda key: next((u for u in rail() if u["unit"] == key), None)
+    """A unit as the hub tab reads it (/api/u/<key>), None once it is gone."""
+    number = lambda key: (view(key) or {}).get("number", "gone")
+    member_of = lambda opened: next(m for m in view(opened["unit"])["members"] if m["id"] == opened["id"])
 
     # --- where a page lands
 
-    a = open_page(page(alpha / "agent/show/csv-import/index.html"), WORKER)
+    a = opened(page(alpha / "agent/show/csv-import/index.html"), WORKER)
     check("a page goes to the unit of the session that opened it, whatever ticket its path names", WORKER, a["unit"])
     check("...which has the tree of that ticket beside it, its repo, and no board while the repo has none", ("map-columns", "alpha", None),
-          tuple(view(a["unit"])[1][k] for k in ("tree", "repo", "board")))
-    b = open_page(page(beta / "agent/show/map-columns/index.html"), WORKER)
-    check("a session's pages in two repos are one unit", (WORKER, 2), (b["unit"], len(view(WORKER)[1]["members"])))
+          tuple(view(a["unit"])[k] for k in ("tree", "repo", "board")))
+    b = opened(page(beta / "agent/show/map-columns/index.html"), WORKER)
+    check("a session's pages in two repos are one unit", (WORKER, 2), (b["unit"], len(view(WORKER)["members"])))
     check("the first open of a page adds it", "added", a["action"])
-    request("POST", "/api/close", {"unit": a["unit"], "id": a["id"]})
+    hub.mark("close", {"unit": a["unit"], "id": a["id"]})
     check("a closed page stays a member, closed", True, member_of(a)["closed"])
-    check("closing in a unit that does not exist, or a page it does not hold, is not found", (404, 404),
-          (request("POST", "/api/close", {"unit": "no-such-unit", "id": a["id"]})[0],
-           request("POST", "/api/close", {"unit": a["unit"], "id": "m0000000000"})[0]))
-    # hub-layout-pass 4
-    check("the hub keeps no seen marks: no route takes one, and neither the rail nor a unit carries any", (404, False, False),
-          (request("POST", "/api/seen", {"url": member_of(a)["url"], "seen": True})[0], "seen" in request("GET", "/api/hub")[1],
-           "seen" in view(a["unit"])[1]))
-    events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
-    events.readline()
-    again = open_page(alpha / "agent/show/csv-import/index.html", WORKER)
+    again = opened(alpha / "agent/show/csv-import/index.html", WORKER)
     check("a second open of the same page brings the same member forward", ("reopened", a["id"]), (again["action"], again["id"]))
     check("...open again", False, member_of(a)["closed"])
-    check("...and adds no second copy", 2, len(view(a["unit"])[1]["members"]))
-    while not (line := events.readline().decode()).startswith("data:"):
-        pass
-    check("...and tells a listening hub tab to reload it, in its unit", ("reopened", WORKER, a["id"]),
-          tuple(json.loads(line[5:])[k] for k in ("type", "unit", "id")))
-    events.close()
-    quiet = http.client.HTTPConnection("127.0.0.1", PORT, timeout=3)
-    quiet.request("GET", "/events")
-    stream, heard = quiet.getresponse(), []
-    with contextlib.suppress(TimeoutError, OSError):
-        while line := stream.readline().decode():
-            heard += [line] if line.startswith("data:") else []
-    stream.close()  # the socket stays open while the response holds it, and a tab listening would launch none
-    quiet.close()
-    check("a hub tab that starts listening hears nothing while nothing changes", [], heard)
-    by_stranger = open_page(alpha / "agent/show/csv-import/index.html", STRANGER)
+    check("...and adds no second copy", 2, len(view(a["unit"])["members"]))
+    by_stranger = opened(alpha / "agent/show/csv-import/index.html", STRANGER)
     check("the same page opened by another session is a member of that session's unit too", (STRANGER, a["id"], 2),
-          (by_stranger["unit"], by_stranger["id"], len(view(WORKER)[1]["members"])))
+          (by_stranger["unit"], by_stranger["id"], len(view(WORKER)["members"])))
 
     note = page(HOME / "notes" / "scratch.html")
-    by_trailer = open_page(note, ORCHESTRATOR, cwd=str(alpha))
+    by_trailer = opened(note, ORCHESTRATOR, cwd=str(alpha))
     check("a page under no ticket goes to its session's unit", ORCHESTRATOR, by_trailer["unit"])
     check("...as a page of the ticket the session committed on last", "csv-import", member_of(by_trailer)["ticket"])
-    check("...whose tree is beside the unit's title", "map-columns", view(ORCHESTRATOR)[1]["tree"])
+    check("...whose tree is beside the unit's title", "map-columns", view(ORCHESTRATOR)["tree"])
     ticket(agent, "drop-zone")
     git(agent, "add", "tickets/drop-zone.md")
     git(agent, "commit", "-q", "-m", "file drop-zone", "-m", f"Session: {ORCHESTRATOR}")
-    later = open_page(page(HOME / "notes" / "later.html"), ORCHESTRATOR, cwd=str(alpha))
+    later = opened(page(HOME / "notes" / "later.html"), ORCHESTRATOR, cwd=str(alpha))
     check("a session that commits on another tree has that tree beside it, and its later pages that ticket",
-          (ORCHESTRATOR, "drop-zone", "drop-zone"), (later["unit"], view(ORCHESTRATOR)[1]["tree"], member_of(later)["ticket"]))
-    novice = open_page(note, NOVICE, cwd=str(alpha))
+          (ORCHESTRATOR, "drop-zone", "drop-zone"), (later["unit"], view(ORCHESTRATOR)["tree"], member_of(later)["ticket"]))
+    novice = opened(note, NOVICE, cwd=str(alpha))
     check("a session with no commits, whose pages name no ticket, has a unit with no tree", (NOVICE, None),
-          (novice["unit"], view(NOVICE)[1]["tree"]))
+          (novice["unit"], view(NOVICE)["tree"]))
     check("...titled by its session's id, cut short, with no session page and no registry entry, which is its short id too",
-          (f"session {NOVICE[:8]}", NOVICE[:8]), tuple(view(NOVICE)[1][k] for k in ("title", "short")))
+          (f"session {NOVICE[:8]}", NOVICE[:8]), tuple(view(NOVICE)[k] for k in ("title", "short")))
     registered(NOVICE, name="novice-name")
     check("...and by its name in the registry once there is one, as its short id is", ("novice-name", "novice-name"),
-          tuple(view(NOVICE)[1][k] for k in ("title", "short")))
+          tuple(view(NOVICE)[k] for k in ("title", "short")))
     # --- hub-session-search: a transcript's title lines as Claude Code 2.1.289 writes them
     transcript = HOME / ".claude" / "projects" / "-home-repos-alpha" / f"{NOVICE}.jsonl"
     transcript.parent.mkdir(parents=True)
@@ -354,29 +296,29 @@ try:
     transcript.write_text(title_line("ai", "Instagram saves") + '{"type":"user","message":{"content":"x"}}\n'
                           + title_line("ai", "Instagram saves pass 1"))
     check("...and by Claude Code's own title for it, its last, over its name in the registry, which stays its short id",
-          ("Instagram saves pass 1", "novice-name"), tuple(view(NOVICE)[1][k] for k in ("title", "short")))
+          ("Instagram saves pass 1", "novice-name"), tuple(view(NOVICE)[k] for k in ("title", "short")))
     with transcript.open("a") as f:
         f.write(title_line("custom", "saves") + title_line("ai", "Instagram saves pass 2") + '{"type":"custom-title","custo')
     check("...the user's title from /rename over the AI's, whichever came last, and a line still being written not yet",
-          "saves", view(NOVICE)[1]["title"])
+          "saves", view(NOVICE)["title"])
     with transcript.open("a") as f:
         f.write(title_line("custom", "saves again")[len('{"type":"custom-title","custo'):])
-    check("...which counts once it is whole", "saves again", view(NOVICE)[1]["title"])
-    ticket_file = open_page(agent / "tickets/csv-import.md", WORKER)
+    check("...which counts once it is whole", "saves again", view(NOVICE)["title"])
+    ticket_file = opened(agent / "tickets/csv-import.md", WORKER)
     check("a ticket file lands in the opener's unit, as a page of that ticket", (WORKER, "csv-import"),
           (ticket_file["unit"], member_of(ticket_file)["ticket"]))
-    payload = open_page(page(alpha / "agent/show/csv-import/broken.html", "<script>const DATA = {not json</script>"), WORKER)
+    payload = opened(page(alpha / "agent/show/csv-import/broken.html", "<script>const DATA = {not json</script>"), WORKER)
     check("a page that looks like a diffview but carries no data opens like any other", WORKER, payload.get("unit"))
-    session_page = open_page(page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html"), ORCHESTRATOR)
+    session_page = opened(page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html"), ORCHESTRATOR)
     check("a session page goes to its session's unit, under no ticket", (ORCHESTRATOR, None),
           (session_page["unit"], member_of(session_page)["ticket"]))
-    worker_page = open_page(page(alpha / f"agent/sessions/{WORKER}/index.html"))
+    worker_page = opened(page(alpha / f"agent/sessions/{WORKER}/index.html"))
     check("a session page lands in its own session's unit, whoever opens it", WORKER, worker_page["unit"])
     page(alpha / f"agent/sessions/{WORKER}/session.md", "---\nsession: x\n---\n\n# Import the CSV files\n\n## Brief\n")
     registered(WORKER, name="worker-name")
     check("a unit is titled by its session page's heading, over its name in the registry", "Import the CSV files",
-          view(WORKER)[1]["title"])
-    check("...and says how to resume that session", f"claude --resume {WORKER}", view(WORKER)[1]["resume"])
+          view(WORKER)["title"])
+    check("...and says how to resume that session", f"claude --resume {WORKER}", view(WORKER)["resume"])
 
     # --- one-hub-tab#P2: a unit's session page lists every page of the unit, a minimized one included
     # The session page's artefact column as the mx renderer writes it: each link carries the absolute path of the file
@@ -392,10 +334,9 @@ try:
         <li><kbd class="n">1</kbd><a class="artefact" href="#" data-artefact="{figure_path}">flow again</a></li>
         <li><kbd class="n">2</kbd><a class="artefact" href="#" data-artefact="https://example.invalid/app?x=1&amp;y=2">app</a></li>
       </ol></section></aside></main>""")
-    stray = open_page(page(HOME / "notes" / "stray.html"), STRANGER)
-    request("POST", "/api/close", {"unit": STRANGER, "id": stray["id"]})
-    served = lambda path: "/f" + urllib.parse.quote(str(path))
-    listed = view(STRANGER)[1]["pages"]
+    stray = opened(page(HOME / "notes" / "stray.html"), STRANGER)
+    hub.mark("close", {"unit": STRANGER, "id": stray["id"]})
+    listed = view(STRANGER)["pages"]
     check("a unit's pages are its session page's column links in its order, once each, then the pages no turn links",
           [(served(figure_path), True), (served(shown_path), True), ("https://example.invalid/app?x=1&y=2", True),
            (served(HOME / "notes" / "stray.html"), False)],
@@ -403,58 +344,39 @@ try:
     check("...each named as the column names it, a page no turn links by its path", [str(figure_path), str(shown_path),
           "https://example.invalid/app?x=1&y=2", str(HOME / "notes" / "stray.html")], [x["artefact"] for x in listed])
     check("...every member listed, the minimized one too, and the session page, the list itself, not on it", (True, False),
-          ({m["url"] for m in view(STRANGER)[1]["members"]} <= {x["url"] for x in listed},
+          ({m["url"] for m in view(STRANGER)["members"]} <= {x["url"] for x in listed},
            any(x["kind"] == "session" for x in listed)))
     check("...the id of each the id it has as a member", stray["id"], listed[-1]["id"])
     check("a page named relative to the opener's directory lands as its absolute path does", a["id"],
-          open_page("agent/show/csv-import/index.html", WORKER, cwd=str(alpha)).get("id"))
+          opened("agent/show/csv-import/index.html", WORKER, cwd=str(alpha)).get("id"))
     check("a page that carries DATA naming sources without files opens like any other", WORKER,
-          open_page(page(alpha / "agent/show/csv-import/sourced.html", '<script>const DATA = {"sources": [{"kind": "git"}]}</script>'),
-                    WORKER).get("unit"))
+          opened(page(alpha / "agent/show/csv-import/sourced.html", '<script>const DATA = {"sources": [{"kind": "git"}]}</script>'),
+                 WORKER).get("unit"))
     check("so does a directory named like a page", WORKER,
-          open_page(page(alpha / "agent/show/csv-import/deck.html/index.html").parent, WORKER).get("unit"))
-
-    # --- a retired show directory: its pages still open, from the agent repo's history
-    gone = page(alpha / "agent/show/retired-work/index.html", '<!doctype html><body><img src="fig.png"></body>')
-    (gone.parent / "fig.png").write_bytes(b"\x89PNG not really")
-    git(agent, "add", "show/retired-work")
-    git(agent, "commit", "-q", "-m", "show retired-work")
-    git(agent, "rm", "-q", "-r", "show/retired-work")
-    git(agent, "commit", "-q", "-m", "retire retired-work")
-    status, body = request("GET", served(gone))
-    check("a page a commit retired opens as it stood before that commit", (200, True),
-          (status, b'<img src="fig.png">' in body))
-    check("...under a line saying it was retired, and in which commit", True, b"retired in " in body)
-    status, body = request("GET", served(gone.parent / "fig.png"))
-    check("...and its image, which its relative link reaches the same way", (200, b"\x89PNG not really"), (status, body))
-    status, body = request("GET", served(gone.parent) + "/")
-    check("...and its directory, read as its index.html", (200, True), (status, b'<img src="fig.png">' in body))
-    status, _ = request("GET", served(alpha / "agent/show/never-was/index.html"))
-    check("a page the agent repo never held is still not found", 404, status)
+          opened(page(alpha / "agent/show/csv-import/deck.html/index.html").parent, WORKER).get("unit"))
 
     # --- the board: the rail's, opened over the hub tab, never a page of a unit
     board = page(agent / "board.html", "<!doctype html><h1>board</h1>")
     board_url = served(board)
     before = {u["unit"]: [m["id"] for m in u["members"]] for u in rail()}
-    handed = open_page(board, ORCHESTRATOR)
+    handed = opened(board, ORCHESTRATOR)
     check("a board handed to the hub opens over the hub tab, joining no unit", (board_url, None, before),
           (handed.get("board"), handed.get("unit"), {u["unit"]: [m["id"] for m in u["members"]] for u in rail()}))
     check("...as does a link to one clicked in a page of the hub tab", (board_url, None),
-          (lambda r: (r.get("board"), r.get("unit")))(request("POST", "/api/open", {"unit": STRANGER, "target": board_url, "by": "user"},
-                                                              {"Origin": ORIGIN})[1]))
+          (lambda r: (r.get("board"), r.get("unit")))(clicked(board_url, STRANGER)))
     page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html", f"""<!doctype html><aside class="column" id="artefacts"><ol>
       <li><a class="artefact" href="#" data-artefact="{board}">board</a></li>
       <li><a class="artefact" href="#" data-artefact="{shown_path}">csv</a></li></ol></aside>""")
     check("...and a session page's column linking it lists it as none of the unit's pages", [served(shown_path)],
-          [p["url"] for p in view(ORCHESTRATOR)[1]["pages"] if p["linked"]])
+          [p["url"] for p in view(ORCHESTRATOR)["pages"] if p["linked"]])
     check("a unit's board is its tree's, marking the tickets its session claimed or committed on",
           (board_url, {"map-columns", "csv-import", "drop-zone"}),
-          (view(ORCHESTRATOR)[1]["board"], set(view(ORCHESTRATOR)[1]["worked_on"])))
+          (view(ORCHESTRATOR)["board"], set(view(ORCHESTRATOR)["worked_on"])))
     ticket(agent, "drop-zone", "done")
-    check("...but none that is done, which is worked on no more", {"map-columns", "csv-import"}, set(view(ORCHESTRATOR)[1]["worked_on"]))
+    check("...but none that is done, which is worked on no more", {"map-columns", "csv-import"}, set(view(ORCHESTRATOR)["worked_on"]))
     ticket(agent, "drop-zone")
     check("...and none of a session that committed on none there, whatever tickets its pages name", (board_url, []),
-          (view(WORKER)[1]["board"], view(WORKER)[1]["worked_on"]))
+          (view(WORKER)["board"], view(WORKER)["worked_on"]))
 
     # --- what never opens
 
@@ -462,7 +384,7 @@ try:
     page(alpha / "agent/show/drop-zone/notes.md", "# notes\n")
     page(alpha / "agent/show/drop-zone/figures/plot.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
     page(alpha / "agent/show/drop-zone/out/raw.html")
-    skipped = open_page(report, WORKER)
+    skipped = opened(report, WORKER)
     check("a worker's report never opens", (True, None), ("skipped" in skipped, skipped["open"]))
     check("...and the line the hub has its caller print says why", True, "not opened" in skipped["say"] and "report" in skipped["say"])
     git(agent, "commit", "-q", "--allow-empty", "-m", "base")
@@ -470,67 +392,63 @@ try:
     git(agent, "commit", "-q", "-am", "csv-import in review", "-m", f"Session: {ORCHESTRATOR}")
     tracker_diff = agent / "diffviews" / "tracker.html"
     tracker_diff.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([BIN / "diffview", f"{agent}@HEAD~1..HEAD", "-o", str(tracker_diff), "--no-auto-summary"],
-                   env=ENV, check=True, capture_output=True)
-    check("a diffview of tracker files never opens", True, "skipped" in open_page(tracker_diff, ORCHESTRATOR))
-    check("...though its source kept as text does, being no diffview", True,
-          "unit" in open_page(shutil.copy(tracker_diff, tracker_diff.with_suffix(".txt")), ORCHESTRATOR))
-    check("a report beside a prototype is no worker's report, and opens", True,
-          "unit" in open_page(page(alpha / "agent/prototypes/csv-import/report.md", "# what the prototype showed\n"), WORKER))
     ticket(agent, "csv-import", "claimed", "map-columns")
     page(agent / "show/csv-import/plan.md", "# plan\n")
     git(agent, "add", "tickets/csv-import.md", "show/csv-import/plan.md")
     git(agent, "commit", "-q", "-m", "csv-import back, with a plan")
     mixed_diff = agent / "diffviews" / "mixed.html"
-    subprocess.run([BIN / "diffview", f"{agent}@HEAD~1..HEAD", "-o", str(mixed_diff), "--no-auto-summary"],
-                   env=ENV, check=True, capture_output=True)
-    check("a diffview of a ticket and a show file opens", ORCHESTRATOR, open_page(mixed_diff, ORCHESTRATOR).get("unit"))
     (alpha / "notes.txt").write_text("one\n")
     git(alpha, "add", "notes.txt")
     git(alpha, "commit", "-q", "-m", "notes")
     code_diff = agent / "diffviews" / "csv-import.html"
-    subprocess.run([BIN / "diffview", f"{alpha}@HEAD~1..HEAD", "-o", str(code_diff), "--no-auto-summary"],
-                   env=ENV, check=True, capture_output=True)
-    code_opened = open_page(code_diff, ORCHESTRATOR)
+    renders = [[f"{agent}@HEAD~2..HEAD~1", tracker_diff], [f"{agent}@HEAD~1..HEAD", mixed_diff], [f"{alpha}@HEAD~1..HEAD", code_diff]]
+    with ThreadPoolExecutor() as pool:  # diffview, as the agents run it
+        list(pool.map(lambda r: subprocess.run([BIN / "diffview", r[0], "-o", str(r[1]), "--no-auto-summary"], env=ENV,
+                                               check=True, capture_output=True), renders))
+    check("a diffview of tracker files never opens", True, "skipped" in opened(tracker_diff, ORCHESTRATOR))
+    check("a report beside a prototype is no worker's report, and opens", True,
+          "unit" in opened(page(alpha / "agent/prototypes/csv-import/report.md", "# what the prototype showed\n"), WORKER))
+    check("a diffview of a ticket and a show file opens", ORCHESTRATOR, opened(mixed_diff, ORCHESTRATOR).get("unit"))
+    code_opened = opened(code_diff, ORCHESTRATOR)
     check("a diffview of code opens", ORCHESTRATOR, code_opened.get("unit"))
 
     # --- a page's lane, from what it is
 
-    lane_of = lambda path: member_of(open_page(path, ORCHESTRATOR))["lane"]
+    lane_of = lambda path: member_of(opened(path, ORCHESTRATOR))["lane"]
     check("a session page goes to the session lane, a diffview page to code", ("session", "code"),
           (member_of(session_page)["lane"], member_of(code_opened)["lane"]))
     check("an image goes to concept, as does any other page of a show directory", ("concept", "concept", "concept"),
           (lane_of(alpha / "agent/show/drop-zone/figures/plot.svg"), lane_of(alpha / "agent/show/drop-zone/notes.md"), member_of(a)["lane"]))
     check("a page in no show directory goes to output, a prototype's too", ("output", "output"),
           (member_of(by_trailer)["lane"],
-           member_of(open_page(page(agent / "prototypes/csv-import/index.html"), ORCHESTRATOR))["lane"]))
-    elsewhere = open_page(shutil.copy(code_diff, HOME / "notes" / "review.html"), ORCHESTRATOR)
-    check("a diffview page goes to code wherever it was written", "code", member_of(elsewhere)["lane"])
+           member_of(opened(page(agent / "prototypes/csv-import/index.html"), ORCHESTRATOR))["lane"]))
+    elsewhere_diff = opened(shutil.copy(code_diff, HOME / "notes" / "review.html"), ORCHESTRATOR)
+    check("a diffview page goes to code wherever it was written", "code", member_of(elsewhere_diff)["lane"])
     check("...though a page that only looks like one does not", "concept", member_of(payload)["lane"])
     check("an image outside any show directory goes to concept", "concept",
-          member_of(open_page(page(HOME / "notes" / "sketch.png", "png"), ORCHESTRATOR))["lane"])
-    overridden = open_page(note, ORCHESTRATOR, lane="concept")
+          member_of(opened(page(HOME / "notes" / "sketch.png", "png"), ORCHESTRATOR))["lane"])
+    overridden = opened(note, ORCHESTRATOR, lane="concept")
     check("an agent's lane overrides the one a page's kind gives it", "concept", member_of(overridden)["lane"])
     check("...and the line the caller prints names it", True, ", lane concept;" in overridden["say"])
-    open_page(note, ORCHESTRATOR)
+    opened(note, ORCHESTRATOR)
     check("...and holds when the page is opened again without one", "concept", member_of(overridden)["lane"])
     check("...the unit's pages listing it in that lane", "concept",
-          next(x["lane"] for x in view(ORCHESTRATOR)[1]["pages"] if x["id"] == overridden["id"]))
-    open_page(note, ORCHESTRATOR, lane="output")
+          next(x["lane"] for x in view(ORCHESTRATOR)["pages"] if x["id"] == overridden["id"]))
+    opened(note, ORCHESTRATOR, lane="output")
     check("...until an agent names another", "output", member_of(overridden)["lane"])
     check("a lane there is none of is refused, naming the lanes", (400, True),
           (lambda r: (r[0], "session, concept, output, code" in r[1].get("error", "")))(
-              request("POST", "/api/open", {"target": str(note), "session": ORCHESTRATOR, "lane": "diff"})))
+              hub.open_page({"target": str(note), "session": ORCHESTRATOR, "lane": "diff"}, PORT, from_page=False)))
 
-    check("a unit's tree is the tree of the ticket its session committed on last", "map-columns", view(ORCHESTRATOR)[1]["tree"])
+    check("a unit's tree is the tree of the ticket its session committed on last", "map-columns", view(ORCHESTRATOR)["tree"])
     scratch_member = member_of(by_trailer)
     check("a member no turn links is in its unit's pages as it was opened", [{
         "url": scratch_member["url"], "id": scratch_member["id"], "artefact": str(note.resolve()), "linked": False, "ticket": "csv-import",
-        "kind": "page", "title": "scratch.html", "lane": "output"}], [x for x in view(ORCHESTRATOR)[1]["pages"] if x["id"] == by_trailer["id"]])
+        "kind": "page", "title": "scratch.html", "lane": "output"}], [x for x in view(ORCHESTRATOR)["pages"] if x["id"] == by_trailer["id"]])
     ticket(agent, "spike", "open", "map-columns")
-    spike = open_page(page(agent / "show/spike/index.html"), SPIKER)
+    spike = opened(page(agent / "show/spike/index.html"), SPIKER)
     (agent / "tickets/spike.md").unlink()
-    spiker = view(spike["unit"])[1]
+    spiker = view(spike["unit"])
     check("a unit whose ticket left the tracker before it was ever read has no tree, is never visited, the ticket marked gone",
           (None, 0, [{"slug": "spike", "status": "gone", "title": "spike", "diff": []}]),
           (spiker.get("tree"), spiker.get("visited"), spiker.get("tickets")))
@@ -538,7 +456,7 @@ try:
     # --- the tracker drives the hub tab
 
     ticket(agent, "csv-import", "done", "map-columns")
-    status = lambda: next(t["status"] for t in view(ORCHESTRATOR)[1]["tickets"] if t["slug"] == "csv-import")
+    status = lambda: next(t["status"] for t in view(ORCHESTRATOR)["tickets"] if t["slug"] == "csv-import")
     check("a ticket's status in the tracker is the hub tab's", "done", status())
     commits = subprocess.run(["git", "log", "--reverse", "--format=%h", "-2"], cwd=alpha, capture_output=True,
                              text=True, check=True).stdout.split()
@@ -552,47 +470,39 @@ try:
         f.write(text)
     # what the hub cached before it left agent ranges out: one page of both ranges, keyed by both
     old_specs = f"{alpha}@{commits[0]}..{commits[1]} {agent}@{agent_range}"
-    page(SCRATCH / "state" / "diffs" / f"map-columns-{hashlib.sha1(old_specs.encode()).hexdigest()[:8]}.html", "stale render")
-    recorded = {"url": "/diff?" + urllib.parse.urlencode({"tracker": str((agent / "tickets").resolve()), "ticket": "map-columns"}),
+    page(hub.STATE / "diffs" / f"map-columns-{hashlib.sha1(old_specs.encode()).hexdigest()[:8]}.html", "stale render")
+    tickets_root = (agent / "tickets").resolve()
+    recorded = {"url": "/diff?" + urllib.parse.urlencode({"tracker": str(tickets_root), "ticket": "map-columns"}),
                 "title": f"diff · code@{commits[0]}..{commits[1]}"}
-    status_code, rendered = request("GET", recorded["url"])
+    render, status_code, _ = hub.render_diff(tickets_root, "map-columns")
+    rendered = render.read_bytes() if render else b""
     check("a ticket's recorded code range renders when opened", (200, True), (status_code, b"notes.txt" in rendered))
     check("...without its agent range, and never from a render cached with it", (False, False),
           (b"plan.md" in rendered, b"stale render" in rendered))
-    renders = lambda: {p: p.stat().st_mtime_ns for p in (SCRATCH / "state" / "diffs").iterdir()}
-    first_render = renders()
-    check("...and once: opened again, the page already rendered is served", (200, first_render),
-          (request("GET", recorded["url"])[0], renders()))
-    from_view = request("POST", "/api/open", {"unit": ORCHESTRATOR, "target": recorded["url"], "title": recorded["title"],
-                                              "by": "user"}, {"Origin": ORIGIN})[1]
+    from_view = clicked(recorded["url"], ORCHESTRATOR, title=recorded["title"])
     check("a recorded range clicked in the hub tab becomes a member of its unit, of its ticket", (ORCHESTRATOR, "diff", "map-columns"),
           (from_view["unit"], member_of(from_view)["kind"], member_of(from_view)["ticket"]))
     check("...under the title the hub tab gave it, opened by the user", (recorded["title"], "user"),
           (member_of(from_view)["title"], member_of(from_view)["by"]))
-    open_page(ORIGIN + recorded["url"], ORCHESTRATOR)
-    check("...and opened by an agent at the hub's own address, it widens nothing served", 403,
-          request("GET", "/f" + urllib.parse.quote(str(page(HOME / "private.html"))))[0])
-    check("a ticket with no range recorded has no diff to render", 404,
-          request("GET", "/diff?" + urllib.parse.urlencode({"tracker": str(agent / "tickets"), "ticket": "drop-zone"}))[0])
+    check("a ticket with no range recorded has no diff to render", 404, hub.render_diff(tickets_root, "drop-zone")[1])
     ticket(agent, "drop-zone")
     with (agent / "tickets/drop-zone.md").open("r+") as f:
         text = f.read().replace("size: S\n", f"size: S\ndiff:\n  - agent@{agent_range}\n")
         f.seek(0)
         f.write(text)
-    check("a ticket recording only agent ranges has no diff to render", 404,
-          request("GET", "/diff?" + urllib.parse.urlencode({"tracker": str(agent / "tickets"), "ticket": "drop-zone"}))[0])
+    check("a ticket recording only agent ranges has no diff to render", 404, hub.render_diff(tickets_root, "drop-zone")[1])
     with (agent / "tickets/map-columns.md").open("r+") as f:
         text = f.read().replace(f"code@{commits[0]}..{commits[1]}", f"code@{commits[0]}..0123abc")
         f.seek(0)
         f.truncate()
         f.write(text)
-    status_code, said = request("GET", recorded["url"])
+    _, status_code, said = hub.render_diff(tickets_root, "map-columns")
     check("a recorded range diffview cannot render answers why, not that none is recorded", (502, True),
-          (status_code, b"0123abc" in said))
+          (status_code, "0123abc" in said))
 
     # --- the rail: the units whose sessions run, numbered by when each last finished a turn
 
-    t0 = time.time()
+    t0 = clock.tick(100)
     os.utime(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html", (t0 - 100, t0 - 100))
     os.utime(alpha / f"agent/sessions/{WORKER}/index.html", (t0 - 10, t0 - 10))
     registered(ORCHESTRATOR, "idle", t0 - 50)
@@ -601,15 +511,14 @@ try:
     ours = lambda: [(u["unit"], u["number"] is not None) for u in rail() if u["unit"] in (ORCHESTRATOR, WORKER, SPIKER)]
     check("the rail numbers the idle sessions by their last turn's end, the latest first, and the busy after them",
           [(ORCHESTRATOR, True), (SPIKER, True), (WORKER, True)], ours())
-    check("...a turn's end read off the session page's render where the registry has none",
-          round(t0 - 10), round(next(u["last"] for u in rail() if u["unit"] == WORKER)))
+    check("...a turn's end read off the session page's render where the registry has none", t0 - 10, view(WORKER)["last"])
     registered(SPIKER, "shell", t0 - 1)
     check("a session running a shell command is numbered with the busy, not with the idle",
           [(ORCHESTRATOR, True), (WORKER, True), (SPIKER, True)], ours())
     registered(SPIKER, "idle", t0 - 200)
     registered(WORKER, "idle", t0)
     check("a session that finishes a turn is the first of them", [(WORKER, True), (ORCHESTRATOR, True), (SPIKER, True)], ours())
-    check("...and 1 on the rail", 1, next(u["number"] for u in rail() if u["unit"] == WORKER))
+    check("...and 1 on the rail", 1, number(WORKER))
     check("a session no running process registers is ended: no number, after every numbered unit", ("ended", None, True),
           (lambda us: (next(u["state"] for u in us if u["unit"] == STRANGER), next(u["number"] for u in us if u["unit"] == STRANGER),
                        all(u["number"] for u in us[:[x["unit"] for x in us].index(STRANGER)])))(rail()))
@@ -618,24 +527,23 @@ try:
     registered(STRANGER, pid=gone_process.pid, started=None)
     registered(NOVICE, started=str(int(SELF_STARTED) + 1))
     check("...as is one whose registry file names a process that has exited, or a pid another process has taken since",
-          ("ended", "ended"), (view(STRANGER)[1]["state"], view(NOVICE)[1]["state"]))
+          ("ended", "ended"), (view(STRANGER)["state"], view(NOVICE)["state"]))
     registered(STRANGER, "idle", t0 + 1)
-    check("a session resumed gets a number again", (True, "idle"), (view(STRANGER)[1]["number"] is not None, view(STRANGER)[1]["state"]))
+    check("a session resumed gets a number again", (True, "idle"), (number(STRANGER) is not None, view(STRANGER)["state"]))
+    clock.tick()
     check("the ✕ takes a unit out of the numbers", (200, None, True),
-          (request("POST", "/api/dismiss", {"unit": ORCHESTRATOR})[0], view(ORCHESTRATOR)[1]["number"], view(ORCHESTRATOR)[1]["dismissed"]))
+          (hub.mark("dismiss", {"unit": ORCHESTRATOR})[0], number(ORCHESTRATOR), view(ORCHESTRATOR)["dismissed"]))
     check("...listed after the numbered ones", True,
           (lambda us: all(u["number"] for u in us[:[x["unit"] for x in us].index(ORCHESTRATOR)]))(rail()))
-    check("...while an agent opening a page there does not bring it back", None,
-          (open_page(page(HOME / "notes" / "while-dismissed.html"), ORCHESTRATOR) and view(ORCHESTRATOR))[1]["number"])
-    registered(ORCHESTRATOR, "idle", time.time() + 1)
-    check("...and its session finishing a turn does, as 1", (1, False),
-          (view(ORCHESTRATOR)[1]["number"], view(ORCHESTRATOR)[1]["dismissed"]))
-    check("a dismissal is refused for a unit that does not exist", 404, request("POST", "/api/dismiss", {"unit": "no-such-unit"})[0])
+    opened(page(HOME / "notes" / "while-dismissed.html"), ORCHESTRATOR)
+    check("...while an agent opening a page there does not bring it back", None, number(ORCHESTRATOR))
+    registered(ORCHESTRATOR, "idle", clock.tick())
+    check("...and its session finishing a turn does, as 1", (1, False), (number(ORCHESTRATOR), view(ORCHESTRATOR)["dismissed"]))
+    check("a dismissal is refused for a unit that does not exist", 404, hub.mark("dismiss", {"unit": "no-such-unit"})[0])
 
     # --- hub-ui-nits 2: the statusline's numbers, from what the statusline keeps of each session's last render
-    unit_context = lambda key: view(key)[1]["context"]
     check("a session with no statusline file shows no context use, nor any usage", (None, []),
-          (unit_context(WORKER), request("GET", "/api/hub")[1]["usage"]))
+          (view(WORKER)["context"], hub.hub_view()["usage"]))
     work = HOME / ".claude-work"
     statusline(WORKER, t0 - 30, context=(42.5, 85000), five_hour=(30, t0 + 3600), seven_day=(12, t0 + 3 * 86400))
     statusline(ORCHESTRATOR, t0 - 10, context=(81, 162000), five_hour=(35, t0 + 3500), seven_day=(13, t0 + 3 * 86400))
@@ -645,38 +553,27 @@ try:
     statusline(SPIKER[:-1] + "9", t0 - 40, work, five_hour=(1, t0 + 60))  # the same account, spelled without the slash
     check("a running session shows its context use, as its statusline last had it",
           ({"used_percentage": 42.5, "total_input_tokens": 85000}, {"used_percentage": 81, "total_input_tokens": 162000}),
-          (unit_context(WORKER), unit_context(ORCHESTRATOR)))
-    check("...an ended one none", None, unit_context(NOVICE))
+          (view(WORKER)["context"], view(ORCHESTRATOR)["context"]))
+    check("...an ended one none", None, view(NOVICE)["context"])
     check("the 5h and weekly usage, one entry per account, each from its newest statusline file, an ended session's too", [
         {"account": str(HOME / ".claude"), "at": t0, "five_hour": {"used_percentage": 99, "resets_at": t0 + 60},
          "seven_day": {"used_percentage": 99, "resets_at": t0 + 60}},
         {"account": str(HOME / ".claude-pro"), "at": t0 - 5, "five_hour": None, "seven_day": None},
         {"account": str(work), "at": t0 - 20, "five_hour": {"used_percentage": 70, "resets_at": t0 - 60},
-         "seven_day": {"used_percentage": 40, "resets_at": t0 + 86400}}], request("GET", "/api/hub")[1]["usage"])
+         "seven_day": {"used_percentage": 40, "resets_at": t0 + 86400}}], hub.hub_view()["usage"])
 
     # --- hub-layout-pass 5: a unit's account, the config dir its session runs under, which the rail ticks on and off
     novice_transcript = HOME / ".claude" / "projects" / "-home-repos-alpha" / f"{NOVICE}.jsonl"
     page(HOME / ".claude-pro" / "projects" / "-home-repos-beta" / f"{WORKER}.jsonl", "")
     check("an ended session's account is the one its transcript is under, a running session's the one its registry "
           "file is under, whatever transcript it has", (str(HOME / ".claude"), str(HOME / ".claude")),
-          (view(NOVICE)[1]["account"], view(WORKER)[1]["account"]))
+          (view(NOVICE)["account"], view(WORKER)["account"]))
     (work / "projects" / "-home-repos-alpha").mkdir(parents=True)
     novice_transcript.rename(work / "projects" / "-home-repos-alpha" / novice_transcript.name)
     check("...a transcript moved to another account moving it there, as the rail has it", (str(work), str(work)),
-          (view(NOVICE)[1]["account"], next(u["account"] for u in rail() if u["unit"] == NOVICE)))
+          (view(NOVICE)["account"], next(u["account"] for u in rail() if u["unit"] == NOVICE)))
     (work / "projects" / "-home-repos-alpha" / novice_transcript.name).unlink()
-    check("...and one with no transcript left has none", None, view(NOVICE)[1]["account"])
-
-    numbers = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
-    numbers.readline()
-    statusline(WORKER, t0 + 1, context=(43, 86000), five_hour=(31, t0 + 3600), seven_day=(12, t0 + 3 * 86400))
-    heard = None
-    while heard not in ("numbers", "disk"):  # past what was told while no tab listened, which a tab hears first
-        if (line := numbers.readline().decode()).startswith("data:"):
-            heard = json.loads(line[5:])["type"]
-    numbers.close()
-    check("a listening hub tab hears of new numbers as numbers alone, which redraw the rail and leave the layout be",
-          "numbers", heard)
+    check("...and one with no transcript left has none", None, view(NOVICE)["account"])
 
     # --- answering a session from its unit: the hub tab's input box types into the session's tmux pane
 
@@ -697,16 +594,10 @@ try:
         started = Path(f"/proc/{pane_pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
         in_pane = lambda status="idle", **extra: registered(ANSWERER, status, pid=int(pane_pid), started=started, **extra)
         in_pane(tmux=f"answering:@0.{pane}")
-        open_page(page(HOME / "notes" / "answering.html"), ANSWERER)
+        opened(page(HOME / "notes" / "answering.html"), ANSWERER)
         check("a unit names the tmux pane its session runs in, as the registry does", (f"answering:@0.{pane}", "idle"),
-              (view(ANSWERER)[1]["pane"], view(ANSWERER)[1]["state"]))
-
-        tab_html = lambda dest: request("GET", "/", headers={"Sec-Fetch-Dest": dest})[1].decode()
-        token_in = lambda page_html: re.search(r'<meta name="hub-token" content="([^"]*)">', page_html)[1]
-        token = token_in(tab_html("document"))
-        check("the hub tab loaded as a tab carries the token that lets it type", True, len(token) > 20)
-        check("...a page in it that fetches the tab, or frames it, gets none", ("", ""), (token_in(tab_html("empty")), token_in(tab_html("iframe"))))
-        typed = lambda body, token=token: request("POST", "/api/type", {"unit": ANSWERER, **body}, {"Origin": ORIGIN, "X-Hub-Token": token})
+              (view(ANSWERER)["pane"], view(ANSWERER)["state"]))
+        typed = lambda text: hub.type_into({"unit": ANSWERER, "text": text})
         arrived = lambda: received.read_bytes() if received.exists() else b""
 
         def arrives(expected: bytes) -> bytes:
@@ -715,40 +606,38 @@ try:
                 time.sleep(0.05)
             return arrived()
 
-        check("a page the hub serves cannot type into a session without the tab's token", ((403, 403), b""),
-              ((typed({"text": "rm -rf ~"}, "")[0], typed({"text": "rm -rf ~"}, "guessed")[0]), arrives(b"")))
-        status_code, answer = typed({"text": "go on, but\nleave the tests"})
+        status_code, answer = typed("go on, but\nleave the tests")
         # a paste of the text, then Enter: what a terminal sends for the same text pasted in and Enter pressed
         check("the box's text arrives in the session's pane as a paste, then Enter", (200, pane, b"\x1b[200~go on, but\rleave the tests\x1b[201~\r"),
               (status_code, answer.get("pane"), arrives(b"\x1b[200~go on, but\rleave the tests\x1b[201~\r")))
         received.write_bytes(b"")
-        check("nothing but whitespace is not sent", 400, typed({"text": " \n "})[0])
+        check("nothing but whitespace is not sent", 400, typed(" \n ")[0])
         tmux("copy-mode", "-t", pane)  # scrolled up in, where copy mode would take the Enter
         check("a pane in copy mode leaves it, and the session gets the paste and the Enter", (200, b"\x1b[200~go on\x1b[201~\r", "0"),
-              (typed({"text": "go on"})[0], arrives(b"\x1b[200~go on\x1b[201~\r"), tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}")))
+              (typed("go on")[0], arrives(b"\x1b[200~go on\x1b[201~\r"), tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}")))
         received.write_bytes(b"")
         in_pane("busy", tmux=f"answering:@0.{pane}")
         check("a working session takes it too, as its pane would queue it", (200, b"\x1b[200~and then this\x1b[201~\r"),
-              (typed({"text": "and then this"})[0], arrives(b"\x1b[200~and then this\x1b[201~\r")))
+              (typed("and then this")[0], arrives(b"\x1b[200~and then this\x1b[201~\r")))
         received.write_bytes(b"")
         in_pane("waiting", tmux=f"answering:@0.{pane}", waiting_for="permission prompt")
         check("a session blocked in its terminal shows as such, on what", ("waiting", "permission prompt"),
-              (view(ANSWERER)[1]["state"], view(ANSWERER)[1]["waiting_for"]))
-        status_code, answer = typed({"text": "yes"})
+              (view(ANSWERER)["state"], view(ANSWERER)["waiting_for"]))
+        status_code, answer = typed("yes")
         check("...and is sent nothing, the hub saying why", (409, True, b""),
               (status_code, "permission prompt" in answer.get("error", ""), arrives(b"")))
         in_pane()
-        check("a session with no tmux pane in the registry has none in its unit", None, view(ANSWERER)[1]["pane"])
-        status_code, answer = typed({"text": "hello"})
+        check("a session with no tmux pane in the registry has none in its unit", None, view(ANSWERER)["pane"])
+        status_code, answer = typed("hello")
         check("...and is sent nothing, the hub saying why", (409, True, b""), (status_code, "no tmux pane" in answer.get("error", ""), arrives(b"")))
         registered(ANSWERER, tmux=f"answering:@0.{pane}")  # the pane, but a process outside it
-        status_code, answer = typed({"text": "hello"})
+        status_code, answer = typed("hello")
         check("a pane that does not hold the session's process is sent nothing", (409, True, b""),
               (status_code, "no longer holds" in answer.get("error", ""), arrives(b"")))
     finally:
         subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
     registered(ANSWERER, pid=gone_process.pid, started=None, tmux=f"answering:@0.{pane}")
-    status_code, answer = typed({"text": "hello"})
+    status_code, answer = typed("hello")
     check("an ended session is sent nothing", (409, True), (status_code, "ended" in answer.get("error", "")))
 
     # --- going to a session's tmux pane from its unit, and closing it there. DOUBLED runs in two panes: under a shell
@@ -773,15 +662,16 @@ try:
             registered(DOUBLED, second, pid=int(own_pid), started=start_of(own_pid), tmux=f"working:{own_window}.{own_pane}", file="second")
 
         doubled()
-        open_page(page(HOME / "notes" / "doubled.html"), DOUBLED)
+        opened(page(HOME / "notes" / "doubled.html"), DOUBLED)
         check("a unit names every tmux pane its session runs in, in the order of their ids",
-              [f"working:{shell_window}.{shell_pane}", f"working:{own_window}.{own_pane}"], view(DOUBLED)[1]["panes"])
+              [f"working:{shell_window}.{shell_pane}", f"working:{own_window}.{own_pane}"], view(DOUBLED)["panes"])
         panes = lambda: sorted(tmux("list-panes", "-a", "-F", "#{session_name} #{window_id} #{pane_id}").splitlines())
         on_client = lambda name: next(
             (r.split()[1:] for r in tmux("list-clients", "-F", "#{client_name} #{session_name} #{pane_id}").splitlines() if r.split()[0] == name), None)
         acted = lambda: {"switch-client", "kill-pane", "load-buffer", "paste-buffer", "send-keys", "select-pane", "select-window",
                          "kill-window", "kill-session", "kill-server"} & set(TMUX_CALLS.read_text().split())
-        pane_route = lambda route, unit=DOUBLED, token=token: request("POST", route, {"unit": unit}, {"Origin": ORIGIN, "X-Hub-Token": token})
+        routes = {"/api/jump": hub.jump, "/api/close-panes": hub.close_panes}
+        pane_route = lambda route, unit=DOUBLED: routes[route]({"unit": unit})
 
         def refused(what: str, route: str, words: str, unit: str = DOUBLED) -> None:
             """The route refuses, says why in words the unit shows, and runs nothing in tmux that changes anything."""
@@ -819,11 +709,6 @@ try:
         doubled("waiting", waiting_for="permission prompt")
         check("a blocked session is gone to all the same, to answer it there", (200, ["working", own_pane]), (pane_route("/api/jump")[0], on_client(latest)))
 
-        TMUX_CALLS.write_text("")
-        check("a page the hub serves can neither jump nor close without the tab's token", ((403, 403, 403, 403), set(), all_panes),
-              ((pane_route("/api/jump", token="")[0], pane_route("/api/jump", token="guessed")[0],
-                pane_route("/api/close-panes", token="")[0], pane_route("/api/close-panes", token="guessed")[0]), acted(), panes()))
-
         for first, second in (("busy", "idle"), ("idle", "shell")):
             doubled(first, second)
             refused(f"a close refuses a session at work in one of its panes ({first}, {second}), saying why", "/api/close-panes", "at work")
@@ -847,9 +732,9 @@ try:
               (200, [shell_pane, own_pane], sorted(r for r in all_panes if r.split()[2] not in (shell_pane, own_pane))),
               (status_code, answer.get("closed"), panes()))
         deadline = time.monotonic() + 10
-        while view(DOUBLED)[1].get("state") != "ended" and time.monotonic() < deadline:
+        while view(DOUBLED).get("state") != "ended" and time.monotonic() < deadline:
             time.sleep(0.1)
-        check("...after which its unit is an ended one, as any whose process exited", "ended", view(DOUBLED)[1]["state"])
+        check("...after which its unit is an ended one, as any whose process exited", "ended", view(DOUBLED)["state"])
     finally:
         subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
         for c in clients:
@@ -857,37 +742,30 @@ try:
             c.wait()
 
     screenshot = b"\x89PNG\r\n\x1a\n not really a png"
-    dropped = lambda name, token=token: request(
-        "POST", f"/api/drop?unit={ANSWERER}&name={urllib.parse.quote(name)}", None,
-        {"Origin": ORIGIN, "X-Hub-Token": token, "Content-Type": "application/octet-stream"}, data=screenshot)
-    status_code, answer = dropped("Screenshot from today.png")
+    status_code, answer = hub.drop(ANSWERER, "Screenshot from today.png", screenshot)
     saved = Path(answer.get("path", "/nonexistent"))
     check("a file pasted or dropped into the box is saved where the session can read it, under its own name, typed bare",
           (200, HOME / ".cache/container-hub/drops" / ANSWERER, True, screenshot),
           (status_code, saved.parent, saved.name.endswith("-Screenshot-from-today.png"), saved.read_bytes() if saved.is_file() else None))
-    check("...a second of the same name kept beside it", True, dropped("Screenshot from today.png")[1].get("path") != str(saved))
-    check("...and not without the tab's token", 403, dropped("x.png", "")[0])
+    check("...a second of the same name kept beside it", True, hub.drop(ANSWERER, "Screenshot from today.png", screenshot)[1].get("path") != str(saved))
     check("...nor for a unit there is none of, whatever its name", (404, 404, False), (
-        request("POST", "/api/drop?unit=no-such-unit&name=x.png", None, {"Origin": ORIGIN, "X-Hub-Token": token}, data=b"x")[0],
-        request("POST", "/api/drop?unit=..&name=x.png", None, {"Origin": ORIGIN, "X-Hub-Token": token}, data=b"x")[0],
-        any((HOME / ".cache/container-hub").glob("*x.png"))))
+        hub.drop("no-such-unit", "x.png", b"x")[0], hub.drop("..", "x.png", b"x")[0], any((HOME / ".cache/container-hub").glob("*x.png"))))
 
     # --- hub-continues-a-session-from-its-handoff: a unit hands its session off from its handoff, by /clear in its pane
     if not READER:
-        print("skip: no mx plugin here, whose handoff hook finds the handoff a /clear picks up")
+        skipped("a unit hands its session off from its handoff", "no mx plugin here, whose handoff hook finds the handoff a /clear picks up")
     else:
         kappa = repo("kappa", [("hand-off", None, CONTINUER)])
         handoffs = kappa / "agent/handoffs"
         handoffs.mkdir()
         handoff = handoffs / "2026-10-07-hand-off.md"
-        h0 = int(time.time()) - 1000  # every prompt and commit below at a time of its own, a whole second apart
+        h0 = int(clock.now) - 1000  # every prompt and commit below at a time of its own, a whole second apart
 
         def commit_handoff(at: int, text: str = "# Hand the work on\n", path: Path = handoff, purpose: str = "continuation") -> None:
             """The session writes its handoff and commits it at `at`, as the committer date has it."""
             path.write_text(f"---\nsession: {CONTINUER}\npurpose: {purpose}\n---\n\n{text}")
             git(kappa / "agent", "add", "handoffs")
-            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "handoff"], cwd=kappa / "agent",
-                           env={**ENV, "GIT_COMMITTER_DATE": f"@{at} +0000"}, check=True, capture_output=True)
+            git(kappa / "agent", "commit", "-q", "-m", "handoff", at=at)
 
         # The session's transcript, as Claude Code 2.1.29x writes its `user` lines, compact: the user's prompts, and what a tool,
         # a hook, a subagent or a task notification put there, which are none of them a prompt of the user's.
@@ -899,7 +777,7 @@ try:
                 f.write(json.dumps({"type": "user", "sessionId": CONTINUER, "message": {"role": "user", "content": content},
                                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(at)), **line}, separators=(",", ":")) + "\n")
         prompt = lambda at, text="go on": transcript_line(at, text, promptSource="typed", turnOrigin="human", origin={"kind": "human"})
-        offer = {"path": str(handoff.resolve()), "url": "/f" + urllib.parse.quote(str(handoff.resolve()))}
+        offer = {"path": str(handoff.resolve()), "url": served(handoff.resolve())}
         # The session's program, standing in for Claude Code: it records every byte that reaches it, and a `/clear`
         # typed into it rewrites its registry entry as `then` says, which is how Claude Code names the new session.
         typed_in, then = SCRATCH / "typed-in", SCRATCH / "then.json"
@@ -930,15 +808,14 @@ while data := os.read(0, 4096):
             idle_in_pane = lambda status="idle", cwd=kappa, **extra: registered(CONTINUER, status, pid=int(pane_pid), started=started,
                                                                                 tmux=where, cwd=cwd, **extra)
             idle_in_pane()
-            open_page(page(HOME / "notes" / "handing.html"), CONTINUER)
-            shown = lambda key=CONTINUER: view(key)[1].get("handoff")
+            opened(page(HOME / "notes" / "handing.html"), CONTINUER)
+            shown = lambda key=CONTINUER: view(key).get("handoff")
             offered = lambda key=CONTINUER: (lambda h: h and {k: v for k, v in h.items() if k != "at"})(shown(key))
 
-            def asked(offer: str, token: str = token, box: dict | None = None):
+            def asked(offer: str, box: dict | None = None):
                 """A click on what the box offers, as the box showed it: by default, as it shows it now."""
                 box = box or shown() or {}
-                return request("POST", "/api/hand-off", {"unit": CONTINUER, "offer": offer, "path": box.get("path"), "at": box.get("at")},
-                               {"Origin": ORIGIN, "X-Hub-Token": token})
+                return hub.hand_off({"unit": CONTINUER, "offer": offer, "path": box.get("path"), "at": box.get("at")})
 
             def got(expected: bytes = b"") -> bytes:
                 """What reached the pane, once it is what was expected or a few seconds have passed."""
@@ -957,17 +834,17 @@ while data := os.read(0, 4096):
                 return (typed.startswith(b"\x1b[200~/mx:handoff ") and typed.endswith(b"\x1b[201~\r") and typed.count(b"\r") == 1
                         and all(w in typed for w in words))
 
-            check("hub-continues-a-session-from-its-handoff#P1: a session idle in its pane with no handoff is offered to write one",
+            check("a session idle in its pane with no handoff is offered to write one",
                   {"offer": "write"}, offered())
             idle_in_pane(cwd=HOME)
             check("...and none in a working directory with no agent repo, where no handoff could go", None, offered())
             idle_in_pane()
             prompt(h0)  # the request, as the session receives it
-            check("hub-continues-a-session-from-its-handoff#P7: a click asks the session to write its handoff, and types nothing else",
+            check("a click asks the session to write its handoff, and types nothing else",
                   ((200, {"asked": "write", "pane": pane}), True), (asked("write"), one_request(b"write", b"commit")))
             typed_in.write_bytes(b"")
             commit_handoff(h0 + 10)
-            check("hub-continues-a-session-from-its-handoff#P6: once the handoff is committed after the last prompt, it is offered to "
+            check("once the handoff is committed after the last prompt, it is offered to "
                   "hand off from", {"offer": "hand-off", **offer}, offered())
             transcript_line(h0 + 20, [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}], toolUseResult={"stdout": "ok"})
             transcript_line(h0 + 21, "Base directory for this skill: /somewhere", isMeta=True)
@@ -982,12 +859,12 @@ while data := os.read(0, 4096):
             check("a handoff edited since it was committed is offered to update, not to hand off from", {"offer": "update", **offer}, offered())
             git(kappa / "agent", "checkout", "--", "handoffs")
             prompt(h0 + 30, "keep going")
-            check("hub-continues-a-session-from-its-handoff#P6: a prompt sent after the handoff's commit makes it stale, offered to update",
+            check("a prompt sent after the handoff's commit makes it stale, offered to update",
                   {"offer": "update", **offer}, offered())
             status_code, answer = asked("hand-off")
             check("...and a click that hands off from what was fresh when the box offered it is refused, nothing typed",
                   (409, True, b""), (status_code, "changed since" in answer.get("error", ""), got()))
-            check("hub-continues-a-session-from-its-handoff#P7: a click asks the session to update its handoff, by its path, and types "
+            check("a click asks the session to update its handoff, by its path, and types "
                   "nothing else", ((200, {"asked": "update", "pane": pane}), True), (asked("update"), one_request(b"update", str(handoff.resolve()).encode())))
             typed_in.write_bytes(b"")
             prompt(h0 + 31, "/mx:handoff continuation: update it")
@@ -1004,7 +881,7 @@ while data := os.read(0, 4096):
             check("a click that hands off from a handoff committed again since the box offered it is refused, nothing typed",
                   ("hand-off", 409, True, b""), ((offered() or {}).get("offer"), status_code, "changed since" in answer.get("error", ""), got()))
             idle_in_pane("busy")
-            check("hub-continues-a-session-from-its-handoff#P1: no offer while the session works", None, offered())
+            check("no offer while the session works", None, offered())
             idle_in_pane("waiting", waiting_for="permission prompt")
             check("...nor while it is blocked", None, offered())
             registered(CONTINUER, tmux=where, cwd=kappa)  # the pane, but a process outside it
@@ -1013,19 +890,18 @@ while data := os.read(0, 4096):
             check("...and again once it is idle in its pane", "hand-off", (offered() or {}).get("offer"))
 
             then.write_text(json.dumps({"sessionId": CONTINUED}))
-            check("a page the hub serves cannot hand a session off without the tab's token", (403, b""), (asked("hand-off", "")[0], got()))
             # the session went busy, or blocked, or its pane came to hold another process, since the box offered
             for case, registers, why in (("working", lambda: idle_in_pane("busy"), "working"),
                                          ("blocked", lambda: idle_in_pane("waiting", waiting_for="dialog open"), "dialog open"),
                                          ("out of its pane", lambda: registered(CONTINUER, tmux=where, cwd=kappa), "no longer holds")):
                 registers()
                 status_code, answer = asked("hand-off")
-                check(f"hub-continues-a-session-from-its-handoff#P3: a session {case} is refused before anything is typed, the hub saying why",
+                check(f"a session {case} is refused before anything is typed, the hub saying why",
                       (409, True, b""), (status_code, why in answer.get("error", ""), got()))
             idle_in_pane()
             then.write_text("{}")
             status_code, answer = asked("hand-off")
-            check("hub-continues-a-session-from-its-handoff#P3: no new session in the registry within the wait is refused, with only "
+            check("no new session in the registry within the wait is refused, with only "
                   "the /clear typed", (409, True, pasted(b"/clear")), (status_code, "no new session" in answer.get("error", ""), got(pasted(b"/clear"))))
             typed_in.write_bytes(b"")
             then.write_text(json.dumps({"sessionId": STALLED, "status": "waiting", "waitingFor": "dialog open"}))
@@ -1036,284 +912,73 @@ while data := os.read(0, 4096):
             idle_in_pane()
             then.write_text(json.dumps({"sessionId": CONTINUED, "status": "idle"}))
             status_code, answer = asked("hand-off")
-            check("hub-continues-a-session-from-its-handoff#P2: a click types /clear, then, once the registry names the new "
+            check("a click types /clear, then, once the registry names the new "
                   "session, `continue`, and nothing else", (200, CONTINUED, f"/u/{CONTINUED}", pasted(b"/clear", b"continue")),
                   (status_code, answer.get("unit"), answer.get("view"), got(pasted(b"/clear", b"continue"))))
             new = view(CONTINUED)
             typed_in.write_bytes(b"")
-            answered = request("POST", "/api/type", {"unit": CONTINUED, "text": "and then"}, {"Origin": ORIGIN, "X-Hub-Token": token})[0]
-            check("hub-continues-a-session-from-its-handoff#P4: the new session is a unit at once, idle, its session page a stand-in, "
-                  "and its box types into the pane", (200, f"/pages/{CONTINUED}", "idle", 200, pasted(b"and then")),
-                  (new[0], new[1].get("session_page", {}).get("url"), new[1].get("state"), answered, got(pasted(b"and then"))))
-            old = view(CONTINUER)[1]
-            check("hub-continues-a-session-from-its-handoff#P5: the old session's unit is among the ended, and offers nothing",
-                  ("ended", None, None), (old["state"], old["number"], old["handoff"]))
-            rendered = page(kappa / f"agent/sessions/{CONTINUED}/index.html")
+            answered = hub.type_into({"unit": CONTINUED, "text": "and then"})[0]
+            check("the new session is a unit at once, idle, its session page a stand-in, "
+                  "and its box types into the pane", (True, f"/pages/{CONTINUED}", "idle", 200, pasted(b"and then")),
+                  (new is not None, (new or {}).get("session_page", {}).get("url"), (new or {}).get("state"), answered, got(pasted(b"and then"))))
+            old = view(CONTINUER)
+            check("the old session's unit is among the ended, and offers nothing",
+                  ("ended", None, None), (old["state"], number(CONTINUER), old["handoff"]))
+            rendered_page = page(kappa / f"agent/sessions/{CONTINUED}/index.html")
             check("...and the new session's page takes the stand-in's place once it is rendered",
-                  "/f" + urllib.parse.quote(str(rendered.resolve())), view(CONTINUED)[1]["session_page"]["url"])
+                  served(rendered_page.resolve()), view(CONTINUED)["session_page"]["url"])
         finally:
             subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
 
-    # --- serving
+    # --- links clicked in the hub tab: a path to copy, rather than a page, where /f/ would not serve it
 
-    status_code, health = request("GET", "/.health")
-    check("/.health says diffview pages can save", {"saves": True}, health)
-    served = member_of(a)["url"]
-    check("a member is served on the hub's origin", 200, request("GET", served)[0])
-    check("a request for another Host is refused", 403, request("GET", served, headers={"Host": "attacker.example:80"})[0])
     secret = page(HOME / ".ssh" / "id_ed25519", "not a page")
-    check("a file no agent opened, outside every agent directory, is not served", 403,
-          request("GET", "/f" + urllib.parse.quote(str(secret)))[0])
-    check("...and a page in the hub tab opening it gets its path to copy, and it is served no more than before",
-          ((200, str(secret)), 403),
-          ((lambda r: (r[0], r[1].get("copy")))(request("POST", "/api/open", {"unit": a["unit"], "target": str(secret)}, {"Origin": ORIGIN})),
-           request("GET", "/f" + urllib.parse.quote(str(secret)))[0]))
-    check("...nor opening a directory widens what is served, though its path comes back to copy", ((200, str(note.parent)), 403),
-          ((lambda r: (r[0], r[1].get("copy")))(request("POST", "/api/open", {"unit": a["unit"], "target": str(note.parent)}, {"Origin": ORIGIN})),
-           request("GET", "/f" + urllib.parse.quote(str(page(HOME / "beside-notes.html"))))[0]))
+    check("a page in the hub tab opening a file no agent opened, outside every agent directory, gets its path to copy",
+          str(secret), clicked(secret, a["unit"]).get("copy"))
+    check("...and one opening a directory", str(note.parent), clicked(note.parent, a["unit"]).get("copy"))
     check("the hub tab hears which links a click copies: a directory and an unserved file, not a page it serves",
           (200, {"copies": [f"file://{note.parent}", str(secret)]}),
-          request("POST", "/api/copies", {"targets": [f"file://{note.parent}", str(secret), served, str(HOME / "gone")]}, {"Origin": ORIGIN}))
-    check("a write for another Host is refused", 403,
-          request("POST", "/api/open", {"target": str(note)}, {"Host": "attacker.example:80", "Origin": ORIGIN})[0])
-    shown = page(HOME / "work" / "out" / "report" / "index.html")
-    page(HOME / "work" / "out" / "secret.txt", "secret")
-    open_page(shown.parent, ORCHESTRATOR, cwd=str(alpha))
-    check("a directory an agent opens is served, and nothing beside it", (200, 403),
-          (request("GET", "/f" + urllib.parse.quote(str(shown)))[0],
-           request("GET", "/f" + urllib.parse.quote(str(HOME / "work" / "out" / "secret.txt")))[0]))
-    check("a file git tracks in the repo around an agent directory is served", 200,
-          request("GET", "/f" + urllib.parse.quote(str(alpha / "README.md")))[0])
-    check("...an untracked one is not", 403, request("GET", "/f" + urllib.parse.quote(str(page(alpha / ".env", "KEY=1"))))[0])
-    request("POST", "/api/open", {"unit": a["unit"], "target": str(alpha / "README.md"), "by": "user"}, {"Origin": ORIGIN})
-    check("...not even once the hub tab opened a tracked file beside it", 403, request("GET", "/f" + urllib.parse.quote(str(alpha / ".env")))[0])
-    page(alpha / "site" / "style.css", "p {}")
-    git(alpha, "add", "site/style.css")
-    git(alpha, "commit", "-q", "-m", "site")
-    page(alpha / "site" / "index.html")
-    check("...nor an untracked page reached through a directory git tracks files in", 403,
-          request("GET", "/f" + urllib.parse.quote(str(alpha / "site")) + "/")[0])
-    check("an open from another origin is refused", 403,
-          request("POST", "/api/open", {"target": str(note)}, {"Origin": "http://attacker.example"})[0])
-    diff_url = member_of(open_page(code_diff, ORCHESTRATOR))["url"]
-    state = {"writer": "t", "savedAt": 1, "comments": []}
-    check("a diffview page saves its comments through the hub", 204,
-          request("POST", diff_url + ".state.json", state, {"Origin": ORIGIN})[0])
-    check("...beside the page", state, json.loads(Path(f"{code_diff}.state.json").read_text()))
-    check("a state write from another origin is refused", 403,
-          request("POST", diff_url + ".state.json", state, {"Origin": "http://attacker.example"})[0])
-    check("a page no diffview watches asking for a new summary is told none runs", 409,
-          request("POST", diff_url + ".summary.json", {}, {"Origin": ORIGIN})[0])
-    watch_record = Path(f"{code_diff}.watch.json")
-    for garbage in ("not json", "[1]"):
-        watch_record.write_text(garbage)
-        check(f"a watch record that is no record ({garbage}) reads as none", (200, None), request("GET", diff_url + ".watch.json"))
-    check("...and keeps its page in the unit", True, any(m["url"] == diff_url for m in view(ORCHESTRATOR)[1]["members"]))
-    watch_record.unlink()
-    unserved = page(HOME / "unserved" / "watched.html")
-    with open(f"{unserved}.watch.json", "w") as record:
-        record.write(json.dumps({"g": 1, "watches": []}))
-        record.flush()
-        fcntl.flock(record, fcntl.LOCK_EX)  # held, as a live watcher holds its record
-        check("a page the hub does not serve cannot ask its watcher for a summary", 403,
-              request("POST", "/f" + urllib.parse.quote(str(unserved)) + ".summary.json", {}, {"Origin": ORIGIN})[0])
-    check("...so nothing asked it", False, Path(f"{unserved}.summary.request.json").exists())
-    check("a route the hub does not have is not found, with a body or none", (404, 404),
-          (request("POST", "/api/nothing", {})[0], request("POST", "/api/nothing")[0]))
-    bare = socket.create_connection(("127.0.0.1", PORT), timeout=10)
-    bare.sendall(b"GET /.health HTTP/1.0\r\n\r\n")
-    check("a request that names no Host is refused", b"HTTP/1.0 403", bare.recv(4096)[:12])
-    bare.close()
-    check("an open that names no target is a bad request", 400, request("POST", "/api/open", {"session": WORKER})[0])
-    check("the hub tab is served at the root, and at a unit", (200, 200, True),
-          (request("GET", "/")[0], request("GET", f"/u/{WORKER}")[0], b"trellis" in request("GET", "/")[1]))
-    old_view = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
-    old_view.request("GET", "/c/map-columns@alpha.123456")
-    sent = old_view.getresponse()
-    check("a container view's old address is sent to the hub tab", (302, "/"), (sent.status, sent.getheader("Location")))
-    old_view.close()
-
-    # --- trellis, served from a cache that is checked on every use
-
-    trellis_cache = HOME / ".cache/container-hub" / ("trellis-" + re.search(r'TRELLIS_VERSION = "(.+)"', (BIN / "container-hub").read_text())[1])
-    trellis_cache.mkdir(parents=True, exist_ok=True)
-    (trellis_cache / "style.css").write_text("body { background: url(https://attacker.example/x) }")
-    status_code, body = request("GET", "/static/trellis/style.css")
-    check("a cached trellis file that differs from its pin is refused", 502, status_code)
-    check("...naming the file", True, b"style.css does not match its pinned sha256" in body)
-    check("...on the hub's stderr too", True, "style.css does not match its pinned sha256" in (SCRATCH / "hub.log").read_text())
-    check("...and left in place rather than fetched over", "body { background: url(https://attacker.example/x) }",
-          (trellis_cache / "style.css").read_text())
-    (trellis_cache / "style.css").unlink()
-
-    # --- what diffview hands the hub: a directory of pages, or a page, served without joining a unit
-
-    rendered = page(SCRATCH / "rendered pages" / "nested" / "review.html")  # a space, which a url spells encoded
-    status_code, shared = request("POST", "/api/serve", {"path": str(rendered.parents[1])})
-    check("a local tool shares a directory and gets its address", (200, "/f" + urllib.parse.quote(str(rendered.parents[1])) + "/"),
-          (status_code, shared.get("url")))
-    check("...under which every page is served", 200, request("GET", shared["url"] + "nested/review.html")[0])
-    listed = request("GET", shared["url"])[1]
-    check("...and the directory's address lists them, linked relative to it", True, b'href="nested/review.html"' in listed)
-    bare = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
-    bare.request("GET", shared["url"].rstrip("/"))
-    moved = bare.getresponse()
-    check("...an address without the trailing slash is sent to the one with it", (301, shared["url"]),
-          (moved.status, moved.getheader("Location")))
-    bare.close()
-    check("a shared directory joins no unit", 404, view("loose")[0])
-    check("a directory nobody shared is not listed", 404, request("GET", "/f" + urllib.parse.quote(str(agent / "tickets")) + "/")[0])
-    check("a page in the hub tab cannot share", 403,
-          request("POST", "/api/serve", {"path": str(secret.parent)}, {"Origin": ORIGIN})[0])
-    check("...nor can another site", 403,
-          request("POST", "/api/serve", {"path": str(secret.parent)}, {"Origin": "http://attacker.example"})[0])
-    check("a path that does not exist is not shared", 404, request("POST", "/api/serve", {"path": str(SCRATCH / "nowhere.html")})[0])
-    check("a directory holding all of home, or home itself, is never shared", (403, 403),
-          (request("POST", "/api/serve", {"path": str(HOME.parent)})[0], request("POST", "/api/serve", {"path": str(HOME)})[0]))
-    alone = page(HOME / "alone.html")
-    status_code, shared_page = request("POST", "/api/serve", {"path": str(alone)})
-    check("a page in home is shared on its own", (200, 200), (status_code, request("GET", shared_page["url"])[0]))
-    request("POST", "/api/serve", {"path": str(alone)})
-    check("...and kept in the list of what is shared once, shared twice", 1,
-          json.loads((SCRATCH / "state/served.json").read_text()).count(str(alone)))
-    check("...and saves beside itself", (204, state),
-          (request("POST", shared_page["url"] + ".state.json", state, {"Origin": ORIGIN})[0],
-           json.loads(Path(f"{alone}.state.json").read_text())))
-    check("...while the rest of home stays unserved", 403, request("GET", "/f" + urllib.parse.quote(str(HOME / "beside-notes.html")))[0])
-    in_temp = page(TEMP_PAGE)
-    beside_temp = page(TEMP_PAGE.with_name(TEMP_PAGE.stem + "-beside.html"))
-    serving = subprocess.run([BIN / "diffview", "--serve", str(in_temp)], env={**ENV, "CONTAINER_HUB_PORT": str(PORT)},
-                             capture_output=True, text=True, timeout=120)
-    temp_url = serving.stdout.split(" at ")[-1].strip()
-    check("diffview --serve takes a page sitting directly in the temp dir", (0, 200),
-          (serving.returncode, request("GET", temp_url.removeprefix(ORIGIN))[0] if temp_url.startswith(ORIGIN) else None))
-    check("...and the rest of the temp dir stays unserved", 403, request("GET", "/f" + urllib.parse.quote(str(beside_temp)))[0])
-    check("...as the temp dir is never shared whole", 403, request("POST", "/api/serve", {"path": str(TEMP)})[0])
+          hub.copying({"targets": [f"file://{note.parent}", str(secret), member_of(a)["url"], str(HOME / "gone")]}, PORT))
 
     # --- what leaves
 
     gone = page(alpha / "agent/prototypes/csv-import/index.html")
-    gone_id = open_page(gone, ORCHESTRATOR)["id"]
+    gone_id = opened(gone, ORCHESTRATOR)["id"]
     gone.unlink()
-    check("a member whose file is deleted leaves its unit", False, any(m["id"] == gone_id for m in view(ORCHESTRATOR)[1]["members"]))
-    retiring = open_page(page(beta / "agent/show/map-columns/retiring.html"), RETIRER)
-    check("a unit's tree, once read", "map-columns", view(retiring["unit"])[1]["tree"])
+    check("a member whose file is deleted leaves its unit", False, any(m["id"] == gone_id for m in view(ORCHESTRATOR)["members"]))
+    retiring = opened(page(beta / "agent/show/map-columns/retiring.html"), RETIRER)
+    check("a unit's tree, once read", "map-columns", view(retiring["unit"])["tree"])
     (beta / "agent/tickets/map-columns.md").unlink()
-    check("...and retired, takes the unit with it, its pages still there", (404, True), (view(RETIRER)[0], Path(beta / "agent/show/map-columns/retiring.html").exists()))
+    check("...and retired, takes the unit with it, its pages still there", (None, True), (view(RETIRER), Path(beta / "agent/show/map-columns/retiring.html").exists()))
     check("...off the rail", False, any(u["unit"] == RETIRER for u in rail()))
-    check("...while a unit of another tree holding a page of that tree stays", 200, view(WORKER)[0])
+    check("...while a unit of another tree holding a page of that tree stays", True, view(WORKER) is not None)
 
     # --- hub-follows-links-between-session-pages: a handoff's link to another session's page, clicked in the hub tab
-    handoff = lambda path: request("POST", "/api/open", {"unit": WORKER, "target": "/f" + urllib.parse.quote(str(path.resolve())),
-                                                         "by": "user"}, {"Origin": ORIGIN})[1]
-    followed = handoff(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html")
+    follow = lambda path: clicked(served(path.resolve()), WORKER)
+    followed = follow(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html")
     check("a click on another session's session page goes to that session's unit, not the one clicked in", (ORCHESTRATOR, False),
-          (followed.get("unit"), any(m["id"] == followed.get("id") for m in view(WORKER)[1]["members"])))
-    revived = handoff(page(beta / f"agent/sessions/{RETIRER}/index.html"))
-    check("...and makes a unit again of a session whose unit went with its tree", (RETIRER, 200, revived.get("id")),
-          (revived.get("unit"), view(RETIRER)[0], view(RETIRER)[1].get("session_page", {}).get("id")))
+          (followed.get("unit"), any(m["id"] == followed.get("id") for m in view(WORKER)["members"])))
+    revived = follow(page(beta / f"agent/sessions/{RETIRER}/index.html"))
+    check("...and makes a unit again of a session whose unit went with its tree", (RETIRER, True, revived.get("id")),
+          (revived.get("unit"), view(RETIRER) is not None, (view(RETIRER) or {}).get("session_page", {}).get("id")))
     lone_session, solo_session, whole_session = (f"{n}0000000-0000-4000-8000-00000000000{n}" for n in (7, 8, 9))
     delta = repo("delta", [("lone", None, lone_session)])
     epsilon = repo("epsilon", [("solo", None, solo_session)])
-    d = open_page(page(delta / "agent/show/lone/index.html"), lone_session)
-    e = open_page(page(epsilon / "agent/show/solo/index.html"), solo_session)
+    d = opened(page(delta / "agent/show/lone/index.html"), lone_session)
+    e = opened(page(epsilon / "agent/show/solo/index.html"), solo_session)
     zeta = repo("zeta", [("whole", None, whole_session)])
-    z = open_page(page(zeta / "agent/show/whole/index.html"), whole_session)
+    z = opened(page(zeta / "agent/show/whole/index.html"), whole_session)
     (zeta / "agent/tickets/half-written.md").write_text("no frontmatter yet\n")  # `tracker data` refuses the whole tracker
-    check("a unit whose tracker refuses its tickets for now is still there", (200, [z["id"]]),
-          (lambda r: (r[0], [m["id"] for m in r[1].get("members", [])]))(view(z["unit"])))
+    check("a unit whose tracker refuses its tickets for now is still there", [z["id"]],
+          [m["id"] for m in (view(z["unit"]) or {}).get("members", [])])
     shutil.rmtree(delta / "agent" / "tickets")
     shutil.rmtree(epsilon)
-    check("a unit whose tracker is gone is gone, its pages still there or not", (404, 404), (view(d["unit"])[0], view(e["unit"])[0]))
+    check("a unit whose tracker is gone is gone, its pages still there or not", (None, None), (view(d["unit"]), view(e["unit"])))
     check("...and left the rail", False, any(u["unit"] in (d["unit"], e["unit"]) for u in rail()))
     passing = "12345678-0000-4000-8000-00000000000a"
-    fleeting_note = open_page(page(HOME / "notes" / "fleeting.html"), passing)
+    fleeting_note = opened(page(HOME / "notes" / "fleeting.html"), passing)
     (HOME / "notes" / "fleeting.html").unlink()
-    check("a unit with no tree goes once every page of it is deleted", (passing, 404), (fleeting_note["unit"], view(passing)[0]))
-
-    # --- claude-browser with a hub
-
-    stubs = SCRATCH / "stubs"
-    stubs.mkdir()
-    record = SCRATCH / "browser"
-    (stubs / "brave").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {record}\n')
-    (stubs / "systemd-run").write_text('#!/bin/sh\nwhile [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n')
-    for s in stubs.iterdir():
-        s.chmod(0o755)
-    local_state = HOME / ".config/BraveSoftware/Brave-Browser/Local State"
-    local_state.parent.mkdir(parents=True)
-    local_state.write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Personal"}}}}))
-
-    def browse(*args: str, cwd: Path = gamma, port: int = PORT, **sessions: str) -> list[str]:
-        """What claude-browser handed the browser; what it said on the way is in browse.said."""
-        record.unlink(missing_ok=True)
-        browse.said = subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=True, capture_output=True, timeout=30, text=True,
-                                     env={**ENV, "CONTAINER_HUB_PORT": str(port), "CLAUDE_CODE_SESSION_ID": WORKER, **sessions,
-                                          "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
-        deadline = time.monotonic() + 5
-        while not record.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        return record.read_text().splitlines() if record.exists() else []
-
-    fresh = page(gamma / "agent/show/one-flow/figure.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
-    tab_came_and_went()
-    opened = browse("agent/show/one-flow/figure.svg")
-    launching = browse.said
-    g = open_page(fresh, WORKER)
-    check("with no hub tab listening, claude-browser opens the hub tab at the unit and the page",
-          ["--profile-directory=Default", f"{ORIGIN}/u/{WORKER}#{g['id']}"], opened)
-    check("...and says which unit the page is in, on one line", (True, 1),
-          (launching.startswith(f"claude-browser: in unit {WORKER}"), launching.count("\n")))
-    check("...and the page is a member", True, any(m["path"] == str(fresh) for m in view(WORKER)[1]["members"]))
-    check("a second page moments later opens no second hub tab", [],
-          browse(str(page(gamma / "agent/show/one-flow/index.html"))))
-    events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
-    events.readline()
-    by_origin = page(gamma / "agent/show/one-flow/origin.html")
-    check("with a hub tab listening, a page claude-browser hands in opens no tab", [],
-          browse(str(by_origin), MX_ORIGIN_SESSION=ORCHESTRATOR))
-    check("...and lands in the unit of the session in MX_ORIGIN_SESSION, over the process's own", (True, False),
-          (any(m["path"] == str(by_origin) for m in view(ORCHESTRATOR)[1]["members"]),
-           any(m["path"] == str(by_origin) for m in view(WORKER)[1]["members"])))
-    shown = open_page(fresh, WORKER)
-    browse(str(fresh))
-    check("...and prints the line the hub gave it", f"claude-browser: {shown['say']}\n", browse.said)
-    check("a board claude-browser hands a listening hub tab opens no tab", ([], "claude-browser: the open hub tab shows the board over it\n"),
-          (browse(str(board)), browse.said))
-    events.close()
-    tab_came_and_went()
-    check("...and with none listening opens the hub tab at the unit, the board over it",
-          ["--profile-directory=Default", f"{ORIGIN}/u/{WORKER}#board:{board_url}"], browse(str(board)))
-    check("a worker's report starts no browser either", [], browse(str(report)))
-    check("...and claude-browser prints why, as the hub put it", f"claude-browser: {skipped['say']}\n", browse.said)
-    tab_came_and_went()
-    unprofiled = subprocess.run([BIN / "claude-browser", str(by_origin)], cwd=gamma, capture_output=True,
-                                timeout=30, text=True, env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CONFIG_DIR": str(HOME / ".claude-nobody"),
-                                                            "CLAUDE_CODE_SESSION_ID": WORKER, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
-    check("a hub tab that has no Brave profile to open in is not said to open: only why not", (1, False, True),
-          (unprofiled.returncode, "in unit" in unprofiled.stderr, "no profile named 'nobody'" in unprofiled.stderr))
-    refused = subprocess.run([BIN / "claude-browser", "--nope", str(by_origin)], capture_output=True, text=True, timeout=30,
-                             env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
-    check("claude-browser refuses an option it does not have, naming it", (1, True),
-          (refused.returncode, "no option --nope" in refused.stderr))
-    lane_page = page(gamma / "agent/show/one-flow/demo.html")
-    browse("--lane", "output", str(lane_page))
-    in_lane = lambda: next(m["lane"] for m in view(WORKER)[1]["members"] if m["path"] == str(lane_page))
-    check("claude-browser --lane puts a page in that lane", "output", in_lane())
-    browse("--lane=code", str(lane_page))
-    check("...as does --lane=<lane>", "code", in_lane())
-    record.unlink(missing_ok=True)
-    no_lane = subprocess.run([BIN / "claude-browser", "--lane", "diff", str(lane_page)], capture_output=True, text=True, timeout=30,
-                             env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
-    check("...and refuses a lane there is none of, opening nothing", (1, True, False, "code"),
-          (no_lane.returncode, "no lane 'diff'" in no_lane.stderr, record.exists(), in_lane()))
-    usage = subprocess.run([BIN / "claude-browser", "--help"], capture_output=True, text=True, timeout=30).stdout
-    check("claude-browser --help says what --lane takes", True,
-          "--lane" in usage and all(lane in usage for lane in ("session", "concept", "output", "code")))
-    check("the hub's own pages open as tabs, not members", [ORIGIN + "/"], browse(ORIGIN + "/")[1:])
-    check("...the hub tab at a unit among them, without a word", ([f"{ORIGIN}/u/{WORKER}"], ""), (browse(f"{ORIGIN}/u/{WORKER}")[1:], browse.said))
-    check("claude-browser with no page opens a blank tab, without a word", (["about:blank"], ""), (browse()[1:], browse.said))
-    check("...so no unit holds them", 404, view("loose")[0])
+    check("a unit with no tree goes once every page of it is deleted", (passing, None), (fleeting_note["unit"], view(passing)))
 
     # --- a page on another origin: framed in its unit's output lane, or listed where it refuses framing
 
@@ -1338,27 +1003,26 @@ while data := os.read(0, 4096):
     elsewhere = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Elsewhere)
     threading.Thread(target=elsewhere.serve_forever, daemon=True).start()
     app = f"http://127.0.0.1:{elsewhere.server_address[1]}"
-    member_at = lambda unit, url: next((m for m in view(unit)[1].get("members", []) if m["url"] == url), {})
+    member_at = lambda unit, url: next((m for m in (view(unit) or {}).get("members", []) if m["url"] == url), {})
+
     def handed(target: str, url: str | None = None) -> dict:
         """The member of WORKER's unit a page an agent hands in becomes; url where the hub spells it otherwise."""
-        open_page(target, WORKER)
+        opened(target, WORKER)
         return member_at(WORKER, url or target)
 
-    clicked = lambda target: request("POST", "/api/open", {"unit": WORKER, "target": target, "by": "user"}, {"Origin": ORIGIN})[1]
-    events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
-    events.readline()
-    check("one-hub-tab#P7: a page on another origin handed in through claude-browser gets no tab, framing allowed or refused",
-          ([], []), (browse(f"{app}/app", MX_ORIGIN_SESSION=ORCHESTRATOR), browse(f"{app}/deny", MX_ORIGIN_SESSION=ORCHESTRATOR)))
-    check("...and claude-browser says the one that refuses is listed, and why", (True, True),
-          ("listed on its session page" in browse.said, "X-Frame-Options is DENY" in browse.said))
+    opened(f"{app}/app", ORCHESTRATOR)
+    refusing = opened(f"{app}/deny", ORCHESTRATOR)
     check("a local server that allows framing is a member in the output lane of the opening session's unit", ("output", None),
           (member_at(ORCHESTRATOR, f"{app}/app").get("lane"), member_at(ORCHESTRATOR, f"{app}/app").get("tab")))
-    listed = next((p for p in view(ORCHESTRATOR)[1]["pages"] if p["url"] == f"{app}/deny"), {})
+    listed = next((p for p in view(ORCHESTRATOR)["pages"] if p["url"] == f"{app}/deny"), {})
     check("a page that refuses framing is listed on the session page, marked as one that opens as a tab", (False, True),
           (listed.get("linked"), "X-Frame-Options" in listed.get("tab", "")))
+    check("...and the line the caller prints says it is listed, and why", (True, True),
+          ("listed on its session page" in refusing["say"], "X-Frame-Options is DENY" in refusing["say"]))
     Elsewhere.headers_of["/app"] = [("X-Frame-Options", "SAMEORIGIN")]
-    browse(f"{app}/app", MX_ORIGIN_SESSION=ORCHESTRATOR)
+    opened(f"{app}/app", ORCHESTRATOR)
     check("...the hub asking the page again at every open", True, "SAMEORIGIN" in member_at(ORCHESTRATOR, f"{app}/app").get("tab", ""))
+    Elsewhere.headers_of["/app"] = []
     check("frame-ancestors that names the hub's origin allows framing, over X-Frame-Options", None,
           handed(f"{app}/hub").get("tab"))
     check("...and one that does not refuses it, as a redirect to a page that refuses does", (True, True),
@@ -1369,19 +1033,562 @@ while data := os.read(0, 4096):
           (lambda m: (m.get("lane"), m.get("tab")))(handed(dead, f"{dead}/")))
     check("a framed app keeps the screen its address opens at", True, bool(handed(f"{app}/app3#/dashboard")))
     check("an address no frame shows, a mailto: one, is listed", True, "http or https" in handed("mailto:x@example.com").get("tab", ""))
-    refusing_click = clicked(f"{app}/deny?a=b#part")
+    refusing_click = clicked(f"{app}/deny?a=b#part", WORKER)
     check("a link clicked in the hub tab to a page that refuses framing is answered as a tab, the URL as given", (True, f"{app}/deny?a=b#part"),
           ("tab" in refusing_click, refusing_click.get("open")))
     check("...and joins no unit", {}, member_at(WORKER, f"{app}/deny?a=b"))
-    framing_click = clicked(f"{app}/app2")
+    framing_click = clicked(f"{app}/app2", WORKER)
     check("...and one to a page that allows framing becomes a member of the unit it was clicked in, by the user", (WORKER, None, "user"),
           (framing_click.get("unit"), framing_click.get("tab"), member_at(WORKER, f"{app}/app2").get("by")))
+
+    loose = opened(page(HOME / "notes" / "unclaimed.html"))
+    check("a page no session opened lands with the loose pages", "loose", loose["unit"])
+    check("...a unit of that name, with no session to resume, no number on the rail and no account", ("loose pages", "", None, None, None),
+          (lambda u: (u["title"], u["resume"], u["state"], number("loose"), u["account"]))(view("loose")))
+
+    # one-hub-tab#P2 where no session page lists a unit's pages, a stand-in in the session lane does, until one exists
+    check("the loose pages have a stand-in for a session page, with the column the hub tab fills", ("/pages/loose", True),
+          (view("loose")["session_page"]["url"], 'id="artefacts"' in hub.stand_in_page(view("loose")).decode()))
+    late = opened(page(alpha / "agent/show/csv-import/late.html"), LATECOMER)
+    stand_in = view(LATECOMER)["session_page"]
+    check("so has a session's unit before its session page is rendered", f"/pages/{LATECOMER}", stand_in["url"])
+    clicked(stand_in["url"], LATECOMER)
+    check("...which, opened from the hub tab, heads the unit as its session page, and lists the unit's pages but itself",
+          ([("session", "session")], [late["id"]]),
+          (lambda u: ([(m["kind"], m["lane"]) for m in u["members"] if m["url"] == stand_in["url"]], [p["id"] for p in u["pages"]]))(view(LATECOMER)))
+    real = page(alpha / f"agent/sessions/{LATECOMER}/index.html")
+    real_url = served(real.resolve())
+    check("...and goes once the session page exists, which takes its place in the unit", (real_url, [real_url]),
+          (lambda u: (u["session_page"]["url"], [m["url"] for m in u["members"] if m["kind"] == "session"]))(view(LATECOMER)))
+
+    # --- hub-rail-marks-sessions-needing-you: what an idle session's page says it needs
+    if not READER:
+        skipped("what an idle session's page says it needs", "no mx plugin here, whose session page reader the rail reads a page by")
+    else:
+        clock.tick(100)
+        asking = alpha / f"agent/sessions/{ASKER}"
+        turn_record(asking, 1, "Two ways to import, Q1 picks", ("Q1",), at=clock.now - 100)
+        opened(page(asking / "index.html"), ASKER)
+        registered(ASKER, "idle")
+        hub.mark("visit", {"unit": ASKER})
+        asker = lambda: (lambda u: (u["state"], u["needs_you"], u["status_line"]))(view(ASKER))
+        check("an idle session whose page has an open question, every record seen, needs you for the question",
+              ("idle", {"questions": 1, "unseen": False}, "Two ways to import, Q1 picks"), asker())
+        registered(ASKER, "busy")
+        check("a busy session shows busy, whatever its page holds", ("busy", None), asker()[:2])
+        registered(ASKER, "waiting", waiting_for="permission prompt")
+        check("...and a blocked one blocked", ("waiting", None), asker()[:2])
+        registered(ASKER, "idle")
+        turn_record(asking, 2, "Imported the CSV files as `Q1 (a)` has it", answered={"Q1": "a"}, at=clock.tick())
+        check("a turn record written since the last visit marks it, the question it answered not",
+              ("idle", {"questions": 0, "unseen": True}, "Imported the CSV files as Q1 (a) has it"), asker())
+        clock.tick()
+        hub.mark("visit", {"unit": ASKER})
+        check("...and once visited, nothing open, it does not need you", None, asker()[1])
+        long_ago = clock.now - 1000  # its last turn's end, older than any other running session's
+        os.utime(asking / "index.html", (long_ago, long_ago))
+        registered(ASKER, "idle", long_ago)
+        numbered_units = lambda: [u["unit"] for u in rail() if u["number"]]
+        unneeded = numbered_units()
+        check("...numbered by its last turn's end, after the idle sessions that finished one since", True,
+              unneeded.index(ASKER) > 0)
+        chat_turn(asking, "```text\nimport running\n```\n\n## **Waiting** on [the worker](agent/show/x/report.md)\n\nI report once it lands.", clock.tick())
+        check("a chat turn after it marks nothing, and is the status line, its first line of prose without its markup",
+              (None, "Waiting on the worker"), asker()[1:])
+        turn_record(asking, 3, "Two more calls", ("Q2", "Q3"), at=clock.tick())
+        turn_record(asking, 4, "Q2 settled, Q3 stands", answered={"Q2": "b"}, at=clock.tick())
+        clock.tick()
+        hub.mark("visit", {"unit": ASKER})
+        check("a question asked in an earlier record stays open beside one answered, whichever turn asked it",
+              ({"questions": 1, "unseen": False}, "Q2 settled, Q3 stands"), asker()[1:])
+        check("a session that needs you is 1 on the rail, however long ago its turn ended, and the rest keep their order",
+              [ASKER, *(u for u in unneeded if u != ASKER)], numbered_units())
+        other = STRANGER  # a unit never dismissed, which a registry entry alone keeps in the numbers
+        entry = HOME / ".claude" / "sessions" / f"{other[:8]}.json"
+        kept = entry.read_text() if entry.exists() else None
+        registered(other, "waiting", long_ago - 100, waiting_for="permission prompt")
+        others = [u for u in unneeded if u not in (ASKER, other)]
+        check("a session blocked in its terminal comes before one that needs you, "
+              "however long ago its turn ended", [other, ASKER, *others], numbered_units())
+        registered(other, "busy", clock.tick())
+        check("...and a busy one after every idle one, however recently its turn ended",
+              [ASKER, *others, other], numbered_units())
+        if kept is None:
+            entry.unlink()
+        else:
+            entry.write_text(kept)
+        (asking / "turns/05.md").write_text("no frontmatter\n")
+        check("a record the reader refuses leaves the unit there, needing nothing and saying nothing", (True, None, ""),
+              (lambda u: (u is not None, u["needs_you"], u["status_line"]))(view(ASKER)))
+    eta = repo("eta", [("lonely", None, STRANGER)])
+    opened(page(eta / "agent/show/lonely/index.html"))
+    view("loose")
+    (eta / "agent/tickets/lonely.md").unlink()
+    check("...which a tree retired does not take, the loose pages of no tree still in it", True,
+          loose["id"] in [m["id"] for m in (view("loose") or {}).get("members", [])])
+
+    # --------------------------------------------------------------------------
+    # what only the server does, over HTTP, against one hub on the state the decisions left
+    # --------------------------------------------------------------------------
+
+    sys.stderr = sys.__stderr__
+    hub_said.close()
+
+    def request(method: str, path: str, body: dict | None = None, headers: dict | None = None,
+                origin: str = ORIGIN, data: bytes | None = None) -> tuple[int, dict | bytes]:
+        data = data if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(origin + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                status, raw = r.status, r.read()
+        except urllib.error.HTTPError as e:
+            status, raw = e.code, e.read()
+        try:
+            return status, json.loads(raw)
+        except ValueError:
+            return status, raw
+
+    def start() -> subprocess.Popen:
+        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(hub.STATE), *HUB_FLAGS],
+                                   env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("a"), start_new_session=True)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and started.poll() is None:
+            try:
+                socket.create_connection(("127.0.0.1", PORT), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        return started
+
+    def stop(proc: subprocess.Popen) -> None:
+        os.killpg(proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
+        proc.wait()
+        # `uv run` is reaped first; the server holds the port until it is gone too
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(proc.pid, 0)
+                time.sleep(0.05)
+            except ProcessLookupError:
+                break
+
+    hub_proc = start()
+    open_page = lambda target, session=None, **extra: request("POST", "/api/open", {"target": str(target), **({"session": session} if session else {}), **extra})[1]
+    http_view = lambda key: request("GET", "/api/u/" + urllib.parse.quote(key, safe=""))
+
+    def members(key: str) -> list[dict]:
+        status_code, body = http_view(key)
+        return body.get("members", []) if status_code == 200 else []
+
+    def announced(path: str, headers: dict) -> int:
+        """The status a write answers that announces its length in its headers and sends no body: the hub refuses a
+        length over its cap before it reads a byte."""
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        conn.putrequest("POST", path)  # put by hand: request() would announce the length of the body it sends
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        try:
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def tab_came_and_went() -> None:
+        """A hub tab that opens and closes again, as the one claude-browser last opened would: the next open with none
+        listening opens one at once, however recently the last did."""
+        tab = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
+        tab.readline()
+        tab.close()
+        time.sleep(2)  # the hub looks for a closed tab once a second
+
+    # --- the routes, and who may use them
+
+    check("/.health says diffview pages can save", (200, {"saves": True}), request("GET", "/.health"))
+    check("the hub tab is served at the root, and at a unit", (200, 200, True),
+          (request("GET", "/")[0], request("GET", f"/u/{WORKER}")[0], b"trellis" in request("GET", "/")[1]))
+    old_view = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    old_view.request("GET", "/c/map-columns@alpha.123456")
+    sent = old_view.getresponse()
+    check("a container view's old address is sent to the hub tab", (302, "/"), (sent.status, sent.getheader("Location")))
+    old_view.close()
+    check("a unit is read at its address, as the decisions left it", (200, "map-columns"), (lambda r: (r[0], r[1].get("tree")))(http_view(WORKER)))
+    check("a unit there is none of is not found", 404, http_view("no-such-unit")[0])
+    check("a route the hub does not have is not found", 404, request("POST", "/api/nothing", {})[0])
+    check("an open that names no target is a bad request", 400, request("POST", "/api/open", {"session": WORKER})[0])
+    member_url = next(m["url"] for m in members(WORKER) if m["id"] == a["id"])
+    check("a member is served on the hub's origin", 200, request("GET", member_url)[0])
+    check("a request for another Host is refused", 403, request("GET", member_url, headers={"Host": "attacker.example:80"})[0])
+    bare = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    bare.sendall(b"GET /.health HTTP/1.0\r\n\r\n")
+    check("a request that names no Host is refused", b"HTTP/1.0 403", bare.recv(4096)[:12])
+    bare.close()
+    check("a write for another Host is refused", 403,
+          request("POST", "/api/open", {"target": str(note)}, {"Host": "attacker.example:80", "Origin": ORIGIN})[0])
+    check("an open from another origin is refused", 403,
+          request("POST", "/api/open", {"target": str(note)}, {"Origin": "http://attacker.example"})[0])
+
+    tab_html = lambda dest: request("GET", "/", headers={"Sec-Fetch-Dest": dest})[1].decode()
+    token_in = lambda page_html: re.search(r'<meta name="hub-token" content="([^"]*)">', page_html)[1]
+    token = token_in(tab_html("document"))
+    check("the hub tab loaded as a tab carries the token that lets it type", True, len(token) > 20)
+    check("...a page in it that fetches the tab, or frames it, gets none", ("", ""), (token_in(tab_html("empty")), token_in(tab_html("iframe"))))
+    # a session idle in a pane, which a route that types or closes would reach: the token is all that keeps a page from it
+    received.unlink()
+    tmux("-f", "/dev/null", "new-session", "-d", "-s", "guarded", "-x", "100", "-y", "20", shlex.join(["exec", sys.executable, str(recorder), str(received)]))
+    try:
+        pane, pane_pid = tmux("display-message", "-p", "-t", "guarded:", "#{pane_id} #{pane_pid}").split()
+        deadline = time.monotonic() + 10
+        while not received.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        registered(ANSWERER, pid=int(pane_pid), started=start_of(pane_pid), tmux=f"guarded:@0.{pane}")
+        TMUX_CALLS.write_text("")
+        acting = [("/api/type", {"unit": ANSWERER, "text": "rm -rf ~"}), ("/api/jump", {"unit": ANSWERER}),
+                  ("/api/close-panes", {"unit": ANSWERER}), ("/api/hand-off", {"unit": ANSWERER, "offer": "write"})]
+        check("a page the hub serves can neither type, jump, close nor hand off without the tab's token, the session idle in its pane",
+              ([403] * 8, set(), b"", True),
+              ([request("POST", route, body, {"Origin": ORIGIN, "X-Hub-Token": t})[0] for route, body in acting for t in ("", "guessed")],
+               acted(), arrives(b""), pane in tmux("list-panes", "-a", "-F", "#{pane_id}").split()))
+        check("...which the tab's token types into", (200, b"\x1b[200~go on\x1b[201~\r"),
+              (request("POST", "/api/type", {"unit": ANSWERER, "text": "go on"}, {"Origin": ORIGIN, "X-Hub-Token": token})[0],
+               arrives(b"\x1b[200~go on\x1b[201~\r")))
+    finally:
+        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+    dropped = lambda unit, t=token: request("POST", f"/api/drop?unit={unit}&name=x.png", None,
+                                            {"Origin": ORIGIN, "X-Hub-Token": t, "Content-Type": "application/octet-stream"}, data=b"x")
+    check("...nor drop a file into a box", (403, 403), (dropped(ANSWERER, "")[0], dropped(ANSWERER, "guessed")[0]))
+    check("a dropped file reaches the box's unit through the route", (200, True),
+          (lambda r: (r[0], r[1].get("path", "").startswith(str(HOME / ".cache/container-hub/drops" / ANSWERER))))(dropped(ANSWERER)))
+    check("a dropped file over the size cap is refused before it is read", 413,
+          announced(f"/api/drop?unit={ANSWERER}&name=huge.png", {"Origin": ORIGIN, "X-Hub-Token": token, "Content-Length": str(200 * 2**20 + 1)}))
+
+    # --- what /f/ serves: the agent directories, the files git tracks around them, and what was opened or shared
+
+    check("a file no agent opened, outside every agent directory, is not served", 403, request("GET", served(secret))[0])
+    request("POST", "/api/open", {"unit": a["unit"], "target": str(secret)}, {"Origin": ORIGIN})
+    check("...and a page in the hub tab opening it serves it no more than before", 403, request("GET", served(secret))[0])
+    request("POST", "/api/open", {"unit": a["unit"], "target": str(note.parent)}, {"Origin": ORIGIN})
+    check("...nor does opening a directory widen what is served", 403, request("GET", served(page(HOME / "beside-notes.html")))[0])
+    open_page(ORIGIN + recorded["url"], ORCHESTRATOR)
+    check("a recorded range opened by an agent at the hub's own address widens nothing served", 403,
+          request("GET", served(page(HOME / "private.html")))[0])
+    shown = page(HOME / "work" / "out" / "report" / "index.html")
+    page(HOME / "work" / "out" / "secret.txt", "secret")
+    open_page(shown.parent, ORCHESTRATOR, cwd=str(alpha))
+    check("a directory an agent opens is served, and nothing beside it", (200, 403),
+          (request("GET", served(shown))[0], request("GET", served(HOME / "work" / "out" / "secret.txt"))[0]))
+    check("a file git tracks in the repo around an agent directory is served", 200, request("GET", served(alpha / "README.md"))[0])
+    check("...an untracked one is not", 403, request("GET", served(page(alpha / ".env", "KEY=1")))[0])
+    request("POST", "/api/open", {"unit": a["unit"], "target": str(alpha / "README.md"), "by": "user"}, {"Origin": ORIGIN})
+    check("...not even once the hub tab opened a tracked file beside it", 403, request("GET", served(alpha / ".env"))[0])
+    page(alpha / "site" / "style.css", "p {}")
+    git(alpha, "add", "site/style.css")
+    git(alpha, "commit", "-q", "-m", "site")
+    page(alpha / "site" / "index.html")
+    check("...nor an untracked page reached through a directory git tracks files in", 403, request("GET", served(alpha / "site") + "/")[0])
+    check("a page an agent opened outside every agent directory is served, the hub having read it off the state", 200,
+          request("GET", served(note))[0])
+
+    # a retired show directory: its pages still open, from the agent repo's history
+    retired = page(alpha / "agent/show/retired-work/index.html", '<!doctype html><body><img src="fig.png"></body>')
+    (retired.parent / "fig.png").write_bytes(b"\x89PNG not really")
+    git(agent, "add", "show/retired-work")
+    git(agent, "commit", "-q", "-m", "show retired-work")
+    git(agent, "rm", "-q", "-r", "show/retired-work")
+    git(agent, "commit", "-q", "-m", "retire retired-work")
+    status_code, body = request("GET", served(retired))
+    check("a page a commit retired opens as it stood before that commit", (200, True), (status_code, b'<img src="fig.png">' in body))
+    check("...under a line saying it was retired, and in which commit", True, b"retired in " in body)
+    check("...and its image, which its relative link reaches the same way", (200, b"\x89PNG not really"), request("GET", served(retired.parent / "fig.png")))
+    status_code, body = request("GET", served(retired.parent) + "/")
+    check("...and its directory, read as its index.html", (200, True), (status_code, b'<img src="fig.png">' in body))
+    check("a page the agent repo never held is still not found", 404, request("GET", served(alpha / "agent/show/never-was/index.html"))[0])
+
+    # a ticket's recorded code range, rendered on first open
+    (agent / "tickets/map-columns.md").write_text((agent / "tickets/map-columns.md").read_text().replace("..0123abc", f"..{commits[1]}"))
+    status_code, body = request("GET", recorded["url"])
+    check("a ticket's recorded code range is served from its render", (200, True), (status_code, b"notes.txt" in body))
+
+    # what a local tool shares: a directory of pages, or a page, served without joining a unit
+    rendered_dir = page(SCRATCH / "rendered pages" / "nested" / "review.html")  # a space, which a url spells encoded
+    status_code, shared = request("POST", "/api/serve", {"path": str(rendered_dir.parents[1])})
+    check("a local tool shares a directory and gets its address", (200, served(rendered_dir.parents[1]) + "/"),
+          (status_code, shared.get("url")))
+    check("...under which every page is served", 200, request("GET", shared["url"] + "nested/review.html")[0])
+    check("...and the directory's address lists them, linked relative to it", True, b'href="nested/review.html"' in request("GET", shared["url"])[1])
+    bare = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    bare.request("GET", shared["url"].rstrip("/"))
+    moved = bare.getresponse()
+    check("...an address without the trailing slash is sent to the one with it", (301, shared["url"]),
+          (moved.status, moved.getheader("Location")))
+    bare.close()
+    check("a shared directory joins no unit", False,
+          any(str(rendered_dir.parents[1]) in (m.get("path") or "") for u in request("GET", "/api/hub")[1]["units"] for m in u["members"]))
+    check("a directory nobody shared is not listed", 404, request("GET", served(agent / "tickets") + "/")[0])
+    check("a page in the hub tab cannot share", 403, request("POST", "/api/serve", {"path": str(secret.parent)}, {"Origin": ORIGIN})[0])
+    check("...nor can another site", 403, request("POST", "/api/serve", {"path": str(secret.parent)}, {"Origin": "http://attacker.example"})[0])
+    check("a path that does not exist is not shared", 404, request("POST", "/api/serve", {"path": str(SCRATCH / "nowhere.html")})[0])
+    check("a directory holding all of home, or home itself, is never shared", (403, 403),
+          (request("POST", "/api/serve", {"path": str(HOME.parent)})[0], request("POST", "/api/serve", {"path": str(HOME)})[0]))
+    state = {"writer": "t", "savedAt": 1, "comments": []}
+    alone = page(HOME / "alone.html")
+    status_code, shared_page = request("POST", "/api/serve", {"path": str(alone)})
+    check("a page in home is shared on its own", (200, 200), (status_code, request("GET", shared_page["url"])[0]))
+    check("...and saves beside itself", (204, state),
+          (request("POST", shared_page["url"] + ".state.json", state, {"Origin": ORIGIN})[0], json.loads(Path(f"{alone}.state.json").read_text())))
+    check("...while the rest of home stays unserved", 403, request("GET", served(HOME / "beside-notes.html"))[0])
+    in_temp = page(TEMP_PAGE)
+    beside_temp = page(TEMP_PAGE.with_name(TEMP_PAGE.stem + "-beside.html"))
+    serving = subprocess.run([BIN / "diffview", "--serve", str(in_temp)], env={**ENV, "CONTAINER_HUB_PORT": str(PORT)},
+                             capture_output=True, text=True, timeout=120)
+    temp_url = serving.stdout.split(" at ")[-1].strip()
+    check("diffview --serve takes a page sitting directly in the temp dir", (0, 200),
+          (serving.returncode, request("GET", temp_url.removeprefix(ORIGIN))[0] if temp_url.startswith(ORIGIN) else None))
+    check("...and the rest of the temp dir stays unserved", 403, request("GET", served(beside_temp))[0])
+    check("...as the temp dir is never shared whole", 403, request("POST", "/api/serve", {"path": str(TEMP)})[0])
+
+    # the stand-in for a session page, and the script every page the hub serves starts with
+    standing = lambda key: request("GET", "/pages/" + urllib.parse.quote(key, safe=""))
+    check("a unit's stand-in is served at its address, and a unit unknown to the hub has none", (200, 404),
+          (standing("loose")[0], standing("no-such-unit")[0]))
+    # the hub tab has a page's links from the page's first script on, the page still in standards mode
+    calls_first = lambda body: body.lower().startswith(b"<!doctype html><script>") and b"wcCatch" in body.split(b"</script>")[0]
+    check("a page the hub serves, a shared directory's listing and a stand-in each start with a script handing the hub tab their links",
+          [True] * 3, [calls_first(request("GET", url)[1]) for url in (shared["url"] + "nested/review.html", shared["url"], "/pages/loose")])
+
+    # trellis, served from a cache that is checked on every use
+    trellis_cache = HOME / ".cache/container-hub" / ("trellis-" + re.search(r'TRELLIS_VERSION = "(.+)"', (BIN / "container-hub").read_text())[1])
+    trellis_cache.mkdir(parents=True, exist_ok=True)
+    (trellis_cache / "style.css").write_text("body { background: url(https://attacker.example/x) }")
+    status_code, body = request("GET", "/static/trellis/style.css")
+    check("a cached trellis file that differs from its pin is refused", 502, status_code)
+    check("...naming the file", True, b"style.css does not match its pinned sha256" in body)
+    check("...on the hub's stderr too", True, "style.css does not match its pinned sha256" in (SCRATCH / "hub.log").read_text())
+    check("...and left in place rather than fetched over", "body { background: url(https://attacker.example/x) }",
+          (trellis_cache / "style.css").read_text())
+    (trellis_cache / "style.css").unlink()
+
+    # --- the state-write protocol a diffview page saves its comments by: a page writes its state whole, so a second
+    # page on the same review would erase the first; the hub takes writes from the page that owns the file, and
+    # refuses the one that is behind
+
+    diff_url = next(m["url"] for m in members(ORCHESTRATOR) if m["path"] == str(code_diff))
+    check("a diffview page saves its comments through the hub", 204, request("POST", diff_url + ".state.json", state, {"Origin": ORIGIN})[0])
+    check("...beside the page", state, json.loads(Path(f"{code_diff}.state.json").read_text()))
+    pages = SCRATCH / "pages"
+    shutil.copy(code_diff, page(pages / "race.html"))
+    request("POST", "/api/serve", {"path": str(pages)})
+    race = served(pages / "race.html.state.json")
+
+    def post(body, headers: dict | None = None, data: bytes | None = None) -> int:
+        return request("POST", race, body, {"Origin": ORIGIN, **(headers or {})}, data=data)[0]
+
+    held = lambda: json.loads((pages / "race.html.state.json").read_text())
+    check("the first write to a review lands", 204, post({"savedAt": 1001, "writer": "a", "since": None, "comments": ["a1"]}))
+    check("and the page that wrote it goes on writing", 204, post({"savedAt": 1002, "writer": "a", "since": None, "comments": ["a2"]}))
+    status_code, answer = request("POST", race, {"savedAt": 1003, "writer": "b", "since": 1001, "comments": ["b1"]}, {"Origin": ORIGIN})
+    check("a page that never saw that write is refused, the refusal naming the save it missed", (409, 1002), (status_code, answer.get("savedAt")))
+    check("the refused write left the file alone", ["a2"], held()["comments"])
+    check("a page that did see it writes", 204, post({"savedAt": 1004, "writer": "b", "since": 1002, "comments": ["b2"]}))
+    check("and takes the review over", (["b2"], "b"), (held()["comments"], held()["writer"]))
+    # one page is enough to put two writes in flight, and a file half of one write and half of another reads as no
+    # state at all, which would wave the next write through unchecked
+    big = {"savedAt": 7001, "writer": "b", "since": None, "comments": ["x" * 400] * 200}
+    with ThreadPoolExecutor(12) as pool:
+        codes = list(pool.map(lambda _: post(big), range(12)))
+    check("concurrent writes from one page all land", [204] * 12, codes)
+    check("and leave the state file readable", 7001, held()["savedAt"])
+    # a page rendered before writes named the page they came from: the file's owner still stands, and a page that
+    # loaded what such a write left is not held to a name it never saw
+    check("a page that predates the check is refused too", 409, post({"savedAt": 8001, "comments": ["old"]}))
+    (pages / "race.html.state.json").write_text(json.dumps({"savedAt": 8002, "comments": ["old"]}))
+    check("and one that loaded an unnamed write goes on from it", 204, post({"savedAt": 8003, "writer": "c", "since": 8002}))
+    check("what a write was based on is not kept", False, "since" in held())
+    check("a state file that is not an object is still refused", 400, post([1, 2]))
+    # a page on another site can aim a form-shaped POST at loopback without a preflight; the browser names that page in
+    # Origin, and only the hub's own pages may write
+    before = held()
+    planted = {"savedAt": 9001, "writer": "c", "since": 8003, "comments": ["planted"]}
+    raw_post = lambda headers: request("POST", race, planted, headers)[0]
+    check("a write from another origin is refused, as is one from a null origin, and one that names no origin at all", [403, 403, 403],
+          [raw_post({"Origin": "http://attacker.example"}), raw_post({"Origin": "null"}), raw_post({})])
+    check("none of them touched the file", before, held())
+    check("a state write for another Host is refused", 403, post(planted, {"Host": "attacker.example:80"}))
+    check("the hub's own origin on localhost writes too", 204, raw_post({"Origin": f"http://localhost:{PORT}"}))
+    check("a write must announce its length", 411, announced(race, {"Origin": ORIGIN}))
+    cap = 4_000_000
+    head = b'{"savedAt": 9500, "writer": "c", "since": null, "pad": "'
+    check("and one over the size cap is refused", 413, announced(race, {"Origin": ORIGIN, "Content-Length": str(cap + 1)}))
+    check("one exactly at the cap is taken", 204, post(None, data=head + b"x" * (cap - len(head) - 2) + b'"}'))
+    check("a write lands only beside a page that exists", 403,
+          request("POST", served(pages / "nopage.html.state.json"), {}, {"Origin": ORIGIN})[0])
+    shutil.copy(pages / "race.html", SCRATCH / "outside.html")  # a real page, just not under the served tree
+    outside = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    outside.request("POST", served(pages) + "/../outside.html.state.json", b"{}", {"Origin": ORIGIN, "Content-Type": "application/json"})
+    check("and never outside the served tree, page or no page", 403, outside.getresponse().status)
+    outside.close()
+    check("so no such files appear", (False, False), ((pages / "nopage.html.state.json").exists(), (SCRATCH / "outside.html.state.json").exists()))
+    # a page polls its state and summary files; one with nothing written beside it yet is a page with nothing to
+    # read, and a 404 there is a red line in the browser's console on a page that is fine
+    shutil.copy(pages / "race.html", pages / "fresh.html")
+    check("a page with no state written yet answers null, and one with no summary written yet the same", [(200, None), (200, None)],
+          [request("GET", served(pages / f"fresh.html.{kind}.json")) for kind in ("state", "summary")])
+    check("a url beside no page is not found", 404, request("GET", served(pages / "nopage.html.state.json"))[0])
+    check("a page no diffview watches asking for a new summary is told none runs", 409, request("POST", diff_url + ".summary.json", {}, {"Origin": ORIGIN})[0])
+    watch_record = Path(f"{code_diff}.watch.json")
+    for garbage in ("not json", "[1]"):
+        watch_record.write_text(garbage)
+        check(f"a watch record that is no record ({garbage}) reads as none", (200, None), request("GET", diff_url + ".watch.json"))
+    check("...and keeps its page in the unit", True, any(m["url"] == diff_url for m in members(ORCHESTRATOR)))
+    watch_record.unlink()
+    unserved = page(HOME / "unserved" / "watched.html")
+    with open(f"{unserved}.watch.json", "w") as record:
+        record.write(json.dumps({"g": 1, "watches": []}))
+        record.flush()
+        fcntl.flock(record, fcntl.LOCK_EX)  # held, as a live watcher holds its record
+        check("a page the hub does not serve cannot ask its watcher for a summary", 403,
+              request("POST", served(unserved) + ".summary.json", {}, {"Origin": ORIGIN})[0])
+    check("...so nothing asked it", False, Path(f"{unserved}.summary.request.json").exists())
+
+    # --- the event stream: what a listening hub tab hears, and whether an open launches one
+
+    events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
+    events.readline()
+    again = open_page(alpha / "agent/show/csv-import/index.html", WORKER)
+    while not (line := events.readline().decode()).startswith("data:"):
+        pass
+    check("an open tells a listening hub tab to reload the page, in its unit", ("reopened", WORKER, a["id"]),
+          tuple(json.loads(line[5:])[k] for k in ("type", "unit", "id")))
     events.close()
-    tab_came_and_went()
+    events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
+    events.readline()
+    statusline(WORKER, clock.now + 1, context=(43, 86000), five_hour=(31, clock.now + 3600), seven_day=(12, clock.now + 3 * 86400))
+    heard = None
+    while heard not in ("numbers", "disk"):
+        if (line := events.readline().decode()).startswith("data:"):
+            heard = json.loads(line[5:])["type"]
+    check("a listening hub tab hears of new numbers as numbers alone, which redraw the rail and leave the layout be",
+          "numbers", heard)
+    events.close()
+    quiet = http.client.HTTPConnection("127.0.0.1", PORT, timeout=3)
+    quiet.request("GET", "/events")
+    stream, heard = quiet.getresponse(), []
+    with contextlib.suppress(TimeoutError, OSError):
+        while line := stream.readline().decode():
+            heard += [line] if line.startswith("data:") else []
+    stream.close()  # the socket stays open while the response holds it, and a tab listening would launch none
+    quiet.close()
+    check("a hub tab that starts listening hears nothing while nothing changes", [], heard)
+
+    # --- claude-browser with a hub
+
+    stubs = SCRATCH / "stubs"
+    stubs.mkdir()
+    record = SCRATCH / "browser"
+    (stubs / "brave").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {record}\n')
+    (stubs / "systemd-run").write_text('#!/bin/sh\nwhile [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n')
+    # in the foreground, so the browser has what it was handed by the time claude-browser returns
+    (stubs / "setsid").write_text('#!/bin/sh\n[ "$1" = -f ] && shift\nexec "$@"\n')
+    for s in stubs.iterdir():
+        s.chmod(0o755)
+    local_state = HOME / ".config/BraveSoftware/Brave-Browser/Local State"
+    local_state.parent.mkdir(parents=True)
+    local_state.write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Personal"}}}}))
+
+    def browse(*args: str, cwd: Path = gamma, port: int = PORT, **sessions: str) -> list[str]:
+        """What claude-browser handed the browser; what it said on the way is in browse.said."""
+        record.unlink(missing_ok=True)
+        browse.said = subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=True, capture_output=True, timeout=30, text=True,
+                                     env={**ENV, "CONTAINER_HUB_PORT": str(port), "CLAUDE_CODE_SESSION_ID": WORKER, **sessions,
+                                          "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
+        return record.read_text().splitlines() if record.exists() else []
+
+    fresh = page(gamma / "agent/show/one-flow/figure.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
+    # whether an open launches a hub tab: one counts while it listens, and an open with none listening launches one
+    closing = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    closing.request("GET", "/events")
+    stream = closing.getresponse()
+    stream.readline(), stream.readline()
+    showing = open_page(fresh, WORKER)
+    check("with a hub tab listening, an open launches none, and gives its caller nothing to open", (False, None),
+          (showing["launch"], showing["open"]))
+    stream.readline(), stream.readline()  # read to the end, as a tab does: it closes then with a FIN, never a reset
+    stream.close()
+    closing.close()
+    time.sleep(2)  # the hub looks for a closed tab once a second
+    opened_by = browse("agent/show/one-flow/figure.svg")
+    launching = browse.said
+    check("once that tab closes, claude-browser opens the hub tab at the unit and the page",
+          ["--profile-directory=Default", f"{ORIGIN}/u/{WORKER}#{showing['id']}"], opened_by)
+    check("...and says which unit the page is in, on one line, something else than an open into a listening tab says", (True, 1, True),
+          (launching.startswith(f"claude-browser: in unit {WORKER}"), launching.count("\n"), launching != f"claude-browser: {showing['say']}\n"))
+    check("...and the page is a member", True, any(m["path"] == str(fresh) for m in members(WORKER)))
+    check("a second page moments later opens no second hub tab", [], browse(str(page(gamma / "agent/show/one-flow/index.html"))))
+    events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
+    events.readline()
+    by_origin = page(gamma / "agent/show/one-flow/origin.html")
+    check("with a hub tab listening, a page claude-browser hands in opens no tab", [], browse(str(by_origin), MX_ORIGIN_SESSION=ORCHESTRATOR))
+    check("...and lands in the unit of the session in MX_ORIGIN_SESSION, over the process's own", (True, False),
+          (any(m["path"] == str(by_origin) for m in members(ORCHESTRATOR)), any(m["path"] == str(by_origin) for m in members(WORKER))))
+    shown = open_page(fresh, WORKER)
+    browse(str(fresh))
+    check("...and prints the line the hub gave it", f"claude-browser: {shown['say']}\n", browse.said)
+    check("a board claude-browser hands a listening hub tab opens no tab", ([], "claude-browser: the open hub tab shows the board over it\n"),
+          (browse(str(board)), browse.said))
+    check("a page on another origin handed in through claude-browser gets no tab, framing allowed or refused",
+          ([], []), (browse(f"{app}/app", MX_ORIGIN_SESSION=ORCHESTRATOR), browse(f"{app}/deny", MX_ORIGIN_SESSION=ORCHESTRATOR)))
+    check("...and claude-browser says the one that refuses is listed, and why", (True, True),
+          ("listed on its session page" in browse.said, "X-Frame-Options is DENY" in browse.said))
+    events.close()
+    killed = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+    killed.sendall(f"GET /events HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n\r\n".encode())
+    killed.recv(4096)
+    check("a hub tab whose browser is killed launches none while it listens", False, open_page(fresh, WORKER)["launch"])
+    killed.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    killed.close()  # with what the hub sent it unread, which closes with a reset
+    time.sleep(2)
+    check("...and once it is gone, claude-browser handed a board opens the hub tab at the unit, the board over it",
+          ["--profile-directory=Default", f"{ORIGIN}/u/{WORKER}#board:{board_url}"], browse(str(board)))
+    check("a board handed in while that tab has not listened yet launches no second one", False, open_page(board, WORKER)["launch"])
+    late_tab = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
+    while not (line := late_tab.readline().decode()).startswith("data:"):
+        pass
+    check("...and the tab hears of it once it listens", ("board", board_url, WORKER),
+          tuple(json.loads(line[5:])[k] for k in ("type", "url", "unit")))
+    late_tab.close()
+    time.sleep(2)  # the hub looks for a closed tab once a second
+    check("a worker's report starts no browser either", [], browse(str(report)))
+    check("...and claude-browser prints why, as the hub put it", f"claude-browser: {skipped['say']}\n", browse.said)
     launched = browse(f"{app}/self")
     check("with no hub tab listening, a page that refuses framing opens the hub tab at its unit, never a tab of its own",
           ["--profile-directory=Default", f"{ORIGIN}/u/{WORKER}#{open_page(f'{app}/self', WORKER)['id']}"], launched)
     elsewhere.shutdown()
+    tab_came_and_went()
+    unprofiled = subprocess.run([BIN / "claude-browser", str(by_origin)], cwd=gamma, capture_output=True,
+                                timeout=30, text=True, env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CONFIG_DIR": str(HOME / ".claude-nobody"),
+                                                            "CLAUDE_CODE_SESSION_ID": WORKER, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+    check("a hub tab that has no Brave profile to open in is not said to open: only why not", (1, False, True),
+          (unprofiled.returncode, "in unit" in unprofiled.stderr, "no profile named 'nobody'" in unprofiled.stderr))
+    refused = subprocess.run([BIN / "claude-browser", "--nope", str(by_origin)], capture_output=True, text=True, timeout=30,
+                             env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+    check("claude-browser refuses an option it does not have, naming it", (1, True),
+          (refused.returncode, "no option --nope" in refused.stderr))
+    lane_page = page(gamma / "agent/show/one-flow/demo.html")
+    browse("--lane", "output", str(lane_page))
+    in_lane = lambda: next(m["lane"] for m in members(WORKER) if m["path"] == str(lane_page))
+    check("claude-browser --lane puts a page in that lane", "output", in_lane())
+    browse("--lane=code", str(lane_page))
+    check("...as does --lane=<lane>", "code", in_lane())
+    record.unlink(missing_ok=True)
+    no_lane = subprocess.run([BIN / "claude-browser", "--lane", "diff", str(lane_page)], capture_output=True, text=True, timeout=30,
+                             env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+    check("...and refuses a lane there is none of, opening nothing", (1, True, False, "code"),
+          (no_lane.returncode, "no lane 'diff'" in no_lane.stderr, record.exists(), in_lane()))
+    usage_text = subprocess.run([BIN / "claude-browser", "--help"], capture_output=True, text=True, timeout=30).stdout
+    check("claude-browser --help says what --lane takes", True,
+          "--lane" in usage_text and all(lane in usage_text for lane in ("session", "concept", "output", "code")))
+    check("the hub's own pages open as tabs, not members", [ORIGIN + "/"], browse(ORIGIN + "/")[1:])
+    check("...so no unit holds them", False, any(m["url"] in ("/", ORIGIN + "/") for u in request("GET", "/api/hub")[1]["units"] for m in u["members"]))
     missing = "agent/show/one-flow/never-written.html"
     check("a page the hub refuses opens as a plain tab", ["--profile-directory=Default", missing], browse(missing))
     check("...and claude-browser says why", True, "refused the page (404" in browse.said and "does not exist" in browse.said)
@@ -1402,129 +1609,30 @@ while data := os.read(0, 4096):
           browse(str(fresh), port=other.server_address[1]))
     check("...and claude-browser says so", True, "no container hub" in browse.said)
     other.shutdown()
-    loose = open_page(page(HOME / "notes" / "unclaimed.html"))
-    check("a page no session opened lands with the loose pages", "loose", loose["unit"])
-    check("...a unit of that name, with no session to resume, no number on the rail and no account", ("loose pages", "", None, None, None),
-          (lambda u: (u["title"], u["resume"], u["state"], u["number"], u["account"]))(view("loose")[1]))
-
-    # one-hub-tab#P2 where no session page lists a unit's pages, a stand-in in the session lane does, until one exists
-    standing = lambda key: request("GET", "/pages/" + urllib.parse.quote(key, safe=""))
-    check("the loose pages have a stand-in for a session page, which the hub serves with the column the hub tab fills",
-          ("/pages/loose", 200, True), (view("loose")[1]["session_page"]["url"], standing("loose")[0], b'id="artefacts"' in standing("loose")[1]))
-    # the hub tab has a page's links from the page's first script on, the page still in standards mode
-    calls_first = lambda body: body.lower().startswith(b"<!doctype html><script>") and b"wcCatch" in body.split(b"</script>")[0]
-    check("a page the hub serves, a shared directory's listing and a stand-in each start with a script handing the hub tab their links",
-          [True] * 3, [calls_first(request("GET", url)[1]) for url in (shared["url"] + "nested/review.html", shared["url"], "/pages/loose")])
-    late = open_page(page(alpha / "agent/show/csv-import/late.html"), LATECOMER)
-    stand_in = view(LATECOMER)[1]["session_page"]
-    check("so has a session's unit before its session page is rendered", f"/pages/{LATECOMER}", stand_in["url"])
-    request("POST", "/api/open", {"unit": LATECOMER, "target": stand_in["url"], "by": "user"}, {"Origin": ORIGIN})
-    check("...which, opened from the hub tab, heads the unit as its session page, and lists the unit's pages but itself",
-          ([("session", "session")], [late["id"]]),
-          (lambda u: ([(m["kind"], m["lane"]) for m in u["members"] if m["url"] == stand_in["url"]], [p["id"] for p in u["pages"]]))(view(LATECOMER)[1]))
-    real = page(alpha / f"agent/sessions/{LATECOMER}/index.html")
-    real_url = "/f" + urllib.parse.quote(str(real.resolve()))
-    check("...and goes once the session page exists, which takes its place in the unit", (real_url, [real_url]),
-          (lambda u: (u["session_page"]["url"], [m["url"] for m in u["members"] if m["kind"] == "session"]))(view(LATECOMER)[1]))
-    check("a unit unknown to the hub has no stand-in", 404, standing("no-such-unit")[0])
-
-    # --- hub-rail-marks-sessions-needing-you: what an idle session's page says it needs
-    if not READER:
-        print("skip: no mx plugin here, whose session page reader the rail reads a page by")
-    else:
-        asking = alpha / f"agent/sessions/{ASKER}"
-        turn_record(asking, 1, "Two ways to import, Q1 picks", ("Q1",), at=time.time() - 100)
-        open_page(page(asking / "index.html"), ASKER)
-        registered(ASKER, "idle")
-        request("POST", "/api/visit", {"unit": ASKER})
-        asker = lambda: (lambda u: (u["state"], u["needs_you"], u["status_line"]))(view(ASKER)[1])
-        check("an idle session whose page has an open question, every record seen, needs you for the question",
-              ("idle", {"questions": 1, "unseen": False}, "Two ways to import, Q1 picks"), asker())
-        registered(ASKER, "busy")
-        check("hub-rail-marks-sessions-needing-you#P2: a busy session shows busy, whatever its page holds", ("busy", None), asker()[:2])
-        registered(ASKER, "waiting", waiting_for="permission prompt")
-        check("...and a blocked one blocked", ("waiting", None), asker()[:2])
-        registered(ASKER, "idle")
-        turn_record(asking, 2, "Imported the CSV files as `Q1 (a)` has it", answered={"Q1": "a"})
-        check("hub-rail-marks-sessions-needing-you#P1: a turn record written since the last visit marks it, the question it answered not",
-              ("idle", {"questions": 0, "unseen": True}, "Imported the CSV files as Q1 (a) has it"), asker())
-        request("POST", "/api/visit", {"unit": ASKER})
-        check("...and once visited, nothing open, it does not need you", None, asker()[1])
-        long_ago = time.time() - 1000  # its last turn's end, older than any other running session's
-        os.utime(asking / "index.html", (long_ago, long_ago))
-        registered(ASKER, "idle", long_ago)
-        numbered_units = lambda: [u["unit"] for u in rail() if u["number"]]
-        unneeded = numbered_units()
-        check("...numbered by its last turn's end, after the idle sessions that finished one since", True,
-              unneeded.index(ASKER) > 0)
-        time.sleep(1)  # a chat turn's time is to the second
-        chat_turn(asking, "```text\nimport running\n```\n\n## **Waiting** on [the worker](agent/show/x/report.md)\n\nI report once it lands.", time.time())
-        check("a chat turn after it marks nothing, and is the status line, its first line of prose without its markup",
-              (None, "Waiting on the worker"), asker()[1:])
-        turn_record(asking, 3, "Two more calls", ("Q2", "Q3"))
-        turn_record(asking, 4, "Q2 settled, Q3 stands", answered={"Q2": "b"})
-        request("POST", "/api/visit", {"unit": ASKER})
-        check("a question asked in an earlier record stays open beside one answered, whichever turn asked it",
-              ({"questions": 1, "unseen": False}, "Q2 settled, Q3 stands"), asker()[1:])
-        check("a session that needs you is 1 on the rail, however long ago its turn ended, and the rest keep their order",
-              [ASKER, *(u for u in unneeded if u != ASKER)], numbered_units())
-        other = STRANGER  # a unit never dismissed, which a registry entry alone keeps in the numbers
-        entry = HOME / ".claude" / "sessions" / f"{other[:8]}.json"
-        kept = entry.read_text() if entry.exists() else None
-        registered(other, "waiting", long_ago - 100, waiting_for="permission prompt")
-        others = [u for u in unneeded if u not in (ASKER, other)]
-        check("hub-rail-mark-follow-ups: a session blocked in its terminal comes before one that needs you, "
-              "however long ago its turn ended", [other, ASKER, *others], numbered_units())
-        registered(other, "busy", time.time())
-        check("...and a busy one after every idle one, however recently its turn ended",
-              [ASKER, *others, other], numbered_units())
-        if kept is None:
-            entry.unlink()
-        else:
-            entry.write_text(kept)
-        (asking / "turns/05.md").write_text("no frontmatter\n")
-        check("a record the reader refuses leaves the unit there, needing nothing and saying nothing", (200, None, ""),
-              (lambda r: (r[0], r[1]["needs_you"], r[1]["status_line"]))(view(ASKER)))
-    eta = repo("eta", [("lonely", None, STRANGER)])
-    open_page(page(eta / "agent/show/lonely/index.html"))
-    view("loose")
-    (eta / "agent/tickets/lonely.md").unlink()
-    check("...which a tree retired does not take, the loose pages of no tree still in it", (200, True),
-          (lambda r: (r[0], loose["id"] in [m["id"] for m in r[1].get("members", [])]))(view("loose")))
-
-    closing = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
-    closing.request("GET", "/events")
-    stream = closing.getresponse()
-    stream.readline(), stream.readline()
-    showing = open_page(fresh, WORKER)
-    check("with a hub tab listening, an open launches none, and gives its caller nothing to open", (False, None),
-          (showing["launch"], showing["open"]))
-    stream.readline(), stream.readline()  # read to the end, as a tab does: it closes then with a FIN, never a reset
-    stream.close()
-    closing.close()
-    time.sleep(2)  # the hub looks for a closed tab once a second
-    closed = open_page(fresh, WORKER)
-    check("...and once that tab closes, the next open launches one, at the unit and the member", (True, f"{ORIGIN}/u/{WORKER}#{closed['id']}"),
-          (closed["launch"], closed["open"]))
-    check("...saying something else than an open into a listening tab", True, closed["say"] != showing["say"])
-    killed = socket.create_connection(("127.0.0.1", PORT), timeout=10)
-    killed.sendall(f"GET /events HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n\r\n".encode())
-    killed.recv(4096)
-    check("a hub tab whose browser is killed launches none while it listens", False, open_page(fresh, WORKER)["launch"])
-    killed.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-    killed.close()  # with what the hub sent it unread, which closes with a reset
-    time.sleep(2)
-    check("...and once it is gone, the next open launches one", True, open_page(fresh, WORKER)["launch"])
-    check("a board handed in while that tab has not listened yet launches no second one", False, open_page(board, WORKER)["launch"])
-    late = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
-    while not (line := late.readline().decode()).startswith("data:"):
-        pass
-    check("...and the tab hears of it once it listens", ("board", board_url, WORKER),
-          tuple(json.loads(line[5:])[k] for k in ("type", "url", "unit")))
-    late.close()
-    time.sleep(2)  # the hub looks for a closed tab once a second
 
     # --- a watched diffview: in the unit of the session that started it, while its worktree exists
+
+    def listening_ports(root: int) -> list[int]:
+        """The TCP ports a process and every process under it listen on, read from /proc."""
+        children: dict[int, list[int]] = {}
+        for stat in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                pid, rest = stat.read_text().split(" ", 1)
+            except OSError:
+                continue
+            children.setdefault(int(rest.rsplit(")", 1)[1].split()[1]), []).append(int(pid))
+        tree, todo = set(), [root]
+        while todo:
+            tree.add(pid := todo.pop())
+            todo += children.get(pid, [])
+        sockets = set()
+        for pid in tree:
+            for fd in Path(f"/proc/{pid}/fd").glob("*"):
+                with contextlib.suppress(OSError):
+                    if (link := os.readlink(fd)).startswith("socket:["):
+                        sockets.add(link[len("socket:["):-1])
+        return [int(f[1].rsplit(":", 1)[1], 16) for table in ("/proc/net/tcp", "/proc/net/tcp6")
+                for f in (line.split() for line in Path(table).read_text().splitlines()[1:]) if f[3] == "0A" and f[9] in sockets]
 
     worktree = HOME / "repos" / "alpha-csv-import"
     git(alpha, "worktree", "add", "-q", "-b", "csv-import", str(worktree))
@@ -1534,119 +1642,93 @@ while data := os.read(0, 4096):
                                env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
                                     "DIFFVIEW_BROWSER": "claude-browser", "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     try:
-        said = []
         while (line := watcher.stdout.readline()) and "watching" not in line:
-            said.append(line)
+            pass
         live = line.split("live page at ")[-1].split()[0] if "live page at " in line else line
         check("--watch prints the hub's address of its page", True, live.startswith(f"{ORIGIN}/f/"))
         check("...and its watcher listens on no port", [], listening_ports(watcher.pid))
         watched = Path(urllib.parse.unquote(urllib.parse.urlsplit(live).path.removeprefix("/f")))
-        member = lambda: next((m for m in view(ORCHESTRATOR)[1].get("members", []) if m["path"] == str(watched)), None)
+        member = lambda: next((m for m in members(ORCHESTRATOR) if m["path"] == str(watched)), None)
         deadline = time.monotonic() + 30
         while not member() and time.monotonic() < deadline:
             time.sleep(0.2)
         check("--watch --open puts the page in the unit of the session that started it", True, member() is not None)
         check("the hub says its watcher runs", True, member() and request("GET", member()["url"] + ".watch.json")[1].get("alive"))
-        record = "/f" + urllib.parse.quote(str(watched)) + ".watch.json"
+        watch_url = served(watched) + ".watch.json"
         git(alpha, "worktree", "remove", "--force", str(worktree))
         check("the watcher stops once its worktree is removed", 0, watcher.wait(timeout=30))
         check("...and the hub says it stopped for good", (False, True),
-              (request("GET", record)[1].get("alive"), request("GET", record)[1].get("gone")))
+              (request("GET", watch_url)[1].get("alive"), request("GET", watch_url)[1].get("gone")))
         check("...and the page leaves its unit", None, member())
         check("...though its file stays", True, watched.is_file())
     finally:
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(watcher.pid, signal.SIGKILL)   # `uv run` leads the group; the watcher is its child
+            os.killpg(watcher.pid, signal.SIGKILL)  # `uv run` leads the group; the watcher is its child
         watcher.wait()
 
-    # --- a damaged state file; the containers' state of the hub before units
+    # --- a restart: a damaged state file, and the containers' state of the hub before units
 
-    def restart() -> subprocess.Popen:
-        os.killpg(hub.pid, signal.SIGKILL)
-        hub.wait()
-        # `uv run` leads the group and is reaped first; the server holds the port until it is gone too
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(hub.pid, 0)
-                time.sleep(0.05)
-            except ProcessLookupError:
-                break
-        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(SCRATCH / "state"), *HUB_FLAGS],
-                                   env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("a"), start_new_session=True)
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and started.poll() is None:
-            try:
-                socket.create_connection(("127.0.0.1", PORT), timeout=1).close()
-                break
-            except OSError:
-                time.sleep(0.1)
-        return started
-
-    (SCRATCH / "state/units/damaged.json").write_text("{not json")
+    (hub.STATE / "units/damaged.json").write_text("{not json")
     UNREADABLE = os.geteuid() != 0  # mode 0 stops no read by root
     if UNREADABLE:
-        unreadable = SCRATCH / "state/units/unreadable.json"
+        unreadable = hub.STATE / "units/unreadable.json"
         unreadable.write_text('{"key": "unreadable", "members": []}\n')
         unreadable.chmod(0)  # read, it raises; nothing can tell what it holds
-    fleeting = page(HOME / "fleeting.html")
-    request("POST", "/api/serve", {"path": str(fleeting)})
-    fleeting.unlink()
     MIGRANT = "99999999-0000-4000-8000-00000000000b"
-    old_member = {"id": "m0123456789", "url": "/f" + urllib.parse.quote(str(note)), "path": str(note), "group": MIGRANT,
+    old_member = {"id": "m0123456789", "url": served(note), "path": str(note), "group": MIGRANT,
                   "ticket": None, "kind": "page", "title": "scratch.html", "first": 1.0, "at": 2.0, "by": "agent", "closed": False, "agent": True}
     old_board = {**old_member, "id": "mboard00000", "url": board_url, "path": str(board), "kind": "board", "title": "board.html"}
     old_tracker = str((alpha / "agent/tickets").resolve())
-    page(SCRATCH / "state/containers/session-old.json", json.dumps({
+    page(hub.STATE / "containers/session-old.json", json.dumps({
         "key": "session-old", "name": "session old", "tracker": old_tracker, "members": [old_member, old_board],
         "seen": {"/f/an/old/page.html": 3.0}, "visited": {MIGRANT: 4.0}}))
-    page(SCRATCH / "state/seen.json", json.dumps({"/f/an/old/page.html": 3.0}))
+    page(hub.STATE / "seen.json", json.dumps({"/f/an/old/page.html": 3.0}))
     LEGACY = "99999999-0000-4000-8000-00000000000c"
-    page(SCRATCH / f"state/units/{LEGACY}.json", json.dumps({
+    page(hub.STATE / f"units/{LEGACY}.json", json.dumps({
         "key": LEGACY, "session": LEGACY, "tracker": old_tracker, "roots": {}, "visited": 0, "dismissed": 0,
         "members": [{**old_member, "id": "m1111111111"}, {**old_board, "id": "mboard11111"}]}))
-    hub = restart()
+    kept = lambda: {key: sorted((m["id"], m["closed"]) for m in members(key)) for key in (WORKER, ORCHESTRATOR, STRANGER)}
+    before_restart = kept()
+    stop(hub_proc)
+    hub_proc = start()
+    check("a unit's pages, and which of them are minimized, survive a restart", before_restart, kept())
     check("a unit an earlier hub kept has its board dropped on a restart, the board being the rail's", ["m1111111111"],
-          [m["id"] for m in view(LEGACY)[1].get("members", [])])
+          [m["id"] for m in members(LEGACY)])
     check("...and its tracker moved onto its pages", ([old_tracker], False),
-          ([m.get("tracker") for m in view(LEGACY)[1]["members"]], "tracker" in json.loads((SCRATCH / f"state/units/{LEGACY}.json").read_text())))
-    check("a shared page deleted before a restart leaves the list of what is shared", False,
-          str(fleeting) in json.loads((SCRATCH / "state/served.json").read_text()))
-    check("a damaged state file does not keep the hub from starting", (None, 200), (hub.poll(), request("GET", "/api/hub")[0]))
-    check("...and the units beside it are still there", 200, view(WORKER)[0])
+          ([m.get("tracker") for m in members(LEGACY)], "tracker" in json.loads((hub.STATE / f"units/{LEGACY}.json").read_text())))
+    check("a damaged state file does not keep the hub from starting", (None, 200), (hub_proc.poll(), request("GET", "/api/hub")[0]))
+    check("...and the units beside it are still there", 200, http_view(WORKER)[0])
     check("...and it is moved aside, not left for the next save to overwrite", (False, 1),
-          ((SCRATCH / "state/units/damaged.json").exists(), len(list((SCRATCH / "state/units").glob("damaged.json.unreadable-*")))))
-    check("a page an agent opened outside every agent directory is served after a restart", 200,
-          request("GET", "/f" + urllib.parse.quote(str(note)))[0])
+          ((hub.STATE / "units/damaged.json").exists(), len(list((hub.STATE / "units").glob("damaged.json.unreadable-*")))))
+    check("a page an agent opened outside every agent directory is served after a restart", 200, request("GET", served(note))[0])
     check("a container the hub kept before units has its pages moved into their session's unit, but its board", (["m0123456789"], 4.0),
-          (lambda r: ([m["id"] for m in r.get("members", [])], r.get("visited")))(view(MIGRANT)[1]))
-    check("...each page with the container's tracker", [old_tracker], [m.get("tracker") for m in view(MIGRANT)[1]["members"]])
-    check("...its seen marks dropped, as the seen marks an earlier hub kept are", (False, False),
-          ("seen" in request("GET", "/api/hub")[1], (SCRATCH / "state/seen.json").exists()))
+          (lambda r: ([m["id"] for m in r.get("members", [])], r.get("visited")))(http_view(MIGRANT)[1]))
+    check("...each page with the container's tracker", [old_tracker], [m.get("tracker") for m in members(MIGRANT)])
+    check("...and the seen marks an earlier hub kept deleted", False, (hub.STATE / "seen.json").exists())
     check("...and the containers set aside", (False, 1),
-          ((SCRATCH / "state/containers").exists(), len(list((SCRATCH / "state").glob("containers.before-units-*")))))
+          ((hub.STATE / "containers").exists(), len(list(hub.STATE.glob("containers.before-units-*")))))
     if UNREADABLE:
-        check("the rail still lists the rest beside a state file it cannot read", True, any(u["unit"] == WORKER for u in rail()))
+        check("the rail still lists the rest beside a state file it cannot read", True, any(u["unit"] == WORKER for u in request("GET", "/api/hub")[1]["units"]))
         check("...and a page opened into its unit is refused, not written over it", 500,
               request("POST", "/api/open", {"target": str(note), "session": "unreadable"})[0])
         unreadable.chmod(0o644)
         check("...which is as it was", '{"key": "unreadable", "members": []}\n', unreadable.read_text())
     check("what was shared before the restart is served after it", (200, 200),
           (request("GET", shared["url"] + "nested/review.html")[0], request("GET", shared_page["url"])[0]))
-    served_list = SCRATCH / "state/served.json"
+    served_list = hub.STATE / "served.json"
     if UNREADABLE:
         listed = served_list.read_text()
         served_list.chmod(0)
-        hub = restart()
-        check("an unreadable list of shared pages does not keep the hub from starting", (None, 200), (hub.poll(), request("GET", "/api/hub")[0]))
+        stop(hub_proc)
+        hub_proc = start()
+        check("an unreadable list of shared pages does not keep the hub from starting", (None, 200), (hub_proc.poll(), request("GET", "/api/hub")[0]))
         check("...and sharing is refused rather than written over it, asked twice", [500, 500],
               [request("POST", "/api/serve", {"path": str(alone)})[0] for _ in range(2)])
         check("...nor served", 403, request("GET", shared_page["url"])[0])
         served_list.chmod(0o644)
         check("...which is as it was", listed, served_list.read_text())
     else:
-        print("skip: the unreadable-file checks, since root reads a file of mode 0")
-
+        skipped("the unreadable-file checks", "root reads a file of mode 0")
     # --- a hub as its user service runs it: no tracker on PATH, the mx plugin's under HOME; and here no diffview beside it
 
     lone_bin = SCRATCH / "lone-bin"
@@ -1655,7 +1737,7 @@ while data := os.read(0, 4096):
         shutil.copy2(BIN / name, lone_bin / name)
     service_home = SCRATCH / "service-home"
     cache = service_home / ".claude/plugins/cache/market/mx"
-    for version, script in (("1.0.9", "#!/bin/sh\nexit 1\n"), ("1.0.10", f'#!/bin/sh\nexec {shutil.which("tracker", path=ENV["PATH"])} "$@"\n')):
+    for version, script in (("1.0.9", "#!/bin/sh\nexit 1\n"), ("1.0.10", f'#!/bin/sh\nexec {shutil.which("tracker")} "$@"\n')):
         (cache / version / "skills/tracker").mkdir(parents=True)
         (cache / version / "skills/tracker/tracker.py").write_text(script)
         (cache / version / "skills/tracker/tracker.py").chmod(0o755)
@@ -1683,18 +1765,18 @@ while data := os.read(0, 4096):
         check("...and with a session page reader it cannot use, marks nothing and serves the rail all the same",
               (200, None, ""), (lambda r: (r[0], r[1].get("needs_you"), r[1].get("status_line")))(service("GET", f"/api/u/{WORKER}")))
         check("a hub with no diffview beside it says its pages cannot save", (200, {"saves": False}), service("GET", "/.health"))
-        check("...and refuses a save, as no route it has", 404,
-              service("POST", "/f" + urllib.parse.quote(str(code_diff)) + ".state.json", {}, {"Origin": f"http://127.0.0.1:{service_port}"})[0])
     finally:
         os.killpg(service_hub.pid, signal.SIGKILL)
         service_hub.wait()
     check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
           TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
 finally:
-    os.killpg(hub.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
-    hub.wait()
+    sys.stderr = sys.__stderr__
+    if hub_proc:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(hub_proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
+        hub_proc.wait()
+    subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
-print()
-print("FAILED" if failures else "all ok")
-sys.exit(1 if failures else 0)
+finish()

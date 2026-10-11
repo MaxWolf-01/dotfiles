@@ -112,5 +112,20 @@
       ];
       homeConfigurations."minimal" = mkHome [ ./nix/home/hosts/minimal.nix ];
       homeConfigurations."minimal-root" = mkHome [ ./nix/home/hosts/minimal-root.nix ];
+
+      # What the test suites need beyond uv and a host's own tools: `nix develop -c make test`.
+      devShells.${system}.default = pkgs.mkShell {
+        packages = with pkgs; [ python3 fzf sops age ffmpeg restic dnsproxy openssl dig zbar notmuch strace ];
+        # uv's Python finds no certificate store of its own on NixOS.
+        SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        # The Chromium Playwright downloads is linked for a conventional Linux; on NixOS it
+        # runs through nix-ld, which finds its libraries here. Elsewhere this is unread.
+        shellHook = ''
+          export NIX_LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath (with pkgs; [
+            glib nspr nss at-spi2-core dbus expat libxkbcommon alsa-lib udev libgbm
+            libX11 libXcomposite libXdamage libXext libXfixes libXrandr libxcb
+          ])}''${NIX_LD_LIBRARY_PATH:+:$NIX_LD_LIBRARY_PATH}
+        '';
+      };
     };
 }

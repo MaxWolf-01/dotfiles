@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
+# tier: full-path (a live hub over HTTP)
 # Drive bin/diffview end to end and check the generated page. Run it directly; no framework.
 #
 # The contract under test: both source modes (git range, OLD=NEW paths) produce a
-# self-contained page whose embedded JSON carries the right files, statuses and
-# commits — and, when chromium is available, whose JS actually renders the tree,
-# the diff gutters, and the comment machinery it promises.
+# self-contained page whose embedded data carries the right files, statuses and
+# commits. What the page does with that data in a browser is tests/diffview-page.test's.
 
 set -uo pipefail
 
@@ -36,18 +36,27 @@ cleanup() {
 trap cleanup EXIT
 for _ in $(seq 300); do curl -sf -o /dev/null "$hub/.health" && break; sleep 0.2; done
 
-failures=0
-check() {
-    local what="$1" expected="$2" actual="$3"
-    if [ "$expected" = "$actual" ]; then
-        echo "ok   $what"
-    else
-        echo "FAIL $what"
-        echo "       expected: $expected"
-        echo "       actual:   $actual"
-        failures=$((failures + 1))
-    fi
+. "$(dirname "${BASH_SOURCE[0]}")/check.sh"
+
+# a Python expression over a page's data: data is all of it, f the file at path (None for an empty path),
+# baked(side) the sha256 of that image version as baked, "none" when the card has no such version,
+# "unbaked SIZE" when it was left out
+field() {
+    python3 - "$@" <<'EOF'
+import base64, hashlib, json, sys
+page, path, expr = sys.argv[1:]
+text = open(page).read()
+data, _ = json.JSONDecoder().raw_decode(text, text.index("const DATA = ") + len("const DATA = "))
+f = next((f for s in data["sources"] for f in s["files"] if f["path"] == path), None)
+def baked(side):
+    v = (f.get("image") or {}).get(side)
+    return "none" if v is None else hashlib.sha256(base64.b64decode(v["src"].split(",", 1)[1])).hexdigest() if "src" in v else f"unbaked {v['size']}"
+print(eval(expr))
+EOF
 }
+datum() { field "$1" "" "$2"; }   # page, then an expression over its data alone
+paths() { datum "$1" "' | '.join(f['path'] for s in data['sources'] for f in s['files'])"; }
+added() { field "$1" "$2" "[ln[3] for h in f['hunks'] for ln in h['lines'] if ln[0] == 1]"; }   # page, path: its added lines
 
 # --- OLD=NEW: two plain files, no git metadata
 
@@ -56,41 +65,40 @@ printf 'alpha\nBETA\ngamma\ndelta\n' > "$work/new.txt"
 out=$("$diffview" "$work/old.txt=$work/new.txt" -o "$work/files.html" --no-auto-summary)
 check "file=file exits 0" 0 $?
 check "file=file counts" "1 files, +2 -1" "$(grep -o '[0-9]* files, +[0-9]* -[0-9]*' <<<"$out")"
-check "changed line is in the page" 1 "$(grep -c 'BETA' "$work/files.html")"
-check "basename survives path stripping" yes "$(grep -q '"path": "new.txt"' "$work/files.html" && echo yes)"
+check "the changed lines are in the page, under the file's basename" "['BETA', 'delta']" "$(added "$work/files.html" new.txt)"
 
 # --- the session the page was rendered for: the origin a separate process was handed wins over its own id
 
-session() { grep -o '"session": "[^"]*"' "$work/session.html"; }
+session() { datum "$work/session.html" "data['session']"; }
 env -u MX_ORIGIN_SESSION -u CLAUDE_CODE_SESSION_ID "$diffview" "$work/old.txt=$work/new.txt" -o "$work/session.html" --no-auto-summary >/dev/null
-check "outside a session the page names none" '"session": ""' "$(session)"
+check "outside a session the page names none" '' "$(session)"
 env -u MX_ORIGIN_SESSION CLAUDE_CODE_SESSION_ID=own "$diffview" "$work/old.txt=$work/new.txt" -o "$work/session.html" --no-auto-summary >/dev/null
-check "a session names itself" '"session": "own"' "$(session)"
+check "a session names itself" own "$(session)"
 MX_ORIGIN_SESSION=origin CLAUDE_CODE_SESSION_ID=own "$diffview" "$work/old.txt=$work/new.txt" -o "$work/session.html" --no-auto-summary >/dev/null
-check "a separate process names the session it works for" '"session": "origin"' "$(session)"
+check "a separate process names the session it works for" origin "$(session)"
 # the resume command enters the directory the session's transcript records, when it is still there
-resume() { grep -o '"resume": "[^"]*"' "$work/session.html"; }
+resume() { datum "$work/session.html" "data['resume']"; }
 mkdir -p "$work/claude/projects/p"
 env -u MX_ORIGIN_SESSION CLAUDE_CONFIG_DIR="$work/claude" CLAUDE_CODE_SESSION_ID=own "$diffview" "$work/old.txt=$work/new.txt" -o "$work/session.html" --no-auto-summary >/dev/null
-check "a session with no transcript here resumes from anywhere" '"resume": "claude --resume own"' "$(resume)"
+check "a session with no transcript here resumes from anywhere" 'claude --resume own' "$(resume)"
 printf '{"type":"summary"}\n{"type":"user","cwd":"%s"}\n' "$work" > "$work/claude/projects/p/own.jsonl"
 env -u MX_ORIGIN_SESSION CLAUDE_CONFIG_DIR="$work/claude" CLAUDE_CODE_SESSION_ID=own "$diffview" "$work/old.txt=$work/new.txt" -o "$work/session.html" --no-auto-summary >/dev/null
 check "a session resumes in the directory it ran in, under its account's config dir" \
-    "\"resume\": \"cd $work && CLAUDE_CONFIG_DIR=$work/claude claude --resume own\"" "$(resume)"
+    "cd $work && CLAUDE_CONFIG_DIR=$work/claude claude --resume own" "$(resume)"
 printf '{"type":"user","cwd":"%s"}\n' "$work/gone" > "$work/claude/projects/p/own.jsonl"
 env -u MX_ORIGIN_SESSION CLAUDE_CONFIG_DIR="$work/claude" CLAUDE_CODE_SESSION_ID=own "$diffview" "$work/old.txt=$work/new.txt" -o "$work/session.html" --no-auto-summary >/dev/null
-check "a session whose directory is gone resumes from anywhere" "\"resume\": \"CLAUDE_CONFIG_DIR=$work/claude claude --resume own\"" "$(resume)"
+check "a session whose directory is gone resumes from anywhere" "CLAUDE_CONFIG_DIR=$work/claude claude --resume own" "$(resume)"
 # run without a config dir, as the container hub's user service is, every account's transcripts are looked through
 mkdir -p "$work/accounts/.claude-work/projects/p" "$work/accounts/.claude/projects/p"
 printf '{"type":"user","cwd":"%s"}\n' "$work" > "$work/accounts/.claude-work/projects/p/own.jsonl"
 env -u MX_ORIGIN_SESSION -u CLAUDE_CONFIG_DIR HOME="$work/accounts" UV_CACHE_DIR="$(uv cache dir)" UV_PYTHON_INSTALL_DIR="$(uv python dir)" \
     CLAUDE_CODE_SESSION_ID=own "$diffview" "$work/old.txt=$work/new.txt" -o "$work/session.html" --no-auto-summary >/dev/null
 check "a session of another account resumes under that account" \
-    "\"resume\": \"cd $work && CLAUDE_CONFIG_DIR=$work/accounts/.claude-work claude --resume own\"" "$(resume)"
+    "cd $work && CLAUDE_CONFIG_DIR=$work/accounts/.claude-work claude --resume own" "$(resume)"
 mv "$work/accounts/.claude-work/projects/p/own.jsonl" "$work/accounts/.claude/projects/p/own.jsonl"
 env -u MX_ORIGIN_SESSION -u CLAUDE_CONFIG_DIR HOME="$work/accounts" UV_CACHE_DIR="$(uv cache dir)" UV_PYTHON_INSTALL_DIR="$(uv python dir)" \
     CLAUDE_CODE_SESSION_ID=own "$diffview" "$work/old.txt=$work/new.txt" -o "$work/session.html" --no-auto-summary >/dev/null
-check "and one of ~/.claude names no config dir" "\"resume\": \"cd $work && claude --resume own\"" "$(resume)"
+check "and one of ~/.claude names no config dir" "cd $work && claude --resume own" "$(resume)"
 
 # --- highlight.js: every file is checked against its pin, cached or fetched
 
@@ -106,7 +114,7 @@ echo 'window.TAMPERED = 1' > "$hl/.cache/diffview/hljs-$version/highlight.min.js
 err=$(highlighted)
 check "a cached highlight.js that differs from its pin is refused on stderr" yes \
     "$(grep -q "hljs-$version/highlight.min.js does not match its pinned sha256" <<<"$err" && echo yes)"
-check "and the page renders without it" "0 1" "$(grep -c TAMPERED "$work/hljs.html") $(grep -c '"path": "new.txt"' "$work/hljs.html")"
+check "and the page renders without it" "0 new.txt" "$(grep -c TAMPERED "$work/hljs.html") $(paths "$work/hljs.html")"
 rm "$hl/.cache/diffview/hljs-$version/highlight.min.js"
 echo 'window.TAMPERED = 1' > "$hl/.cache/diffview/hljs-0.0.1/highlight.min.js"
 echo 'window.TAMPERED = 1' > "$hl/.cache/diffview/highlight.min.js"   # where every version was cached before
@@ -131,11 +139,11 @@ git -C "$repo" -c user.name=t -c user.email=t@t commit -q -m "rename and extend"
 
 out=$("$diffview" "$repo@HEAD~2..HEAD" -o "$work/range.html" --summary "test summary paragraph")
 check "git range exits 0" 0 $?
-check "both commits embedded" 2 "$(grep -o '"subject": "' "$work/range.html" | wc -l)"
-check "summary embedded" yes "$(grep -q 'test summary paragraph' "$work/range.html" && echo yes)"
+check "both commits embedded, oldest first" "['add a.txt', 'rename and extend']" "$(datum "$work/range.html" "[c['subject'] for c in data['sources'][0]['commits']]")"
+check "summary embedded" "test summary paragraph" "$(datum "$work/range.html" "data['summary']")"
 
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/rename.html" --no-auto-summary >/dev/null
-check "rename detected over the renaming range" yes "$(grep -q '"status": "renamed"' "$work/rename.html" && echo yes)"
+check "rename detected over the renaming range" "renamed a.txt" "$(field "$work/rename.html" b.txt "f['status'] + ' ' + f['oldPath']")"
 
 # --- a path with a space in it: git tab-terminates the name in the diff header
 
@@ -149,15 +157,15 @@ printf 'SELECT 2;\n' > "$spacerepo/dir with space/q.sql"
 git -C "$spacerepo" add "dir with space/q.sql"
 git -C "$spacerepo" -c user.name=t -c user.email=t@t commit -q -m edit
 "$diffview" "$spacerepo@HEAD~1..HEAD" -o "$work/space.html" --no-auto-summary >/dev/null
-check "a path with a space does not keep the tab git ends it with" 0 "$(grep -c 'q\.sql\\t' "$work/space.html")"
-check "and with it the language it is highlighted in" yes "$(grep -q '"lang": "sql"' "$work/space.html" && echo yes)"
+check "a path with a space does not keep the tab git ends it with" "dir with space/q.sql" "$(paths "$work/space.html")"
+check "and with it the language it is highlighted in" sql "$(field "$work/space.html" "dir with space/q.sql" "f['lang']")"
 
 # a note names the path git prints, so a path read wrong takes the note to a file of its own
 cat > "$work/space-notes.json" <<'EOF'
 {"notes": [{"id": 1, "path": "dir with space/q.sql", "text": "a note that has to find this file"}]}
 EOF
 "$diffview" "$spacerepo@HEAD~1..HEAD" -o "$work/space-note.html" --no-auto-summary --notes "$work/space-notes.json" >/dev/null
-check "and a note naming it lands on the file, not beside it" 0 "$(grep -c '"status": "untouched"' "$work/space-note.html")"
+check "and a note naming it lands on the file, not beside it" "dir with space/q.sql" "$(paths "$work/space-note.html")"
 
 # --- a binary file: it has no ---/+++ lines, so the `diff --git` header is the only place its path appears
 
@@ -176,41 +184,27 @@ git -C "$binrepo" -c user.name=t -c user.email=t@t commit -q -m "change the imag
 
 out=$("$diffview" "$binrepo@HEAD~1..HEAD" -o "$work/binary.html" --no-auto-summary)
 check "a changed binary file reaches the page" "1 files, +0 -0" "$(grep -o '[0-9]* files, +[0-9]* -[0-9]*' <<<"$out")"
-check "marked binary, so the page shows a card instead of hunks" yes "$(grep -q '"binary": true' "$work/binary.html" && echo yes)"
-check "under the whole path, not a half of it" yes "$(grep -q '"path": "dir with space/img.png"' "$work/binary.html" && echo yes)"
+check "under the whole path, not a half of it" "dir with space/img.png" "$(paths "$work/binary.html")"
+check "marked binary, so the page shows a card instead of hunks" True "$(field "$work/binary.html" "dir with space/img.png" "f['binary']")"
 
 "$diffview" "$binrepo@HEAD~2..HEAD~1" -o "$work/binary-add.html" --no-auto-summary >/dev/null
-check "an added binary file too" yes "$(grep -q '"status": "added"' "$work/binary-add.html" && grep -q '"binary": true' "$work/binary-add.html" && echo yes)"
+check "an added binary file too" "added True" "$(field "$work/binary-add.html" "dir with space/img.png" "f['status'] + ' ' + str(f['binary'])")"
 
 # a mode change has no ---/+++ lines and no hunks either, so there is no gap for a baked copy of the file to open
 chmod +x "$binrepo/readme.txt"
 git -C "$binrepo" add readme.txt
 git -C "$binrepo" -c user.name=t -c user.email=t@t commit -q -m "make it executable"
 "$diffview" "$binrepo@HEAD~1..HEAD" -o "$work/mode.html" --no-auto-summary >/dev/null
-check "a mode-only change reaches the page" yes "$(grep -q '"path": "readme.txt"' "$work/mode.html" && echo yes)"
-check "carrying no copy of the file" 0 "$(grep -c '"content": \[' "$work/mode.html")"
+check "a mode-only change reaches the page" readme.txt "$(paths "$work/mode.html")"
+check "carrying no copy of the file" None "$(field "$work/mode.html" readme.txt "f.get('content')")"
 
 printf '\x89PNG\r\n\x1a\n\x00\x01' > "$work/before.png"
 printf '\x89PNG\r\n\x1a\n\x00\x02\x03' > "$work/after.png"
 "$diffview" "$work/before.png=$work/after.png" -o "$work/binary-files.html" --no-auto-summary >/dev/null
-check "and a file=file compare of two binaries, under the new side's name" yes "$(grep -q '"path": "after.png"' "$work/binary-files.html" && echo yes)"
+check "and a file=file compare of two binaries, under the new side's name" after.png "$(paths "$work/binary-files.html")"
 
 # --- images: every version a card shows is baked into the page, byte for byte as the source holds it
 
-# a Python expression over one file of a page's data: f is the file, baked(side) the sha256 of that
-# image version as baked, "none" when the card has no such version, "unbaked SIZE" when it was left out
-field() {
-    python3 - "$@" <<'EOF'
-import base64, hashlib, json, sys
-page, path, expr = sys.argv[1:]
-data = json.loads(open(page).read().split("const DATA = ", 1)[1].split(";\n", 1)[0])
-f = next(f for s in data["sources"] for f in s["files"] if f["path"] == path)
-def baked(side):
-    v = (f.get("image") or {}).get(side)
-    return "none" if v is None else hashlib.sha256(base64.b64decode(v["src"].split(",", 1)[1])).hexdigest() if "src" in v else f"unbaked {v['size']}"
-print(eval(expr))
-EOF
-}
 baked() { field "$1" "$2" "baked('$3') + ' ' + baked('$4')"; }   # page, path, then the two sides to name
 digest() { sha256sum "$1" | cut -d' ' -f1; }
 
@@ -323,22 +317,22 @@ check "its bytes that are no UTF-8 show as U+FFFD (here as ?)" 'caf? cr?me' \
 printf 'four\n' >> "$repo/b.txt"
 "$diffview" "$repo@HEAD.." -o "$work/worktree.html" --no-auto-summary >/dev/null
 check "worktree range exits 0" 0 $?
-check "uncommitted line is in the page" yes "$(grep -q '"four"' "$work/worktree.html" && echo yes)"
-check "detail names the worktree" yes "$(grep -q 'HEAD..worktree' "$work/worktree.html" && echo yes)"
+check "uncommitted line is in the page" "['four']" "$(added "$work/worktree.html" b.txt)"
+check "detail names the worktree" HEAD..worktree "$(datum "$work/worktree.html" "data['sources'][0]['detail']")"
 git -C "$repo" checkout -q -- b.txt
 "$diffview" "$repo@$(git -C "$repo" rev-parse HEAD~1)..$(git -C "$repo" rev-parse HEAD)" -o "$work/fullids.html" --no-auto-summary >/dev/null
 check "full commit ids in a range show abbreviated" \
-    "\"detail\": \"$(git -C "$repo" rev-parse --short HEAD~1)..$(git -C "$repo" rev-parse --short HEAD)\"" \
-    "$(grep -o '"detail": "[^"]*"' "$work/fullids.html" | head -1)"
+    "$(git -C "$repo" rev-parse --short HEAD~1)..$(git -C "$repo" rev-parse --short HEAD)" \
+    "$(datum "$work/fullids.html" "data['sources'][0]['detail']")"
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pinned.html" --no-auto-summary >/dev/null
 check "the copyable spec pins a range's ends to commits" \
-    "\"spec\": \"$repo@$(git -C "$repo" rev-parse --short HEAD~1)..$(git -C "$repo" rev-parse --short HEAD)\"" \
-    "$(grep -o '"spec": "[^"]*"' "$work/pinned.html" | head -1)"
+    "$repo@$(git -C "$repo" rev-parse --short HEAD~1)..$(git -C "$repo" rev-parse --short HEAD)" \
+    "$(datum "$work/pinned.html" "data['sources'][0]['spec']")"
 check "and a worktree range's base, leaving its right side open" \
-    "\"spec\": \"$repo@$(git -C "$repo" rev-parse --short HEAD)..\"" \
-    "$(grep -o '"spec": "[^"]*"' "$work/worktree.html" | head -1)"
-check "an OLD=NEW spec is both absolute paths" "\"spec\": \"$work/old.txt=$work/new.txt\"" \
-    "$(grep -o '"spec": "[^"]*"' "$work/files.html" | head -1)"
+    "$repo@$(git -C "$repo" rev-parse --short HEAD).." \
+    "$(datum "$work/worktree.html" "data['sources'][0]['spec']")"
+check "an OLD=NEW spec is both absolute paths" "$work/old.txt=$work/new.txt" \
+    "$(datum "$work/files.html" "data['sources'][0]['spec']")"
 
 # --- agent notes: inline annotations and agent-side resolutions from --notes
 
@@ -349,10 +343,10 @@ cat > "$work/notes.json" <<'EOF'
 EOF
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/notes.html" --no-auto-summary --notes "$work/notes.json" >/dev/null
 check "notes generation exits 0" 0 $?
-check "notes embedded" yes "$(grep -q 'kept the old order on purpose' "$work/notes.html" && echo yes)"
-check "string line was coerced to a number" yes "$(grep -q '"line": 3' "$work/notes.html" && echo yes)"
-check "gapped ids survive verbatim" yes "$(grep -q '"id": 7' "$work/notes.html" && echo yes)"
-check "agent resolutions normalise to numbers" yes "$(grep -q '"agentResolved": \[2, 5\]' "$work/notes.html" && echo yes)"
+check "notes embedded, a string line coerced to a number, gapped ids kept verbatim" \
+    "[(1, 3, 'kept the old order on purpose'), (7, None, 'this file carries the feature')]" \
+    "$(datum "$work/notes.html" "[(n['id'], n.get('line'), n['text']) for n in data['notes']]")"
+check "agent resolutions normalise to numbers" "[2, 5]" "$(datum "$work/notes.html" "data['agentResolved']")"
 echo 'not json' > "$work/bad.json"
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/x.html" --no-auto-summary --notes "$work/bad.json" >/dev/null 2>&1
 check "malformed notes fail loud" 1 $?
@@ -373,8 +367,8 @@ err=$("$diffview" "$repo@HEAD~1..HEAD" -o "$work/x.html" --no-auto-summary \
 check "a note path in no source warns" yes "$(grep -q "path 'nope.txt' is in no source" <<<"$err" && echo yes)"
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/untouched.html" --no-auto-summary \
     --notes <(echo '{"notes": [{"id": 1, "path": "c.txt", "line": 2, "text": "outside the diff"}]}') >/dev/null
-check "a note on a file outside the diff puts that file on the page" yes "$(grep -q '"status": "untouched"' "$work/untouched.html" && echo yes)"
-check "the untouched file carries the noted line" yes "$(grep -q '"untouched two"' "$work/untouched.html" && echo yes)"
+check "a note on a file outside the diff puts that file on the page" untouched "$(field "$work/untouched.html" c.txt "f['status']")"
+check "the untouched file carries the noted line" True "$(field "$work/untouched.html" c.txt "any(ln[3] == 'untouched two' for h in f['hunks'] for ln in h['lines'])")"
 
 # a note answering a comment needs no place of its own: the comment's file and lines fill in
 cat > "$work/answer.html.state.json" <<'EOF'
@@ -383,8 +377,9 @@ cat > "$work/answer.html.state.json" <<'EOF'
 EOF
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/answer.html" --no-auto-summary \
     --notes <(echo '{"notes": [{"id": 2, "re": "C1", "text": "because"}]}') >/dev/null
-check "a note answering a comment inherits its file" yes "$(grep -q '"re": 1, "text": "because", "path": "b.txt"' "$work/answer.html" && echo yes)"
-check "and its lines" yes "$(grep -q '"side": "new", "line": 3, "end": 3' "$work/answer.html" && echo yes)"
+answer() { datum "$work/answer.html" "' '.join(str(data['notes'][0].get(k)) for k in $1)"; }
+check "a note answering a comment inherits its file" "1 because b.txt" "$(answer "('re', 'text', 'path')")"
+check "and its lines" "new 3 3" "$(answer "('side', 'line', 'end')")"
 "$diffview" "$repo@HEAD~1..HEAD" -o "$work/x.html" --no-auto-summary \
     --notes <(echo '{"notes": [{"id": 2, "re": "C9", "text": "answering nothing"}]}') >/dev/null 2>&1
 check "a note answering a comment that is not on the page fails loud" 1 $?
@@ -443,7 +438,7 @@ check "--sources-of on a file that is no diffview page fails" 1 $?
 printf 'five\n' >> "$repo/b.txt"
 "$diffview" "$repo@.." -o "$work/atwt.html" --no-auto-summary >/dev/null
 check "empty-base worktree range works" 0 $?
-check "empty base means HEAD" yes "$(grep -q 'HEAD..worktree' "$work/atwt.html" && echo yes)"
+check "empty base means HEAD" HEAD..worktree "$(datum "$work/atwt.html" "data['sources'][0]['detail']")"
 git -C "$repo" checkout -q -- b.txt
 
 # --- saved review state beside the page is baked into rebuilds
@@ -454,7 +449,8 @@ cat > "$work/range.html.state.json" <<EOF
                "text": "state survives a rebuild", "excerpt": ["+ three"]}]}
 EOF
 "$diffview" "$repo@HEAD~2..HEAD" -o "$work/range.html" --no-auto-summary --summary "test summary paragraph" >/dev/null
-check "saved comments baked into the page" yes "$(grep -q 'state survives a rebuild' "$work/range.html" && echo yes)"
+saved() { datum "$1" "[c['text'] for c in data['saved']['comments']]"; }   # page: the texts of the comments baked into it
+check "saved comments baked into the page" "['state survives a rebuild']" "$(saved "$work/range.html")"
 echo '[]' > "$work/range.html.state.json"
 "$diffview" "$repo@HEAD~2..HEAD" -o "$work/range.html" --no-auto-summary --summary "test summary paragraph" >/dev/null 2>&1
 check "non-object state file does not crash the build" 0 $?
@@ -464,16 +460,17 @@ cat > "$work/range.html.state.json" <<EOF
                "text": "sneaky <!--<script> comment", "excerpt": ["+ three"]}]}
 EOF
 "$diffview" "$repo@HEAD~2..HEAD" -o "$work/range.html" --no-auto-summary --summary "test summary paragraph" >/dev/null
-check "comment openers cannot break the page script" 0 "$(grep -c '<!--<script' "$work/range.html")"
+check "comment openers cannot break the page script, and come back as typed" "0 ['sneaky <!--<script> comment']" \
+    "$(grep -c '<!--<script' "$work/range.html") $(saved "$work/range.html")"
 rm -f "$work/range.html.state.json"
 "$diffview" "$repo@HEAD~2..HEAD" -o "$work/range.html" --no-auto-summary --summary "test summary paragraph" >/dev/null
 
 # --- the page's path is the review's identity
 
-key1=$(grep -o '"key": "[^"]*"' "$work/range.html")
-check "the page keys on its own path" "\"key\": \"$work/range.html\"" "$key1"
+key1=$(datum "$work/range.html" "data['key']")
+check "the page keys on its own path" "$work/range.html" "$key1"
 "$diffview" "$repo@HEAD~2..HEAD" "$repo@HEAD~1..HEAD" -o "$work/range.html" --no-auto-summary --summary "s" >/dev/null
-check "a later round adding a range keeps that identity" "$key1" "$(grep -o '"key": "[^"]*"' "$work/range.html")"
+check "a later round adding a range keeps that identity" "$key1" "$(datum "$work/range.html" "data['key']")"
 
 # --- derived output: one page per source list, so parallel renders never collide
 
@@ -519,15 +516,15 @@ PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/o.html"
 opened=$(cat "$work/stub/opened")
 check "--open opens the page on the container hub" "$hub/f$work/pages/o.html" "$opened"
 curl -s -o "$work/served.html" "$opened"   # grep -q on a pipe would cut curl off, which pipefail counts as a failure
-check "which serves the page there" yes "$(grep -q "\"key\": \"$work/pages/o.html\"" "$work/served.html" && echo yes)"
+check "which serves the page there" "$work/pages/o.html" "$(datum "$work/served.html" "data['key']")"
 check "and says the pages it serves can save" True "$(curl -s "$hub/.health" | python3 -c 'import json,sys;print(json.load(sys.stdin)["saves"])')"
 
 PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$hubhome/home.html" --no-auto-summary --open >/dev/null 2>&1
 check "a page sitting in your home is served on its own" "$hub/f$hubhome/home.html" "$(cat "$work/stub/opened")"
 check "and nothing else in your home with it" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$hub/f$hubhome/hub.log")"
 refused=$("$diffview" --serve "$hubhome" 2>&1)
-check "your home is never served whole" "1 yes" "$? $(grep -q 'never serves whole' <<<"$refused" && echo yes)"
-check "...in the hub's own words, not its JSON" no "$(grep -q '{"' <<<"$refused" && echo yes || echo no)"
+check "your home is never served whole, in the hub's own words, not its JSON" "1 yes" \
+    "$? $(grep -q 'refused it: [^{]*never serves whole' <<<"$refused" && echo yes)"
 refused=$("$diffview" --serve "$work/nowhere" 2>&1)
 check "a path that does not exist is refused before the hub is asked" "1 yes" "$? $(grep -q "^diffview: --serve $work/nowhere does not exist" <<<"$refused" && echo yes)"
 # a symlinked home must not walk past that guard: resolve both sides or it does
@@ -556,72 +553,8 @@ check "...and says who refused it, and why" yes "$(tr '\n' ' ' <<<"$said" | grep
 lines=$(PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/o.html" --no-auto-summary --open 2>/dev/null | grep -c '^file://')
 check "no file:// url is printed alongside the served one" 0 "$lines"
 
-# loopback binding is not enough on its own: a page can point a name at 127.0.0.1
-check "a foreign Host header is refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example.com' "$hub/.health")"
-check "and a loopback one is not" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$hub/.health")"
-
-# a page writes the state whole, so a second page on the same review would erase the first;
-# the server takes writes from the page that owns the file, and refuses the one that is behind
-"$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/race.html" --no-auto-summary >/dev/null
 served=$("$diffview" --serve "$work/pages")
 check "--serve prints the directory's address on the hub" "diffview: serving $work/pages at $hub/f$work/pages/" "$served"
-origin=$hub
-pages="$origin/f$work/pages"
-state="$pages/race.html.state.json"
-post() { curl -s -o /dev/null -w '%{http_code}\n' -X POST -H "Origin: $origin" -d "$1" "$state"; }   # one write per code, so parallel posts below never interleave
-held() { python3 -c "import json;print(json.dumps(json.load(open('$work/pages/race.html.state.json'))$1))"; }
-check "the first write to a review lands" 204 "$(post '{"savedAt": 1001, "writer": "a", "since": null, "comments": ["a1"]}')"
-check "and the page that wrote it goes on writing" 204 "$(post '{"savedAt": 1002, "writer": "a", "since": null, "comments": ["a2"]}')"
-check "a page that never saw that write is refused" 409 "$(post '{"savedAt": 1003, "writer": "b", "since": 1001, "comments": ["b1"]}')"
-check "the refused write left the file alone" '["a2"]' "$(held '["comments"]')"
-check "the refusal names the save the page missed" 1002 "$(curl -s -X POST -H "Origin: $origin" -d '{"savedAt": 1003, "writer": "b", "since": 1001}' "$state" | python3 -c 'import json,sys;print(json.load(sys.stdin)["savedAt"])')"
-check "a page that did see it writes" 204 "$(post '{"savedAt": 1004, "writer": "b", "since": 1002, "comments": ["b2"]}')"
-check "and takes the review over" '["b2"] "b"' "$(held '["comments"]') $(held '["writer"]')"
-# one page is enough to put two writes in flight, and a file half of one write and half of
-# another reads as no state at all -- which would wave the next write through unchecked
-big=$(python3 -c "import json;print(json.dumps({'savedAt': 7001, 'writer': 'b', 'since': None, 'comments': ['x' * 400] * 200}))")
-rm -f "$work/pages/codes"
-posts=()   # waited on by pid: a bare wait would wait on the hub too
-for _ in $(seq 1 12); do post "$big" >> "$work/pages/codes" & posts+=($!); done
-wait "${posts[@]}"
-check "concurrent writes from one page all land" 12 "$(grep -c '^204$' "$work/pages/codes")"
-check "and leave the state file readable" ok "$(python3 -c "import json;json.load(open('$work/pages/race.html.state.json'));print('ok')" 2>&1 | tail -1)"
-
-# a page rendered before writes named the page they came from: the file's owner still stands,
-# and a page that loaded what such a write left is not held to a name it never saw
-check "a page that predates the check is refused too" 409 "$(post '{"savedAt": 8001, "comments": ["old"]}')"
-python3 -c "import json;json.dump({'savedAt': 8002, 'comments': ['old']}, open('$work/pages/race.html.state.json', 'w'))"
-check "and one that loaded an unnamed write goes on from it" 204 "$(post '{"savedAt": 8003, "writer": "c", "since": 8002}')"
-
-check "what a write was based on is not kept" yes "$(held '' | grep -q since || echo yes)"
-check "a state file that is not an object is still refused" 400 "$(post '[1, 2]')"
-
-# a page on another site can aim a form-shaped POST at loopback without a preflight; the
-# browser names that page in Origin, and only the server's own pages may write
-before=$(held '')
-foreign() { curl -s -o /dev/null -w '%{http_code}' -X POST "$@" -d '{"savedAt": 9001, "writer": "c", "since": 8003, "comments": ["planted"]}' "$state"; }
-check "a write from another origin is refused" 403 "$(foreign -H 'Origin: http://attacker.example')"
-check "so is one from a null origin" 403 "$(foreign -H 'Origin: null')"
-check "and one that names no origin at all" 403 "$(foreign -H 'Origin:')"
-check "none of them touched the file" "$before" "$(held '')"
-check "the server's own origin on localhost writes too" 204 "$(foreign -H "Origin: http://localhost:$CONTAINER_HUB_PORT")"
-check "a write must announce its length" 411 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" "$state")"
-head -c 4200000 /dev/zero | tr '\0' x > "$work/pages/huge"
-check "and one over the size cap is refused" 413 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" --data-binary "@$work/pages/huge" "$state")"
-python3 -c "
-head = '{\"savedAt\": 9500, \"writer\": \"c\", \"since\": null, \"pad\": \"'
-print(head + 'x' * (4_000_000 - len(head) - 2) + '\"}', end='')" > "$work/pages/capped"
-check "one exactly at the cap is taken" "4000000 204" "$(wc -c < "$work/pages/capped") $(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" --data-binary "@$work/pages/capped" "$state")"
-check "a write lands only beside a page that exists" 403 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $origin" -d '{}' "$pages/nopage.html.state.json")"
-cp "$work/pages/race.html" "$work/outside.html"   # a real page, just not under the served tree
-check "and never outside the served tree, page or no page" 403 "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is -X POST -H "Origin: $origin" -d '{}' "$pages/../outside.html.state.json")"
-check "so no such files appear" yes "$([ ! -e "$work/pages/nopage.html.state.json" ] && [ ! -e "$work/outside.html.state.json" ] && echo yes)"
-
-# a page polls its state and summary files; one with nothing written beside it yet is a page with nothing
-# to read, and a 404 there is a red line in the browser's console on a page that is fine
-check "a page with no state written yet answers null" "null 200" "$(curl -s -w ' %{http_code}' "$pages/o.html.state.json")"
-check "and one with no summary written yet the same" "null 200" "$(curl -s -w ' %{http_code}' "$pages/o.html.summary.json")"
-check "a url beside no page is not found" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$pages/nopage.html.state.json")"
 
 # --- with no hub answering, --serve brings one up; two at once, from a person and an agent say, leave one
 
@@ -649,14 +582,12 @@ echo "a stub summary paragraph"
 STUB
 chmod +x "$work/stub/change-summary"
 PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/async.html" >/dev/null
-cp "$work/async.html" "$work/pending.html"   # the page as it looks before the summary lands, for the DOM checks below
-check "the page holds a slot for the summary" yes "$(grep -q '"summaryPending": true' "$work/async.html" && echo yes)"
+check "the page holds a slot for the summary" True "$(datum "$work/async.html" "data['summaryPending']")"
 check "and is written before that summary exists" no "$([ -f "$work/async.html.summary.json" ] && echo yes || echo no)"
 for _ in $(seq 40); do [ -f "$work/async.html.summary.json" ] && break; sleep 0.2; done
 check "the summary lands in the sidecar a served page polls" yes "$(grep -q 'a stub summary paragraph' "$work/async.html.summary.json" && echo yes)"
-check "and is baked into the page file too" yes "$(grep -q 'a stub summary paragraph' "$work/async.html" && echo yes)"
-cp "$work/async.html.summary.json" "$work/pending.html.summary.json"
-check "which clears the slot" yes "$(grep -q '"summaryPending": false' "$work/async.html" && echo yes)"
+check "and is baked into the page file too, which clears the slot" "a stub summary paragraph False" \
+    "$(datum "$work/async.html" "data['summary'] + ' ' + str(data['summaryPending'])")"
 
 # a failed model call belongs in the page, not in a terminal that has moved on
 cat > "$work/stub/change-summary" <<'STUB'
@@ -669,7 +600,7 @@ err=$(PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~2..HEAD" -o "$work/failed.
 for _ in $(seq 40); do [ -f "$work/failed.html.summary.json" ] && break; sleep 0.2; done
 check "a failed summary says nothing on the command line" "" "$err"
 check "and carries its reason in the sidecar instead" yes "$(grep -q 'not logged in' "$work/failed.html.summary.json" && echo yes)"
-check "leaving the page as it was written" yes "$(grep -q '"summaryPending": true' "$work/failed.html" && echo yes)"
+check "leaving the page as it was written" True "$(datum "$work/failed.html" "data['summaryPending']")"
 
 # the page is open and commentable for the seconds the model runs, and the rewrite must keep what lands
 cat > "$work/stub/change-summary" <<'STUB'
@@ -681,7 +612,8 @@ STUB
 PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/commented.html" >/dev/null
 echo '{"savedAt":1,"comments":[{"id":1,"text":"written while the model ran"}],"viewed":[],"nextId":2,"verdict":[]}' > "$work/commented.html.state.json"
 for _ in $(seq 60); do grep -q 'a slow summary paragraph' "$work/commented.html" && break; sleep 0.2; done
-check "a comment made while the summary was written survives the rewrite" yes "$(grep -q 'written while the model ran' "$work/commented.html" && echo yes)"
+check "a comment made while the summary was written survives the rewrite" "a slow summary paragraph ['written while the model ran']" \
+    "$(datum "$work/commented.html" "data['summary']") $(saved "$work/commented.html")"
 
 # rendering to the same path again while the model runs makes the page somebody else's
 cat > "$work/stub/change-summary" <<'STUB'
@@ -694,406 +626,8 @@ PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/raced.html" >
 "$diffview" "$repo@HEAD~2..HEAD" -o "$work/raced.html" --no-auto-summary --summary "the newer render" >/dev/null
 for _ in $(seq 40); do [ -f "$work/raced.html.summary.json" ] && break; sleep 0.2; done
 sleep 0.5
-check "a late summary does not clobber the render that replaced it" yes "$(grep -q 'the newer render' "$work/raced.html" && echo yes)"
+check "a late summary does not clobber the render that replaced it" "the newer render" "$(datum "$work/raced.html" "data['summary']")"
 check "though the sidecar still holds it for a page already open" yes "$(grep -q 'a late summary paragraph' "$work/raced.html.summary.json" && echo yes)"
 rm -f "$work/stub/change-summary"
 
-# --- rendered DOM, when a browser is around
-
-if command -v chromium >/dev/null; then
-    # the pages are driven over http: only a served page can save comments, so a
-    # file:// run would exercise the read-only path instead of the review machinery
-    base=$("$diffview" --serve "$work" | grep -o 'http://[^ ]*')
-    base=${base%/}
-    # file cards render lazily on scroll; force them so the DOM snapshot is deterministic
-    sed 's#</body>#<script>setTimeout(() => document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render"))), 300)</script></body>#' \
-        "$work/range.html" > "$work/dom.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 \
-        --dump-dom "$base/dom.html" 2>/dev/null)
-    # a page whose summary was still being written picks it up from the sidecar, in place
-    pending=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/pending.html" 2>/dev/null)
-    check "an open page fills its summary slot from the sidecar" yes "$(grep -q 'a stub summary paragraph' <<<"$pending" && echo yes)"
-    failed=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/failed.html" 2>/dev/null)
-    check "and shows why there is none when the model call failed" yes "$(grep -q 'no summary — change-summary: claude exited 1: not logged in' <<<"$failed" && echo yes)"
-
-    check "tree renders one row per file" 1 "$(grep -o 'class="tree-file' <<<"$dom" | wc -l)"
-    check "diff hunks render" yes "$([ "$(grep -o 'tbody class="hunk"' <<<"$dom" | wc -l)" -ge 1 ] && echo yes)"
-    check "comment gutters present" yes "$([ "$(grep -o 'data-no=' <<<"$dom" | wc -l)" -ge 3 ] && echo yes)"
-    check "copy button present" yes "$(grep -q 'copy 0 comments' <<<"$dom" && echo yes)"
-
-    sed 's#</body>#<script>setTimeout(() => document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render"))), 300)</script></body>#' \
-        "$work/binary.html" > "$work/bindom.html"
-    bindom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/bindom.html" 2>/dev/null)
-    check "an image whose bytes do not decode says so on its card" yes "$(grep -q 'not shown: these bytes do not decode as PNG' <<<"$bindom" && echo yes)"
-    sed 's#</body>#<script>setTimeout(() => document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render"))), 300)</script></body>#' \
-        "$work/images.html" > "$work/imgdom.html"
-    imgdom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/imgdom.html" 2>/dev/null)
-    check "an image too big to bake says so on its card, with its size and the limit" yes \
-        "$(grep -q 'not shown: 5,242,881 bytes, over the 5,242,880 an image may bring into the page' <<<"$imgdom" && echo yes)"
-    sed 's#</body>#<script>setTimeout(() => document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render"))), 300)</script></body>#' \
-        "$work/images-worktree.html" > "$work/wtdom.html"
-    wtdom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/wtdom.html" 2>/dev/null)
-    check "and one with nothing to read says that" yes "$(grep -q 'not shown: the source has no readable copy of this version' <<<"$wtdom" && echo yes)"
-
-    # the page places a note in the section its source names, where the same path and line are in both
-    sed 's#</body>#<script>setTimeout(() => document.body.append(Object.assign(document.createElement("pre"), { id: "placed", textContent: DATA.notes.map(n => `A${n.id}@${n.fileKey}`).join(" ") })), 300)</script></body>#' \
-        "$work/twins.html" > "$work/twinsdom.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/twinsdom.html" 2>/dev/null)
-    check "a note lands in its source's section, one without a source in the first holding its path" \
-        "A1@1:README.md A2@1:same.txt A3@0:README.md" "$(grep -o 'id="placed">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-
-    # annotations end to end: ids on the boxes, the agent's resolution folding a comment
-    # away, m landing on the next unresolved one, and what the copy button would produce
-    cat > "$work/ann-notes.json" <<'EOF'
-{"notes": [{"id": 1, "path": "b.txt", "line": 3, "text": "kept the old order on purpose"}],
- "resolved": ["C1"]}
-EOF
-    cat > "$work/ann.html.state.json" <<'EOF'
-{"key": "diffview:repo@HEAD~1..HEAD", "savedAt": 1, "nextId": 3, "viewed": [], "verdict": [],
- "comments": [{"id": 1, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 3, "end": 3,
-               "text": "first thought", "excerpt": ["+ three"]},
-              {"id": 2, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 3, "end": 3,
-               "text": "second thought", "excerpt": ["+ three"], "re": 1}]}
-EOF
-    "$diffview" "$repo@HEAD~1..HEAD" -o "$work/ann.html" --no-auto-summary --notes "$work/ann-notes.json" >/dev/null
-    sed 's#</body>#<script>setTimeout(() => { document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render"))); document.dispatchEvent(new KeyboardEvent("keydown", { key: "m", bubbles: true })); document.body.append(Object.assign(document.createElement("pre"), { id: "exp", textContent: commentsMarkdown() })); }, 300)</script></body>#' \
-        "$work/ann.html" > "$work/anndom.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/anndom.html" 2>/dev/null)
-    check "the agent note carries its id" yes "$(grep -q 'data-ann="a1"' <<<"$dom" && echo yes)"
-    check "comments carry their ids" yes "$(grep -q 'data-ann="c2"' <<<"$dom" && echo yes)"
-    check "the agent's resolution folds C1 away" yes "$(grep -q 'class="cbox resolved" data-ann="c1"' <<<"$dom" && echo yes)"
-    check "the copy button counts only unresolved" yes "$(grep -q 'copy 1 comment<' <<<"$dom" && echo yes)"
-    check "m lands on the next unresolved comment" yes "$(grep -q 'class="cbox focus-ann" data-ann="c2"' <<<"$dom" && echo yes)"
-    check "the export names the comment id" yes "$(grep -q '\*\*C2\*\*' <<<"$dom" && echo yes)"
-    check "the export marks a reply to a note" yes "$(grep -q 'reply to your note A1' <<<"$dom" && echo yes)"
-    check "the export leaves the resolved comment out" yes "$(grep -q '\*\*C1\*\*' <<<"$dom" || echo yes)"
-    check "the jump prompt is on the page" yes "$(grep -q 'id="jump"' <<<"$dom" && echo yes)"
-
-    # the subtle one: Ctrl+k reaches a comment the agent called resolved, r overrides that
-    # claim, and the override is what gets persisted — so the next rebuild cannot reinstate it
-    cat > "$work/probe.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  key("k", { ctrlKey: true });
-  const input = document.querySelector("#jump input");
-  input.value = "c1";
-  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  key("r");
-  key("D");
-  key("u");
-  document.body.append(Object.assign(document.createElement("pre"), { id: "probe", textContent:
-    "at=" + (S.ann && S.ann.kind + S.ann.id) + " resolved=" + isResolved(1)
-    + " comments=" + S.comments.length }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="probe.js"></script></body>#' "$work/ann.html" > "$work/probe.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/probe.html" 2>/dev/null)
-    check "ctrl+k reaches a resolved comment by id" yes "$(grep -q 'at=comment1' <<<"$dom" && echo yes)"
-    check "r overrides the agent's resolution" yes "$(grep -q 'resolved=false' <<<"$dom" && echo yes)"
-    check "the override is persisted to the file beside the page" yes "$(grep -q '"verdict": \[\[1, false\]\]' "$work/probe.html.state.json" && echo yes)"
-    check "u restores a deleted comment" yes "$(grep -q 'comments=2' <<<"$dom" && echo yes)"
-
-    # resolving the comment you stand on has to look like it did something: focus keeps a
-    # resolved comment open, so it must leave — and a click is the way back into a folded one
-    cat > "$work/fold.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  key("m");
-  key("r");
-  const folded = getComputedStyle(document.querySelector('[data-ann="c2"] .ctext')).display === "none";
-  const left = S.ann ? S.ann.kind + S.ann.id : "none";
-  document.querySelector('[data-ann="c2"]').click();
-  const reopened = getComputedStyle(document.querySelector('[data-ann="c2"] .ctext')).display !== "none";
-  document.body.append(Object.assign(document.createElement("pre"), { id: "fold", textContent:
-    "folded=" + folded + " focus=" + left + " reopened=" + reopened }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="fold.js"></script></body>#' "$work/ann.html" > "$work/fold.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/fold.html" 2>/dev/null)
-    check "resolving folds the comment and lets focus go" yes "$(grep -q 'folded=true focus=none' <<<"$dom" && echo yes)"
-    check "clicking a folded comment opens it back up" yes "$(grep -q 'reopened=true' <<<"$dom" && echo yes)"
-
-    # a focused comment must not capture Space: it stays the review-progress key everywhere,
-    # which is why resolve lives on its own letter
-    cat > "$work/space.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  key("m");
-  key(" ");
-  document.body.append(Object.assign(document.createElement("pre"), { id: "space", textContent:
-    "resolved=" + isResolved(2) + " viewed=" + S.viewed.size + " focus=" + (S.ann ? "held" : "none") }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="space.js"></script></body>#' "$work/ann.html" > "$work/space.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/space.html" 2>/dev/null)
-    check "space on a focused comment marks the file viewed, never resolves" "resolved=false viewed=1 focus=none" "$(grep -o 'id="space">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-
-    # motion runs on document position, not on an index into the ring being walked: notes
-    # sorted however the JSON happened to list them, and every hop taken from somewhere the
-    # ring does not contain — a comment you just resolved, a note while m walks comments
-    cat > "$work/order-notes.json" <<'EOF'
-{"notes": [{"id": 9, "path": "b.txt", "line": 3, "text": "listed first, sits last"},
-           {"id": 2, "path": "b.txt", "line": 1, "text": "listed second, sits first"}],
- "resolved": []}
-EOF
-    cat > "$work/order.html.state.json" <<'EOF'
-{"key": "diffview:repo@HEAD~1..HEAD", "savedAt": 1, "nextId": 4, "viewed": [], "verdict": [],
- "comments": [{"id": 1, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 1, "end": 1, "text": "one", "excerpt": ["  one"]},
-              {"id": 2, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 2, "end": 2, "text": "two", "excerpt": ["  two"]},
-              {"id": 3, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 2, "end": 2, "text": "three", "excerpt": ["  two"]}]}
-EOF
-    "$diffview" "$repo@HEAD~1..HEAD" -o "$work/order.html" --no-auto-summary --notes "$work/order-notes.json" >/dev/null
-    cat > "$work/order.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-const trace = [];
-const mark = () => trace.push(S.ann ? (S.ann.kind === "note" ? "A" : "C") + S.ann.id : "-");
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  key("n"); mark();                 // notes walk the file, not the JSON: A2 before A9
-  key("n"); mark();
-  key("k", { ctrlKey: true });      // stand on C2, resolve it, and carry on to the next one
-  const input = document.querySelector("#jump input");
-  input.value = "c2";
-  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  key("r"); mark();
-  key("n"); mark();                 // and across kinds, forward from where you stand
-  key("m"); mark();                 // entering a ring with nothing ahead still lands: nearest behind
-  key("m"); mark();                 // but walking one stops at its end
-  document.body.append(Object.assign(document.createElement("pre"), { id: "trace", textContent: trace.join(" ") }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="order.js"></script></body>#' "$work/order.html" > "$work/order-dom.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/order-dom.html" 2>/dev/null)
-    check "motion follows document order, not ring position" "A2 A9 C3 A9 C3 C3" "$(grep -o 'id="trace">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-
-    # a note you have read and have nothing to say about: r folds it, n skips it, focus moves on,
-    # the export names it, and the fold is tied to the text — a rewritten note comes back unseen
-    "$diffview" "$repo@HEAD~1..HEAD" -o "$work/seen.html" --no-auto-summary --notes "$work/order-notes.json" >/dev/null
-    cat > "$work/seen.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  key("n");                          // A2
-  key("r");                          // seen; focus should have gone on to A9
-  const after = S.ann ? S.ann.kind + S.ann.id : "none";
-  const folded = getComputedStyle(document.querySelector('[data-ann="a2"] .atext')).display === "none";
-  key("N");                          // back from A9: A2 is skipped, nothing before it, so we stay
-  const skipped = S.ann ? S.ann.kind + S.ann.id : "none";
-  key("r");                          // A9 seen too; ring is empty, focus is let go
-  const empty = S.ann ? S.ann.kind + S.ann.id : "none";
-  const count = document.querySelector(".fhead .acount").classList.contains("hidden") ? "hidden" : "shown";
-  const exported = commentsMarkdown().includes("## notes read, nothing needed\n\nA2, A9");
-  S.seen.set(2, "some earlier wording");   // the agent rewrote A2 since it was marked
-  document.body.append(Object.assign(document.createElement("pre"), { id: "seen", textContent:
-    `after=${after} folded=${folded} skipped=${skipped} empty=${empty} count=${count} exported=${exported} rewritten=${isSeen(findNote(2)) ? "seen" : "unseen"}` }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="seen.js"></script></body>#' "$work/seen.html" > "$work/seen-dom.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/seen-dom.html" 2>/dev/null)
-    check "r on a note marks it seen: folded, skipped, exported, and tied to its text" \
-        "after=note9 folded=true skipped=note9 empty=none count=hidden exported=true rewritten=unseen" \
-        "$(grep -o 'id="seen">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-    check "seen notes are persisted beside the page" yes "$(grep -q '"seen": \[\[2, "listed second, sits first"\], \[9, "listed first, sits last"\]\]' "$work/seen-dom.html.state.json" && echo yes)"
-
-    # a seen note that was also replied to is spoken for by the reply, so the export does not list it
-    cat > "$work/replied.js" <<'EOF'
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  toggleSeen(findNote(1));
-  document.body.append(Object.assign(document.createElement("pre"), { id: "replied", textContent:
-    "listed=" + commentsMarkdown().includes("## notes read, nothing needed") }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="replied.js"></script></body>#' "$work/ann.html" > "$work/replied.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/replied.html" 2>/dev/null)
-    check "a seen note with a reply is left to the reply" yes "$(grep -q 'listed=false' <<<"$dom" && echo yes)"
-
-    # threads: a reply sits under what it answers, indented, and motion walks that order;
-    # a reply to a nested note is written at the thread's anchor, right under the note
-    cat > "$work/thread-notes.json" <<'EOF'
-{"notes": [{"id": 1, "path": "b.txt", "line": 3, "text": "root note"},
-           {"id": 5, "re": "C1", "text": "answers the root comment"},
-           {"id": 6, "re": "C3", "text": "answers the reply to the root note"}]}
-EOF
-    cat > "$work/thread.html.state.json" <<'EOF'
-{"savedAt": 1, "nextId": 4, "viewed": [], "verdict": [],
- "comments": [{"id": 1, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 3, "end": 3, "text": "root comment", "excerpt": ["+ three"]},
-              {"id": 2, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 3, "end": 3, "text": "second root comment", "excerpt": ["+ three"]},
-              {"id": 3, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 3, "end": 3, "text": "replies to A1", "excerpt": ["+ three"], "re": 1}]}
-EOF
-    "$diffview" "$repo@HEAD~1..HEAD" -o "$work/thread.html" --no-auto-summary --notes "$work/thread-notes.json" >/dev/null
-    cat > "$work/thread.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-const trace = [];
-const mark = () => trace.push(S.ann ? (S.ann.kind === "note" ? "A" : "C") + S.ann.id : "-");
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  const order = [...document.querySelectorAll("[data-ann]")].map(el => el.dataset.ann + ":" + el.style.getPropertyValue("--depth")).join(" ");
-  key("m"); mark(); key("m"); mark(); key("m"); mark();
-  key("k", { ctrlKey: true });
-  const input = document.querySelector("#jump input");
-  input.value = "a5";
-  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-  key("c");
-  const ed = document.querySelector(".cbox[data-editing]");
-  const anchored = ed.dataset.side + ed.dataset.start + "-" + ed.dataset.end + "/re" + ed.dataset.re;
-  const under = ed.closest("tr").previousElementSibling.querySelector("[data-ann]").dataset.ann;
-  const buttons = [...document.querySelectorAll('[data-ann="a1"] button')].map(b => b.textContent).join(",");
-  document.body.append(Object.assign(document.createElement("pre"), { id: "thread", textContent:
-    `order=${order} motion=${trace.join(" ")} anchored=${anchored} under=${under} buttons=${buttons}` }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="thread.js"></script></body>#' "$work/thread.html" > "$work/thread-dom.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/thread-dom.html" 2>/dev/null)
-    check "replies sit under what they answer, indented, and motion follows" \
-        "order=a1:0 c3:1 a6:2 c1:0 a5:1 c2:0 motion=C3 C1 C2 anchored=new3-3/re5 under=a5 buttons=reply,mark seen" \
-        "$(grep -o 'id="thread">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-
-    # a save that does not land must not look like a save that did
-    cat > "$work/fail.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  window.fetch = () => Promise.resolve({ ok: false, status: 503 });
-  key("m"); key("r");
-  setTimeout(() => document.body.append(Object.assign(document.createElement("pre"), { id: "fail", textContent:
-    "banners=" + document.querySelectorAll(".savefail").length
-    + " command=" + document.querySelector(".savefail code").textContent
-    + " copy=" + document.querySelector(".savefail button.btn").textContent
-    + " local=" + JSON.parse(localStorage.getItem("dv-state:" + DATA.key)).verdict.length })), 200);
-}, 300);
-EOF
-    sed 's#</body>#<script src="fail.js"></script></body>#' "$work/ann.html" > "$work/fail.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/fail.html" 2>/dev/null)
-    check "a rejected save says so instead of passing silently" yes "$(grep -q 'banners=1' <<<"$dom" && echo yes)"
-    check "the warning carries the restart command with a copy button, and the browser holds what did not land" \
-        "command=diffview --serve $work/ann.html copy=copy local=1" "$(grep -o 'id="fail">[^<]*' <<<"$dom" | cut -d'>' -f2 | sed 's/^banners=1 //')"
-
-    # that warning is a live fact, not a notice: the server answering again clears it and lands what was typed meanwhile
-    cat > "$work/back.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-const real = window.fetch.bind(window);
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  window.fetch = () => Promise.resolve({ ok: false, status: 503 });
-  key("m"); key("r");                 // resolve a comment into a server that is gone
-  setTimeout(() => {
-    const broke = document.querySelectorAll(".savefail").length;
-    window.fetch = real;              // and now it is back
-    setTimeout(() => document.body.append(Object.assign(document.createElement("pre"), { id: "back", textContent:
-      `broke=${broke} bars=${document.querySelectorAll(".savefail").length} retrying=${!!RETRY}` })), 5000);
-  }, 100);
-}, 300);
-EOF
-    sed 's#</body>#<script src="back.js"></script></body>#' "$work/ann.html" > "$work/back.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=20000 --dump-dom "$base/back.html" 2>/dev/null)
-    check "a server that comes back clears the warning by itself" "broke=1 bars=0 retrying=false" "$(grep -o 'id="back">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-    check "and the retry writes what was typed while it was down" True "$(python3 -c "import json;print(json.load(open('$work/back.html.state.json'))['verdict'] != [])")"
-
-    # a second page on one review saves first: this page's save is refused, the file is merged in and the save
-    # goes again; nobody is asked, and the other page's comment shows up here
-    cat > "$work/rival.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-setTimeout(async () => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  // another page has this review open and saves first: everything here, plus a comment of its own
-  const theirs = { savedAt: 1234, writer: "another-page", since: SINCE, nextId: S.nextId + 1, verdict: [], seen: [],
-                   comments: [...S.comments, { ...S.comments[0], id: S.nextId, text: "from the other page" }] };
-  await fetch(location.pathname + ".state.json", { method: "POST", body: JSON.stringify(theirs) });
-  key("m"); key("r");                 // this page's own save is based on a version the file has left behind
-  setTimeout(() => document.body.append(Object.assign(document.createElement("pre"), { id: "rival", textContent:
-    `bars=${document.querySelectorAll(".savefail").length} shown=${S.comments.some(c => c.text === "from the other page")}`
-    + ` verdicts=${S.verdict.size} landed=${SINCE > 1234}` })), 1500);
-}, 300);
-EOF
-    sed 's#</body>#<script src="rival.js"></script></body>#' "$work/ann.html" > "$work/rival.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=20000 --dump-dom "$base/rival.html" 2>/dev/null)
-    check "a save the file moved under is merged and sent again, and the other page's comment shows up here" \
-        "bars=0 shown=true verdicts=1 landed=true" "$(grep -o 'id="rival">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-    check "and the file holds the other page's comment and this page's verdict" "True True" \
-        "$(python3 -c "import json;s=json.load(open('$work/rival.html.state.json'));print(any(c['text'] == 'from the other page' for c in s['comments']), s['verdict'] != [])")"
-
-    # a page opened as a file cannot write anywhere, so it says so and refuses comments
-    cat > "$work/ro.js" <<'EOF'
-const key = (k, extra) => document.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true, ...extra }));
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  key("j"); key("c");
-  key("m"); key("r");
-  key("n"); key("r");
-  document.body.append(Object.assign(document.createElement("pre"), { id: "ro", textContent:
-    "editors=" + document.querySelectorAll(".cbox[data-editing]").length + " resolved=" + isResolved(2) + " seen=" + isSeen(findNote(1)) }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="ro.js"></script></body>#' "$work/ann.html" > "$work/ro.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "file://$work/ro.html" 2>/dev/null)
-    check "a file:// page says it is read-only" yes "$(grep -q 'class="readonly"' <<<"$dom" && echo yes)"
-    check "the banner names the command that enables comments" yes "$(grep -q "diffview --serve $work" <<<"$dom" && echo yes)"
-    check "a file:// page opens no comment editor, resolves nothing, marks nothing seen" "editors=0 resolved=false seen=false" "$(grep -o 'id="ro">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-    check "a file:// page writes no state" yes "$([ ! -f "$work/ro.html.state.json" ] && echo yes)"
-
-    # what a reviewer or an agent writes is shown, never run: markup in a comment, a note or
-    # the summary comes out as the characters typed
-    cat > "$work/markup.html.state.json" <<'EOF'
-{"savedAt": 1, "nextId": 2, "viewed": [], "verdict": [],
- "comments": [{"id": 1, "fileKey": "0:b.txt", "hi": 0, "side": "new", "start": 3, "end": 3,
-               "text": "quoting <b>bold</b> and <script>alert(1)</script>", "excerpt": ["+ three"]}]}
-EOF
-    "$diffview" "$repo@HEAD~1..HEAD" -o "$work/markup.html" --summary 'a summary with <img src=x onerror=alert(2)> in it' \
-        --notes <(echo '{"notes": [{"id": 1, "path": "b.txt", "line": 3, "text": "note with <iframe src=x></iframe> `and <u>code</u>`"}]}') >/dev/null
-    cat > "$work/markup.js" <<'EOF'
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  document.body.append(Object.assign(document.createElement("pre"), { id: "markup", textContent:
-    "elements=" + document.querySelectorAll(".ctext b, .ctext script, .atext iframe, .atext u, .summary img").length }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="markup.js"></script></body>#' "$work/markup.html" > "$work/markup-dom.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/markup-dom.html" 2>/dev/null)
-    check "markup in a comment renders as text" 1 "$(grep -c 'quoting &lt;b&gt;bold&lt;/b&gt; and &lt;script&gt;alert(1)&lt;/script&gt;' <<<"$dom")"
-    check "markup in a note renders as text, inside code too" 1 "$(grep -c 'note with &lt;iframe src=x&gt;&lt;/iframe&gt; <code>and &lt;u&gt;code&lt;/u&gt;</code>' <<<"$dom")"
-    check "markup in the summary renders as text" 1 "$(grep -c 'a summary with &lt;img src=x onerror=alert(2)&gt; in it' <<<"$dom")"
-    check "and none of it became an element" "elements=0" "$(grep -o 'id="markup">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-
-    # a gap opened all the way must not leave a header that reads as more folded lines
-    seq 1 40 | sed 's/^/line /' > "$work/gap-old.txt"
-    sed -e 's/^line 12$/line 12 changed/' -e 's/^line 21$/line 21 changed/' "$work/gap-old.txt" > "$work/gap-new.txt"
-    "$diffview" "$work/gap-old.txt=$work/gap-new.txt" -o "$work/gap.html" --no-auto-summary >/dev/null
-    cat > "$work/gap.js" <<'EOF'
-setTimeout(() => {
-  document.querySelectorAll(".main .fcard").forEach(c => c.dispatchEvent(new Event("render")));
-  const joined = () => document.querySelectorAll("tr.hunkhdr.joined").length;
-  const before = joined();
-  expandHunk(ALL[0].f, 0, 1, 20, 1);   // fill the gap between the hunks into the first one
-  document.body.append(Object.assign(document.createElement("pre"), { id: "gap", textContent:
-    "before=" + before + " after=" + joined() + " gaps=" + document.querySelectorAll("tr.gap").length
-    + " height=" + getComputedStyle(document.querySelector("tr.hunkhdr.joined td")).height }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="gap.js"></script></body>#' "$work/gap.html" > "$work/gap-dom.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/gap-dom.html" 2>/dev/null)
-    check "a fully opened gap turns the lower hunk's header into a hairline" "before=0 after=1 gaps=2 height=2px" "$(grep -o 'id="gap">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-
-    # a panel resized in a container makes the browser report a ResizeObserver loop; that is no error of the page's
-    cat > "$work/resize.js" <<'EOF'
-setTimeout(() => {
-  dispatchEvent(new ErrorEvent("error", { message: "ResizeObserver loop completed with undelivered notifications" }));
-  const quiet = document.getElementById("toast").textContent;
-  dispatchEvent(new ErrorEvent("error", { message: "boom" }));
-  document.body.append(Object.assign(document.createElement("pre"), { id: "resize", textContent:
-    `quiet=[${quiet}] loud=[${document.getElementById("toast").textContent}]` }));
-}, 300);
-EOF
-    sed 's#</body>#<script src="resize.js"></script></body>#' "$work/range.html" > "$work/resize.html"
-    dom=$(chromium --headless --disable-gpu --virtual-time-budget=8000 --dump-dom "$base/resize.html" 2>/dev/null)
-    check "a ResizeObserver loop raises no error, and any other error still does" "quiet=[] loud=[JS error: boom]" \
-        "$(grep -o 'id="resize">[^<]*' <<<"$dom" | cut -d'>' -f2)"
-else
-    echo "skip chromium not found — DOM checks not run"
-fi
-
-echo
-if [ "$failures" -eq 0 ]; then echo "all checks passed"; else echo "$failures check(s) FAILED"; exit 1; fi
+finish
