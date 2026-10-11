@@ -191,9 +191,7 @@ exit 1
         self.git(code, "commit", "-q", "-m", "init")
         self.git(agent, "init", "-q")
         for slug, parent, session in tickets:
-            ticket(agent, slug, "claimed" if parent else "open", parent)
-            self.git(agent, "add", f"tickets/{slug}.md")
-            self.git(agent, "commit", "-q", "-m", f"file {slug}", "-m", f"Session: {session}")
+            self.committed(agent, slug, session, "claimed" if parent else "open", parent)
         return code
 
     def committed(self, agent: Path, slug: str, session: str, status: str = "open", parent: str | None = None) -> None:
