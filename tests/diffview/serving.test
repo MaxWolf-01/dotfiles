@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# tier: full-path (a live hub over HTTP)
+# Drive bin/diffview where it reaches the container hub, and the summary it has written after the page. Run it
+# directly; no framework. What diffview renders is page-data.test's.
+
+set -uo pipefail
+
+# real shells pin the browser via this var; the --open checks stub xdg-open, so force that path
+export DIFFVIEW_BROWSER=""
+
+bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../bin" && pwd)"
+diffview="$bin/diffview"
+work=$(mktemp -d)
+free_port() { python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])"; }
+
+# a container hub of the test's own, never the one on 8377, with a home of its own outside $work
+# so $work can be served whole; uv keeps its real directories, or the hub resolves its dependencies anew
+hubhome=$(mktemp -d)
+uvcache=$(uv cache dir)
+uvpython=$(uv python dir)
+export CONTAINER_HUB_PORT
+CONTAINER_HUB_PORT=$(free_port)
+hub="http://127.0.0.1:$CONTAINER_HUB_PORT"
+HOME="$hubhome" UV_CACHE_DIR="$uvcache" UV_PYTHON_INSTALL_DIR="$uvpython" setsid "$bin/container-hub" --port "$CONTAINER_HUB_PORT" --state "$hubhome/state" \
+    > "$hubhome/hub.log" 2>&1 &
+hubpid=$!
+downport=$(free_port)   # where a hub is down until a diffview brings one up
+cleanup() {
+    kill -- "-$hubpid" 2>/dev/null
+    pkill -f "container-hub --port $downport" 2>/dev/null
+    rm -rf "$work" "$hubhome"
+}
+trap cleanup EXIT
+for _ in $(seq 300); do curl -sf -o /dev/null "$hub/.health" && break; sleep 0.2; done
+
+. "$(dirname "${BASH_SOURCE[0]}")/../check.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/data.sh"
+
+# a repo with three commits, so that HEAD~2..HEAD and HEAD~1..HEAD name different diffs
+repo="$work/repo"
+git init -q "$repo"
+for f in c a b; do
+    printf '%s\n' "$f" > "$repo/$f.txt"
+    git -C "$repo" add "$f.txt"
+    git -C "$repo" -c user.name=t -c user.email=t@t commit -q -m "add $f.txt"
+done
+
+# --- derived output: one page per source list, so parallel renders never collide
+
+d1=$(HOME="$work" "$diffview" "$repo@HEAD~2..HEAD" --no-auto-summary | head -1 | awk '{print $1}')
+d2=$(HOME="$work" "$diffview" "$repo@HEAD~2..HEAD" --no-auto-summary | head -1 | awk '{print $1}')
+d3=$(HOME="$work" "$diffview" "$repo@HEAD~1..HEAD" --no-auto-summary | head -1 | awk '{print $1}')
+check "same specs derive the same page" "$d1" "$d2"
+check "different specs derive different pages" yes "$([ "$d1" != "$d3" ] && echo yes)"
+check "derived pages land under Downloads/diffview" yes "$(case "$d1" in "$work"/Downloads/diffview/*) echo yes;; esac)"
+check "a derived name carries no range to mis-copy" yes "$(grep -qE '/repo-[0-9a-f]{8}\.html$' <<<"$d1" && echo yes)"
+check "a derived page is served by the hub, so its url can take comments" yes "$(HOME="$work" "$diffview" "$repo@HEAD~2..HEAD" --no-auto-summary | tail -1 | grep -qE "^$hub/f$work/Downloads/diffview/repo-[0-9a-f]{8}\.html\$" && echo yes)"
+
+# the displacing render is the moment comments are about to be stranded, so it says so
+echo '{"savedAt":1,"comments":[{"id":1}],"viewed":[],"nextId":2,"verdict":[]}' > "$d1.state.json"
+warned=$(HOME="$work" "$diffview" "$repo@HEAD~1..HEAD" --no-auto-summary 2>&1 >/dev/null)
+check "a page displacing one that holds comments says so" yes "$(grep -q 'holds comments this one will not' <<<"$warned" && echo yes)"
+rm -f "$d1.state.json"
+check "and stays quiet when the earlier page holds none" "" "$(HOME="$work" "$diffview" "$repo@HEAD~1..HEAD" --no-auto-summary 2>&1 >/dev/null)"
+
+d4=$(HOME="$work" "$diffview" "$repo@HEAD~2..HEAD" "$repo@HEAD~1..HEAD" --no-auto-summary | head -1 | awk '{print $1}')
+check "a derived page is pinned to its specs, so a grown one differs" yes "$([ "$d1" != "$d4" ] && echo yes)"
+
+mkdir -p "$repo/sub" && touch "$repo/sub/keep"
+d5=$(HOME="$work" "$diffview" "$repo/sub@HEAD~2..HEAD" --no-auto-summary | head -1 | awk '{print $1}')
+check "a spec written from a subdirectory names the repo's page" "$d1" "$d5"
+rm -rf "$repo/sub"
+
+repo2="$work/repo2"; mkdir -p "$repo2"; git -C "$repo2" init -q
+for i in 1 2; do echo "line $i" >> "$repo2/a.txt"; git -C "$repo2" add a.txt; git -C "$repo2" commit -qm "c$i"; done
+r1=$(HOME="$work" "$diffview" "$repo2@HEAD~1..HEAD" --no-auto-summary | head -1 | awk '{print $1}')
+echo "line 3" >> "$repo2/a.txt"; git -C "$repo2" add a.txt; git -C "$repo2" commit -qm c3
+r2=$(HOME="$work" "$diffview" "$repo2@HEAD~1..HEAD" --no-auto-summary | head -1 | awk '{print $1}')
+check "a HEAD-relative range names a new page once a commit lands" yes "$([ "$r1" != "$r2" ] && echo yes)"
+
+# --- --open lands on a page that can take comments, not a read-only file
+
+mkdir -p "$work/stub" "$work/pages"
+printf '#!/bin/sh\necho "$1" > "%s/opened"\n' "$work/stub" > "$work/stub/xdg-open"
+chmod +x "$work/stub/xdg-open"
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/o.html" --no-auto-summary --open >/dev/null 2>&1
+opened=$(cat "$work/stub/opened")
+check "--open opens the page on the container hub" "$hub/f$work/pages/o.html" "$opened"
+curl -s -o "$work/served.html" "$opened"   # grep -q on a pipe would cut curl off, which pipefail counts as a failure
+check "which serves the page there" "$work/pages/o.html" "$(datum "$work/served.html" "data['key']")"
+check "and says the pages it serves can save" True "$(curl -s "$hub/.health" | python3 -c 'import json,sys;print(json.load(sys.stdin)["saves"])')"
+
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$hubhome/home.html" --no-auto-summary --open >/dev/null 2>&1
+check "a page sitting in your home is served on its own" "$hub/f$hubhome/home.html" "$(cat "$work/stub/opened")"
+check "and nothing else in your home with it" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$hub/f$hubhome/hub.log")"
+refused=$("$diffview" --serve "$hubhome" 2>&1)
+check "your home is never served whole, in the hub's own words, not its JSON" "1 yes" \
+    "$? $(grep -q 'refused it: [^{]*never serves whole' <<<"$refused" && echo yes)"
+refused=$("$diffview" --serve "$work/nowhere" 2>&1)
+check "a path that does not exist is refused before the hub is asked" "1 yes" "$? $(grep -q "^diffview: --serve $work/nowhere does not exist" <<<"$refused" && echo yes)"
+# a symlinked home must not walk past that guard: resolve both sides or it does
+ln -s "$hubhome" "$work/homelink"
+refused=$("$diffview" --serve "$work/homelink" 2>&1)
+check "nor through a symlink to it" "1 yes" "$? $(grep -q 'never serves whole' <<<"$refused" && echo yes)"
+
+# a diffview with no hub beside it, and none answering, says so rather than failing
+mkdir -p "$work/nohub"
+cp "$diffview" "$work/nohub/diffview"
+said=$(CONTAINER_HUB_PORT=$(free_port) "$work/nohub/diffview" --serve "$work/pages" 2>&1)
+check "a diffview whose hub is gone says it cannot be started" "1 yes" "$? $(grep -q 'could not be started' <<<"$said" && echo yes)"
+
+# something else on the hub's port that refuses the page, in words that are no JSON: the page opens as a file, and says why
+refuserport=$(free_port)
+mkdir -p "$work/refuser"
+timeout 120 python3 -m http.server --bind 127.0.0.1 --directory "$work/refuser" "$refuserport" >/dev/null 2>&1 &
+refuser=$!
+for _ in $(seq 100); do curl -s -o /dev/null "http://127.0.0.1:$refuserport/" && break; sleep 0.1; done
+said=$(CONTAINER_HUB_PORT=$refuserport PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/refused.html" --no-auto-summary --open 2>&1 >/dev/null)
+kill "$refuser"
+check "a page the hub's port refuses opens read-only, as its file" "file://$work/pages/refused.html" "$(cat "$work/stub/opened")"
+check "...and says who refused it, and why" yes "$(tr '\n' ' ' <<<"$said" | grep -q "127.0.0.1:$refuserport refused it: .*501.*; read-only" && echo yes)"
+
+# the page is opened as one url, not shadowed by a second one naming the read-only file
+lines=$(PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/o.html" --no-auto-summary --open 2>/dev/null | grep -c '^file://')
+check "no file:// url is printed alongside the served one" 0 "$lines"
+
+served=$("$diffview" --serve "$work/pages")
+check "--serve prints the directory's address on the hub" "diffview: serving $work/pages at $hub/f$work/pages/" "$served"
+
+# --- with no hub answering, --serve brings one up; two at once, from a person and an agent say, leave one
+
+mkdir -p "$work/beat" "$work/downhome"
+starts=()
+for n in 1 2; do
+    HOME="$work/downhome" UV_CACHE_DIR="$uvcache" UV_PYTHON_INSTALL_DIR="$uvpython" CONTAINER_HUB_PORT=$downport \
+        "$diffview" --serve "$work/beat" > "$work/beat/start$n" 2>&1 &
+    starts+=($!)
+done
+wait "${starts[@]}"
+check "--serve with the hub down starts one and prints the address on it" \
+    "diffview: serving $work/beat at http://127.0.0.1:$downport/f$work/beat/ x2" "$(sort -u "$work/beat/start1" "$work/beat/start2") x$(cat "$work/beat/start1" "$work/beat/start2" | grep -c serving)"
+for _ in $(seq 50); do [ "$(pgrep -fc "bin/python .*container-hub --port $downport")" -le 1 ] && break; sleep 0.2; done
+check "and two at once leave one hub" 1 "$(pgrep -fc "bin/python .*container-hub --port $downport")"
+pkill -f "container-hub --port $downport"
+
+# --- the auto summary lands after the page, never before it
+
+cat > "$work/stub/change-summary" <<'STUB'
+#!/bin/sh
+cat > /dev/null
+sleep 1
+echo "a stub summary paragraph"
+STUB
+chmod +x "$work/stub/change-summary"
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/async.html" >/dev/null
+check "the page holds a slot for the summary" True "$(datum "$work/async.html" "data['summaryPending']")"
+check "and is written before that summary exists" no "$([ -f "$work/async.html.summary.json" ] && echo yes || echo no)"
+for _ in $(seq 40); do [ -f "$work/async.html.summary.json" ] && break; sleep 0.2; done
+check "the summary lands in the sidecar a served page polls" yes "$(grep -q 'a stub summary paragraph' "$work/async.html.summary.json" && echo yes)"
+check "and is baked into the page file too, which clears the slot" "a stub summary paragraph False" \
+    "$(datum "$work/async.html" "data['summary'] + ' ' + str(data['summaryPending'])")"
+
+# a failed model call belongs in the page, not in a terminal that has moved on
+cat > "$work/stub/change-summary" <<'STUB'
+#!/bin/sh
+cat > /dev/null
+echo "change-summary: claude exited 1: not logged in" >&2
+exit 1
+STUB
+err=$(PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~2..HEAD" -o "$work/failed.html" 2>&1 >/dev/null)
+for _ in $(seq 40); do [ -f "$work/failed.html.summary.json" ] && break; sleep 0.2; done
+check "a failed summary says nothing on the command line" "" "$err"
+check "and carries its reason in the sidecar instead" yes "$(grep -q 'not logged in' "$work/failed.html.summary.json" && echo yes)"
+check "leaving the page as it was written" True "$(datum "$work/failed.html" "data['summaryPending']")"
+
+# the page is open and commentable for the seconds the model runs, and the rewrite must keep what lands
+cat > "$work/stub/change-summary" <<'STUB'
+#!/bin/sh
+cat > /dev/null
+sleep 2
+echo "a slow summary paragraph"
+STUB
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/commented.html" >/dev/null
+echo '{"savedAt":1,"comments":[{"id":1,"text":"written while the model ran"}],"viewed":[],"nextId":2,"verdict":[]}' > "$work/commented.html.state.json"
+for _ in $(seq 60); do grep -q 'a slow summary paragraph' "$work/commented.html" && break; sleep 0.2; done
+check "a comment made while the summary was written survives the rewrite" "a slow summary paragraph ['written while the model ran']" \
+    "$(datum "$work/commented.html" "data['summary']") $(saved "$work/commented.html")"
+
+# rendering to the same path again while the model runs makes the page somebody else's
+cat > "$work/stub/change-summary" <<'STUB'
+#!/bin/sh
+cat > /dev/null
+sleep 2
+echo "a late summary paragraph"
+STUB
+PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/raced.html" >/dev/null
+"$diffview" "$repo@HEAD~2..HEAD" -o "$work/raced.html" --no-auto-summary --summary "the newer render" >/dev/null
+for _ in $(seq 40); do [ -f "$work/raced.html.summary.json" ] && break; sleep 0.2; done
+sleep 0.5
+check "a late summary does not clobber the render that replaced it" "the newer render" "$(datum "$work/raced.html" "data['summary']")"
+check "though the sidecar still holds it for a page already open" yes "$(grep -q 'a late summary paragraph' "$work/raced.html.summary.json" && echo yes)"
+rm -f "$work/stub/change-summary"
+
+finish
