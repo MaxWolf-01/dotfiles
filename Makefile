@@ -62,7 +62,7 @@ run/%:
 	start=$$(date +%s); \
 	timeout -k 10 $(TIMEOUT) ./$* < /dev/null 2>&1 | tee "$$log"; rc=$${PIPESTATUS[0]}; \
 	case $$rc in \
-		0) grep '^skip' "$$log" | sed 's|^|$*: |' >> "$(RESULTS)/partly" ;; \
+		0) grep -E '^skip[ :]' "$$log" | sed 's|^|$*: |' >> "$(RESULTS)/partly" ;; \
 		77) echo "$*: $$(sed -n 's/^skip: //p' "$$log" | tail -1)" >> "$(RESULTS)/skipped" ;; \
 		124|137) echo "$*: stopped after $(TIMEOUT) s" >> "$(RESULTS)/failed" ;; \
 		*) echo "$*" >> "$(RESULTS)/failed" ;; \
