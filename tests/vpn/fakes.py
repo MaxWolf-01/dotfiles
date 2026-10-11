@@ -27,6 +27,7 @@ unnoticed.
 """
 
 import atexit
+import contextlib
 import hashlib
 import socket
 import threading
@@ -839,3 +840,149 @@ class Watcher:
         self.world.end = T0 + secs
         self.due = watching(self.world, vpn.handle, self.w, self.due)
         return self
+
+
+# --- the peers, and the World the watcher cases build over them
+
+
+def peer(name, country, city, online=True):
+    return {
+        "ID": f"id-{name}",
+        "HostName": name,
+        "DNSName": f"{name}.mullvad.ts.net.",
+        "Online": online,
+        "ExitNode": False,
+        "ExitNodeOption": True,
+        "Location": {"Country": country, "City": city},
+    }
+
+
+# Out of order on purpose, so the sorting is visible. Frankfurt has a node after
+# the current one, an offline one between, and one before it to wrap around to.
+PEERS = [
+    peer("de-fra-wg-202", "Germany", "Frankfurt"),
+    peer("se-sto-wg-001", "Sweden", "Stockholm"),
+    peer("de-fra-wg-401", "Germany", "Frankfurt"),
+    peer("nl-ams-wg-001", "Netherlands", "Amsterdam"),
+    peer("de-fra-wg-001", "Germany", "Frankfurt"),
+    peer("de-fra-wg-203", "Germany", "Frankfurt", online=False),
+    peer("ch-zrh-wg-001", "Switzerland", "Zurich"),
+    peer("de-dus-wg-101", "Germany", "Dusseldorf"),
+    peer("us-ash-wg-001", "USA", "Ashburn, VA"),
+    peer("at-vie-wg-001", "Austria", "Vienna"),
+    peer("de-ber-wg-001", "Germany", "Berlin"),
+    peer("se-got-wg-001", "Sweden", "Gothenburg"),
+]
+LAPTOP = {"ID": "id-laptop", "HostName": "laptop", "DNSName": "laptop.tail0000.ts.net.",
+          "Online": True, "ExitNode": False, "ExitNodeOption": False}
+
+
+def status(exit_name=None, online=True):
+    """A full status reading with `exit_name` as the exit node, or none."""
+    peers = {p["ID"]: dict(p) for p in PEERS + [LAPTOP]}
+    if exit_name is None:
+        return {"BackendState": "Running", "Peer": peers, "ExitNodeStatus": None}
+    peers[f"id-{exit_name}"]["ExitNode"] = True
+    return {"BackendState": "Running", "Peer": peers, "ExitNodeStatus": {"ID": f"id-{exit_name}", "Online": online}}
+
+
+HOSTS = [Host(p["HostName"], p["Location"]["Country"], p["Location"]["City"], online=p["Online"])
+         for p in PEERS]
+EVERYTHING = frozenset(h.name for h in HOSTS)
+# Frankfurt as it was live on 2026-09-25: fifteen nodes in four provider series.
+FRANKFURT = [Host(f"de-fra-wg-{n}", "Germany", "Frankfurt")
+             for n in "001 002 003 004 005 101 102 103 104 201 202 203 404 405 406".split()]
+WORLDS: list[World] = []
+"""Every World the cases below build, for the check at the end that none of them asked am.i.mullvad.net."""
+
+
+def world(exit_name="de-fra-wg-202", *, automatic=False, blocked=(), dead=(), offline=(), mute=(), inert=(),
+          vesktop=True, auto_pick="de-fra-wg-001", phase=0.0):
+    """The fake network of PEERS, the exit node pinned to `exit_name` (or on automatic mode, or off for
+    None). `dead` nodes answer nothing, `inert` ones answer handshakes and carry nothing, `mute` ones carry
+    traffic but Discord does not answer through them. The dot's state file starts out absent."""
+    hosts = [replace(h, blocked=h.name in blocked, answers=h.name not in dead,
+                     carries=h.name not in dead and h.name not in inert,
+                     online=h.online and h.name not in offline, discord_silent=h.name in mute) for h in HOSTS]
+    setting = ("off", None) if exit_name is None else ("automatic" if automatic else "pinned", exit_name)
+    wd = World(hosts, setting, auto_pick=auto_pick, vesktop=vesktop, phase=phase)
+    vpn.STATE_FILE.unlink(missing_ok=True)
+    WORLDS.append(wd)
+    return wd
+
+
+def run_to(watching, secs):
+    """Run the watcher to `secs` into its World, to the first moment it is idle at or after `secs`. With engine
+    updates every 2 s, that is `secs` itself when it is even."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        watching.until(secs)
+    return watching
+
+
+def output(wd, kind, place="", watching=None):
+    """Send the watcher a request, as a vpn command does, and run the watcher until it has served it and is idle
+    again: the final message when the request failed, or None, and every line the command printed."""
+    watching = watching or Watcher(wd)
+    wd.happen(Ask(kind, place))
+    caller = wd.callers[-1]
+    run_to(watching, wd.now - T0)
+    (ok, message), = caller.finishes
+    return (None, caller.lines + [message]) if ok else (message, caller.lines)
+
+
+def command(wd, kind, place=""):
+    """Send the watcher a request, and run it until it has served it; the final message when it failed, or None."""
+    return output(wd, kind, place)[0]
+
+
+def finished(wd, n=0):
+    """When the n-th request's final line went out, in seconds after the World's first moment."""
+    return next(e.t for e in wd.entries if e.kind == "finish" and e.req == n) - T0
+
+
+def at(wd, secs, happening):
+    wd.when(At(secs), happening)
+
+
+def lines(wd, unit):
+    path = wd.runs / f"{unit}.jsonl"
+    return [json.loads(text) for text in path.read_text().splitlines()] if path.exists() else []
+
+
+def records(wd):
+    return lines(wd, vpn.NODE_UNIT)
+
+
+def events(wd):
+    return [r["stats"]["event"] for r in records(wd)]
+
+
+def last(wd):
+    return records(wd)[-1]["stats"]
+
+
+def moved(wd):
+    return [(r["stats"]["event"], r["stats"]["by"], r["stats"]["from"], r["stats"]["to"])
+            for r in records(wd)]
+
+
+def beats(wd):
+    return lines(wd, vpn.WATCH_UNIT)
+
+
+def sets(wd):
+    return [e.what for e in wd.entries if e.kind == "set"]
+
+
+def discords(wd):
+    """The Discord checks run: (seconds in, the node they went through)."""
+    return [(round(e.t - T0, 2), e.state[1]) for e in wd.entries if e.kind == "discord"]
+
+
+def shown():
+    """What the dot would show: the state file, or None where there is none."""
+    return json.loads(vpn.STATE_FILE.read_text()) if vpn.STATE_FILE.exists() else None
+
+
+def since(secs):
+    return datetime.fromtimestamp(T0 + secs).astimezone().isoformat(timespec="seconds")
