@@ -787,7 +787,8 @@ def log_in_process() -> None:
         assert outcome == "ok" or reason, f"bin/run-log refuses a {outcome} without a reason"
         stats = json.loads(json.dumps({} if stats is None else stats))
         assert isinstance(stats, dict), f"bin/run-log refuses stats that are not a JSON object: {stats!r}"
-        line = {"ts": iso(time.time()), "unit": unit, "outcome": outcome, "reason": reason or None, "stats": stats}
+        line = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "unit": unit, "outcome": outcome,
+                "reason": reason or None, "stats": stats}
         logs = Path(os.environ["RUN_LOG_DIR"])
         logs.mkdir(parents=True, exist_ok=True)
         with open(logs / f"{unit}.jsonl", "a") as f:
