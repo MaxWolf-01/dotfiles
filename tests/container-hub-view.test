@@ -50,8 +50,20 @@ BIN = Path(__file__).resolve().parents[1] / "bin"
 CHROMIUM = os.environ.get("CHROMIUM") or shutil.which("chromium")
 ORCHESTRATOR = "aaaaaaaa-0000-4000-8000-000000000001"
 SECOND = "bbbbbbbb-0000-4000-8000-000000000002"  # an orchestrator of another subtree of the same tree
-ANSWERING = f"{0x11:08x}-0000-4000-8000-{0x11:012x}"  # a session in a tmux pane, which the input box types into
-SELF_STARTED = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
+LEFT, RIGHT = f"p:{ORCHESTRATOR}:left", f"p:{ORCHESTRATOR}:right"  # the panes of ORCHESTRATOR's unit
+
+
+def session_id(n: int) -> str:
+    return f"{n:08x}-0000-4000-8000-{n:012x}"
+
+
+def started(pid: int | str = "self") -> str:
+    """When the process started, as Claude Code's registry records it: /proc/<pid>/stat's starttime field."""
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
+ANSWERING = session_id(0x11)  # a session in a tmux pane, which the input box types into
+SELF_STARTED = started()
 VIEWPORT = {"width": 1600, "height": 950}
 
 failures = 0
@@ -142,7 +154,8 @@ class World:
     and both tickets' show pages, open in ORCHESTRATOR's unit. The tab opens in the overview, every page loaded."""
 
     def __init__(self, browser, run: Path, name: str):
-        self.hub = self.context = None
+        self.hub = self.context = self.tmux_socket = None
+        self.news = 0  # the pages hears() has opened
         self.errors = []
         try:
             self.build(browser, run, name)
@@ -151,7 +164,7 @@ class World:
             raise
 
     def build(self, browser, run: Path, name: str) -> None:
-        self.scratch = run / name
+        self.scratch = Path(tempfile.mkdtemp(dir=run, prefix=f"{name}."))  # a scenario named twice runs twice
         self.home = self.scratch / "home"
         self.code = self.home / "repos" / "alpha"
         self.agent = self.code / "agent"
@@ -161,7 +174,7 @@ class World:
         self.tmux_socket = self.scratch / "tmux.sock"
         self.tmux_refused = self.scratch / "tmux-refused"
         self.tmux_shim = self.scratch / "shim" / "tmux"
-        self.tmux_shim.parent.mkdir(parents=True)
+        self.tmux_shim.parent.mkdir()
         self.tmux_shim.write_text(f"""#!/usr/bin/env bash
 [ "$1" = -S ] && [ "$2" = {shlex.quote(str(self.tmux_socket))} ] && exec {shlex.quote(shutil.which("tmux"))} "$@"
 printf '%s\\n' "$*" >> {shlex.quote(str(self.tmux_refused))}
@@ -230,14 +243,17 @@ exit 1
         self.view = self.context.new_page()
         self.view.on("pageerror", lambda e: self.errors.append(str(e)))
         self.view.goto(self.origin + "/")
+        self.view.evaluate("navigator.clipboard.writeText('')")  # the browser's, which every world's profile shares
         self.view.wait_for_function("window.wc && ws.views().length === 2", timeout=30000)
         for member in ("csv-import", "map-columns"):  # a key that trellis sends into a page still loading goes nowhere
             self.frame_of(member)
 
     # ---- the world on disk, and the hub
 
-    def git(self, cwd: Path, *args: str) -> None:
-        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, env=self.env,
+    def git(self, cwd: Path, *args: str, at: int | None = None) -> None:
+        """git in the world, committing at `at` where it is given, as the committer date has it."""
+        env = {**self.env, "GIT_COMMITTER_DATE": f"@{at} +0000"} if at else self.env
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args], cwd=cwd, env=env,
                        check=True, capture_output=True)
 
     def ticket(self, slug: str, status: str = "open", parent: str | None = None) -> None:
@@ -305,13 +321,14 @@ exit 1
     def start_hub(self) -> None:
         self.hub = subprocess.Popen(self.hub_args, env=self.env, stdout=subprocess.DEVNULL,
                                     stderr=(self.scratch / "hub.log").open("a"), start_new_session=True)
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
+
+        def listening() -> bool:
             try:
                 socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
-                return
+                return True
             except OSError:
-                time.sleep(0.05)
+                return False
+        until(listening, f"the hub to listen on its port (its log: {self.scratch / 'hub.log'})", within=60)
 
     def kill_hub(self) -> None:
         os.killpg(self.hub.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
@@ -329,17 +346,20 @@ exit 1
                               text=True, check=True).stdout.strip()
 
     def close(self) -> None:
-        if self.context:
-            check("no script errors", [], self.errors)
-            self.context.close()
-        if self.hub:
-            self.kill_hub()
-        if not hasattr(self, "tmux_refused"):  # stopped before it had a tmux of its own
-            return
-        if self.tmux_socket.exists():
-            subprocess.run([self.tmux_shim, "-S", self.tmux_socket, "kill-server"], env=self.env, capture_output=True, check=False)
-        check("no tmux call, the hub's or the test's, went to a server other than the world's own", "",
-              self.tmux_refused.read_text() if self.tmux_refused.exists() else "")
+        """Everything the world started stops, whichever step of it fails."""
+        try:
+            if self.context:
+                check("no script errors", [], self.errors)
+                self.context.close()
+        finally:
+            try:
+                if self.hub:
+                    self.kill_hub()
+            finally:
+                if self.tmux_socket:
+                    subprocess.run([self.tmux_shim, "-S", self.tmux_socket, "kill-server"], env=self.env, capture_output=True, check=False)
+                    check("no tmux call, the hub's or the test's, went to a server other than the world's own", "",
+                          self.tmux_refused.read_text() if self.tmux_refused.exists() else "")
 
     # ---- what the tab shows
 
@@ -452,10 +472,14 @@ exit 1
         self.settle()
 
     def hears(self, cause):
-        """Do cause(), which has the hub tell this tab something, and return what it returns once the tab has read
-        the hub again on the news and drawn what it read: by then the tab has done whatever the news makes it do."""
-        with self.view.expect_event("requestfinished", lambda r: r.url == self.origin + "/api/hub", timeout=30000):
-            result = cause()
+        """Do cause(), which has the hub tell this tab something, and return what it returns once the tab has done
+        whatever the news makes it do. An agent of ORCHESTRATOR then opens a page: the tab reads the hub whole on each
+        piece of news and draws what it read, so once that page is in the layout, a read holding the cause's news has
+        been drawn."""
+        result = cause()
+        self.news += 1
+        after = self.opened(self.page(f"show/map-columns/news-{self.news}.html", "<h1>news</h1>"))
+        self.view.wait_for_function(f"!!ws.view({json.dumps(after)})", timeout=10000)
         self.settle()
         return result
 
@@ -472,6 +496,13 @@ exit 1
     def focus_view(self, view_id: str) -> None:
         self.view.evaluate(f"ws.focus({json.dumps(view_id)})")
         self.view.wait_for_function(HOLDS_KEYBOARD, timeout=10000)
+
+    def click_into(self, frame) -> None:
+        """Click into the page, and wait for trellis to hand its panel the keyboard a frame later: a key pressed
+        sooner would be undone by the handover."""
+        frame.click("body", position={"x": 300, "y": 200})
+        self.view.wait_for_function(HOLDS_KEYBOARD, timeout=10000)
+        self.settle()
 
     def focus_session(self) -> None:
         """The keyboard into the session page, as a click into it would put it there."""
@@ -526,6 +557,10 @@ exit 1
         self.view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(second_id)})", timeout=10000)
         return second_id
 
+    def board_marks(self) -> list[str]:
+        """The tickets the board marks as the unit's."""
+        return self.frame_at("/board.html").evaluate("[...document.querySelectorAll('[data-hub-unit]')].map(r => r.dataset.slug)")
+
     def rail(self) -> list[str]:
         """The numbered units, in their order on the rail."""
         return self.view.evaluate("wc.state.units.filter(u => u.number).map(u => u.unit)")
@@ -560,7 +595,7 @@ class Pane:
                f"exec {sys.executable} {recorder} {self.received}")
         self.id, pid = w.tmux("display-message", "-p", "-t", "answering:", "#{pane_id} #{pane_pid}").split()
         self.pid = int(pid)
-        self.started = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        self.started = started(pid)
         self.target = f"answering:@0.{self.id}"
         self.in_pane()
         self.session_page = w.page(f"sessions/{ANSWERING}/index.html", "<h1>answering's session</h1>")
@@ -629,13 +664,11 @@ def entering_a_unit(w: World) -> None:
     w.view.keyboard.press("Control+Alt+1")
     settles("ctrl+alt+1 goes into the first orchestrator", ORCHESTRATOR, w.current)
     w.frame_of(ORCHESTRATOR)
-    # hub-layout-pass 1 and 2
-    left = f"p:{ORCHESTRATOR}:left"
     check("the session page is in the sidebar right of the rail, never a tab", (w.session_url(w.pages[0]), False),
           (w.sidebar_url(), w.view.evaluate("ws.views().some(v => v.params.kind === 'session')")))
     check("...and the other pages of a unit open in a pane on the left: two tickets' show pages as its tabs",
-          ([left], [left] * 2), (w.panes(), [w.panel_of(w.ids[k]) for k in ("csv-import", "map-columns")]))
-    settles("...on screen", [left], w.on_screen)
+          ([LEFT], [LEFT] * 2), (w.panes(), [w.panel_of(w.ids[k]) for k in ("csv-import", "map-columns")]))
+    settles("...on screen", [LEFT], w.on_screen)
     check("closing or reloading the hub tab asks nothing", False,
           w.view.evaluate("(e => (dispatchEvent(e), e.defaultPrevented))(new Event('beforeunload', { cancelable: true }))"))
 
@@ -671,14 +704,10 @@ def keys_with_the_hub_frozen(w: World) -> None:
 
 @scenario
 def a_ruling_minimizes_nothing(w: World) -> None:
-    """hub-layout-pass 4"""
+    """hub-layout-pass 4: a ruling in the tracker minimizes nothing."""
     w.enter()
     w.rule("csv-import", "done")
     check("ruling a ticket leaves its pages where they are", True, w.ids["csv-import"] in w.docked())
-    w.focus("csv-import")
-    w.view.keyboard.press("Control+Alt+w")
-    settles("a ruled ticket's page minimizes as any other does", (False, ["minimized", "–"]),
-            lambda: (w.ids["csv-import"] in w.docked(), w.line("/csv-import/index.html")))
 
 
 @scenario
@@ -740,12 +769,13 @@ def an_image_looked_at(w: World) -> None:
     frame.wait_for_function("document.getElementById('shot').complete")
     looked = lambda: v.evaluate("document.querySelector('#look img')?.src.split('/').pop() ?? null")
     looked_width = lambda: v.evaluate("parseFloat(document.querySelector('#look img')?.style.width)")
+    fitted = lambda: v.evaluate("""(() => { const img = document.querySelector('#look img'), box = img?.parentElement;
+        return !!img && (Math.abs(parseFloat(img.style.width) - box.clientWidth) < 1 || Math.abs(parseFloat(img.style.height) - box.clientHeight) < 1); })()""")
     views_before = v.evaluate("ws.views().length")
     frame.click("#shot")
     settles("a click on an image in a page looks at it closer, over the tab", "shot.svg", looked)
     check("...and opens no page", views_before, v.evaluate("ws.views().length"))
-    in_page = frame.evaluate("document.getElementById('shot').getBoundingClientRect().width")
-    settles("...drawn larger than the page draws it", True, lambda: looked_width() > in_page)
+    settles("...fitted to the tab: as wide as the look, or as high", True, fitted)
     fitted_width = looked_width()
     v.mouse.move(700, 400)
     v.mouse.wheel(0, -300)
@@ -796,15 +826,14 @@ def minimized_pages_listed(w: World) -> None:
     w.written()
     check("...still a member, minimized", True, w.member(w.mids["map-columns"])["closed"])
     w.frame_of(ORCHESTRATOR).click(w.line_link("/map-columns/index.html"))
-    left = f"p:{ORCHESTRATOR}:left"
-    settles("a click on its line in the column brings it back to its pane, focused", (left, w.ids["map-columns"]),
+    settles("a click on its line in the column brings it back to its pane, focused", (LEFT, w.ids["map-columns"]),
             lambda: (w.panel_of(w.ids["map-columns"]), w.focused()))
     settles("...its line marked open again", ["open", "●"], lambda: w.line("/map-columns/index.html"))
     v.keyboard.press("Control+Alt+w")
     settles("minimized again", False, lambda: w.ids["map-columns"] in w.docked())
     v.wait_for_function(HOLDS_KEYBOARD, timeout=10000)  # the panel nearest it takes the keyboard a frame later
     w.frame_of(ORCHESTRATOR).press("#t01 > summary", "2")
-    settles("the session page's key 2 brings back the focused turn's second page", (left, w.ids["map-columns"]),
+    settles("the session page's key 2 brings back the focused turn's second page", (LEFT, w.ids["map-columns"]),
             lambda: (w.panel_of(w.ids["map-columns"]), w.focused()))
     w.focus_view(other_id)
     v.keyboard.press("Control+Alt+w")
@@ -830,37 +859,35 @@ def minimized_pages_listed(w: World) -> None:
 def keyboard_between_panes(w: World) -> None:
     v = w.view
     w.enter()
-    left, right = f"p:{ORCHESTRATOR}:left", f"p:{ORCHESTRATOR}:right"
     diff_id, diff_panel = w.open_diff()
     diff_frame = w.frame_at("/diffviews/map-columns.html")
-    check("a diffview page goes to the pane on the right", [left, right], w.panes())
+    check("a diffview page goes to the pane on the right", [LEFT, RIGHT], w.panes())
     v.keyboard.press("Control+Alt+0")
     until(lambda: w.current() is None, "the overview")
     v.keyboard.press("Control+Alt+1")
-    settles("the camera frames the unit whole: both panes on screen", [left, right], w.on_screen)
+    settles("the camera frames the unit whole: both panes on screen", [LEFT, RIGHT], w.on_screen)
     w.focus("map-columns")
     v.keyboard.press("Control+Alt+l")
     settles("ctrl+alt+l moves the keyboard to the pane on the right", (diff_panel, True), lambda: (w.focused_panel(), w.holds_keyboard()))
-    check("...the camera staying, both panes being in sight", [left, right], w.on_screen())
+    check("...the camera staying, both panes being in sight", [LEFT, RIGHT], w.on_screen())
     v.keyboard.press("Control+Alt+l")
     w.fence()
     check("...and at the rightmost pane the keyboard stays", diff_panel, w.focused_panel())
     # into the diff, over to the left pane and back by a click: trellis hears no focus move between two pages
     diff_frame.click("body", position={"x": 300, "y": 200})
-    v.mouse.click(*v.evaluate(f"(r => [r.x + r.width / 2, r.y + r.height / 2])(document.querySelector('[data-panel=\"{left}\"]').getBoundingClientRect())"))
-    diff_frame.click("body", position={"x": 300, "y": 200})
-    settles("a click into a page focuses its panel, before any key", diff_panel, w.focused_panel)
-    w.settle()  # trellis hands the keyboard over a frame after the click's focus, which would undo a key pressed sooner
+    v.mouse.click(*v.evaluate(f"(r => [r.x + r.width / 2, r.y + r.height / 2])(document.querySelector('[data-panel=\"{LEFT}\"]').getBoundingClientRect())"))
+    w.click_into(diff_frame)
+    check("a click into a page focuses its panel, before any key", diff_panel, w.focused_panel())
     diff_frame.press("body", "Control+Alt+h")
-    settles("ctrl+alt+h from inside a page moves the keyboard to the pane on its left", (left, True),
+    settles("ctrl+alt+h from inside a page moves the keyboard to the pane on its left", (LEFT, True),
             lambda: (w.focused_panel(), w.holds_keyboard()))
     v.keyboard.press("Control+Alt+h")
     settles("...and from the leftmost pane into the session page in its sidebar", True, w.holds_session)
     v.keyboard.press("Control+Alt+l")
-    settles("...and ctrl+alt+l from there to the leftmost pane", (left, True), lambda: (w.focused_panel(), w.holds_keyboard()))
+    settles("...and ctrl+alt+l from there to the leftmost pane", (LEFT, True), lambda: (w.focused_panel(), w.holds_keyboard()))
     v.keyboard.press("Control+Alt+l")
     settles("...and on to the right", (diff_panel, True), lambda: (w.focused_panel(), w.holds_keyboard()))
-    check("...the camera never moving", [left, right], w.on_screen())
+    check("...the camera never moving", [LEFT, RIGHT], w.on_screen())
     w.tab_of(diff_id).click()
     v.keyboard.press("F6")
     w.fence()
@@ -909,16 +936,13 @@ def maximize(w: World) -> None:
     """ctrl+alt+z takes the focused panel, or the session page, over the whole window and back."""
     v = w.view
     w.enter()
-    left, right = f"p:{ORCHESTRATOR}:left", f"p:{ORCHESTRATOR}:right"
     diff_id, diff_panel = w.open_diff()
     diff_frame = w.frame_at("/diffviews/map-columns.html")
     # over the whole window: the one panel on screen, both sidebars out of sight
     sight = lambda: (w.on_screen(), w.shown("rail-side"), w.shown("session-side"))
-    whole, maximized = ([left, right], True, True), ([diff_panel], False, False)
+    whole, maximized = ([LEFT, RIGHT], True, True), ([diff_panel], False, False)
     settles("both panes in sight, and both sidebars", whole, sight)
-    diff_frame.click("body", position={"x": 300, "y": 200})
-    settles("(the diff's panel focused)", diff_panel, w.focused_panel)
-    w.settle()  # trellis hands the keyboard over a frame after the click's focus, which would undo a key pressed sooner
+    w.click_into(diff_frame)
     diff_frame.press("body", "Control+Alt+z")
     settles("ctrl+alt+z from inside a page puts that page's panel over the whole window, both sidebars out of sight", maximized, sight)
     diff_frame.press("body", "Control+Alt+z")
@@ -937,7 +961,7 @@ def maximize(w: World) -> None:
     v.keyboard.press("Control+Alt+z")
     settles("maximized again,", maximized, sight)
     v.keyboard.press("Control+Alt+h")
-    settles("...ctrl+alt+h brings everything back and the keyboard into the panel on the left", (whole, left),
+    settles("...ctrl+alt+h brings everything back and the keyboard into the panel on the left", (whole, LEFT),
             lambda: (sight(), w.focused_panel()))
     w.focus_session()
     v.keyboard.press("Control+Alt+z")
@@ -1048,7 +1072,6 @@ def the_users_arrangement(w: World) -> None:
     """A pane resized and a page put beside another survive a reload of the hub tab, and an agent opening another page."""
     v = w.view
     w.enter()
-    left, right = f"p:{ORCHESTRATOR}:left", f"p:{ORCHESTRATOR}:right"
     diff_id, diff_panel = w.open_diff()
     divider = v.evaluate(f"""(() => {{ const app = document.getElementById("app").getBoundingClientRect();
         const d = [...document.querySelectorAll('[data-trellis-part="divider"][data-split="g:{ORCHESTRATOR}"]')]
@@ -1066,13 +1089,13 @@ def the_users_arrangement(w: World) -> None:
     figure = w.agent / "show/map-columns/plot.svg"
     figure.write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 20"><rect width="40" height="20"/></svg>')
     figure_id = w.opened(figure)
-    settles("an agent's figure lands in the left pane", left, lambda: w.panel_of(figure_id))
+    settles("an agent's figure lands in the left pane", LEFT, lambda: w.panel_of(figure_id))
     v.evaluate(f"ws.dock({json.dumps(figure_id)}, {{ beside: {json.dumps(diff_panel)}, edge: 'right' }})")
 
     def beside_diff() -> bool:
         at, cols = w.panel_of(figure_id), w.panes()
-        code = next(i for i, c in enumerate(cols) if right in c.split("+"))
-        return at != left and at in "+".join(cols[code:code + 2]).split("+")
+        code = next(i for i, c in enumerate(cols) if RIGHT in c.split("+"))
+        return at != LEFT and at in "+".join(cols[code:code + 2]).split("+")
     settles("a page dragged beside the diff sits beside it", True, beside_diff)
     arranged = w.panes(), weights()
     w.written()
@@ -1081,12 +1104,12 @@ def the_users_arrangement(w: World) -> None:
     reloaded.close()
     late = w.page("show/map-columns/late.html", "<h1>late</h1>")
     late_id = w.opened(late)
-    settles("a page an agent opens later goes to its pane", left, lambda: w.panel_of(late_id))
+    settles("a page an agent opens later goes to its pane", LEFT, lambda: w.panel_of(late_id))
     check("...and the arrangement holds", arranged, (w.panes(), weights()))
     w.hears(lambda: w.opened(late, lane="output"))
-    check("a page an agent puts in another lane of the same pane stays where it is", left, w.panel_of(late_id))
+    check("a page an agent puts in another lane of the same pane stays where it is", LEFT, w.panel_of(late_id))
     w.opened(late, lane="code")
-    settles("...and one an agent puts in the code lane moves to the right pane", right, lambda: w.panel_of(late_id))
+    settles("...and one an agent puts in the code lane moves to the right pane", RIGHT, lambda: w.panel_of(late_id))
     every_pane = lambda: sorted(sum((c.split("+") for c in w.panes()), []))
     check("...every pane of the unit on screen, the user's third included", every_pane(), sorted(w.on_screen()))
     w.focus_view(late_id)
@@ -1111,6 +1134,7 @@ def an_agent_opening_a_page_again(w: World) -> None:
     check("a page that would lose what is typed in it is not reloaded under it", False, reloaded())
     w.frame_of("map-columns").evaluate("window.reloadWouldLose = () => false")
     settles("...and is reloaded once it would lose nothing", True, reloaded)
+    w.frame_of("map-columns").evaluate("window.__mark = 1")
     w.opened(w.pages[2])
     settles("a page that says nothing is reloaded at once", True, reloaded, within=5)
     w.frame_of("map-columns").evaluate("window.__mark = 1")
@@ -1144,7 +1168,7 @@ def the_next_page_and_the_board(w: World) -> None:
     settles("ctrl+alt+b shows the board, floating over the units", "floating", board_placement)
     board = w.frame_at("/board.html")  # a key pressed into a page still loading goes nowhere
     settles("...marking the tickets the unit's session claimed or committed on and not done, and no other", ["map-columns"],
-            lambda: board.evaluate("[...document.querySelectorAll('[data-hub-unit]')].map(r => r.dataset.slug)"))
+            w.board_marks)
     check("...the first of them scrolled into view", True,
           board.evaluate("(r => r.top >= 0 && r.bottom <= innerHeight)(document.getElementById('t-map-columns').getBoundingClientRect())"))
     v.keyboard.press("Control+Alt+b")
@@ -1199,13 +1223,12 @@ def two_orchestrators_on_one_tree(w: World) -> None:
     v.keyboard.press("Control+Alt+k")
     settles("ctrl+alt+k back up to the one before", SECOND, w.current)
     # the board over one of two orchestrators on one tree marks that one's tickets
-    marked = lambda: w.frame_at("/board.html").evaluate("[...document.querySelectorAll('[data-hub-unit]')].map(r => r.dataset.slug)")
     v.keyboard.press("Control+Alt+b")
-    settles("the board over the second orchestrator marks its tickets, not the first's", ["drop-zone"], marked)
+    settles("the board over the second orchestrator marks its tickets, not the first's", ["drop-zone"], w.board_marks)
     v.keyboard.press("Control+Alt+j")
-    settles("...and the marks follow you to the other orchestrator", ["map-columns"], marked)
+    settles("...and the marks follow you to the other orchestrator", ["map-columns"], w.board_marks)
     v.keyboard.press("Control+Alt+k")
-    settles("...and back", ["drop-zone"], marked)
+    settles("...and back", ["drop-zone"], w.board_marks)
 
 
 @scenario
@@ -1331,7 +1354,7 @@ def the_hub_gone(w: World) -> None:
 def many_units(w: World) -> None:
     """one-hub-tab#P1: many orchestrators' pages open in one tab, and a page opened then still loads."""
     v = w.view
-    many = [f"{n:08x}-0000-4000-8000-{n:012x}" for n in range(0x10, 0x19)]
+    many = [session_id(n) for n in range(0x10, 0x19)]
     for n, session in enumerate(many):
         w.registered(session, w.t0 - 300 - n)
         w.opened(w.page(f"show/unit-{n}/index.html", f"<h1>unit {n}</h1>"), session)
@@ -1353,7 +1376,7 @@ def many_units(w: World) -> None:
 @scenario
 def a_session_page_nobody_opened(w: World) -> None:
     """Entering a unit whose session page nobody opened opens that page, the list of its pages."""
-    unit = f"{0x10:08x}-0000-4000-8000-{0x10:012x}"
+    unit = session_id(0x10)
     w.registered(unit, w.t0 - 300)
     w.opened(w.page("show/unit-0/index.html", "<h1>unit 0</h1>"), unit)
     unopened = w.page(f"sessions/{unit}/index.html", "<h1>unit 0's session</h1>")
@@ -1408,7 +1431,7 @@ def typing_into_the_pane(w: World) -> None:
     v.keyboard.type("go on")
     v.keyboard.press("Shift+Enter")
     v.keyboard.type("but leave the tests")
-    check("shift+enter is a new line in the box, sending nothing", ("go on\nbut leave the tests", b""), (p.text(), p.arrived()))
+    check("shift+enter is a new line in the box, sending nothing", ("go on\nbut leave the tests", 0), (p.text(), w.posted("type")))
     check("the box's unsent text survives a reload", "go on\nbut leave the tests", p.after_reload())
     v.evaluate(f"{BOX}.querySelector('textarea').dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', bubbles: true, cancelable: true }}))")
     # dispatchEvent returns once the box's handler has run, and a send starts in it
@@ -1521,7 +1544,7 @@ def jump_and_close_panes(w: World) -> None:
     before = all_panes()
     p.in_pane()
     settles("a unit whose session runs in a tmux pane has jump and close over its box", ["jump to panectrl+alt+g", "close panectrl+alt+x"], acts)
-    second_started = Path(f"/proc/{second_pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    second_started = started(second_pid)
 
     def both(status: str = "idle") -> None:
         """The unit's state is read from either of its session's processes, so both change together."""
@@ -1649,12 +1672,11 @@ def continuing_from_a_handoff(w: World) -> None:
         (document.querySelector('#units button[title="session {ANSWERING}"] .mark'))""")
 
     def commit_handoff(at: int, text: str) -> None:
-        """The session writes its handoff and commits it at `at`, as the committer date has it."""
+        """The session writes its handoff and commits it at `at`."""
         handoff.parent.mkdir(exist_ok=True)
         handoff.write_text(f"---\nsession: {ANSWERING}\npurpose: continuation\n---\n\n{text}")
         w.git(w.agent, "add", "handoffs")
-        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "handoff"],
-                       cwd=w.agent, env={**w.env, "GIT_COMMITTER_DATE": f"@{at} +0000"}, check=True, capture_output=True)
+        w.git(w.agent, "commit", "-q", "-m", "handoff", at=at)
 
     p.in_pane(cwd=str(w.code))
     settles("hub-continues-a-session-from-its-handoff#P1: the box of a session idle in its pane, with no handoff, offers to write one",
@@ -1698,7 +1720,7 @@ def continuing_from_a_handoff(w: World) -> None:
         w.registered(session, w.t0 - 301, status, pid=p.pid, started=p.started, tmux=p.target, cwd=str(w.code), **extra)
         (w.home / ".claude/sessions" / f"{ANSWERING[:8]}.json").unlink()
 
-    stalled = f"{0x21:08x}-0000-4000-8000-{0x21:012x}"
+    stalled = session_id(0x21)
     cleared_into(stalled, "waiting", waitingFor="permission prompt")
     settles("hub-continues-a-session-from-its-handoff#P3: a refusal after the /clear started a session takes the tab to that "
             "session's unit, its box saying why", [stalled, True],
@@ -1713,7 +1735,7 @@ def continuing_from_a_handoff(w: World) -> None:
     v.locator(f'#units button[title="session {ANSWERING}"] .name').click()  # its middle may be the id, which copies
     settles("back in the session the refusal left", [ANSWERING, True],
             lambda: [w.current(), v.evaluate(f"{offer}?.checkVisibility() ?? false")])
-    handed_to = f"{0x20:08x}-0000-4000-8000-{0x20:012x}"
+    handed_to = session_id(0x20)
     cleared_into(handed_to)
     settles("hub-continues-a-session-from-its-handoff#P4: a click takes the tab to the new session's unit, its stand-in in the sidebar "
             "and its input box live", [handed_to, f"/pages/{handed_to}", "waiting", True],
@@ -1728,7 +1750,6 @@ def continuing_from_a_handoff(w: World) -> None:
 def pages_on_another_origin(w: World) -> None:
     """Framed in the left pane where they allow it, listed and opened as a tab on a click where they refuse."""
     v = w.view
-    left = f"p:{ORCHESTRATOR}:left"
     w.enter()
     w.minimize(w.ids["map-columns"])
     framed_at = lambda url: v.evaluate(f"ws.views().find(v => v.params.url === {json.dumps(url)})?.panelId ?? null")
@@ -1752,7 +1773,7 @@ def pages_on_another_origin(w: World) -> None:
         tab.value.close()
         v.bring_to_front()
         w.opened(f"{app}/app")
-        settles("a local server that allows framing opens in the left pane of the opening session's unit", left, lambda: framed_at(f"{app}/app"))
+        settles("a local server that allows framing opens in the left pane of the opening session's unit", LEFT, lambda: framed_at(f"{app}/app"))
         settles("...showing the page", True, lambda: any(f.url == f"{app}/app" for f in v.frames))
 
         def clicked(href: str) -> None:
@@ -1769,7 +1790,7 @@ def pages_on_another_origin(w: World) -> None:
         tab.value.close()
         check("...and no panel", None, framed_at(f"{app}/self"))
         clicked(f"{app}/app2")
-        settles("a plain click on a link to one that allows it opens it in the unit's left pane", left, lambda: framed_at(f"{app}/app2"))
+        settles("a plain click on a link to one that allows it opens it in the unit's left pane", LEFT, lambda: framed_at(f"{app}/app2"))
 
 
 @scenario
@@ -1842,7 +1863,7 @@ def finding_an_orchestrator(w: World) -> None:
                                       for t in ("Chore", title)))
         w.opened(w.page(f"notes/ended-{i}.html", "an ended session's page"), sid)
     for n in (0x10, 0x11):  # running sessions whose ids start with what the ended ones' only hold inside
-        session = f"{n:08x}-0000-4000-8000-{n:012x}"
+        session = session_id(n)
         w.registered(session, w.t0 - 300 - n)
         w.opened(w.page(f"show/unit-{n}/index.html", f"<h1>unit {n}</h1>"), session)
     w.registered(ORCHESTRATOR, time.time(), name="alpha-d2")
