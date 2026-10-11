@@ -13,8 +13,8 @@ every step the watcher takes through a port that acts (a probe, a `tailscale
 set`, a connect, a Discord check), for every change from outside, and for
 each request's sending, disconnection and final line.
 
-The World's port wiring and the drivers at the bottom are the only code here
-that calls into bin/vpn. A test states what happens, and they call. The ports
+The World's port wiring, its drivers and the World a test builds are the only
+code here that calls into bin/vpn. A test states what happens, and they call. The ports
 also count what bin/vpn reads through them, and can play tailscaled not
 answering, tailscale stopped, automatic mode slow to pick, and engine updates
 out of phase with the first moment.
@@ -27,12 +27,10 @@ unnoticed.
 """
 
 import atexit
-import contextlib
 import hashlib
 import socket
 import threading
 import heapq
-import importlib.util
 import io
 import itertools
 import json
@@ -44,9 +42,10 @@ from collections.abc import Callable
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from typing import Any, Literal
+
+from check import bin_module  # tests/ is on sys.path in every test that imports this
 
 SCRATCH = Path(tempfile.mkdtemp(prefix="vpn-fakes-"))
 atexit.register(shutil.rmtree, SCRATCH, ignore_errors=True)
@@ -78,16 +77,7 @@ os.environ["VPN_TAILSCALED_SOCKET"] = str(SCRATCH / "tailscaled.sock")
 os.environ["PATH"] = f"{SCRATCH / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
 
 
-def load(name: str, path: Path):
-    loader = SourceFileLoader(name, str(path))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-vpn = load("vpn", Path(__file__).resolve().parents[2] / "bin" / "vpn")
+vpn = bin_module("vpn")
 
 T0 = float(int(time.time()))
 """The World's first moment: the wall clock when this module loads."""
@@ -893,7 +883,7 @@ EVERYTHING = frozenset(h.name for h in HOSTS)
 FRANKFURT = [Host(f"de-fra-wg-{n}", "Germany", "Frankfurt")
              for n in "001 002 003 004 005 101 102 103 104 201 202 203 404 405 406".split()]
 WORLDS: list[World] = []
-"""Every World the cases below build, for the check at the end that none of them asked am.i.mullvad.net."""
+"""Every World `world()` builds, for a test's closing check that none of them asked am.i.mullvad.net."""
 
 
 def world(exit_name="de-fra-wg-202", *, automatic=False, blocked=(), dead=(), offline=(), mute=(), inert=(),
@@ -914,7 +904,7 @@ def world(exit_name="de-fra-wg-202", *, automatic=False, blocked=(), dead=(), of
 def run_to(watching, secs):
     """Run the watcher to `secs` into its World, to the first moment it is idle at or after `secs`. With engine
     updates every 2 s, that is `secs` itself when it is even."""
-    with contextlib.redirect_stdout(io.StringIO()):
+    with redirect_stdout(io.StringIO()):
         watching.until(secs)
     return watching
 

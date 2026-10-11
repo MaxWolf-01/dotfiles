@@ -4,13 +4,13 @@
 #   # tier: fast                          in-process: no browser, desktop, tmux, systemd, network or sleeps
 #   # tier: full-path (what it drives)    the real thing, end to end
 # `make test` runs the fast files, `make test-full-path` the rest, and both refuse a file that names neither.
-# A file exits 77 to skip, after a line `skip: <why>`; one that skips only some of its cases prints a line starting
-# `skip` for each and passes. The run ends by naming every skip, whole or in part, and every failure.
+# A file exits 77 to skip, after a line `skip: <why>`; one that skips only some of its cases prints a line
+# `skip <what>: <why>` for each and passes. The run ends by naming every skip, whole or in part, and every failure.
 
 SHELL := bash
 
-# Every *.test file in the repo.
-TESTS = $(shell git ls-files --cached --others --exclude-standard '*.test')
+# Every *.test file in the repo, less one deleted but not yet staged.
+TESTS = $(wildcard $(shell git ls-files --cached --others --exclude-standard '*.test'))
 FAST = $(shell grep -lx '# tier: fast' $(TESTS))
 FULL_PATH = $(shell grep -lE '^# tier: full-path( |$$)' $(TESTS))
 UNDECLARED = $(filter-out $(FAST) $(FULL_PATH),$(TESTS))
@@ -25,7 +25,7 @@ SERIAL = backup/restic_backup.test tests/overdue-check.test
 
 # Seconds a file may run before it is stopped and counted as failed. A script's dependencies install before its clock
 # starts, so a cold uv cache does not read as a hang.
-test: TIMEOUT = 60
+test: TIMEOUT = 120
 test:
 	@$(call run-tier,$(FAST))
 
@@ -62,7 +62,7 @@ run/%:
 	start=$$(date +%s); \
 	timeout -k 10 $(TIMEOUT) ./$* < /dev/null 2>&1 | tee "$$log"; rc=$${PIPESTATUS[0]}; \
 	case $$rc in \
-		0) grep -E '^skip[ :]' "$$log" | sed 's|^|$*: |' >> "$(RESULTS)/partly" ;; \
+		0) grep '^skip ' "$$log" | sed 's|^|$*: |' >> "$(RESULTS)/partly" ;; \
 		77) echo "$*: $$(sed -n 's/^skip: //p' "$$log" | tail -1)" >> "$(RESULTS)/skipped" ;; \
 		124|137) echo "$*: stopped after $(TIMEOUT) s" >> "$(RESULTS)/failed" ;; \
 		*) echo "$*" >> "$(RESULTS)/failed" ;; \

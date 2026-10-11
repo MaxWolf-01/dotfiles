@@ -7,13 +7,12 @@ TMUX_SOCKET and CLEAR_WAIT. A module loaded anew on the same state is the hub re
 disk goes: main()'s own start-up (the old containers moved in, each unit repaired) runs only in a hub process.
 """
 
-import importlib.util
 import itertools
 import time
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-HUB = Path(__file__).resolve().parent.parent / "bin" / "container-hub"
+from check import bin_module  # tests/ is on sys.path in every test that imports this
+
 LOADS = itertools.count()
 
 
@@ -37,8 +36,6 @@ class Clock:
 
 def load(clock: Clock, state: Path):
     """bin/container-hub as a module of its own, on its clock, keeping its units under `state`."""
-    loader = SourceFileLoader(f"container_hub_{next(LOADS)}", str(HUB))
-    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-    loader.exec_module(module)
+    module = bin_module("container-hub", f"container_hub_{next(LOADS)}")
     module.time, module.STATE = clock, state
     return module
