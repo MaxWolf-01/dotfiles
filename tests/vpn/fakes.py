@@ -43,6 +43,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from functools import cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -265,10 +266,12 @@ class At:
     secs: float
 
 
+@cache
 def key(name: str) -> str:
     return "nodekey:" + hashlib.sha256(name.encode()).hexdigest()
 
 
+@cache
 def stable_id(name: str) -> str:
     return "n" + hashlib.sha256(b"id" + name.encode()).hexdigest()[:12].upper() + "CNTRL"
 
