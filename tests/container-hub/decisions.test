@@ -1,0 +1,598 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro", "pyyaml", "markdown-it-py"]  # the hub's own, whose module this loads
+# ///
+"""Check what the container hub decides: which unit a page lands in, its lane and title, a unit's pages, how the rail
+numbers the units, what never opens, what leaves. Run it directly; no framework.
+
+The hub's module is loaded in this process, as tests/vpn/examples.test checks bin/vpn, its functions called on
+fixture files and its clock the test's. Each scenario builds a world of its own (fakes.World): a scratch HOME with a
+repo or two, each holding an agent repo whose tickets were committed by sessions (a `Session:` trailer). Which
+sessions run is what the HOME's session registry (`.claude/sessions/`) says; this process stands in for each. No
+session here runs in a tmux pane: what the hub does in tmux, and what only its server does, is server.test's.
+"""
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fakes  # noqa: E402  (the hub's module in this process, its clock, and the world it reads)
+from check import BIN, check, finish, skipped  # noqa: E402
+from fakes import SELF_STARTED, page, served, ticket  # noqa: E402
+
+ORCHESTRATOR = "aaaaaaaa-0000-4000-8000-000000000001"
+WORKER = "bbbbbbbb-0000-4000-8000-000000000002"
+STRANGER = "cccccccc-0000-4000-8000-000000000003"
+SPIKER = "dddddddd-0000-4000-8000-000000000004"
+NOVICE = "eeeeeeee-0000-4000-8000-000000000005"  # commits on nothing
+RETIRER = "ffffffff-0000-4000-8000-000000000006"
+ANSWERER = "abababab-0000-4000-8000-000000000007"  # drops a file into its box
+LATECOMER = "cdcdcdcd-0000-4000-8000-000000000008"  # renders its session page late
+ASKER = "efefefef-0000-4000-8000-000000000009"  # writes turn records with questions, and chat turns
+
+TREE = [("map-columns", None, ORCHESTRATOR), ("csv-import", "map-columns", ORCHESTRATOR)]
+"""alpha's tickets: csv-import under map-columns, both committed by the orchestrator."""
+
+hub_said = (fakes.RUN / "module.log").open("w")
+sys.stderr = hub_said  # what the hub prints on the way, as its log would hold it; check() prints to stdout
+try:
+    # --- where a page lands
+
+    w = fakes.World()
+    alpha, beta = w.repo("alpha", TREE), w.repo("beta", [("map-columns", None, STRANGER)])
+    a = w.opened(page(alpha / "agent/show/csv-import/index.html"), WORKER)
+    check("a page goes to the unit of the session that opened it, whatever ticket its path names", WORKER, a["unit"])
+    check("...which has the tree of that ticket beside it, its repo, and no board while the repo has none", ("map-columns", "alpha", None),
+          tuple(w.view(a["unit"])[k] for k in ("tree", "repo", "board")))
+    b = w.opened(page(beta / "agent/show/map-columns/index.html"), WORKER)
+    check("a session's pages in two repos are one unit", (WORKER, 2), (b["unit"], len(w.view(WORKER)["members"])))
+    check("the first open of a page adds it", "added", a["action"])
+    w.hub.mark("close", {"unit": a["unit"], "id": a["id"]})
+    check("a closed page stays a member, closed", True, w.member_of(a)["closed"])
+    again = w.opened(alpha / "agent/show/csv-import/index.html", WORKER)
+    check("a second open of the same page brings the same member forward", ("reopened", a["id"]), (again["action"], again["id"]))
+    check("...open again", False, w.member_of(a)["closed"])
+    check("...and adds no second copy", 2, len(w.view(a["unit"])["members"]))
+    by_stranger = w.opened(alpha / "agent/show/csv-import/index.html", STRANGER)
+    check("the same page opened by another session is a member of that session's unit too", (STRANGER, a["id"], 2),
+          (by_stranger["unit"], by_stranger["id"], len(w.view(WORKER)["members"])))
+    check("a page named relative to the opener's directory lands as its absolute path does", a["id"],
+          w.opened("agent/show/csv-import/index.html", WORKER, cwd=str(alpha)).get("id"))
+    ticket_file = w.opened(alpha / "agent/tickets/csv-import.md", WORKER)
+    check("a ticket file lands in the opener's unit, as a page of that ticket", (WORKER, "csv-import"),
+          (ticket_file["unit"], w.member_of(ticket_file)["ticket"]))
+    payload = w.opened(page(alpha / "agent/show/csv-import/broken.html", "<script>const DATA = {not json</script>"), WORKER)
+    check("a page that looks like a diffview but carries no data opens like any other", WORKER, payload.get("unit"))
+    check("a page that carries DATA naming sources without files opens like any other", WORKER,
+          w.opened(page(alpha / "agent/show/csv-import/sourced.html", '<script>const DATA = {"sources": [{"kind": "git"}]}</script>'),
+                   WORKER).get("unit"))
+    check("so does a directory named like a page", WORKER,
+          w.opened(page(alpha / "agent/show/csv-import/deck.html/index.html").parent, WORKER).get("unit"))
+
+    # --- a page under no ticket, and what titles a unit
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    agent = alpha / "agent"
+    note = page(w.home / "notes" / "scratch.html")
+    by_trailer = w.opened(note, ORCHESTRATOR, cwd=str(alpha))
+    check("a page under no ticket goes to its session's unit", ORCHESTRATOR, by_trailer["unit"])
+    check("...as a page of the ticket the session committed on last", "csv-import", w.member_of(by_trailer)["ticket"])
+    check("...whose tree is beside the unit's title", "map-columns", w.view(ORCHESTRATOR)["tree"])
+    w.committed(agent, "drop-zone", ORCHESTRATOR)
+    later = w.opened(page(w.home / "notes" / "later.html"), ORCHESTRATOR, cwd=str(alpha))
+    check("a session that commits on another tree has that tree beside it, and its later pages that ticket",
+          (ORCHESTRATOR, "drop-zone", "drop-zone"), (later["unit"], w.view(ORCHESTRATOR)["tree"], w.member_of(later)["ticket"]))
+    novice = w.opened(note, NOVICE, cwd=str(alpha))
+    check("a session with no commits, whose pages name no ticket, has a unit with no tree", (NOVICE, None),
+          (novice["unit"], w.view(NOVICE)["tree"]))
+    check("...titled by its session's id, cut short, with no session page and no registry entry, which is its short id too",
+          (f"session {NOVICE[:8]}", NOVICE[:8]), tuple(w.view(NOVICE)[k] for k in ("title", "short")))
+    w.registered(NOVICE, name="novice-name")
+    check("...and by its name in the registry once there is one, as its short id is", ("novice-name", "novice-name"),
+          tuple(w.view(NOVICE)[k] for k in ("title", "short")))
+    # hub-session-search: a transcript's title lines as Claude Code 2.1.289 writes them
+    transcript = w.home / ".claude" / "projects" / "-home-repos-alpha" / f"{NOVICE}.jsonl"
+    title_line = lambda kind, text: json.dumps({"type": f"{kind}-title", f"{kind}Title": text, "sessionId": NOVICE},
+                                               separators=(",", ":")) + "\n"
+    page(transcript, title_line("ai", "Instagram saves") + '{"type":"user","message":{"content":"x"}}\n'
+         + title_line("ai", "Instagram saves pass 1"))
+    check("...and by Claude Code's own title for it, its last, over its name in the registry, which stays its short id",
+          ("Instagram saves pass 1", "novice-name"), tuple(w.view(NOVICE)[k] for k in ("title", "short")))
+    with transcript.open("a") as f:
+        f.write(title_line("custom", "saves") + title_line("ai", "Instagram saves pass 2") + '{"type":"custom-title","custo')
+    check("...the user's title from /rename over the AI's, whichever came last, and a line still being written not yet",
+          "saves", w.view(NOVICE)["title"])
+    with transcript.open("a") as f:
+        f.write(title_line("custom", "saves again")[len('{"type":"custom-title","custo'):])
+    check("...which counts once it is whole", "saves again", w.view(NOVICE)["title"])
+    session_page = w.opened(page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html"), ORCHESTRATOR)
+    check("a session page goes to its session's unit, under no ticket", (ORCHESTRATOR, None),
+          (session_page["unit"], w.member_of(session_page)["ticket"]))
+    worker_page = w.opened(page(alpha / f"agent/sessions/{WORKER}/index.html"))
+    check("a session page lands in its own session's unit, whoever opens it", WORKER, worker_page["unit"])
+    page(alpha / f"agent/sessions/{WORKER}/session.md", "---\nsession: x\n---\n\n# Import the CSV files\n\n## Brief\n")
+    w.registered(WORKER, name="worker-name")
+    check("a unit is titled by its session page's heading, over its name in the registry", "Import the CSV files",
+          w.view(WORKER)["title"])
+    check("...and says how to resume that session", f"claude --resume {WORKER}", w.view(WORKER)["resume"])
+
+    # --- one-hub-tab#P2: a unit's session page lists every page of the unit, a minimized one included
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    shown_path = page(alpha / "agent/show/csv-import/index.html")
+    w.opened(shown_path, STRANGER)
+    # The session page's artefact column as the mx renderer writes it: each link carries the absolute path of the file
+    # it opens, or the URL as written. A link elsewhere on the page (a turn's chip) repeats one of the column's.
+    figure_path = page(alpha / "agent/show/csv-import/flow.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
+    page(alpha / f"agent/sessions/{STRANGER}/index.html", f"""<!doctype html><main>
+      <details class="turn"><summary>turn 2 <span class="chip"><a href="#" data-artefact="{shown_path}">csv</a></span></summary></details>
+      <aside class="column" id="artefacts"><section class="group" id="a02"><ol>
+        <li><kbd class="n">1</kbd><a class="artefact" href="#" data-artefact="{figure_path}">flow</a></li>
+        <li><kbd class="n">2</kbd><a class="artefact" href="#" data-artefact="{shown_path}">csv</a></li>
+      </ol></section><section class="group" id="a01"><ol>
+        <li><kbd class="n">1</kbd><a class="artefact" href="#" data-artefact="{figure_path}">flow again</a></li>
+        <li><kbd class="n">2</kbd><a class="artefact" href="#" data-artefact="https://example.invalid/app?x=1&amp;y=2">app</a></li>
+      </ol></section></aside></main>""")
+    w.opened(alpha / f"agent/sessions/{STRANGER}/index.html", STRANGER)  # a member, which the list it is leaves off
+    stray =w.opened(page(w.home / "notes" / "stray.html"), STRANGER)
+    w.hub.mark("close", {"unit": STRANGER, "id": stray["id"]})
+    w.clock.tick()
+    aside = w.opened(page(w.home / "notes" / "aside.html"), STRANGER)  # opened after stray, though named before it
+    listed = w.view(STRANGER)["pages"]
+    check("a unit's pages are its session page's column links in its order, once each, then the pages no turn links, as opened",
+          [(served(figure_path), True), (served(shown_path), True), ("https://example.invalid/app?x=1&y=2", True),
+           (served(w.home / "notes" / "stray.html"), False), (served(w.home / "notes" / "aside.html"), False)],
+          [(x["url"], x["linked"]) for x in listed])
+    check("...each named as the column names it, a page no turn links by its path", [str(figure_path), str(shown_path),
+          "https://example.invalid/app?x=1&y=2", str(w.home / "notes" / "stray.html"), str(w.home / "notes" / "aside.html")],
+          [x["artefact"] for x in listed])
+    check("...every member listed, the minimized one too, and the session page, the list itself, not on it", (True, False),
+          ({m["url"] for m in w.view(STRANGER)["members"] if m["kind"] != "session"} <= {x["url"] for x in listed},
+           any(x["kind"] == "session" for x in listed)))
+    check("...the id of each the id it has as a member", [stray["id"], aside["id"]], [x["id"] for x in listed[-2:]])
+
+    # --- the board: the rail's, opened over the hub tab, never a page of a unit
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    agent = alpha / "agent"
+    shown_path = page(alpha / "agent/show/csv-import/index.html")
+    w.opened(shown_path, WORKER)
+    w.opened(shown_path, STRANGER)
+    w.committed(agent, "drop-zone", ORCHESTRATOR)
+    w.opened(page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html"), ORCHESTRATOR)
+    board = page(agent / "board.html", "<!doctype html><h1>board</h1>")
+    board_url = served(board)
+    before = {u["unit"]: [m["id"] for m in u["members"]] for u in w.rail()}
+    handed = w.opened(board, ORCHESTRATOR)
+    check("a board handed to the hub opens over the hub tab, joining no unit", (board_url, None, before),
+          (handed.get("board"), handed.get("unit"), {u["unit"]: [m["id"] for m in u["members"]] for u in w.rail()}))
+    check("...as does a link to one clicked in a page of the hub tab", (board_url, None),
+          (lambda r: (r.get("board"), r.get("unit")))(w.clicked(board_url, STRANGER)))
+    page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html", f"""<!doctype html><aside class="column" id="artefacts"><ol>
+      <li><a class="artefact" href="#" data-artefact="{board}">board</a></li>
+      <li><a class="artefact" href="#" data-artefact="{shown_path}">csv</a></li></ol></aside>""")
+    check("...and a session page's column linking it lists it as none of the unit's pages", [served(shown_path)],
+          [p["url"] for p in w.view(ORCHESTRATOR)["pages"] if p["linked"]])
+    check("a unit's board is its tree's, marking the tickets its session claimed or committed on",
+          (board_url, {"map-columns", "csv-import", "drop-zone"}),
+          (w.view(ORCHESTRATOR)["board"], set(w.view(ORCHESTRATOR)["worked_on"])))
+    ticket(agent, "drop-zone", "done")
+    check("...but none that is done, which is worked on no more", {"map-columns", "csv-import"}, set(w.view(ORCHESTRATOR)["worked_on"]))
+    ticket(agent, "drop-zone")
+    check("...and none of a session that committed on none there, whatever tickets its pages name", (board_url, []),
+          (w.view(WORKER)["board"], w.view(WORKER)["worked_on"]))
+
+    # --- what never opens, and a page's lane, from what it is
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    agent = alpha / "agent"
+    w.committed(agent, "drop-zone", ORCHESTRATOR)
+    a = w.opened(page(alpha / "agent/show/csv-import/index.html"), WORKER)
+    note = page(w.home / "notes" / "scratch.html")
+    by_trailer = w.opened(note, ORCHESTRATOR, cwd=str(alpha))
+    session_page = w.opened(page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html"), ORCHESTRATOR)
+    payload = w.opened(page(alpha / "agent/show/csv-import/broken.html", "<script>const DATA = {not json</script>"), WORKER)
+    report = page(alpha / "agent/show/drop-zone/report.md", "## Comments\n")
+    page(alpha / "agent/show/drop-zone/notes.md", "# notes\n")
+    page(alpha / "agent/show/drop-zone/figures/plot.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
+    skipped_open = w.opened(report, WORKER)
+    check("a worker's report never opens", (True, None), ("skipped" in skipped_open, skipped_open["open"]))
+    check("...and the line the hub has its caller print says why", True, "not opened" in skipped_open["say"] and "report" in skipped_open["say"])
+    w.git(agent, "commit", "-q", "--allow-empty", "-m", "base")
+    ticket(agent, "csv-import", "review", "map-columns")
+    w.git(agent, "commit", "-q", "-am", "csv-import in review", "-m", f"Session: {ORCHESTRATOR}")
+    tracker_diff = agent / "diffviews" / "tracker.html"
+    tracker_diff.parent.mkdir(parents=True, exist_ok=True)
+    ticket(agent, "csv-import", "claimed", "map-columns")
+    page(agent / "show/csv-import/plan.md", "# plan\n")
+    w.git(agent, "add", "tickets/csv-import.md", "show/csv-import/plan.md")
+    w.git(agent, "commit", "-q", "-m", "csv-import back, with a plan")
+    mixed_diff = agent / "diffviews" / "mixed.html"
+    (alpha / "notes.txt").write_text("one\n")
+    w.git(alpha, "add", "notes.txt")
+    w.git(alpha, "commit", "-q", "-m", "notes")
+    code_diff = agent / "diffviews" / "csv-import.html"
+    renders = [[f"{agent}@HEAD~2..HEAD~1", tracker_diff], [f"{agent}@HEAD~1..HEAD", mixed_diff], [f"{alpha}@HEAD~1..HEAD", code_diff]]
+    with ThreadPoolExecutor() as pool:  # diffview, as the agents run it
+        list(pool.map(lambda r: subprocess.run([BIN / "diffview", r[0], "-o", str(r[1]), "--no-auto-summary"], env=w.env,
+                                               check=True, capture_output=True), renders))
+    check("a diffview of tracker files never opens", True, "skipped" in w.opened(tracker_diff, ORCHESTRATOR))
+    check("a report beside a prototype is no worker's report, and opens", True,
+          "unit" in w.opened(page(alpha / "agent/prototypes/csv-import/report.md", "# what the prototype showed\n"), WORKER))
+    check("a diffview of a ticket and a show file opens", ORCHESTRATOR, w.opened(mixed_diff, ORCHESTRATOR).get("unit"))
+    code_opened = w.opened(code_diff, ORCHESTRATOR)
+    check("a diffview of code opens", ORCHESTRATOR, code_opened.get("unit"))
+
+    lane_of = lambda path: w.member_of(w.opened(path, ORCHESTRATOR))["lane"]
+    check("a session page goes to the session lane, a diffview page to code", ("session", "code"),
+          (w.member_of(session_page)["lane"], w.member_of(code_opened)["lane"]))
+    check("an image goes to concept, as does any other page of a show directory", ("concept", "concept", "concept"),
+          (lane_of(alpha / "agent/show/drop-zone/figures/plot.svg"), lane_of(alpha / "agent/show/drop-zone/notes.md"), w.member_of(a)["lane"]))
+    check("a page in no show directory goes to output, a prototype's too", ("output", "output"),
+          (w.member_of(by_trailer)["lane"],
+           w.member_of(w.opened(page(agent / "prototypes/csv-import/index.html"), ORCHESTRATOR))["lane"]))
+    elsewhere_diff = w.opened(shutil.copy(code_diff, w.home / "notes" / "review.html"), ORCHESTRATOR)
+    check("a diffview page goes to code wherever it was written", "code", w.member_of(elsewhere_diff)["lane"])
+    check("...though a page that only looks like one does not", "concept", w.member_of(payload)["lane"])
+    check("an image outside any show directory goes to concept", "concept",
+          w.member_of(w.opened(page(w.home / "notes" / "sketch.png", "png"), ORCHESTRATOR))["lane"])
+    overridden = w.opened(note, ORCHESTRATOR, lane="concept")
+    check("an agent's lane overrides the one a page's kind gives it", "concept", w.member_of(overridden)["lane"])
+    check("...and the line the caller prints names it", True, ", lane concept;" in overridden["say"])
+    w.opened(note, ORCHESTRATOR)
+    check("...and holds when the page is opened again without one", "concept", w.member_of(overridden)["lane"])
+    check("...the unit's pages listing it in that lane", "concept",
+          next(x["lane"] for x in w.view(ORCHESTRATOR)["pages"] if x["id"] == overridden["id"]))
+    w.opened(note, ORCHESTRATOR, lane="output")
+    check("...until an agent names another", "output", w.member_of(overridden)["lane"])
+    check("a lane there is none of is refused, naming the lanes", (400, True),
+          (lambda r: (r[0], "session, concept, output, code" in r[1].get("error", "")))(
+              w.hub.open_page({"target": str(note), "session": ORCHESTRATOR, "lane": "diff"}, w.port, from_page=False)))
+
+    # --- a unit's tree, and a member as it was opened
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    agent = alpha / "agent"
+    note = page(w.home / "notes" / "scratch.html")
+    by_trailer = w.opened(note, ORCHESTRATOR, cwd=str(alpha))
+    check("a unit's tree is the tree of the ticket its session committed on last", "map-columns", w.view(ORCHESTRATOR)["tree"])
+    scratch_member = w.member_of(by_trailer)
+    check("a member no turn links is in its unit's pages as it was opened", [{
+        "url": scratch_member["url"], "id": scratch_member["id"], "artefact": str(note.resolve()), "linked": False, "ticket": "csv-import",
+        "kind": "page", "title": "scratch.html", "lane": "output"}], [x for x in w.view(ORCHESTRATOR)["pages"] if x["id"] == by_trailer["id"]])
+    ticket(agent, "spike", "open", "map-columns")
+    spike = w.opened(page(agent / "show/spike/index.html"), SPIKER)
+    (agent / "tickets/spike.md").unlink()
+    spiker = w.view(spike["unit"])
+    check("a unit whose ticket left the tracker before it was ever read has no tree, is never visited, the ticket marked gone",
+          (None, 0, [{"slug": "spike", "status": "gone", "title": "spike", "diff": []}]),
+          (spiker.get("tree"), spiker.get("visited"), spiker.get("tickets")))
+
+    # --- the tracker drives the hub tab
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    agent = alpha / "agent"
+    w.opened(page(w.home / "notes" / "scratch.html"), ORCHESTRATOR, cwd=str(alpha))
+    ticket(agent, "csv-import", "done", "map-columns")
+    status = lambda: next(t["status"] for t in w.view(ORCHESTRATOR)["tickets"] if t["slug"] == "csv-import")
+    check("a ticket's status in the tracker is the hub tab's", "done", status())
+    page(agent / "show/csv-import/plan.md", "# plan\n")
+    w.git(agent, "add", "show/csv-import/plan.md")
+    w.git(agent, "commit", "-q", "-m", "a plan")
+    (alpha / "notes.txt").write_text("one\n")
+    w.git(alpha, "add", "notes.txt")
+    w.git(alpha, "commit", "-q", "-m", "notes")
+    last_two = lambda repo: subprocess.run(["git", "log", "--reverse", "--format=%h", "-2"], cwd=repo, capture_output=True,
+                                           text=True, check=True).stdout.split()
+    commits = last_two(alpha)  # the code repo's last commit adds notes.txt
+    agent_range = "..".join(last_two(agent))  # the agent repo's last commit adds show/csv-import/plan.md
+    recorded_diff = lambda slug, *ranges: page(agent / f"tickets/{slug}.md", fakes.ticket_text(slug).replace(
+        "size: S\n", "size: S\ndiff:\n" + "".join(f"  - {r}\n" for r in ranges)))
+    recorded_diff("map-columns", f"code@{commits[0]}..{commits[1]}", f"agent@{agent_range}")
+    # what the hub cached before it left agent ranges out: one page of both ranges, keyed by both
+    old_specs = f"{alpha}@{commits[0]}..{commits[1]} {agent}@{agent_range}"
+    page(w.hub.STATE / "diffs" / f"map-columns-{hashlib.sha1(old_specs.encode()).hexdigest()[:8]}.html", "stale render")
+    tickets_root = (agent / "tickets").resolve()
+    recorded = {"url": "/diff?" + urllib.parse.urlencode({"tracker": str(tickets_root), "ticket": "map-columns"}),
+                "title": f"diff · code@{commits[0]}..{commits[1]}"}
+    render, status_code, _ = w.hub.render_diff(tickets_root, "map-columns")
+    rendered = render.read_bytes() if render else b""
+    check("a ticket's recorded code range renders when opened", (200, True), (status_code, b"notes.txt" in rendered))
+    check("...without its agent range, and never from a render cached with it", (False, False),
+          (b"plan.md" in rendered, b"stale render" in rendered))
+    from_view = w.clicked(recorded["url"], ORCHESTRATOR, title=recorded["title"])
+    check("a recorded range clicked in the hub tab becomes a member of its unit, of its ticket", (ORCHESTRATOR, "diff", "map-columns"),
+          (from_view["unit"], w.member_of(from_view)["kind"], w.member_of(from_view)["ticket"]))
+    check("...under the title the hub tab gave it, opened by the user", (recorded["title"], "user"),
+          (w.member_of(from_view)["title"], w.member_of(from_view)["by"]))
+    ticket(agent, "drop-zone")
+    check("a ticket with no range recorded has no diff to render", 404, w.hub.render_diff(tickets_root, "drop-zone")[1])
+    recorded_diff("drop-zone", f"agent@{agent_range}")
+    check("a ticket recording only agent ranges has no diff to render", 404, w.hub.render_diff(tickets_root, "drop-zone")[1])
+    recorded_diff("map-columns", f"code@{commits[0]}..0123abc", f"agent@{agent_range}")
+    _, status_code, said = w.hub.render_diff(tickets_root, "map-columns")
+    check("a recorded range diffview cannot render answers why, not that none is recorded", (502, True),
+          (status_code, "0123abc" in said))
+
+    # --- the rail: the units whose sessions run, numbered by when each last finished a turn
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    for session in (ORCHESTRATOR, WORKER, SPIKER, STRANGER, NOVICE):
+        w.opened(page(w.home / "notes" / f"{session[:8]}.html"), session)
+    t0 = w.clock.tick(100)
+    for session, at in ((ORCHESTRATOR, t0 - 100), (WORKER, t0 - 10)):
+        w.opened(session_page := page(alpha / f"agent/sessions/{session}/index.html"), session)
+        os.utime(session_page, (at, at))
+    w.registered(ORCHESTRATOR, "idle", t0 - 50)
+    w.registered(WORKER, "busy", t0 - 5)
+    w.registered(SPIKER, "idle", t0 - 200)
+    ours = lambda: [(u["unit"], u["number"] is not None) for u in w.rail() if u["unit"] in (ORCHESTRATOR, WORKER, SPIKER)]
+    check("the rail numbers the idle sessions by their last turn's end, the latest first, and the busy after them",
+          [(ORCHESTRATOR, True), (SPIKER, True), (WORKER, True)], ours())
+    check("...a turn's end read off the session page's render where the registry has none", t0 - 10, w.view(WORKER)["last"])
+    w.registered(SPIKER, "shell", t0 - 1)
+    check("a session running a shell command is numbered with the busy, not with the idle",
+          [(ORCHESTRATOR, True), (WORKER, True), (SPIKER, True)], ours())
+    w.registered(SPIKER, "waiting", t0 - 1000, waiting_for="permission prompt")
+    check("a session blocked in its terminal is numbered first, however long ago its turn ended",
+          [(SPIKER, True), (ORCHESTRATOR, True), (WORKER, True)], ours())
+    w.registered(SPIKER, "idle", t0 - 200)
+    w.registered(WORKER, "idle", t0)
+    check("a session that finishes a turn is the first of them", [(WORKER, True), (ORCHESTRATOR, True), (SPIKER, True)], ours())
+    check("...and 1 on the rail", 1, w.number(WORKER))
+    check("a session no running process registers is ended: no number, after every numbered unit", ("ended", None, True),
+          (lambda us: (next(u["state"] for u in us if u["unit"] == STRANGER), next(u["number"] for u in us if u["unit"] == STRANGER),
+                       all(u["number"] for u in us[:[x["unit"] for x in us].index(STRANGER)])))(w.rail()))
+    w.ended(STRANGER)
+    w.registered(NOVICE, started=str(int(SELF_STARTED) + 1))
+    check("...as is one whose registry file names a process that has exited, or a pid another process has taken since",
+          ("ended", "ended"), (w.view(STRANGER)["state"], w.view(NOVICE)["state"]))
+    w.registered(STRANGER, "idle", t0 + 1)
+    check("a session resumed gets a number again", (True, "idle"), (w.number(STRANGER) is not None, w.view(STRANGER)["state"]))
+    w.clock.tick()
+    check("the ✕ takes a unit out of the numbers", (200, None, True),
+          (w.hub.mark("dismiss", {"unit": ORCHESTRATOR})[0], w.number(ORCHESTRATOR), w.view(ORCHESTRATOR)["dismissed"]))
+    check("...listed after the numbered ones", True,
+          (lambda us: all(u["number"] for u in us[:[x["unit"] for x in us].index(ORCHESTRATOR)]))(w.rail()))
+    w.opened(page(w.home / "notes" / "while-dismissed.html"), ORCHESTRATOR)
+    check("...while an agent opening a page there does not bring it back", None, w.number(ORCHESTRATOR))
+    w.registered(ORCHESTRATOR, "idle", w.clock.tick())
+    check("...and its session finishing a turn does, as 1", (1, False), (w.number(ORCHESTRATOR), w.view(ORCHESTRATOR)["dismissed"]))
+    check("a dismissal is refused for a unit that does not exist", 404, w.hub.mark("dismiss", {"unit": "no-such-unit"})[0])
+
+    # --- hub-ui-nits 2: the statusline's numbers, from what the statusline keeps of each session's last render
+
+    w = fakes.World()
+    for session in (ORCHESTRATOR, WORKER, SPIKER, STRANGER, NOVICE):
+        w.opened(page(w.home / "notes" / f"{session[:8]}.html"), session)
+    t0 = w.clock.now
+    for session in (ORCHESTRATOR, WORKER, SPIKER):
+        w.registered(session, "idle", t0 - 100)
+    check("a session with no statusline file shows no context use, nor any usage", (None, []),
+          (w.view(WORKER)["context"], w.hub.hub_view()["usage"]))
+    work = w.home / ".claude-work"
+    w.statusline(WORKER, t0 - 30, context=(42.5, 85000), five_hour=(30, t0 + 3600), seven_day=(12, t0 + 3 * 86400))
+    w.statusline(ORCHESTRATOR, t0 - 10, context=(81, 162000), five_hour=(35, t0 + 3500), seven_day=(13, t0 + 3 * 86400))
+    w.statusline(SPIKER, t0 - 20, f"{work}/", context=(5, 9000), five_hour=(70, t0 - 60), seven_day=(40, t0 + 86400))
+    w.statusline(NOVICE, t0, context=(90, 180000), five_hour=(99, t0 + 60), seven_day=(99, t0 + 60))
+    w.statusline(STRANGER, t0 - 5, w.home / ".claude-pro", context=(20, 40000))
+    w.statusline(SPIKER[:-1] + "9", t0 - 40, work, five_hour=(1, t0 + 60))  # the same account, spelled without the slash
+    check("a running session shows its context use, as its statusline last had it",
+          ({"used_percentage": 42.5, "total_input_tokens": 85000}, {"used_percentage": 81, "total_input_tokens": 162000}),
+          (w.view(WORKER)["context"], w.view(ORCHESTRATOR)["context"]))
+    check("...an ended one none", None, w.view(NOVICE)["context"])
+    check("the 5h and weekly usage, one entry per account, each from its newest statusline file, an ended session's too", [
+        {"account": str(w.home / ".claude"), "at": t0, "five_hour": {"used_percentage": 99, "resets_at": t0 + 60},
+         "seven_day": {"used_percentage": 99, "resets_at": t0 + 60}},
+        {"account": str(w.home / ".claude-pro"), "at": t0 - 5, "five_hour": None, "seven_day": None},
+        {"account": str(work), "at": t0 - 20, "five_hour": {"used_percentage": 70, "resets_at": t0 - 60},
+         "seven_day": {"used_percentage": 40, "resets_at": t0 + 86400}}], w.hub.hub_view()["usage"])
+
+    # --- hub-layout-pass 5: a unit's account, the config dir its session runs under, which the rail ticks on and off
+
+    w = fakes.World()
+    for session in (WORKER, NOVICE):
+        w.opened(page(w.home / "notes" / f"{session[:8]}.html"), session)
+    w.registered(WORKER)
+    work = w.home / ".claude-work"
+    novice_transcript = page(w.home / ".claude" / "projects" / "-home-repos-alpha" / f"{NOVICE}.jsonl", "")
+    page(w.home / ".claude-pro" / "projects" / "-home-repos-beta" / f"{WORKER}.jsonl", "")
+    check("an ended session's account is the one its transcript is under, a running session's the one its registry "
+          "file is under, whatever transcript it has", (str(w.home / ".claude"), str(w.home / ".claude")),
+          (w.view(NOVICE)["account"], w.view(WORKER)["account"]))
+    (work / "projects" / "-home-repos-alpha").mkdir(parents=True)
+    novice_transcript.rename(work / "projects" / "-home-repos-alpha" / novice_transcript.name)
+    check("...a transcript moved to another account moving it there, as the rail has it", (str(work), str(work)),
+          (w.view(NOVICE)["account"], next(u["account"] for u in w.rail() if u["unit"] == NOVICE)))
+    (work / "projects" / "-home-repos-alpha" / novice_transcript.name).unlink()
+    check("...and one with no transcript left has none", None, w.view(NOVICE)["account"])
+
+    # --- a file pasted or dropped into a unit's box
+
+    w = fakes.World()
+    w.opened(page(w.home / "notes" / "answering.html"), ANSWERER)
+    screenshot = b"\x89PNG\r\n\x1a\n not really a png"
+    status_code, answer = w.hub.drop(ANSWERER, "Screenshot from today.png", screenshot)
+    saved = Path(answer.get("path", "/nonexistent"))
+    check("a file pasted or dropped into the box is saved where the session can read it, under its own name, typed bare",
+          (200, w.home / ".cache/container-hub/drops" / ANSWERER, True, screenshot),
+          (status_code, saved.parent, saved.name.endswith("-Screenshot-from-today.png"), saved.read_bytes() if saved.is_file() else None))
+    check("...a second of the same name kept beside it", True, w.hub.drop(ANSWERER, "Screenshot from today.png", screenshot)[1].get("path") != str(saved))
+    check("...nor for a unit there is none of, whatever its name", (404, 404, False), (
+        w.hub.drop("no-such-unit", "x.png", b"x")[0], w.hub.drop("..", "x.png", b"x")[0], any((w.home / ".cache/container-hub").glob("*x.png"))))
+
+    # --- links clicked in the hub tab: a path to copy, rather than a page, where /f/ would not serve it
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    a = w.opened(page(alpha / "agent/show/csv-import/index.html"), WORKER)
+    note = page(w.home / "notes" / "scratch.html")
+    w.opened(note, ORCHESTRATOR, cwd=str(alpha))
+    secret = page(w.home / ".ssh" / "id_ed25519", "not a page")
+    check("a page in the hub tab opening a file no agent opened, outside every agent directory, gets its path to copy",
+          str(secret), w.clicked(secret, a["unit"]).get("copy"))
+    check("...and one opening a directory", str(note.parent), w.clicked(note.parent, a["unit"]).get("copy"))
+    check("the hub tab hears which links a click copies: a directory and an unserved file, not a page it serves",
+          (200, {"copies": [f"file://{note.parent}", str(secret)]}),
+          w.hub.copying({"targets": [f"file://{note.parent}", str(secret), w.member_of(a)["url"], str(w.home / "gone")]}, w.port))
+
+    # --- what leaves
+
+    w = fakes.World()
+    alpha, beta = w.repo("alpha", TREE), w.repo("beta", [("map-columns", None, STRANGER)])
+    # WORKER's unit sits in alpha's tree, whose page of it changed last
+    w.opened(page(beta / "agent/show/map-columns/index.html"), WORKER)
+    os.utime(page(alpha / "agent/show/csv-import/index.html"), (w.clock.now, w.clock.now))
+    w.opened(alpha / "agent/show/csv-import/index.html", WORKER)
+    w.opened(page(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html"), ORCHESTRATOR)
+    gone = page(alpha / "agent/prototypes/csv-import/index.html")
+    gone_id = w.opened(gone, ORCHESTRATOR)["id"]
+    gone.unlink()
+    check("a member whose file is deleted leaves its unit", False, any(m["id"] == gone_id for m in w.view(ORCHESTRATOR)["members"]))
+    retiring = w.opened(page(beta / "agent/show/map-columns/retiring.html"), RETIRER)
+    check("a unit's tree, once read", "map-columns", w.view(retiring["unit"])["tree"])
+    (beta / "agent/tickets/map-columns.md").unlink()
+    check("...and retired, takes the unit with it, its pages still there", (None, True),
+          (w.view(RETIRER), (beta / "agent/show/map-columns/retiring.html").exists()))
+    check("...off the rail", False, any(u["unit"] == RETIRER for u in w.rail()))
+    check("...while a unit of another tree holding a page of that tree stays", True, w.view(WORKER) is not None)
+    # hub-follows-links-between-session-pages: a handoff's link to another session's page, clicked in the hub tab
+    follow = lambda path: w.clicked(served(path.resolve()), WORKER)
+    followed = follow(alpha / f"agent/sessions/{ORCHESTRATOR}/index.html")
+    check("a click on another session's session page goes to that session's unit, not the one clicked in", (ORCHESTRATOR, False),
+          (followed.get("unit"), any(m["id"] == followed.get("id") for m in w.view(WORKER)["members"])))
+    revived = follow(page(beta / f"agent/sessions/{RETIRER}/index.html"))
+    check("...and makes a unit again of a session whose unit went with its tree", (RETIRER, True, revived.get("id")),
+          (revived.get("unit"), w.view(RETIRER) is not None, (w.view(RETIRER) or {}).get("session_page", {}).get("id")))
+    lone_session, solo_session, whole_session = (f"{n}0000000-0000-4000-8000-00000000000{n}" for n in (7, 8, 9))
+    delta = w.repo("delta", [("lone", None, lone_session)])
+    epsilon = w.repo("epsilon", [("solo", None, solo_session)])
+    d = w.opened(page(delta / "agent/show/lone/index.html"), lone_session)
+    e = w.opened(page(epsilon / "agent/show/solo/index.html"), solo_session)
+    zeta = w.repo("zeta", [("whole", None, whole_session)])
+    z = w.opened(page(zeta / "agent/show/whole/index.html"), whole_session)
+    (zeta / "agent/tickets/half-written.md").write_text("no frontmatter yet\n")  # `tracker data` refuses the whole tracker
+    check("a unit whose tracker refuses its tickets for now is still there", [z["id"]],
+          [m["id"] for m in (w.view(z["unit"]) or {}).get("members", [])])
+    shutil.rmtree(delta / "agent" / "tickets")
+    shutil.rmtree(epsilon)
+    check("a unit whose tracker is gone is gone, its pages still there or not", (None, None), (w.view(d["unit"]), w.view(e["unit"])))
+    check("...and left the rail", False, any(u["unit"] in (d["unit"], e["unit"]) for u in w.rail()))
+    passing = "12345678-0000-4000-8000-00000000000a"
+    fleeting_note = w.opened(page(w.home / "notes" / "fleeting.html"), passing)
+    (w.home / "notes" / "fleeting.html").unlink()
+    check("a unit with no tree goes once every page of it is deleted", (passing, None), (fleeting_note["unit"], w.view(passing)))
+
+    # --- the loose pages, and a stand-in for a session page
+
+    w = fakes.World()
+    alpha = w.repo("alpha", TREE)
+    loose = w.opened(page(w.home / "notes" / "unclaimed.html"))
+    check("a page no session opened lands with the loose pages", "loose", loose["unit"])
+    check("...a unit of that name, with no session to resume, no number on the rail and no account", ("loose pages", "", None, None, None),
+          (lambda u: (u["title"], u["resume"], u["state"], w.number("loose"), u["account"]))(w.view("loose")))
+    eta = w.repo("eta", [("lonely", None, STRANGER)])
+    w.opened(page(eta / "agent/show/lonely/index.html"))
+    w.view("loose")
+    (eta / "agent/tickets/lonely.md").unlink()
+    check("...which a tree retired does not take, the loose pages of no tree still in it", True,
+          loose["id"] in [m["id"] for m in (w.view("loose") or {}).get("members", [])])
+    # one-hub-tab#P2 where no session page lists a unit's pages, a stand-in in the session lane does, until one exists
+    check("the loose pages have a stand-in for a session page, with the column the hub tab fills", ("/pages/loose", True),
+          (w.view("loose")["session_page"]["url"], 'id="artefacts"' in w.hub.stand_in_page(w.view("loose")).decode()))
+    late = w.opened(page(alpha / "agent/show/csv-import/late.html"), LATECOMER)
+    stand_in = w.view(LATECOMER)["session_page"]
+    check("so has a session's unit before its session page is rendered", f"/pages/{LATECOMER}", stand_in["url"])
+    w.clicked(stand_in["url"], LATECOMER)
+    check("...which, opened from the hub tab, heads the unit as its session page, and lists the unit's pages but itself",
+          ([("session", "session")], [late["id"]]),
+          (lambda u: ([(m["kind"], m["lane"]) for m in u["members"] if m["url"] == stand_in["url"]], [p["id"] for p in u["pages"]]))(w.view(LATECOMER)))
+    real = page(alpha / f"agent/sessions/{LATECOMER}/index.html")
+    real_url = served(real.resolve())
+    check("...and goes once the session page exists, which takes its place in the unit", (real_url, [real_url]),
+          (lambda u: (u["session_page"]["url"], [m["url"] for m in u["members"] if m["kind"] == "session"]))(w.view(LATECOMER)))
+
+    # --- hub-rail-marks-sessions-needing-you: what an idle session's page says it needs
+
+    if not fakes.READER:
+        skipped("what an idle session's page says it needs", "no mx plugin here, whose session page reader the rail reads a page by")
+    else:
+        w = fakes.World()
+        alpha = w.repo("alpha", TREE)
+        for session in (ORCHESTRATOR, WORKER, STRANGER):
+            w.opened(page(w.home / "notes" / f"{session[:8]}.html"), session)
+        w.registered(WORKER, "idle", w.clock.now - 500)
+        w.clock.tick(100)
+        asking = alpha / f"agent/sessions/{ASKER}"
+        w.turn_record(asking, 1, "Two ways to import, Q1 picks", ("Q1",), at=w.clock.now - 100)
+        w.opened(page(asking / "index.html"), ASKER)
+        w.registered(ASKER, "idle")
+        w.hub.mark("visit", {"unit": ASKER})
+        asker = lambda: (lambda u: (u["state"], u["needs_you"], u["status_line"]))(w.view(ASKER))
+        check("an idle session whose page has an open question, every record seen, needs you for the question",
+              ("idle", {"questions": 1, "unseen": False}, "Two ways to import, Q1 picks"), asker())
+        w.registered(ASKER, "busy")
+        check("a busy session shows busy, whatever its page holds", ("busy", None), asker()[:2])
+        w.registered(ASKER, "waiting", waiting_for="permission prompt")
+        check("...and a blocked one blocked", ("waiting", None), asker()[:2])
+        w.registered(ASKER, "idle")
+        w.turn_record(asking, 2, "Imported the CSV files as `Q1 (a)` has it", answered={"Q1": "a"}, at=w.clock.tick())
+        check("a turn record written since the last visit marks it, the question it answered not",
+              ("idle", {"questions": 0, "unseen": True}, "Imported the CSV files as Q1 (a) has it"), asker())
+        w.clock.tick()
+        w.hub.mark("visit", {"unit": ASKER})
+        check("...and once visited, nothing open, it does not need you", None, asker()[1])
+        long_ago = w.clock.now - 1000  # its last turn's end, older than any other running session's
+        os.utime(asking / "index.html", (long_ago, long_ago))
+        w.registered(ASKER, "idle", long_ago)
+        w.registered(ORCHESTRATOR, "idle", w.clock.now)
+        numbered_units = lambda: [u["unit"] for u in w.rail() if u["number"]]
+        unneeded = numbered_units()
+        check("...numbered by its last turn's end, after the idle sessions that finished one since", True,
+              unneeded.index(ASKER) > 0)
+        w.chat_turn(asking, "```text\nimport running\n```\n\n## **Waiting** on [the worker](agent/show/x/report.md)\n\nI report once it lands.", w.clock.tick())
+        check("a chat turn after it marks nothing, and is the status line, its first line of prose without its markup",
+              (None, "Waiting on the worker"), asker()[1:])
+        w.turn_record(asking, 3, "Two more calls", ("Q2", "Q3"), at=w.clock.tick())
+        w.turn_record(asking, 4, "Q2 settled, Q3 stands", answered={"Q2": "b"}, at=w.clock.tick())
+        w.clock.tick()
+        w.hub.mark("visit", {"unit": ASKER})
+        check("a question asked in an earlier record stays open beside one answered, whichever turn asked it",
+              ({"questions": 1, "unseen": False}, "Q2 settled, Q3 stands"), asker()[1:])
+        check("a session that needs you is 1 on the rail, however long ago its turn ended, and the rest keep their order",
+              [ASKER, *(u for u in unneeded if u != ASKER)], numbered_units())
+        other = STRANGER  # a unit no registry entry kept in the numbers until now
+        w.registered(other, "waiting", long_ago - 100, waiting_for="permission prompt")
+        others = [u for u in unneeded if u not in (ASKER, other)]
+        check("a session blocked in its terminal comes before one that needs you, "
+              "however long ago its turn ended", [other, ASKER, *others], numbered_units())
+        w.registered(other, "busy", w.clock.tick())
+        check("...and a busy one after every idle one, however recently its turn ended",
+              [ASKER, *others, other], numbered_units())
+        (asking / "turns/05.md").write_text("no frontmatter\n")
+        check("a record the reader refuses leaves the unit there, needing nothing and saying nothing", (True, None, ""),
+              (lambda u: (u is not None, u["needs_you"], u["status_line"]))(w.view(ASKER)))
+
+    check("no world's hub or test called tmux", "", "".join(w.refused() for w in fakes.WORLDS))
+finally:
+    sys.stderr = sys.__stderr__
+    hub_said.close()
+
+finish()
