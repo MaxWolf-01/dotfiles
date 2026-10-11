@@ -1,0 +1,258 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: full-path (a live hub, claude-browser and diffview as processes)
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro"]
+# ///
+"""Check the properties of work containers that only the tools show: claude-browser with no hub answering hands the
+browser a plain tab, and the diffview page `diffview --open` prints is served by a hub, on a free port, never 8377.
+Run it directly; no framework. The properties the hub's module decides are work-containers.test's.
+
+Examples:
+
+    tests/container-hub/work-containers-tools.test
+    tests/container-hub/work-containers-tools.test diffview    # only the properties whose statement holds one of these strings
+"""
+
+import atexit
+import contextlib
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fakes  # noqa: E402  (the environment a hub's world runs in)
+from check import BIN, finish, free_port, prop, run_properties  # noqa: E402
+
+SCRATCH = Path(tempfile.mkdtemp(prefix="work-containers-tools-test."))
+LIVE_HUB_PORT = 8377
+"""The port of the hub this machine runs, which no check may touch."""
+
+
+def git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", *args],
+                   cwd=cwd, env=fakes.tools_env(SCRATCH), check=True, capture_output=True)
+
+
+# --------------------------------------------------------------------------
+# P3: no hub, a plain tab
+# --------------------------------------------------------------------------
+
+BRAVE = """#!/bin/sh
+printf '%s\\n' "$@" > "$RECORD.tmp" && mv "$RECORD.tmp" "$RECORD"
+"""
+
+SYSTEMD_RUN = """#!/bin/sh
+# drop systemd-run's own options, run the command they wrap
+while [ "${1#--}" != "$1" ]; do shift; done
+exec "$@"
+"""
+
+
+@contextlib.contextmanager
+def no_hub(how: str):
+    """A port with no hub on it: nothing listening, a socket that never answers, or a server that is not one."""
+    if how == "nothing":
+        yield port_beside_live_hub()
+        return
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(8)
+    stop = False
+    if how == "foreign":
+        def serve():
+            while not stop:
+                with contextlib.suppress(OSError):
+                    conn, _ = s.accept()
+                    with conn:
+                        conn.recv(65536)
+                        conn.sendall(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+
+        threading.Thread(target=serve, daemon=True).start()
+    try:
+        yield s.getsockname()[1]
+    finally:
+        stop = True
+        s.close()
+
+
+def port_beside_live_hub() -> int:
+    """A free port, never the live hub's."""
+    while (port := free_port()) == LIVE_HUB_PORT:
+        pass
+    return port
+
+
+@prop("With no hub answering, claude-browser hands the browser the plain URL or file, as today.")
+def no_hub_plain_tab():
+    """Nothing on the hub's port, a socket that accepts and never answers, and a server that is not a hub: each
+    time the browser gets the profile and the target it got before containers, the file as a file:// URL of
+    its real path, a URL as it was given, and a blank tab for no target, within a few seconds."""
+    home = Path(tempfile.mkdtemp(prefix="no-hub-home.", dir=SCRATCH))
+    stubs = home / "stubs"
+    stubs.mkdir()
+    for name, body in (("brave", BRAVE), ("systemd-run", SYSTEMD_RUN)):
+        (stubs / name).write_text(body)
+        (stubs / name).chmod(0o755)
+    state = home / ".config" / "BraveSoftware" / "Brave-Browser" / "Local State"
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({"profile": {"info_cache": {"Profile 3": {"name": "Personal"}}}}))
+    pages = home / "repos" / "alpha" / "agent" / "show" / "map-columns"
+    pages.mkdir(parents=True)
+    (pages / "index.html").write_text("<!doctype html><p>map columns</p>\n")
+    (pages / "a figure.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"/>\n')
+    (home / "linked").symlink_to(pages)
+    cases = [
+        ([str(pages / "index.html")], f"file://{pages}/index.html"),
+        (["agent/show/map-columns/a figure.svg"], f"file://{pages}/a figure.svg"),
+        ([str(home / "linked" / "index.html")], f"file://{pages}/index.html"),
+        (["https://example.com/a/b?c=d#e"], "https://example.com/a/b?c=d#e"),
+        ([], "about:blank"),
+    ]
+
+    def hands(n: int, how: str, args: list[str], target: str) -> None:
+        """One case, with a record of its own: the cases run at once, since a socket that never answers holds each
+        for as long as claude-browser waits on it."""
+        record = home / f"record-{n}"
+        with no_hub(how) as port:
+            env = fakes.tools_env(home, CLAUDE_CONFIG_DIR=str(home / ".claude"), CONTAINER_HUB_PORT=str(port),
+                           CLAUDE_CODE_SESSION_ID="00000000-0000-4000-8000-000000000003", RECORD=str(record),
+                           PATH=f"{stubs}:{BIN}:{os.environ['PATH']}")
+            started = time.monotonic()
+            run = subprocess.run([BIN / "claude-browser", *args], env=env, cwd=home / "repos" / "alpha",
+                                 capture_output=True, text=True, timeout=30, check=False)
+            took = time.monotonic() - started
+        at = f"claude-browser {' '.join(args)} with {how} on the hub's port"
+        assert run.returncode == 0, f"{at} exited {run.returncode}: {run.stderr}"
+        assert took < 10, f"{at} took {took:.1f} s"
+        deadline = time.monotonic() + 10
+        while not record.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert record.exists(), f"{at}: the browser was never started"
+        handed = record.read_text().splitlines()
+        assert len(handed) == 2 and handed[0] == "--profile-directory=Profile 3", f"{at}: the browser got {handed}"
+        got = urllib.parse.unquote(handed[1]) if handed[1].startswith("file://") else handed[1]
+        assert got == target, f"{at}: the browser got {handed[1]!r}, not {target!r}"
+
+    every = [(how, args, target) for how in ("nothing", "silent", "foreign") for args, target in cases]
+    with ThreadPoolExecutor(len(every)) as pool:
+        for done in [pool.submit(hands, n, *case) for n, case in enumerate(every)]:
+            done.result()
+
+
+# --------------------------------------------------------------------------
+# P4: a diffview page takes comments through the hub
+# --------------------------------------------------------------------------
+
+
+class HubError(Exception):
+    pass
+
+
+class NotThroughHub(Exception):
+    """`diffview --open` printed an address on a server other than the hub."""
+
+
+@contextlib.contextmanager
+def hub_process():
+    """bin/container-hub on a port of its own, its HOME and state in a scratch directory: (its HOME, its origin)."""
+    home = Path(tempfile.mkdtemp(prefix="hub-home.", dir=SCRATCH))
+    port = port_beside_live_hub()
+    log = home / "hub.log"
+    with log.open("a") as out:
+        proc = subprocess.Popen(
+            [BIN / "container-hub", "--port", str(port), "--state", str(home / ".local" / "state" / "container-hub")],
+            env=fakes.tools_env(home), cwd=home, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            if proc.poll() is not None:
+                raise HubError(f"the hub exited with {proc.returncode} on start:\n{log.read_text()}")
+            with contextlib.suppress(OSError), socket.create_connection(("127.0.0.1", port), timeout=1):
+                break
+            if time.monotonic() > deadline:
+                raise HubError(f"the hub did not answer on port {port} within 60 s:\n{log.read_text()}")
+            time.sleep(0.1)
+        yield home, port
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
+        proc.wait()
+
+
+def request(origin: str, method: str, url: str, body: bytes | None = None, headers: dict | None = None) -> tuple[int, bytes, str]:
+    """Status, body and the URL answered at, after redirects."""
+    req = urllib.request.Request(urllib.parse.urljoin(origin, url), data=body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read(), r.url
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), e.url
+
+
+@prop("A diffview page that `diffview --open` opens is served by the hub, so it is never read-only.")
+def diffview_served_by_hub():
+    """The address it prints is on the hub's origin and answers with the page; the hub answers /.health with
+    `saves: true`; and a state-file write to the page's address plus `.state.json`, from the hub's own
+    origin, lands in the file beside the page."""
+    with hub_process() as (home, port):
+        origin = f"http://127.0.0.1:{port}"
+        repo = home / "repos" / "alpha"
+        repo.mkdir(parents=True)
+        (home / ".cache" / "diffview").mkdir(parents=True)
+        (home / ".cache" / "diffview" / "highlight.min.js").write_text("")  # diffview would fetch it otherwise
+        token = f"line-{os.getpid()}-only-in-this-diff"
+        git(repo, "init", "-q")
+        (repo / "notes.txt").write_text("one\n")
+        git(repo, "add", "notes.txt")
+        git(repo, "commit", "-q", "-m", "one")
+        (repo / "notes.txt").write_text(f"one\n{token}\n")
+        git(repo, "commit", "-q", "-am", "two")
+        page = repo / "agent" / "diffviews" / "map-columns.html"
+        record = home / "opened"
+        browser = home / "browser"
+        browser.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" > {record}\n')
+        browser.chmod(0o755)
+        env = fakes.tools_env(home, CONTAINER_HUB_PORT=str(port), DIFFVIEW_BROWSER=str(browser))
+        run = subprocess.run([BIN / "diffview", f"{repo}@HEAD~1..HEAD", "-o", str(page), "--open",
+                              "--no-auto-summary"], cwd=repo, env=env, capture_output=True, text=True, timeout=120,
+                             check=False)
+        assert run.returncode == 0, f"diffview --open exited {run.returncode}: {run.stderr}"
+        address = next((line for line in run.stdout.splitlines() if line.startswith(("http://", "https://"))), None)
+        assert address, f"diffview --open printed no http address: {run.stdout!r}"
+        where = urllib.parse.urlsplit(address)
+        if where.scheme != "http" or where.netloc not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            raise NotThroughHub(f"diffview --open printed {address}, not an address on the hub at port {port}")
+        status, raw, _ = request(origin, "GET", "/.health")
+        health = json.loads(raw) if status == 200 else None
+        assert isinstance(health, dict) and health.get("saves") is True, f"/.health answered {status}: {raw[:200]!r}"
+        status, raw, final = request(origin, "GET", address)
+        assert status == 200 and token.encode() in raw, f"{address} answered {status}, without the page"
+        state = {"writer": "diffview", "savedAt": 1, "comments": [{"id": 1, "path": "notes.txt", "text": "why?"}]}
+        target = urllib.parse.urlsplit(final)._replace(query="", fragment="").geturl() + ".state.json"
+        status, raw, _ = request(origin, "POST", target, json.dumps(state).encode(),
+                                 {"Origin": f"{where.scheme}://{where.netloc}", "Content-Type": "application/json"})
+        assert 200 <= status < 300, f"the state write to {target} answered {status}: {raw[:200]!r}"
+        beside = Path(f"{page}.state.json")
+        assert beside.is_file() and json.loads(beside.read_text()) == state, (
+            f"{beside} does not hold the state written: {beside.read_text() if beside.is_file() else 'missing'}")
+
+
+if __name__ == "__main__":
+    atexit.register(shutil.rmtree, SCRATCH, ignore_errors=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    run_properties(only=sys.argv[1:])
+    finish()
