@@ -21,7 +21,7 @@ JOBS ?= $(shell nproc)
 
 # Seconds a file may run before it is stopped and counted as failed. A script's dependencies install before its clock
 # starts, so a cold uv cache does not read as a hang.
-test: TIMEOUT = 120
+test: TIMEOUT = 60
 test:
 	@$(call run-tier,$(FAST))
 
