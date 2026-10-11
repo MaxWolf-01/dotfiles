@@ -16,10 +16,6 @@ FULL_PATH = $(shell grep -lE '^# tier: full-path( |$$)' $(TESTS))
 UNDECLARED = $(filter-out $(FAST) $(FULL_PATH),$(TESTS))
 # How many test files run at once; `make test JOBS=1` runs them one by one.
 JOBS ?= $(shell nproc)
-# Run alone after the rest. On a loaded machine restic can exit before passing on what its ssh said,
-# and these tests decide from those words that a target is unreachable. backup/restic_backup.sh
-# decides the same way, so a busy host can report an unreachable target as a failed backup.
-SERIAL = backup/restic_backup.test tests/overdue-check.test
 
 .PHONY: install test test-full-path
 
@@ -33,12 +29,11 @@ test-full-path: TIMEOUT = 600
 test-full-path:
 	@$(call run-tier,$(FULL_PATH))
 
-# The files run in parallel, the SERIAL ones alone after them, and each one's output is printed whole once it ends.
+# The files run in parallel, and each one's output is printed whole once it ends.
 define run-tier
 $(if $(UNDECLARED),$(error these files name no tier: $(UNDECLARED)))
 results=$$(mktemp -d); \
-$(call run-files,-j$(JOBS) --output-sync=target,$(filter-out $(SERIAL),$(1))) \
-$(call run-files,-j1,$(filter $(SERIAL),$(1))) \
+$(call run-files,-j$(JOBS) --output-sync=target,$(1)) \
 skipped=$$(sort "$$results/skipped" 2>/dev/null); partly=$$(sort "$$results/partly" 2>/dev/null); \
 failed=$$(sort "$$results/failed" 2>/dev/null); rm -rf "$$results"; \
 [ -z "$$skipped" ] || { echo; echo "skipped:"; sed 's/^/  /' <<<"$$skipped"; }; \
