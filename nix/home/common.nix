@@ -393,6 +393,7 @@
     age
     ast-grep
     cargo
+    csvlens
     curl
     duckdb
     dust
