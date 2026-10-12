@@ -202,14 +202,16 @@ exit 1
 
     def registered(self, session: str, status: str = "idle", at: float | None = None, pid: int | None = None,
                    started: str | None = SELF_STARTED, name: str | None = None, tmux: str | None = None,
-                   waiting_for: str | None = None, cwd: Path | None = None, file: str | None = None) -> None:
+                   waiting_for: str | None = None, cwd: Path | None = None, file: str | None = None,
+                   started_at: int | None = None, kind: str | None = None) -> None:
         """The session's file in the registry, as Claude Code writes it while the session's process runs: by default
         this test's own process, which runs for as long as the hub reads it, marked at the hub's clock. A second
         process of the session has a file of its own."""
         entry = {"pid": pid or os.getpid(), "sessionId": session, "status": status,
                  "statusUpdatedAt": int((at or self.clock.now) * 1000), **({"procStart": started} if started else {}),
                  **({"name": name} if name else {}), **({"tmux": tmux} if tmux else {}),
-                 **({"waitingFor": waiting_for} if waiting_for else {}), **({"cwd": str(cwd)} if cwd else {})}
+                 **({"waitingFor": waiting_for} if waiting_for else {}), **({"cwd": str(cwd)} if cwd else {}),
+                 **({"startedAt": started_at} if started_at else {}), **({"kind": kind} if kind else {})}
         path = self.home / ".claude" / "sessions" / f"{file or session[:8]}.json"  # named by the pid there; any name reads alike
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(entry))

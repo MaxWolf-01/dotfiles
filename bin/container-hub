@@ -25,13 +25,18 @@ while in it is out of them until its session next finishes a turn. The loose pag
 number. A unit goes once its tree is retired, or, with no tree, once every page of it is deleted.
 
 A unit's mark on the rail is its session's state: a turning three-quarter ring while it works (still where motion is
-reduced), red while it is blocked in its terminal, and while it is idle, a filled dot where it needs you and a hollow
-one where it does not; a session whose turn ended on a shell left running in the background is idle, waiting on that
-run. An idle session needs you when its session page has a question no later turn answered or superseded, or a turn
-record written since you last visited its unit; a session idle on a worker or a run, whose turns since were chat turns,
-does not. Under its title is its status line: the headline of its newest turn, a turn record's
-heading or the first line of a chat turn. Both are read from the session's page directory by the newest mx plugin's own
-reader; with no plugin installed, every idle session's dot is hollow and none has a status line.
+reduced), red while it is blocked in its terminal, and while it is idle, a filled dot where it needs you, a filled
+sand one where it waits on a run and does not need you, and a hollow one otherwise. A session whose turn ended with a
+command left running in the background is idle, waiting on it. A command that ends on its own (a wait on a worker, a
+test suite) is a run. One that runs until stopped is a watcher; the hub knows it by `--watch` in its command
+(`diffview --watch`). Only a run fills the dot. The session page shows each run at the top of its turns, with its
+description, age and command, and the watchers in one line after them. The hub reads them from the session's
+transcript: each `Bash` call made with `run_in_background` that no task notification has named since, while the
+registry says a shell runs. An idle session needs you when its session page has a question no later turn answered or
+superseded, or a turn record written since you last visited its unit; a session idle on a worker or a run, whose turns
+since were chat turns, does not. Under its title is its status line: the headline of its newest turn, a turn record's
+heading or the first line of a chat turn. Both are read from the session's page directory by the newest mx plugin's
+own reader; with no plugin installed, every idle session's dot is hollow and none has a status line.
 
 The rail's search box (ctrl+alt+f) finds a unit, ended ones included, as fzf finds a line of its title, short id and
 session id, a prefix of either id first, and enter goes to the one picked.
@@ -108,6 +113,12 @@ refuses a session at work or with a shell running in the background, and jump on
 hub runs these in tmux: display-message and capture-pane to read a pane, load-buffer, paste-buffer, delete-buffer and
 send-keys to type into one, list-clients and switch-client to jump, and kill-pane to close. A pane killed that was its
 window's last takes the window with it, as closing it in tmux would.
+
+The hub also keeps every session it can type into on the newest mx installed for its account. Where the version mx's
+own hook last recorded for the session is older, or there is none, it types /reload-plugins into the session's pane,
+once per version, while the session is idle and its input box empty; never into a dispatched worker, which stays on
+the mx its run started with. Claude Code then loads that version's skills and hooks, and mx tells the agent at its
+next prompt what changed. Each reload typed is a line of the hub's log.
 
 A unit's box can also hand its session off to a new session in the same pane, from the session's handoff
 (/mx:handoff). It does so where the session runs idle in a pane the box can type into, in a project with an agent
@@ -189,6 +200,8 @@ none.
                               "last", "number", "status_line", "needs_you" ({"questions", "unseen"}, where it
                               needs you), "board", "worked_on" (the tickets the board marks),
                               "dismissed", "handoff" (what its box offers: {"offer", "path"?, "url"?, "at"?, its last commit}, as above),
+                              "background" (what its idle session left running in the background, oldest first:
+                              [{"what", "command", "at", "watcher"}]),
                               "members": [{"id", "url", "closed", "lane", "tab"?, ...}], "pages",
                               ...}. A member's url is where the hub serves it, relative to here, and its "tab" why it
                               refuses to be framed, where it does. "pages" is every page
@@ -465,13 +478,16 @@ def claude_title(session: str, memo: dict) -> str | None:
 
 
 USER_LINE = re.compile(rb'^\{.*"type":"user".*$', re.MULTILINE)
-NOTHING_READ = {"custom": None, "ai": None, "prompted": None}
+LAUNCH_LINE = re.compile(rb'^\{.*"run_in_background":\s*true.*$', re.MULTILINE)
+NOTIFIED_LINE = re.compile(rb'^\{.*<tool-use-id>.*$', re.MULTILINE)
+NOTIFIED = re.compile(r"<task-notification>.*?<tool-use-id>(\S+?)</tool-use-id>", re.S)
+NOTHING_READ = {"custom": None, "ai": None, "prompted": None, "background": {}}
 
 
 def transcript_read(session: str, memo: dict) -> dict:
-    """What the hub reads of a session's transcript: its titles, and when the user last sent it a prompt
-    (`prompted_at`). A transcript only grows, so what was read of it is kept while it grows, and a read takes only what
-    was added since."""
+    """What the hub reads of a session's transcript: its titles, when the user last sent it a prompt (`prompted_at`), and
+    the commands it left running in the background (`still_running`). A transcript only grows, so what was read of
+    it is kept while it grows, and a read takes only what was added since."""
     path = transcript(session, memo)
     try:
         st = path.stat() if path else None
@@ -501,8 +517,64 @@ def transcript_read(session: str, memo: dict) -> dict:
         # a tool's result is most of a transcript's user lines, and the largest: never parsed
         prompts = [at for m in USER_LINE.finditer(whole) if b'"toolUseResult"' not in m[0] and (at := prompted_at(m[0]))]
         found["prompted"] = max([found["prompted"] or 0, *prompts]) or None
+        found["background"] = still_running(whole, found["background"])
         transcripts_read[path] = (st.st_size, st.st_mtime, read + len(whole), found)
     return found
+
+
+def still_running(whole: bytes, before: dict[str, dict]) -> dict[str, dict]:
+    """The commands a session left running in the background and no task notification has said the end of yet, by
+    the id of the tool call that started each: {"what" (the description the agent gave it), "command", "at"}. Claude
+    Code notifies the session of each one's end, naming that call; a call's id appears in a later line only there."""
+    running = dict(before)
+    for m in LAUNCH_LINE.finditer(whole):
+        try:
+            line = json.loads(m[0])
+        except ValueError:
+            continue
+        if line.get("type") != "assistant":
+            continue
+        for call in (line.get("message") or {}).get("content") or []:
+            if not isinstance(call, dict):
+                continue
+            given = call.get("input") or {}
+            if call.get("type") == "tool_use" and call.get("name") == "Bash" and given.get("run_in_background") is True:
+                command = str(given.get("command") or "")
+                running[str(call.get("id"))] = {"what": str(given.get("description") or command.split("\n")[0]),
+                                                "command": command, "at": epoch_of(line.get("timestamp"))}
+    for m in NOTIFIED_LINE.finditer(whole):
+        if b'"toolUseResult"' in m[0]:  # a command's own output can quote a notification
+            continue
+        try:
+            line = json.loads(m[0])
+        except ValueError:
+            continue
+        said = (line.get("attachment") or {}).get("prompt") if line.get("type") == "attachment" else (line.get("message") or {}).get("content")
+        if line.get("type") in ("user", "attachment") and isinstance(said, str):
+            for ended in NOTIFIED.findall(said):
+                running.pop(ended, None)
+    return running
+
+
+def epoch_of(iso: object) -> float | None:
+    """Seconds since the epoch of an ISO 8601 time as a transcript writes one; None for anything else."""
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def background(session: str, entry: dict | None, memo: dict) -> list[dict]:
+    """The commands an idle session left running in the background, oldest first, each marked a `watcher` as the
+    module's docstring defines one, where the registry says a shell runs (`shell`). Only those its running processes
+    started: a resumed session's transcript also holds the launches of a process that has exited, whose shells ended
+    with it and were never notified of."""
+    if not entry or entry.get("status") != "shell":
+        return []
+    since = min((p["startedAt"] / 1000 for p in entry["processes"] if isinstance(p.get("startedAt"), (int, float))), default=0)
+    commands = sorted((c for c in transcript_read(session, memo)["background"].values() if (c["at"] or 0) >= since),
+                      key=lambda c: c["at"] or 0)
+    return [{**c, "watcher": "--watch" in c["command"]} for c in commands]
 
 
 def prompted_at(raw: bytes) -> float | None:
@@ -1206,7 +1278,7 @@ def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, d
             "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
             "first": min(m["first"] for m in kept), "visited": data.get("visited") or 0,
             "status_line": said["status_line"], "needs_you": needs_you(state, said, data.get("visited") or 0),
-            "handoff": handoff_offer(entry, memo),
+            "handoff": handoff_offer(entry, memo), "background": background(session, entry, memo) if session else [],
             "resume": resume_command(session) if session else "", "tickets": tickets, "pages": pages, "members": members,
             "board": page_of_path(board).url if board and board.is_file() else None,
             "worked_on": [s for s in committed if tracker.tickets[s]["status"] != "done"],  # what is done is worked on no more
@@ -1599,6 +1671,11 @@ def paste(pane: str, text: str) -> str:
     pane to settle. Claude Code attaches an image whose path is pasted, but it finds a path's start only after a space
     or a line feed, and tmux pastes a line break as a carriage return: the line before a path goes in with it as one
     path that cannot be read, and is lost. It also drops an Enter that arrives while it still reads an image."""
+    with typing:
+        return pasted(pane, text)
+
+
+def pasted(pane: str, text: str) -> str:
     # the space between two images is Claude Code's to put in; pasted alone, it would change nothing to settle on
     pieces = [p for p in IMAGE_PATH.split(text) if p.strip()] if IMAGE_PATH.search(text) else [text]
     if tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip() == "1":
@@ -1650,6 +1727,105 @@ def drop(key: str, name: str, data: bytes) -> tuple[int, dict]:
         path = directory / f"{stamp}-{n}-{stem}"
     path.write_bytes(data)
     return 200, {"path": str(path)}
+
+
+# --------------------------------------------------------------------------
+# keeping each session on the newest mx: /reload-plugins typed in once a newer one is installed
+# --------------------------------------------------------------------------
+
+MX = "mx@MaxWolf-01"
+RELOAD = "/reload-plugins"
+RELOAD_EVERY = 15  # seconds between two looks at every session
+RELOADED: dict[str, str] = {}
+"""The mx version the hub last typed RELOAD into a session for, by the session's id: once per version, even where the
+session never records the move (an mx from before it did)."""
+typing = threading.RLock()  # one paste into a pane at a time, whoever types it; `paste` takes it itself
+
+
+def version_of(text: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", text))
+
+
+def installed_mx(account: str) -> str | None:
+    """The mx version Claude Code has installed for an account, as its `plugins/installed_plugins.json` records it."""
+    try:
+        # Claude Code's file, read as `registry` reads its others: one that does not parse now is read at the next look
+        return str(json.loads((Path(account) / "plugins" / "installed_plugins.json").read_text())["plugins"][MX][0]["version"])
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def loaded_mx(account: str, session: str) -> str | None:
+    """The mx version a session last ran its hooks from, as mx's own hook records it (mx/hooks/plugin_updates.py) in
+    the plugin's data directory: Claude Code names it after the plugin's id, every character but a letter, digit, `_`
+    or `-` a `-`."""
+    try:
+        return (Path(account) / "plugins" / "data" / re.sub(r"[^A-Za-z0-9_-]", "-", MX) / "sessions" / session).read_text().strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def dispatched(pid: int) -> bool:
+    """A dispatched worker's process: it stays on the mx its run started with, and its environment says it is one."""
+    try:
+        return any(v.startswith(b"DISPATCH_WORKLOG=") for v in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
+    except OSError:
+        return False
+
+
+def reload_due(session: str, entry: dict) -> str | None:
+    """The mx version to reload a running session to: the one installed for its account, where the session runs an
+    older one or none it recorded, is idle, interactive and no dispatched worker, and the hub has not typed the reload
+    for that version yet. None otherwise."""
+    if entry.get("status") not in ("idle", "shell") or entry.get("kind", "interactive") != "interactive":
+        return None
+    if not (installed := installed_mx(entry["account"])):
+        return None
+    have = [v for v in (loaded_mx(entry["account"], session), RELOADED.get(session)) if v]
+    if any(version_of(v) >= version_of(installed) for v in have) or dispatched(int(entry["pid"])):
+        return None
+    return installed
+
+
+def prompt_empty(shown: str) -> bool:
+    """Claude Code's input box on a pane's screen holds nothing: its line `❯` alone, between the two rules that frame
+    it. Any other screen counts as not empty: a draft, a dialog, a placeholder, a layout this does not know."""
+    lines = shown.rstrip("\n").split("\n")
+    framed = [i for i in range(1, len(lines) - 1)
+              if lines[i].startswith("❯") and lines[i - 1].startswith("─") and lines[i + 1].startswith("─")]
+    return bool(framed) and lines[framed[-1]].strip() == "❯"
+
+
+def reload_into(session: str, entry: dict, version: str) -> str:
+    """Type RELOAD into the session's pane where it is still idle and its input box is empty, and say so; nothing
+    where it was not typed. A turn draws an empty box too, so the registry is asked again right before."""
+    pane, _ = pane_in(entry)
+    if not pane:
+        return ""
+    with typing:
+        if (registry().get(session) or {}).get("status") not in ("idle", "shell") or not prompt_empty(screen(pane)):
+            return ""
+        if failed := paste(pane, RELOAD):
+            return f"reloading mx in {entry.get('name') or session[:8]}: {failed}"
+    RELOADED[session] = version
+    return f"typed {RELOAD} into {entry.get('name') or session[:8]} ({pane}) for mx {version}"
+
+
+def keep_plugins_current() -> None:
+    """Every RELOAD_EVERY seconds, reload each session due a newer mx (`reload_due`) whose pane the hub can type into."""
+    while True:
+        time.sleep(RELOAD_EVERY)
+        try:
+            live = registry()
+        except Exception as e:  # a file changing under the read: the next look reads it again
+            print(f"keeping sessions on the newest mx: {e}", file=sys.stderr, flush=True)
+            continue
+        for session, entry in live.items():
+            try:
+                if (version := reload_due(session, entry)) and (said := reload_into(session, entry, version)):
+                    print(said, file=sys.stderr, flush=True)
+            except Exception as e:  # one session failing it (tmux, an entry of another shape) stops none of the others
+                print(f"reloading mx in {session[:8]}: {e}", file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -2313,6 +2489,7 @@ def main(args: Args) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.daemon_threads = True
     threading.Thread(target=watch_disk, daemon=True).start()
+    threading.Thread(target=keep_plugins_current, daemon=True).start()
     print(f"container-hub on http://127.0.0.1:{args.port}/, state in {STATE}", flush=True)
     server.serve_forever()
 
