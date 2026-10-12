@@ -95,7 +95,7 @@ in
     icon = toString ../../desktop/icons/nvim.svg;
     type = "Application";
     categories = [ "Utility" "Development" "TextEditor" ];
-    mimeType = [ "text/markdown" "text/plain" ];
+    mimeType = [ "text/markdown" "text/plain" "text/csv" "text/tab-separated-values" ];
     terminal = true;
     settings.Path = "${config.home.homeDirectory}/Downloads";
   };
@@ -109,6 +109,8 @@ in
       "text/x-shellscript" = "nvim.desktop";
       "text/x-yaml" = "nvim.desktop";
       "text/x-toml" = "nvim.desktop";
+      "text/csv" = "nvim.desktop";
+      "text/tab-separated-values" = "nvim.desktop";
       "application/json" = "nvim.desktop";
       "application/javascript" = "nvim.desktop";
       "application/x-shellscript" = "nvim.desktop";
