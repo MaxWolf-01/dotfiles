@@ -65,6 +65,12 @@ let
     bash coreutils uv sops jq
   ]);
 
+  # with-secrets runs sops exec-env for the Enable Banking application's id, and
+  # the collector sops for its private key; jq for bin/run-log.
+  erstePath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv sops jq
+  ]);
+
   # sops for the Bridge password, uv for lifelog's header index, jq for bin/run-log.
   mailPath = lib.makeBinPath (with pkgs; [
     bash coreutils isync notmuch sops uv jq
@@ -448,6 +454,40 @@ in
       # Ten to, in the hours between calendar-collect's, which signs in to neither
       # but reads the KUSSS and Moodle feeds.
       OnCalendar = "01/3:50:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Erste bookings → the lifelog record ---
+  # What it reads, records and counts as a failed run: secrets/scripts/erste-collect --help.
+
+  systemd.user.services.erste-collect = {
+    Unit = {
+      Description = "Read max's Erste account through Enable Banking into the lifelog record";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${erstePath}"
+        # A unit's environment does not say where the age key is; a shell's does.
+        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
+      ];
+      ExecStart = "${dotfiles}/bin/with-secrets enable-banking ${secrets}/scripts/erste-collect fetch";
+      # A read is a few pages, each answered in seconds; a run this long has hung.
+      TimeoutStartSec = "10min";
+    };
+  };
+
+  systemd.user.timers.erste-collect = {
+    # Twice leaves two of the bank's four daily reads without max present for a
+    # read by hand; erste-collect itself refuses a fifth.
+    Unit.Description = "Erste collection (twice a day)";
+    Timer = {
+      # Ten to, in hours neither calendar-collect nor jku-collect takes.
+      OnCalendar = "08,20:50:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
