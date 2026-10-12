@@ -93,7 +93,8 @@ take the Enter. Nothing goes to a session blocked in its terminal (the registry'
 question, a dialog), to one that runs in no tmux pane, or to a pane that no longer holds the session's process. What
 the box sent shows at the top of the session page's turns, as the turn under way, until a render of the page shows
 it or the session ends, since the page shows a message only once its turn ends. A file pasted or dropped into the
-box is saved under the cache's `container-hub/drops/` and its path typed in its place.
+box is saved under the cache's `container-hub/drops/` and its path typed in its place; the session attaches an
+image's as the image.
 
 Beside the box, jump (ctrl+alt+g) takes you to the session's tmux pane: it moves the tmux client you typed in last to
 that pane, its tmux session and window with it, and leaves raising the terminal's window to you. Close (ctrl+alt+x,
@@ -102,7 +103,7 @@ one of the session's processes, the shell the session was started from included;
 unit goes to the ended ones, as any whose process exited. A session resumed in a second pane while the first still runs shows how many panes
 it runs in, and each jump goes to the next of them. Neither acts on a pane that no longer holds the session's own
 process; close refuses a session at work, and jump one with no tmux client attached. So the hub runs these in tmux:
-display-message to read a pane, load-buffer, paste-buffer, delete-buffer and send-keys to type into one, list-clients
+display-message and capture-pane to read a pane, load-buffer, paste-buffer, delete-buffer and send-keys to type into one, list-clients
 and switch-client to jump, and kill-pane to close. A pane killed that was its window's last takes the window with it,
 as closing it in tmux would.
 
@@ -1432,8 +1433,8 @@ def top_level(headers) -> bool:
 
 
 TMUX_SOCKET: Path | None = None
-TMUX_COMMANDS = {"display-message", "load-buffer", "paste-buffer", "delete-buffer", "send-keys", "list-clients",
-                 "switch-client", "kill-pane"}
+TMUX_COMMANDS = {"display-message", "capture-pane", "load-buffer", "paste-buffer", "delete-buffer", "send-keys",
+                 "list-clients", "switch-client", "kill-pane"}
 """All the hub ever asks of tmux, as the module's docstring lists it. kill-pane only ever runs on a pane `holds` found
 holding a session's own process in the same request."""
 
@@ -1571,22 +1572,57 @@ def type_into(body: dict) -> tuple[int, dict]:
     return 200, {"ok": True, "pane": pane}
 
 
+IMAGE_PATH = re.compile(r"((?<!\S)/\S+\.(?:png|jpe?g|gif|webp)(?!\S))", re.IGNORECASE)
+"""A path Claude Code reads a paste of as an image to attach: an absolute one, set apart by whitespace, whose name ends
+as an image's does."""
+SETTLED = 0.2  # seconds a pane's screen stays the same once a paste has changed it
+SETTLE_LIMIT = 3.0
+
+
 def paste(pane: str, text: str) -> str:
     """Type the text into the pane and press Enter; why tmux refused, else nothing. A paste, so a newline stays a
     newline rather than sending the message early; tmux types it as plain keys where the program asked for no
     bracketed paste. A pane in copy mode leaves it first: the paste would reach the program, but copy mode would take
-    the Enter."""
-    buffer = f"container-hub-{secrets.token_hex(4)}"
-    steps = [(("load-buffer", "-b", buffer, "-"), text), (("paste-buffer", "-p", "-d", "-b", buffer, "-t", pane), None),
-             (("send-keys", "-t", pane, "Enter"), None)]
+    the Enter.
+
+    A text naming images goes in a piece at a time, each image's path a paste of its own, and each piece waits for the
+    pane to settle: Claude Code attaches an image whose path is pasted, but of one paste holding words and several
+    such paths it keeps a single image and loses the rest, and it drops an Enter that arrives while it still reads an
+    image."""
+    # the space between two images is Claude Code's to put in; pasted alone, it would change nothing to settle on
+    pieces = [p for p in IMAGE_PATH.split(text) if p.strip()] if IMAGE_PATH.search(text) else [text]
     if tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip() == "1":
-        steps.insert(0, (("send-keys", "-t", pane, "-X", "cancel"), None))
-    for args, given in steps:
-        run = tmux(*args, given=given)
-        if run.returncode != 0:
-            tmux("delete-buffer", "-b", buffer)
-            return f"tmux {args[0]} into {pane}: {run.stderr.strip()}"
+        if (run := tmux("send-keys", "-t", pane, "-X", "cancel")).returncode != 0:
+            return f"tmux send-keys into {pane}: {run.stderr.strip()}"
+    for piece in pieces:
+        buffer = f"container-hub-{secrets.token_hex(4)}"
+        shown = screen(pane) if len(pieces) > 1 else ""
+        for args, given in [(("load-buffer", "-b", buffer, "-"), piece), (("paste-buffer", "-p", "-d", "-b", buffer, "-t", pane), None)]:
+            if (run := tmux(*args, given=given)).returncode != 0:
+                tmux("delete-buffer", "-b", buffer)
+                return f"tmux {args[0]} into {pane}: {run.stderr.strip()}"
+        if len(pieces) > 1:
+            settle(pane, shown)
+    if (run := tmux("send-keys", "-t", pane, "Enter")).returncode != 0:
+        return f"tmux send-keys into {pane}: {run.stderr.strip()}"
     return ""
+
+
+def screen(pane: str) -> str:
+    return tmux("capture-pane", "-p", "-t", pane).stdout
+
+
+def settle(pane: str, shown: str) -> None:
+    """Wait until the pane shows something other than `shown` and has stayed the same for SETTLED seconds, or for
+    SETTLE_LIMIT seconds where it never does."""
+    start = time.monotonic()
+    last, since = shown, start
+    while (now := time.monotonic()) - start < SETTLE_LIMIT:
+        time.sleep(0.05)
+        if (current := screen(pane)) != last:
+            last, since = current, time.monotonic()
+        elif last != shown and now - since >= SETTLED:
+            return
 
 
 def drop(key: str, name: str, data: bytes) -> tuple[int, dict]:
