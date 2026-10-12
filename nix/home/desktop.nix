@@ -100,6 +100,16 @@ in
     settings.Path = "${config.home.homeDirectory}/Downloads";
   };
 
+  xdg.desktopEntries.csvlens = {
+    name = "csvlens";
+    comment = "View CSV and TSV files as a table";
+    exec = "${config.home.homeDirectory}/bin/csvlens-open %f";
+    type = "Application";
+    categories = [ "Utility" "Viewer" ];
+    mimeType = [ "text/csv" "text/tab-separated-values" ];
+    terminal = true;
+  };
+
   xdg.mimeApps = {
     enable = true;
     defaultApplications = {
@@ -109,8 +119,8 @@ in
       "text/x-shellscript" = "nvim.desktop";
       "text/x-yaml" = "nvim.desktop";
       "text/x-toml" = "nvim.desktop";
-      "text/csv" = "nvim.desktop";
-      "text/tab-separated-values" = "nvim.desktop";
+      "text/csv" = "csvlens.desktop";
+      "text/tab-separated-values" = "csvlens.desktop";
       "application/json" = "nvim.desktop";
       "application/javascript" = "nvim.desktop";
       "application/x-shellscript" = "nvim.desktop";
