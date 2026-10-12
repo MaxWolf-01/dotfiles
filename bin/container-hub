@@ -25,13 +25,18 @@ while in it is out of them until its session next finishes a turn. The loose pag
 number. A unit goes once its tree is retired, or, with no tree, once every page of it is deleted.
 
 A unit's mark on the rail is its session's state: a turning three-quarter ring while it works (still where motion is
-reduced), red while it is blocked in its terminal, and while it is idle, a filled dot where it needs you and a hollow
-one where it does not; a session whose turn ended on a shell left running in the background is idle, waiting on that
-run. An idle session needs you when its session page has a question no later turn answered or superseded, or a turn
-record written since you last visited its unit; a session idle on a worker or a run, whose turns since were chat turns,
-does not. Under its title is its status line: the headline of its newest turn, a turn record's
-heading or the first line of a chat turn. Both are read from the session's page directory by the newest mx plugin's own
-reader; with no plugin installed, every idle session's dot is hollow and none has a status line.
+reduced), red while it is blocked in its terminal, and while it is idle, a filled dot where it needs you, a filled
+sand one where it waits on a run, and a hollow one where neither. A session whose turn ended with a command left
+running in the background is idle, waiting on it. Such a command is a run where it ends on its own (a wait on a
+worker, a test suite), and a watcher where it runs until stopped, which the hub tells by `--watch` in its command
+(`diffview --watch`); only a run marks the dot. Its session page shows each run at the top of its turns, its
+description, age and command, and the watchers in a line after them. The hub reads them from the session's transcript:
+each `Bash` call made with `run_in_background` that no task notification has named since, while the registry says a
+shell runs. An idle session needs you when its session page has a question no later turn answered or superseded, or a
+turn record written since you last visited its unit; a session idle on a worker or a run, whose turns since were chat
+turns, does not. Under its title is its status line: the headline of its newest turn, a turn record's heading or the
+first line of a chat turn. Both are read from the session's page directory by the newest mx plugin's own reader; with
+no plugin installed, every idle session's dot is hollow and none has a status line.
 
 The rail's search box (ctrl+alt+f) finds a unit, ended ones included, as fzf finds a line of its title, short id and
 session id, a prefix of either id first, and enter goes to the one picked.
@@ -189,6 +194,8 @@ none.
                               "last", "number", "status_line", "needs_you" ({"questions", "unseen"}, where it
                               needs you), "board", "worked_on" (the tickets the board marks),
                               "dismissed", "handoff" (what its box offers: {"offer", "path"?, "url"?, "at"?, its last commit}, as above),
+                              "background" (what its idle session left running in the background, oldest first:
+                              [{"what", "command", "at", "watcher"}]),
                               "members": [{"id", "url", "closed", "lane", "tab"?, ...}], "pages",
                               ...}. A member's url is where the hub serves it, relative to here, and its "tab" why it
                               refuses to be framed, where it does. "pages" is every page
@@ -465,12 +472,15 @@ def claude_title(session: str, memo: dict) -> str | None:
 
 
 USER_LINE = re.compile(rb'^\{.*"type":"user".*$', re.MULTILINE)
-NOTHING_READ = {"custom": None, "ai": None, "prompted": None}
+LAUNCH_LINE = re.compile(rb'^\{.*"run_in_background":\s*true.*$', re.MULTILINE)
+NOTIFIED_LINE = re.compile(rb'^\{.*<tool-use-id>.*$', re.MULTILINE)
+NOTIFIED = re.compile(r"<task-notification>.*?<tool-use-id>(\S+?)</tool-use-id>", re.S)
+NOTHING_READ = {"custom": None, "ai": None, "prompted": None, "background": {}}
 
 
 def transcript_read(session: str, memo: dict) -> dict:
-    """What the hub reads of a session's transcript: its titles, and when the user last sent it a prompt
-    (`prompted_at`). A transcript only grows, so what was read of it is kept while it grows, and a read takes only what
+    """What the hub reads of a session's transcript: its titles, when the user last sent it a prompt
+    (`prompted_at`), and the commands it left running in the background (`launched`). A transcript only grows, so what was read of it is kept while it grows, and a read takes only what
     was added since."""
     path = transcript(session, memo)
     try:
@@ -501,8 +511,60 @@ def transcript_read(session: str, memo: dict) -> dict:
         # a tool's result is most of a transcript's user lines, and the largest: never parsed
         prompts = [at for m in USER_LINE.finditer(whole) if b'"toolUseResult"' not in m[0] and (at := prompted_at(m[0]))]
         found["prompted"] = max([found["prompted"] or 0, *prompts]) or None
+        found["background"] = launched(whole, found["background"])
         transcripts_read[path] = (st.st_size, st.st_mtime, read + len(whole), found)
     return found
+
+
+def launched(whole: bytes, before: dict[str, dict]) -> dict[str, dict]:
+    """The commands a session left running in the background and no task notification has said the end of yet, by
+    the id of the tool call that started each: {"what" (the description the agent gave it), "command", "at"}. Claude
+    Code notifies the session of each one's end, naming that call; a call's id appears in a later line only there."""
+    running = dict(before)
+    for m in LAUNCH_LINE.finditer(whole):
+        try:
+            line = json.loads(m[0])
+        except ValueError:
+            continue
+        if line.get("type") != "assistant":
+            continue
+        for call in (line.get("message") or {}).get("content") or []:
+            if not isinstance(call, dict):
+                continue
+            given = call.get("input") or {}
+            if call.get("type") == "tool_use" and call.get("name") == "Bash" and given.get("run_in_background") is True:
+                command = str(given.get("command") or "")
+                running[str(call.get("id"))] = {"what": str(given.get("description") or command.split("\n")[0]),
+                                                "command": command, "at": stamp(line.get("timestamp"))}
+    for m in NOTIFIED_LINE.finditer(whole):
+        if b'"toolUseResult"' in m[0]:  # a command's own output can quote a notification
+            continue
+        try:
+            line = json.loads(m[0])
+        except ValueError:
+            continue
+        said = (line.get("attachment") or {}).get("prompt") if line.get("type") == "attachment" else (line.get("message") or {}).get("content")
+        if line.get("type") in ("user", "attachment") and isinstance(said, str):
+            for ended in NOTIFIED.findall(said):
+                running.pop(ended, None)
+    return running
+
+
+def stamp(at: object) -> float | None:
+    try:
+        return datetime.fromisoformat(str(at).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def background(session: str, entry: dict | None, memo: dict) -> list[dict]:
+    """What an idle session left running in the background, oldest first, where the registry says something runs
+    (`shell`): each command a run, which ends on its own (a wait on a worker, a test suite), or a watcher, which runs
+    until stopped (`diffview --watch`), told apart by `--watch` in its command."""
+    if not entry or entry.get("status") != "shell":
+        return []
+    runs = sorted(transcript_read(session, memo)["background"].values(), key=lambda r: r["at"] or 0)
+    return [{**r, "watcher": "--watch" in r["command"]} for r in runs]
 
 
 def prompted_at(raw: bytes) -> float | None:
@@ -1206,7 +1268,7 @@ def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, d
             "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
             "first": min(m["first"] for m in kept), "visited": data.get("visited") or 0,
             "status_line": said["status_line"], "needs_you": needs_you(state, said, data.get("visited") or 0),
-            "handoff": handoff_offer(entry, memo),
+            "handoff": handoff_offer(entry, memo), "background": background(session, entry, memo) if session else [],
             "resume": resume_command(session) if session else "", "tickets": tickets, "pages": pages, "members": members,
             "board": page_of_path(board).url if board and board.is_file() else None,
             "worked_on": [s for s in committed if tracker.tickets[s]["status"] != "done"],  # what is done is worked on no more
