@@ -197,7 +197,7 @@
       # Persist full history across restart/logout (default only keeps pinned/tagged)
       clipboard-history = "keep-all";
       database-backend = "sqlite";
-      history-length = 100;
+      history-length = 300;
       # Layout / appearance
       clipboard-orientation = "vertical";
       clipboard-position-horizontal = "top";
