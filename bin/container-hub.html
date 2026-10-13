@@ -326,8 +326,9 @@ const TOKEN = (() => { const m = document.querySelector('meta[name="hub-token"]'
 const hubFetch = window.fetch.bind(window);
 
 let ws = null;
-let read = { units: [], usage: [] }; // the hub's last answer, every account's units in it
-let state = { units: [], members: [] }; // that answer as the tab shows it: the shown accounts', with the user's changes
+let read = { units: [], usage: [] }; // the hub's last index (/api/hub), every account's units in it
+const details = new Map(); // /api/u/<key> of each unit the tab lays out: its pages and members, which the index leaves out
+let state = { units: [], members: [] }; // those answers as the tab shows them: the shown accounts', with the user's changes
 // The unit you are in, by its session, so a reorder of the rail never moves you; null in the overview. An address
 // at a unit (/u/<key>, the Stop hook's link) puts you there.
 const asked = location.pathname.startsWith("/u/") ? decodeURIComponent(location.pathname.slice(3)) : null;
@@ -375,7 +376,9 @@ function send(p) {
     }));
 }
 
-async function refresh() {
+// The index, then the details of the units laid out: read again for those `changed` names, and for those a change
+// made here waits on.
+async function refresh(changed = []) {
   const started = performance.now();
   let r;
   try {
@@ -385,7 +388,10 @@ async function refresh() {
     return; // the hub is down: the status line says so, and the tab reads again once it is back
   }
   read = await r.json();
-  for (const p of pending) if (p.answered !== null && p.answered < started) pending.delete(p);
+  const answered = [...pending].filter((p) => p.answered !== null && p.answered < started);
+  derive();
+  await hold([...changed, ...answered.map((p) => p.body.unit)]);
+  for (const p of answered) pending.delete(p);
   derive();
   for (const k of Object.keys(localStorage)) {
     const [, kind, U] = k.match(/^hub:(panes|draft):(.*)$/s) ?? [];
@@ -393,12 +399,25 @@ async function refresh() {
   }
 }
 
-// The state from the hub's last answer: a hidden account's units leave it, and with them its pages, its numbers
-// and its place in the search.
+// The details of every unit laid out, read where the tab holds none yet or `again` names the unit; others are let go.
+async function hold(again = []) {
+  const wanted = new Set(laidOut().map((u) => u.unit));
+  for (const U of details.keys()) if (!wanted.has(U)) details.delete(U);
+  await Promise.all([...wanted].filter((U) => !details.has(U) || again.includes(U)).map(async (U) => {
+    try {
+      const r = await fetch(`/api/u/${encodeURIComponent(U)}`);
+      if (r.ok) details.set(U, await r.json());
+      else details.delete(U); // gone since the index was read
+    } catch {} // the hub is down: held as it was, and read again once it is back
+  }));
+}
+
+// The state from the hub's last answers: a hidden account's units leave it, and with them its pages, its numbers
+// and its place in the search. The index goes over the details, which are read only when they change.
 function derive() {
-  const units = read.units.filter((u) => !hiddenAccounts.has(u.account));
+  const units = read.units.filter((u) => !hiddenAccounts.has(u.account)).map((u) => ({ ...details.get(u.unit), ...u }));
   // every unit's members in one list, each knowing its unit, which is what the layout and the keys walk
-  state = { ...read, units, members: units.flatMap((u) => u.members.map((m) => ({ ...m, id: vid(u.unit, m.id), mid: m.id, group: u.unit }))) };
+  state = { ...read, units, members: units.flatMap((u) => (u.members ?? []).map((m) => ({ ...m, id: vid(u.unit, m.id), mid: m.id, group: u.unit }))) };
   for (const p of pending) p.change(state);
   renumber(state);
   // a turn record written in the unit you are in is one you see as it lands; unvisited, it would number the unit 1
@@ -429,11 +448,9 @@ const unit = (key) => state.units.find((u) => u.unit === key);
 const vid = (U, mid) => `${U}~${mid}`;
 const numbered = () => state.units.filter((u) => u.number);
 const shown = (m) => !m.closed;
-// What an agent opened since you were last in the unit, counted only for a live orchestrator, numbered or set aside:
-// an ended session's or the loose pages' are listed in their session page, not pressed on you.
-const fresh = (u) =>
-  u.unit === current || !u.session || u.state === "ended" ? []
-  : state.members.filter((m) => m.group === u.unit && m.by === "agent" && m.at > u.visited);
+// When an agent opened each page it opened since you were last in the unit, counted only for a live orchestrator,
+// numbered or set aside: an ended session's or the loose pages' are listed in their session page, not pressed on you.
+const fresh = (u) => u.unit === current || !u.session || u.state === "ended" ? [] : u.agent_opened_at.filter((at) => at > u.visited);
 // Why an idle session needs you, as the hub has it, or null: its open questions, and a turn record written since you
 // last visited its unit, which the unit you are in has none of.
 const needs = (u) => {
@@ -720,6 +737,7 @@ function enter(U) {
   if (U) localStorage.setItem("hub:current", U);
   else localStorage.removeItem("hub:current");
   if (U) visit(U);
+  if (U && !details.has(U)) hold().then(() => { derive(); apply(); if (current === U) focusIn(U); });
   // an unnumbered unit leaves the layout with you, and an open board is the new unit's tree's
   if ((left && !unit(left)?.number) || (boardOpen && boardOf() !== board)) apply();
   render();
@@ -727,7 +745,7 @@ function enter(U) {
 
 function nextNewUnit() {
   const queue = state.units
-    .map((u) => ({ u, first: Math.min(...fresh(u).map((m) => m.at)) }))
+    .map((u) => ({ u, first: Math.min(...fresh(u)) }))
     .filter((x) => Number.isFinite(x.first))
     .sort((a, b) => a.first - b.first);
   if (!queue.length) return note("nothing new for any other orchestrator");
@@ -825,7 +843,7 @@ function userOpen(a, U) {
 // session page, which takes the tab to that session's unit, once the tab has read it. A page on another origin
 // that refuses to be framed opens as a browser tab instead: at once where a unit lists it so, else once the hub has
 // asked it, which the browser counts as part of the click for a few seconds only; past those, the tab says to click again.
-const refuses = (href) => state.units.some((u) => u.pages.some((p) => p.tab && new URL(p.url, location.href).href === href));
+const refuses = (href) => state.units.some((u) => u.refusing.some((url) => new URL(url, location.href).href === href));
 // When this tab last opened a page that refuses framing as a browser tab, by its address as the browser spells it: the page is minimized no more
 // from then until an agent opens it again.
 const tabbedAt = new Map();
@@ -2276,6 +2294,16 @@ function reloadWhenFree(iframe, again = false) {
   try { w.location.reload(); } catch {}
 }
 
+// A member of a unit the tab does not lay out, for the note an agent's open of it earns.
+async function memberOf(U, mid) {
+  try {
+    const m = (await (await fetch(`/api/u/${encodeURIComponent(U)}`)).json()).members?.find((x) => x.id === mid);
+    return m && { ...m, id: vid(U, m.id), mid: m.id, group: U };
+  } catch {
+    return null;
+  }
+}
+
 // ---- the hub's events, and what happens when it goes away
 
 const status = $("status");
@@ -2287,11 +2315,11 @@ events.onopen = () => {
   // The hub tells this stream of what changes from when it opened; the view's first read came before that.
   if (!lost) {
     const read = JSON.stringify(state);
-    return refresh().then(() => JSON.stringify(state) !== read && apply());
+    return refresh([...details.keys()]).then(() => JSON.stringify(state) !== read && apply());
   }
   lost = false;
   for (const p of pending) if (p.unsent) send(p);
-  refresh().then(() => apply()); // events sent while away are gone
+  refresh([...details.keys()]).then(() => apply()); // events sent while away are gone
   if (saidDown) note("hub back; caught up");
   saidDown = false;
 };
@@ -2314,13 +2342,13 @@ events.onerror = () => {
 };
 events.onmessage = async (e) => {
   const ev = JSON.parse(e.data);
-  await refresh();
+  await refresh(ev.units ?? (["added", "reopened", "close"].includes(ev.type) ? [ev.unit] : []));
   if (ev.type === "visit" || ev.type === "numbers") return render();
   // a click answered already; a hidden account's agent puts nothing over the tab
   const hidden = (U) => hiddenAccounts.has(read.units.find((u) => u.unit === U)?.account);
   if (ev.type === "board") return ev.by === "user" || hidden(ev.unit) ? render() : openBoard(ev.url, ev.unit, false);
   if (ev.type !== "added" && ev.type !== "reopened") return apply();
-  const m = state.members.find((x) => x.group === ev.unit && x.mid === ev.id);
+  const m = state.members.find((x) => x.group === ev.unit && x.mid === ev.id) ?? await memberOf(ev.unit, ev.id);
   if (!m) return apply();
   if (m.kind === "session") { // its sidebar's, never the layout's
     const frame = sessionPages.get(m.group)?.element.querySelector("iframe");

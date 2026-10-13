@@ -47,8 +47,9 @@ account's name on the rail, or Enter or Space on it, hides the account, and anot
 profile keeps its own choice, and leaves a hidden account's units out of everything but the hub's state.
 
 Membership, minimized pages, visits, dismissals and the session a hand-off came from live in one JSON file per unit
-under --state; everything else is read from disk on every request, so the hub's state can go and only those marks go
-with it. What it read of Claude Code's transcripts, which only grow, it keeps in memory and reads on from.
+under --state; everything else is read from disk, so the hub's state can go and only those marks go with it. The hub
+keeps each unit as it last read it, with the stat of every file it read it from, and reads again only the units one
+of whose files has changed. What it read of Claude Code's transcripts, which only grow, it keeps too, and reads on from.
 
 Every page has a lane, its level of abstraction, from the highest to the lowest: session, concept, output, code. A
 page's lane follows from what it is: a session page goes to session, a diffview page to code, an image to concept,
@@ -159,7 +160,9 @@ none.
     GET  /                    the hub tab
     GET  /u/<key>             the hub tab at a unit: a session id, or `loose`. A container view's old address,
                               /c/<key>, is sent to the hub tab.
-    GET  /events              server-sent events: something in the hub changed. One stream per hub tab.
+    GET  /events              server-sent events: something in the hub changed. One stream per hub tab. A change on disk
+                              is {"type": "disk", "units"}, naming the units whose details (as /api/hub leaves them
+                              out) changed, or {"type": "numbers"} where only the statusline's numbers did.
     GET  /pages/<key>         a unit's stand-in for its session page, while it has none.
     POST /api/open            {"target", "session"?, "cwd"?, "unit"?, "title"?, "by"?, "lane"?}: a path, file:// URL or
                               URL becomes a member of its unit, or comes forward again if it is one. Every answer
@@ -191,10 +194,14 @@ none.
                               Answers {"closed": [panes]}; 409 {"error": why} where it closes none.
     POST /api/serve           {"path"}: from a local tool only, serve a page with what sits beside it, or a
                               directory with everything under it, without making it a member. Answers {"url"}.
-    GET  /api/hub             {"units": [...], "usage": [...]}: every unit, the numbered ones
+    GET  /api/hub             {"units": [...], "usage": [...]}: the rail's index. Every unit, the numbered ones
                               first in the rail's order, then the dismissed, then the ended, each the latest turn
-                              first; and each account's 5h and weekly usage, as the statusline last had them.
-    GET  /api/u/<key>         one unit: {"unit", "session", "account", "title", "short", "tree", "repo", "state", "waiting_for",
+                              first, as /api/u/<key> has it but for its details: "members", "pages", "tickets" and
+                              "session_page". In their place "refusing", the urls of its pages that refuse to be
+                              framed, and "agent_opened_at", the times an agent opened a page of it since the unit's
+                              last visit. Beside the units, each account's 5h and weekly usage, as the statusline
+                              last had them.
+    GET  /api/u/<key>         one unit, its "number" null (the rail's index has it): {"unit", "session", "account", "title", "short", "tree", "repo", "state", "waiting_for",
                               "pane", "panes" (every pane its session's processes run in, as the registry names them),
                               "context" (its running session's context use, as the statusline last had it),
                               "last", "number", "status_line", "needs_you" ({"questions", "unseen"}, where it
@@ -344,6 +351,22 @@ def signature(root: Path) -> tuple:
         return ()
 
 
+def stamp(path: Path | str) -> tuple | None:
+    """What a file's stat says of its content, None where there is no file. A write of the same size in the same
+    tick of the kernel's clock as the stat before it keeps the stamp, and the hub misses it, on kernels before 6.13,
+    which brought finer times for a file whose time was just read (multigrain timestamps)."""
+    try:
+        s = os.stat(path)
+    except OSError:
+        return None
+    return s.st_ino, s.st_mtime_ns, s.st_size, s.st_mode
+
+
+REFUSED: dict[Path, tuple] = {}
+"""The agent directories whose tracker refused to be read, with the command and ticket files it refused: asked again
+only once either has changed. A failure that clears on its own stays until then."""
+
+
 def tracker_at(agent: Path | None) -> Tracker | None:
     """The tracker an agent directory belongs to, read again only once a ticket file has changed. None when
     there is none, or `tracker` refuses to read it."""
@@ -354,10 +377,15 @@ def tracker_at(agent: Path | None) -> Tracker | None:
     command = tracker_command()
     if not command or not agent.parent.is_dir():
         return None
+    tried = (command, signature(agent / "tickets"), root and signature(root))
+    if REFUSED.get(agent) == tried:
+        return None
     run = subprocess.run([command, "data"], cwd=agent.parent, capture_output=True, text=True, check=False)
     if run.returncode != 0:
         print(f"tracker data in {agent.parent} failed: {run.stderr.strip()[:300]}", file=sys.stderr, flush=True)
+        REFUSED[agent] = tried
         return None
+    REFUSED.pop(agent, None)
     data = json.loads(run.stdout)
     root = Path(data["root"]).resolve()
     tickets = {t["slug"]: {"status": t["status"], "parent": t.get("parent"), "title": t.get("title") or t["slug"],
@@ -365,6 +393,13 @@ def tracker_at(agent: Path | None) -> Tracker | None:
     ROOTS[agent] = root
     TRACKERS[root] = Tracker(root, tickets, signature(root))
     return TRACKERS[root]
+
+
+def tracker_of(agent: Path, memo: dict) -> Tracker | None:
+    """tracker_at, once per read of the hub."""
+    if (agent, "tracker") not in memo:
+        memo[agent, "tracker"] = tracker_at(agent)
+    return memo[agent, "tracker"]
 
 
 SESSION_LOGS: dict[Path, tuple[str, dict[str, list[str]]]] = {}
@@ -376,16 +411,59 @@ def git(cwd: Path, *args: str) -> str:
     return run.stdout if run.returncode == 0 else ""
 
 
+REFS: dict[Path, tuple[tuple | None, str, Path]] = {}
+"""refs_of's last answer for each agent directory, with refs_stamp then."""
+
+
+def refs_of(agent: Path, memo: dict) -> tuple[str, Path]:
+    """The refs of an agent repo, as `git for-each-ref` lists them, and its common git dir: once per read of the hub,
+    and asked of git only once a file git keeps the refs in has changed."""
+    if (agent, "refs") in memo:
+        return memo[agent, "refs"]
+    seen = refs_stamp(agent)
+    if seen is not None and (hit := REFS.get(agent)) and hit[0] == seen:
+        memo[agent, "refs"] = hit[1:]
+        return hit[1:]
+    refs = git(agent, "for-each-ref", "--format=%(objectname)")
+    common = Path(git(agent, "rev-parse", "--path-format=absolute", "--git-common-dir").strip() or agent) if refs else agent
+    REFS[agent] = seen, refs, common
+    memo[agent, "refs"] = refs, common
+    return refs, common
+
+
+def refs_stamp(agent: Path) -> tuple | None:
+    """The stamp of every file git keeps an agent repo's refs in: a ref written replaces its file, or packed-refs, or
+    the reftable's list. None where the agent directory is no repo of its own, which git is asked about every time."""
+    common = git_dir(agent)
+    if common is None:
+        return None
+    found = [stamp(common / "packed-refs"), stamp(common / "reftable" / "tables.list")]
+    for top, _, names in os.walk(common / "refs"):
+        found += [(top, name, stamp(os.path.join(top, name))) for name in names]
+    return tuple(found)
+
+
+def git_dir(agent: Path) -> Path | None:
+    """The common git dir of the repo an agent directory is: its `.git`, or for a worktree, the one the directory its
+    `.git` file names points to in `commondir`."""
+    dot = agent / ".git"
+    if dot.is_dir():
+        return dot
+    try:
+        named = Path(dot.read_text().removeprefix("gitdir:").strip())
+    except OSError:
+        return None
+    named = named if named.is_absolute() else agent / named
+    try:
+        return (named / (named / "commondir").read_text().strip()).resolve()
+    except OSError:
+        return named
+
+
 def session_tickets(agent: Path, session: str, memo: dict | None = None) -> list[str]:
     """The tickets a session's commits in an agent repo touched, the most recent first, from the `Session:`
-    trailers on every branch. `memo` holds the refs of each repo already asked, for a read of every unit at once."""
-    if memo is not None and agent in memo:
-        refs, common = memo[agent]
-    else:
-        refs = git(agent, "for-each-ref", "--format=%(objectname)")
-        common = Path(git(agent, "rev-parse", "--path-format=absolute", "--git-common-dir").strip() or agent) if refs else agent
-        if memo is not None:
-            memo[agent] = refs, common
+    trailers on every branch."""
+    refs, common = refs_of(agent, {} if memo is None else memo)
     if not refs:
         return []
     cached = SESSION_LOGS.get(common)
@@ -462,12 +540,20 @@ def transcript(session: str, memo: dict) -> Path | None:
     if session not in transcripts and not memo.get("transcripts looked"):
         memo["transcripts looked"] = True  # one look per read of the hub, however many sessions have no transcript
         # a session whose transcript Claude Code has cleaned away would otherwise walk every project at every read
-        projects = tuple((d.path, d.stat().st_mtime_ns) for root in HOME.glob(".claude*/projects") for d in os.scandir(root)
-                         if d.is_dir())
+        projects = projects_in(HOME.glob(".claude*/projects"), memo)
         if projects != looked_at:
             looked_at = projects
             transcripts.update({p.stem: p for p in HOME.glob(".claude*/projects/*/*.jsonl")})
     return transcripts.get(session)
+
+
+def projects_in(roots, memo: dict) -> tuple:
+    """Every project directory under these `projects` directories, with when it last changed, which a transcript
+    written or deleted changes: once per read of the hub."""
+    roots = tuple(sorted(map(str, roots)))
+    if ("projects", roots) not in memo:
+        memo["projects", roots] = tuple((d.path, d.stat().st_mtime_ns) for root in roots for d in os.scandir(root) if d.is_dir())
+    return memo["projects", roots]
 
 
 def claude_title(session: str, memo: dict) -> str | None:
@@ -606,18 +692,29 @@ def prompted_at(raw: bytes) -> float | None:
         return None
 
 
+statusline_read: dict[Path, tuple] = {}
+"""Each file statusline_inputs read, by its stamp then."""
+
+
 def statusline_inputs() -> list[dict]:
     """What Claude Code last handed each session's statusline, which the statusline keeps as
     `~/.cache/claude-statusline/<session id>.json` with `config_dir` (the account's `CLAUDE_CONFIG_DIR`) and
     `written_at` added. Claude Code keeps these numbers nowhere else."""
-    found = []
+    global statusline_read
+    found, kept = [], {}
     for path in STATUSLINE.glob("*.json"):
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
+        at = stamp(path)
+        if (hit := statusline_read.get(path)) and hit[0] == at:
+            data = hit[1]
+        else:
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+        kept[path] = at, data
         if isinstance(data, dict):
             found.append(data)
+    statusline_read = kept
     return found
 
 
@@ -634,12 +731,14 @@ def context_use(inputs: list[dict]) -> dict[str, dict]:
 def usage(inputs: list[dict]) -> list[dict]:
     """Each account's 5h and weekly usage, from its newest statusline input: [{"account", "at", "five_hour",
     "seven_day"}], each window {"used_percentage", "resets_at"}, or null where the input carries none."""
-    newest = {}
+    newest, accounts = {}, {}
     for d in inputs:
         at = d.get("written_at")
         if not isinstance(d.get("config_dir"), str) or not isinstance(at, (int, float)):
             continue
-        account = account_of(d["config_dir"])
+        if d["config_dir"] not in accounts:
+            accounts[d["config_dir"]] = account_of(d["config_dir"])
+        account = accounts[d["config_dir"]]
         if at > newest.get(account, {}).get("written_at", -1):
             newest[account] = d
     window = lambda w: {k: w.get(k) for k in ("used_percentage", "resets_at")} if isinstance(w, dict) else None
@@ -762,9 +861,14 @@ def diffview_payload(page: bytes) -> dict | None:
 DIFFVIEWS: dict[Path, tuple[tuple[int, int], bool]] = {}
 
 
+def may_be_diffview(path: Path | str) -> bool:
+    """A file the hub would take for a diffview page, were it one: an HTML page."""
+    return str(path).endswith(".html")
+
+
 def is_diffview(path: Path | None) -> bool:
     """A diffview page, wherever it was written; read again only once the file has changed."""
-    if not path or path.suffix != ".html" or not path.is_file():
+    if not path or not may_be_diffview(path) or not path.is_file():
         return False
     stat = path.stat()
     if (hit := DIFFVIEWS.get(path)) and hit[0] == (stat.st_mtime_ns, stat.st_size):
@@ -828,7 +932,7 @@ listeners: list[queue.Queue] = []
 # The digests of the hub each listener last saw, taken when it starts listening and moved on by every round of the
 # disk watch: a listener hears of every change made since it started, and of nothing else. What changed before is
 # the listener's to read once its stream is open.
-seen_by: weakref.WeakKeyDictionary[queue.Queue, tuple[str, str]] = weakref.WeakKeyDictionary()
+seen_by: weakref.WeakKeyDictionary[queue.Queue, dict] = weakref.WeakKeyDictionary()
 launched_at = 0.0
 """When an open last had its caller open the hub tab: a tab just opened has not listened yet."""
 unheard: list[tuple[float, dict]] = []
@@ -1208,19 +1312,27 @@ resumable_at: tuple = ()
 def resume_command(session: str, memo: dict) -> str:
     """diffview's resume command, from the transcripts one look per read of the hub found. Asked to find them itself,
     diffview looks in every project directory for each unit, and that was half of every read."""
-    global resumable_at
     if not diffview:
         return f"claude --resume {session}"
+    return diffview.resume_command(session, resumable_of(session, memo))
+
+
+def resumable_of(session: str, memo: dict) -> list[Path]:
+    """A session's transcripts under the config dirs diffview resumes from, as one look per read of the hub finds
+    them."""
+    global resumable_at
     if not memo.get("resumable looked"):
         memo["resumable looked"] = True
         roots = [c / "projects" for c in diffview.claude_configs() if (c / "projects").is_dir()]
-        projects = tuple((d.path, d.stat().st_mtime_ns) for root in roots for d in os.scandir(root) if d.is_dir())
+        projects = projects_in(roots, memo)
         if projects != resumable_at:  # a transcript written or deleted changes its project directory
             resumable_at = projects
-            resumable.clear()
+            found: dict[str, list[Path]] = {}
             for path in (p for root in roots for p in root.glob("*/*.jsonl")):
-                resumable.setdefault(path.stem, []).append(path)
-    return diffview.resume_command(session, resumable.get(session, []))
+                found.setdefault(path.stem, []).append(path)
+            resumable.clear()
+            resumable.update(found)
+    return resumable.get(session, [])
 
 
 def stays(member: dict) -> bool:
@@ -1231,13 +1343,13 @@ def stays(member: dict) -> bool:
 def present(path: Path) -> bool:
     """A member's file is still there, and when it is a watched diffview, so is every repo it watched: a live
     diff belongs in its unit while its worktree exists."""
-    return path.exists() and not (diffview and diffview.watched_repo_gone(path))
+    return path.exists() and not (diffview and may_be_diffview(path) and diffview.watched_repo_gone(path))
 
 
-def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, dict]) -> dict | None:
-    """Everything the hub tab draws of a unit, but its number, which hub_view gives it among the others. None
-    once the unit is gone: its tree retired, or every page of it deleted. A member whose file is gone leaves it
-    here."""
+def unit_view(key: str, live: dict[str, dict], memo: dict) -> dict | None:
+    """Everything the hub tab draws of a unit, but what hub_read adds at every read: its number among the others, its
+    context use and its handoff. None once the unit is gone: its tree retired, or every page of it deleted. A member
+    whose file is gone leaves it here."""
     data = load(key)
     if data is None:
         return None
@@ -1306,11 +1418,10 @@ def unit_view(key: str, live: dict[str, dict], memo: dict, contexts: dict[str, d
             "tree": tree, "repo": tracker.repo if tracker else "",
             "state": state, "waiting_for": (entry or {}).get("waitingFor"), "pane": (entry or {}).get("tmux"),
             "panes": list({pane_id(p): p["tmux"] for p in in_panes(entry)}.values()) if entry else [],
-            "context": contexts.get(session) if entry else None,
             "last": last, "number": None, "dismissed": bool(data.get("dismissed")) and data["dismissed"] >= last,
             "first": min(m["first"] for m in kept), "visited": data.get("visited") or 0,
             "status_line": said["status_line"], "needs_you": needs_you(state, said, data.get("visited") or 0),
-            "handoff": handoff_offer(entry, memo), "background": background(session, entry, memo) if session else [],
+            "background": background(session, entry, memo) if session else [],
             "resume": resume_command(session, memo) if session else "", "tickets": tickets, "pages": pages, "members": members,
             "board": page_of_path(board).url if board and board.is_file() else None,
             "worked_on": [s for s in committed if tracker.tickets[s]["status"] != "done"],  # what is done is worked on no more
@@ -1377,7 +1488,7 @@ def unit_tracker(kept: list[dict], session: str | None, memo: dict) -> tuple[Tra
     so that the same pages on the same disk give the same tracker whatever order they were opened in."""
     roots = sorted({m.get("tracker") for m in kept} - {None})
     there = [r for r in roots if Path(r).is_dir()]
-    trackers = [t for r in there if (t := tracker_at(Path(r).parent))]
+    trackers = [t for r in there if (t := tracker_of(Path(r).parent, memo))]
     if not trackers:
         return None, bool(roots) and not there
     committed = lambda t: bool(session) and any(s in t.tickets for s in session_tickets(t.agent, session, memo))
@@ -1409,14 +1520,15 @@ def page_says(directory: Path | None, reader) -> dict:
     """What a session's page directory says it needs: how many questions are open, by the reader's own rule, when
     the newest turn record was written, and the status line, the newest turn's headline: a turn record's H1, or
     the first line of a chat turn's reply. A record's time is its file's, which the transcript would only confirm
-    at the cost of reading all of it. Read again only once a record, or the reader, has changed."""
+    at the cost of reading all of it. Read again only once a record, the session.md the reader also reads and may
+    refuse, or the reader has changed."""
     if not reader or not directory:
         return NOTHING_SAID
     try:
         records = {p: p.stat() for p in sorted((directory / "turns").glob("*.md"))}
     except OSError:  # one gone between the glob and the stat: read at the next look
         return PAGE_SAYS.get(directory, ((), NOTHING_SAID))[1]
-    signature = (reader.__file__, *((p.name, st.st_mtime_ns, st.st_size) for p, st in records.items()))
+    signature = (reader.__file__, stamp(directory / "session.md"), *((p.name, st.st_mtime_ns, st.st_size) for p, st in records.items()))
     if (hit := PAGE_SAYS.get(directory)) and hit[0] == signature:
         return hit[1]
     written = lambda t: datetime.fromtimestamp(records[t.path].st_mtime, UTC) if t.path in records else None
@@ -1466,17 +1578,31 @@ def needs_you(state: str | None, said: dict, visited: float) -> dict | None:
 
 def hub_view() -> dict:
     """Every unit that is still there, in the rail's order, as the module's docstring gives it."""
+    return hub_read()[0]
+
+
+def hub_read() -> tuple[dict, dict[str, str]]:
+    """hub_view, and the digest of each unit's details (DETAIL) as kept with its view."""
     live, memo, inputs = registry(), {}, statusline_inputs()
     contexts = context_use(inputs)
-    units = []
-    for path in sorted((STATE / "units").glob("*.json")):
+    units, details, listed = [], {}, set()
+    try:
+        names = sorted(n for n in os.listdir(STATE / "units") if n.endswith(".json") and not n.startswith("."))
+    except FileNotFoundError:
+        names = []
+    for name in names:
+        key, path = urllib.parse.unquote(name.removesuffix(".json")), STATE / "units" / name
+        listed.add(key)
         try:
-            view = unit_view(urllib.parse.unquote(path.stem), live, memo, contexts)
+            view, details[key] = kept_view(key, live, memo)
         except OSError as e:
             print(f"listing {path}: {e}", file=sys.stderr, flush=True)
             continue
         if view:
-            units.append(view)
+            units.append(with_live(view, live, contexts, memo))
+    for key in KEPT.keys() - listed:
+        KEPT.pop(key, None)
+        STATES.pop(key, None)
     numbered = sorted((u for u in units if u["session"] and u["state"] != "ended" and not u["dismissed"]),
                       key=lambda u: (rank(u), -u["last"]))
     for n, u in enumerate(numbered, 1):
@@ -1484,7 +1610,164 @@ def hub_view() -> dict:
     # the dismissed, then the loose pages, then the ended, each the latest first
     rest = sorted((u for u in units if u["number"] is None),
                   key=lambda u: (2 if u["state"] == "ended" else 0 if u["dismissed"] else 1, -u["last"]))
-    return {"units": [*numbered, *rest], "usage": usage(inputs)}
+    return {"units": [*numbered, *rest], "usage": usage(inputs)}, {u["unit"]: details[u["unit"]] for u in units}
+
+
+def unit_read(key: str) -> dict | None:
+    """One unit as hub_view has it, but for its number, which only the rail's order gives it: read from that unit's
+    inputs alone."""
+    live, memo = registry(), {}
+    view, _ = kept_view(key, live, memo)
+    return view and with_live(view, live, context_use(statusline_inputs()), memo)
+
+
+def with_live(view: dict, live: dict[str, dict], contexts: dict[str, dict], memo: dict) -> dict:
+    """A unit's kept view with what every read adds to it: the handoff its box offers rests on a tmux pane as much as
+    on disk, so it is never kept."""
+    s = view["session"]
+    return {**view, "context": contexts.get(s) if s in live else None, "handoff": handoff_offer(live.get(s), memo)}
+
+
+KEPT: dict[str, tuple[tuple, dict | None, str]] = {}
+"""Each unit's view as a read last built it, with what it was built from (`unit_inputs`) and the digest of its
+details."""
+
+
+def kept_view(key: str, live: dict[str, dict], memo: dict) -> tuple[dict | None, str]:
+    """A unit's view, built again where its inputs have changed, and the digest of its details. The inputs are read
+    before the build, so one that changes while it runs is seen changed by the next read."""
+    seen = unit_inputs(key, live, memo)
+    if (hit := KEPT.get(key)) and hit[0] == seen:
+        return hit[1:]
+    view = unit_view(key, live, memo)
+    digest = view and hashlib.sha1(json.dumps([view[k] for k in DETAIL], sort_keys=True).encode()).hexdigest()
+    KEPT[key] = seen, view, digest
+    return view, digest
+
+
+STATES: dict[str, tuple] = {}
+"""Each unit's state file as unit_inputs last read it, by its stamp then, with the paths it names (`planned`)."""
+
+
+def unit_inputs(key: str, live: dict[str, dict], memo: dict) -> tuple:
+    """Everything unit_view reads a unit from, as cheaply as a change shows: a stamp for each file, and the value of
+    what the units share (the registry, the trackers, the agent repos' refs). It may hold more than unit_view reads,
+    which costs a build too many, but never less, which would keep a view gone stale."""
+    at = stamp(state_file(key))
+    if not ((hit := STATES.get(key)) and hit[0] == at):
+        data = load(key)
+        hit = STATES[key] = at, data, data and planned(data)
+    _, data, plan = hit
+    if data is None:
+        return (at,)
+    session, roots, files, dirs = plan
+    reader = page_reader(memo)
+    return (at,
+            tuple((root, os.path.isdir(root), getattr(tracker_of(agent, memo), "signature", None),
+                   session and refs_of(agent, memo)[0], os.path.isfile(board)) for root, agent, board in roots),
+            tuple((stamp_once(f, memo), watched(record)) for f, record in files),
+            tuple(page_dir_inputs(*d, memo) for d in dirs),
+            live.get(session) if session else None,
+            session and transcript_inputs(session, memo),
+            reader and reader.__file__)
+
+
+def planned(data: dict) -> tuple:
+    """The paths unit_inputs stamps, as a unit's state file names them. Its session page may be under any tracker its
+    pages sit in, or be a page of it."""
+    session, members = data.get("session"), data["members"]
+    roots = sorted({m.get("tracker") for m in members} - {None})
+    agents = [Path(r).parent for r in roots]
+    dirs = list(dict.fromkeys([*(a / "sessions" / session for a in agents),
+                               *(Path(m["path"]).parent for m in members if m["kind"] == "session" and m.get("path"))])) if session else []
+    return (session, [(r, a, str(a / "board.html")) for r, a in zip(roots, agents)],
+            [(m["path"], diffview and may_be_diffview(m["path"]) and str(diffview.watch_path(Path(m["path"]))))
+             for m in members if m.get("path")],
+            [(str(d / "index.html"), str(d / "session.md"), str(d / "turns")) for d in dirs])
+
+
+def page_dir_inputs(page: str, md: str, turns: str, memo: dict) -> tuple:
+    at = stamp(page)
+    try:
+        # in the order the directory lists them, which moves only once an entry is added or removed
+        records = tuple((e.name, stamp(e.path)) for e in os.scandir(turns) if e.name.endswith(".md"))
+    except OSError:
+        records = ()
+    return at, stamp(md), records, links_in(page, at, memo)
+
+
+LINKS: dict[str, tuple] = {}
+"""What links_in reads off each session page, by its stamp then."""
+
+
+def links_in(page: str, at: tuple | None, memo: dict) -> tuple:
+    """What the pages a session page links add to its unit's view beside their addresses: whether each is a
+    diffview, which sets its lane, and another session's title, for a link to that session's page."""
+    if at is None:
+        return ()
+    if not ((hit := LINKS.get(page)) and hit[0] == at):
+        hit = LINKS[page] = at, tuple((p.url, str(p.path) if p.path and may_be_diffview(p.path) else None,
+                                       str(p.path.parent / "session.md") if p.path and p.kind == "session" else None)
+                                      for _, p in session_links(Path(page)))
+    return tuple((url, html and stamp_once(html, memo), md and stamp_once(md, memo)) for url, html, md in hit[1])
+
+
+def stamp_once(path: str, memo: dict) -> tuple | None:
+    """stamp, once per read of the hub: a session page mostly links its unit's members, and other units' pages."""
+    stamps = memo.setdefault("stamps", {})
+    if path not in stamps:
+        stamps[path] = stamp(path)
+    return stamps[path]
+
+
+CWDS: dict[Path, tuple] = {}
+"""The directory each transcript records its session running in, by the transcript's stamp when it was read."""
+
+
+def transcript_inputs(session: str, memo: dict) -> tuple:
+    """A session's transcript, and those its resume command is read from: the stamp of each, and the directory each
+    records with whether it is there, which the command goes to."""
+    path = transcripts.get(session)
+    if (at := path and stamp(path)) is None:
+        path = transcript(session, memo)
+        at = path and stamp(path)
+    written = []
+    for p in resumable_of(session, memo) if diffview else []:
+        p_at = at if p == path else stamp(p)
+        if not ((hit := CWDS.get(p)) and hit[0] == p_at):
+            try:
+                hit = CWDS[p] = p_at, diffview.transcript_cwd(p)
+            except OSError:  # deleted since the look found it: the next read looks again
+                hit = p_at, ""
+        written.append((str(p), p_at, hit[1], bool(hit[1]) and os.path.isdir(hit[1])))
+    return path and str(path), at, tuple(written)
+
+
+WATCHED: dict[str, tuple] = {}
+"""The repos each watch record names, by the record's stamp when it was read."""
+
+
+def watched(record: str | None) -> tuple | None:
+    """A watch record's stamp, and whether each repo it names is still there, which keeps its page in its unit
+    (present)."""
+    if not record or (at := stamp(record)) is None:
+        return None
+    if not ((hit := WATCHED.get(record)) and hit[0] == at):
+        WATCHED[record] = hit = at, diffview.watched_repos_in(Path(record))
+    return at, tuple(os.path.exists(r) for r in hit[1])
+
+
+DETAIL = ("members", "pages", "tickets", "session_page")
+"""What /api/u/<key> holds of a unit beyond its row of the rail's index."""
+
+
+def rail_index(view: dict) -> dict:
+    """Every unit without its details, but for what the hub tab reads of them for units it does not lay out: the
+    pages that refuse to be framed, which a click anywhere checks, and the agents' opens the rail counts."""
+    return {**view, "units": [{**{k: v for k, v in u.items() if k not in DETAIL},
+                               "refusing": [p["url"] for p in u["pages"] if p.get("tab")],
+                               "agent_opened_at": [m["at"] for m in u["members"] if m.get("by") == "agent" and m["at"] > u["visited"]]}
+                              for u in view["units"]]}
 
 
 def listing(directory: Path) -> bytes:
@@ -2262,15 +2545,15 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"trellis {name}: {e}", file=sys.stderr, flush=True)
                 return self.send(502, f"trellis could not be served: {e}".encode(), "text/plain")
         if path == "/api/hub":
-            return self.send_json(hub_view())
+            return self.send_json(rail_index(hub_view()))
         if path.startswith("/api/u/"):
             key = urllib.parse.unquote(path.removeprefix("/api/u/"))
-            view = next((u for u in hub_view()["units"] if u["unit"] == key), None)
+            view = unit_read(key)
             return self.send_json(view) if view else self.send_json({"error": "no such unit"}, 404)
         if path == "/events":
             return self.stream()
         if key := stand_in_key(path):
-            view = next((u for u in hub_view()["units"] if u["unit"] == key), None)
+            view = unit_read(key)
             return self.send_page(stand_in_page(view)) if view else self.send(404, b"no such unit", "text/plain")
         if path == "/diff":
             query = urllib.parse.parse_qs(parts.query)
@@ -2403,12 +2686,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(answer, code)
 
 
-def view_digest() -> tuple[str, str]:
-    """The hub's digest in two parts: what the layout is built from, and the statusline's numbers, which change at
-    every step of a session's turn and redraw only the rail."""
-    view = hub_view()
-    numbers = {"usage": view.pop("usage"), "context": {u["unit"]: u.pop("context") for u in view["units"]}}
-    return tuple(hashlib.sha1(json.dumps(x, sort_keys=True).encode()).hexdigest() for x in (view, numbers))
+def view_digest() -> dict:
+    """What a listener has seen of the hub, as digests: the rail's index, the statusline's numbers in it, which change
+    at every step of a session's turn and redraw only the rail, and each unit's details."""
+    view, details = hub_read()
+    index = rail_index(view)
+    numbers = {"usage": index.pop("usage"), "context": {u["unit"]: u.pop("context") for u in index["units"]}}
+    return {"index": hashlib.sha1(json.dumps(index, sort_keys=True).encode()).hexdigest(),
+            "numbers": hashlib.sha1(json.dumps(numbers, sort_keys=True).encode()).hexdigest(), "units": details}
+
+
+def disk_event(heard: dict | None, now: dict) -> dict | None:
+    """What a listener that has seen `heard` of the hub is told once it is `now`: the units whose details changed
+    (`units`), every unit where what it had seen is not known, and nothing where nothing it reads changed."""
+    if not heard:
+        return {"type": "disk", "units": sorted(now["units"])}
+    changed = sorted(k for k in heard["units"].keys() | now["units"].keys() if heard["units"].get(k) != now["units"].get(k))
+    if changed or heard["index"] != now["index"]:
+        return {"type": "disk", "units": changed}
+    return {"type": "numbers"} if heard["numbers"] != now["numbers"] else None
 
 
 def restart_command() -> str:
@@ -2436,11 +2732,8 @@ def watch_disk() -> None:
             print(f"watching: {e}", file=sys.stderr, flush=True)
             continue
         for q in watching:
-            heard = seen_by.get(q)
-            if not heard or heard[0] != digest[0]:
-                q.put({"type": "disk"})
-            elif heard[1] != digest[1]:
-                q.put({"type": "numbers"})
+            if event := disk_event(seen_by.get(q), digest):
+                q.put(event)
             seen_by[q] = digest
 
 
