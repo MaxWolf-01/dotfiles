@@ -135,11 +135,12 @@ bound.
 The finance page watches no job either. It draws what max earns, spends and
 owns since 2019, every figure from lifelog's finance views, and an explorer
 panel beside the charts lists the bookings behind any figure clicked. Its
-header says how old each source is: Erste is fetched twice a day, while Trade
-Republic, Flatex and their statements of holdings are exports max makes by hand,
-and one too old to pass for current is marked. It is the one page that carries
-code it did not write: trellis, its panel library. The collector fetches
-trellis and the page's fonts once, pinned by hash, and puts them inside the file.
+header gives the age of each source the views read, and marks one too old to
+pass for current. Erste is fetched twice a day; the other sources are exports
+max makes by hand, which `secrets/lifelog/lifelog/catalog.toml` lists. It is the
+one page that carries code it did not write: trellis, its panel library. The
+collector fetches trellis and the page's fonts once, pinned by hash, and puts
+them inside the file.
 
 Every figure on a page, repository sizes included, was measured by the job that
 wrote it down: a collector reads records, never a restic repository, and the
