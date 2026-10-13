@@ -47,7 +47,8 @@ account's name on the rail, or Enter or Space on it, hides the account, and anot
 profile keeps its own choice, and leaves a hidden account's units out of everything but the hub's state.
 
 Membership, minimized pages, visits, dismissals and the session a hand-off came from live in one JSON file per unit
-under --state; everything else is read from disk, so the hub's state can go and only those marks go with it. The hub
+under --state, and which mx each running session had /reload-plugins typed in for (below) in `reloaded.json` beside
+them; everything else is read from disk, so the hub's state can go and only those marks go with it. The hub
 keeps each unit as it last read it, with the stat of every file it read it from, and reads again only the units one
 of whose files has changed. What it read of Claude Code's transcripts, which only grow, it keeps too, and reads on from.
 
@@ -117,7 +118,7 @@ window's last takes the window with it, as closing it in tmux would.
 
 The hub also keeps every session it can type into on the newest mx installed for its account. Where the version mx's
 own hook last recorded for the session is older, or there is none, it types /reload-plugins into the session's pane,
-once per version, while the session is idle and its input box empty; never into a dispatched worker, which stays on
+once per version however often the hub restarts, while the session is idle and its input box empty; never into a dispatched worker, which stays on
 the mx its run started with. Claude Code then loads that version's skills and hooks, and mx tells the agent at its
 next prompt what changed. Each reload typed is a line of the hub's log.
 
@@ -148,6 +149,11 @@ time.
 Typing, dropping a file, handing off, jumping and closing each want the token the hub hands to a top-level load of /
 alone, so a page the hub serves cannot act on a session by fetching their routes. It shares the tab's origin all the
 same, so a page that scripts the tab itself is not stopped; only a page served from another origin would be.
+
+The hub runs its own code, and diffview's beside it, as they were when it started. Within a few seconds of either
+changing on disk it runs again, in the same process and on the same port, once the requests under way are answered: a
+request made meanwhile waits for the new code, and the hub tab's event stream is back within a second.
+container-hub.html it reads at every request.
 
 The line the Stop hook prints under a finished turn links the hub tab at that session's unit, /u/<session id> on
 this hub (http://127.0.0.1:8377/u/<session id> on the default port), wherever the hub answers; where none does,
@@ -285,7 +291,7 @@ class Args:
     port: int = int(os.environ.get("CONTAINER_HUB_PORT") or 8377)
     """Port to serve on, on 127.0.0.1; claude-browser looks for the hub on $CONTAINER_HUB_PORT too."""
     state: Path = Path("~/.local/state/container-hub")
-    """Directory the hub keeps each unit's members and the user's marks in."""
+    """Directory the hub keeps each unit's members and the user's marks in, and the mx reloads it typed."""
     tmux_socket: Path | None = None
     """Socket of the tmux server the sessions run under; tmux's default one ($TMUX_TMPDIR) when unset."""
     clear_wait: float = 30.0
@@ -2052,9 +2058,14 @@ MX = "mx@MaxWolf-01"
 RELOAD = "/reload-plugins"
 RELOAD_EVERY = 15  # seconds between two looks at every session
 RELOADED: dict[str, str] = {}
-"""The mx version the hub last typed RELOAD into a session for, by the session's id: once per version, even where the
-session never records the move (an mx from before it did)."""
+"""The mx version the hub last typed RELOAD into a running session for, by the session's id: once per version, even
+where the session never records the move (an mx from before it did), and an idle one records it only at its next
+prompt. Kept in --state, so no restart of the hub types it in again."""
 typing = threading.RLock()  # one paste into a pane at a time, whoever types it; `paste` takes it itself
+
+
+def reloads_file() -> Path:
+    return STATE / "reloaded.json"
 
 
 def version_of(text: str) -> tuple[int, ...]:
@@ -2122,25 +2133,34 @@ def reload_into(session: str, entry: dict, version: str) -> str:
             return ""
         if failed := paste(pane, RELOAD):
             return f"reloading mx in {entry.get('name') or session[:8]}: {failed}"
-    RELOADED[session] = version
+        RELOADED[session] = version  # under `typing`, which a restart takes first: no reload typed goes unrecorded
+        write_json(reloads_file(), RELOADED)
     return f"typed {RELOAD} into {entry.get('name') or session[:8]} ({pane}) for mx {version}"
 
 
 def keep_plugins_current() -> None:
-    """Every RELOAD_EVERY seconds, reload each session due a newer mx (`reload_due`) whose pane the hub can type into."""
+    """From the hub's start, every RELOAD_EVERY seconds, reload each session due a newer mx (`reload_due`) whose pane
+    the hub can type into."""
     while True:
+        reload_round()
         time.sleep(RELOAD_EVERY)
+
+
+def reload_round() -> None:
+    try:
+        live = registry()
+    except Exception as e:  # a file changing under the read: the next look reads it again
+        print(f"keeping sessions on the newest mx: {e}", file=sys.stderr, flush=True)
+        return
+    with typing:  # an ended session needs no mark: a resumed one records the version it starts on
+        for ended in RELOADED.keys() - live.keys():
+            del RELOADED[ended]
+    for session, entry in live.items():
         try:
-            live = registry()
-        except Exception as e:  # a file changing under the read: the next look reads it again
-            print(f"keeping sessions on the newest mx: {e}", file=sys.stderr, flush=True)
-            continue
-        for session, entry in live.items():
-            try:
-                if (version := reload_due(session, entry)) and (said := reload_into(session, entry, version)):
-                    print(said, file=sys.stderr, flush=True)
-            except Exception as e:  # one session failing it (tmux, an entry of another shape) stops none of the others
-                print(f"reloading mx in {session[:8]}: {e}", file=sys.stderr, flush=True)
+            if (version := reload_due(session, entry)) and (said := reload_into(session, entry, version)):
+                print(said, file=sys.stderr, flush=True)
+        except Exception as e:  # one session failing it (tmux, an entry of another shape) stops none of the others
+            print(f"reloading mx in {session[:8]}: {e}", file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -2480,6 +2500,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def handle_one_request(self):
+        global answering
+        with answered:
+            answering += 1
+        try:
+            super().handle_one_request()
+        finally:
+            with answered:
+                answering -= 1
+                answered.notify_all()
+
     def send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -2599,7 +2630,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"retry: 1000\n: connected\n\n")  # a dropped stream is back within a second
             self.wfile.flush()
             quiet = 0
-            while not self.peer_gone():
+            while not self.peer_gone() and not RESTARTING.is_set():
                 try:
                     self.wfile.write(f"data: {json.dumps(q.get(timeout=1))}\n\n".encode())
                 except queue.Empty:
@@ -2717,24 +2748,99 @@ def restart_command() -> str:
     return "systemctl --user restart container-hub" if service else shlex.join(["setsid", "-f", str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
 
 
-def watch_disk() -> None:
+def watch_disk(server: ThreadingHTTPServer) -> None:
     """A hub tab that is showing hears when the disk under it changes: a ticket's status, a page deleted, a new
-    artefact, a session finishing a turn. Read only while a tab listens."""
+    artefact, a session finishing a turn. Read only while a tab listens. A round that finds the hub's own code
+    changed stops the server, for main() to run the new code."""
+    failing = None
     while True:
         time.sleep(2)
-        with lock:
-            watching = list(listeners)
-        if not watching:
-            continue
-        try:
-            digest = view_digest()
-        except Exception as e:  # a ticket or page changing under the read: the next round reads it again
-            print(f"watching: {e}", file=sys.stderr, flush=True)
-            continue
-        for q in watching:
-            if event := disk_event(seen_by.get(q), digest):
-                q.put(event)
-            seen_by[q] = digest
+        if code_changed():
+            return server.shutdown()
+        failing = watch_round(failing)
+
+
+def watch_round(failing: str | None) -> str | None:
+    """Tell each listener what changed since it last heard, and return why that failed, None where it did not. Given
+    what the round before returned, a failure is printed once until it is another, and its end once."""
+    with lock:
+        watching = list(listeners)
+    if not watching:
+        return failing
+    try:
+        digest = view_digest()
+    except Exception as e:  # a ticket or page changing under the read: the next round reads it again
+        if (why := f"{type(e).__name__}: {e}") != failing:
+            print(f"watching: {why}", file=sys.stderr, flush=True)
+        return why
+    if failing:
+        print("watching again", file=sys.stderr, flush=True)
+    for q in watching:
+        if event := disk_event(seen_by.get(q), digest):
+            q.put(event)
+        seen_by[q] = digest
+    return None
+
+
+# --------------------------------------------------------------------------
+# new code: the hub runs again, in its own process, once its code or diffview's changes on disk
+# --------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).resolve()
+CODE = (SCRIPT, HERE / "diffview")
+LOADED = tuple(map(stamp, CODE))
+"""The code as the hub loaded it, once, at its start."""
+LISTENING = "CONTAINER_HUB_LISTENING"
+"""Where the hub run again finds the descriptor of its listening socket, which stays open across the exec: a
+connection made meanwhile waits in its queue for the new code rather than being refused."""
+RESTARTING = threading.Event()
+"""Set once the hub is about to run again: each event stream ends, and its tab connects again a second later."""
+RESTART_WAIT = 60  # seconds a restart waits for the requests under way; a hand-off waits up to --clear-wait for its new session
+answering = 0
+"""Requests under way: counted, so a restart lets them finish."""
+answered = threading.Condition()
+
+
+def code_changed() -> bool:
+    """The code on disk is not what the hub runs, and is the same a moment later, so a file still being written is
+    left until it is whole."""
+    if (now := tuple(map(stamp, CODE))) == LOADED:
+        return False
+    time.sleep(0.5)
+    return tuple(map(stamp, CODE)) == now
+
+
+def dependencies(script: Path) -> str | None:
+    """The script's inline metadata (PEP 723), which names the packages uv installs for it."""
+    try:
+        found = re.search(r"^# /// script$.*?^# ///$", script.read_text(), re.MULTILINE | re.DOTALL)
+    except OSError:
+        return None
+    return found[0] if found else None
+
+
+DEPENDENCIES = dependencies(SCRIPT)
+
+
+def run_again(server: ThreadingHTTPServer) -> None:
+    """Exec the script anew in this process, on its flags and its listening socket, once the requests under way are
+    answered (RESTART_WAIT at most) and no paste is half typed. It runs on this interpreter, whose environment holds
+    the script's packages, unless the script names others since: then through its `#!`, which has uv install them.
+    Returns only where neither exec could start."""
+    changed = [p.name for p, was, now in zip(CODE, LOADED, map(stamp, CODE)) if was != now]
+    print(f"running again: {' and '.join(changed)} changed on disk", file=sys.stderr, flush=True)
+    RESTARTING.set()
+    with answered:
+        answered.wait_for(lambda: not answering, timeout=RESTART_WAIT)
+    with typing, lock:
+        os.set_inheritable(server.fileno(), True)
+        env = {**os.environ, LISTENING: str(server.fileno())}
+        argv = [str(SCRIPT), *sys.argv[1:]]
+        for command in ([sys.executable, *argv], argv) if dependencies(SCRIPT) == DEPENDENCIES else (argv,):
+            try:
+                os.execve(command[0], command, env)
+            except OSError as e:
+                print(f"running again as {command[0]}: {e}", file=sys.stderr, flush=True)
 
 
 def migrate() -> None:
@@ -2812,12 +2918,24 @@ def main(args: Args) -> None:
             (SHARED if path.is_dir() else OPENED).add(path)
         if kept != listed:
             write_json(shared_file(), kept)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    try:
+        RELOADED.update(read_json(reloads_file()) or {})
+    except OSError as e:  # a reload typed again at worst
+        print(f"starting without the mx reloads in {reloads_file()}: {e}", file=sys.stderr, flush=True)
+    listening = os.environ.pop(LISTENING, None)  # set where the hub runs again
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler, bind_and_activate=not listening)
+    if listening:
+        server.socket.close()
+        server.socket = socket.socket(fileno=int(listening))
+        os.set_inheritable(server.fileno(), False)
+        server.server_address = server.socket.getsockname()
     server.daemon_threads = True
-    threading.Thread(target=watch_disk, daemon=True).start()
+    threading.Thread(target=watch_disk, args=(server,), daemon=True).start()
     threading.Thread(target=keep_plugins_current, daemon=True).start()
     print(f"container-hub on http://127.0.0.1:{args.port}/, state in {STATE}", flush=True)
-    server.serve_forever()
+    server.serve_forever()  # until the code on disk changes
+    run_again(server)
+    sys.exit(1)
 
 
 if __name__ == "__main__":

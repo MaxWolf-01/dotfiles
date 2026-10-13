@@ -44,7 +44,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fakes  # noqa: E402  (the hub's module in this process, its clock, and the world it reads)
-from check import BIN, check, finish, free_port, needs, skipped  # noqa: E402
+from check import BIN, check, finish, free_port, needs, settles, skipped  # noqa: E402
 from fakes import READER, page, served, ticket  # noqa: E402
 
 needs("tmux")
@@ -1203,6 +1203,103 @@ while data := os.read(0, 4096):
     finally:
         os.killpg(service_hub.pid, signal.SIGKILL)
         service_hub.wait()
+
+    # --- hub-restarts-on-new-code: a hub from a bin/ of its own runs again once a script there changes, and types
+    # /reload-plugins into a session once per mx version however often it restarts. Its tmux is a fake that records
+    # what each pane is typed, and shows each pane as a file says: an empty input box, or a draft.
+
+    new_bin, fake = SCRATCH / "new-bin", SCRATCH / "fake-tmux"
+    new_bin.mkdir()
+    for name in ("container-hub", "container-hub.html", "diffview"):
+        shutil.copy2(BIN / name, new_bin / name)
+    (fake / "bin").mkdir(parents=True)
+    (fake / "bin/tmux").write_text(f"""#!/usr/bin/env bash
+# tmux -S <socket> <command> <args>, as the hub calls it
+fake={shlex.quote(str(fake))}
+command=$3; shift 3
+case $command in
+  display-message) if [ "$4" = '#{{pane_pid}}' ]; then cat "$fake/pid-$3"; else echo 0; fi ;;
+  capture-pane) cat "$fake/screen-$3" ;;
+  load-buffer) cat > "$fake/buffer-$2" ;;
+  paste-buffer) printf '%s %s\\n' "$6" "$(cat "$fake/buffer-$4")" >> "$fake/typed" ;;
+esac
+""")
+    (fake / "bin/tmux").chmod(0o755)
+    rule = "─" * 30
+    box = lambda line: f"{rule}\n{line}\n{rule}\n"
+    page(HOME / ".claude/plugins/installed_plugins.json", json.dumps({"plugins": {"mx@MaxWolf-01": [{"version": "1.0.55"}]}}))
+    sessions = {}  # the session id, its pane, and its process: a dispatched worker's environment would keep it from any reload
+    for session, pane_id, line in (("decafbad-0000-4000-8000-000000000012", "%71", "❯ "), ("deadbeef-0000-4000-8000-000000000013", "%72", "❯ a draft")):
+        process = subprocess.Popen(["sleep", "600"], env={k: v for k, v in ENV.items() if k != "DISPATCH_WORKLOG"})
+        sessions[session] = pane_id, process
+        (fake / f"pid-{pane_id}").write_text(str(process.pid))
+        (fake / f"screen-{pane_id}").write_text(box(line))
+        registered(session, pid=process.pid, started=fakes.started(process.pid), tmux=f"s:@0.{pane_id}")
+    typed = lambda: (fake / "typed").read_text().splitlines() if (fake / "typed").exists() else []
+    new_port = free_port()
+    new_origin = f"http://127.0.0.1:{new_port}"
+
+    def start_new() -> subprocess.Popen:
+        started = subprocess.Popen([new_bin / "container-hub", "--port", str(new_port), "--state", str(SCRATCH / "new-state"), *HUB_FLAGS],
+                                   env={**ENV, "PATH": f"{fake / 'bin'}:{ENV['PATH']}"}, stdout=subprocess.DEVNULL,
+                                   stderr=(SCRATCH / "new-hub.log").open("a"), start_new_session=True)
+        settles("the hub from its own bin/ starts", True, lambda: started.poll() is None and answers(), within=60)
+        return started
+
+    def answers() -> bool:
+        try:
+            return request("GET", "/.health", origin=new_origin)[0] == 200
+        except OSError:
+            return False
+
+    def connected(stream) -> bool:
+        return any(b"connected" in stream.readline() for _ in range(2))
+
+    def ends(stream, within: float) -> bool:
+        """Reads the event stream until it ends, or for `within` seconds; a stream ended is the server's doing."""
+        deadline = time.monotonic() + within
+        while (line := stream.readline()) and time.monotonic() < deadline:
+            pass
+        return not line
+
+    server_of = lambda proc: Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()  # under `uv run`
+    new_hub = start_new()
+    try:
+        first = sessions["decafbad-0000-4000-8000-000000000012"][0]
+        settles("a session due a newer mx has /reload-plugins typed in at the hub's start", [f"{first} /reload-plugins"], typed)
+        serving = server_of(new_hub)
+        events = urllib.request.urlopen(f"{new_origin}/events", timeout=30)
+        connected(events)
+        script = (new_bin / "container-hub").read_text()
+        health = 'self.send_json({"saves": diffview is not None})'
+        check("the hub answers /.health as the test edits it", 1, script.count(health))
+        (new_bin / "container-hub").write_text(script.replace(health, 'self.send_json({"saves": diffview is not None, "new": True})'))
+        edited = time.monotonic()
+        ended = ends(events, 20)
+        dropped = time.monotonic() - edited
+        check("the hub's script changing on disk ends an open hub tab's event stream within a watch round and a second",
+              (True, True), (ended, dropped < 4))
+        reconnect = urllib.request.urlopen(f"{new_origin}/events", timeout=30)
+        check("...which connects again at once, and is answered by the new code", (True, (200, {"saves": True, "new": True})),
+              (connected(reconnect), request("GET", "/.health", origin=new_origin)))
+        reconnect.close()
+        check("...in the hub's own process, under the one uv that started it", serving, server_of(new_hub))
+        (new_bin / "diffview").unlink()
+        settles("diffview changing on disk has the hub run again without it", (200, {"saves": False, "new": True}),
+                lambda: request("GET", "/.health", origin=new_origin))
+        stop(new_hub)
+        second = sessions["deadbeef-0000-4000-8000-000000000013"][0]
+        (fake / f"screen-{second}").write_text(box("❯ "))  # due from now; the hub started next is the first to look
+        new_hub = start_new()
+        settles("/reload-plugins for one mx version is typed into a session once, across a hub run again twice and restarted",
+                [f"{first} /reload-plugins", f"{second} /reload-plugins"], typed, within=30)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(new_hub.pid, signal.SIGKILL)
+        new_hub.wait()
+        for _, process in sessions.values():
+            process.kill()
+            process.wait()
     check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
           TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
 finally:
