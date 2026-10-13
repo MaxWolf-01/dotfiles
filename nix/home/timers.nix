@@ -71,6 +71,12 @@ let
     bash coreutils uv sops jq
   ]);
 
+  # with-secrets runs sops exec-env for the WakaTime app's id and secret, which
+  # renew wakatime-sync's token; jq for bin/run-log.
+  wakatimePath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv sops jq
+  ]);
+
   # sops for the Bridge password, uv for lifelog's header index, jq for bin/run-log.
   mailPath = lib.makeBinPath (with pkgs; [
     bash coreutils isync notmuch sops uv jq
@@ -549,8 +555,12 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${uvScriptPath}" ];
-      ExecStart = "${dotfiles}/bin/wakatime-sync --record";
+      Environment = [
+        "PATH=${wakatimePath}"
+        # A unit's environment does not say where the age key is; a shell's does.
+        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
+      ];
+      ExecStart = "${dotfiles}/bin/with-secrets wakatime-lifelog-sync-oauth-app ${dotfiles}/bin/wakatime-sync --record";
       TimeoutStartSec = "30min";
     };
   };

@@ -21,7 +21,14 @@ An empty file means the day was fetched and had no activity. The last few days
 are always fetched again, because plugins queue heartbeats while offline and
 deliver them late.
 
-The API key is read from ~/.wakatime.cfg. `--record` appends the run's outcome
+The API is read with an OAuth token of a WakaTime app, whose id and secret come
+from `with-secrets wakatime-lifelog-sync-oauth-app`; the API key in the
+WakaTime config can only send heartbeats. `--login` authorizes the app once and
+keeps the token in ~/.local/state/wakatime-sync/token.json. A token lives 365
+days, and a run trades it for a new one once it is --renew-after-days old, so a
+renewal that stops working fails a run eleven months before the token dies.
+
+`--record` appends the run's outcome
 to ~/logs/runs/wakatime-sync.jsonl via bin/run-log; a network that is down is
 a skip, an API error is a fail.
 
@@ -35,10 +42,9 @@ Examples:
     wakatime-sync --all              # everything since the account was created
     wakatime-sync --since 2025-01-01 --until 2025-01-31
     wakatime-sync --record           # the timer's invocation
+    with-secrets wakatime-lifelog-sync-oauth-app wakatime-sync --login
 """
 
-import base64
-import configparser
 import json as jsonlib
 import os
 import pathlib
@@ -49,13 +55,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import tyro
 
 API = "https://api.wakatime.com/api/v1/users/current"
 DATA_DIR = pathlib.Path.home() / "data/wakatime/heartbeats"
-CONFIG = pathlib.Path.home() / ".wakatime.cfg"
+TOKEN = pathlib.Path.home() / ".local/state/wakatime-sync/token.json"
+OAUTH = "https://wakatime.com/oauth"
+# WakaTime's own page, which shows the code to paste instead of redirecting it anywhere.
+REDIRECT_URI = "https://wakatime.com/oauth/test"
+SCOPE = "read_heartbeats"
+CREDS = "wakatime-lifelog-sync-oauth-app"
 # By absolute path: the systemd unit pins a PATH without ~/bin.
 RUN_LOG_BIN = pathlib.Path.home() / ".dotfiles/bin/run-log"
 # monitoring: collector
@@ -81,6 +92,10 @@ class Args:
     """Append the outcome to the run log (bin/run-log). For the timer."""
     json: bool = False
     """Print the summary as JSON instead of prose."""
+    login: bool = False
+    """Authorize the app: print the URL to open, read the code the page shows from stdin, and save the token. Needs the app's credentials in the environment."""
+    renew_after_days: int = 30
+    """Trade the token for a new one once it is this many days old. Renewing needs the app's credentials in the environment."""
 
 
 class Offline(Exception):
@@ -88,6 +103,8 @@ class Offline(Exception):
 
 
 def main(args: Args) -> int:
+    if args.login:
+        return login()
     try:
         stats = sync(args)
     except Offline as e:
@@ -111,7 +128,7 @@ def main(args: Args) -> int:
 
 
 def sync(args: Args) -> dict:
-    api = Api(api_key())
+    api = Api(access_token(args.renew_after_days))
     today = date.today()
     until = date.fromisoformat(args.until) if args.until else today
 
@@ -141,8 +158,8 @@ def sync(args: Args) -> dict:
 
 
 class Api:
-    def __init__(self, key: str) -> None:
-        self.auth = "Basic " + base64.b64encode(key.encode()).decode()
+    def __init__(self, token: str) -> None:
+        self.auth = f"Bearer {token}"
 
     def get(self, path: str, **params: str) -> dict:
         url = f"{API}/{path}"
@@ -166,13 +183,52 @@ class Api:
                 raise Offline(f"timed out reading {path}") from e
 
 
-def api_key() -> str:
-    cfg = configparser.ConfigParser()
-    cfg.read(CONFIG)
-    key = cfg.get("settings", "api_key", fallback="")
-    if not key:
-        raise RuntimeError(f"no api_key under [settings] in {CONFIG}")
-    return key
+def login() -> int:
+    url = f"{OAUTH}/authorize?" + urllib.parse.urlencode(
+        {"client_id": app_credentials()[0], "response_type": "code", "redirect_uri": REDIRECT_URI, "scope": SCOPE})
+    print(f"Open this, authorize, and paste the code the page shows:\n\n  {url}\n", file=sys.stderr)
+    save_token(request_token(grant_type="authorization_code", code=input("code: ").strip()))
+    print(f"token saved to {TOKEN}")
+    return 0
+
+
+def access_token(renew_after_days: int) -> str:
+    if not TOKEN.exists():
+        raise RuntimeError(f"no token in {TOKEN}; run: with-secrets {CREDS} wakatime-sync --login")
+    token = jsonlib.loads(TOKEN.read_text())
+    if datetime.now(UTC) - datetime.fromisoformat(token["obtained_at"]) >= timedelta(days=renew_after_days):
+        # merged: a response without a refresh_token leaves the old one in place
+        token = save_token(token | request_token(grant_type="refresh_token", refresh_token=token["refresh_token"]))
+    return token["access_token"]
+
+
+def app_credentials() -> tuple[str, str]:
+    app_id, secret = os.environ.get("WAKATIME_APP_ID"), os.environ.get("WAKATIME_APP_SECRET")
+    if not (app_id and secret):
+        raise RuntimeError(f"WAKATIME_APP_ID and WAKATIME_APP_SECRET are not set; run under: with-secrets {CREDS}")
+    return app_id, secret
+
+
+def request_token(**fields: str) -> dict:
+    app_id, secret = app_credentials()
+    data = urllib.parse.urlencode({"client_id": app_id, "client_secret": secret, "redirect_uri": REDIRECT_URI, **fields})
+    try:
+        with urllib.request.urlopen(f"{OAUTH}/token", data=data.encode(), timeout=60) as resp:
+            return jsonlib.load(resp)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} from {OAUTH}/token: {e.read()[:200].decode(errors='replace')}") from e
+    except urllib.error.URLError as e:
+        raise Offline(str(e.reason)) from e
+
+
+def save_token(token: dict) -> dict:
+    token = token | {"obtained_at": datetime.now(UTC).isoformat()}
+    TOKEN.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TOKEN.with_suffix(".json.tmp")
+    tmp.touch(mode=0o600)
+    tmp.write_text(jsonlib.dumps(token, indent=1))
+    os.replace(tmp, TOKEN)
+    return token
 
 
 def day_file(data_dir: pathlib.Path, day: date) -> pathlib.Path:
