@@ -844,13 +844,19 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # Like the activity page, it reads lifelog's views, here the finance ones, which take a few CPU-seconds
-  # each. It runs half an hour after each Erste fetch, so the page is never more than that behind the bank;
-  # the exports max makes by hand land whenever, and `systemctl --user start` covers wanting one now. curl
-  # fetches trellis and the fonts the page carries, once, into the cache.
+  # Like the activity page, it reads lifelog's views, here the finance ones,
+  # which take a few CPU-seconds each. It runs after each Erste fetch, so the
+  # page shows each fetch within the hour. After= orders it behind a fetch that
+  # fires in the same wake, as both timers do after a suspend; it pulls nothing
+  # in. The exports max makes by hand land whenever, and `systemctl --user
+  # start` covers wanting one now. curl fetches trellis and the fonts the page
+  # carries, once, into the cache.
 
   systemd.user.services.dashboard-finance = {
-    Unit.Description = "Rebuild the finance dashboard from lifelog's views";
+    Unit = {
+      Description = "Rebuild the finance dashboard from lifelog's views";
+      After = [ "erste-collect.service" ];
+    };
     Service = {
       Type = "oneshot";
       Environment = [ "PATH=${uvScriptPath}:${lib.makeBinPath [ pkgs.curl ]}" ];

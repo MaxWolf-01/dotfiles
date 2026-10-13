@@ -110,10 +110,10 @@ is reported, not skipped. The mechanics are in the comments at the top of
 ## Dashboards
 
 Five pages, all in `~/Documents/dashboards/`: `backups.html`, `dns-vpn.html`,
-`yapit.html`, `activity.html`, `finance.html`. Bookmark them by hand — where
+`yapit.html`, `activity.html`, `finance.html`. Bookmark them by hand: where
 they sit and in what order is a matter of taste, and a policy-managed bookmark
-cannot be moved or renamed without the policy fighting back. The bookmarks are the index; the
-pages do not link each other.
+cannot be moved or renamed without the policy fighting back. The bookmarks are
+the index; the pages do not link each other.
 
 Each page is one self-contained file written by its own collector,
 `secrets/scripts/dashboard-<topic>`, on a timer in `nix/home/timers.nix` —
@@ -132,13 +132,14 @@ weekday punchcard and monthly hours. It shares the shape of the others because
 the shape is what makes a page durable: one file, one collector, one timer, one
 bound.
 
-Nor does the finance page: it draws what max earns, spends and owns since
-2019, every figure from lifelog's finance views, with the bookings behind each
-one a click away in its explorer. Its header says how old each bank's data is:
-Erste is fetched, the other accounts and the statements are exports max makes
-by hand, and one too old to pass for current is marked. It is the one page that
-carries code it did not write: trellis, its panel library, which the collector
-fetches once, pinned by hash, with the house fonts, and puts inside the file.
+The finance page watches no job either. It draws what max earns, spends and
+owns since 2019, every figure from lifelog's finance views, and an explorer
+panel beside the charts lists the bookings behind any figure clicked. Its
+header says how old each source is: Erste is fetched twice a day, while Trade
+Republic, Flatex and their statements of holdings are exports max makes by hand,
+and one too old to pass for current is marked. It is the one page that carries
+code it did not write: trellis, its panel library. The collector fetches
+trellis and the page's fonts once, pinned by hash, and puts them inside the file.
 
 Every figure on a page, repository sizes included, was measured by the job that
 wrote it down: a collector reads records, never a restic repository, and the
