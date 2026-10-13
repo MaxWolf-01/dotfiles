@@ -118,8 +118,8 @@ window's last takes the window with it, as closing it in tmux would.
 
 The hub also keeps every session it can type into on the newest mx installed for its account. Where the version mx's
 own hook last recorded for the session is older, or there is none, it types /reload-plugins into the session's pane,
-once per version however often the hub restarts, while the session is idle and its input box empty; never into a dispatched worker, which stays on
-the mx its run started with. Claude Code then loads that version's skills and hooks, and mx tells the agent at its
+once per version however often the hub restarts, while the session is idle and its input box empty; never into a
+dispatched worker, which stays on the mx its run started with. Claude Code then loads that version's skills and hooks, and mx tells the agent at its
 next prompt what changed. Each reload typed is a line of the hub's log.
 
 A unit's box can also hand its session off to a new session in the same pane, from the session's handoff
@@ -152,8 +152,9 @@ same, so a page that scripts the tab itself is not stopped; only a page served f
 
 The hub runs its own code, and diffview's beside it, as they were when it started. Within a few seconds of either
 changing on disk it runs again, in the same process and on the same port, once the requests under way are answered: a
-request made meanwhile waits for the new code, and the hub tab's event stream is back within a second.
-container-hub.html it reads at every request.
+request made meanwhile waits for the new code, and the hub tab's event stream is back within a second. Code that does
+not compile it says so of, once, and stays on what it runs. container-hub.html needs none of this: the hub reads it at
+every request.
 
 The line the Stop hook prints under a finished turn links the hub tab at that session's unit, /u/<session id> on
 this hub (http://127.0.0.1:8377/u/<session id> on the default port), wherever the hub answers; where none does,
@@ -2061,6 +2062,9 @@ RELOADED: dict[str, str] = {}
 """The mx version the hub last typed RELOAD into a running session for, by the session's id: once per version, even
 where the session never records the move (an mx from before it did), and an idle one records it only at its next
 prompt. Kept in --state, so no restart of the hub types it in again."""
+RELOADS_UNREAD = False
+"""The marks' file could not be read at the start: what is in it is unknown, so no reload is typed and nothing written
+over it until a restart reads it."""
 typing = threading.RLock()  # one paste into a pane at a time, whoever types it; `paste` takes it itself
 
 
@@ -2147,6 +2151,8 @@ def keep_plugins_current() -> None:
 
 
 def reload_round() -> None:
+    if RELOADS_UNREAD:
+        return
     try:
         live = registry()
     except Exception as e:  # a file changing under the read: the next look reads it again
@@ -2752,7 +2758,7 @@ def watch_disk(server: ThreadingHTTPServer) -> None:
     """A hub tab that is showing hears when the disk under it changes: a ticket's status, a page deleted, a new
     artefact, a session finishing a turn. Read only while a tab listens. A round that finds the hub's own code
     changed stops the server, for main() to run the new code."""
-    failing = None
+    failing = frozenset()
     while True:
         time.sleep(2)
         if code_changed():
@@ -2760,9 +2766,9 @@ def watch_disk(server: ThreadingHTTPServer) -> None:
         failing = watch_round(failing)
 
 
-def watch_round(failing: str | None) -> str | None:
-    """Tell each listener what changed since it last heard, and return why that failed, None where it did not. Given
-    what the round before returned, a failure is printed once until it is another, and its end once."""
+def watch_round(failing: frozenset[str]) -> frozenset[str]:
+    """Tell each listener what changed since it last heard. Returns the errors the rounds have failed with since one
+    last succeeded, given those the round before returned: each is printed once, and the end of them once."""
     with lock:
         watching = list(listeners)
     if not watching:
@@ -2770,16 +2776,16 @@ def watch_round(failing: str | None) -> str | None:
     try:
         digest = view_digest()
     except Exception as e:  # a ticket or page changing under the read: the next round reads it again
-        if (why := f"{type(e).__name__}: {e}") != failing:
+        if (why := f"{type(e).__name__}: {e}") not in failing:
             print(f"watching: {why}", file=sys.stderr, flush=True)
-        return why
+        return failing | {why}
     if failing:
         print("watching again", file=sys.stderr, flush=True)
     for q in watching:
         if event := disk_event(seen_by.get(q), digest):
             q.put(event)
         seen_by[q] = digest
-    return None
+    return frozenset()
 
 
 # --------------------------------------------------------------------------
@@ -2795,19 +2801,32 @@ LISTENING = "CONTAINER_HUB_LISTENING"
 connection made meanwhile waits in its queue for the new code rather than being refused."""
 RESTARTING = threading.Event()
 """Set once the hub is about to run again: each event stream ends, and its tab connects again a second later."""
-RESTART_WAIT = 60  # seconds a restart waits for the requests under way; a hand-off waits up to --clear-wait for its new session
+REFUSED_CODE: tuple | None = None
+"""The code on disk the hub last found would not compile: looked at again once it changes."""
 answering = 0
 """Requests under way: counted, so a restart lets them finish."""
 answered = threading.Condition()
 
 
 def code_changed() -> bool:
-    """The code on disk is not what the hub runs, and is the same a moment later, so a file still being written is
-    left until it is whole."""
-    if (now := tuple(map(stamp, CODE))) == LOADED:
+    """The code on disk is not what the hub runs, is the same a moment later, so a file still being written is left
+    until it is whole, and compiles: a merge or an edit saved half done leaves the hub on the code it runs. The script
+    gone counts as not compiling; diffview gone is a hub that serves without it."""
+    global REFUSED_CODE
+    if (now := tuple(map(stamp, CODE))) in (LOADED, REFUSED_CODE):
         return False
     time.sleep(0.5)
-    return tuple(map(stamp, CODE)) == now
+    if tuple(map(stamp, CODE)) != now:
+        return False
+    for path in CODE:
+        try:
+            if path == SCRIPT or path.exists():
+                compile(path.read_bytes(), str(path), "exec")
+        except (OSError, SyntaxError, ValueError) as e:
+            print(f"staying on the code the hub runs: {path.name} does not compile ({e})", file=sys.stderr, flush=True)
+            REFUSED_CODE = now
+            return False
+    return True
 
 
 def dependencies(script: Path) -> str | None:
@@ -2824,14 +2843,15 @@ DEPENDENCIES = dependencies(SCRIPT)
 
 def run_again(server: ThreadingHTTPServer) -> None:
     """Exec the script anew in this process, on its flags and its listening socket, once the requests under way are
-    answered (RESTART_WAIT at most) and no paste is half typed. It runs on this interpreter, whose environment holds
+    answered and no paste is half typed. It runs on this interpreter, whose environment holds
     the script's packages, unless the script names others since: then through its `#!`, which has uv install them.
     Returns only where neither exec could start."""
     changed = [p.name for p, was, now in zip(CODE, LOADED, map(stamp, CODE)) if was != now]
     print(f"running again: {' and '.join(changed)} changed on disk", file=sys.stderr, flush=True)
     RESTARTING.set()
     with answered:
-        answered.wait_for(lambda: not answering, timeout=RESTART_WAIT)
+        # a hand-off waits up to --clear-wait for its new session, then types once more
+        answered.wait_for(lambda: not answering, timeout=CLEAR_WAIT + 30)
     with typing, lock:
         os.set_inheritable(server.fileno(), True)
         env = {**os.environ, LISTENING: str(server.fileno())}
@@ -2888,7 +2908,7 @@ def repair(data: dict) -> bool:
 
 
 def main(args: Args) -> None:
-    global STATE, TOKEN, TMUX_SOCKET, CLEAR_WAIT
+    global STATE, TOKEN, TMUX_SOCKET, CLEAR_WAIT, RELOADS_UNREAD
     STATE = args.state.expanduser().resolve()
     TMUX_SOCKET = args.tmux_socket
     CLEAR_WAIT = args.clear_wait
@@ -2920,8 +2940,9 @@ def main(args: Args) -> None:
             write_json(shared_file(), kept)
     try:
         RELOADED.update(read_json(reloads_file()) or {})
-    except OSError as e:  # a reload typed again at worst
-        print(f"starting without the mx reloads in {reloads_file()}: {e}", file=sys.stderr, flush=True)
+    except OSError as e:
+        RELOADS_UNREAD = True
+        print(f"typing no /reload-plugins: {reloads_file()} could not be read ({e})", file=sys.stderr, flush=True)
     listening = os.environ.pop(LISTENING, None)  # set where the hub runs again
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler, bind_and_activate=not listening)
     if listening:
