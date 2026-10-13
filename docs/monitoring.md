@@ -137,9 +137,10 @@ owns since 2019, every figure from lifelog's finance views, and an explorer
 panel beside the charts lists the bookings behind any figure clicked. Its
 header gives the age of each source the views read, and marks one too old to
 pass for current. Erste is fetched twice a day; the other sources are exports
-max makes by hand, which lifelog's catalog lists. It is the one page that carries
-code it did not write: trellis, its panel library. The collector fetches
-trellis and the page's fonts once, pinned by hash, and puts them inside the file.
+max makes by hand, which `secrets/lifelog/lifelog/catalog.toml` lists. It is the
+one page that carries code it did not write: trellis, its panel library. The
+collector fetches trellis and the page's fonts once, pinned by hash, and puts
+them inside the file.
 
 Every figure on a page, repository sizes included, was measured by the job that
 wrote it down: a collector reads records, never a restic repository, and the
