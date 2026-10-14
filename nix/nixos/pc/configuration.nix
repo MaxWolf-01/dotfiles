@@ -12,6 +12,7 @@
     ./agent-user.nix
     ./host-recorder.nix
     ./hardware-alerts.nix
+    ../journald.nix
   ];
 
   # Boot
