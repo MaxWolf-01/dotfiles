@@ -292,24 +292,22 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Workflow retro, and the repo retros ---
-  # mx's weekly review of every Claude Code session, then of each repo on ./repo-retros, run
-  # from the agents repo's checkout; bin/workflow-retro says what it records. 02:00 Monday
-  # falls inside the window claude-ping opens at 23:30. Persistent: a laptop asleep at 02:00
-  # runs it on waking.
+  # --- Workflow retro ---
+  # mx's weekly review of every Claude Code session, run from the agents repo's checkout;
+  # bin/workflow-retro says what it records. 02:00 Monday falls inside the window
+  # claude-ping opens at 23:30. Persistent: a laptop asleep at 02:00 runs it on waking.
 
   systemd.user.services.workflow-retro = {
     Unit = {
-      Description = "Workflow retro and repo retros, each when there is something new since its last run";
+      Description = "Workflow retro, when max did anything since its last run";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
     Service = {
       Type = "oneshot";
       # oneshot defaults to no timeout, and a wedged run would leave the unit activating
-      # and every later Monday a silent no-op. The workflow retro takes an hour or two, and
-      # the repo retros run after it, one at a time.
-      TimeoutStartSec = "18h";
+      # and every later Monday a silent no-op. A real run takes an hour or two.
+      TimeoutStartSec = "12h";
       # On TERM the retro gives its stage a minute to end before killing it, then logs;
       # the default 90s would cut that short and lose the job run log line.
       TimeoutStopSec = "3min";
@@ -320,9 +318,45 @@ in
   };
 
   systemd.user.timers.workflow-retro = {
-    Unit.Description = "Workflow retro and repo retros (Mondays 02:00)";
+    Unit.Description = "Workflow retro (Mondays 02:00)";
     Timer = {
       OnCalendar = "Mon *-*-* 02:00:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Repo retros ---
+  # mx's weekly review of each repo on ./repo-retros, run from the agents repo's checkout, on a
+  # night of its own: chained after the workflow retro it would run past 04:30, opening a window
+  # that swallows claude-ping's 08:30 anchor. bin/workflow-retro says what it records.
+  # Persistent: a laptop asleep at 02:00 runs it on waking.
+
+  systemd.user.services.repo-retros = {
+    Unit = {
+      Description = "Repo retros, each when its repo has a commit since its last run";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # oneshot defaults to no timeout, and a wedged run would leave the unit activating
+      # and every later Tuesday a silent no-op. Four repo retros run one after another,
+      # each up to an hour or so.
+      TimeoutStartSec = "8h";
+      # On TERM the retro gives its stage a minute to end before killing it, then logs;
+      # the default 90s would cut that short and lose the job run log line.
+      TimeoutStopSec = "3min";
+      # claude for the retro's stages, uv for its scripts, jq for both run logs
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      ExecStart = "${dotfiles}/bin/workflow-retro --repos ${home}/repos/github/MaxWolf-01/agents";
+    };
+  };
+
+  systemd.user.timers.repo-retros = {
+    Unit.Description = "Repo retros (Tuesdays 02:00)";
+    Timer = {
+      OnCalendar = "Tue *-*-* 02:00:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
