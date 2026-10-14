@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# tier: fast
+# Drive bin/workflow-retro against a stub retro and check the job run log line each ending
+# leaves. Run it directly; no framework.
+#
+# The promise under test: every run leaves exactly one line, whose outcome the watchdog can
+# trust (a quiet week is a skip, never an ok) and whose reason is the retro's own last word,
+# a run stopped by the TERM a stopped unit sends included.
+
+set -uo pipefail
+
+wrapper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/workflow-retro"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+export RUN_LOG_DIR="$work/runs"
+
+. "$(dirname "${BASH_SOURCE[0]}")/check.sh"
+needs jq setsid
+
+# The agents repo, as far as the wrapper reaches into it: mx's retro, here a stub that records
+# its arguments, prints $STUB_LINES as the retro prints its log, and exits $STUB_EXIT. With
+# $STUB_READY set it instead says so through that file and waits to be stopped.
+agents="$work/agents"
+mkdir -p "$agents/mx/bin"
+cat > "$agents/mx/bin/retro" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$STUB_ARGV"
+if [ -n "${STUB_READY:-}" ]; then
+    trap 'echo "2026-10-19T00:10:00Z 2026-10-19T000000Z stopped: SIGTERM during collect, which ended with it" >&2; exit 143' TERM
+    touch "$STUB_READY"
+    while :; do sleep 1 & wait $!; done
+fi
+printf '%s' "${STUB_LINES:-}" >&2
+exit "${STUB_EXIT:-0}"
+STUB
+chmod +x "$agents/mx/bin/retro"
+export STUB_ARGV="$work/argv"
+
+# The newest line of the job run log, as "<outcome> | <reason> | <exit>".
+logged() {
+    tail -n1 "$RUN_LOG_DIR/workflow-retro.jsonl" | jq -r '"\(.outcome) | \(.reason) | \(.stats.exit)"'
+}
+
+lines() {
+    wc -l < "$RUN_LOG_DIR/workflow-retro.jsonl" | tr -d ' '
+}
+
+# --- a committed report is an ok, and the retro is asked to skip a quiet week
+
+STUB_EXIT=0 STUB_LINES="2026-10-19T00:00:01Z 2026-10-19T000000Z started: $agents, ...
+2026-10-19T01:30:00Z 2026-10-19T000000Z committed 1a2b3c4 in $agents/agent
+" "$wrapper" "$agents" --data "$work/data" >/dev/null 2>&1
+check "a committed run exits 0" 0 $?
+check "a committed run is ok, with the retro's last line as its reason" \
+    "ok | committed 1a2b3c4 in $agents/agent | 0" "$(logged)"
+check "the retro runs on the agents repo, gated, with the options passed on" \
+    "$agents --if-active --data $work/data" "$(paste -sd' ' "$STUB_ARGV")"
+
+# --- a quiet week is a skip
+
+STUB_EXIT=3 STUB_LINES="2026-10-19T00:00:01Z 2026-10-19T000000Z skipped: no session or commit of max's since 2026-10-12T00:00:00Z
+" "$wrapper" "$agents" >/dev/null 2>&1
+check "a skipped run exits 0" 0 $?
+check "a quiet week is a skip, saying why" \
+    "skip | skipped: no session or commit of max's since 2026-10-12T00:00:00Z | 3" "$(logged)"
+
+# --- anything else is a fail
+
+STUB_EXIT=1 STUB_LINES="2026-10-19T00:00:01Z 2026-10-19T000000Z started: x
+2026-10-19T00:50:00Z 2026-10-19T000000Z not committed: $agents/agent is mid-rebase; the report stays in /d/runs/r
+" "$wrapper" "$agents" >/dev/null 2>&1
+check "an uncommitted report exits 1" 1 $?
+check "an uncommitted report is a fail, saying why" \
+    "fail | not committed: $agents/agent is mid-rebase; the report stays in /d/runs/r | 1" "$(logged)"
+
+STUB_EXIT=1 STUB_LINES="no earlier run of this retro in /a/retro/report.md's history: pass --since
+" "$wrapper" "$agents" >/dev/null 2>&1
+check "an error the retro exits on is the reason as it printed it" \
+    "fail | no earlier run of this retro in /a/retro/report.md's history: pass --since | 1" "$(logged)"
+
+STUB_EXIT=137 STUB_LINES="" "$wrapper" "$agents" >/dev/null 2>&1
+check "a retro that printed nothing still leaves a line" \
+    "fail | the retro exited 137 and printed nothing | 137" "$(logged)"
+
+before=$(lines)
+"$wrapper" "$work/nowhere" >/dev/null 2>&1
+check "no retro to run exits 1" 1 $?
+check "no retro to run is a fail naming where it looked" \
+    "fail | no retro at $work/nowhere/mx/bin/retro | null" "$(logged)"
+check "each run leaves exactly one line" $((before + 1)) "$(lines)"
+
+# --- a stopped run: TERM to every process at once, as systemd stops a unit
+
+export STUB_READY="$work/ready"
+setsid "$wrapper" "$agents" >/dev/null 2>&1 &
+pid=$!
+for _ in $(seq 100); do [ -e "$STUB_READY" ] && break; sleep 0.1; done
+kill -TERM -- "-$pid"
+wait "$pid"
+check "a stopped run exits 1" 1 $?
+check "a stopped run is a fail, with the stage the retro ended" \
+    "fail | stopped: SIGTERM during collect, which ended with it | 143" "$(logged)"
+
+finish
