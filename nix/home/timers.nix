@@ -38,6 +38,15 @@ let
     bash coreutils uv jq
   ]);
 
+  # The retros' units: claude for the retro's stages, uv for its scripts, jq for both run logs.
+  retroPath = "${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin";
+
+  # The repos ./repo-retros lists, read when this module is built, so a change to the list reaches
+  # the timeout on the next switch; bin/workflow-retro reads the list itself at each run.
+  repoRetros = builtins.filter (line: line != "")
+    (map (line: lib.trim (builtins.head (lib.splitString "#" line)))
+      (lib.splitString "\n" (builtins.readFile ./repo-retros)));
+
   # bin/slack-archive is a uv script that drives slackdump; jq for bin/run-log.
   slackPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv jq slackdump
@@ -298,10 +307,18 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Workflow retro ---
-  # mx's weekly review of every Claude Code session, run from the agents repo's checkout;
-  # bin/workflow-retro says what it records. 02:00 Monday falls inside the window
-  # claude-ping opens at 23:30. Persistent: a laptop asleep at 02:00 runs it on waking.
+  # --- Retros ---
+  # mx's weekly retros, run from the agents repo's checkout: on Monday the workflow retro, of the
+  # agents repo and every Claude Code session; on Tuesday the repo retro of each repo on
+  # ./repo-retros, one after another. bin/workflow-retro says what each records. Each kind gets a
+  # night of its own to end inside the window claude-ping opens at 23:30 (why: the claude-ping
+  # comment below), though a long night of repo retros can still run past it. Persistent: a laptop
+  # asleep at 02:00 runs them on waking. When both catch up on the same waking, the repo retros
+  # wait for the workflow retro to end.
+  # Both are oneshots, which have no start timeout by default, so a wedged run would leave the unit
+  # activating and every later week a silent no-op. On TERM the retro gives its stage a minute to
+  # end and then logs. The default 90s stop timeout would cut that short and lose the job run log
+  # line, hence 3min.
 
   systemd.user.services.workflow-retro = {
     Unit = {
@@ -311,14 +328,9 @@ in
     };
     Service = {
       Type = "oneshot";
-      # oneshot defaults to no timeout, and a wedged run would leave the unit activating
-      # and every later Monday a silent no-op. A real run takes an hour or two.
-      TimeoutStartSec = "12h";
-      # On TERM the retro gives its stage a minute to end before killing it, then logs;
-      # the default 90s would cut that short and lose the job run log line.
+      TimeoutStartSec = "12h"; # a real run takes an hour or two
       TimeoutStopSec = "3min";
-      # claude for the retro's stages, uv for its scripts, jq for both run logs
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      Environment = [ "PATH=${retroPath}" ];
       ExecStart = "${dotfiles}/bin/workflow-retro ${home}/repos/github/MaxWolf-01/agents";
     };
   };
@@ -332,30 +344,17 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Repo retros ---
-  # mx's weekly review of each repo on ./repo-retros, run from the agents repo's checkout;
-  # bin/workflow-retro says what it records. A retro night is meant to end inside the window
-  # claude-ping opens at 23:30, by 04:30: a stage after that opens a window that swallows the
-  # 08:30 anchor, so the repo retros get a night of their own rather than following the
-  # workflow retro. Persistent: a laptop asleep at 02:00 runs it on waking.
-
   systemd.user.services.repo-retros = {
     Unit = {
       Description = "Repo retros, each when its repo has a commit since its last run";
-      After = [ "network-online.target" ];
+      After = [ "network-online.target" "workflow-retro.service" ];
       Wants = [ "network-online.target" ];
     };
     Service = {
       Type = "oneshot";
-      # oneshot defaults to no timeout, and a wedged run would leave the unit activating
-      # and every later Tuesday a silent no-op. 8h holds the retros ./repo-retros lists at up
-      # to two hours each, one after another; it grows with that list.
-      TimeoutStartSec = "8h";
-      # On TERM the retro gives its stage a minute to end before killing it, then logs;
-      # the default 90s would cut that short and lose the job run log line.
+      TimeoutStartSec = "${toString (2 * builtins.length repoRetros)}h"; # up to two hours a repo
       TimeoutStopSec = "3min";
-      # claude for the retro's stages, uv for its scripts, jq for both run logs
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      Environment = [ "PATH=${retroPath}" ];
       ExecStart = "${dotfiles}/bin/workflow-retro --repos ${home}/repos/github/MaxWolf-01/agents";
     };
   };
