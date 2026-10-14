@@ -854,6 +854,39 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # Like the activity page, it reads lifelog's views, here the finance ones,
+  # which take a few CPU-seconds each. It runs after each Erste fetch, so the
+  # page shows each fetch within the hour. After= orders it behind a fetch that
+  # fires in the same wake, as both timers do after a suspend; it pulls nothing
+  # in. The exports max makes by hand land whenever, and `systemctl --user
+  # start` covers wanting one now. curl fetches trellis and the fonts the page
+  # carries, once, into the cache.
+
+  systemd.user.services.dashboard-finance = {
+    Unit = {
+      Description = "Rebuild the finance dashboard from lifelog's views";
+      After = [ "erste-collect.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${uvScriptPath}:${lib.makeBinPath [ pkgs.curl ]}" ];
+      ExecStart = "${secrets}/scripts/dashboard-finance --record";
+      TimeoutStartSec = "10min";
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.dashboard-finance = {
+    Unit.Description = "Finance dashboard refresh (twice a day)";
+    Timer = {
+      OnCalendar = "09,21:20:00";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Claude usage-window anchor ---
   # The 5-hour window starts with your first message, so these pings pin it to a
   # fixed grid: 08:30 → 13:30 → 18:30 → 23:30. Deliberately no 04:30 ping: it
