@@ -109,27 +109,38 @@ is reported, not skipped. The mechanics are in the comments at the top of
 
 ## Dashboards
 
-Four pages, all in `~/Documents/dashboards/`: `backups.html`, `dns-vpn.html`,
-`yapit.html`, `activity.html`. Bookmark them by hand — where they sit and in
-what order is a matter of taste, and a policy-managed bookmark cannot be moved
-or renamed without the policy fighting back. The bookmarks are the index; the
-pages do not link each other.
+Five pages, all in `~/Documents/dashboards/`: `backups.html`, `dns-vpn.html`,
+`yapit.html`, `activity.html`, `finance.html`. Bookmark them by hand: where
+they sit and in what order is a matter of taste, and a policy-managed bookmark
+cannot be moved or renamed without the policy fighting back. The bookmarks are
+the index; the pages do not link each other.
 
 Each page is one self-contained file written by its own collector,
 `secrets/scripts/dashboard-<topic>`, on a timer in `nix/home/timers.nix` —
-hourly, except the activity page, which re-reads years of records each run and
-goes daily. `dashboard-<topic> --help` says what that page reads and from where;
+hourly, except the two pages that re-read years of records each run: the activity
+page goes daily, the finance page twice a day, after each Erste fetch.
+`dashboard-<topic> --help` says what that page reads and from where;
 `--json` prints the same data unrendered, where the collector has one. They live
 in `~/Documents` because Firefox runs firejailed and can see that directory, and
 a symlink into `~/.dotfiles` dangles inside the jail.
 
-The activity page is the one that watches no job. It draws when this machine was
+The activity page watches no job. It draws when this machine was
 in use, from the records the day left behind anyway — editor and browser
 heartbeats, browser history, agent prompts, commits, the phone, sleep — as a
 raster of every day against the hour of day, one day or one week in detail, a
 weekday punchcard and monthly hours. It shares the shape of the others because
 the shape is what makes a page durable: one file, one collector, one timer, one
 bound.
+
+The finance page watches no job either. It draws what max earns, spends and
+owns since 2019, every figure from lifelog's finance views, and an explorer
+panel beside the charts lists the bookings behind any figure clicked. Its
+header gives the age of each source the views read, and marks one too old to
+pass for current. Erste is fetched twice a day; the other sources are exports
+max makes by hand, which `secrets/lifelog/lifelog/catalog.toml` lists. It is the
+one page that carries code it did not write: trellis, its panel library. The
+collector fetches trellis and the page's fonts once, pinned by hash, and puts
+them inside the file.
 
 Every figure on a page, repository sizes included, was measured by the job that
 wrote it down: a collector reads records, never a restic repository, and the

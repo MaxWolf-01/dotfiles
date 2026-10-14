@@ -89,6 +89,12 @@ let
     bash coreutils gnused uv notmuch poppler-utils curl sops jq
   ]);
 
+  # hv fetch is node running the hypervisor's own TypeScript, and ssh with the
+  # hypervisor's mailbox key, so it needs no ssh agent.
+  hvFetchPath = lib.makeBinPath (with pkgs; [
+    bash coreutils nodejs openssh
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -766,6 +772,31 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Jarvis → hypervisor ---
+  # The VPS cannot open a connection to the laptop, so Jarvis leaves the
+  # hypervisor's messages in an outbox there, and this pulls them into the
+  # hypervisor's inbox. While the laptop sleeps, they wait on the VPS.
+
+  systemd.user.services.hv-fetch = {
+    Unit = {
+      Description = "Bring Jarvis's messages into the hypervisor's inbox";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${hvFetchPath}" ];
+      ExecStart = "${home}/repos/github/MaxWolf-01/agents/hypervisor/hv fetch";
+      TimeoutStartSec = "2min";
+    };
+  };
+
+  systemd.user.timers.hv-fetch = {
+    Unit.Description = "Jarvis's messages to the hypervisor (every 5 min)";
+    Timer.OnCalendar = "*:0/5";
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Overdue watchdog ---
   # The only scheduled alerter; what it watches and why is in bin/overdue-check.
   # The offset makes pc alert first and this host stay quiet, so a healthy setup
@@ -921,6 +952,39 @@ in
       OnCalendar = "*-*-* 11:40:00";
       Persistent = true;
       RandomizedDelaySec = "20m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # Like the activity page, it reads lifelog's views, here the finance ones,
+  # which take a few CPU-seconds each. It runs after each Erste fetch, so the
+  # page shows each fetch within the hour. After= orders it behind a fetch that
+  # fires in the same wake, as both timers do after a suspend; it pulls nothing
+  # in. The exports max makes by hand land whenever, and `systemctl --user
+  # start` covers wanting one now. curl fetches trellis and the fonts the page
+  # carries, once, into the cache.
+
+  systemd.user.services.dashboard-finance = {
+    Unit = {
+      Description = "Rebuild the finance dashboard from lifelog's views";
+      After = [ "erste-collect.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${uvScriptPath}:${lib.makeBinPath [ pkgs.curl ]}" ];
+      ExecStart = "${secrets}/scripts/dashboard-finance --record";
+      TimeoutStartSec = "10min";
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.dashboard-finance = {
+    Unit.Description = "Finance dashboard refresh (twice a day)";
+    Timer = {
+      OnCalendar = "09,21:20:00";
+      Persistent = true;
+      RandomizedDelaySec = "10m";
     };
     Install.WantedBy = [ "timers.target" ];
   };

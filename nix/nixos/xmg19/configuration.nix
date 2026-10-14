@@ -3,6 +3,7 @@
 {
   imports = [
     ./disk-config.nix
+    ../journald.nix
   ];
 
   hardware.facter.reportPath = ./facter.json;
