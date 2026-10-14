@@ -3,9 +3,10 @@
 # Drive bin/workflow-retro against a stub retro and check the job run log line each ending
 # leaves. Run it directly; no framework.
 #
-# The promise under test: every run leaves exactly one line, whose outcome the watchdog can
-# trust (a quiet week is a skip, never an ok) and whose reason is the retro's own last word,
-# a run stopped by the TERM a stopped unit sends included.
+# The promise under test: every retro leaves exactly one line in its own job's log, whose
+# outcome the watchdog can trust (a quiet week is a skip, never an ok) and whose reason is the
+# retro's own last word, a run stopped by the TERM a stopped unit sends included; and each repo
+# on the list of repo retros gets its retro after the workflow retro's, until a stop.
 
 set -uo pipefail
 
@@ -13,18 +14,24 @@ wrapper="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/workflow-retro"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 export RUN_LOG_DIR="$work/runs"
+export REPO_RETROS="$work/no-repos"
+: > "$REPO_RETROS"
 
 . "$(dirname "${BASH_SOURCE[0]}")/check.sh"
 needs jq setsid
 
 # The agents repo, as far as the wrapper reaches into it: mx's retro, here a stub that records
-# its arguments, prints $STUB_LINES as the retro prints its log, and exits $STUB_EXIT. With
-# $STUB_READY set it instead says so through that file and waits to be stopped.
+# its arguments, in $STUB_ARGV and as a line of $STUB_CALLS, prints $STUB_LINES as the retro
+# prints its log, and exits $STUB_EXIT; for a repo with a file of its name in $STUB_REPOS,
+# the values that file sets. With $STUB_READY set it instead says so through that file and
+# waits to be stopped.
 agents="$work/agents"
 mkdir -p "$agents/mx/bin"
 cat > "$agents/mx/bin/retro" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$STUB_ARGV"
+echo "$*" >> "$STUB_CALLS"
+[ -f "$STUB_REPOS/$(basename "$1")" ] && . "$STUB_REPOS/$(basename "$1")"
 if [ -n "${STUB_READY:-}" ]; then
     trap 'echo "2026-10-19T00:10:00Z 2026-10-19T000000Z stopped: SIGTERM during collect, which ended with it" >&2; exit 143' TERM
     touch "$STUB_READY"
@@ -34,11 +41,12 @@ printf '%s' "${STUB_LINES:-}" >&2
 exit "${STUB_EXIT:-0}"
 STUB
 chmod +x "$agents/mx/bin/retro"
-export STUB_ARGV="$work/argv"
+export STUB_ARGV="$work/argv" STUB_CALLS="$work/calls" STUB_REPOS="$work/repos"
+mkdir "$STUB_REPOS"
 
-# The newest line of the job run log, as "<outcome> | <reason> | <exit>".
+# The newest line of a job's run log, the workflow retro's by default, as "<outcome> | <reason> | <exit>".
 logged() {
-    tail -n1 "$RUN_LOG_DIR/workflow-retro.jsonl" | jq -r '"\(.outcome) | \(.reason) | \(.stats.exit)"'
+    tail -n1 "$RUN_LOG_DIR/${1:-workflow-retro}.jsonl" | jq -r '"\(.outcome) | \(.reason) | \(.stats.exit)"'
 }
 
 lines() {
@@ -89,10 +97,50 @@ check "no retro to run is a fail naming where it looked" \
     "fail | no retro at $work/nowhere/mx/bin/retro | null" "$(logged)"
 check "each run leaves exactly one line" $((before + 1)) "$(lines)"
 
+# --- the repo retros, each in its own job's log, after the workflow retro
+
+list="$work/repo-retros"
+cat > "$list" <<EOF
+# the repos
+~/.dotfiles
+
+$work/jarvis   # trailing comment
+$work/quartz
+$work/yapit
+EOF
+cat > "$STUB_REPOS/.dotfiles" <<'EOF'
+STUB_LINES="2026-10-19T03:00:00Z 2026-10-19T030000Z committed 9f8e7d6 in /home/max/.dotfiles/agent
+"
+EOF
+cat > "$STUB_REPOS/jarvis" <<'EOF'
+STUB_EXIT=3 STUB_LINES="2026-10-19T03:10:00Z 2026-10-19T031000Z skipped: no commit in /w/jarvis since 2026-10-12T02:00:00Z
+"
+EOF
+cat > "$STUB_REPOS/quartz" <<'EOF'
+STUB_EXIT=1 STUB_LINES="/w/quartz/agent is no agent repo with a main checkout, a git repo of its own, which a retro's report is committed in; /mx:project-setup makes one
+"
+EOF
+: > "$STUB_CALLS"
+HOME="$work" REPO_RETROS="$list" STUB_EXIT=0 STUB_LINES="2026-10-19T00:00:01Z 2026-10-19T000000Z committed 1a2b3c4 in $agents/agent
+" "$wrapper" "$agents" --data "$work/data" >/dev/null 2>&1
+check "a refused repo retro fails the run" 1 $?
+check "each listed repo's retro runs after the workflow retro's, gated, with the options passed on" \
+    "$agents --if-active --data $work/data|$work/.dotfiles --if-active --data $work/data|$work/jarvis --if-active --data $work/data|$work/quartz --if-active --data $work/data|$work/yapit --if-active --data $work/data" \
+    "$(paste -sd'|' "$STUB_CALLS")"
+check "a repo's committed report is an ok in its own job's log, named without the dot" \
+    "ok | committed 9f8e7d6 in /home/max/.dotfiles/agent | 0" "$(logged repo-retro-dotfiles)"
+check "a quiet repo is a skip" \
+    "skip | skipped: no commit in /w/jarvis since 2026-10-12T02:00:00Z | 3" "$(logged repo-retro-jarvis)"
+check "a repo with no agent repo of its own is a fail, with the refusal as its reason" \
+    "fail | /w/quartz/agent is no agent repo with a main checkout, a git repo of its own, which a retro's report is committed in; /mx:project-setup makes one | 1" \
+    "$(logged repo-retro-quartz)"
+check "a refused repo stops no later one" "ok" "$(logged repo-retro-yapit | cut -d' ' -f1)"
+
 # --- a stopped run: TERM to every process at once, as systemd stops a unit
 
 export STUB_READY="$work/ready"
-setsid "$wrapper" "$agents" >/dev/null 2>&1 &
+: > "$STUB_CALLS"
+REPO_RETROS="$list" setsid "$wrapper" "$agents" >/dev/null 2>&1 &
 pid=$!
 for _ in $(seq 100); do [ -e "$STUB_READY" ] && break; sleep 0.1; done
 kill -TERM -- "-$pid"
@@ -100,5 +148,6 @@ wait "$pid"
 check "a stopped run exits 1" 1 $?
 check "a stopped run is a fail, with the stage the retro ended" \
     "fail | stopped: SIGTERM during collect, which ended with it | 143" "$(logged)"
+check "a stop during the workflow retro starts no repo retro" "$agents --if-active" "$(cat "$STUB_CALLS")"
 
 finish
