@@ -30,7 +30,7 @@ ElevenLabs Scribe v2 transcribes and separates the voices in one request, which
 needs ELEVENLABS_API_KEY (`with-secrets elevenlabs scribe run ...`). The
 response is kept in cache/, and no recording is sent twice: every later run,
 in any folder, reuses it. Claude Code (`claude -p`) names the speakers and
-writes the notes.
+writes the notes. `usage` shows what the ElevenLabs plan has left.
 
 Examples:
 
@@ -39,10 +39,12 @@ Examples:
     scribe rename ~/Documents/scribe/2026-09-20-agent-swarms Parzival=Levi
     scribe regen ~/Documents/scribe/2026-09-20-agent-swarms
     scribe share ~/Documents/scribe/2026-09-20-agent-swarms
+    with-secrets elevenlabs scribe usage
 """
 
 import atexit
 import base64
+import calendar
 import datetime as dt
 import difflib
 import functools
@@ -74,7 +76,8 @@ from tyro.extras import SubcommandApp
 app = SubcommandApp()
 
 SCRIBE_URL = os.environ.get("SCRIBE_API_URL") or "https://api.elevenlabs.io/v1/speech-to-text"
-"""Where the transcription request goes; $SCRIBE_API_URL points it at a test server."""
+"""Where the transcription request goes; $SCRIBE_API_URL points it, and the account queries beside it, at a test server."""
+API = SCRIBE_URL.split("/v1/")[0]
 MODEL = "ElevenLabs Scribe v2"
 STAGES = ["preparing audio", "transcribing", "naming speakers", "writing notes", "rendering"]
 
@@ -252,6 +255,44 @@ def share(args: ShareArgs) -> None:
     exists. Anyone holding the link can open the page; `share rm` takes it down."""
     folder = open_folder(args.folder)
     print(put_online(folder))
+
+
+@app.command(name="usage")
+def usage() -> None:
+    """Show the ElevenLabs plan: credits left and the hours of Scribe they buy, the reset date, the next bill,
+    and this billing period's use, by model and by the recordings this machine sent."""
+    plan = account("GET", "/v1/user/subscription")
+    months, billed = PERIODS.get(plan.get("character_refresh_period"), (1, ""))
+    reset = dt.datetime.fromtimestamp(plan["next_character_count_reset_unix"])
+    start = months_before(reset, months)
+    used, limit = plan["character_count"], plan["character_limit"]
+    left = max(limit - used, 0)
+    bill = plan.get("next_invoice") or {}
+    lines = [
+        f"plan:     {plan['tier'].capitalize()}, {plan['status']}"
+        + (f", billed {PERIODS.get(plan.get('billing_period'), (0, ''))[1]}" if plan.get("billing_period") else "")
+        + (f"; next bill {bill['amount_due_cents'] / 100:.2f} {plan['currency'].upper()} on "
+           f"{dt.datetime.fromtimestamp(bill['next_payment_attempt_unix']):%Y-%m-%d}" if bill.get("next_payment_attempt_unix") else ""),
+        f"credits:  {used:,} of {limit:,} used, {left:,} left until {reset:%Y-%m-%d} ({(reset - dt.datetime.now()).days} days)",
+        f"          about {left / SCRIBE_CREDITS_PER_HOUR:.1f} h of Scribe without keyterms; "
+        + ("past them, ElevenLabs refuses requests" if not plan.get("max_credit_limit_extension")
+           else f"past them, usage-based billing, {plan['current_overage']['amount']} {plan['currency'].upper()} so far"),
+    ]
+    try:
+        models = account_usage(start)
+    except Failed as exc:
+        models = {}
+        lines.append(f"used:     unknown, {exc}")
+    for model, u in models.items():
+        lines.append(f"used:     {u['requests']} {model} requests since {start:%Y-%m-%d}, {hms(u['minutes'] * 60)} of audio, "
+                     f"{u['credits']:,} credits, worth {u['usd']:.2f} USD")
+    if sent := sent_since(start):
+        lines.append(f"sent from this machine since {start:%Y-%m-%d}:")
+        for at, folder, src, req in sent:
+            credits = int(req["headers"].get("character-cost", 0))
+            lines.append(f"          {at:%Y-%m-%d}  {hms(src.duration):>8}  {credits:>6,} credits  {folder.name}"
+                         + (", with keyterms" if req.get("keyterms") else ""))
+    print("\n".join(lines))
 
 
 def open_folder(folder: Path) -> Path:
@@ -472,9 +513,7 @@ class Counting(io.FileIO):
 
 def transcribe(recording: Path, folder: Path, src: Source, progress: "Progress") -> None:
     """One ElevenLabs Scribe v2 request; the raw response goes to cache/scribe.json."""
-    key = os.environ.get("ELEVENLABS_API_KEY")
-    if not key:
-        raise Failed("ELEVENLABS_API_KEY is not set. Run it as `with-secrets elevenlabs scribe run ...`.")
+    key = api_key()
     flac = folder / "cache" / "audio.flac"
     run_cmd(
         ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(recording), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
@@ -532,6 +571,77 @@ def transcribe(recording: Path, folder: Path, src: Source, progress: "Progress")
                       f"{int(headers.get('character-cost', 0)):,} credits, as ElevenLabs reports it")
     else:
         progress.paid(None, "unknown, ElevenLabs reported no cost for this request")
+
+
+# ---------------------------------------------------------------- the account
+
+
+SCRIBE_CREDITS_PER_HOUR = 1100
+"""What a Scribe v2 request without keyterms has cost: 1,203 credits for 3,936 s of audio on the Starter plan."""
+PERIODS = {"monthly_period": (1, "monthly"), "3_month_period": (3, "quarterly"),
+           "6_month_period": (6, "half-yearly"), "annual_period": (12, "yearly")}
+"""ElevenLabs' billing and refresh periods: their length in months, and how a bill for them reads."""
+
+
+def api_key() -> str:
+    key = os.environ.get("ELEVENLABS_API_KEY")
+    if not key:
+        raise Failed("ELEVENLABS_API_KEY is not set. Run scribe as `with-secrets elevenlabs scribe ...`.")
+    return key
+
+
+def account(method: str, path: str, **kwargs) -> dict:
+    """One request to the ElevenLabs API about the account; its JSON answer."""
+    try:
+        r = httpx.request(method, API + path, headers={"xi-api-key": api_key()}, timeout=60, **kwargs)
+    except httpx.HTTPError as exc:
+        raise Failed(f"the request to ElevenLabs failed ({exc!r}). Check the network and run again.")
+    if r.status_code != 200:
+        raise Failed(f"ElevenLabs answered {r.status_code} to {method} {path}: {r.text[:400]}")
+    return r.json()
+
+
+def account_usage(start: dt.datetime) -> dict[str, dict]:
+    """The account's use since start, by model name: requests, minutes of audio, credits and USD.
+
+    The endpoint is the one ElevenLabs names as the successor of /v1/usage/character-stats; its
+    reference page is missing, so the request's shape is what its validation errors asked for."""
+    now = dt.datetime.now()
+    span = int((now - start).total_seconds())
+    body = account("POST", "/v1/workspace/analytics/query/usage-by-product-over-time", json={
+        "start_time": int(start.timestamp() * 1000), "end_time": int(now.timestamp() * 1000),
+        "interval_seconds": span, "group_by": ["model"],
+    })
+    models: dict[str, dict] = {}
+    for row in (dict(zip(body["columns"], row)) for row in body["rows"]):
+        if row["usage_count"]:
+            u = models.setdefault(row.get("model_name") or row["model"], {"requests": 0, "minutes": 0.0, "credits": 0, "usd": 0.0})
+            u["requests"] += row["usage_count"]
+            u["minutes"] += row["total_minutes"]
+            u["credits"] += row["total_usage"]
+            u["usd"] += row["total_cost"]
+    return models
+
+
+def months_before(t: dt.datetime, n: int) -> dt.datetime:
+    """The same day n months earlier, or that month's last day where it is shorter."""
+    y, m = divmod(t.year * 12 + t.month - 1 - n, 12)
+    return t.replace(year=y, month=m + 1, day=min(t.day, calendar.monthrange(y, m + 1)[1]))
+
+
+def sent_since(start: dt.datetime) -> list[tuple[dt.datetime, Path, Source, dict]]:
+    """The transcription requests this machine's recordings made since start, oldest first: when,
+    the folder that holds the request's record, its source record and the request record."""
+    index = read_json(index_path()) if index_path().exists() else {}
+    sent = []
+    for folders in index.values():
+        for folder in map(Path, folders):
+            req = folder / "cache" / "scribe-request.json"
+            if req.exists() and (src := load_source(folder)):
+                if (at := dt.datetime.fromtimestamp(req.stat().st_mtime)) >= start:
+                    sent.append((at, folder, src, read_json(req)))
+                break
+    return sorted(sent, key=lambda s: s[0])
 
 
 # ---------------------------------------------------------------- conversation.json
