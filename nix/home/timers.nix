@@ -327,10 +327,11 @@ in
   };
 
   # --- Repo retros ---
-  # mx's weekly review of each repo on ./repo-retros, run from the agents repo's checkout, on a
-  # night of its own: chained after the workflow retro it would run past 04:30, opening a window
-  # that swallows claude-ping's 08:30 anchor. bin/workflow-retro says what it records.
-  # Persistent: a laptop asleep at 02:00 runs it on waking.
+  # mx's weekly review of each repo on ./repo-retros, run from the agents repo's checkout;
+  # bin/workflow-retro says what it records. A retro night is meant to end inside the window
+  # claude-ping opens at 23:30, by 04:30: a stage after that opens a window that swallows the
+  # 08:30 anchor, so the repo retros get a night of their own rather than following the
+  # workflow retro. Persistent: a laptop asleep at 02:00 runs it on waking.
 
   systemd.user.services.repo-retros = {
     Unit = {
@@ -341,8 +342,8 @@ in
     Service = {
       Type = "oneshot";
       # oneshot defaults to no timeout, and a wedged run would leave the unit activating
-      # and every later Tuesday a silent no-op. Four repo retros run one after another,
-      # each up to an hour or so.
+      # and every later Tuesday a silent no-op. 8h holds the retros ./repo-retros lists at up
+      # to two hours each, one after another; it grows with that list.
       TimeoutStartSec = "8h";
       # On TERM the retro gives its stage a minute to end before killing it, then logs;
       # the default 90s would cut that short and lose the job run log line.
