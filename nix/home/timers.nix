@@ -305,6 +305,12 @@ in
     };
     Service = {
       Type = "oneshot";
+      # oneshot defaults to no timeout, and a wedged run would leave the unit activating
+      # and every later Monday a silent no-op. A real run takes an hour or two.
+      TimeoutStartSec = "12h";
+      # On TERM the retro gives its stage a minute to end before killing it, then logs;
+      # the default 90s would cut that short and lose the job run log line.
+      TimeoutStopSec = "3min";
       # claude for the retro's stages, uv for its scripts, jq for both run logs
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${dotfiles}/bin/workflow-retro ${home}/repos/github/MaxWolf-01/agents";
