@@ -89,6 +89,12 @@ let
     bash coreutils gnused uv notmuch poppler-utils curl sops jq
   ]);
 
+  # hv fetch is node running the hypervisor's own TypeScript, and ssh with the
+  # hypervisor's mailbox key, so it needs no ssh agent.
+  hvFetchPath = lib.makeBinPath (with pkgs; [
+    bash coreutils nodejs openssh
+  ]);
+
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
@@ -692,6 +698,31 @@ in
       OnCalendar = "*:05/30";
       Persistent = true;
     };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Jarvis → hypervisor ---
+  # The VPS cannot open a connection to the laptop, so Jarvis leaves the
+  # hypervisor's messages in an outbox there, and this pulls them into the
+  # hypervisor's inbox. While the laptop sleeps, they wait on the VPS.
+
+  systemd.user.services.hv-fetch = {
+    Unit = {
+      Description = "Bring Jarvis's messages into the hypervisor's inbox";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${hvFetchPath}" ];
+      ExecStart = "${home}/repos/github/MaxWolf-01/agents/hypervisor/hv fetch";
+      TimeoutStartSec = "2min";
+    };
+  };
+
+  systemd.user.timers.hv-fetch = {
+    Unit.Description = "Jarvis's messages to the hypervisor (every 5 min)";
+    Timer.OnCalendar = "*:0/5";
     Install.WantedBy = [ "timers.target" ];
   };
 
