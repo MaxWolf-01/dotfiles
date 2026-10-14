@@ -292,6 +292,34 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Workflow retro ---
+  # mx's weekly review of every Claude Code session, run from the agents repo's checkout;
+  # bin/workflow-retro says what it records. 02:00 Monday falls inside the window
+  # claude-ping opens at 23:30. Persistent: a laptop asleep at 02:00 runs it on waking.
+
+  systemd.user.services.workflow-retro = {
+    Unit = {
+      Description = "Workflow retro, when max did anything since its last run";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # claude for the retro's stages, uv for its scripts, jq for both run logs
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      ExecStart = "${dotfiles}/bin/workflow-retro ${home}/repos/github/MaxWolf-01/agents";
+    };
+  };
+
+  systemd.user.timers.workflow-retro = {
+    Unit.Description = "Workflow retro (Mondays 02:00)";
+    Timer = {
+      OnCalendar = "Mon *-*-* 02:00:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- GitHub repo mirror (clone missing, fetch existing) ---
 
   systemd.user.services.github-mirror = {
