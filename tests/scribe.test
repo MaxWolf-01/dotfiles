@@ -36,6 +36,7 @@ Examples:
     tests/scribe.test --only margin neighbour --keep
 """
 
+import datetime as dt
 import email.parser
 import functools
 import gzip
@@ -49,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -351,6 +353,44 @@ class FakeElevenLabs(http.server.ThreadingHTTPServer):
         self.url = f"http://127.0.0.1:{self.server_address[1]}/v1/speech-to-text"
 
 
+class FakeAccount(http.server.ThreadingHTTPServer):
+    """Answers the account queries of `scribe usage`: a Starter plan with 1,000 of 30,000 credits
+    used, which resets in ten days, and three Scribe v2 requests. Keeps each usage query's body."""
+
+    def __init__(self):
+        self.reset = int(time.time()) + 10 * 86400
+        self.queries: list[dict] = []
+        plan = {"tier": "starter", "status": "active", "character_count": 1000, "character_limit": 30000,
+                "max_credit_limit_extension": 0, "next_character_count_reset_unix": self.reset, "currency": "usd",
+                "billing_period": "annual_period", "character_refresh_period": "monthly_period",
+                "next_invoice": {"amount_due_cents": 7200, "next_payment_attempt_unix": self.reset + 200 * 86400}}
+        used = {"columns": ["model", "timestamp", "total_usage", "total_minutes", "total_cost", "usage_count", "model_name"],
+                "rows": [["scribe_v2", "2026-10-01T00:00:00Z", 900, 45.0, 0.18, 2, "Scribe v2"],
+                         ["scribe_v2", "2026-10-10T00:00:00Z", 100, 5.5, 0.02, 1, "Scribe v2"]]}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def answer(handler, body: dict | None) -> None:
+                out = json.dumps(body).encode()
+                handler.send_response(200 if body else 404)
+                handler.send_header("Content-Length", str(len(out)))
+                handler.end_headers()
+                handler.wfile.write(out)
+
+            def do_GET(handler) -> None:
+                handler.answer(plan if handler.path == "/v1/user/subscription" else None)
+
+            def do_POST(handler) -> None:
+                self.queries.append(json.loads(handler.rfile.read(int(handler.headers["Content-Length"]))))
+                handler.answer(used if handler.path == "/v1/workspace/analytics/query/usage-by-product-over-time" else None)
+
+            def log_message(handler, *args) -> None:
+                pass
+
+        super().__init__(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server_address[1]}/v1/speech-to-text"
+
+
 # --- the properties
 
 
@@ -614,6 +654,34 @@ def rename(w: Work) -> None:
     md = read(out / "transcript.md")
     ids = re.findall(r"\bt\d+\b", md)
     expect(not ids, f"after the merge, transcript.md shows turn ids {sorted(set(ids))}")
+
+
+
+@prop("usage shows the credits left and the hours of Scribe they buy, the period's use by model, and the recordings this machine sent in it")
+def usage(w: Work) -> None:
+    recording = w.root / "another recording.flac"
+    subprocess.run(["ffmpeg", "-v", "error", "-i", str(w.recording), "-af", "volume=0.5", "-c:a", "flac", str(recording)], check=True)
+    out = w.root / "usage"
+    server = FakeElevenLabs(w.response)
+    w.scribe("run", str(recording), "--out", str(out), env={"SCRIBE_API_URL": server.url}, offline=False)
+    server.shutdown()
+    account = FakeAccount()
+    r = w.scribe("usage", env={"SCRIBE_API_URL": account.url}, offline=False)
+    account.shutdown()
+    reset = dt.datetime.fromtimestamp(account.reset)
+    start = reset.replace(month=reset.month - 1) if reset.month > 1 else reset.replace(year=reset.year - 1, month=12)
+    want = [
+        f"plan:     Starter, active, billed yearly; next bill 72.00 USD on {reset + dt.timedelta(days=200):%Y-%m-%d}",
+        f"credits:  1,000 of 30,000 used, 29,000 left until {reset:%Y-%m-%d}",
+        "about 26.4 h of Scribe without keyterms; past them, ElevenLabs refuses requests",
+        f"used:     3 Scribe v2 requests since {start:%Y-%m-%d}, 50:30 of audio, 1,000 credits, worth 0.20 USD",
+        f"667 credits  {out.name}",
+    ]
+    for line in want:
+        expect(line in r.stdout, f"usage did not say {line!r}:\n{r.stdout}")
+    expect(len(account.queries) == 1 and account.queries[0]["group_by"] == ["model"]
+           and account.queries[0]["start_time"] == int(start.timestamp() * 1000),
+           f"the usage query was {account.queries}, not one by model from {start}")
 
 
 if __name__ == "__main__":
