@@ -41,7 +41,8 @@ let
   # The retros' units: claude for the retro's stages, uv for its scripts, jq for both run logs.
   retroPath = "${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin";
 
-  # The repos ./repo-retros lists, which bin/workflow-retro reads too, as it says.
+  # The repos ./repo-retros lists, read when this module is built, so a change to the list reaches
+  # the timeout on the next switch; bin/workflow-retro reads the list itself at each run.
   repoRetros = builtins.filter (line: line != "")
     (map (line: lib.trim (builtins.head (lib.splitString "#" line)))
       (lib.splitString "\n" (builtins.readFile ./repo-retros)));
@@ -312,11 +313,12 @@ in
   # ./repo-retros, one after another. bin/workflow-retro says what each records. Each kind gets a
   # night of its own to end inside the window claude-ping opens at 23:30 (why: the claude-ping
   # comment below), though a long night of repo retros can still run past it. Persistent: a laptop
-  # asleep at 02:00 runs them on waking, the repo retros after a workflow retro caught up with them.
+  # asleep at 02:00 runs them on waking. When both catch up on the same waking, the repo retros
+  # wait for the workflow retro to end.
   # Both are oneshots, which have no start timeout by default, so a wedged run would leave the unit
   # activating and every later week a silent no-op. On TERM the retro gives its stage a minute to
-  # end before killing it, then logs, which the default 90s stop timeout would cut short, losing
-  # the job run log line.
+  # end and then logs. The default 90s stop timeout would cut that short and lose the job run log
+  # line, hence 3min.
 
   systemd.user.services.workflow-retro = {
     Unit = {
