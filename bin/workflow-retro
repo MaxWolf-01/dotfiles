@@ -1,63 +1,103 @@
 #!/usr/bin/env bash
-# Run the workflow retro if max did anything since its last run, and record how it ended.
+# Run the workflow retro, or with --repos each listed repo's repo retro, each only when there is
+# something new for it to read, and record how each ended.
 #
-# The retro is mx's, run from the agents repo's own checkout. Given --if-active it decides
-# whether there is anything to read, and exits 3 when there is not. This adds the job run
-# log line the overdue watchdog reads.
+# The retros are mx's, run from the agents repo's own checkout. Given --if-active a retro decides
+# whether there is anything to read, and exits 3 when there is not. This adds a job run log line
+# per retro, which the overdue watchdog reads for a job its config names.
 set -uo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: workflow-retro [AGENTS_REPO] [RETRO_OPTION...]
+Usage: workflow-retro [--repos] [AGENTS_REPO] [RETRO_OPTION...]
 
 Runs `retro AGENTS_REPO --if-active RETRO_OPTION...` from AGENTS_REPO's own mx
-(default ~/repos/github/MaxWolf-01/agents), then appends one line to the job run
-log ~/logs/runs/workflow-retro.jsonl:
+(default ~/repos/github/MaxWolf-01/agents), and appends one line to the job run
+log ~/logs/runs/workflow-retro.jsonl.
+
+With --repos it instead runs `retro REPO --if-active RETRO_OPTION...` for each
+repo on the list of repo retros, one after another, each appending one line to
+~/logs/runs/repo-retro-<name>.jsonl, <name> its directory's name without a
+leading dot. The list is nix/home/repo-retros in these dotfiles: one repo per
+line, `~` for the home directory, `#` starting a comment. A stop ends the retro
+under way and starts no later one.
 
   ok    the retro committed its report
-  skip  no message or commit of max's since the last run (the retro exited 3)
-  fail  the retro failed, stopped, or left its report uncommitted
+  skip  nothing new since its last run (the retro exited 3)
+  fail  the retro was refused, failed, stopped, or left its report uncommitted
+
+A run that cannot start (no retro, or with --repos no list) logs its fail to
+workflow-retro.jsonl, or with --repos to repo-retros.jsonl. Exits 1 when any
+retro failed.
 
 `retro --help` says what a run reads and writes; its runs.log, in the retro's
-data directory, keeps every run's lines. Environment: RUN_LOG_DIR, as run-log.
+data directory, keeps every run's lines. Environment: RUN_LOG_DIR, as run-log;
+REPO_RETROS, a list to read instead.
 EOF
 }
 
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+repos_mode=0 unit=workflow-retro
+[ "${1:-}" = --repos ] && { repos_mode=1; unit=repo-retros; shift; }
 
 agents="${1:-$HOME/repos/github/MaxWolf-01/agents}"
 [ $# -gt 0 ] && shift
 # Reached relative to this script: the unit pins its own PATH, without ~/bin.
-run_log="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/run-log"
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+run_log="$here/run-log"
+list="${REPO_RETROS:-$here/../nix/home/repo-retros}"
 retro="$agents/mx/bin/retro"
 
 if [ ! -x "$retro" ]; then
     echo "workflow-retro: no retro at $retro; is $agents the agents repo?" >&2
-    "$run_log" workflow-retro fail --reason "no retro at $retro"
+    "$run_log" "$unit" fail --reason "no retro at $retro"
+    exit 1
+fi
+if [ "$repos_mode" = 1 ] && [ ! -f "$list" ]; then
+    echo "workflow-retro: no list of repo retros at $list" >&2
+    "$run_log" "$unit" fail --reason "no list of repo retros at $list"
     exit 1
 fi
 
 # A stopped unit, its start timeout or a shutdown sends TERM to every process here at once.
-# The retro ends its stage and logs why. This script and tee ignore the TERM and wait for it:
-# the script so it can still write the job run log line, tee because a tee that died first
-# would break the pipe the retro logs into.
-trap : TERM INT HUP
+# The retro ends its stage and logs why. This script and tee outlive the TERM and wait for it:
+# the script so it can still write the job run log line and start no later retro, tee because
+# a tee that died first would break the pipe the retro logs into.
+stopped=0
+trap 'stopped=1' TERM INT HUP
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
-"$retro" "$agents" --if-active "$@" 2>&1 | (trap '' TERM INT HUP; exec tee "$out")
-rc=${PIPESTATUS[0]}
 
-# The retro's own lines are "<time> <run> <message>"; an error it exits on is the message alone.
-last=$(grep -v '^[[:space:]]*$' "$out" | tail -n1 \
-    | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z [^ ]+ //')
-[ -n "$last" ] || last="the retro exited $rc and printed nothing"
-stats=$(jq -cn --argjson exit "$rc" '{exit: $exit}')
+# One retro, and its job run log line: run_retro <job> <repo> [retro option...]. Fails when the run did.
+run_retro() {
+    local job=$1 repo=$2 rc last outcome
+    shift 2
+    "$retro" "$repo" --if-active "$@" </dev/null 2>&1 | (trap '' TERM INT HUP; exec tee "$out")
+    rc=${PIPESTATUS[0]}
+    # The retro's own lines are "<time> <run> <message>"; an error it exits on is the message alone.
+    last=$(grep -v '^[[:space:]]*$' "$out" | tail -n1 \
+        | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z [^ ]+ //')
+    [ -n "$last" ] || last="the retro exited $rc and printed nothing"
+    case $rc in
+        0) outcome=ok ;;
+        3) outcome=skip ;;
+        *) outcome=fail ;;
+    esac
+    "$run_log" "$job" "$outcome" --reason "$last" --stats "$(jq -cn --argjson exit "$rc" '{exit: $exit}')"
+    [ "$outcome" != fail ]
+}
 
-case $rc in
-    0) outcome=ok ;;
-    3) outcome=skip ;;
-    *) outcome=fail ;;
-esac
-"$run_log" workflow-retro "$outcome" --reason "$last" --stats "$stats"
-[ "$outcome" = fail ] && exit 1
-exit 0
+if [ "$repos_mode" = 0 ]; then
+    run_retro workflow-retro "$agents" "$@"
+    exit
+fi
+
+failed=0
+mapfile -t repos < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$list")
+for repo in "${repos[@]}"; do
+    [ "$stopped" = 1 ] && break
+    repo="${repo/#\~/$HOME}"
+    name=$(basename "$repo")
+    run_retro "repo-retro-${name#.}" "$repo" "$@" || failed=1
+done
+exit "$failed"
