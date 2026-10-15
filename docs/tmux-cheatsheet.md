@@ -81,7 +81,8 @@ Sessions auto-save every 1min. After reboot, just run `tmux`.
 | `C-r` | Manual restore (needs prefix) |
 
 **Saves:** window/pane layout, working directories, pane contents
-**Doesn't save:** running processes (but shows which dir they were in)
+**Restarts:** Claude Code sessions that were still running, each resumed in its pane
+**Doesn't save:** other running processes (but shows which dir they were in)
 
 ## Misc
 
