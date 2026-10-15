@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Print how much of each Claude plan's quota is used and when it resets, for every Claude
 # Code profile on this machine: ~/.claude and each ~/.claude-NAME that holds a login.
-# Usage: cc-quota
+# Usage: cc-quota [--json]
 #
 # It reads Anthropic's OAuth usage endpoint with the profile's current access token
 # and never refreshes it: a refresh rotates the token Claude Code holds. An expired one is
@@ -13,12 +13,27 @@
 # comes from the Admin API's cost report, which counts whole days, so it runs through yesterday. It
 # needs an organization-scoped API key: $CC_QUOTA_ORG_KEY when set, else ORGANIZATION_API_KEY in
 # with-secrets' anthropic. Without one, or with CC_QUOTA_ORG_KEY set empty, the section is left out.
+#
+# --json prints the same report as one line of JSON, for a history to append it to: at (UTC),
+# profiles (name, plan, buckets of name, used %, resets_at, dollars_left, dollars_limit; or name and
+# error), and console (org, grant, since, spent, left in dollars, spent counted through yesterday;
+# or an error; null without a key).
 set -euo pipefail
-case ${1:-} in -h|--help) awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;; esac
+json=false
+case ${1:-} in
+-h|--help) awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
+--json) json=true ;;
+'') ;;
+*) echo "cc-quota: no option $1; cc-quota --help says what it takes" >&2; exit 2 ;;
+esac
 
 api=${CC_QUOTA_API:-https://api.anthropic.com}
 now_ms=$(($(date +%s) * 1000))
 
+failed() { jq -nc --arg n "$1" --arg e "$2" '{name: $n, error: $e}'; }
+
+# Every profile's report, one JSON object each.
+profiles=()
 for dir in "$HOME/.claude" "$HOME"/.claude-*/; do
 	dir=${dir%/}
 	creds=$dir/.credentials.json
@@ -26,52 +41,72 @@ for dir in "$HOME/.claude" "$HOME"/.claude-*/; do
 	name=${dir##*/.claude-}
 	[[ $name == "$dir" ]] && name=default
 	if (($(jq -r '.claudeAiOauth.expiresAt // 0' "$creds") < now_ms)); then
-		echo "$name: token expired; open claude in this profile to renew it"
+		profiles+=("$(failed "$name" "token expired; open claude in this profile to renew it")")
 		continue
 	fi
 	token=$(jq -r .claudeAiOauth.accessToken "$creds")
 	if ! usage=$(curl -sSf "$api/api/oauth/usage" -H "Authorization: Bearer $token" -H 'anthropic-beta: oauth-2025-04-20'); then
-		echo "$name: the usage endpoint refused the request"
+		profiles+=("$(failed "$name" "the usage endpoint refused the request")")
 		continue
 	fi
-	echo "$name ($(jq -r '.claudeAiOauth.subscriptionType // "?"' "$creds"))"
 	# Every bucket the reply fills in, so one Anthropic adds later shows up under its own name.
 	# Reset times jitter around the minute (04:59:59.85, then 05:00:00.24), so they are rounded to it.
-	jq -r 'to_entries[] | select(.value | type == "object" and has("utilization") and .resets_at != null)
-		| [.key, (.value.utilization | round | tostring) + "%",
-		   (.value.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdate + 30 | . - . % 60),
-		   (if .value.remaining_dollars then "$\(.value.remaining_dollars) of $\(.value.limit_dollars) left" else "" end)] | @tsv' <<<"$usage" |
-		while IFS=$'\t' read -r bucket used resets dollars; do
-			printf '  %-16s %4s  resets %s%s\n' "$bucket" "$used" "$(date -d "@$resets" '+%a %d %b %H:%M')" "${dollars:+  $dollars}"
-		done
+	profiles+=("$(jq -c --arg n "$name" --arg p "$(jq -r '.claudeAiOauth.subscriptionType // "?"' "$creds")" '{name: $n, plan: $p, buckets: [
+		to_entries[] | select(.value | type == "object" and has("utilization") and .resets_at != null)
+		| {name: .key, used: (.value.utilization | round),
+		   resets_at: (.value.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdate + 30 | . - . % 60 | todate),
+		   dollars_left: .value.remaining_dollars, dollars_limit: .value.limit_dollars}]}' <<<"$usage")")
 done
 
-key=${CC_QUOTA_ORG_KEY-$(with-secrets anthropic printenv ORGANIZATION_API_KEY 2>/dev/null || true)}
-[[ -n $key ]] || exit 0
-grant=${CC_QUOTA_GRANT:-200}
-day=${CC_QUOTA_GRANT_DAY:-10}
-since=$(date +%Y-%m-)$(printf %02d "$day")
-(($(date +%-d) >= day)) || since=$(date -d "$since -1 month" +%F)
-admin=(-H "x-api-key: $key" -H 'anthropic-version: 2023-06-01')
-if ! org=$(curl -sSf "$api/v1/organizations/me" "${admin[@]}" | jq -r .name); then
-	echo "console: the Admin API refused the organization key"
+# The Console org's credit grant, as one JSON object, or null without a key.
+console() {
+	local key grant day since admin org cents=0 page report
+	key=${CC_QUOTA_ORG_KEY-$(with-secrets anthropic printenv ORGANIZATION_API_KEY 2>/dev/null || true)}
+	[[ -n $key ]] || { echo null; return; }
+	grant=${CC_QUOTA_GRANT:-200}
+	day=${CC_QUOTA_GRANT_DAY:-10}
+	since=$(date +%Y-%m-)$(printf %02d "$day")
+	(($(date +%-d) >= day)) || since=$(date -d "$since -1 month" +%F)
+	admin=(-H "x-api-key: $key" -H 'anthropic-version: 2023-06-01')
+	if ! org=$(curl -sSf "$api/v1/organizations/me" "${admin[@]}" | jq -r .name); then
+		jq -nc '{error: "the Admin API refused the organization key"}'
+		return
+	fi
+	# A cycle that starts today has no whole day yet, and the report refuses an empty range.
+	if [[ $since != "$(date +%F)" ]]; then
+		page=
+		while :; do
+			if ! report=$(curl -sSfG "$api/v1/organizations/cost_report" "${admin[@]}" --data-urlencode "starting_at=${since}T00:00:00Z" -d limit=31 ${page:+--data-urlencode "page=$page"}); then
+				jq -nc --arg o "$org" '{org: $o, error: "the cost report refused the request"}'
+				return
+			fi
+			cents=$(jq -r --arg c "$cents" '[.data[].results[].amount | tonumber] | add + ($c | tonumber)' <<<"$report")
+			page=$(jq -r 'if .has_more then .next_page else empty end' <<<"$report")
+			[[ -n $page ]] || break
+		done
+	fi
+	jq -nc --arg o "$org" --argjson g "$grant" --arg s "$since" --argjson c "$cents" \
+		'{org: $o, grant: $g, since: $s, spent: ($c / 100), left: ($g - $c / 100)}'
+}
+
+report=$(jq -nc --arg at "$(date -u +%FT%TZ)" --argjson console "$(console)" \
+	'{at: $at, profiles: ($ARGS.positional | map(fromjson)), console: $console}' --args ${profiles[@]+"${profiles[@]}"})
+if $json; then
+	echo "$report"
 	exit 0
 fi
-cents=0
-# A cycle that starts today has no whole day yet, and the report refuses an empty range.
-if [[ $since != "$(date +%F)" ]]; then
-	page=
-	while :; do
-		if ! report=$(curl -sSfG "$api/v1/organizations/cost_report" "${admin[@]}" --data-urlencode "starting_at=${since}T00:00:00Z" -d limit=31 ${page:+--data-urlencode "page=$page"}); then
-			echo "console $org: the cost report refused the request"
-			exit 0
-		fi
-		cents=$(jq -r --arg c "$cents" '[.data[].results[].amount | tonumber] | add + ($c | tonumber)' <<<"$report")
-		page=$(jq -r 'if .has_more then .next_page else empty end' <<<"$report")
-		[[ -n $page ]] || break
+
+# The report as text: a line per profile or Console org, an indented one per bucket.
+jq -r '(.profiles[] | if .error then ["line", "\(.name): \(.error)"]
+		else ["line", "\(.name) (\(.plan))"], (.buckets[] | ["bucket", .name, "\(.used)%", (.resets_at | fromdate),
+			(if .dollars_left then "$\(.dollars_left) of $\(.dollars_limit) left" else "" end)]) end),
+	(.console // empty | if .error then ["line", "console\(if .org then " \(.org)" else "" end): \(.error)"]
+		else ["line", "console \(.org)"], ["grant", "\(.spent / .grant * 100 | round)%", .since, .left, .grant] end)
+	| @tsv' <<<"$report" |
+	while IFS=$'\t' read -r kind a b c d; do
+		case $kind in
+		line) echo "$a" ;;
+		bucket) printf '  %-16s %4s  resets %s%s\n' "$a" "$b" "$(date -d "@$c" '+%a %d %b %H:%M')" "${d:+  $d}" ;;
+		grant) printf '  %-16s %4s  since %s  $%.2f of $%s left, through yesterday\n' credit_grant "$a" "$(date -d "$b" '+%a %d %b')" "$c" "$d" ;;
+		esac
 	done
-fi
-echo "console $org"
-used=$(jq -n --argjson c "$cents" --argjson g "$grant" '$c / $g | round')
-left=$(jq -n --argjson c "$cents" --argjson g "$grant" '$g - $c / 100')
-printf '  %-16s %4s  since %s  $%.2f of $%s left, through yesterday\n' credit_grant "$used%" "$(date -d "$since" '+%a %d %b')" "$left" "$grant"
