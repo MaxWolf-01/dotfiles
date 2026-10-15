@@ -14,9 +14,10 @@ let
   ]);
 
   # uv runs lifelog for the collectors' last runs jarvis-sync ships; jq because
-  # bin/run-log builds its line with it.
+  # bin/run-log builds its line with it; curl and sops for the cc-quota report it
+  # ships, sops through with-secrets.
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh uv jq
+    bash coreutils rsync openssh uv jq curl sops
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
@@ -757,6 +758,7 @@ in
       Environment = [
         "PATH=${syncPath}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
+        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${secrets}/scripts/jarvis-sync --record";
     };
