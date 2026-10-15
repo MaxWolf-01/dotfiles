@@ -25,6 +25,11 @@
 #   the first space.
 # - resurrect's save hooks are not run, and its old-save pruning is left to the
 #   caller.
+# - a pane running a Claude Code session is saved with the command that resumes
+#   it, read from the session's registry file (~/.claude*/sessions/<pid>.json),
+#   so restore.sh brings the session back rather than a fresh one. That command
+#   names the session's directory and its config dir, ~/.claude by unsetting
+#   CLAUDE_CONFIG_DIR: a restored pane's shell may hold another account's.
 set -u
 
 tmux=$1
@@ -45,10 +50,30 @@ tq() { printf -v "$1" "'%s'" "${2//\'/\'\\\'\'}"; }
 target='' file=''
 
 # A pane's full command: the first process whose parent is the pane's shell.
-declare -A fullcmd=()
-while read -r ppid args; do
-    [[ -v fullcmd[$ppid] ]] || fullcmd[$ppid]=$args
-done < <(ps -a -o ppid= -o args=)
+declare -A fullcmd=() firstpid=()
+while read -r ppid pid args; do
+    [[ -v fullcmd[$ppid] ]] || fullcmd[$ppid]=$args firstpid[$ppid]=$pid
+done < <(ps -a -o ppid= -o pid= -o args=)
+
+# The command that resumes each running interactive Claude Code session, by its
+# pid. A registry file is one line of JSON without a newline, and jq reads the
+# files it is given as one stream, where a file written mid-save would break the
+# ones after it. So each goes to jq as a line of its own, behind its path, and
+# one that does not parse is skipped. A stale one names a pid no pane has.
+declare -A resume=()
+registries=()
+for f in "$HOME"/.claude*/sessions/*.json; do
+    [ -f "$f" ] || continue
+    read -r json <"$f"
+    registries+=("$f$d$json")
+done
+while IFS=$d read -r pid id cwd config; do
+    account="env -u CLAUDE_CONFIG_DIR "
+    [ "$config" = "$HOME/.claude" ] || printf -v account 'CLAUDE_CONFIG_DIR=%q ' "$config"
+    printf -v "resume[$pid]" 'cd %q && %sclaude --resume %s' "$cwd" "$account" "$id"
+done < <(((${#registries[@]})) && printf '%s\n' "${registries[@]}" | jq -rR 'index("\t") as $i
+    | (.[$i + 1:] | fromjson? | select(.kind == "interactive")) as $s
+    | [$s.pid, $s.sessionId, $s.cwd, (.[:$i] | sub("/sessions/[^/]*$"; ""))] | @tsv')
 
 # Grouped sessions: the first session of a group is the original and is saved
 # like any other; each later one becomes a grouped_session line pointing at it.
@@ -83,7 +108,10 @@ while IFS=$u read -r sess win wact wflags pidx title path pact pcmd ppid hist hb
     fp[$key]="$pane_id $hist $hbytes $cx $cy $pw $ph $alt $activity"
     hist_cy[$key]="$hist $cy"
     path=${path/ /\\ }
-    pane_lines+=("pane${d}${sess}${d}${win}${d}${wact}${d}:${wflags}${d}${pidx}${d}${title}${d}:${path}${d}${pact}${d}${pcmd}${d}:${fullcmd[$ppid]-}")
+    cmd=${fullcmd[$ppid]-}
+    child=${firstpid[$ppid]-0}
+    [[ -v resume[$child] ]] && cmd=${resume[$child]}
+    pane_lines+=("pane${d}${sess}${d}${win}${d}${wact}${d}:${wflags}${d}${pidx}${d}${title}${d}:${path}${d}${pact}${d}${pcmd}${d}:${cmd}")
 done < <("$tmux" list-panes -a -F "#{session_name}$u#{window_index}$u#{window_active}$u#{window_flags}$u#{pane_index}$u#{pane_title}$u#{pane_current_path}$u#{pane_active}$u#{pane_current_command}$u#{pane_pid}$u#{history_size}$u#{history_bytes}$u#{cursor_x}$u#{cursor_y}$u#{pane_width}$u#{pane_height}$u#{window_activity}$u#{alternate_on}$u#{pane_id}")
 
 # Windows: one list-windows, and every window's own automatic-rename in one
@@ -116,7 +144,9 @@ state_line=$("$tmux" display-message -p "state${d}#{client_session}${d}#{client_
     ((${#grouped_lines[@]})) && printf '%s\n' "${grouped_lines[@]}"
     printf '%s\n' "${pane_lines[@]}" "${window_lines[@]}" "$state_line"
 } >"$state"
-if cmp -s "$state" "$dir/last"; then
+# A save in the same second as the previous one writes the very file `last`
+# names, which cmp would find equal to itself and delete.
+if ! [[ $state -ef $dir/last ]] && cmp -s "$state" "$dir/last"; then
     rm "$state"
 else
     ln -fs "${state##*/}" "$dir/last"
