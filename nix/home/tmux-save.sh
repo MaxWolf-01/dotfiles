@@ -144,7 +144,9 @@ state_line=$("$tmux" display-message -p "state${d}#{client_session}${d}#{client_
     ((${#grouped_lines[@]})) && printf '%s\n' "${grouped_lines[@]}"
     printf '%s\n' "${pane_lines[@]}" "${window_lines[@]}" "$state_line"
 } >"$state"
-if cmp -s "$state" "$dir/last"; then
+# A save in the same second as the previous one writes the very file `last`
+# names, which cmp would find equal to itself and delete.
+if ! [[ $state -ef $dir/last ]] && cmp -s "$state" "$dir/last"; then
     rm "$state"
 else
     ln -fs "${state##*/}" "$dir/last"
