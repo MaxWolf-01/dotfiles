@@ -7,14 +7,22 @@ Laptop GPU, Ubuntu with standalone Home Manager.
 
 | Port | Wired to | Output |
 |---|---|---|
-| Thunderbolt 4 (USB-C) | iGPU | `DP-1`, `DP-2` |
-| USB-C 3.2 | dGPU | `DP-3` |
+| Thunderbolt 4 (USB-C, bolt icon) | iGPU | `DP-1`, `DP-2`; a dock's monitors also on `DP-4` to `DP-6` |
+| USB-C 3.2 (DP and bolt icons) | dGPU | `DP-3`; a dock's monitors on the outputs it opens under it (`DP-4`, `DP-5`) |
 | HDMI | dGPU | `HDMI-A-1` |
 
 Measured on 2026-09-28 by which card reads the monitor's EDID; the dGPU's
 power state does not reroute a port. A monitor on a dGPU port keeps the dGPU in
 D0. Two monitors on the iGPU need both on the Thunderbolt port, through an MST
-hub or a Thunderbolt dock (untested).
+hub or a Thunderbolt dock. The ThinkPad Thunderbolt 4 Dock there drives the LG
+ultrawide at 3440x1440@100 and the Arzopa at 2560x1600@60 (2026-10-01).
+
+The dock belongs on the Thunderbolt port. On the USB-C 3.2 port it works as a
+USB-C dock, and its monitors land on the dGPU: the dGPU stays awake, monitors
+are slow to come up, and pages and images render slowly, since mutter's shared
+iGPU/dGPU path fails here ("No EGL display") and it copies every frame
+instead (2026-10-06). `boltctl list` says which port the dock is on: on the
+Thunderbolt port it reads `authorized`, on the other `disconnected`.
 
 The kernel names an output `cardN-<output>`, and N changes between boots: the
 dGPU was `card2` on 2026-09-28 and `card1` on 2026-09-29. `dgpu status` lists
@@ -60,7 +68,15 @@ Measured on 2026-09-23, driver 580.178, kernel 7.0.0-34:
 - Idle on AC, unlocked: D3cold. Idle on battery, locked: D3cold. The card
   goes to sleep within seconds of its last user exiting, on either.
 - gnome-shell holds handles on the card (`nvidia-smi` lists it with 3 MiB)
-  and that does not keep it awake.
+  and that does not keep it awake, unless that login has driven a monitor on
+  a dGPU port. Then gnome-shell keeps the card in D0 until logout, after the
+  monitor is gone (a login of 2026-09-30 that began with a monitor on `DP-3`
+  held it until 2026-10-16; the login after the next boot let it sleep).
+- At login, logind gives the user an ACL entry on the render node
+  (`user:max:rw-`), which the lock does not clear, so `dgpu status` reads
+  "unlocked" on a locked card. Opening the render node and querying its driver
+  leaves the card in D3cold (2026-10-16); `/dev/nvidia*` carry no ACL and stay
+  locked. `agent/tickets/dgpu-lock-survives-logind-acl.md`.
 - Resume from hibernate: D3cold, locked.
 - A locked card refuses `nvidia-smi` ("Insufficient Permissions") and every
   other open made as the user.
@@ -135,4 +151,9 @@ History: the host recorder's `dgpu_port` column (D3cold or D0 every 5 s).
   the next hibernate hung in `nvidia-sleep.sh` with the lid shut until the
   power cut out. `dgpu-wedge-watch` (`nix/home/timers.nix`) tells max to
   reboot when the kernel logs it; only a reboot recovers the card.
+- **The dock's monitors black after a resume.** On 2026-10-06 the
+  thunderbolt driver tore down both DisplayPort tunnels right after a resume
+  (`(DP): not active, tearing down` in `journalctl -k`), and the dock's
+  monitors stayed black until it was replugged. Replug it into the Thunderbolt
+  port; that night it went into the USB-C 3.2 port instead (see Ports).
 - **`reboot -h 0`** is not a thing on systemd; `reboot`.
