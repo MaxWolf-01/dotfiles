@@ -1,0 +1,424 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "httpx", "websockets"]
+# ///
+"""Keep a local copy of what Discord shows you: the GIFs you starred, the emoji and stickers of every server you are in.
+
+Reads Discord through Vesktop: restarts it with a DevTools port open, asks for
+the data as the logged-in page, then restarts it without the port (a Vesktop
+that was closed stays closed). The token never leaves the page. A Vesktop that
+already has the port open is used as it is.
+
+Each run downloads only what the folder lacks. Nothing is ever deleted or
+overwritten: a GIF you unstarred, an emoji or sticker a server removed, a server you left,
+all keep their files and their manifest entries. Downloads that fail are tried
+again on the next run.
+
+Examples:
+
+    discord-download gifs
+    discord-download emojis
+    discord-download stickers
+    discord-download emojis --out /tmp/emojis
+"""
+
+import asyncio
+import json
+import mimetypes
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+
+import httpx
+import tyro
+import websockets
+from tyro.extras import SubcommandApp
+
+MAIN_BUNDLE = "Vesktop/resources/app.asar"  # in the main process's argv, not as a --flag
+PICTURES = Path.home() / "Pictures/discord"
+
+# Fetches the favourites fresh from the API, not from the client's cache, and decodes
+# them with the client's own protobuf class. Format: 1 = image, 2 = video.
+FETCH_FAVOURITES_JS = """
+(async () => {
+  const { RestAPI, UserSettingsActionCreators } = Vencord.Webpack.Common;
+  const proto = UserSettingsActionCreators.FrecencyUserSettingsActionCreators.ProtoClass;
+  const res = await RestAPI.get({ url: "/users/@me/settings-proto/2" });
+  const bytes = Uint8Array.from(atob(res.body.settings), c => c.charCodeAt(0));
+  return proto.fromBinary(bytes).favoriteGifs?.gifs ?? {};
+})()
+"""
+
+# The emoji and stickers come from the client's stores, which hold every server's. Who
+# uploaded one is only in the API's answer, and only on servers where you may create or
+# manage them, so only those servers are asked.
+FETCH_SERVER_ITEMS_JS = """
+(async () => {
+  const C = Vencord.Webpack.Common, P = C.PermissionsBits;
+  const servers = [];
+  for (const g of Object.values(C.GuildStore.getGuilds())) {
+    const items = (%(list)s ?? []).map(%(shape)s);
+    if (items.length && [P.MANAGE_GUILD_EXPRESSIONS, P.CREATE_GUILD_EXPRESSIONS].some(p => C.PermissionStore.can(p, g))) {
+      const uploaders = Object.fromEntries((await C.RestAPI.get({ url: `/guilds/${g.id}/%(key)s` })).body
+        .filter(e => e.user).map(e => [e.id, { id: e.user.id, name: e.user.username }]));
+      for (const e of items) if (uploaders[e.id]) e.uploader = uploaders[e.id];
+    }
+    servers.push({ id: g.id, name: g.name, items });
+  }
+  return { me: C.UserStore.getCurrentUser().id, servers };
+})()
+"""
+
+
+@dataclass(frozen=True)
+class Kind:
+    """What a server holds that discord-download keeps: emoji or stickers."""
+
+    key: str
+    """Names the manifest (<key>.json), its entries' key and the API route."""
+    list_js: str
+    """JS listing one server's items from the client's store."""
+    shape_js: str
+    """JS turning one item into what the manifest keeps of it."""
+    ext: Callable[[dict], str]
+    """The file extension for a manifest entry."""
+    url: Callable[[str, str], str]
+    """The CDN URL for an id and its extension."""
+
+    @property
+    def fetch_js(self) -> str:
+        return FETCH_SERVER_ITEMS_JS % {"list": self.list_js, "shape": self.shape_js, "key": self.key}
+
+
+EMOJIS = Kind(
+    key="emojis",
+    list_js="C.EmojiStore.getGuildEmoji(g.id)",
+    shape_js="e => ({ id: e.id, name: e.name, animated: e.animated })",
+    ext=lambda e: ".gif" if e["animated"] else ".png",
+    url=lambda id, ext: f"https://cdn.discordapp.com/emojis/{id}{ext}",
+)
+
+STICKER_EXT = {1: ".png", 2: ".png", 3: ".json", 4: ".gif"}  # Discord's format_type: PNG, APNG, Lottie, GIF
+
+STICKERS = Kind(
+    key="stickers",
+    list_js="C.StickersStore.getStickersByGuildId(g.id)",
+    shape_js="s => ({ id: s.id, name: s.name, format: s.format_type })",
+    ext=lambda s: STICKER_EXT.get(s["format"], ".png"),
+    # A Lottie sticker is JSON, which only discord.com serves; a GIF one only media.discordapp.net.
+    url=lambda id, ext: (f"https://discord.com/stickers/{id}.json" if ext == ".json"
+                         else f"https://media.discordapp.net/stickers/{id}{ext}"),
+)
+
+READY_JS = """
+!!(window.Vencord?.Webpack?.Common?.UserStore?.getCurrentUser?.()
+   && Vencord.Webpack.Common.UserSettingsActionCreators?.FrecencyUserSettingsActionCreators?.ProtoClass
+   && Object.keys(Vencord.Webpack.Common.GuildStore.getGuilds()).length)
+"""
+
+app = SubcommandApp()
+
+
+@app.command(name="gifs")
+def gifs(out: Path = PICTURES / "gifs", port: int = 9222) -> None:
+    """Download the GIFs starred in Discord's GIF picker.
+
+    The folder holds favorites.json, the manifest: every favourite ever seen, keyed
+    by its link, with Discord's entry (src, format, width, height, order) and the
+    name of the downloaded file. Files are named <order>-<slug>.<ext>, where order
+    is the GIF's place in the picker when it was first downloaded.
+
+    Args:
+        out: Folder the GIFs and favorites.json go to. Created when missing.
+        port: DevTools port Vesktop is started with.
+    """
+    download_gifs(read_discord(FETCH_FAVOURITES_JS, port), out)
+
+
+@app.command(name="emojis")
+def emojis(out: Path = PICTURES / "server-emojis", port: int = 9222) -> None:
+    """Download the custom emoji of every server you are in.
+
+    The folder holds:
+
+    - emojis.json, the manifest: every server and emoji ever seen, keyed by id, with
+    its current name, the first and last day a run saw it, and whether the last run
+    still did (accessible); an emoji also names its file and, where Discord tells,
+    who uploaded it.
+
+    - all/<server>/<emoji>.<png|gif>, every emoji ever downloaded, under the names
+    they had when first seen. A name already taken gets the emoji's id appended.
+
+    - gone/ and mine/, the same tree as symlinks into all/: the emoji the last run
+    no longer saw (removed, or their server left), and the ones you uploaded. Each
+    run rebuilds both, removing only symlinks.
+
+    Args:
+        out: Folder the emoji and emojis.json go to. Created when missing.
+        port: DevTools port Vesktop is started with.
+    """
+    archive_server_items(EMOJIS, out, port)
+
+
+@app.command(name="stickers")
+def stickers(out: Path = PICTURES / "server-stickers", port: int = 9222) -> None:
+    """Download the stickers of every server you are in.
+
+    The folder is laid out like the one `emojis` fills, with stickers.json as its
+    manifest. A sticker is a .png (still or animated), a .gif, or a .json for the
+    Lottie animations Discord draws itself.
+
+    Args:
+        out: Folder the stickers and stickers.json go to. Created when missing.
+        port: DevTools port Vesktop is started with.
+    """
+    archive_server_items(STICKERS, out, port)
+
+
+# --- emoji and stickers
+
+
+def archive_server_items(kind: Kind, out: Path, port: int) -> None:
+    seen = read_discord(kind.fetch_js, port)
+    if not seen["servers"]:
+        sys.exit(f"Discord listed no servers; not marking all {kind.key} gone. Rerun once Vesktop has loaded.")
+    with httpx.Client(follow_redirects=True, timeout=30, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        archive(kind, seen, out, client, date.today().isoformat())
+
+
+def archive(kind: Kind, seen: dict, out: Path, client: httpx.Client, today: str) -> None:
+    """Merge what Discord shows today into the manifest, download what is missing, rebuild the views."""
+    manifest_path = out / f"{kind.key}.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"servers": {}, kind.key: {}}
+    servers, items = manifest["servers"], manifest[kind.key]
+
+    for s in servers.values():
+        s["member"] = False
+    for e in items.values():
+        e["accessible"] = False
+    folders = {s["folder"] for s in servers.values()} | {p.name for p in (out / "all").glob("*")}
+    for server in seen["servers"]:
+        known = servers.setdefault(server["id"], {"first_seen": today})
+        if "folder" not in known:
+            folder = safe_name(server["name"]) or server["id"]
+            known["folder"] = f"{folder}-{server['id']}" if folder in folders else folder
+            folders.add(known["folder"])
+        known.update(name=server["name"], last_seen=today, member=True)
+        for item in server["items"]:
+            entry = items.setdefault(item["id"], {"server": server["id"], "first_seen": today})
+            entry.update({k: v for k, v in item.items() if k not in ("id", "uploader")}, last_seen=today, accessible=True)
+            if "uploader" in item:
+                entry.update(uploader=item["uploader"]["name"], uploader_id=item["uploader"]["id"])
+
+    # Names are compared without their extension, so blob.png and blob.gif never sit side by side.
+    stems = {str(Path(e["file"]).with_suffix("")) for e in items.values() if e.get("file")}
+    stems |= {str(p.relative_to(out).with_suffix("")) for p in (out / "all").glob("*/*")}
+    missing = [(id, e) for id, e in items.items() if not (e.get("file") and (out / e["file"]).exists())]
+    for id, e in missing:
+        if not e.get("file"):
+            stem = f"all/{servers[e['server']]['folder']}/{safe_name(e['name']) or id}"
+            stem = f"{stem}-{id}" if stem in stems else stem
+            stems.add(stem)
+            e["file"] = stem + kind.ext(e)
+
+    def fetch(missing_item):
+        id, e = missing_item
+        try:
+            res = client.get(kind.url(id, Path(e["file"]).suffix))
+            res.raise_for_status()
+        except httpx.HTTPError as err:
+            return id, str(err).splitlines()[0]
+        path = out / e["file"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(path, "xb") as f:  # x: never overwrite
+                f.write(res.content)
+        except FileExistsError:
+            return id, f"{path} appeared while downloading; left as it is"
+        return id, None
+
+    with ThreadPoolExecutor(8) as pool:
+        results = list(pool.map(fetch, missing))
+    failed = [(id, err) for id, err in results if err]
+    for id, _ in failed:
+        del items[id]["file"]
+    out.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=1, ensure_ascii=False) + "\n")
+
+    have = {id: e for id, e in items.items() if e.get("file")}
+    gone = [e for e in have.values() if not e["accessible"]]
+    mine = [e for e in have.values() if e.get("uploader_id") == seen["me"]]
+    rebuild_view(out, "gone", gone)
+    rebuild_view(out, "mine", mine)
+
+    print(f"{sum(e['accessible'] for e in items.values())} {kind.key} in {len(seen['servers'])} servers, "
+          f"{len(missing) - len(failed)} downloaded, {len(failed)} failed; "
+          f"{len(have)} in {out / 'all'}, {len(gone)} of them gone, {len(mine)} yours")
+    for id, err in failed:
+        print(f"fail {items[id]['name']} ({id})\n     {err}", file=sys.stderr)
+
+
+def rebuild_view(out: Path, view: str, entries: list[dict]) -> None:
+    """out/view as symlinks to the entries' files; anything in it that is not a symlink is left alone."""
+    root = out / view
+    if root.exists():
+        for path in sorted(root.rglob("*"), reverse=True):
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+    for e in entries:
+        link = root / Path(e["file"]).relative_to("all")
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(os.path.relpath(out / e["file"], link.parent))
+
+
+# --- GIFs
+
+
+def download_gifs(favourites: dict, out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    manifest_path = out / "favorites.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    for link, entry in favourites.items():
+        manifest[link] = {**manifest.get(link, {}), **entry}
+
+    new, failed = 0, []
+    with httpx.Client(follow_redirects=True, timeout=30, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for link, entry in sorted(manifest.items(), key=lambda kv: kv[1]["order"]):
+            if entry.get("file") and (out / entry["file"]).exists():
+                continue
+            stem = f"{entry['order']:03d}-{slug(link)}"
+            if existing := next(out.glob(f"{glob_escape(stem)}.*"), None):
+                entry["file"] = existing.name
+                continue
+            try:
+                res = client.get(entry["src"])
+                res.raise_for_status()
+            except httpx.HTTPError as e:
+                failed.append((link, str(e).splitlines()[0]))
+                continue
+            ctype = res.headers.get("content-type", "").split(";")[0]
+            ext = mimetypes.guess_extension(ctype) or Path(entry["src"].split("?")[0]).suffix or ".bin"
+            (out / f"{stem}{ext}").write_bytes(res.content)
+            entry["file"] = f"{stem}{ext}"
+            print(f"new  {entry['file']}")
+            new += 1
+
+    manifest_path.write_text(json.dumps(manifest, indent=1) + "\n")
+    print(f"{len(favourites)} starred, {new} downloaded, {len(failed)} failed, {len(manifest)} in {out}")
+    for link, error in failed:
+        print(f"fail {link}\n     {error}", file=sys.stderr)
+
+
+def slug(link: str) -> str:
+    last = link.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+    return re.sub(r"[^A-Za-z0-9]+", "-", last)[:60].strip("-")
+
+
+def safe_name(name: str) -> str:
+    return re.sub(r"[^\w.]+", "-", name)[:60].strip("-.")
+
+
+def glob_escape(s: str) -> str:
+    return re.sub(r"([*?\[])", r"[\1]", s)
+
+
+# --- Vesktop
+
+
+def read_discord(expression: str, port: int):
+    """Evaluate expression in Vesktop's logged-in Discord page, restarting Vesktop with a DevTools port if needed."""
+    devtools = f"http://127.0.0.1:{port}"
+    if devtools_up(devtools):
+        wait_until_ready(devtools)
+        return asyncio.run(evaluate(devtools, expression))
+    was_running = bool(vesktop_pids())
+    quit_vesktop()
+    launch_vesktop(f"--remote-debugging-port={port}")
+    try:
+        wait_until_ready(devtools)
+        return asyncio.run(evaluate(devtools, expression))
+    finally:
+        quit_vesktop()
+        if was_running:
+            launch_vesktop()
+
+
+def vesktop_pids() -> list[int]:
+    pids = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        args = [a.decode(errors="replace") for a in argv]
+        if any(a.endswith(MAIN_BUNDLE) for a in args) and not any(a.startswith("--type=") for a in args):
+            pids.append(int(proc.name))
+    return pids
+
+
+def quit_vesktop(timeout: float = 20) -> None:
+    pids = vesktop_pids()
+    for pid in pids:
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while vesktop_pids():
+        if time.monotonic() > deadline:
+            sys.exit(f"Vesktop (pid {pids}) did not quit within {timeout:.0f}s of SIGTERM; close it by hand and rerun.")
+        time.sleep(0.3)
+
+
+def launch_vesktop(*flags: str) -> None:
+    subprocess.Popen(["vesktop", *flags], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def devtools_up(devtools: str) -> bool:
+    try:
+        return httpx.get(f"{devtools}/json/version", timeout=1).is_success
+    except httpx.HTTPError:
+        return False
+
+
+def wait_until_ready(devtools: str, timeout: float = 90) -> None:
+    """Wait for Discord to be logged in, its servers listed and its settings classes loaded."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if asyncio.run(evaluate(devtools, READY_JS)):
+                return
+        except (httpx.HTTPError, StopIteration, OSError, websockets.WebSocketException, RuntimeError):
+            pass
+        time.sleep(1)
+    sys.exit(f"Discord did not finish loading in Vesktop within {timeout:.0f}s (is it logged in?).")
+
+
+async def evaluate(devtools: str, expression: str):
+    """Evaluate JS in Vesktop's Discord page over the Chrome DevTools Protocol; return its value."""
+    pages = httpx.get(f"{devtools}/json/list", timeout=5).json()
+    ws_url = next(p["webSocketDebuggerUrl"] for p in pages if p["type"] == "page" and "discord.com" in p["url"])
+    async with websockets.connect(ws_url, max_size=None) as ws:
+        await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+            "expression": expression, "returnByValue": True, "awaitPromise": True}}))
+        while (msg := json.loads(await ws.recv())).get("id") != 1:
+            pass
+    result = msg["result"]
+    if "exceptionDetails" in result:
+        raise RuntimeError(result["exceptionDetails"].get("exception", {}).get("description", result["exceptionDetails"]))
+    return result["result"].get("value")
+
+
+if __name__ == "__main__":
+    app.cli(description=__doc__)
