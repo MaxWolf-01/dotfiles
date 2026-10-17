@@ -35,7 +35,7 @@ in
   };
 
   # A system unit, not a user one: user.slice caps max's units together with
-  # the workers (agent-user.nix), and the test would compete with them there.
+  # the workers (../agent-user.nix), and the test would compete with them there.
   systemd.services.memory-test = {
     description = "Stress the RAM and mail if it fails";
     serviceConfig = {

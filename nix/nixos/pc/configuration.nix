@@ -9,7 +9,12 @@
     ./sftpgo.nix
     ./tailnet-lock.nix
     ./hd-idle.nix
-    ./agent-user.nix
+    (import ../agent-user.nix {
+      memoryMax = "10G";
+      dispatcherKeys = [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
+      ];
+    })
     ./host-recorder.nix
     ./hardware-alerts.nix
     ../journald.nix
@@ -30,7 +35,7 @@
     requestEncryptionCredentials = false;
   };
   # No cgroup counts the ARC; the cap bounds how much of what the workers'
-  # ceiling (agent-user.nix) leaves the rest of pc it can take.
+  # ceiling (memoryMax, above) leaves the rest of pc it can take.
   boot.kernelParams = [ "zfs.zfs_arc_max=${toString (3 * 1024 * 1024 * 1024)}" ];
 
   # Network

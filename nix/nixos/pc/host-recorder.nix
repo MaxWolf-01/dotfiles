@@ -11,7 +11,7 @@
     serviceConfig = {
       ExecStart = "/home/max/.dotfiles/bin/host-recorder";
       # The rows name every user's panes and their working directories, which
-      # the workers' 700 homes keep from each other (agent-user.nix). So the
+      # the workers' 700 homes keep from each other (../agent-user.nix). So the
       # files are readable by wheel, which holds max and no worker.
       Group = "wheel";
       UMask = "0027";
