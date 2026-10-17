@@ -5,11 +5,11 @@
 # only boundary between a worker and the rest of the machine: no read access to
 # max's home or anything mounted inside it (pc's HDD pool), none to the other
 # worker's home (both are mode 700, the NixOS default), no wheel, no sudo, no
-# docker group, no outgoing tailnet. Two users rather than two config dirs under one user
-# because the Helferline account is shared with a whole team: a session on it
-# must not be able to read the personal account's transcripts, worktrees or
-# plugin cache. A home boundary covers exactly what is inside a home; dispatch's
-# scratch dir and worker logs under /tmp are outside it.
+# docker group, no outgoing tailnet. Two users rather than two config dirs
+# under one user because the Helferline account is shared with a whole team: a
+# session on it must not be able to read the personal account's transcripts,
+# worktrees or plugin cache. A home boundary covers exactly what is inside a
+# home; dispatch's scratch dir and worker logs under /tmp are outside it.
 #
 # A function of what differs between the hosts that import it: memoryMax is
 # the workers' memory ceiling (below), dispatcherKeys the public key of each
@@ -59,9 +59,9 @@ in
     {
       # rwx------ on /home/max. The workers are in no group of max's and there
       # are no ACLs, so this directory mode is the only thing that denies them
-      # /home/max, and with it whatever mounts inside it, pc's pool among them. 700
-      # is already the NixOS default for normal users; it is pinned here so the
-      # boundary does not depend on that default staying put.
+      # /home/max, and with it whatever mounts inside it, pc's pool among them.
+      # 700 is already the NixOS default for normal users; it is pinned here so
+      # the boundary does not depend on that default staying put.
       max.homeMode = "700";
     }
   ];
@@ -69,9 +69,10 @@ in
 
   # The workers' memory ceiling. logind parents every user's slice to
   # user.slice, so it holds max's sessions too. At the ceiling the OOM killer
-  # ranks by size plus oom_score_adj; the workers' 500 puts them before max's
-  # processes (200 or less) up to 3 GiB larger. No swap: a swapping cgroup
-  # stalls the host long before the killer acts.
+  # ranks by size plus oom_score_adj, in thousandths of the ceiling; the
+  # workers' 500 puts them before max's processes (200 or less) up to 30% of
+  # the ceiling larger, 3 GiB on pc's 10G. No swap: a swapping cgroup stalls
+  # the host long before the killer acts.
   systemd.slices.user.sliceConfig = {
     MemoryMax = memoryMax;
     MemorySwapMax = 0;
