@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["tyro", "httpx", "websockets"]
 # ///
-"""Keep a local copy of what Discord shows you: the GIFs you starred, the emoji of every server you are in.
+"""Keep a local copy of what Discord shows you: the GIFs you starred, the emoji and stickers of every server you are in.
 
 Reads Discord through Vesktop: restarts it with a DevTools port open, asks for
 the data as the logged-in page, then restarts it without the port (a Vesktop
@@ -11,7 +11,7 @@ that was closed stays closed). The token never leaves the page. A Vesktop that
 already has the port open is used as it is.
 
 Each run downloads only what the folder lacks. Nothing is ever deleted or
-overwritten: a GIF you unstarred, an emoji a server removed, a server you left,
+overwritten: a GIF you unstarred, an emoji or sticker a server removed, a server you left,
 all keep their files and their manifest entries. Downloads that fail are tried
 again on the next run.
 
@@ -19,6 +19,7 @@ Examples:
 
     discord-download gifs
     discord-download emojis
+    discord-download stickers
     discord-download emojis --out /tmp/emojis
 """
 
@@ -31,7 +32,9 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -55,25 +58,66 @@ FETCH_FAVOURITES_JS = """
 })()
 """
 
-# The emoji come from the client's store, which holds every server's. Who uploaded one
-# is only in the API's answer, and only on servers where you may create or manage emoji,
-# so only those servers are asked.
-FETCH_EMOJIS_JS = """
+# The emoji and stickers come from the client's stores, which hold every server's. Who
+# uploaded one is only in the API's answer, and only on servers where you may create or
+# manage them, so only those servers are asked.
+FETCH_SERVER_ITEMS_JS = """
 (async () => {
-  const { GuildStore, EmojiStore, PermissionStore, PermissionsBits: P, RestAPI, UserStore } = Vencord.Webpack.Common;
+  const C = Vencord.Webpack.Common, P = C.PermissionsBits;
   const servers = [];
-  for (const g of Object.values(GuildStore.getGuilds())) {
-    const emojis = (EmojiStore.getGuildEmoji(g.id) ?? []).map(e => ({ id: e.id, name: e.name, animated: e.animated }));
-    if (emojis.length && [P.MANAGE_GUILD_EXPRESSIONS, P.CREATE_GUILD_EXPRESSIONS].some(p => PermissionStore.can(p, g))) {
-      const uploaders = Object.fromEntries((await RestAPI.get({ url: `/guilds/${g.id}/emojis` })).body
+  for (const g of Object.values(C.GuildStore.getGuilds())) {
+    const items = (%(list)s ?? []).map(%(shape)s);
+    if (items.length && [P.MANAGE_GUILD_EXPRESSIONS, P.CREATE_GUILD_EXPRESSIONS].some(p => C.PermissionStore.can(p, g))) {
+      const uploaders = Object.fromEntries((await C.RestAPI.get({ url: `/guilds/${g.id}/%(key)s` })).body
         .filter(e => e.user).map(e => [e.id, { id: e.user.id, name: e.user.username }]));
-      for (const e of emojis) if (uploaders[e.id]) e.uploader = uploaders[e.id];
+      for (const e of items) if (uploaders[e.id]) e.uploader = uploaders[e.id];
     }
-    servers.push({ id: g.id, name: g.name, emojis });
+    servers.push({ id: g.id, name: g.name, items });
   }
-  return { me: UserStore.getCurrentUser().id, servers };
+  return { me: C.UserStore.getCurrentUser().id, servers };
 })()
 """
+
+
+@dataclass(frozen=True)
+class Kind:
+    """What a server holds that discord-download keeps: emoji or stickers."""
+
+    key: str
+    """Names the manifest (<key>.json), its entries' key and the API route."""
+    list_js: str
+    """JS listing one server's items from the client's store."""
+    shape_js: str
+    """JS turning one item into what the manifest keeps of it."""
+    ext: Callable[[dict], str]
+    """The file extension for a manifest entry."""
+    url: Callable[[str, str], str]
+    """The CDN URL for an id and its extension."""
+
+    @property
+    def fetch_js(self) -> str:
+        return FETCH_SERVER_ITEMS_JS % {"list": self.list_js, "shape": self.shape_js, "key": self.key}
+
+
+EMOJIS = Kind(
+    key="emojis",
+    list_js="C.EmojiStore.getGuildEmoji(g.id)",
+    shape_js="e => ({ id: e.id, name: e.name, animated: e.animated })",
+    ext=lambda e: ".gif" if e["animated"] else ".png",
+    url=lambda id, ext: f"https://cdn.discordapp.com/emojis/{id}{ext}",
+)
+
+STICKER_EXT = {1: ".png", 2: ".png", 3: ".json", 4: ".gif"}  # Discord's format_type: PNG, APNG, Lottie, GIF
+
+STICKERS = Kind(
+    key="stickers",
+    list_js="C.StickersStore.getStickersByGuildId(g.id)",
+    shape_js="s => ({ id: s.id, name: s.name, format: s.format_type })",
+    ext=lambda s: STICKER_EXT.get(s["format"], ".png"),
+    # A Lottie sticker is JSON, which only discord.com serves; a GIF one only media.discordapp.net.
+    url=lambda id, ext: (f"https://discord.com/stickers/{id}.json" if ext == ".json"
+                         else f"https://media.discordapp.net/stickers/{id}{ext}"),
+)
 
 READY_JS = """
 !!(window.Vencord?.Webpack?.Common?.UserStore?.getCurrentUser?.()
@@ -122,86 +166,105 @@ def emojis(out: Path = PICTURES / "server-emojis", port: int = 9222) -> None:
         out: Folder the emoji and emojis.json go to. Created when missing.
         port: DevTools port Vesktop is started with.
     """
-    seen = read_discord(FETCH_EMOJIS_JS, port)
+    archive_server_items(EMOJIS, out, port)
+
+
+@app.command(name="stickers")
+def stickers(out: Path = PICTURES / "server-stickers", port: int = 9222) -> None:
+    """Download the stickers of every server you are in.
+
+    The folder is laid out like the one `emojis` fills, with stickers.json as its
+    manifest. A sticker is a .png (still or animated), a .gif, or a .json for the
+    Lottie animations Discord draws itself.
+
+    Args:
+        out: Folder the stickers and stickers.json go to. Created when missing.
+        port: DevTools port Vesktop is started with.
+    """
+    archive_server_items(STICKERS, out, port)
+
+
+# --- emoji and stickers
+
+
+def archive_server_items(kind: Kind, out: Path, port: int) -> None:
+    seen = read_discord(kind.fetch_js, port)
     if not seen["servers"]:
-        sys.exit("Discord listed no servers; not marking every emoji gone. Rerun once Vesktop has loaded.")
+        sys.exit(f"Discord listed no servers; not marking all {kind.key} gone. Rerun once Vesktop has loaded.")
     with httpx.Client(follow_redirects=True, timeout=30, headers={"User-Agent": "Mozilla/5.0"}) as client:
-        archive_emojis(seen, out, client, date.today().isoformat())
+        archive(kind, seen, out, client, date.today().isoformat())
 
 
-# --- emoji
-
-
-def archive_emojis(seen: dict, out: Path, client: httpx.Client, today: str) -> None:
+def archive(kind: Kind, seen: dict, out: Path, client: httpx.Client, today: str) -> None:
     """Merge what Discord shows today into the manifest, download what is missing, rebuild the views."""
-    manifest_path = out / "emojis.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"servers": {}, "emojis": {}}
-    servers, emojis = manifest["servers"], manifest["emojis"]
+    manifest_path = out / f"{kind.key}.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"servers": {}, kind.key: {}}
+    servers, items = manifest["servers"], manifest[kind.key]
 
     for s in servers.values():
         s["member"] = False
-    for e in emojis.values():
+    for e in items.values():
         e["accessible"] = False
     folders = {s["folder"] for s in servers.values()} | {p.name for p in (out / "all").glob("*")}
     for server in seen["servers"]:
         known = servers.setdefault(server["id"], {"first_seen": today})
         if "folder" not in known:
-            folder = folder_name(server["name"]) or server["id"]
+            folder = safe_name(server["name"]) or server["id"]
             known["folder"] = f"{folder}-{server['id']}" if folder in folders else folder
             folders.add(known["folder"])
         known.update(name=server["name"], last_seen=today, member=True)
-        for emoji in server["emojis"]:
-            entry = emojis.setdefault(emoji["id"], {"server": server["id"], "first_seen": today})
-            entry.update(name=emoji["name"], animated=emoji["animated"], last_seen=today, accessible=True)
-            if "uploader" in emoji:
-                entry.update(uploader=emoji["uploader"]["name"], uploader_id=emoji["uploader"]["id"])
+        for item in server["items"]:
+            entry = items.setdefault(item["id"], {"server": server["id"], "first_seen": today})
+            entry.update({k: v for k, v in item.items() if k not in ("id", "uploader")}, last_seen=today, accessible=True)
+            if "uploader" in item:
+                entry.update(uploader=item["uploader"]["name"], uploader_id=item["uploader"]["id"])
 
     # Names are compared without their extension, so blob.png and blob.gif never sit side by side.
-    stems = {str(Path(e["file"]).with_suffix("")) for e in emojis.values() if e.get("file")}
+    stems = {str(Path(e["file"]).with_suffix("")) for e in items.values() if e.get("file")}
     stems |= {str(p.relative_to(out).with_suffix("")) for p in (out / "all").glob("*/*")}
-    missing = [(eid, e) for eid, e in emojis.items() if not (e.get("file") and (out / e["file"]).exists())]
-    for eid, e in missing:
+    missing = [(id, e) for id, e in items.items() if not (e.get("file") and (out / e["file"]).exists())]
+    for id, e in missing:
         if not e.get("file"):
-            stem = f"all/{servers[e['server']]['folder']}/{e['name']}"
-            stem = f"{stem}-{eid}" if stem in stems else stem
+            stem = f"all/{servers[e['server']]['folder']}/{safe_name(e['name']) or id}"
+            stem = f"{stem}-{id}" if stem in stems else stem
             stems.add(stem)
-            e["file"] = stem + (".gif" if e["animated"] else ".png")
+            e["file"] = stem + kind.ext(e)
 
-    def fetch(item):
-        eid, e = item
+    def fetch(missing_item):
+        id, e = missing_item
         try:
-            res = client.get(f"https://cdn.discordapp.com/emojis/{eid}{Path(e['file']).suffix}")
+            res = client.get(kind.url(id, Path(e["file"]).suffix))
             res.raise_for_status()
         except httpx.HTTPError as err:
-            return eid, str(err).splitlines()[0]
+            return id, str(err).splitlines()[0]
         path = out / e["file"]
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(path, "xb") as f:  # x: never overwrite
                 f.write(res.content)
         except FileExistsError:
-            return eid, f"{path} appeared while downloading; left as it is"
-        return eid, None
+            return id, f"{path} appeared while downloading; left as it is"
+        return id, None
 
     with ThreadPoolExecutor(8) as pool:
         results = list(pool.map(fetch, missing))
-    failed = [(eid, err) for eid, err in results if err]
-    for eid, _ in failed:
-        del emojis[eid]["file"]
+    failed = [(id, err) for id, err in results if err]
+    for id, _ in failed:
+        del items[id]["file"]
     out.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=1, ensure_ascii=False) + "\n")
 
-    have = {eid: e for eid, e in emojis.items() if e.get("file")}
+    have = {id: e for id, e in items.items() if e.get("file")}
     gone = [e for e in have.values() if not e["accessible"]]
     mine = [e for e in have.values() if e.get("uploader_id") == seen["me"]]
     rebuild_view(out, "gone", gone)
     rebuild_view(out, "mine", mine)
 
-    print(f"{sum(e['accessible'] for e in emojis.values())} emoji in {len(seen['servers'])} servers, "
+    print(f"{sum(e['accessible'] for e in items.values())} {kind.key} in {len(seen['servers'])} servers, "
           f"{len(missing) - len(failed)} downloaded, {len(failed)} failed; "
           f"{len(have)} in {out / 'all'}, {len(gone)} of them gone, {len(mine)} yours")
-    for eid, err in failed:
-        print(f"fail {emojis[eid]['name']} ({eid})\n     {err}", file=sys.stderr)
+    for id, err in failed:
+        print(f"fail {items[id]['name']} ({id})\n     {err}", file=sys.stderr)
 
 
 def rebuild_view(out: Path, view: str, entries: list[dict]) -> None:
@@ -262,8 +325,8 @@ def slug(link: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", last)[:60].strip("-")
 
 
-def folder_name(server: str) -> str:
-    return re.sub(r"[^\w.]+", "-", server)[:60].strip("-.")
+def safe_name(name: str) -> str:
+    return re.sub(r"[^\w.]+", "-", name)[:60].strip("-.")
 
 
 def glob_escape(s: str) -> str:
