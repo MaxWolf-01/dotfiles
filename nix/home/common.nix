@@ -250,6 +250,9 @@
         { on = [ "F" "v" ]; run = extFilter videoExt; desc = "Filter video"; }
         { on = [ "F" "a" ]; run = extFilter audioExt; desc = "Filter audio"; }
         { on = [ "F" "m" ]; run = extFilter "${imageExt}|${videoExt}|${audioExt}"; desc = "Filter all media"; }
+        # An empty fd search lists every file below the cwd as one directory; the filters above narrow it.
+        # Files only, so symlinks and directories stay out; fd skips hidden and gitignored files.
+        { on = [ "F" "f" ]; run = ''search_do --via=fd --args="--type file"''; desc = "Flat view of every file below"; }
       ];
     };
     settings = {
