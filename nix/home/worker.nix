@@ -1,4 +1,4 @@
-# Home Manager for a dispatch worker user on pc. nix/nixos/pc/agent-user.nix
+# Home Manager for a dispatch worker user on pc. nix/nixos/agent-user.nix
 # creates the users; this is a function of what differs between them: the
 # user's name, the identity its commits carry, and the HOST.md record it
 # publishes. It does not import common.nix, which is max's environment (his git
@@ -49,7 +49,7 @@ in
 
   # This user's own rootless daemon. Set per user rather than through
   # `virtualisation.docker.rootless.setSocketVariable`, which would export it
-  # for max too; see nix/nixos/pc/agent-user.nix.
+  # for max too; see nix/nixos/agent-user.nix.
   home.sessionVariables.DOCKER_HOST =
     "unix:///run/user/${toString osConfig.users.users.${name}.uid}/docker.sock";
 
@@ -58,7 +58,7 @@ in
   programs.zsh.enable = true;
 
   # Every process an ssh command starts inherits it; why 500 is beside the
-  # memory ceiling in nix/nixos/pc/agent-user.nix.
+  # memory ceiling in nix/nixos/agent-user.nix.
   programs.zsh.envExtra = ''
     if (( $(</proc/self/oom_score_adj) < 500 )); then echo 500 >/proc/self/oom_score_adj; fi
   '';
