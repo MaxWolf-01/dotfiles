@@ -14,10 +14,10 @@ let
   ]);
 
   # uv runs lifelog for the collectors' last runs jarvis-sync ships; jq because
-  # bin/run-log builds its line with it; curl and sops for the cc-quota report it
-  # ships, sops through with-secrets.
+  # bin/run-log builds its line with it; curl, sops and gnugrep for the cc-quota
+  # report it ships, the last two through with-secrets.
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh uv jq curl sops
+    bash coreutils rsync openssh uv jq curl sops gnugrep
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
