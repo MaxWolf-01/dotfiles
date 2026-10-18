@@ -44,7 +44,8 @@
   systemd.slices.system.sliceConfig.MemoryMin = "32M";
 
   # The recorder prunes files older than 14 days when it starts, and as a
-  # system service it starts about once per boot; tmpfiles' daily clean keeps the same bound by
-  # modification time, so reading an old file does not keep it.
+  # system service it starts about once per boot; tmpfiles' daily clean keeps
+  # the same bound by modification time, so reading an old file does not
+  # keep it.
   systemd.tmpfiles.rules = [ "e /var/lib/host-recorder - - - m:14d" ];
 }
