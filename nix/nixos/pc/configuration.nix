@@ -16,7 +16,7 @@
       ];
     })
     ./host-unlock.nix
-    ./host-recorder.nix
+    ../host-recorder.nix
     ./hardware-alerts.nix
     ../journald.nix
   ];
