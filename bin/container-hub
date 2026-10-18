@@ -30,16 +30,16 @@ reduced), red while it is blocked in its terminal, and while it is idle, a fille
 sand one where it waits on a run and does not need you, and a hollow one otherwise. A session whose turn ended with a
 command left running in the background is idle, waiting on it. So is one whose turn ended with an agent it started in
 the background still at work, which the registry marks busy as it does a turn under way; the session's transcript
-tells the two apart. A command that ends on its own (a wait on a worker, a test suite) is a run. One that runs until
-stopped is a watcher; the hub knows it by `--watch` in its command (`diffview --watch`). Only a run fills the dot. The
-session page shows each run at the top of its turns, with its description, age and command, and the watchers in one
-line after them. The hub reads them from the session's transcript: each `Bash` call made with `run_in_background` that
-no task notification has named since, while the registry says a shell runs. An idle session needs you when its session
-page has a question no later turn answered or superseded, or a turn record written since you last visited its unit; a
-session idle on a worker or a run, whose turns since were chat turns, does not. Under its title is its status line:
-the headline of its newest turn, a turn record's heading or the first line of a chat turn. Both are read from the
-session's page directory by the newest mx plugin's own reader; with no plugin installed, every idle session's dot is
-hollow and none has a status line.
+tells the two apart. A command that ends on its own (a wait on a worker, a test suite) is a run, and so is an agent. A
+command that runs until stopped is a watcher; the hub knows it by `--watch` in its command (`diffview --watch`). Only
+a run fills the dot. The session page shows each run at the top of its turns, with its description, age and command,
+and the watchers in one line after them. The hub reads them from the session's transcript: each `Bash` call made with
+`run_in_background`, and each agent launched in the background, that no task notification has named since, while the
+registry says one runs. An idle session needs you when its session page has a question no later turn answered or
+superseded, or a turn record written since you last visited its unit; a session idle on a worker or a run, whose turns
+since were chat turns, does not. Under its title is its status line: the headline of its newest turn, a turn record's
+heading or the first line of a chat turn. Both are read from the session's page directory by the newest mx plugin's
+own reader; with no plugin installed, every idle session's dot is hollow and none has a status line.
 
 The rail's search box (ctrl+alt+f) finds a unit, ended ones included, as fzf finds a line of its title, short id and
 session id, a prefix of either id first, and enter goes to the one picked.
@@ -587,11 +587,12 @@ def claude_title(session: str, memo: dict) -> str | None:
 
 USER_LINE = re.compile(rb'^\{.*"type":"user".*$', re.MULTILINE)
 LAUNCH_LINE = re.compile(rb'^\{.*"run_in_background":\s*true.*$', re.MULTILINE)
+AGENT_LINE = re.compile(rb'^\{.*"(?:status":"async_launched|resumedAgentId)".*$', re.MULTILINE)
 NOTIFIED_LINE = re.compile(rb'^\{.*<tool-use-id>.*$', re.MULTILINE)
-NOTIFIED = re.compile(r"<task-notification>.*?<tool-use-id>(\S+?)</tool-use-id>", re.S)
+NOTIFIED = re.compile(r"<(?:tool-use|task)-id>(\S+?)</(?:tool-use|task)-id>")
 TURN_START = re.compile(rb'^\{"type":"api-request",', re.MULTILINE)
 TURN_END_LINE = re.compile(rb'^\{.*"subtype":"turn_duration".*$', re.MULTILINE)
-NOTHING_READ: dict = {"custom": None, "ai": None, "prompted": None, "background": {}, "ended": None}
+NOTHING_READ: dict = {"custom": None, "ai": None, "prompted": None, "background": {}, "agents": {}, "ended": None}
 
 
 def transcript_read(session: str, memo: dict) -> dict:
@@ -628,17 +629,21 @@ def transcript_read(session: str, memo: dict) -> dict:
         # a tool's result is most of a transcript's user lines, and the largest: never parsed
         prompts = [at for m in USER_LINE.finditer(whole) if b'"toolUseResult"' not in m[0] and (at := prompted_at(m[0]))]
         found["prompted"] = max([found["prompted"] or 0, *prompts]) or None
-        found["background"] = still_running(whole, found["background"])
+        found["background"], found["agents"] = still_running(whole, found["background"], found["agents"])
         found["ended"] = turn_marks(whole, found["ended"])
         transcripts_read[path] = (st.st_size, st.st_mtime, read + len(whole), found)
     return found
 
 
-def still_running(whole: bytes, before: dict[str, dict]) -> dict[str, dict]:
-    """The commands a session left running in the background and no task notification has said the end of yet, by
-    the id of the tool call that started each: {"what" (the description the agent gave it), "command", "at"}. Claude
-    Code notifies the session of each one's end, naming that call; a call's id appears in a later line only there."""
-    running = dict(before)
+def still_running(whole: bytes, before: dict[str, dict], agents: dict[str, str]) -> tuple[dict[str, dict], dict[str, str]]:
+    """The commands and agents a session left running in the background and no task notification has said the end of
+    yet, a command by the id of the tool call that started it, an agent by its own: {"what" (the description the
+    agent gave it), "command" (`agent` for an agent), "at"}; and every agent the session launched, its description by
+    its id. An agent runs in the background where its call's result says it was launched so (`async_launched`), and
+    again from a SendMessage whose result says it resumed it (`resumedAgentId`). Claude Code notifies the session of
+    each one's end, naming the call that launched it and an agent's id; either appears in a later line only there."""
+    running, agents = dict(before), dict(agents)
+    events: list[tuple[int, str, dict | None]] = []  # (where in the lines, the id, what started there or None for an end)
     for m in LAUNCH_LINE.finditer(whole):
         try:
             line = json.loads(m[0])
@@ -652,8 +657,24 @@ def still_running(whole: bytes, before: dict[str, dict]) -> dict[str, dict]:
             given = call.get("input") or {}
             if call.get("type") == "tool_use" and call.get("name") == "Bash" and given.get("run_in_background") is True:
                 command = str(given.get("command") or "")
-                running[str(call.get("id"))] = {"what": str(given.get("description") or command.split("\n")[0]),
-                                                "command": command, "at": epoch_of(line.get("timestamp"))}
+                events.append((m.start(), str(call.get("id")), {"what": str(given.get("description") or command.split("\n")[0]),
+                                                               "command": command, "at": epoch_of(line.get("timestamp"))}))
+    for m in AGENT_LINE.finditer(whole):
+        try:
+            line = json.loads(m[0])
+        except ValueError:
+            continue
+        result = line.get("toolUseResult")
+        if line.get("type") != "user" or not isinstance(result, dict):
+            continue
+        if result.get("status") == "async_launched" and result.get("agentId"):
+            agent = str(result["agentId"])
+            agents[agent] = str(result.get("description") or "an agent")
+        elif result.get("resumedAgentId"):
+            agent = str(result["resumedAgentId"])
+        else:  # a command's output can quote either
+            continue
+        events.append((m.start(), agent, {"what": agents.get(agent, "an agent"), "command": "agent", "at": epoch_of(line.get("timestamp"))}))
     for m in NOTIFIED_LINE.finditer(whole):
         if b'"toolUseResult"' in m[0]:  # a command's own output can quote a notification
             continue
@@ -663,9 +684,14 @@ def still_running(whole: bytes, before: dict[str, dict]) -> dict[str, dict]:
             continue
         said = (line.get("attachment") or {}).get("prompt") if line.get("type") == "attachment" else (line.get("message") or {}).get("content")
         if line.get("type") in ("user", "attachment") and isinstance(said, str):
-            for ended in NOTIFIED.findall(said):
-                running.pop(ended, None)
-    return running
+            for notice in said.split("<task-notification>")[1:]:
+                events += [(m.start(), ended, None) for ended in NOTIFIED.findall(notice.split("</task-notification>")[0])]
+    for _, key, started in sorted(events, key=lambda e: e[0]):  # an agent resumed after its end runs again
+        if started:
+            running[key] = started
+        else:
+            running.pop(key, None)
+    return running, agents
 
 
 def turn_marks(whole: bytes, before: float | None) -> float | None:
@@ -698,11 +724,11 @@ def epoch_of(iso: object) -> float | None:
 
 
 def background(session: str, entry: dict | None, memo: dict) -> list[dict]:
-    """The commands an idle session left running in the background, oldest first, each marked a `watcher` as the
-    module's docstring defines one, where the registry says a shell runs (`shell`). Only those its running processes
-    started: a resumed session's transcript also holds the launches of a process that has exited, whose shells ended
-    with it and were never notified of."""
-    if not entry or entry.get("status") != "shell":
+    """The commands and agents an idle session left running in the background, oldest first, each marked a `watcher`
+    as the module's docstring defines one, where the registry says one runs (`shell`, or `busy` with its turn over).
+    Only those its running processes started: a resumed session's transcript also holds the launches of a process
+    that has exited, whose shells and agents ended with it and were never notified of."""
+    if not entry or entry.get("status") not in RUNNING or shown_state(entry, memo) != "idle":
         return []
     since = min((p["startedAt"] / 1000 for p in entry["processes"] if isinstance(p.get("startedAt"), (int, float))), default=0)
     commands = sorted((c for c in transcript_read(session, memo)["background"].values() if (c["at"] or 0) >= since),
