@@ -127,6 +127,13 @@ Custom systemd services need explicit `path` for any package whose binaries the 
 
 See `docs/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).
 
+## Unlocking a host after a reboot
+
+`host-unlock <host>`, run on zephylux, sends a rebooted host what it keeps
+locked: xmg19's `/home`, and pc's age key, SSH key and encrypted ZFS datasets.
+Run it whenever xmg19 or pc was rebooted; `host-unlock --help` says what each
+gets.
+
 ## SFTPGo File Drop
 
 The only service on pc with a public (non-tailnet) surface. Manage accounts with
