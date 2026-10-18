@@ -66,8 +66,11 @@
             format = "ext4";
             mountpoint = "/home";
             # Mounted by host-unlock-receive once the volume is open; a boot
-            # without it is a normal boot with /home empty.
-            mountOptions = [ "noauto" "nofail" ];
+            # without it is a normal boot with /home empty. logind makes every
+            # login session require the user's home, so while the volume is
+            # closed a login waits out this timeout for a device that is not
+            # coming: one second, where systemd's default is ninety.
+            mountOptions = [ "noauto" "nofail" "x-systemd.device-timeout=1s" ];
           };
         };
       };
