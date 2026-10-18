@@ -115,7 +115,15 @@
   services.upower.enable = true;
   services.udisks2.enable = true;
 
-  # Lid/idle: hypridle controls screen/lock/suspend, not logind
+  # A worker host never sleeps: the lid, logind's idle action and hypridle's
+  # suspend all leave it running, since systemd refuses every sleep state.
+  # sleepfor's `rtcwake -m off` is a poweroff, not a sleep, and still works.
+  systemd.sleep.settings.Sleep = {
+    AllowSuspend = false;
+    AllowHibernation = false;
+    AllowHybridSleep = false;
+    AllowSuspendThenHibernate = false;
+  };
   services.logind.settings.Login = {
     HandleLidSwitch = "ignore";
     HandleLidSwitchExternalPower = "ignore";
