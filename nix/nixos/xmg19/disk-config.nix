@@ -1,5 +1,5 @@
 # disko config for xmg19 (Tongfang/XMG, 931GB NVMe)
-# LUKS + LVM: EFI (1G) + boot (2G) + encrypted root (200G) + encrypted home (rest)
+# LUKS + LVM: EFI (1G) + boot (2G) + encrypted root (200G) + swap (32G) + encrypted home (rest)
 {
   disko.devices.disk.main = {
     device = "/dev/disk/by-id/nvme-Samsung_SSD_970_EVO_Plus_1TB_S4W6NF0M500455Y";
@@ -31,6 +31,10 @@
             type = "luks";
             name = "cryptroot";
             settings.allowDiscards = true;
+            # Unlocks from the TPM, with the passphrase as the fallback slot. The
+            # TPM key is enrolled once by hand (docs/nixos-new-machine.md). With
+            # Secure Boot off this protects only a drive pulled out of the laptop.
+            settings.crypttabExtraOpts = [ "tpm2-device=auto" ];
             content = {
               type = "lvm_pv";
               vg = "vg-xmg19";

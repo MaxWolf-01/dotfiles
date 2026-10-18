@@ -1,6 +1,6 @@
 # NixOS on a New Machine
 
-Last updated 2026-03-16 after xmg19 install. Re-verify before acting — tools evolve fast.
+Last updated 2026-10-18 after xmg19's reinstall. Re-verify before acting — tools evolve fast.
 
 ## Quick Reference
 
@@ -24,6 +24,30 @@ Last updated 2026-03-16 after xmg19 install. Re-verify before acting — tools e
 ### Without custom ISO (from existing Linux)
 
 Same as above, but step 1-2 replaced with: boot any Linux, set up root SSH manually, install `cpio` if needed. nixos-anywhere will kexec into a NixOS installer — **IP changes after kexec**. Re-run with `--phases disko,install` at the new IP.
+
+### Disk unlocked by the TPM
+
+A host whose crypttab entry carries `tpm2-device=auto` (xmg19's
+`disk-config.nix`) needs `boot.initrd.systemd.enable` and one enrolment after
+its first `nswitch`, which asks for the passphrase:
+
+```bash
+sudo systemd-cryptenroll --tpm2-device=auto /dev/disk/by-partlabel/disk-main-luks
+```
+
+The key is bound to PCR 7, the Secure Boot state. A firmware update or a
+changed Secure Boot setting falls back to the passphrase prompt; enrol again
+after it. The passphrase stays as the other slot.
+
+### A low-trust host (no SSH key, no secrets)
+
+xmg19 holds no key for GitHub, so everything it clones comes over HTTPS. Clone
+the agents repo before `./setup get_claude`, which would clone it over SSH:
+
+```bash
+git clone https://github.com/MaxWolf-01/agents.git ~/repos/github/MaxWolf-01/agents
+cd ~/.dotfiles && ./setup get_claude
+```
 
 ### SSH host key cleanup
 
@@ -73,6 +97,18 @@ nixos-anywhere kexecs the target into a NixOS installer. DHCP assigns a new IP. 
 
 nixos-anywhere's `--phases disko,install` needs `nixos-install` on the target. Ubuntu doesn't have it. Either: let nixos-anywhere do the full kexec flow (no `--phases`), or boot a NixOS live USB.
 
+### Firmware reorders the boot entries
+
+xmg19's AMI firmware moved the USB stick to the front of BootOrder after dead
+entries were deleted with `efibootmgr`. Check `efibootmgr` after the install and
+put the new system first (`efibootmgr -o <its number>,...`).
+
+### Prompts the install asks
+
+disko asks for the LUKS passphrase on the terminal. Run nixos-anywhere in a
+plain tmux pane: `job` sends output to its log, so the prompt never shows, and
+an empty passphrase fails `luksFormat`.
+
 ### HM common.nix import
 
 `mkHome` (standalone HM) auto-includes `common.nix`. NixOS HM module path does NOT. The host nix file must explicitly `import ../common.nix` and set `targets.genericLinux.enable = false`.
@@ -86,5 +122,5 @@ nixos-anywhere's `--phases disko,install` needs `nixos-install` on the target. U
 ## Current Setup
 
 - **pc**: NixOS, manual hardware-configuration.nix, ext4, no disko/facter
-- **xmg19**: NixOS via nixos-anywhere, disko (LUKS+LVM, Samsung 1TB by stable ID, VG `vg-xmg19`), facter, Hyprland
+- **xmg19**: NixOS via nixos-anywhere, disko (LUKS+LVM unlocked by the TPM, Samsung 1TB by stable ID, VG `vg-xmg19`), facter, Hyprland
 - **zephyrus**: Ubuntu 26.04 with standalone HM (NixOS planned)

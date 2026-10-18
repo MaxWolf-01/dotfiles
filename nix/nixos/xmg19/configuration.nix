@@ -42,6 +42,9 @@
   hardware.tuxedo-drivers.enable = true;
 
   boot = {
+    # systemd in stage 1 is what reads the TPM: cryptroot unlocks unattended
+    # (disk-config.nix), so a reboot or an rtcwake wake-up comes all the way up.
+    initrd.systemd.enable = true;
     initrd.kernelModules = [ "nvidia" "nvidia_modeset" "nvidia_uvm" "nvidia_drm" ];
     kernelParams = [
       "nvidia_drm.fbdev=1"
@@ -112,7 +115,15 @@
   services.upower.enable = true;
   services.udisks2.enable = true;
 
-  # Lid/idle: hypridle controls screen/lock/suspend, not logind
+  # A worker host never sleeps: the lid, logind's idle action and hypridle's
+  # suspend all leave it running, since systemd refuses every sleep state.
+  # sleepfor's `rtcwake -m off` is a poweroff, not a sleep, and still works.
+  systemd.sleep.settings.Sleep = {
+    AllowSuspend = false;
+    AllowHibernation = false;
+    AllowHybridSleep = false;
+    AllowSuspendThenHibernate = false;
+  };
   services.logind.settings.Login = {
     HandleLidSwitch = "ignore";
     HandleLidSwitchExternalPower = "ignore";
@@ -127,12 +138,14 @@
   networking.networkmanager.wifi.macAddress = "stable";
 
   # Encrypted DNS to Quad9 (mirrors `setup net_harden` on non-NixOS hosts);
-  # opportunistic so captive portals still work pre-auth. No domains = [ "~." ]
-  # — it would tie with tailscaled's ~. and let Quad9 answer blocked domains
+  # opportunistic so captive portals still work pre-auth. tailscaled stays out
+  # of DNS here (--accept-dns=false below), so this and the LAN router answer
+  # everything. Should tailscaled ever own DNS again, no domains = [ "~." ]: it
+  # would tie with tailscaled's ~. and let Quad9 answer blocked domains
   # (docs/dns.md).
   services.resolved = {
     enable = true;
-    dnsovertls = "opportunistic";
+    settings.Resolve.DNSOverTLS = "opportunistic";
   };
   networking.nameservers = [ "9.9.9.9#dns.quad9.net" "149.112.112.112#dns.quad9.net" ];
 
@@ -144,8 +157,12 @@
   };
   hardware.nvidia-container-toolkit.enable = true;
 
-  # Tailscale
+  # Tailscale. --accept-dns=false keeps xmg19 off the tailnet's ad-blocking
+  # resolver, as pc: a blocked domain is a silent NXDOMAIN to a worker or a job
+  # (docs/dns.md). Tagged tag:server in secrets/tailscale/policy.hujson, so it
+  # opens no connection into the tailnet.
   services.tailscale.enable = true;
+  services.tailscale.extraSetFlags = [ "--accept-dns=false" ];
 
   # SSH
   services.openssh = {
