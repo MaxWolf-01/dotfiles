@@ -37,8 +37,9 @@ let
       for user in "''${hm_users[@]}"; do
         systemctl restart "home-manager-$user.service"
       done
+      # A lingering user's manager started at boot without the units in its home.
       for user in "''${linger_users[@]}"; do
-        systemctl start "user@$(id -u "$user").service"
+        systemctl restart "user@$(id -u "$user").service"
       done
       echo "xmg19: /home unlocked"
     '';
@@ -57,13 +58,13 @@ in
     }];
   }];
 
-  # Without the condition these run at boot against the empty mountpoint and
-  # write a user's files onto the system disk, under where /home mounts later.
-  # Home Manager's own RequiresMountsFor would instead start home.mount at boot,
+  # Without the condition Home Manager runs at boot against the empty mountpoint
+  # and writes a user's files onto the system disk, under where /home mounts
+  # later. Its own RequiresMountsFor would instead start home.mount at boot,
   # which waits 90 s for a device that is not there while logins wait on it.
-  systemd.services = {
-    "user@".unitConfig.ConditionPathIsMountPoint = "/home";
-  } // lib.genAttrs (map (u: "home-manager-${u}") hmUsers) (_: {
+  # The user managers are left to start: logins wait on them, and one that
+  # skips itself costs every login a 25 s timeout.
+  systemd.services = lib.genAttrs (map (u: "home-manager-${u}") hmUsers) (_: {
     unitConfig.ConditionPathIsMountPoint = "/home";
     unitConfig.RequiresMountsFor = lib.mkForce [ ];
   });
