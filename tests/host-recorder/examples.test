@@ -11,7 +11,10 @@
 # argument says is not there. The run lasts three rankings or more, which is
 # where the heavier reads are (every cgroup, a pane's largest process and its
 # cwd), and a helper changes the machine under it after the first: a driver
-# loads, and a service starts burning CPU.
+# loads, and a service starts burning CPU. On xmg19 the GPU wakes up idle
+# after the first ranking and gets busy after the second, so the loop starts
+# processes there: an nvidia-smi query each (a stand-in, which answers from the
+# fixture), at the cadence the recorder's header gives.
 
 set -uo pipefail
 
@@ -20,6 +23,7 @@ work=$(mktemp -d)
 feeder=
 trap '[ -z "$feeder" ] || kill "$feeder" 2>/dev/null; rm -rf "$work"' EXIT
 root=$work/root
+stub="$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures/host-recorder/bin" && pwd)"
 
 # Resolved before the timed run, so fetching it does not eat the recorder's time.
 strace=$(command -v strace || echo "$(nix build --no-link --print-out-paths nixpkgs#strace^out)/bin/strace")
@@ -71,6 +75,7 @@ put sys/class/power_supply/BAT0/capacity 80
 put sys/class/power_supply/BAT0/power_now 12345678
 put sys/bus/pci/devices/0000:00:01.0/power_state D0
 mkdir -p "$root/sys/bus/pci/devices/0000:01:00.0" "$root/sys/bus/pci/drivers/nvidia"
+put sys/bus/pci/devices/0000:01:00.0/power/runtime_status suspended
 ln -s "$root/sys/bus/pci/drivers/nvidia" "$root/sys/bus/pci/devices/0000:01:00.0/driver"
 put sys/class/hwmon/hwmon1/name k10temp
 put sys/class/hwmon/hwmon1/temp1_input 54875
@@ -120,13 +125,39 @@ put proc/1500/statm "460800 700000 57600 100 0 230400 0"
 put proc/1500/comm postgres
 mkdir -p "$root/proc/1500/cwd"
 
-# feed <state dir>: once the first ranking is written, the NVMe driver loads
-# and build.service burns a core's worth of CPU and more.
+# xmg19's devices, put in place for its run alone: pc's set takes the first
+# hwmon named nvme, and the one it expects appears only once its run is going.
+xmg19_devices() {
+    put sys/class/hwmon/hwmon4/name coretemp
+    put sys/class/hwmon/hwmon4/temp1_input 49000
+    put sys/class/hwmon/hwmon5/name pch_cannonlake
+    put sys/class/hwmon/hwmon5/temp1_input 52000
+    # The model as the kernel gives it, padded with spaces.
+    put sys/class/hwmon/hwmon6/name nvme
+    put sys/class/hwmon/hwmon6/temp1_input 36850
+    put sys/class/nvme/nvme0/model "Patriot M.2 P300 256GB                  "
+    ln -s "$root/sys/class/nvme/nvme0" "$root/sys/class/hwmon/hwmon6/device"
+    put sys/class/hwmon/hwmon7/name nvme
+    put sys/class/hwmon/hwmon7/temp1_input 40850
+    put sys/class/nvme/nvme1/model "Samsung SSD 970 EVO Plus 1TB            "
+    ln -s "$root/sys/class/nvme/nvme1" "$root/sys/class/hwmon/hwmon7/device"
+}
+# nvidia-smi's answers, and the fields each makes: a reading it cannot give is
+# [N/A], as the power draw of pc's GPU is.
+GPU_IDLE="52, [N/A], 0" IDLE_FIELDS=active,52,,0
+GPU_BUSY="71, 62.35, 97" BUSY_FIELDS=active,71,62.35,97
+
+# feed <state dir>: once the first ranking is written, the NVMe driver loads,
+# the GPU wakes up idle, and build.service burns a core's worth of CPU and
+# more; once the second is, the GPU gets busy.
 feed() {
     local use=0
     until grep -qs ',(rest),' "$1"/*.top.csv; do sleep 0.02; done
     put sys/class/hwmon/hwmon2/name nvme
     put sys/class/hwmon/hwmon2/temp1_input 38850
+    put sys/bus/pci/devices/0000:01:00.0/power/runtime_status active
+    until [ "$(cat "$1"/*.top.csv | grep -c ',(rest),')" -ge 2 ]; do sleep 0.02; done
+    put nvidia-smi "$GPU_BUSY"
     while :; do
         use=$((use + 1000000000))
         put sys/fs/cgroup/system.slice/build.service/cpu.stat "usage_usec $use"
@@ -140,14 +171,17 @@ core=4800,1.37,20480,1024,1.52,0.94
 declare -A SAMPLE=(
     [zephylux]=$core,67,61,16,3100,2900,balanced,45,65,1,80,12.3,0,D0,1
     [pc]=$core,54,49,38,16,36,42,30,33,51,28
+    [xmg19]=$core,49,52,16,40,36,active,71,62.35,97
 )
 declare -A FIRST_SAMPLE=(
     [zephylux]=${SAMPLE[zephylux]}
     [pc]=$core,54,49,,16,36,42,30,33,51,28
+    [xmg19]=$core,49,52,16,40,36,suspended,,,
 )
 declare -A HEADER=(
     [zephylux]=time,mhz_max,load1,mem_avail_mb,swap_used_mb,mem_some_avg10,mem_full_avg10,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv
     [pc]=time,mhz_max,load1,mem_avail_mb,swap_used_mb,mem_some_avg10,mem_full_avg10,cpu_c,ccd1_c,nvme_c,board_c,wmi1_c,wmi2_c,wmi3_c,wmi4_c,wmi5_c,wmi6_c
+    [xmg19]=time,mhz_max,load1,mem_avail_mb,swap_used_mb,mem_some_avg10,mem_full_avg10,pkg_c,pch_c,board_c,samsung_c,patriot_c,gpu_pm,gpu_c,gpu_w,gpu_util
 )
 # The first hourly dump: every cgroup's counter as it stood then.
 counters=$(printf '%s\n' "system,(root),5000000" "system,sshd.service,300000" "system,build.service,0" \
@@ -161,13 +195,16 @@ counters=$(printf '%s\n' "system,(root),5000000" "system,sshd.service,300000" "s
 old_header=time,pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,mhz_max,load1,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv,mem_avail_mb,swap_used_mb
 torn="$(date +%F) 00:00:01,67,6"
 
-# run <host> <how>: zephylux or pc as a user service, or pc as its system
-# service, which has no HOME and a STATE_DIRECTORY.
-for run in "zephylux user" "pc user" "pc system"; do
+# run <host> <how>: zephylux or pc as a user service, or pc or xmg19 as its
+# system service, which has no HOME and a STATE_DIRECTORY.
+for run in "zephylux user" "pc user" "pc system" "xmg19 system"; do
     read -r host how <<<"$run"
     name="$host as a $how service"
     put proc/sys/kernel/hostname "$host"
-    rm -rf "$work/state" "$root/sys/class/hwmon/hwmon2"
+    rm -rf "$work/state" "$root"/sys/class/hwmon/hwmon[2467] "$root"/sys/class/nvme
+    [ "$host" != xmg19 ] || xmg19_devices
+    put sys/bus/pci/devices/0000:01:00.0/power/runtime_status suspended
+    put nvidia-smi "$GPU_IDLE"
     put sys/fs/cgroup/system.slice/build.service/cpu.stat "usage_usec 0"
     if [ "$how" = user ]; then
         dir=$work/state/host-recorder env=(-u STATE_DIRECTORY HOME=$root/home/agent XDG_STATE_HOME=$work/state)
@@ -180,7 +217,7 @@ for run in "zephylux user" "pc user" "pc system"; do
     printf '%s\n%s' "$old_header" "$torn" > "$dir/$(date +%F).csv"
 
     feed "$dir" & feeder=$!
-    env "${env[@]}" HOST_RECORDER_ROOT="$root" \
+    env "${env[@]}" HOST_RECORDER_ROOT="$root" PATH="$stub:$PATH" \
         timeout -s INT 5 "$strace" -f -qq -o "$work/trace" \
         -e trace=clone,clone3,fork,vfork,execve,execveat,openat -e signal=none \
         "$recorder" 0.05 > /dev/null 2> "$work/stderr"
@@ -193,6 +230,12 @@ for run in "zephylux user" "pc user" "pc system"; do
         continue
     fi
     started=$(awk '/openat\(.*\.csv"/ { loop = 1 } loop && /(clone|clone3|fork|vfork|execve|execveat)\(/' "$work/trace")
+    if [ "$host" = xmg19 ]; then
+        queries=$(grep -c 'execve(".*/nvidia-smi"' <<<"$started")
+        check "$name: the sampling loop starts no process but nvidia-smi, one per query" "$queries" \
+            "$(grep -vc 'execve(".*/nvidia-smi"' <<<"$started")"
+        started=$(grep -v -e 'execve(".*/nvidia-smi"' -e 'clone\|fork' <<<"$started")
+    fi
     check "$name: the sampling loop starts no process, over $rankings rankings" "" "$started"
 
     # Below the thermal-log rows and the new header, the samples this run wrote.
@@ -201,6 +244,15 @@ for run in "zephylux user" "pc user" "pc system"; do
         "$old_header|$torn,torn|${HEADER[$host]}" "$(head -3 "$dir/$(date +%F).csv" | paste -sd'|')"
     check "$name: the first sample, before the NVMe driver loads" "${FIRST_SAMPLE[$host]}" "$(head -1 <<<"$samples")"
     check "$name: the last sample, every reading" "${SAMPLE[$host]}" "$(tail -1 <<<"$samples")"
+
+    if [ "$host" = xmg19 ]; then
+        gpu=$(tail -n +4 "$dir/$(date +%F).csv" | cut -d, -f13-)
+        asked=$(grep -cx "$IDLE_FIELDS" <<<"$gpu") skipped=$(grep -cx 'active,,,' <<<"$gpu")
+        check "$name: while the GPU idles, nvidia-smi is asked once in a ranking's twelve samples" \
+            "asked 1, skipped 11 or more" "asked $asked, skipped $( ((skipped >= 11)) && echo '11 or more' || echo "$skipped")"
+        check "$name: once it answers busy, it is asked every sample" "" \
+            "$(sed -n "/^$BUSY_FIELDS\$/,\$p" <<<"$gpu" | grep -vx "$BUSY_FIELDS")"
+    fi
 
     top=$(cat "$dir"/*.top.csv)
     check "$name: the pane's first row names its manager, memory, processes, largest process, cwd and pressure" \

@@ -4,6 +4,7 @@
   imports = [
     ./disk-config.nix
     ./home-unlock.nix
+    ../host-recorder.nix
     ../journald.nix
   ];
 
@@ -73,6 +74,9 @@
     powerManagement.enable = true;
     powerManagement.finegrained = true;
   };
+
+  # The recorder's xmg19 sensor set reads the dGPU through nvidia-smi.
+  systemd.services.host-recorder.path = [ config.hardware.nvidia.package.bin ];
 
   environment.systemPackages = with pkgs; [
     git firefox
