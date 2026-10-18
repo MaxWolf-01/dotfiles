@@ -3,6 +3,7 @@
 {
   imports = [
     ./disk-config.nix
+    ./home-unlock.nix
     ../journald.nix
   ];
 
@@ -57,7 +58,6 @@
       "memmap=16M$0x260800000"
     ];
     blacklistedKernelModules = [ "nouveau" ];
-    resumeDevice = "/dev/vg-xmg19/swap";
   };
 
   hardware.nvidia = {

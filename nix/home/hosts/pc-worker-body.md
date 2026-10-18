@@ -21,3 +21,10 @@ systemd unit or a script written for another host's PATH has to be given here.
   can reach one.
 - **Driving a real browser.** Headless renders work; a session you can click
   does not.
+
+## After a reboot
+
+pc comes back with max's age key, SSH key and encrypted datasets locked, and
+its backups skip until they are unlocked; work here runs regardless. When
+`worker-hosts` shows pc up for less than a day, the orchestrator runs
+`host-unlock pc` on zephylux once.
