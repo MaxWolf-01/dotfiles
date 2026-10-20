@@ -3,12 +3,15 @@
 -- (scripts/syntax-themes.py in the quartz repo): Flexoki 2.0's hues at half chroma, each held at
 -- 4.5:1 on the ground. A wash or mark is the token's translucent value laid over the ground, since
 -- a highlight group takes no alpha. `float` is ground-2 half way to the edge: a window without a
--- border needs that much to stand off the page. Follows 'background', which nvim reads from the
--- terminal.
+-- border needs that much to stand off the page. On it the hairline (`floatedge`) and the selected
+-- row (`sel`, the accent at 25%) step up to stay visible, and small text there is muted, since
+-- faint falls under 4.5:1. `search` is the accent at about 30%, apart from the selection's mark.
+-- Follows 'background', which nvim reads from the terminal.
 
 local palettes = {
   light = {
     ground = "#f4e4cd", ground2 = "#eddabe", float = "#decbb0", edge = "#cfbca3",
+    floatedge = "#b7a792", sel = "#b7b28d", search = "#b6b892",
     faint = "#675f59", muted = "#5e5650", body = "#37261d", strong = "#22140b",
     accent = "#426724", accent2 = "#674806", wash = "#d8d0b2", mark = "#d9c5a2",
     wash2 = "#dbc8a9", washred = "#e0cab6",
@@ -17,6 +20,7 @@ local palettes = {
   },
   dark = {
     ground = "#14110e", ground2 = "#1b1713", float = "#302a24", edge = "#463f37",
+    floatedge = "#5a534a", sel = "#414830", search = "#2f3a21",
     faint = "#888076", muted = "#b0a89e", body = "#ede3d2", strong = "#faf2dc",
     accent = "#75a252", accent2 = "#cdb78a", wash = "#29311d", mark = "#554b39",
     wash2 = "#352f24", washred = "#302420",
@@ -30,7 +34,7 @@ local function groups(c)
     -- editor
     Normal = { fg = c.body, bg = c.ground },
     NormalFloat = { fg = c.body, bg = c.float },
-    FloatBorder = { fg = c.edge, bg = c.float },
+    FloatBorder = { fg = c.floatedge, bg = c.float },
     FloatTitle = { fg = c.strong, bg = c.float, bold = true },
     Cursor = { fg = c.ground, bg = c.body },
     CursorLine = { bg = c.ground2 },
@@ -53,13 +57,13 @@ local function groups(c)
     WinBar = { fg = c.muted },
     WinBarNC = { fg = c.faint },
     Pmenu = { fg = c.body, bg = c.float },
-    PmenuSel = { fg = c.strong, bg = c.wash },
+    PmenuSel = { fg = c.strong, bg = c.sel },
     PmenuKind = { fg = c.muted, bg = c.float },
-    PmenuExtra = { fg = c.faint, bg = c.float },
+    PmenuExtra = { fg = c.muted, bg = c.float },
     PmenuSbar = { bg = c.float },
-    PmenuThumb = { bg = c.edge },
+    PmenuThumb = { bg = c.floatedge },
     Visual = { bg = c.mark },
-    Search = { bg = c.wash },
+    Search = { bg = c.search },
     CurSearch = { fg = c.ground, bg = c.accent },
     IncSearch = { fg = c.ground, bg = c.accent },
     Substitute = { fg = c.ground, bg = c.accent2 },
@@ -194,10 +198,11 @@ local function groups(c)
     TelescopeNormal = { link = "NormalFloat" },
     TelescopeBorder = { link = "FloatBorder" },
     TelescopeTitle = { link = "FloatTitle" },
-    TelescopePromptCounter = { fg = c.faint },
+    TelescopePromptCounter = { fg = c.muted },
     TelescopeSelection = { link = "PmenuSel" },
     TelescopeMatching = { fg = c.accent, bold = true },
     WhichKeyNormal = { link = "NormalFloat" },
+    WhichKeySeparator = { fg = c.muted },
     BlinkCmpKindFunction = { fg = c.orange },
     BlinkCmpKindMethod = { fg = c.orange },
     BlinkCmpKindConstructor = { fg = c.orange },
@@ -208,7 +213,7 @@ local function groups(c)
     BlinkCmpKindEnum = { fg = c.yellow },
     BlinkCmpKindConstant = { fg = c.yellow },
     BlinkCmpKindSnippet = { fg = c.magenta },
-    BlinkCmpKindText = { fg = c.faint },
+    BlinkCmpKindText = { fg = c.muted },
     DashboardHeader = { fg = c.accent },
     DashboardFooter = { fg = c.faint },
     DashboardDesc = { fg = c.body },
