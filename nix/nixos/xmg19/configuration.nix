@@ -61,9 +61,15 @@
     blacklistedKernelModules = [ "nouveau" ];
   };
 
+  # The dGPU powers itself off when idle (runtime D3, D3cold) and back on when
+  # a program opens it, CUDA included. On Turing only the proprietary module
+  # with GSP firmware off does that; the open one reports "Runtime D3 status:
+  # Not supported" (NVIDIA README, "Open Linux Kernel Modules", Known Issues).
   hardware.nvidia = {
     modesetting.enable = true;
-    open = true;
+    open = false;
+    gsp.enable = false;
+    moduleParams.nvidia.NVreg_EnableGpuFirmware = 0;
     nvidiaSettings = false;
     prime = {
       offload.enable = true;
@@ -74,6 +80,14 @@
     powerManagement.enable = true;
     powerManagement.finegrained = true;
   };
+
+  # finegrained hands the dGPU to runtime PM with a udev rule on the driver's
+  # bind, but the driver binds in the initrd, before that rule exists, and the
+  # coldplug that replays events afterwards sends add, not bind. Without this
+  # rule power/control stays "on" and the card never powers down.
+  services.udev.extraRules = ''
+    ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", TEST=="power/control", ATTR{power/control}="auto"
+  '';
 
   # The recorder's xmg19 sensor set reads the dGPU through nvidia-smi.
   systemd.services.host-recorder.path = [ config.hardware.nvidia.package.bin ];
