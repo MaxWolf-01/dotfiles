@@ -210,7 +210,7 @@ local function groups(c)
     BlinkCmpMenuBorder = { fg = c.floatedge, bg = c.ground },
     BlinkCmpDoc = { fg = c.body, bg = c.ground2 },
     BlinkCmpDocBorder = { fg = c.floatedge, bg = c.ground },
-    BlinkCmpDocSeparator = { fg = c.floatedge, bg = c.ground },
+    BlinkCmpDocSeparator = { fg = c.floatedge, bg = c.ground2 },
     BlinkCmpSignatureHelp = { fg = c.body, bg = c.ground2 },
     BlinkCmpSignatureHelpBorder = { fg = c.floatedge, bg = c.ground },
     BlinkCmpKindFunction = { fg = c.orange },
