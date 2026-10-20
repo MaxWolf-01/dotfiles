@@ -2,18 +2,16 @@
 -- day, a brown near-black by night, one moss accent. Code takes the same colours as mwolf.dev's
 -- (scripts/syntax-themes.py in the quartz repo): Flexoki 2.0's hues at half chroma, each held at
 -- 4.5:1 on the ground. A wash or mark is the token's translucent value laid over the ground, since
--- a highlight group takes no alpha. A float with a border (diagnostics, telescope) sits on ground-2,
--- close to the page so its text keeps its contrast. One without (completion, its docs, which-key)
--- sits on `float`, ground-2 half way to the edge, which it needs to stand off the page; on it the
--- selected row (`sel`, the accent at 25%) steps up, and small text is muted, since faint falls
--- under 4.5:1 there. `visual` is the mark's hue only as strong as code on it stays readable (every
+-- a highlight group takes no alpha. Every float sits on ground-2 inside a hairline (`floatedge`;
+-- options.lua gives each one a border), close to the page so its text keeps its contrast; a
+-- float's selected row (`sel`) is the accent at 25% over it. `visual` is the mark's hue only as strong as code on it stays readable (every
 -- ink at 3.8:1 or more), and `search` the accent at about 20%, apart from it by hue and as readable.
 -- Follows 'background', which nvim reads from the terminal.
 
 local palettes = {
   light = {
-    ground = "#f4e4cd", ground2 = "#eddabe", float = "#decbb0", edge = "#cfbca3",
-    floatedge = "#b7a792", sel = "#b7b28d", search = "#cdc9a8", visual = "#e5d2b4",
+    ground = "#f4e4cd", ground2 = "#eddabe", edge = "#cfbca3",
+    floatedge = "#b7a792", sel = "#c2bd98", search = "#cdc9a8", visual = "#e5d2b4",
     faint = "#675f59", muted = "#5e5650", body = "#37261d", strong = "#22140b",
     accent = "#426724", accent2 = "#674806", wash = "#d8d0b2", mark = "#d9c5a2",
     wash2 = "#dbc8a9", washred = "#e0cab6",
@@ -21,8 +19,8 @@ local palettes = {
     cyan = "#466662", blue = "#39506e", purple = "#4b4268", magenta = "#6f4258",
   },
   dark = {
-    ground = "#14110e", ground2 = "#1b1713", float = "#302a24", edge = "#463f37",
-    floatedge = "#5a534a", sel = "#414830", search = "#252b1a", visual = "#2a251d",
+    ground = "#14110e", ground2 = "#1b1713", edge = "#463f37",
+    floatedge = "#5a534a", sel = "#313a23", search = "#252b1a", visual = "#2a251d",
     faint = "#888076", muted = "#b0a89e", body = "#ede3d2", strong = "#faf2dc",
     accent = "#75a252", accent2 = "#cdb78a", wash = "#29311d", mark = "#554b39",
     wash2 = "#352f24", washred = "#302420",
@@ -36,7 +34,7 @@ local function groups(c)
     -- editor
     Normal = { fg = c.body, bg = c.ground },
     NormalFloat = { fg = c.body, bg = c.ground2 },
-    FloatBorder = { fg = c.floatedge, bg = c.ground2 },
+    FloatBorder = { fg = c.ground2edge, bg = c.ground2 },
     FloatTitle = { fg = c.strong, bg = c.ground2, bold = true },
     Cursor = { fg = c.ground, bg = c.body },
     CursorLine = { bg = c.ground2 },
@@ -58,12 +56,12 @@ local function groups(c)
     TabLineFill = { bg = c.ground2 },
     WinBar = { fg = c.muted },
     WinBarNC = { fg = c.faint },
-    Pmenu = { fg = c.body, bg = c.float },
+    Pmenu = { fg = c.body, bg = c.ground2 },
     PmenuSel = { fg = c.strong, bg = c.sel },
-    PmenuKind = { fg = c.muted, bg = c.float },
-    PmenuExtra = { fg = c.muted, bg = c.float },
-    PmenuSbar = { bg = c.float },
-    PmenuThumb = { bg = c.floatedge },
+    PmenuKind = { fg = c.muted, bg = c.ground2 },
+    PmenuExtra = { fg = c.muted, bg = c.ground2 },
+    PmenuSbar = { bg = c.ground2 },
+    PmenuThumb = { bg = c.ground2edge },
     Visual = { bg = c.visual },
     VisualNOS = { bg = c.visual },
     Search = { bg = c.search },
@@ -204,15 +202,15 @@ local function groups(c)
     TelescopePromptCounter = { fg = c.muted },
     TelescopeSelection = { link = "PmenuSel" },
     TelescopeMatching = { fg = c.accent, bold = true },
-    WhichKeyNormal = { link = "Pmenu" },
+    WhichKeyNormal = { link = "NormalFloat" },
     WhichKeySeparator = { fg = c.muted },
     BlinkCmpMenu = { link = "Pmenu" },
-    BlinkCmpMenuBorder = { fg = c.floatedge, bg = c.float },
-    BlinkCmpDoc = { fg = c.body, bg = c.float },
-    BlinkCmpDocBorder = { fg = c.floatedge, bg = c.float },
-    BlinkCmpDocSeparator = { fg = c.floatedge, bg = c.float },
-    BlinkCmpSignatureHelp = { fg = c.body, bg = c.float },
-    BlinkCmpSignatureHelpBorder = { fg = c.floatedge, bg = c.float },
+    BlinkCmpMenuBorder = { fg = c.ground2edge, bg = c.ground2 },
+    BlinkCmpDoc = { fg = c.body, bg = c.ground2 },
+    BlinkCmpDocBorder = { fg = c.ground2edge, bg = c.ground2 },
+    BlinkCmpDocSeparator = { fg = c.ground2edge, bg = c.ground2 },
+    BlinkCmpSignatureHelp = { fg = c.body, bg = c.ground2 },
+    BlinkCmpSignatureHelpBorder = { fg = c.ground2edge, bg = c.ground2 },
     BlinkCmpKindFunction = { fg = c.orange },
     BlinkCmpKindMethod = { fg = c.orange },
     BlinkCmpKindConstructor = { fg = c.orange },
@@ -234,7 +232,7 @@ local function groups(c)
     DashboardMruTitle = { fg = c.strong, bold = true },
     DashboardFiles = { fg = c.muted },
     SagaBeacon = { bg = c.accent },
-    SagaCount = { fg = c.muted, bg = c.float },
+    SagaCount = { fg = c.muted, bg = c.ground2 },
     SagaVirtLine = { fg = c.edge },
     SagaActionTitle = { link = "FloatTitle" },
     CopilotSuggestion = { fg = c.faint },

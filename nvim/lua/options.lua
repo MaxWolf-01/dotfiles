@@ -21,6 +21,8 @@ o.signcolumn = "yes"       -- column to the left of numbers for git status, etc.
 o.cursorline = true        -- highlight current line
 o.cursorlineopt = "number" -- only highlight number of current line
 o.showmatch = true         -- highlight matching brackets
+o.winborder = "rounded"    -- every float gets a hairline, so it can share the page's ground
+o.pumborder = "rounded"    -- the built-in completion menu too
 
 -- Special character display
 o.list = true
