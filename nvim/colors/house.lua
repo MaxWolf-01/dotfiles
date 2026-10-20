@@ -2,16 +2,18 @@
 -- day, a brown near-black by night, one moss accent. Code takes the same colours as mwolf.dev's
 -- (scripts/syntax-themes.py in the quartz repo): Flexoki 2.0's hues at half chroma, each held at
 -- 4.5:1 on the ground. A wash or mark is the token's translucent value laid over the ground, since
--- a highlight group takes no alpha. `float` is ground-2 half way to the edge: a window without a
--- border needs that much to stand off the page. On it the hairline (`floatedge`) and the selected
--- row (`sel`, the accent at 25%) step up to stay visible, and small text there is muted, since
--- faint falls under 4.5:1. `search` is the accent at about 30%, apart from the selection's mark.
+-- a highlight group takes no alpha. A float with a border (diagnostics, telescope) sits on ground-2,
+-- close to the page so its text keeps its contrast. One without (completion, its docs, which-key)
+-- sits on `float`, ground-2 half way to the edge, which it needs to stand off the page; on it the
+-- selected row (`sel`, the accent at 25%) steps up, and small text is muted, since faint falls
+-- under 4.5:1 there. `visual` is the mark's hue only as strong as code on it stays readable (every
+-- ink at 3.8:1 or more), and `search` the accent at about 20%, apart from it by hue and as readable.
 -- Follows 'background', which nvim reads from the terminal.
 
 local palettes = {
   light = {
     ground = "#f4e4cd", ground2 = "#eddabe", float = "#decbb0", edge = "#cfbca3",
-    floatedge = "#b7a792", sel = "#b7b28d", search = "#b6b892",
+    floatedge = "#b7a792", sel = "#b7b28d", search = "#cdc9a8", visual = "#e5d2b4",
     faint = "#675f59", muted = "#5e5650", body = "#37261d", strong = "#22140b",
     accent = "#426724", accent2 = "#674806", wash = "#d8d0b2", mark = "#d9c5a2",
     wash2 = "#dbc8a9", washred = "#e0cab6",
@@ -20,7 +22,7 @@ local palettes = {
   },
   dark = {
     ground = "#14110e", ground2 = "#1b1713", float = "#302a24", edge = "#463f37",
-    floatedge = "#5a534a", sel = "#414830", search = "#2f3a21",
+    floatedge = "#5a534a", sel = "#414830", search = "#252b1a", visual = "#2a251d",
     faint = "#888076", muted = "#b0a89e", body = "#ede3d2", strong = "#faf2dc",
     accent = "#75a252", accent2 = "#cdb78a", wash = "#29311d", mark = "#554b39",
     wash2 = "#352f24", washred = "#302420",
@@ -33,9 +35,9 @@ local function groups(c)
   return {
     -- editor
     Normal = { fg = c.body, bg = c.ground },
-    NormalFloat = { fg = c.body, bg = c.float },
-    FloatBorder = { fg = c.floatedge, bg = c.float },
-    FloatTitle = { fg = c.strong, bg = c.float, bold = true },
+    NormalFloat = { fg = c.body, bg = c.ground2 },
+    FloatBorder = { fg = c.floatedge, bg = c.ground2 },
+    FloatTitle = { fg = c.strong, bg = c.ground2, bold = true },
     Cursor = { fg = c.ground, bg = c.body },
     CursorLine = { bg = c.ground2 },
     CursorColumn = { bg = c.ground2 },
@@ -62,7 +64,8 @@ local function groups(c)
     PmenuExtra = { fg = c.muted, bg = c.float },
     PmenuSbar = { bg = c.float },
     PmenuThumb = { bg = c.floatedge },
-    Visual = { bg = c.mark },
+    Visual = { bg = c.visual },
+    VisualNOS = { bg = c.visual },
     Search = { bg = c.search },
     CurSearch = { fg = c.ground, bg = c.accent },
     IncSearch = { fg = c.ground, bg = c.accent },
@@ -87,7 +90,7 @@ local function groups(c)
     DiffAdd = { bg = c.wash },
     DiffDelete = { fg = c.red, bg = c.washred },
     DiffChange = { bg = c.wash2 },
-    DiffText = { bg = c.mark },
+    DiffText = { bg = c.wash2 },
     Added = { fg = c.green },
     Removed = { fg = c.red },
     Changed = { fg = c.accent2 },
@@ -201,8 +204,15 @@ local function groups(c)
     TelescopePromptCounter = { fg = c.muted },
     TelescopeSelection = { link = "PmenuSel" },
     TelescopeMatching = { fg = c.accent, bold = true },
-    WhichKeyNormal = { link = "NormalFloat" },
+    WhichKeyNormal = { link = "Pmenu" },
     WhichKeySeparator = { fg = c.muted },
+    BlinkCmpMenu = { link = "Pmenu" },
+    BlinkCmpMenuBorder = { fg = c.floatedge, bg = c.float },
+    BlinkCmpDoc = { fg = c.body, bg = c.float },
+    BlinkCmpDocBorder = { fg = c.floatedge, bg = c.float },
+    BlinkCmpDocSeparator = { fg = c.floatedge, bg = c.float },
+    BlinkCmpSignatureHelp = { fg = c.body, bg = c.float },
+    BlinkCmpSignatureHelpBorder = { fg = c.floatedge, bg = c.float },
     BlinkCmpKindFunction = { fg = c.orange },
     BlinkCmpKindMethod = { fg = c.orange },
     BlinkCmpKindConstructor = { fg = c.orange },
