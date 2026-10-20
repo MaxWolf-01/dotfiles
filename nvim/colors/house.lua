@@ -2,10 +2,12 @@
 -- day, a brown near-black by night, one moss accent. Code takes the same colours as mwolf.dev's
 -- (scripts/syntax-themes.py in the quartz repo): Flexoki 2.0's hues at half chroma, each held at
 -- 4.5:1 on the ground. A wash or mark is the token's translucent value laid over the ground, since
--- a highlight group takes no alpha. Every float sits on ground-2 inside a hairline (`floatedge`;
--- options.lua gives each one a border), close to the page so its text keeps its contrast; a
--- float's selected row (`sel`) is the accent at 25% over it. `visual` is the mark's hue only as strong as code on it stays readable (every
--- ink at 3.8:1 or more), and `search` the accent at about 20%, apart from it by hue and as readable.
+-- a highlight group takes no alpha. Every float sits on ground-2 inside a hairline (`floatedge`),
+-- close to the page so its text keeps its contrast; options.lua gives each one a border, drawn on
+-- the page's ground so no strip of ground-2 shows outside its rounded corners. A float's selected
+-- row (`sel`) is the accent at 25% over it. `visual` is the mark's hue only as strong as code on it
+-- stays readable (every ink at 3.8:1 or more), and `search` the accent at about 20%, apart from it
+-- by hue and as readable.
 -- Follows 'background', which nvim reads from the terminal.
 
 local palettes = {
@@ -34,8 +36,8 @@ local function groups(c)
     -- editor
     Normal = { fg = c.body, bg = c.ground },
     NormalFloat = { fg = c.body, bg = c.ground2 },
-    FloatBorder = { fg = c.ground2edge, bg = c.ground2 },
-    FloatTitle = { fg = c.strong, bg = c.ground2, bold = true },
+    FloatBorder = { fg = c.floatedge, bg = c.ground },
+    FloatTitle = { fg = c.strong, bg = c.ground, bold = true },
     Cursor = { fg = c.ground, bg = c.body },
     CursorLine = { bg = c.ground2 },
     CursorColumn = { bg = c.ground2 },
@@ -61,7 +63,7 @@ local function groups(c)
     PmenuKind = { fg = c.muted, bg = c.ground2 },
     PmenuExtra = { fg = c.muted, bg = c.ground2 },
     PmenuSbar = { bg = c.ground2 },
-    PmenuThumb = { bg = c.ground2edge },
+    PmenuThumb = { bg = c.floatedge },
     Visual = { bg = c.visual },
     VisualNOS = { bg = c.visual },
     Search = { bg = c.search },
@@ -205,12 +207,12 @@ local function groups(c)
     WhichKeyNormal = { link = "NormalFloat" },
     WhichKeySeparator = { fg = c.muted },
     BlinkCmpMenu = { link = "Pmenu" },
-    BlinkCmpMenuBorder = { fg = c.ground2edge, bg = c.ground2 },
+    BlinkCmpMenuBorder = { fg = c.floatedge, bg = c.ground },
     BlinkCmpDoc = { fg = c.body, bg = c.ground2 },
-    BlinkCmpDocBorder = { fg = c.ground2edge, bg = c.ground2 },
-    BlinkCmpDocSeparator = { fg = c.ground2edge, bg = c.ground2 },
+    BlinkCmpDocBorder = { fg = c.floatedge, bg = c.ground },
+    BlinkCmpDocSeparator = { fg = c.floatedge, bg = c.ground },
     BlinkCmpSignatureHelp = { fg = c.body, bg = c.ground2 },
-    BlinkCmpSignatureHelpBorder = { fg = c.ground2edge, bg = c.ground2 },
+    BlinkCmpSignatureHelpBorder = { fg = c.floatedge, bg = c.ground },
     BlinkCmpKindFunction = { fg = c.orange },
     BlinkCmpKindMethod = { fg = c.orange },
     BlinkCmpKindConstructor = { fg = c.orange },
