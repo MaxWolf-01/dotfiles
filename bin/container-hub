@@ -93,7 +93,8 @@ trailers), and scrolls the first of them into view.
 Pages are served from here (`/f/<absolute path>`), so the hub tab shares their origin and reaches into them:
 their links and keys. A link there to a directory, or to a file the hub does not serve, copies its path instead,
 and looks like the code it is rather than a link; a plain click on inline code copies its text, and one on an image
-not linked elsewhere shows it over the whole tab, zoomed and panned as a figure is, and keeps nothing. A link to another
+not linked elsewhere shows it over the whole tab, zoomed and panned as a figure is, and keeps nothing. A markdown file
+is served rendered, in the house style, its frontmatter shown as the YAML it is. A link to another
 session's session page (a handoff's "continues" or "continued in") takes the tab to that session's unit, as
 /u/<session id> does, and makes it a unit again where it had gone. A diffview page served here saves its comments
 through diffview's own code; `diffview --open`, `--watch` and `--serve` hand their pages here to be served. Worker
@@ -272,6 +273,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import tyro
+from markdown_it import MarkdownIt
+from markdown_it.common.normalize_url import validateLink
 
 HERE = Path(__file__).resolve().parent
 HOME = Path.home().resolve()
@@ -1068,7 +1071,7 @@ INLINE = re.compile(r"text/(html|plain|css|javascript)|application/(json|pdf)|(i
 
 
 def content_type(path: Path, body: bytes) -> str:
-    """Text a browser would download (TOML, YAML, Nix, shell, markdown) goes out as plain text, for the pane to show."""
+    """Text a browser would download (TOML, YAML, Nix, shell) goes out as plain text, for the pane to show."""
     guessed = mimetypes.guess_type(path.name)[0]
     if guessed and INLINE.fullmatch(guessed):
         return guessed
@@ -1077,6 +1080,56 @@ def content_type(path: Path, body: bytes) -> str:
     except UnicodeDecodeError:
         return guessed or "application/octet-stream"
     return "text/plain; charset=utf-8"
+
+
+MARKDOWN_SUFFIXES = (".md", ".markdown")
+
+
+def markdown_page(path: Path, body: bytes) -> bytes:
+    """A markdown file as a page in the house style: its frontmatter as the YAML it is, then its text rendered,
+    titled by its first heading. Raw HTML in it shows as text, since a page served here can act on the hub tab."""
+    text = body.decode(errors="replace")
+    front = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    tokens = MARKDOWN.parse(text[front.end():] if front else text)
+    title = next((tokens[i + 1].content for i, t in enumerate(tokens) if t.type == "heading_open" and t.tag == "h1"), path.name)
+    house = mx_script("house-style/tokens.css")
+    return (MARKDOWN_PAGE.replace("__TITLE__", html.escape(title))
+            .replace("__TOKENS__", house.read_text() if house else "")
+            .replace("__BODY__", (f'<pre class="front">{html.escape(front.group(1))}</pre>\n' if front else "")
+                     + MARKDOWN.renderer.render(tokens, MARKDOWN.options, {}))).encode()
+
+
+def file_links(self, tokens, idx, options, env) -> str:
+    """A link to an absolute or ~ path would resolve against the hub's address; as a file:// URL the hub tab routes it."""
+    href = tokens[idx].attrGet("href") or ""
+    if href.startswith(("/", "~/")):
+        tokens[idx].attrSet("href", Path(href).expanduser().as_uri())
+    return self.renderToken(tokens, idx, options, env)
+
+
+MARKDOWN = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable(["table", "strikethrough", "linkify"])
+MARKDOWN.linkify.set({"fuzzy_link": False, "fuzzy_email": False})  # `container-hub.py` is no domain
+MARKDOWN.validateLink = lambda url: url.strip().lower().startswith("file:") or validateLink(url)
+MARKDOWN.add_render_rule("link_open", file_links)
+
+MARKDOWN_PAGE = """<!doctype html><meta charset="utf-8"><title>__TITLE__</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,400;1,6..72,600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>__TOKENS__
+  :root { --size-body: 16px; }
+  main { padding: 1.5rem 1.75rem 4rem; }
+  h1 { font-weight: 600; font-size: 1.6em; line-height: 1.2; color: var(--strong); margin: 0 0 1rem; }
+  .prose h4, .prose h5, .prose h6 { font-weight: 600; margin-top: 1.5em; }
+  .prose li > p { margin: 0; }
+  .prose pre { background: var(--ground-2); padding: 0.75em 1em; border-radius: var(--radius); overflow-x: auto; font-size: 0.85em; line-height: 1.5; }
+  .prose pre code { background: none; padding: 0; font-size: inherit; }
+  .prose img { max-width: 100%; }
+  .prose hr { border: 0; border-top: 1px solid var(--edge); }
+  .front { font: 0.8125rem/1.5 var(--font-mono); color: var(--muted); background: none !important; padding: 0 0 0.75em !important;
+    border-bottom: 1px solid var(--edge); border-radius: 0 !important; white-space: pre-wrap; }
+</style>
+<body><main class="prose">
+__BODY__</main></body>
+"""
 
 
 def too_broad(directory: Path) -> bool:
@@ -2617,6 +2670,8 @@ class Handler(BaseHTTPRequestHandler):
             if found := retired(path):
                 name, body, sha = found
                 ctype = content_type(name, body)
+                if name.suffix in MARKDOWN_SUFFIXES:
+                    body, ctype = markdown_page(name, body), "text/html"
                 if ctype == "text/html":
                     banner = f'<div style="font:12px/1.6 monospace;padding:2px 10px;background:#e8d9b5;color:#3b2f20">retired in {sha}; shown from the agent repo\'s history</div>'
                     return self.send_page(re.sub(rb"(<body[^>]*>)", lambda m: m.group(1) + banner.encode(), body, count=1), ctype)
@@ -2624,6 +2679,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, f"{path} does not exist".encode(), "text/plain")
         body = path.read_bytes()
         ctype = content_type(path, body)
+        if path.suffix in MARKDOWN_SUFFIXES:
+            return self.send_page(markdown_page(path, body), "text/html; charset=utf-8")
         if ctype == "text/html":
             return self.send_page(body, ctype)
         self.send(200, body, ctype)
