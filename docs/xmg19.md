@@ -19,10 +19,12 @@ outputs, by PCI device rather than by card number:
 
 ## The discrete GPU
 
-The NVIDIA driver cuts the dGPU's power (D3cold) once nothing has it open,
-and powers it back up when a program opens it, so a CUDA job needs no step of
-its own. Why that takes the proprietary kernel module and a udev rule of our
-own: the comments above both in `nix/nixos/xmg19/configuration.nix`.
+The NVIDIA driver is set up to cut the dGPU's power (D3cold) once nothing has
+it open, and to power it back up when a program opens it, so a CUDA job needs
+no step of its own. Not yet measured on xmg19: the setup is from 2026-10-20,
+driver 595.104.02, kernel 6.18.54. The comments above `hardware.nvidia` and
+`services.udev.extraRules` in `nix/nixos/xmg19/configuration.nix` say why it
+takes the proprietary kernel module and a udev rule of our own.
 
 Its state, read without waking it:
 

@@ -52,6 +52,8 @@
       "nvidia_drm.fbdev=1"
       "nvidia.NVreg_PreserveVideoMemoryAllocations=1"
       "nvidia.NVreg_TemporaryFilePath=/var/tmp"
+      # GSP firmware off, which runtime D3 needs (hardware.nvidia below)
+      "nvidia.NVreg_EnableGpuFirmware=0"
       # One of the two Corsair CM4X16GE2666C18S2 sticks flips bits at physical
       # 0x2610b84d5-0x2610bff1d (stressapptest, 2026-10-17). This keeps Linux off
       # the 16M around it. The address holds only for this pair of sticks in these
@@ -69,7 +71,6 @@
     modesetting.enable = true;
     open = false;
     gsp.enable = false;
-    moduleParams.nvidia.NVreg_EnableGpuFirmware = 0;
     nvidiaSettings = false;
     prime = {
       offload.enable = true;
