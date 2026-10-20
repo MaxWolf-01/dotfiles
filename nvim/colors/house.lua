@@ -2,11 +2,13 @@
 -- day, a brown near-black by night, one moss accent. Code takes the same colours as mwolf.dev's
 -- (scripts/syntax-themes.py in the quartz repo): Flexoki 2.0's hues at half chroma, each held at
 -- 4.5:1 on the ground. A wash or mark is the token's translucent value laid over the ground, since
--- a highlight group takes no alpha. Follows 'background', which nvim reads from the terminal.
+-- a highlight group takes no alpha. `float` is ground-2 half way to the edge: a window without a
+-- border needs that much to stand off the page. Follows 'background', which nvim reads from the
+-- terminal.
 
 local palettes = {
   light = {
-    ground = "#f4e4cd", ground2 = "#eddabe", edge = "#cfbca3",
+    ground = "#f4e4cd", ground2 = "#eddabe", float = "#decbb0", edge = "#cfbca3",
     faint = "#675f59", muted = "#5e5650", body = "#37261d", strong = "#22140b",
     accent = "#426724", accent2 = "#674806", wash = "#d8d0b2", mark = "#d9c5a2",
     wash2 = "#dbc8a9", washred = "#e0cab6",
@@ -14,7 +16,7 @@ local palettes = {
     cyan = "#466662", blue = "#39506e", purple = "#4b4268", magenta = "#6f4258",
   },
   dark = {
-    ground = "#14110e", ground2 = "#1b1713", edge = "#463f37",
+    ground = "#14110e", ground2 = "#1b1713", float = "#302a24", edge = "#463f37",
     faint = "#888076", muted = "#b0a89e", body = "#ede3d2", strong = "#faf2dc",
     accent = "#75a252", accent2 = "#cdb78a", wash = "#29311d", mark = "#554b39",
     wash2 = "#352f24", washred = "#302420",
@@ -27,9 +29,9 @@ local function groups(c)
   return {
     -- editor
     Normal = { fg = c.body, bg = c.ground },
-    NormalFloat = { fg = c.body, bg = c.ground2 },
-    FloatBorder = { fg = c.edge, bg = c.ground2 },
-    FloatTitle = { fg = c.strong, bg = c.ground2, bold = true },
+    NormalFloat = { fg = c.body, bg = c.float },
+    FloatBorder = { fg = c.edge, bg = c.float },
+    FloatTitle = { fg = c.strong, bg = c.float, bold = true },
     Cursor = { fg = c.ground, bg = c.body },
     CursorLine = { bg = c.ground2 },
     CursorColumn = { bg = c.ground2 },
@@ -50,12 +52,14 @@ local function groups(c)
     TabLineFill = { bg = c.ground2 },
     WinBar = { fg = c.muted },
     WinBarNC = { fg = c.faint },
-    Pmenu = { fg = c.body, bg = c.ground2 },
+    Pmenu = { fg = c.body, bg = c.float },
     PmenuSel = { fg = c.strong, bg = c.wash },
-    PmenuSbar = { bg = c.ground2 },
+    PmenuKind = { fg = c.muted, bg = c.float },
+    PmenuExtra = { fg = c.faint, bg = c.float },
+    PmenuSbar = { bg = c.float },
     PmenuThumb = { bg = c.edge },
     Visual = { bg = c.mark },
-    Search = { bg = c.mark },
+    Search = { bg = c.wash },
     CurSearch = { fg = c.ground, bg = c.accent },
     IncSearch = { fg = c.ground, bg = c.accent },
     Substitute = { fg = c.ground, bg = c.accent2 },
@@ -72,6 +76,8 @@ local function groups(c)
     SpellRare = { undercurl = true, sp = c.purple },
     SpellLocal = { undercurl = true, sp = c.cyan },
     QuickFixLine = { bg = c.wash },
+    Conceal = { fg = c.faint },
+    OkMsg = { fg = c.green },
 
     -- diffs and git: a convention that outranks the palette's one accent
     DiffAdd = { bg = c.wash },
@@ -84,6 +90,7 @@ local function groups(c)
     GitSignsAdd = { fg = c.green },
     GitSignsDelete = { fg = c.red },
     GitSignsChange = { fg = c.accent2 },
+    GitSignsCurrentLineBlame = { fg = c.faint },
 
     DiagnosticError = { fg = c.red },
     DiagnosticWarn = { fg = c.accent2 },
@@ -94,10 +101,12 @@ local function groups(c)
     DiagnosticUnderlineWarn = { undercurl = true, sp = c.accent2 },
     DiagnosticUnderlineInfo = { undercurl = true, sp = c.blue },
     DiagnosticUnderlineHint = { undercurl = true, sp = c.cyan },
+    DiagnosticUnderlineOk = { undercurl = true, sp = c.green },
     DiagnosticUnnecessary = { fg = c.faint },
-    LspReferenceText = { bg = c.ground2 },
-    LspReferenceRead = { bg = c.ground2 },
-    LspReferenceWrite = { bg = c.ground2 },
+    DiagnosticDeprecated = { fg = c.faint, strikethrough = true },
+    LspReferenceText = { bg = c.wash2 },
+    LspReferenceRead = { bg = c.wash2 },
+    LspReferenceWrite = { bg = c.wash2 },
     LspInlayHint = { fg = c.faint },
 
     -- code, as on mwolf.dev: punctuation and operators muted, comments and docstrings fainter,
@@ -180,6 +189,41 @@ local function groups(c)
     ["@markup.raw"] = { fg = c.cyan },
     ["@markup.quote"] = { fg = c.muted, italic = true },
     ["@markup.list"] = { fg = c.muted },
+
+    -- plugins: every float wears the float ground and a hairline, virtual text is faint
+    TelescopeNormal = { link = "NormalFloat" },
+    TelescopeBorder = { link = "FloatBorder" },
+    TelescopeTitle = { link = "FloatTitle" },
+    TelescopePromptCounter = { fg = c.faint },
+    TelescopeSelection = { link = "PmenuSel" },
+    TelescopeMatching = { fg = c.accent, bold = true },
+    WhichKeyNormal = { link = "NormalFloat" },
+    BlinkCmpKindFunction = { fg = c.orange },
+    BlinkCmpKindMethod = { fg = c.orange },
+    BlinkCmpKindConstructor = { fg = c.orange },
+    BlinkCmpKindKeyword = { fg = c.green },
+    BlinkCmpKindClass = { fg = c.yellow },
+    BlinkCmpKindStruct = { fg = c.yellow },
+    BlinkCmpKindInterface = { fg = c.yellow },
+    BlinkCmpKindEnum = { fg = c.yellow },
+    BlinkCmpKindConstant = { fg = c.yellow },
+    BlinkCmpKindSnippet = { fg = c.magenta },
+    BlinkCmpKindText = { fg = c.faint },
+    DashboardHeader = { fg = c.accent },
+    DashboardFooter = { fg = c.faint },
+    DashboardDesc = { fg = c.body },
+    DashboardIcon = { fg = c.muted },
+    DashboardKey = { fg = c.accent },
+    DashboardShortCut = { fg = c.accent },
+    DashboardProjectTitle = { fg = c.strong, bold = true },
+    DashboardMruTitle = { fg = c.strong, bold = true },
+    DashboardFiles = { fg = c.muted },
+    SagaBeacon = { bg = c.accent },
+    SagaCount = { fg = c.muted, bg = c.float },
+    SagaVirtLine = { fg = c.edge },
+    SagaActionTitle = { link = "FloatTitle" },
+    CopilotSuggestion = { fg = c.faint },
+    TypeVirtualText = { fg = c.faint },
 
     -- LSP semantic tokens otherwise colour a readonly name as a constant
     ["@lsp.type.variable"] = { link = "@variable" },
