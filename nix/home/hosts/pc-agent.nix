@@ -7,4 +7,5 @@ import ../worker.nix {
     email = "MaxWolf-01-clanker@users.noreply.github.com";
   };
   record = ./pc-agent/HOST.md;
+  body = ./pc-worker-body.md;
 }
