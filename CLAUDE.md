@@ -197,7 +197,7 @@ The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to the Cloud
 Worker `mwolf-dev` on push to `v4` (`.github/workflows/deploy.yml`). The Worker serves
 mwolf.dev and www.mwolf.dev, and that repo's `wrangler.jsonc` says how.
 
-The site's images and videos live in the R2 bucket `mwolf-dev-media` on max's
+The site's images, videos, `.mp3` recordings and PDFs live in the R2 bucket `mwolf-dev-media` on max's
 Cloudflare account, flat by file name, and the site links them at
 `https://media.mwolf.dev/<file name>` (Quartz's `mediaBaseUrl`). The bucket is
 reached only through that custom domain; its `r2.dev` URL is off. It was made
