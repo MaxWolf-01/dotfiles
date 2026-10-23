@@ -20,6 +20,7 @@ return {
     completion = {
       menu = {
         auto_show = true,  -- Show menu automatically as you type
+        border = 'rounded',
       },
       list = {
         selection = {
@@ -30,6 +31,7 @@ return {
       documentation = {
         auto_show = true,  -- Show docs when selecting items
         auto_show_delay_ms = 200,
+        window = { border = 'rounded' },
       },
       ghost_text = { 
         enabled = false -- Show inline preview of selected item
@@ -41,6 +43,7 @@ return {
       enabled = true,
       window = {
         show_documentation = false,  -- Only show signature, not full docs
+        border = 'rounded',
       }
     },
     

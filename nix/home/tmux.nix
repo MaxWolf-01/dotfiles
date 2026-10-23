@@ -52,6 +52,16 @@ let
     PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.procps pkgs.diffutils pkgs.gnused pkgs.gnutar pkgs.gzip pkgs.jq ]}
     exec ${pkgs.bash}/bin/bash ${./tmux-save.sh} ${tmux} "$HOME/.tmux/resurrect"
   '';
+
+  # The house night colours (mx house-style tokens; yellow is nvim's
+  # nvim/colors/house.lua code yellow), for what tmux draws over a pane.
+  house = {
+    ground2 = "#1b1713";
+    edge = "#463f37";
+    muted = "#b0a89e";
+    accent = "#75a252";
+    yellow = "#bda773";
+  };
 in
 {
   # Systemd timer for tmux session auto-save (more reliable than continuum)
@@ -256,16 +266,33 @@ in
       # Detach to terminal when session is destroyed (instead of switching to another)
       set -g detach-on-destroy on
 
-      # Status bar (clean, minimal)
+      # The status bar and messages name palette slots (colour0-15) and
+      # `default`, so they follow the palette ghostty draws (terminal-colors.nix);
+      # the rest takes the `house` colours set at the top of tmux.nix. The accent
+      # green marks where your keys go: the active pane, a pending prefix.
       set -g status-position bottom
-      set -g status-style "bg=colour235,fg=colour250"
+      set -g status-style "bg=default,fg=colour7,dim"
       set -g status-left-length 30
-      set -g status-left "#[fg=colour117,bold] #S #[fg=colour244]│ "
-      set -g status-right "#[fg=colour244]%H:%M "
-      set -g window-status-format "#[fg=colour244] #I:#W "
-      set -g window-status-current-format "#[fg=colour117,bold] #I:#W "
-      set -g pane-border-style "fg=colour238"
-      set -g pane-active-border-style "fg=colour117"
+      set -g status-left "#{?client_prefix,#[fg=${house.accent}],#[fg=colour15]}#[bold,nodim] #S #[fg=colour8,nobold]│ "
+      set -g status-right "%H:%M "
+      setw -g window-status-separator ""
+      setw -g window-status-format " #I:#W "
+      setw -g window-status-current-format "#[fg=colour15,bold,nodim] #I:#W "
+      setw -g window-status-activity-style "fg=colour3,nodim"
+      set -g pane-border-style "fg=${house.edge}"
+      set -g pane-active-border-style "fg=${house.accent}"
+      set -g pane-border-indicators both
+      set -g message-style "bg=colour8,fg=colour15"
+      set -g message-command-style "bg=${house.edge},fg=${house.yellow}"
+      # Selection and search hits only tint the ground, so the text under them
+      # keeps its own colours.
+      setw -g mode-style "bg=${house.edge}"
+      setw -g copy-mode-match-style "bg=${house.edge},fg=${house.yellow}"
+      setw -g copy-mode-current-match-style "bg=${house.yellow},fg=${house.ground2}"
+      set -g popup-style "bg=${house.ground2}"
+      # tmux drops dim on a popup border, and edge is too faint to frame one.
+      set -g popup-border-style "fg=${house.muted}"
+      setw -g clock-mode-colour "${house.accent}"
     '';
   };
 }
