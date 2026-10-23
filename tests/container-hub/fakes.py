@@ -113,9 +113,9 @@ served = lambda path: "/f" + urllib.parse.quote(str(path))
 
 SELF_STARTED = started()
 RUN = Path(tempfile.mkdtemp(prefix="container-hub-test.", dir="/tmp"))
-"""Every world's scratch directory, gone when the test ends. In /tmp whatever $TMPDIR is, since a world's HOME holds
-the hub's default socket, whose path a unix socket bounds at 107 bytes: under the laptop devShell's TMPDIR
-(/var/tmp/nix-shell.XXXXXX) it comes to 109."""
+"""Every world's scratch directory, gone when the test ends. In /tmp whatever $TMPDIR is: a world's HOME holds the
+hub's default socket, and under a deep TMPDIR such as the laptop devShell's (/var/tmp/nix-shell.XXXXXX) its path is
+too long for a unix socket."""
 atexit.register(shutil.rmtree, RUN, ignore_errors=True)
 WORLDS: list["World"] = []
 
