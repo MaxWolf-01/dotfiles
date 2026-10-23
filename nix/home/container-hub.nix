@@ -50,9 +50,11 @@ let
   peerSocket = name: "${state}/peers/${name}.sock";
   scriptPath = lib.makeBinPath ((with pkgs; [ bash coreutils uv git curl ]) ++ [ config.programs.tmux.package ]);
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
-  peers = lib.filterAttrs (name: peer: name != cfg.host && peer.trust <= cfg.hosts.${cfg.host}.trust) cfg.hosts;
+  peers = cfg.peers;
 in
 {
+  imports = [ ./session-copies.nix ];
+
   options.containerHub = {
     loopback = lib.mkEnableOption ''
       the hub on 127.0.0.1:8377 as well, for a browser on this host. Every
@@ -90,6 +92,12 @@ in
       });
       default = import ./session-hosts.nix;
       description = "The hosts that run max's sessions; ./session-hosts.nix says what they are for.";
+    };
+    peers = lib.mkOption {
+      type = lib.types.attrs;
+      readOnly = true;
+      default = lib.filterAttrs (name: peer: name != cfg.host && peer.trust <= cfg.hosts.${cfg.host}.trust) cfg.hosts;
+      description = "The hosts of `hosts` this one relays and pulls session copies of (./session-copies.nix): every other one trusted as much as this one or less.";
     };
   };
 

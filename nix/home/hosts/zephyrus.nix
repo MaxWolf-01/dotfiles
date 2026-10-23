@@ -18,6 +18,10 @@
     tailnet = "https://zephylux.tail710178.ts.net:8377";
   };
 
+  # The working backups here are the only ones that keep the worker users'
+  # transcripts, so the laptop is the host that pulls them.
+  sessionCopies.workerHosts = true;
+
   imports = [
     ../brave.nix
     ../container-hub.nix

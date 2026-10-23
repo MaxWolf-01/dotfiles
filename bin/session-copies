@@ -5,11 +5,13 @@
 # ///
 """Pull other hosts' Claude Code sessions into this host's session copies.
 
-Each source is a user@host reached over ssh. From every account directory in its home (`~/.claude*/`), the pull
-copies the transcripts (`projects/`), the session pages (`session-pages/`) and the registry entry of each session
-whose process runs (`sessions/<pid>.json`), into `<root>/<host>/<user>/`, laid out as they are in the source's
-home. Nothing else of the account comes along: no credentials, settings, plugins or registry keys, and no `.git`
-directory anywhere. A copy mirrors its source: what the source deleted, the next pull deletes.
+Each source is an ssh destination, `[user@]host`, optionally named: `NAME=DEST` pulls DEST into a copy under NAME,
+the host's name in nix/home/session-hosts.nix, where an unnamed one lands under DEST's host. From every account
+directory in the home the login lands in (`~/.claude*/`), the pull copies the transcripts (`projects/`), the session
+pages (`session-pages/`) and the registry entry of each session whose process runs (`sessions/<pid>.json`), into
+`<root>/<name>/<user>/`, laid out as they are in the source's home. Nothing else of the account comes along: no
+credentials, settings, plugins or registry keys, and no `.git` directory anywhere. A copy mirrors its source: what
+the source deleted, the next pull deletes.
 
 A source on this host is left out, so a host's own sessions never land among its copies. A source that does not
 answer, or whose ssh agent holds no key, is skipped, and its copy stays as the last pull left it. The run is a skip
@@ -18,8 +20,8 @@ when no source was pulled, and a failure when any source that answered could not
 Examples:
 
     session-copies --sources max@pc agent@pc
-    session-copies --sources max@pc --worker-hosts --record
-    session-copies --sources max@zephylux --record
+    session-copies --sources pc=pc --worker-hosts --record
+    session-copies --sources zephylux=zephylux --record
 """
 
 import fcntl
@@ -55,11 +57,13 @@ FILTER = """\
 - *
 """
 
-# Run on the source, by sh whatever the login shell is (zsh fails a glob that matches nothing). It names the
-# account directories, then each registry entry with the start time of the process its pid has now, in clock ticks
-# as /proc has it, empty where no such process runs. The start time is the 22nd field of /proc/<pid>/stat, the 20th
-# after the command's name, which may hold spaces and parentheses, so the line is cut at its last ")".
+# Run on the source, by sh whatever the login shell is (zsh fails a glob that matches nothing). It names the user
+# the login landed as (sshd sets USER), the account directories, then each registry entry with the start time of the
+# process its pid has now, in clock ticks as /proc has it, empty where no such process runs. The start time is the
+# 22nd field of /proc/<pid>/stat, the 20th after the command's name, which may hold spaces and parentheses, so the
+# line is cut at its last ")".
 PROBE = r"""
+echo "user ${USER:-$(id -un)}"
 for d in .claude*/; do
   [ -d "$d" ] && [ ! -L "${d%/}" ] && echo "account ${d%/}"
 done
@@ -74,7 +78,7 @@ done
 @dataclass
 class Args:
     sources: list[str] = field(default_factory=list)
-    """The user@host logins to pull from, each as ssh reaches it."""
+    """The logins to pull from, each `[NAME=]DEST`: DEST as ssh reaches it, NAME the host its copy lands under."""
     worker_hosts: bool = False
     """Pull from every worker host's user too (`worker-hosts --targets`), so a worker user is pulled once its host
     publishes a record."""
@@ -101,17 +105,21 @@ def main(args: Args) -> int:
             sources = peers(args.sources + (worker_targets() if args.worker_hosts else []))
         except Exception as e:
             return report(args.record, "fail", str(e), {})
-        results = {source: pull_one(source, root) for source in sources}
+        results = {dest: pull_one(name, dest, root) for name, dest in sources}
     return summarise(results, args.record)
 
 
-def peers(targets: list[str]) -> list[str]:
-    """The sources to pull, each once, less any on this host."""
+def peers(targets: list[str]) -> list[tuple[str, str]]:
+    """The sources to pull, each once as (name, destination), less any on this host."""
+    sources = []
     for target in targets:
-        if not re.fullmatch(r"[a-z_][a-z0-9_-]*@[A-Za-z0-9.-]+", target):
-            raise ValueError(f"not a user@host login: {target!r}")
+        match = re.fullmatch(r"(?:([A-Za-z0-9.-]+)=)?((?:[a-z_][a-z0-9_-]*@)?([A-Za-z0-9.-]+))", target)
+        if not match:
+            raise ValueError(f"not a [NAME=][user@]host login: {target!r}")
+        name, dest, host = match.groups()
+        sources.append((name or host, dest, host))
     this = os.uname().nodename
-    return [t for t in dict.fromkeys(targets) if t.split("@")[1] != this]
+    return [(name, dest) for name, dest, host in dict.fromkeys(sources) if this not in (name, host)]
 
 
 def worker_targets() -> list[str]:
@@ -121,14 +129,15 @@ def worker_targets() -> list[str]:
     return run.stdout.split()
 
 
-def pull_one(source: str, root: Path) -> tuple[str, str]:
+def pull_one(name: str, source: str, root: Path) -> tuple[str, str]:
     """(outcome, reason) of pulling one source into its copy."""
-    user, host = source.split("@")
-    copy = root / host / user
     try:
-        accounts, entries = probe(source)
+        user, accounts, entries = probe(source)
         if not accounts:
             raise Skipped(f"{source} has no ~/.claude*/ directory")
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user):
+            raise RuntimeError(f"{source} names its user {user!r}, which is no user name")
+        copy = root / name / user
         copy.mkdir(parents=True, exist_ok=True)
         rsync(source, copy)
         prune(copy, entries)
@@ -139,9 +148,9 @@ def pull_one(source: str, root: Path) -> tuple[str, str]:
     return "ok", ""
 
 
-def probe(source: str) -> tuple[list[str], dict[str, str]]:
-    """The source's account directories, and its registry entries by their path, each with the start time of the
-    process its pid names now, empty where none runs."""
+def probe(source: str) -> tuple[str, list[str], dict[str, str]]:
+    """The user the source's login lands as, its account directories, and its registry entries by their path, each
+    with the start time of the process its pid names now, empty where none runs."""
     try:
         run = subprocess.run([*SSH, source, "sh -s"], input=PROBE, capture_output=True, text=True, timeout=120,
                              check=False)
@@ -150,15 +159,17 @@ def probe(source: str) -> tuple[list[str], dict[str, str]]:
     if run.returncode != 0:
         raise unreachable(source, run.returncode, run.stderr) or RuntimeError(
             f"probing {source} exited {run.returncode}: {run.stderr.strip()[-300:]}")
-    accounts, entries = [], {}
+    user, accounts, entries = "", [], {}
     for line in run.stdout.splitlines():
         kind, _, rest = line.partition(" ")
-        if kind == "account":
+        if kind == "user":
+            user = rest
+        elif kind == "account":
             accounts.append(rest)
         elif kind == "entry":
             path, _, started = rest.partition(" ")
             entries[path] = started.strip()
-    return accounts, entries
+    return user, accounts, entries
 
 
 def unreachable(source: str, code: int, stderr: str) -> Skipped | None:
