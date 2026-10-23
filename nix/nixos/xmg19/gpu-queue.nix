@@ -21,5 +21,8 @@ in
 
   # Sticky, as /tmp is: every user adds entries, and removes only their own.
   # Under /run, so a boot, which has ended every job, starts with it empty.
-  systemd.tmpfiles.rules = [ "d /run/gpu-queue 1777 root root -" ];
+  systemd.tmpfiles.rules = [
+    "d /run/gpu-queue 1777 root root -"
+    "f /run/gpu-queue/.lock 0644 root root -"
+  ];
 }

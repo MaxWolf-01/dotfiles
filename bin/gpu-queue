@@ -105,8 +105,12 @@ show_queue() {
                    (./60 % 60 | floor | select(. > 0) | "\(.)m")] | join("") end);
         def clock: strflocaltime("%H:%M");
         def pad($w): tostring | . + (" " * ([$w - length, 0] | max) // "");
+        # Anyone can write an entry, so what it says reaches the terminal without its control characters.
+        def clean: gsub("[\\p{Cc}\\s]+"; " ");
         if length == 0 then "the GPU queue is empty" else
-        [.[] | {pos: (.seq | tostring), user, name, session: (.short // "-"), eta: (.eta | dur),
+        [to_entries[] | (.key + 1) as $pos | .value
+         | {pos: ($pos | tostring), user: (.user | clean), name: (.name | clean), session: (.short // "-" | clean),
+                eta: (.eta | dur),
                 start: (if .state == "running" then
                             "running since \(.started | clock), "
                             + (if .overrunning then "overrunning by \(($now - .started - .eta) | dur)"
@@ -116,7 +120,7 @@ show_queue() {
                             + (if .expected_start > $now then " (in \((.expected_start - $now) | dur))" else "" end)
                             + ", queued \(.queued | clock)"
                         end),
-                command, note}] as $rows
+                command: (.command | clean), note: (.note // "" | clean)}] as $rows
         | [{pos: "#", user: "USER", name: "NAME", session: "SESSION", eta: "ETA", start: "START"}] + $rows
         | (map(.pos | length) | max) as $wp | (map(.user | length) | max) as $wu
         | (map(.name | length) | max) as $wn | (map(.session | length) | max) as $ws
@@ -124,7 +128,7 @@ show_queue() {
         | .[] | (" " * ($wp + 2)) as $indent
         | "\(.pos | pad($wp))  \(.user | pad($wu))  \(.name | pad($wn))  \(.session | pad($ws))  \(.eta | pad($we))  \(.start)"
           + (if .command then "\n\($indent)$ \(.command)" else "" end)
-          + (if (.note // "") != "" then "\n\($indent)note: \(.note | gsub("\\s+"; " "))" else "" end)
+          + (if (.note // "") != "" then "\n\($indent)note: \(.note)" else "" end)
         end'
 }
 
@@ -157,6 +161,14 @@ short_id() {
     echo "${name:-${sid:0:8}}"
 }
 
+# Replaces this job's entry with stdin, whole, and readable by every user
+# whatever umask the caller runs under: an entry another user cannot read is
+# one their gpu-run cannot see, and runs beside.
+write_entry() {
+    (umask 022; cat >"$entry.tmp")
+    mv "$entry.tmp" "$entry"
+}
+
 cmd_run() {
     local eta="" name="" note=""
     while [ $# -gt 0 ]; do
@@ -175,15 +187,17 @@ cmd_run() {
     secs=$(seconds_of "$eta") || die "--eta $eta is not a duration; write it as 90s, 45m, 2h, 1h30m or 1d"
     [ ${#note} -le $note_max ] || die "--note is ${#note} characters; the queue takes $note_max at most"
     name=${name:-${1##*/}}
+    note=${note//[$'\n\t']/ }
     [[ $name != *[[:cntrl:]]* ]] || die "--name holds a control character"
+    [[ $note != *[[:cntrl:]]* ]] || die "--note holds a control character"
     [ -d "$dir" ] && [ -w "$dir" ] ||
         die "no writable GPU queue at $dir; xmg19 makes it (nix/nixos/xmg19/gpu-queue.nix), and GPU_QUEUE_DIR points a test elsewhere"
 
     local session=${CLAUDE_CODE_SESSION_ID:-} short=null seq entry
     [ -z "$session" ] || short=$(jq -n --arg s "$(short_id "$session")" '$s')
-    # Taken with a read-only descriptor, which flock needs no more than: the
-    # lock file belongs to whoever made it first.
-    [ -e "$dir/.lock" ] || : 2>/dev/null >>"$dir/.lock" || true
+    # Taken with a read-only descriptor, which flock needs no more than: on
+    # xmg19 the lock file is root's, and elsewhere whoever made it first owns it.
+    [ -e "$dir/.lock" ] || (umask 022; : >>"$dir/.lock")
     exec 9<"$dir/.lock"
     flock 9
     seq=$(find "$dir" -maxdepth 1 -name '[0-9]*.json' -printf '%f\n' | sed 's/\.json$//' | sort -n | tail -1)
@@ -198,8 +212,7 @@ cmd_run() {
         --argjson queued "$(date +%s)" --arg session "$session" --argjson short "$short" \
         '{seq: $seq, user: $user, pid: $pid, start: $start, name: $name, note: $note, command: ($command | rtrimstr(" ")),
           eta: $eta, queued: $queued, started: null, session: (if $session == "" then null else $session end),
-          short: $short}' >"$entry.tmp"
-    mv "$entry.tmp" "$entry"
+          short: $short}' | write_entry
     flock -u 9
     exec 9<&-
 
@@ -212,8 +225,7 @@ cmd_run() {
             sleep "$poll"
         done
     fi
-    jq --argjson t "$(date +%s)" '.started = $t' "$entry" >"$entry.tmp"
-    mv "$entry.tmp" "$entry"
+    jq --argjson t "$(date +%s)" '.started = $t' "$entry" | write_entry
     echo "gpu-run: $name has the GPU" >&2
 
     local rc=0
