@@ -15,7 +15,9 @@
 #        job stop <name>
 #        job rm   <name>
 #   run    starts <command> in a tmux session named job-<name>, with output
-#          going to the job's log, and returns at once. Fails when <name>
+#          going to the job's log, and returns after its first second: a
+#          command that has exited non-zero by then makes `run` exit 1 with
+#          the status line and the log's last line. Fails when <name>
 #          already exists, running or done: names are unique until `job rm`,
 #          which is what stops one agent from reading another's build. Name
 #          jobs <project>-<activity> (api-migrate, docs-build); the name is
@@ -38,7 +40,9 @@
 #          The second form waits on files directly, for callers that keep
 #          their own state (dispatch-ctl); <name> resolves to exactly that.
 #   probe  one line per job: running, done (with its exit code), or gone
-#   stop   TERM the job, which still gets to write its status line
+#   stop   TERM the job, which still gets to write its status line. TERM, like
+#          Ctrl-C in the job's pane, reaches the command itself, and the
+#          status line holds whatever exit the command made of it
 #   rm     kill the session and forget the job, freeing the name
 #
 # The exit code says how the wait ended, so the wake-up carries the answer.
@@ -160,6 +164,22 @@ cmd_run() {
         rm -rf "$dir"
         die "$name wrote no meta in 10s; the pane's last lines are above"
     fi
+    # A command that dies at once, as a server on a taken port does, is a
+    # failed start, not a started job: the caller would otherwise go on to
+    # measure whatever already holds the port.
+    for _ in $(seq 10); do
+        [ -f "$status" ] && break
+        sleep 0.1
+    done
+    if [ -f "$status" ]; then
+        if [ "$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$status")" != 0 ]; then
+            echo "job: $name failed at once  $(cat "$status")" >&2
+            echo "-- log, last line: $(tail -n 1 "$log")" >&2
+            exit 1
+        fi
+        echo "done $name  $(cat "$status")"
+        return
+    fi
     echo "started $name  pid=$(metaval pid "$meta")  (tmux attach -t $session)"
 }
 
@@ -189,13 +209,15 @@ cmd_exec() {
     load_caller_env
     printf 'pid=%s\nstarted=%s\ncwd=%s\nawake=%s\ncmd=%s\n' "$$" "$(iso)" "$PWD" "$awake" "$*" > "$meta"
     started=$(now)
-    finish() {
-        rc=$1
-        printf 'exit=%s ended=%s secs=%s\n' "$rc" "$(iso)" "$(( $(now) - started ))" > "$status"
-        exit "$rc"
-    }
-    trap 'finish 143' TERM
-    trap 'finish 130' INT
+    # The command runs in the foreground, in the runner's process group, so
+    # Ctrl-C in the pane and `job stop` reach it and the runner alike. Not as a
+    # background `&` to wait on: bash starts a background command with SIGINT
+    # and SIGQUIT ignored, which every process under it inherits, so Ctrl-C in
+    # the pane, or a `timeout -s INT` the command uses itself, never lands.
+    # The traps only keep the runner alive until the command has ended, so the
+    # status line holds the command's own exit, whatever it made of the signal;
+    # a child of a shell gets back the default action of every signal it traps.
+    trap : INT TERM
     # nosleep holds a systemd inhibitor for the command's lifetime and is a
     # no-op where there is nothing to inhibit, so it costs nothing to always
     # ask for it and saves the run that would have been suspended mid-flight.
@@ -210,13 +232,13 @@ cmd_exec() {
         # hundred characters of PATH in front of the part that identifies it.
         # `nosleep --list` is where that string is read, when a hold is
         # refusing a suspend and the question is whose it is.
-        nosleep --why "job $name" bash -c 'exec "$@" >>"$JOB_LOG" 2>&1' job-exec "$@" &
+        nosleep --why "job $name" bash -c 'exec "$@" >>"$JOB_LOG" 2>&1' job-exec "$@"
     else
-        "$@" >> "$log" 2>&1 &
+        "$@" >> "$log" 2>&1
     fi
-    child=$!
-    wait "$child"
-    finish $?
+    rc=$?
+    printf 'exit=%s ended=%s secs=%s\n' "$rc" "$(iso)" "$(( $(now) - started ))" > "$status"
+    exit "$rc"
 }
 
 # --- wait
