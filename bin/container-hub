@@ -28,12 +28,14 @@ number. A unit goes once its tree is retired, or, with no tree, once every page 
 A unit's mark on the rail is its session's state: a turning three-quarter ring while it works (still where motion is
 reduced), red while it is blocked in its terminal, and while it is idle, a filled dot where it needs you, a filled
 sand one where it waits on a run and does not need you, and a hollow one otherwise. A session whose turn ended with a
-command left running in the background is idle, waiting on it. A command that ends on its own (a wait on a worker, a
-test suite) is a run. One that runs until stopped is a watcher; the hub knows it by `--watch` in its command
-(`diffview --watch`). Only a run fills the dot. The session page shows each run at the top of its turns, with its
-description, age and command, and the watchers in one line after them. The hub reads them from the session's
-transcript: each `Bash` call made with `run_in_background` that no task notification has named since, while the
-registry says a shell runs. An idle session needs you when its session page has a question no later turn answered or
+command left running in the background is idle, waiting on it. So is one whose turn ended with an agent it started in
+the background still at work, which the registry marks busy as it does a turn under way; the session's transcript
+tells the two apart. A command that ends on its own (a wait on a worker, a test suite) is a run, and so is an agent. A
+command that runs until stopped is a watcher; the hub knows it by `--watch` in its command (`diffview --watch`). Only
+a run fills the dot. The session page shows each run at the top of its turns, with its description, age and command,
+and the watchers in one line after them. The hub reads them from the session's transcript: each `Bash` call made with
+`run_in_background`, and each agent launched in the background, that no task notification has named since, while the
+registry says one runs. An idle session needs you when its session page has a question no later turn answered or
 superseded, or a turn record written since you last visited its unit; a session idle on a worker or a run, whose turns
 since were chat turns, does not. Under its title is its status line: the headline of its newest turn, a turn record's
 heading or the first line of a chat turn. Both are read from the session's page directory by the newest mx plugin's
@@ -91,7 +93,9 @@ trailers), and scrolls the first of them into view.
 Pages are served from here (`/f/<absolute path>`), so the hub tab shares their origin and reaches into them:
 their links and keys. A link there to a directory, or to a file the hub does not serve, copies its path instead,
 and looks like the code it is rather than a link; a plain click on inline code copies its text, and one on an image
-not linked elsewhere shows it over the whole tab, zoomed and panned as a figure is, and keeps nothing. A link to another
+not linked elsewhere shows it over the whole tab, zoomed and panned as a figure is, and keeps nothing. A markdown file
+is served rendered, in the house style, its frontmatter shown as the YAML it is; a button at its top right, which shows
+while the pointer is on the page, and the key y copy the file as written. A link to another
 session's session page (a handoff's "continues" or "continued in") takes the tab to that session's unit, as
 /u/<session id> does, and makes it a unit again where it had gone. A diffview page served here saves its comments
 through diffview's own code; `diffview --open`, `--watch` and `--serve` hand their pages here to be served. Worker
@@ -270,6 +274,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import tyro
+from markdown_it import MarkdownIt
+from markdown_it.common.normalize_url import validateLink
 
 HERE = Path(__file__).resolve().parent
 HOME = Path.home().resolve()
@@ -493,16 +499,25 @@ def session_tickets(agent: Path, session: str, memo: dict | None = None) -> list
 
 
 RUNNING = ("busy", "shell")
-"""A registry status of a session something of which still runs: a turn (`busy`), or, its turn over, a shell it left
-running in the background (`shell`), which closing its panes or clearing it would cut off. The others are `idle`, and
-`waiting` on something in its terminal, which `waitingFor` names: "permission prompt", "input needed", "dialog open".
-As Claude Code 2.1.296 writes them."""
+"""A registry status of a session something of which still runs: a turn or an agent it started in the background
+(`busy`), or, its turn over, a shell it left running in the background (`shell`), which closing its panes or clearing
+it would cut off. The others are `idle`, and `waiting` on something in its terminal, which `waitingFor` names:
+"permission prompt", "input needed", "dialog open". As Claude Code 2.1.302 writes them."""
 
 
-def shown_state(status: str) -> str:
-    """A registry status as a unit shows it: a session whose turn ended on a shell left running in the background is
-    idle, waiting on that run as on a worker; it takes input and is no longer at work."""
-    return "idle" if status == "shell" else status
+def shown_state(entry: dict, memo: dict) -> str:
+    """A running session's registry status as its unit shows it: a session whose turn ended on a shell or an agent
+    left running in the background is idle, waiting on that run as on a worker; it takes input and is no longer at
+    work."""
+    status = entry.get("status", "idle")
+    return "idle" if status == "shell" or status == "busy" and turn_ended(entry, memo) else status
+
+
+def turn_ended(entry: dict, memo: dict) -> float | None:
+    """When a running session's last turn ended, where no turn has started since. Claude Code's registry cannot say:
+    it marks a session `busy` while a turn is under way or an agent, workflow or teammate it started runs in the
+    background. Its transcript can (`turn_marks`)."""
+    return transcript_read(str(entry["sessionId"]), memo)["ended"]
 
 
 def rank(unit: dict) -> int:
@@ -576,15 +591,19 @@ def claude_title(session: str, memo: dict) -> str | None:
 
 USER_LINE = re.compile(rb'^\{.*"type":"user".*$', re.MULTILINE)
 LAUNCH_LINE = re.compile(rb'^\{.*"run_in_background":\s*true.*$', re.MULTILINE)
+AGENT_LINE = re.compile(rb'^\{.*"(?:status":"async_launched|resumedAgentId)".*$', re.MULTILINE)
 NOTIFIED_LINE = re.compile(rb'^\{.*<tool-use-id>.*$', re.MULTILINE)
-NOTIFIED = re.compile(r"<task-notification>.*?<tool-use-id>(\S+?)</tool-use-id>", re.S)
-NOTHING_READ = {"custom": None, "ai": None, "prompted": None, "background": {}}
+NOTIFIED = re.compile(r"<(?:tool-use|task)-id>(\S+?)</(?:tool-use|task)-id>")
+TURN_START = re.compile(rb'^\{"type":"api-request",', re.MULTILINE)
+TURN_END_LINE = re.compile(rb'^\{.*"subtype":"turn_duration".*$', re.MULTILINE)
+NOTHING_READ: dict = {"custom": None, "ai": None, "prompted": None, "background": {}, "agents": {}, "ended": None}
 
 
 def transcript_read(session: str, memo: dict) -> dict:
-    """What the hub reads of a session's transcript: its titles, when the user last sent it a prompt (`prompted_at`), and
-    the commands it left running in the background (`still_running`). A transcript only grows, so what was read of
-    it is kept while it grows, and a read takes only what was added since."""
+    """What the hub reads of a session's transcript: its titles, when the user last sent it a prompt (`prompted_at`),
+    the commands it left running in the background (`still_running`), and when its last turn ended while none has
+    started since (`turn_marks`). A transcript only grows, so what was read of it is kept while it grows, and a read
+    takes only what was added since."""
     path = transcript(session, memo)
     try:
         st = path.stat() if path else None
@@ -614,16 +633,21 @@ def transcript_read(session: str, memo: dict) -> dict:
         # a tool's result is most of a transcript's user lines, and the largest: never parsed
         prompts = [at for m in USER_LINE.finditer(whole) if b'"toolUseResult"' not in m[0] and (at := prompted_at(m[0]))]
         found["prompted"] = max([found["prompted"] or 0, *prompts]) or None
-        found["background"] = still_running(whole, found["background"])
+        found["background"], found["agents"] = still_running(whole, found["background"], found["agents"])
+        found["ended"] = turn_marks(whole, found["ended"])
         transcripts_read[path] = (st.st_size, st.st_mtime, read + len(whole), found)
     return found
 
 
-def still_running(whole: bytes, before: dict[str, dict]) -> dict[str, dict]:
-    """The commands a session left running in the background and no task notification has said the end of yet, by
-    the id of the tool call that started each: {"what" (the description the agent gave it), "command", "at"}. Claude
-    Code notifies the session of each one's end, naming that call; a call's id appears in a later line only there."""
-    running = dict(before)
+def still_running(whole: bytes, before: dict[str, dict], agents: dict[str, str]) -> tuple[dict[str, dict], dict[str, str]]:
+    """The commands and agents a session left running in the background and no task notification has said the end of
+    yet, a command by the id of the tool call that started it, an agent by its own: {"what" (the description the
+    agent gave it), "command" (`agent` for an agent), "at"}; and every agent the session launched, its description by
+    its id. An agent runs in the background where its call's result says it was launched so (`async_launched`), and
+    again from a SendMessage whose result says it resumed it (`resumedAgentId`). Claude Code notifies the session of
+    each one's end, naming the call that launched it and an agent's id; either appears in a later line only there."""
+    running, agents = dict(before), dict(agents)
+    events: list[tuple[int, str, dict | None]] = []  # (where in the lines, the id, what started there or None for an end)
     for m in LAUNCH_LINE.finditer(whole):
         try:
             line = json.loads(m[0])
@@ -637,8 +661,24 @@ def still_running(whole: bytes, before: dict[str, dict]) -> dict[str, dict]:
             given = call.get("input") or {}
             if call.get("type") == "tool_use" and call.get("name") == "Bash" and given.get("run_in_background") is True:
                 command = str(given.get("command") or "")
-                running[str(call.get("id"))] = {"what": str(given.get("description") or command.split("\n")[0]),
-                                                "command": command, "at": epoch_of(line.get("timestamp"))}
+                events.append((m.start(), str(call.get("id")), {"what": str(given.get("description") or command.split("\n")[0]),
+                                                               "command": command, "at": epoch_of(line.get("timestamp"))}))
+    for m in AGENT_LINE.finditer(whole):
+        try:
+            line = json.loads(m[0])
+        except ValueError:
+            continue
+        result = line.get("toolUseResult")
+        if line.get("type") != "user" or not isinstance(result, dict):
+            continue
+        if result.get("status") == "async_launched" and result.get("agentId"):
+            agent = str(result["agentId"])
+            agents[agent] = str(result.get("description") or "an agent")
+        elif result.get("resumedAgentId"):
+            agent = str(result["resumedAgentId"])
+        else:  # a command's output can quote either
+            continue
+        events.append((m.start(), agent, {"what": agents.get(agent, "an agent"), "command": "agent", "at": epoch_of(line.get("timestamp"))}))
     for m in NOTIFIED_LINE.finditer(whole):
         if b'"toolUseResult"' in m[0]:  # a command's own output can quote a notification
             continue
@@ -648,9 +688,35 @@ def still_running(whole: bytes, before: dict[str, dict]) -> dict[str, dict]:
             continue
         said = (line.get("attachment") or {}).get("prompt") if line.get("type") == "attachment" else (line.get("message") or {}).get("content")
         if line.get("type") in ("user", "attachment") and isinstance(said, str):
-            for ended in NOTIFIED.findall(said):
-                running.pop(ended, None)
-    return running
+            for notice in said.split("<task-notification>")[1:]:
+                events += [(m.start(), ended, None) for ended in NOTIFIED.findall(notice.split("</task-notification>")[0])]
+    for _, key, started in sorted(events, key=lambda e: e[0]):  # an agent resumed after its end runs again
+        if started:
+            running[key] = started
+        else:
+            running.pop(key, None)
+    return running, agents
+
+
+def turn_marks(whole: bytes, before: float | None) -> float | None:
+    """When the session's last turn ended, after these lines, where no turn has started since; `before` where they
+    hold neither. Claude Code 2.1.302 writes an `api-request` line at each call to the model from the session's main
+    thread, its first right after the prompt that starts a turn, and a `turn_duration` line once the turn ends. An
+    agent's calls go to a transcript of its own, and a local command (/reload-plugins) calls no model."""
+    started = max((m.start() for m in TURN_START.finditer(whole)), default=-1)
+    ended, at = -1, None
+    for m in TURN_END_LINE.finditer(whole):
+        if b'"toolUseResult"' in m[0]:  # a command's output can quote one
+            continue
+        try:
+            line = json.loads(m[0])
+        except ValueError:
+            continue
+        if line.get("type") == "system" and line.get("subtype") == "turn_duration" and not line.get("isSidechain"):
+            ended, at = m.start(), epoch_of(line.get("timestamp"))
+    if ended > started:
+        return at
+    return None if started >= 0 else before
 
 
 def epoch_of(iso: object) -> float | None:
@@ -662,11 +728,11 @@ def epoch_of(iso: object) -> float | None:
 
 
 def background(session: str, entry: dict | None, memo: dict) -> list[dict]:
-    """The commands an idle session left running in the background, oldest first, each marked a `watcher` as the
-    module's docstring defines one, where the registry says a shell runs (`shell`). Only those its running processes
-    started: a resumed session's transcript also holds the launches of a process that has exited, whose shells ended
-    with it and were never notified of."""
-    if not entry or entry.get("status") != "shell":
+    """The commands and agents an idle session left running in the background, oldest first, each marked a `watcher`
+    as the module's docstring defines one, where the registry says one runs (`shell`, or `busy` with its turn over).
+    Only those its running processes started: a resumed session's transcript also holds the launches of a process
+    that has exited, whose shells and agents ended with it and were never notified of."""
+    if not entry or entry.get("status") not in RUNNING or shown_state(entry, memo) != "idle":
         return []
     since = min((p["startedAt"] / 1000 for p in entry["processes"] if isinstance(p.get("startedAt"), (int, float))), default=0)
     commands = sorted((c for c in transcript_read(session, memo)["background"].values() if (c["at"] or 0) >= since),
@@ -1006,7 +1072,7 @@ INLINE = re.compile(r"text/(html|plain|css|javascript)|application/(json|pdf)|(i
 
 
 def content_type(path: Path, body: bytes) -> str:
-    """Text a browser would download (TOML, YAML, Nix, shell, markdown) goes out as plain text, for the pane to show."""
+    """Text a browser would download (TOML, YAML, Nix, shell) goes out as plain text, for the pane to show."""
     guessed = mimetypes.guess_type(path.name)[0]
     if guessed and INLINE.fullmatch(guessed):
         return guessed
@@ -1015,6 +1081,83 @@ def content_type(path: Path, body: bytes) -> str:
     except UnicodeDecodeError:
         return guessed or "application/octet-stream"
     return "text/plain; charset=utf-8"
+
+
+MARKDOWN_SUFFIXES = (".md", ".markdown")
+
+
+def markdown_page(path: Path, body: bytes) -> bytes:
+    """A markdown file as a page in the house style: its frontmatter as the YAML it is, then its text rendered,
+    titled by its first heading, with a button and the key y that copy the file as written. Raw HTML in it shows as
+    text, since a page served here can act on the hub tab."""
+    text = body.decode(errors="replace")
+    front = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    tokens = MARKDOWN.parse(text[front.end():] if front else text)
+    title = next((tokens[i + 1].content for i, t in enumerate(tokens) if t.type == "heading_open" and t.tag == "h1"), path.name)
+    house = mx_script("house-style/tokens.css")
+    parts = {"TITLE": html.escape(title), "TOKENS": house.read_text() if house else "",
+             "SOURCE": json.dumps(text).replace("<", "\\u003c"),  # no text in the file ends its script element
+             "BODY": (f'<pre class="front">{html.escape(front.group(1))}</pre>\n' if front else "")
+             + MARKDOWN.renderer.render(tokens, MARKDOWN.options, {})}
+    return re.sub(r"__(TITLE|TOKENS|SOURCE|BODY)__", lambda m: parts[m[1]], MARKDOWN_PAGE).encode()
+
+
+def file_links(self, tokens, idx, options, env) -> str:
+    """A link to an absolute or ~ path would resolve against the hub's address; as a file:// URL the hub tab routes it."""
+    href = tokens[idx].attrGet("href") or ""
+    if href.startswith(("/", "~/")):
+        tokens[idx].attrSet("href", Path(href).expanduser().as_uri())
+    return self.renderToken(tokens, idx, options, env)
+
+
+MARKDOWN = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable(["table", "strikethrough", "linkify"])
+MARKDOWN.linkify.set({"fuzzy_link": False, "fuzzy_email": False})  # `container-hub.py` is no domain
+MARKDOWN.validateLink = lambda url: url.strip().lower().startswith("file:") or validateLink(url)
+MARKDOWN.add_render_rule("link_open", file_links)
+
+MARKDOWN_PAGE = """<!doctype html><meta charset="utf-8"><title>__TITLE__</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,400;1,6..72,600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>__TOKENS__
+  :root { --size-body: 16px; }
+  main { padding: 1.5rem 1.75rem 4rem; }
+  h1 { font-weight: 600; font-size: 1.6em; line-height: 1.2; color: var(--strong); margin: 0 0 1rem; }
+  .prose h4, .prose h5, .prose h6 { font-weight: 600; margin-top: 1.5em; }
+  .prose li > p { margin: 0; }
+  .prose pre { background: var(--ground-2); padding: 0.75em 1em; border-radius: var(--radius); overflow-x: auto; font-size: 0.85em; line-height: 1.5; }
+  .prose pre code { background: none; padding: 0; font-size: inherit; }
+  .prose img { max-width: 100%; }
+  .prose hr { border: 0; border-top: 1px solid var(--edge); }
+  .front { font: 0.8125rem/1.5 var(--font-mono); color: var(--muted); background: none !important; padding: 0 0 0.75em !important;
+    border-bottom: 1px solid var(--edge); border-radius: 0 !important; white-space: pre-wrap; }
+  /* the copy button shows while the pointer is on the page, as a session page turn's does on the turn */
+  #copy { position: fixed; top: 0.75rem; right: 0.75rem; display: inline-flex; padding: 0.3rem; border: 1px solid var(--edge);
+    border-radius: var(--radius); background: var(--ground-2); color: var(--muted); cursor: pointer; opacity: 0;
+    transition: opacity 150ms, color 150ms, border-color 150ms; }
+  body:hover #copy, #copy:focus-visible { opacity: 1; }
+  #copy:hover, #copy.done { color: var(--accent); border-color: var(--accent); }
+  @media (hover: none) { #copy { opacity: 1; } }
+</style>
+<body><main class="prose">
+__BODY__</main>
+<button id="copy" type="button" aria-label="copy the markdown" title="copy the markdown (y)"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg></button>
+<script type="application/json" id="source">__SOURCE__</script>
+<script>
+  const button = document.getElementById("copy"), source = JSON.parse(document.getElementById("source").textContent);
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(source); }
+    catch {  // a frame the clipboard API refuses
+      const ta = Object.assign(document.createElement("textarea"), { value: source });
+      document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+    }
+    button.classList.add("done"); button.title = "copied";
+    setTimeout(() => { button.classList.remove("done"); button.title = "copy the markdown (y)"; }, 1200);
+  };
+  button.addEventListener("click", copy);
+  addEventListener("keydown", (e) => {
+    if (e.key === "y" && !(e.ctrlKey || e.metaKey || e.altKey) && !e.target.matches("input, textarea, [contenteditable]")) copy();
+  });
+</script></body>
+"""
 
 
 def too_broad(directory: Path) -> bool:
@@ -1418,8 +1561,8 @@ def unit_view(key: str, live: dict[str, dict], memo: dict) -> dict | None:
     entry = live.get(session) if session else None
     kept_at = transcript(session, memo) if session and not entry else None
     account = entry["account"] if entry else account_of(kept_at.parent.parent.parent) if kept_at else None
-    state = None if not session else shown_state(entry.get("status", "idle")) if entry else "ended"
-    last = last_turn(session_page, entry)
+    state = None if not session else shown_state(entry, memo) if entry else "ended"
+    last = last_turn(session_page, entry, memo)
     said = page_says(session_page.parent if session_page and session_page.is_file() else None, page_reader(memo))
     title = ((session_dir and session_title(session_dir)) or (session and claude_title(session, memo)) or (entry or {}).get("name")
              or (f"session {session[:8]}" if session else "loose pages"))
@@ -1519,11 +1662,14 @@ def modified(member: dict) -> float:
         return 0
 
 
-def last_turn(session_page: Path | None, entry: dict | None) -> float:
+def last_turn(session_page: Path | None, entry: dict | None, memo: dict) -> float:
     """When a session last finished a turn: its page's last render, which the Stop hook writes at every turn's end,
-    or the registry marking it idle. 0 when neither says."""
+    the registry marking it idle, or, where the registry has it busy on an agent in the background, its transcript.
+    0 when none says."""
     times = [session_page.stat().st_mtime] if session_page and session_page.is_file() else []
-    if entry and shown_state(entry.get("status", "")) == "idle" and isinstance(entry.get("statusUpdatedAt"), (int, float)):
+    if entry and entry.get("status") == "busy" and (ended := turn_ended(entry, memo)):
+        times.append(ended)
+    elif entry and shown_state(entry, memo) == "idle" and isinstance(entry.get("statusUpdatedAt"), (int, float)):
         times.append(entry["statusUpdatedAt"] / 1000)
     return max(times, default=0)
 
@@ -1956,7 +2102,7 @@ def close_panes(body: dict) -> tuple[int, dict]:
     try:
         entry, panes, why = panes_of(body["unit"])
         if entry and any(p.get("status") in RUNNING for p in entry["processes"]):
-            return 409, {"error": "the session is at work, or a shell it left in the background still runs; close it once that is done"}
+            return 409, {"error": "the session is at work, or a shell or an agent it left in the background still runs; close it once that is done"}
         if not panes:
             return 409, {"error": why}
         closed = []
@@ -2304,7 +2450,8 @@ def hand_off_in(key: str, shown: dict) -> tuple[int, dict]:
         return 409, {"error": "the session has ended"}
     if entry.get("status") != "idle":
         doing = {"waiting": f"blocked in its terminal ({entry.get('waitingFor') or 'waiting'})",
-                 "shell": "running a shell it left in the background"}.get(entry.get("status"), "working")
+                 "shell": "running a shell it left in the background"}.get(entry.get("status"))
+        doing = doing or ("running an agent it left in the background" if turn_ended(entry, {}) else "working")
         return 409, {"error": f"the session is {doing}; try again once it is idle"}
     state = handoff_state(entry, {})
     if not state:
@@ -2551,6 +2698,8 @@ class Handler(BaseHTTPRequestHandler):
             if found := retired(path):
                 name, body, sha = found
                 ctype = content_type(name, body)
+                if name.suffix in MARKDOWN_SUFFIXES:
+                    body, ctype = markdown_page(name, body), "text/html"
                 if ctype == "text/html":
                     banner = f'<div style="font:12px/1.6 monospace;padding:2px 10px;background:#e8d9b5;color:#3b2f20">retired in {sha}; shown from the agent repo\'s history</div>'
                     return self.send_page(re.sub(rb"(<body[^>]*>)", lambda m: m.group(1) + banner.encode(), body, count=1), ctype)
@@ -2558,6 +2707,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, f"{path} does not exist".encode(), "text/plain")
         body = path.read_bytes()
         ctype = content_type(path, body)
+        if path.suffix in MARKDOWN_SUFFIXES:
+            return self.send_page(markdown_page(path, body), "text/html; charset=utf-8")
         if ctype == "text/html":
             return self.send_page(body, ctype)
         self.send(200, body, ctype)

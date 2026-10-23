@@ -16,6 +16,7 @@
     ./backup-target.nix
     ../host-recorder.nix
     ../journald.nix
+    ../uv-python.nix
   ];
 
   hardware.facter.reportPath = ./facter.json;

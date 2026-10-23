@@ -28,7 +28,7 @@ vim.schedule(function()
   require "mappings"
 end)
 
--- vim.cmd.colorscheme "catppuccin"
+vim.cmd.colorscheme "house"
 
 -- Highlight when yanking (copying) text
 vim.api.nvim_create_autocmd('TextYankPost', {
