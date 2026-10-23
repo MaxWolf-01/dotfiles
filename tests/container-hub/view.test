@@ -2249,6 +2249,140 @@ def a_window_made_narrow(w: World) -> None:
             lambda: (w.view.evaluate("document.body.classList.contains('phone')"), w.shown("rail-side"), w.shown("session-side"), w.on_screen()))
 
 
+# ---- another host's sessions, through the hub that relays its hub
+
+PEER = session_id(0x21)  # a session on the laptop, in a tmux pane
+
+
+@scenario
+def a_peers_sessions(w: World) -> None:
+    """hub-relays-peer-backends: the world's hub is pc's, relaying a laptop's hub on a HOME of its own. The laptop's
+    session runs in a pane of the world's tmux server, which the laptop's hub types into."""
+    home = w.scratch / "lap"
+    (home / ".claude/sessions").mkdir(parents=True)
+    (home / ".claude/projects").mkdir()  # an account the form offers
+    env = {**w.env, "HOME": str(home)}
+    lap = [str(BIN / "container-hub"), "--socket", str(w.scratch / "lap.sock"), "--url", "http://laptop.invalid",
+           "--state", str(w.scratch / "lap-state"), "--host", "laptop", "--tmux-socket", str(w.tmux_socket)]
+
+    def start_laptop() -> subprocess.Popen:
+        hub = subprocess.Popen(lap, env=env, stdout=subprocess.DEVNULL, stderr=(w.scratch / "lap.log").open("a"), start_new_session=True)
+        until(lambda: (w.scratch / "lap.sock").exists() or hub.poll() is not None, "the laptop's hub to listen")
+        return hub
+
+    def stop(hub: subprocess.Popen) -> None:
+        os.killpg(hub.pid, signal.SIGKILL)
+        hub.wait()
+
+    received, recorder = w.scratch / "lap-received", w.scratch / "recorder.py"
+    recorder.write_text("import os, sys, tty\ntty.setraw(0)\nos.write(1, b'\\x1b[?2004h')\nout = open(sys.argv[1], 'ab', buffering=0)\n"
+                        "while data := os.read(0, 4096):\n    out.write(data)\n")
+    w.tmux("-f", "/dev/null", "new-session", "-d", "-s", "lap", "-x", "100", "-y", "20", f"exec {sys.executable} {recorder} {received}")
+    pane, pid = w.tmux("display-message", "-p", "-t", "lap:", "#{pane_id} #{pane_pid}").split()
+    (home / ".claude/sessions" / f"{pid}.json").write_text(json.dumps({
+        "pid": int(pid), "procStart": started(pid), "sessionId": PEER, "status": "idle", "statusUpdatedAt": int(w.t0 * 1000) - 50_000,
+        "tmux": f"lap:@1.{pane}"}))
+    laptop = start_laptop()
+    try:
+        shown = home / "notes" / "laptop.html"
+        shown.parent.mkdir()
+        shown.write_text("<!doctype html><h1>written on the laptop</h1>")
+        figure = home / "notes" / "figure.svg"
+        figure.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20"/></svg>')
+        # the page in the right pane, a frame there, beside the figure in the left, an image there
+        for opened in ({"target": str(shown), "lane": "code"}, {"target": str(figure)}):
+            subprocess.run(["curl", "-sf", "--unix-socket", str(w.scratch / "lap.sock"), "-H", "Content-Type: application/json", "-d",
+                            json.dumps({**opened, "session": PEER}), "http://hub/api/open"], check=True, capture_output=True)
+        w.kill_hub()
+        w.hub_args += ["--host", "pc", "--peer", f"laptop={w.scratch / 'lap.sock'}"]
+        w.start_hub()
+        w.view.reload()
+        key = f"laptop/{PEER}"
+        w.view.wait_for_function(f"window.wc && wc.state.units.some(u => u.unit === {json.dumps(key)})", timeout=30000)
+        hosts = lambda: w.view.evaluate("[...document.querySelectorAll('#units .nav')].map(b => [b.title.replace('session ', ''), b.querySelector('.host')?.textContent])")
+        settles("one rail holds both hosts' sessions, each row naming its host", sorted([[ORCHESTRATOR, "pc"], [PEER, "laptop"]]),
+                lambda: sorted(hosts()))
+        w.view.locator(f'#units button[title="session {PEER}"] .name').click()
+        until(lambda: w.current() == key, "the laptop's unit")
+        check("its session page is the laptop's hub's, through the relay", f"/h/laptop/pages/{PEER}",
+              urllib.parse.urlsplit(until(w.sidebar_url, "the session sidebar")).path)
+        w.frame_at("/laptop.html")  # its page, in its pane
+        box = lambda: w.view.evaluate(f"(b => b && [b.dataset.state, b.querySelector('.how').textContent])({BOX})")
+        settles("the box types into the laptop's pane", ["waiting", "idle · enter types into tmux session lap"], box)
+        w.view.evaluate(f"{BOX}.querySelector('textarea').focus()")
+        w.view.keyboard.type("from pc")
+        w.view.keyboard.press("Enter")
+        settles("...and what it sends, the laptop's hub types there", b"\x1b[200~from pc\x1b[201~\r",
+                lambda: received.read_bytes() if received.exists() else b"")
+
+        stop(laptop)
+        aside = lambda: w.view.evaluate("[...document.querySelectorAll('#aside-units > *')].map(e => e.tagName === 'H2' ? e.textContent.replace(/; as read at .*/, '') : e.querySelector('.nav').title.replace('session ', ''))")
+        settles("with the laptop down, its session shows under the laptop, as last read, and not among the ended",
+                ["laptop does not answer", PEER], aside, within=20)
+        check("...its mark the state it was last read in, faded", ["idle", True],
+              w.view.evaluate(f"(m => [m.dataset.state, 'unreachable' in m.dataset])(document.querySelector('#aside-units button[title=\"session {PEER}\"] .mark'))"))
+        settles("...and its box sends nothing, saying why", "none", lambda: (box() or [None])[0])
+        settles("...in so many words", True, lambda: box()[1].startswith("laptop does not answer; as read at "))
+        check("...and offers none of what it refuses: no jump, no close, no handoff", [False, False],
+              w.view.evaluate(f"(b => [b.querySelector('.acts').checkVisibility(), b.querySelector('.offer')?.checkVisibility() ?? false])({BOX})"))
+        # A tab opened while the laptop is down: each page of its unit is a notice in the hub's style, in place of the page.
+        notices = lambda page: page.evaluate("""[...document.querySelectorAll('#session-frames > .current iframe, #work iframe')]
+          .filter(f => f.getAttribute('src').startsWith('/h/laptop/') && !f.closest('.figure')).map(f => {
+            const d = f.contentDocument, own = d?.querySelector('meta[name="hub-unreachable"]');
+            return [f.getAttribute('src').split('/').pop(), own ? d.querySelector('h1').textContent : null];
+          }).concat([...document.querySelectorAll('#work .figure')].filter(b => b.querySelector('img').getAttribute('src').startsWith('/h/laptop/'))
+            .map(b => ['figure.svg', b.querySelector('.unreachable')?.contentDocument?.querySelector('h1')?.textContent ?? null])).sort()""")
+        figures = lambda page: page.evaluate("document.querySelectorAll('#work .figure img').length")
+        desk = w.fresh_tab()
+        down = sorted([[PEER, "laptop does not answer"], ["laptop.html", "laptop does not answer"], ["figure.svg", "laptop does not answer"]])
+        settles("a tab opened with the laptop down shows a notice in place of the session page, a page and a figure", down,
+                lambda: notices(desk), within=20)
+        check("...the figure an image of the tab's, the notice in its place", 1, figures(desk))
+        check("...saying when the hub last read the laptop", True, desk.evaluate(
+            "/The hub last read laptop at \\d\\d:\\d\\d\\b/.test(document.querySelector('#session-frames > .current iframe').contentDocument.body.textContent)"))
+        phone = w.fresh_tab()
+        phone.set_viewport_size(PHONE)
+        notice_fits = lambda: phone.evaluate("""(f => { const d = f?.contentDocument; return !!d?.querySelector('meta[name="hub-unreachable"]')
+            && d.documentElement.scrollWidth <= d.documentElement.clientWidth && f.checkVisibility(); })(document.querySelector('#session-frames > .current iframe'))""")
+        settles("...and at phone width, the notice fitting the screen", True, notice_fits, within=20)
+        check("...under a box with no send button", False, phone.evaluate(f"{BOX}.querySelector('.send').checkVisibility()"))
+        phone.close()
+        w.view.locator("#start").click()
+        starts_on = lambda: w.view.evaluate("[...document.querySelectorAll('#start-host option')].map(o => o.value)")
+        settles("...and the form that starts a session offers this host alone", ["pc"], starts_on)
+        w.view.keyboard.press("Escape")
+        laptop = start_laptop()
+        settles("the laptop back, its session is numbered on the rail again", True,
+                lambda: w.view.evaluate(f"!!wc.state.units.find(u => u.unit === {json.dumps(key)})?.number"), within=20)
+        settles("...and the tab opened while it was down shows its pages in place of the notices",
+                sorted([[PEER, None], ["laptop.html", None], ["figure.svg", None]]), lambda: notices(desk), within=20)
+        desk.close()
+        w.view.locator("#start").click()
+        settles("...and the form names the host a session starts on: either", ["pc", "laptop"], starts_on)
+        w.view.select_option("#start-host", "laptop")
+        settles("...offering, for the laptop, what the laptop's hub offers", True,
+                lambda: w.view.evaluate(f"[...document.querySelectorAll('#start-account option')].some(o => o.value.startsWith({json.dumps(str(home))}))"))
+        # A directory only the laptop has, and a model no hub takes: pc's hub would refuse the directory, the laptop's
+        # refuses the model, before it starts anything.
+        w.view.fill("#start-project", str(shown.parent))
+        w.view.fill("#start-model", "no model!")
+        w.view.locator("#starter button[type=submit]").click()
+        settles("...and starts it there: the laptop's hub is the one that answers", "not started: 'no model!' is no model name",
+                lambda: w.view.evaluate("document.querySelector('#starter .say').textContent"))
+        w.view.keyboard.press("Escape")
+        on_laptop = lambda: json.loads(subprocess.run(["curl", "-sf", "--unix-socket", str(w.scratch / "lap.sock"), f"http://hub/api/u/{PEER}"],
+                                                      check=True, capture_output=True).stdout)
+        w.view.keyboard.press("Control+Alt+d")
+        settles("ctrl+alt+d sets the laptop's session aside on the laptop's hub", True, lambda: on_laptop()["dismissed"])
+        w.view.keyboard.press("Control+Alt+x")
+        w.view.keyboard.press("Control+Alt+x")
+        settles("ctrl+alt+x twice closes the laptop's session's pane, through the laptop's hub", False,
+                lambda: pane in subprocess.run([w.tmux_shim, "-S", w.tmux_socket, "list-panes", "-a", "-F", "#{pane_id}"],
+                                               env=w.env, capture_output=True, text=True).stdout.split())  # its server goes with its last pane
+    finally:
+        stop(laptop)
+
+
 # ---- running them
 
 def run(browser, scratch: Path, name: str) -> None:

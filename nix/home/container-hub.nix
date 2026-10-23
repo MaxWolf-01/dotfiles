@@ -29,11 +29,23 @@
 #
 # Restart=always, not on-failure: the hub never exits on its own, so any exit,
 # a clean one included, leaves every agent's pages opening as plain tabs.
+#
+# A peer is another host's hub this one relays (the hub's --peer), reached
+# over ssh as max: ssh forwards the peer's socket to one here that only max
+# can open, since ssh makes it 0600 (StreamLocalBindMask) in a directory of
+# his. Not over the peer's tailnet port: the tailnet policy cannot tell max's
+# processes on pc from the dispatch workers beside them, so a grant from pc to
+# that port would let a worker drive the peer's sessions, and the workers hold
+# no ssh login to the peer. The forward is a unit of its own: a peer asleep or
+# out of reach is ssh failing and trying again every 30s, while the hub shows
+# what it last read of the peer.
 { config, pkgs, lib, ... }:
 let
   cfg = config.containerHub;
   port = "8377";
-  socket = "${config.home.homeDirectory}/.local/state/container-hub/hub.sock";
+  state = "${config.home.homeDirectory}/.local/state/container-hub";
+  socket = "${state}/hub.sock";
+  peerSocket = name: "${state}/peers/${name}.sock";
   scriptPath = lib.makeBinPath ((with pkgs; [ bash coreutils uv git curl ]) ++ [ config.programs.tmux.package ]);
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
 in
@@ -56,6 +68,15 @@ in
         port on the tailnet (the hub's --tailnet). A host whose serve table a
         system unit owns (pc) serves the socket from there instead.'';
     };
+    peers = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      example = { zephylux = "zephylux"; };
+      description = ''
+        The other hosts' hubs this one relays: the host name the hub tab
+        shows, to the ssh destination that reaches that host. Its hub listens
+        where this host's does, under the same home.'';
+    };
   };
 
   config.assertions = [
@@ -69,23 +90,47 @@ in
     }
   ];
 
-  config.systemd.user.services.container-hub = {
-    Unit.Description = "The container hub: every page an agent opens, in its orchestrator's unit";
+  config.systemd.user.services = {
+    container-hub = {
+      Unit.Description = "The container hub: every page an agent opens, in its orchestrator's unit";
+      Service = {
+        ExecStart = lib.escapeShellArgs ([ "${dotfiles}/bin/container-hub" "--socket" socket ]
+          ++ lib.optionals cfg.loopback [ "--port" port ]
+          ++ lib.optionals (cfg.url != null) [ "--url" cfg.url ]
+          ++ lib.optionals (cfg.tailnet != null) [ "--tailnet" cfg.tailnet ]
+          ++ lib.optionals (cfg.peers != { }) ([ "--peer" ] ++ lib.mapAttrsToList (name: _: "${name}=${peerSocket name}") cfg.peers));
+        # "-": the hub never waits on tailscale, so a laptop offline or with
+        # tailscaled stopped keeps its hub. tailscale is the Ubuntu system
+        # package in /usr/bin. max is its operator, which lets him proxy a port
+        # without sudo, though not serve a socket.
+        ExecStartPost = lib.optional (cfg.tailnet != null)
+          "-/usr/bin/tailscale serve --bg --yes --https=${port} http://127.0.0.1:${port}";
+        Environment = [ "PATH=${scriptPath}" "TMUX_TMPDIR=%t" ];
+        Restart = "always";
+        RestartSec = 2;
+      };
+      Install.WantedBy = [ "default.target" ];
+    };
+  } // lib.mapAttrs' (name: destination: lib.nameValuePair "container-hub-peer-${name}" {
+    Unit = {
+      Description = "The container hub's way to ${name}'s hub: its socket, forwarded over ssh";
+      After = [ "ssh-agent.service" ];
+      Wants = [ "ssh-agent.service" ];
+      StartLimitIntervalSec = 0; # a peer asleep for a week is tried all week
+    };
     Service = {
-      ExecStart = lib.escapeShellArgs ([ "${dotfiles}/bin/container-hub" "--socket" socket ]
-        ++ lib.optionals cfg.loopback [ "--port" port ]
-        ++ lib.optionals (cfg.url != null) [ "--url" cfg.url ]
-        ++ lib.optionals (cfg.tailnet != null) [ "--tailnet" cfg.tailnet ]);
-      # "-": the hub never waits on tailscale, so a laptop offline or with
-      # tailscaled stopped keeps its hub. tailscale is the Ubuntu system
-      # package in /usr/bin. max is its operator, which lets him proxy a port
-      # without sudo, though not serve a socket.
-      ExecStartPost = lib.optional (cfg.tailnet != null)
-        "-/usr/bin/tailscale serve --bg --yes --https=${port} http://127.0.0.1:${port}";
-      Environment = [ "PATH=${scriptPath}" "TMUX_TMPDIR=%t" ];
+      ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p -m 700 ${state}/peers";
+      # BatchMode: no prompt waits on nobody, so a key still locked after a
+      # reboot is a failure tried again. ExitOnForwardFailure: an ssh that
+      # could not make the socket exits rather than holding nothing.
+      # StreamLocalBindUnlink: the socket a killed ssh left is made anew.
+      ExecStart = lib.escapeShellArgs [ "${pkgs.openssh}/bin/ssh" "-N" "-oBatchMode=yes" "-oConnectTimeout=10"
+        "-oServerAliveInterval=15" "-oServerAliveCountMax=3" "-oExitOnForwardFailure=yes"
+        "-oStreamLocalBindUnlink=yes" "-L" "${peerSocket name}:${socket}" destination ];
+      Environment = [ "SSH_AUTH_SOCK=%t/ssh-agent" ];
       Restart = "always";
-      RestartSec = 2;
+      RestartSec = 30;
     };
     Install.WantedBy = [ "default.target" ];
-  };
+  }) cfg.peers;
 }
