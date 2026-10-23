@@ -62,6 +62,35 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- YouTube → xmg19 ---
+
+  systemd.user.services.youtube-xmg19 = {
+    Unit = {
+      Description = "Restic backup to xmg19 (YouTube archive)";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/youtube/xmg19.conf";
+    };
+  };
+
+  systemd.user.timers.youtube-xmg19 = {
+    Unit.Description = "Daily backup to xmg19 (YouTube archive)";
+    Timer = {
+      OnCalendar = "*-*-* 02:30:00";
+      Persistent = true;
+      RandomizedDelaySec = "5m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Phone sync (rsync over Tailscale SSH) ---
 
   systemd.user.services.phone-sync = {
@@ -118,6 +147,36 @@ in
       OnCalendar = "daily";
       Persistent = true;
       RandomizedDelaySec = "20m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Phone → xmg19 ---
+  # After the sync for the reason phone-rsyncnet gives.
+
+  systemd.user.services.phone-xmg19 = {
+    Unit = {
+      Description = "Restic backup to xmg19 (phone data)";
+      After = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/xmg19.conf";
+    };
+  };
+
+  systemd.user.timers.phone-xmg19 = {
+    Unit.Description = "Daily backup to xmg19 (phone data)";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
@@ -179,6 +238,35 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Encrypted → xmg19 ---
+
+  systemd.user.services.encrypted-xmg19 = {
+    Unit = {
+      Description = "Restic backup to xmg19 (encrypted data)";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/encrypted/xmg19.conf";
+    };
+  };
+
+  systemd.user.timers.encrypted-xmg19 = {
+    Unit.Description = "Weekly backup to xmg19 (encrypted data)";
+    Timer = {
+      OnCalendar = "weekly";
+      Persistent = true;
+      RandomizedDelaySec = "1h50m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- pc service state → rsync.net ---
   # pc-local app state (e.g. mdsr's spaced-repetition DB) that lives on pc's own
   # disk, not in a tank dataset. ExecStartPre stages consistent snapshots; the
@@ -213,6 +301,39 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- pc service state → xmg19 ---
+  # Stages into a tree of its own (base_path in pcstate/xmg19.conf): staging
+  # starts by deleting the tree, and sharing pcstate-rsyncnet's would let one
+  # run delete it under the other's restic.
+
+  systemd.user.services.pcstate-xmg19 = {
+    Unit = {
+      Description = "Restic backup to xmg19 (pc service state)";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${backupPath}"
+        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStartPre = "${dotfiles}/backup/pcstate_snapshot.sh ${home}/.local/state/pcstate-xmg19";
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/pcstate/xmg19.conf";
+    };
+  };
+
+  systemd.user.timers.pcstate-xmg19 = {
+    Unit.Description = "Weekly backup to xmg19 (pc service state)";
+    Timer = {
+      OnCalendar = "weekly";
+      Persistent = true;
+      RandomizedDelaySec = "50m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Catch-up handle ---
   # "The backups can run now." secrets/zshrc starts it on login, when the age key
   # is decrypted or the ssh key enters the agent, and zfs-unlock starts it when a
@@ -237,6 +358,10 @@ in
         "phone-pc.service"
         "encrypted-rsyncnet.service"
         "pcstate-rsyncnet.service"
+        "youtube-xmg19.service"
+        "phone-xmg19.service"
+        "encrypted-xmg19.service"
+        "pcstate-xmg19.service"
       ];
     };
   };

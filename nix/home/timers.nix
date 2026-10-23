@@ -108,7 +108,7 @@ let
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
-  # TimeoutStartSec on the three restic services: Type=oneshot disables the start
+  # TimeoutStartSec on the restic services: Type=oneshot disables the start
   # timeout by default, so a restic blocked on a dead sftp socket or a hung sshfs
   # read never dies. It holds the repo lock — restic only breaks a lock whose
   # owner has exited, and a task in uninterruptible sleep still exists — and the
@@ -164,6 +164,30 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  systemd.user.services.working-xmg19 = {
+    Unit = {
+      Description = "Restic backup to xmg19 (working data)";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      TimeoutStartSec = "2h";
+      Environment = [ "PATH=${backupPath}" "SSH_AUTH_SOCK=${sshAuthSock}" ];
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/working/xmg19.conf";
+    };
+  };
+
+  systemd.user.timers.working-xmg19 = {
+    Unit.Description = "Daily backup to xmg19 (working data)";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "50m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Jarvis VPS workspace → rsync.net (via SSHFS) ---
 
   systemd.user.services.jarvis-rsyncnet = {
@@ -205,6 +229,7 @@ in
       Wants = [
         "working-rsyncnet.service"
         "working-pc.service"
+        "working-xmg19.service"
         "jarvis-rsyncnet.service"
       ];
     };

@@ -334,9 +334,12 @@
         HostName = "100.124.59.34";
         User = "root";
       };
+      # accept-new for the reason given at zephylux below: the backups pc writes
+      # here as `backup@xmg19` are its first connection to this host.
       "xmg xmg19" = {
         HostName = "100.97.152.25";
         User = "max";
+        StrictHostKeyChecking = "accept-new";
       };
       # accept-new so an unattended job can reach here on a machine that has
       # never had an interactive ssh to it — pc's overdue-check reads this
