@@ -780,7 +780,7 @@ in
   };
 
   # --- pc's and the worker hosts' sessions → ~/.local/share/session-copies ---
-  # What it copies and from whom: bin/session-copies --help. The working
+  # What it copies: bin/session-copies --help. The working
   # backups pick the copies up, which is how pc's and the workers' transcripts
   # reach a restic snapshot at all. worker-hosts --targets names the worker
   # users, so one whose host publishes a record is pulled without an edit here.
