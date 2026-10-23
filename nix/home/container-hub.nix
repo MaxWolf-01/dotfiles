@@ -95,8 +95,8 @@ in
           };
         };
       });
-      default = import ./session-hosts.nix;
-      description = "The hosts that run max's sessions; ./session-hosts.nix says what they are for.";
+      default = lib.listToAttrs (map (h: { inherit (h) name; value = removeAttrs h [ "name" ]; }) (import ./session-hosts.nix));
+      description = "The hosts that run max's sessions, by name; ./session-hosts.nix says what they are for.";
     };
     peers = lib.mkOption {
       type = lib.types.attrs;

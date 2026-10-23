@@ -1,0 +1,121 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro>=1.0.14"]
+# ///
+"""Build or deploy https://hub.mwolf.dev/, the one address that opens whichever container hub is up.
+
+The page tries the hub of every host in nix/home/session-hosts.nix at once, at the address `tailscale serve`
+gives it (https://<host>.tail710178.ts.net:8377/), and opens the first in the list's order that answers.
+Off the tailnet none answers, and the page shows every hub's link instead. It holds no data but those addresses.
+
+Chrome asks before a public page reaches a tailnet address (Local Network Access), so the first open in a
+browser asks whether hub.mwolf.dev may look for devices on the local network; where that is refused, the page
+shows the links.
+
+The site is a Cloudflare Worker named hub with static assets only, on the custom domain hub.mwolf.dev, which
+Cloudflare puts in the mwolf.dev zone on the first deploy. Deploying needs the Cloudflare token, so it runs
+wrangler under with-secrets cloudflare-mwolf-dev-workers, and it needs nix to read the hosts list.
+
+Examples:
+
+    container-hub-address build /tmp/hub     # the site and its wrangler.json, to look at or serve
+    container-hub-address deploy             # publishes
+"""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Annotated
+
+import tyro
+from tyro.extras import SubcommandApp
+
+app = SubcommandApp()
+
+DOMAIN = "hub.mwolf.dev"
+HERE = Path(__file__).resolve().parent
+HOSTS = HERE.parent / "nix/home/session-hosts.nix"
+PAGE = HERE / "container-hub-address.html"
+HUB = "https://{name}.tail710178.ts.net:8377/"
+"""Where `tailscale serve` puts a host's hub (nix/home/container-hub.nix, which holds the port)."""
+WRANGLER = ["with-secrets", "cloudflare-mwolf-dev-workers", "npx", "--yes", "wrangler@4.140.0"]
+HEADERS = "/*\n  X-Robots-Tag: noindex, nofollow\n  Referrer-Policy: no-referrer\n"
+WORKER = {
+    "name": "hub",
+    "compatibility_date": "2026-09-01",
+    "assets": {"directory": "public"},
+    # no address but the custom domain: no workers.dev name, no per-version preview URLs
+    "workers_dev": False,
+    "preview_urls": False,
+    "routes": [{"pattern": DOMAIN, "custom_domain": True}],
+}
+
+
+class Failed(Exception):
+    """A failure the user can act on; its message says what failed and what to do."""
+
+
+@app.command(name="build")
+def build(out: Annotated[Path, tyro.conf.Positional]) -> None:
+    """Write the site into OUT: public/ (the page and its headers) and wrangler.json beside it.
+
+    Args:
+        out: The directory to write into, made if missing; files of the same names are replaced.
+    """
+    hubs = [{"name": h["name"], "url": HUB.format(name=h["name"])} for h in hosts()]
+    # a "</" in the data would end the script element it sits in
+    page = PAGE.read_text().replace("__HUBS__", json.dumps(hubs).replace("</", "<\\/"))
+    (out / "public").mkdir(parents=True, exist_ok=True)
+    (out / "public" / "index.html").write_text(page)
+    (out / "public" / "_headers").write_text(HEADERS)
+    (out / "wrangler.json").write_text(json.dumps(WORKER, indent=1) + "\n")
+    print(f"{out}: {', '.join(h['name'] for h in hubs)}", file=sys.stderr)
+
+
+@app.command(name="deploy")
+def deploy() -> None:
+    """Build the site and deploy it to hub.mwolf.dev as the Worker's only version. This publishes it."""
+    with tempfile.TemporaryDirectory(prefix="container-hub-address-") as tmp:
+        out = Path(tmp)
+        build(out)
+        print(f"deploying to {DOMAIN}", file=sys.stderr)
+        run([*WRANGLER, "deploy", "--config", str(out / "wrangler.json")], "deploying",
+            env={**os.environ, "WRANGLER_SEND_METRICS": "false"}, cwd=out)
+
+
+def hosts() -> list[dict]:
+    """The hosts list, in its order."""
+    cmd = ["nix", "eval", "--json", "--file", str(HOSTS)]
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Failed(f"reading {HOSTS} needs nix, which is not on PATH.")
+    if r.returncode:
+        raise Failed(f"{shlex.join(cmd)} exited {r.returncode}: {r.stderr.strip()[-1500:]}")
+    return json.loads(r.stdout)
+
+
+def run(cmd: list[str], what: str, env: dict[str, str] | None = None, cwd: Path | None = None) -> None:
+    try:
+        r = subprocess.run(cmd, env=env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Failed(f"{what} failed: {cmd[0]} is not on PATH.")
+    if r.returncode:
+        raise Failed(f"{what} failed ({shlex.join(cmd[:4])} exited {r.returncode}): {(r.stderr + r.stdout).strip()[-1500:]}")
+    print(r.stdout.strip(), file=sys.stderr)
+
+
+def main() -> None:
+    try:
+        app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
+    except Failed as exc:
+        sys.exit(f"container-hub-address: {exc}")
+
+
+if __name__ == "__main__":
+    main()

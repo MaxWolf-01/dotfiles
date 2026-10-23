@@ -7,10 +7,15 @@
 # The session copies follow the same rule (session-copies.nix): each host
 # pulls max's sessions from every host its hub relays.
 #
+# hub.mwolf.dev (bin/container-hub-address) tries each host's hub in this
+# order and opens the first that answers, so a host that is up the most comes
+# first. The name is also the host's tailnet name: the page finds its hub at
+# https://<name>.tail710178.ts.net:8377/.
+#
 # A new host is an entry here and nothing else. A VPS, say, would be
-# `vps = { ssh = "vps"; trust = 1; };`: pc and the laptop relay it and pull
-# its sessions, and it relays and pulls neither.
-{
-  pc = { ssh = "pc"; trust = 2; };
-  zephylux = { ssh = "zephylux"; trust = 2; };
-}
+# `{ name = "vps"; ssh = "vps"; trust = 1; }`: pc and the laptop relay it and
+# pull its sessions, it relays and pulls neither, and the page tries its hub.
+[
+  { name = "pc"; ssh = "pc"; trust = 2; }
+  { name = "zephylux"; ssh = "zephylux"; trust = 2; }
+]
