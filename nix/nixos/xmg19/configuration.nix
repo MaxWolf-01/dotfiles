@@ -4,6 +4,7 @@
   imports = [
     ./disk-config.nix
     ../journald.nix
+    ../uv-python.nix
   ];
 
   hardware.facter.reportPath = ./facter.json;
