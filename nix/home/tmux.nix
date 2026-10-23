@@ -1,7 +1,6 @@
 { config, pkgs, lib, ... }:
 let
   tmux = "${pkgs.tmux}/bin/tmux";
-  # Restores the last save when no server is running; tmux-restore.sh says how.
   # Tested by tests/tmux-restore.test.
   tmuxRestore = pkgs.writeShellScript "tmux-restore" ''
     exec ${pkgs.bash}/bin/bash ${./tmux-restore.sh} ${tmux} "$HOME/.tmux/resurrect" "$@"
@@ -30,22 +29,6 @@ let
     exec ${pkgs.bash}/bin/bash ${./tmux-save.sh} ${tmux} "$HOME/.tmux/resurrect"
   '';
 
-  # The server at boot, restored, or with one session `main` when there is no
-  # save. resurrect's restore.sh runs inside the server, on the PATH the server
-  # starts with, which a unit gives it here. A detached server has no terminal
-  # to size its windows by; they resize to the first client that attaches.
-  #
-  # TMUX_RESTORED_AT_BOOT=1 is in the environment of the panes this restore
-  # creates, not of panes opened later, for zsh/zshrc to keep a prompt from
-  # taking the resume command restore.sh types.
-  tmuxBoot = pkgs.writeShellScript "tmux-boot" ''
-    PATH=${lib.makeBinPath [ pkgs.bash pkgs.coreutils pkgs.gawk pkgs.gnugrep pkgs.gnused pkgs.gnutar pkgs.gzip pkgs.tmux ]}:$PATH
-    export TMUX_RESTORED_AT_BOOT=1
-    ${tmuxRestore} 200 50
-    ${tmux} set-environment -g -u TMUX_RESTORED_AT_BOOT 2>/dev/null
-    ${tmux} list-sessions &>/dev/null || exec env -u TMUX_RESTORED_AT_BOOT ${tmux} new-session -d -s main
-  '';
-
   # The house night colours (mx house-style tokens; yellow is nvim's
   # nvim/colors/house.lua code yellow), for what tmux draws over a pane.
   house = {
@@ -57,15 +40,11 @@ let
   };
 in
 {
-  options.tmuxServer.atBoot = lib.mkEnableOption ''
-    the tmux server from boot, restored from the last save, for a host whose
-    sessions have to come back after a reboot with nobody logged in. It needs
-    lingering on, so the user's systemd starts at boot. Elsewhere `tms`
-    restores when it finds no server'';
+  options.tmuxServer.atBoot = lib.mkEnableOption "the tmux server at boot, restored from the last save (needs lingering)";
 
-  # A oneshot that stays active, so a server already running when it starts is
-  # left alone. A switch keeps the running server: restarting the unit ends
-  # every session in it, and so does stopping it, or removing it from the config.
+  # The server lives in this unit, so stopping or restarting it ends every
+  # session; keep-old stops a switch from doing either. restore.sh runs inside
+  # the server on this PATH, which every pane inherits; NixOS's zsh sets its own.
   config.systemd.user.services.tmux-server = lib.mkIf config.tmuxServer.atBoot {
     Unit = {
       Description = "tmux server, restored from the last save";
@@ -74,8 +53,11 @@ in
     Service = {
       Type = "oneshot";
       RemainAfterExit = true;
-      Environment = [ "TMUX_TMPDIR=%t" ];
-      ExecStart = toString tmuxBoot;
+      Environment = [
+        "TMUX_TMPDIR=%t"
+        "PATH=${lib.makeBinPath [ pkgs.bash pkgs.coreutils pkgs.gawk pkgs.gnugrep pkgs.gnused pkgs.gnutar pkgs.gzip pkgs.hostname pkgs.tmux ]}"
+      ];
+      ExecStart = "${tmuxRestore} 200 50";
     };
     Install.WantedBy = [ "default.target" ];
   };

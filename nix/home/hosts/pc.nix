@@ -15,8 +15,6 @@
   # (nix/nixos/pc/container-hub.nix).
   containerHub.url = "https://pc.tail710178.ts.net:8377";
 
-  # Sessions on pc outlive the laptop's lid, so they come back after a reboot
-  # without a login. Lingering is on in nix/nixos/pc/configuration.nix.
   tmuxServer.atBoot = true;
 
   targets.genericLinux.enable = false;

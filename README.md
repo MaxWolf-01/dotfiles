@@ -127,9 +127,6 @@ For new NixOS installs via nixos-anywhere, see `docs/nixos-new-machine.md`.
 
 Place age key at `~/.local/secrets/age-key.txt`, then: `./setup secrets`
 
-On a host that runs max's sessions (pc): `./setup get_claude` and `./setup claude_helferline`,
-then `claude` once in each profile to log in (`CLAUDE_CONFIG_DIR=~/.claude-helferline claude` for the work one).
-
 ## Setup (Server/Container)
 
 ```bash
