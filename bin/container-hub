@@ -411,6 +411,7 @@ import urllib.parse
 import uuid
 import weakref
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1832,11 +1833,11 @@ def found_view(session: str, live: dict[str, dict], memo: dict) -> dict | None:
     if not path or session in live or session in fork_sources() or release_beside(path):
         return None
     cwd, entry = started_in(path)
-    if not cwd or entry.startswith("sdk"):
+    if not person_started(cwd, entry):
         return None
     agent, _ = agent_of(Path(cwd))
-    page = next((d / "index.html" for d in [*page_dirs(session), *([agent / "sessions" / session] if agent else [])]
-                 if (d / "index.html").is_file()), None)
+    records = page_records(session, accounts(), cwd, {})
+    page = records / "index.html" if records and (records / "index.html").is_file() else None
     member = session_member(page_of_path(page) if page else Page(url=stand_in_url(session), kind="session", session=session),
                             str(agent / "tickets") if agent else None, path.stat().st_mtime)
     return unit_view(session, live, memo, {"session": session, "members": [member]})
@@ -2208,13 +2209,34 @@ def rail_index(view: dict) -> dict:
 SEARCH_READ = 2.0
 """Seconds one read of the session index spends reading transcripts; what it has not read by then, the next reads on."""
 TITLE_MARKS = ((b'\n{"type":"custom-title"', "customTitle"), (b'\n{"type":"ai-title"', "aiTitle"))
-INDEX: dict[str, list] = {}
-"""What the index read of each transcript, by its path: [size, mtime_ns, bytes read, custom title, ai title, cwd,
-entrypoint], `cwd` None until a line naming it is read. Kept in --state, so a hub started anew reads only what was
+
+
+class Indexed(NamedTuple):
+    """What the session index read of one transcript."""
+
+    size: int
+    mtime_ns: int
+    read: int
+    """How far it was read, to the end of its last whole line."""
+    custom: str | None
+    ai: str | None
+    cwd: str | None
+    """None until a line naming it is read."""
+    entry: str
+    """Claude Code's entrypoint for the session, "" where its line names none."""
+
+
+UNREAD = Indexed(0, 0, 0, None, None, None, "")
+INDEX_VERSION = 1
+"""The shape of --state's session-index.json; one kept in another is read again from scratch."""
+INDEX: dict[str, Indexed] = {}
+"""What the index read of each transcript, by its path. Kept in --state, so a hub started anew reads only what was
 written since."""
 index_lock = threading.Lock()
 index_kept = False
 """Whether INDEX holds what --state kept of it."""
+LISTINGS: dict[tuple, dict] = {}
+"""The last listing every_session made of each set of account directories, for a read that comes while another runs."""
 PAGE_TITLES: dict[Path, tuple] = {}
 """The heading of each session.md the index read, by its stamp then."""
 
@@ -2227,73 +2249,104 @@ def own_sessions() -> dict:
     """Every session this host's own transcripts hold, as every_session gives them, the copy a fork started from
     left out: that session is another host's."""
     places = {a.resolve(): (a, account_of(a)) for a in accounts()}
-    return every_session(list(places.values()), True, set(fork_sources()))
+    return every_session(list(places.values()), agents=True, skip=set(fork_sources()))
 
 
 def copied_sessions(c: "Copy") -> dict:
     """Every session a host's session copy holds, as every_session gives them."""
     return every_session([(a, f"{c.home.rstrip('/')}/{a.name}") for a in sorted(c.root.glob(".claude*")) if a.is_dir()],
-                         False, set())
+                         agents=False, skip=set())
 
 
 def every_session(places: list[tuple[Path, str]], agents: bool, skip: set[str]) -> dict:
     """Every session a person started whose transcript is under these account directories, each with its account's
     name as the hub names it: {"accounts": the names, "sessions": [[id, title, its account's place in accounts, when
     its transcript was last written]], "unread"}, the latest first. A title is the one its unit would have: its session
-    page's heading, under its account or, with `agents`, in the agent repo of the directory it ran in; else the title
-    Claude Code keeps in its transcript; else "". Left out: a dispatched worker's session and an SDK's (an `sdk`
-    entrypoint), a session released to another host, which is that host's, and those `skip` names.
-    "unread" counts the transcripts the read ran out of time for, listed as far as they were read before."""
+    page's heading, under one of these accounts or, with `agents`, in the agent repo of the directory it ran in
+    (page_records); else the title Claude Code keeps in its transcript; else "". Left out: what person_started leaves
+    out, a session released to another host, which is that host's, and those `skip` names. "unread" counts the
+    transcripts the read ran out of time for, listed as far as they were read before. A read that comes while another
+    runs gets that one's last listing, where there is one, rather than wait for it."""
+    asked = tuple(str(a) for a, _ in places)
+    if not index_lock.acquire(blocking=False):
+        if asked in LISTINGS:
+            return LISTINGS[asked]
+        index_lock.acquire()
+    try:
+        LISTINGS[asked] = listing = read_index(places, agents, skip)
+    finally:
+        index_lock.release()
+    return listing
+
+
+def read_index(places: list[tuple[Path, str]], agents: bool, skip: set[str]) -> dict:
+    """every_session's listing, under the index's lock."""
     global index_kept
     deadline, memo = time.monotonic() + SEARCH_READ, {}
     found, seen, unread, changed = {}, set(), 0, False
-    with index_lock:
-        if not index_kept:
-            try:
-                kept = read_json(index_file())
-            except OSError as e:  # only what was read of the transcripts, which a read gets again
-                print(f"the session index kept: {e}", file=sys.stderr, flush=True)
-                kept = None
-            INDEX.update(kept if isinstance(kept, dict) else {})
-            index_kept = True
-        for n, (account, _) in enumerate(places):
-            pages = set(listed(account / PAGES))
-            for project in listed(account / "projects"):
-                names = set(listed(account / "projects" / project))
-                for name in names:
-                    session = name.removesuffix(".jsonl")
-                    if name == session or session in skip or session + RELEASE in names:
-                        continue
-                    path = account / "projects" / project / name
-                    try:
-                        st = path.stat()
-                    except OSError:
-                        continue
-                    seen.add(key := str(path))
-                    held = INDEX.get(key)
-                    if not held or held[:2] != [st.st_size, st.st_mtime_ns]:
-                        if time.monotonic() < deadline:
-                            held = INDEX[key] = indexed(path, st, held)
-                            changed = True
-                        else:
-                            unread += 1
-                    if not held or held[5] is None or held[6].startswith("sdk"):
-                        continue
-                    page = (account / PAGES / session if session in pages
-                            else agents and session_records(held[5], session, memo))
-                    title = (page and page_title(page / "session.md")) or held[3] or held[4] or ""
-                    if session not in found or found[session][3] < st.st_mtime:
-                        found[session] = [session, title, n, st.st_mtime]
-        under = tuple(f"{a}/" for a, _ in places)
-        for key in [k for k in INDEX if k.startswith(under) and k not in seen]:
-            del INDEX[key]
-            changed = True
-        if changed:
-            try:
-                write_json(index_file(), INDEX)
-            except OSError as e:
-                print(f"keeping the session index: {e}", file=sys.stderr, flush=True)
+    if not index_kept:
+        try:
+            kept = read_json(index_file())
+        except OSError as e:  # only what was read of the transcripts, which a read gets again
+            print(f"the session index kept: {e}", file=sys.stderr, flush=True)
+            kept = None
+        if isinstance(kept, dict) and kept.get("version") == INDEX_VERSION:
+            INDEX.update((k, Indexed(*v)) for k, v in kept.get("transcripts", {}).items())
+        index_kept = True
+    roots = [a for a, _ in places]
+    for n, account in enumerate(roots):
+        for project in listed(account / "projects"):
+            names = set(listed(account / "projects" / project))
+            for name in names:
+                session = name.removesuffix(".jsonl")
+                if name == session or session in skip or session + RELEASE in names:
+                    continue
+                path = account / "projects" / project / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                seen.add(key := str(path))
+                held = INDEX.get(key)
+                if not held or (held.size, held.mtime_ns) != (st.st_size, st.st_mtime_ns):
+                    if time.monotonic() < deadline:
+                        held = INDEX[key] = indexed(path, st, held or UNREAD)
+                        changed = True
+                    else:
+                        unread += 1
+                if not held or not person_started(held.cwd, held.entry):
+                    continue
+                page = page_records(session, roots, held.cwd if agents else None, memo)
+                title = (page and page_title(page / "session.md")) or held.custom or held.ai or ""
+                if session not in found or found[session][3] < st.st_mtime:
+                    found[session] = [session, title, n, st.st_mtime]
+    under = tuple(f"{a}/" for a in roots)
+    for key in [k for k in INDEX if k.startswith(under) and k not in seen]:
+        del INDEX[key]
+        changed = True
+    if changed:
+        try:
+            write_json(index_file(), {"version": INDEX_VERSION, "transcripts": INDEX})
+        except OSError as e:
+            print(f"keeping the session index: {e}", file=sys.stderr, flush=True)
     return {"accounts": [name for _, name in places], "sessions": sorted(found.values(), key=lambda s: -s[3]), "unread": unread}
+
+
+def person_started(cwd: str | None, entry: str) -> bool:
+    """A session a person started, by the first line of its transcript that names its directory: a dispatched
+    worker's and an SDK's are Claude Code's `sdk` entrypoints."""
+    return bool(cwd) and not entry.startswith("sdk")
+
+
+def page_records(session: str, roots: list[Path], cwd: str | None, memo: dict) -> Path | None:
+    """A session's page directory, where it has one: under one of the account directories `roots`, else, given the
+    directory it ran in, in that directory's agent repo, where an older mx kept it and every mx commits it."""
+    for root in roots:
+        if ("pages", root) not in memo:
+            memo["pages", root] = set(listed(root / PAGES))
+        if session in memo["pages", root]:
+            return root / PAGES / session
+    return session_records(cwd, session, memo) if cwd else None
 
 
 def listed(directory: Path) -> list[str]:
@@ -2303,21 +2356,21 @@ def listed(directory: Path) -> list[str]:
         return []
 
 
-def indexed(path: Path, st: os.stat_result, held: list | None) -> list:
+def indexed(path: Path, st: os.stat_result, held: Indexed) -> Indexed:
     """What the index holds of a transcript, read on from where it last stopped: a transcript only grows. Its titles
     are its last lines of each kind (claude_title), its cwd and entrypoint those of its first line that names them
     (started_in)."""
-    _, _, read, custom, ai, cwd, entry = held or [0, 0, 0, None, None, None, ""]
-    if st.st_size < read:  # rewritten, not grown
-        read, custom, ai, cwd, entry = 0, None, None, None, ""
-    elif entry.startswith("sdk"):  # never listed, so never read on
-        return [st.st_size, st.st_mtime_ns, read, custom, ai, cwd, entry]
+    if st.st_size < held.read:  # rewritten, not grown
+        held = UNREAD
+    elif held.cwd is not None and not person_started(held.cwd, held.entry):  # never listed, so never read on
+        return held._replace(size=st.st_size, mtime_ns=st.st_mtime_ns)
+    _, _, read, custom, ai, cwd, entry = held
     try:
         with path.open("rb") as f:
             f.seek(read)
             added = f.read(st.st_size - read)
     except OSError:
-        return held or [0, 0, 0, None, None, None, ""]
+        return held
     whole = b"\n" + added[:added.rfind(b"\n") + 1]  # a line still being written is read once it is whole
     titles = [custom, ai]
     for i, (mark, field) in enumerate(TITLE_MARKS):
@@ -2328,7 +2381,7 @@ def indexed(path: Path, st: os.stat_result, held: list | None) -> list:
         said = json_line(whole, whole.rfind(b"\n", 0, at) + 1)
         if said.get("cwd"):
             cwd, entry = str(said["cwd"]), str(said.get("entrypoint") or "")
-    return [st.st_size, st.st_mtime_ns, read + len(whole) - 1, *titles, cwd, entry]
+    return Indexed(st.st_size, st.st_mtime_ns, read + len(whole) - 1, *titles, cwd, entry)
 
 
 def json_line(text: bytes, start: int) -> dict:
@@ -3021,7 +3074,7 @@ def recent_projects() -> list[dict]:
     projects = {}
     for _, path in sorted(found, reverse=True)[:PROJECTS_READ]:
         cwd, entry = started_in(path)
-        if not cwd or entry.startswith("sdk") or not os.path.isdir(cwd):
+        if not person_started(cwd, entry) or not os.path.isdir(cwd):
             continue
         agent, _ = agent_of(Path(cwd))
         projects.setdefault(str(agent.parent) if agent else cwd, bool(agent))
