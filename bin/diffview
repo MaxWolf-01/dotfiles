@@ -41,17 +41,17 @@ Examples:
 import base64
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -83,7 +83,7 @@ class Args:
     notes: str = ""
     """JSON file holding the agent's side of the review, shown inline in the diff. Schema: {"notes": [{"id": 3, "path": "a/b.py", "text": "why this changed", "line": 42, "end": 44, "side": "new"|"old", "source": "~/repo"}], "resolved": ["C1", "C4"]}. A note's id is the handle the page shows as A3; ids must be unique. line/end/side/source are optional, a line-less note attaches to the whole file. source names the section a note belongs to, by that source's root (a repo's toplevel, or the NEW of an OLD=NEW), and the note lands in that section only; without one it lands in whichever section holds its path, the one holding its line first. A note on a file the diff does not touch puts that file on the page too (in its source's section, or the first holding it), read-only, opened at the noted lines (line-less: at its top; an image other than SVG, whole): the place to say what was read and deliberately left alone. A note with "re": "C4" answers that review comment: it sits under it, indented, and needs no path or line of its own; the thread can go on from there (the reviewer replies to a note with c or its reply button, and the reply carries "re A3"). Answering a comment does not resolve it. "resolved" lists the review comments the agent has addressed, written the way the export shows them. Note text is never part of the comment export; the export does name the notes the reviewer marked seen without replying, so silence and "read, fine" stay distinguishable. In --watch mode the page refreshes when this file changes."""
     serve: str = ""
-    """Have the container hub (container-hub, on $CONTAINER_HUB_PORT, else 8377) serve this already-rendered page, or this directory of them, so they can save comments to disk, print its address there, and exit. Starts the hub when it is down: its user service where that is installed and serves the port, else a hub of its own. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent. A page cut off from the hub says so and keeps what you type in the browser until the hub is back: run this again."""
+    """Have the container hub (container-hub, on its socket: $CONTAINER_HUB_SOCKET, else ~/.local/state/container-hub/hub.sock) serve this already-rendered page, or this directory of them, so they can save comments to disk, print its address there, and exit. Starts the hub when it is down: its user service where that is installed and the socket is its own, else a hub of its own, which a browser here reaches at 127.0.0.1:$CONTAINER_HUB_PORT, else 8377. A page opened as a file cannot write anywhere, so it is read-only; served, it stores comments beside itself. Idempotent. A page cut off from the hub says so and keeps what you type in the browser until the hub is back: run this again."""
     context: int = 3
     """Context lines around each hunk (git diff -U)."""
     sources_of: str = ""
@@ -460,8 +460,9 @@ def comment_id(item: object, path: str) -> int:
 
 # ---------------------------------------------------------------- serving, through the container hub
 
-HUB_PORT = int(os.environ.get("CONTAINER_HUB_PORT") or 8377)
-HUB_SERVICE_PORT = 8377   # the port the container-hub user service answers on
+HUB_SERVICE_SOCKET = Path("~/.local/state/container-hub/hub.sock").expanduser()   # where the container-hub user service listens
+HUB_SOCKET = Path(os.environ.get("CONTAINER_HUB_SOCKET") or HUB_SERVICE_SOCKET).expanduser()
+HUB_PORT = int(os.environ.get("CONTAINER_HUB_PORT") or 8377)   # where a hub of diffview's own listens for the browser
 MAX_STATE_BYTES = 4_000_000   # a real state file is under 20 KB; anything near this is not a page saving
 
 
@@ -490,39 +491,61 @@ def serve_root(root_spec: str) -> None:
     print(f"diffview: serving {root} at {url}")
 
 
+class HubConnection(http.client.HTTPConnection):
+    """HTTP to the container hub, over its socket."""
+
+    def __init__(self, timeout: float):
+        super().__init__("localhost", timeout=timeout)
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(str(HUB_SOCKET))
+
+
+def ask_hub(method: str, route: str, body: dict | None = None, timeout: float = 30) -> tuple[int, bytes]:
+    """The hub's answer, as its status and body. OSError where nothing answers on the socket, and
+    http.client.HTTPException where what answers speaks no HTTP."""
+    hub = HubConnection(timeout)
+    try:
+        hub.request(method, route, None if body is None else json.dumps(body).encode(), {"Content-Type": "application/json"})
+        answer = hub.getresponse()
+        return answer.status, answer.read()
+    finally:
+        hub.close()
+
+
 def hub_address(path: Path) -> tuple[str | None, str]:
     """Where the container hub serves path, a page or a directory of them, the hub started if it is down;
     else None and why not."""
-    origin = f"http://127.0.0.1:{HUB_PORT}"
-    ask = urllib.request.Request(f"{origin}/api/serve", json.dumps({"path": str(path.resolve())}).encode(),
-                                 {"Content-Type": "application/json"})
     for started in (False, True):
         try:
-            with urllib.request.urlopen(ask, timeout=30) as r:
-                return origin + json.loads(r.read())["url"], ""
-        except urllib.error.HTTPError as e:
-            said = e.read().decode(errors="replace")
-            try:
-                said = json.loads(said)["error"]
-            except (ValueError, KeyError, TypeError):
-                pass
-            return None, f"the container hub at {origin} refused it: {said}"
-        except (OSError, ValueError) as e:
+            status, said = ask_hub("POST", "/api/serve", {"path": str(path.resolve())})
+            answer = json.loads(said) if status == 200 else {}
+            if status == 200:
+                return answer["url"], ""
+        except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as e:
             if started:
-                return None, f"the container hub at {origin} did not answer: {e}"
-            if why := start_hub(origin):
+                return None, f"the container hub at {HUB_SOCKET} did not answer: {e}"
+            if why := start_hub():
                 return None, why
+            continue
+        try:
+            said = json.loads(said)["error"]
+        except (ValueError, KeyError, TypeError):
+            said = said.decode(errors="replace")
+        return None, f"the container hub at {HUB_SOCKET} refused it: {said}"
     raise AssertionError("unreachable")
 
 
-def start_hub(origin: str) -> str:
-    """Bring the hub up: its user service, where that is installed and answers on this port, else a hub of
+def start_hub() -> str:
+    """Bring the hub up: its user service, where that is installed and listens on this socket, else a hub of
     this command's own, in a session of its own so it outlives it. Empty once it answers, else why not."""
     log = Path.home() / ".local" / "state" / "container-hub" / "hub.log"
     # under a minute in all: `board` gives `diffview --serve` 60 s before it opens the page as a file
     deadline = time.monotonic() + 45
     try:
-        service = HUB_PORT == HUB_SERVICE_PORT and subprocess.run(
+        service = HUB_SOCKET == HUB_SERVICE_SOCKET and subprocess.run(
             ["systemctl", "--user", "start", "container-hub"], capture_output=True, timeout=20, check=False).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         service = False
@@ -531,41 +554,33 @@ def start_hub(origin: str) -> str:
         log.parent.mkdir(parents=True, exist_ok=True)
         try:
             with log.open("a") as out:
-                subprocess.Popen([str(hub), "--port", str(HUB_PORT)],
+                subprocess.Popen([str(hub), "--socket", str(HUB_SOCKET), "--port", str(HUB_PORT)],
                                  stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
         except OSError as e:
             return f"the container hub could not be started from {hub}: {e}"
     while time.monotonic() < deadline:   # a first run has uv resolve the hub's dependencies
         try:
-            with urllib.request.urlopen(f"{origin}/.health", timeout=1):
+            if ask_hub("GET", "/.health", timeout=1)[0] == 200:
                 return ""
-        except OSError:
-            time.sleep(0.2)
+        except (OSError, http.client.HTTPException):
+            pass
+        time.sleep(0.2)
     where = "journalctl --user -u container-hub" if service else str(log)
-    return f"the container hub did not come up at {origin} within 45 s; see {where}"
+    return f"the container hub did not come up at {HUB_SOCKET} within 45 s; see {where}"
 
 
-def local_request(handler) -> bool:
-    """Binding to loopback stops remote sockets, not a web page that points a name at 127.0.0.1."""
-    host = (handler.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
-    return host in ("127.0.0.1", "localhost", "::1", "")
-
-
-def write_refusal(handler) -> tuple[int, bytes] | None:
+def write_refusal(headers, origins: tuple[str, ...]) -> tuple[int, bytes] | None:
     """Why a write is not taken, as (status, body); None when it may go ahead.
 
-    A page on another site can send a form-shaped POST to loopback without a preflight, and
+    A page on another site can send a form-shaped POST to the hub without a preflight, and
     the browser hides the answer but the server would still act. Browsers put the sending
-    page's origin on every POST, so a write is taken only from this server's own origin;
-    nothing but a page saves state, so a missing Origin has no honest sender. The body is
-    bounded and must announce its length, so the read that follows is never open-ended.
+    page's origin on every POST, so a write is taken only from one of the server's own
+    `origins`; nothing but a page saves state, so a missing Origin has no honest sender. The
+    body is bounded and must announce its length, so the read that follows is never open-ended.
     """
-    if not local_request(handler):
+    if headers.get("Origin") not in origins:
         return 403, b"forbidden"
-    port = handler.server.server_address[1]
-    if handler.headers.get("Origin") not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
-        return 403, b"forbidden"
-    length = handler.headers.get("Content-Length", "")
+    length = headers.get("Content-Length", "")
     if not length.isdigit():
         return 411, b"length required"
     if int(length) > MAX_STATE_BYTES:

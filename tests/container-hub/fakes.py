@@ -137,6 +137,8 @@ class World:
         self.temp.mkdir()  # beside HOME and not around it, so each guard is checked on its own
         self.port = port
         """The port the hub takes for its own, so that one of its addresses names a page it serves."""
+        self.origins = (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+        """The hub's own origins, as a request on that port knows them: the hub tab's first."""
         self.tmux_socket = self.scratch / "tmux.sock"
         self.tmux_refused, self.tmux_calls = self.scratch / "tmux-refused", self.scratch / "tmux-calls"
         shim = self.scratch / "shim" / "tmux"
@@ -166,6 +168,7 @@ exit 1
         self.hub = load(self.clock, (self.scratch / "state").resolve())
         self.hub.STATE.mkdir()
         self.hub.TMUX_SOCKET = self.tmux_socket
+        self.hub.URL = self.origins[0]
         WORLDS.append(self)
 
     def refused(self) -> str:
@@ -256,11 +259,11 @@ exit 1
 
     def opened(self, target, session: str | None = None, **body) -> dict:
         """What the hub answers an agent that opens a page, as claude-browser asks it."""
-        return self.hub.open_page({"target": str(target), **({"session": session} if session else {}), **body}, self.port, from_page=False)[1]
+        return self.hub.open_page({"target": str(target), **({"session": session} if session else {}), **body}, self.origins, from_page=False)[1]
 
     def clicked(self, target, unit: str, **body) -> dict:
         """What the hub answers the hub tab for a link clicked in a page of the unit."""
-        return self.hub.open_page({"target": str(target), "unit": unit, "by": "user", **body}, self.port, from_page=True)[1]
+        return self.hub.open_page({"target": str(target), "unit": unit, "by": "user", **body}, self.origins, from_page=True)[1]
 
     def rail(self) -> list[dict]:
         return self.hub.hub_view()["units"]

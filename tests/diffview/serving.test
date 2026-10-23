@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tier: full-path (a live hub over HTTP)
+# tier: full-path (a live hub over its socket and HTTP)
 # Drive bin/diffview where it reaches the container hub, and the summary it has written after the page. Run it
 # directly; no framework. What diffview renders is page-data.test's.
 
@@ -13,21 +13,23 @@ diffview="$bin/diffview"
 work=$(mktemp -d)
 free_port() { python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])"; }
 
-# a container hub of the test's own, never the one on 8377, with a home of its own outside $work
-# so $work can be served whole; uv keeps its real directories, or the hub resolves its dependencies anew
+# a container hub of the test's own, never the user's, with a home of its own outside $work
+# so $work can be served whole; uv keeps its real directories, or the hub resolves its dependencies anew.
+# Every diffview here finds it on its socket, wherever its HOME is.
 hubhome=$(mktemp -d)
 uvcache=$(uv cache dir)
 uvpython=$(uv python dir)
-export CONTAINER_HUB_PORT
-CONTAINER_HUB_PORT=$(free_port)
-hub="http://127.0.0.1:$CONTAINER_HUB_PORT"
-HOME="$hubhome" UV_CACHE_DIR="$uvcache" UV_PYTHON_INSTALL_DIR="$uvpython" setsid "$bin/container-hub" --port "$CONTAINER_HUB_PORT" --state "$hubhome/state" \
+export CONTAINER_HUB_SOCKET="$hubhome/hub.sock"
+hubport=$(free_port)
+hub="http://127.0.0.1:$hubport"
+HOME="$hubhome" UV_CACHE_DIR="$uvcache" UV_PYTHON_INSTALL_DIR="$uvpython" setsid "$bin/container-hub" --port "$hubport" --state "$hubhome/state" \
     > "$hubhome/hub.log" 2>&1 &
 hubpid=$!
 downport=$(free_port)   # where a hub is down until a diffview brings one up
+downsocket="$work/down.sock"
 cleanup() {
     kill -- "-$hubpid" 2>/dev/null
-    pkill -f "container-hub --port $downport" 2>/dev/null
+    pkill -f "container-hub --socket $downsocket" 2>/dev/null
     rm -rf "$work" "$hubhome"
 }
 trap cleanup EXIT
@@ -106,19 +108,23 @@ check "nor through a symlink to it" "1 yes" "$? $(grep -q 'never serves whole' <
 # a diffview with no hub beside it, and none answering, says so rather than failing
 mkdir -p "$work/nohub"
 cp "$diffview" "$work/nohub/diffview"
-said=$(CONTAINER_HUB_PORT=$(free_port) "$work/nohub/diffview" --serve "$work/pages" 2>&1)
+said=$(CONTAINER_HUB_SOCKET="$work/nohub.sock" "$work/nohub/diffview" --serve "$work/pages" 2>&1)
 check "a diffview whose hub is gone says it cannot be started" "1 yes" "$? $(grep -q 'could not be started' <<<"$said" && echo yes)"
 
-# something else on the hub's port that refuses the page, in words that are no JSON: the page opens as a file, and says why
-refuserport=$(free_port)
-mkdir -p "$work/refuser"
-timeout 120 python3 -m http.server --bind 127.0.0.1 --directory "$work/refuser" "$refuserport" >/dev/null 2>&1 &
-refuser=$!
-for _ in $(seq 100); do curl -s -o /dev/null "http://127.0.0.1:$refuserport/" && break; sleep 0.1; done
-said=$(CONTAINER_HUB_PORT=$refuserport PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/refused.html" --no-auto-summary --open 2>&1 >/dev/null)
-kill "$refuser"
-check "a page the hub's port refuses opens read-only, as its file" "file://$work/pages/refused.html" "$(cat "$work/stub/opened")"
-check "...and says who refused it, and why" yes "$(tr '\n' ' ' <<<"$said" | grep -q "127.0.0.1:$refuserport refused it: .*501.*; read-only" && echo yes)"
+# something else on the hub's socket that refuses the page, in words that are no JSON: the page opens as a file, and says why
+refuser="$work/refuser.sock"
+timeout 120 python3 -c 'import http.server, socketserver, sys
+class Refuser(socketserver.UnixStreamServer):
+    def get_request(self):  # http.server logs the client address, which a unix socket has none of
+        conn, _ = self.socket.accept()
+        return conn, ("", 0)
+Refuser(sys.argv[1], http.server.BaseHTTPRequestHandler).serve_forever()' "$refuser" >/dev/null 2>&1 &
+refuserpid=$!
+for _ in $(seq 100); do [ -S "$refuser" ] && break; sleep 0.1; done
+said=$(CONTAINER_HUB_SOCKET="$refuser" PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/refused.html" --no-auto-summary --open 2>&1 >/dev/null)
+kill "$refuserpid"
+check "a page the hub's socket refuses opens read-only, as its file" "file://$work/pages/refused.html" "$(cat "$work/stub/opened")"
+check "...and says who refused it, and why" yes "$(tr '\n' ' ' <<<"$said" | grep -q "$refuser refused it: .*501.*; read-only" && echo yes)"
 
 # the page is opened as one url, not shadowed by a second one naming the read-only file
 lines=$(PATH="$work/stub:$PATH" "$diffview" "$repo@HEAD~1..HEAD" -o "$work/pages/o.html" --no-auto-summary --open 2>/dev/null | grep -c '^file://')
@@ -133,15 +139,15 @@ mkdir -p "$work/beat" "$work/downhome"
 starts=()
 for n in 1 2; do
     HOME="$work/downhome" UV_CACHE_DIR="$uvcache" UV_PYTHON_INSTALL_DIR="$uvpython" CONTAINER_HUB_PORT=$downport \
-        "$diffview" --serve "$work/beat" > "$work/beat/start$n" 2>&1 &
+        CONTAINER_HUB_SOCKET="$downsocket" "$diffview" --serve "$work/beat" > "$work/beat/start$n" 2>&1 &
     starts+=($!)
 done
 wait "${starts[@]}"
 check "--serve with the hub down starts one and prints the address on it" \
     "diffview: serving $work/beat at http://127.0.0.1:$downport/f$work/beat/ x2" "$(sort -u "$work/beat/start1" "$work/beat/start2") x$(cat "$work/beat/start1" "$work/beat/start2" | grep -c serving)"
-for _ in $(seq 50); do [ "$(pgrep -fc "bin/python .*container-hub --port $downport")" -le 1 ] && break; sleep 0.2; done
-check "and two at once leave one hub" 1 "$(pgrep -fc "bin/python .*container-hub --port $downport")"
-pkill -f "container-hub --port $downport"
+for _ in $(seq 50); do [ "$(pgrep -fc "bin/python .*container-hub --socket $downsocket")" -le 1 ] && break; sleep 0.2; done
+check "and two at once leave one hub" 1 "$(pgrep -fc "bin/python .*container-hub --socket $downsocket")"
+pkill -f "container-hub --socket $downsocket"
 
 # --- the auto summary lands after the page, never before it
 
