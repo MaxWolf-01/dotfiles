@@ -33,9 +33,11 @@
 #          the laptop stops suspending until someone works out why.
 #          `nosleep --list` names every hold and how to clear it.
 #          Without --tty the command's stdin is empty and its stdout and stderr
-#          are a pipe, not a terminal: a question nobody expected gets
+#          are a pipe, not a terminal: a question read from stdin gets
 #          end-of-input and fails the job rather than leaving it waiting, and
-#          the log holds no colours or progress-bar redraws.
+#          the log holds no colours or progress-bar redraws. A prompt that
+#          opens /dev/tty itself (sudo, ssh's password and host-key questions,
+#          pinentry) still reaches the pane, and only the pane, and waits there.
 #          --tty gives the command the pane's terminal instead, for a command
 #          a human has to type into, such as a passphrase prompt: attach, then
 #          answer it in the pane. The log is then a copy of what the pane
@@ -258,10 +260,25 @@ cmd_exec() {
 # the code, blaming the wrapper for what the command did. tee ignores INT and
 # TERM: Ctrl-C and `job stop` are for the command, and a tee that died of them
 # would kill with SIGPIPE a command that prints on its way out.
+# tee is a process substitution rather than a pipeline stage because a pipeline
+# ends when its last writer closes the pipe: a server the command started with
+# `&` would hold the job open long after the command's exit. The runner gives
+# tee a moment to copy the command's last lines, then writes the status line
+# whether or not something the command left behind is still writing.
 run_piped() {
-    "${wrap[@]}" bash -c 'exec "$@" </dev/null 2>&1' job-exec "$@" |
-        ( trap '' INT TERM; exec tee -a "$log" )
-    return "${PIPESTATUS[0]}"
+    local out copy rc
+    # Opened with exec rather than on the command's own redirect: bash leaves
+    # $! unset for a process substitution on a command run inside a function.
+    exec {out}> >(trap '' INT TERM; exec tee -a "$log")
+    copy=$!
+    "${wrap[@]}" bash -c 'exec "$@" </dev/null 2>&1' job-exec "$@" >&"$out" {out}>&-
+    rc=$?
+    exec {out}>&-
+    for _ in $(seq 20); do
+        kill -0 "$copy" 2>/dev/null || break
+        sleep 0.1
+    done
+    return "$rc"
 }
 
 # The command keeps the pane's terminal, and tmux copies the pane's output into
@@ -269,21 +286,26 @@ run_piped() {
 # closed, so the runner prints a marker the pane does not display, closes the
 # copy only once the marker has reached the log, and cuts the log there.
 run_on_pane() {
-    local rc marker at
+    local rc marker from at
     tmux pipe-pane -t "$TMUX_PANE" "cat >> $(printf %q "$log")"
     "${wrap[@]}" "$@"
     rc=$?
     marker="job-end-$$-$(now)"
+    from=$(stat -c %s "$log")
     printf '\033]9999;%s\007' "$marker"
     for _ in $(seq 50); do
-        at=$(grep -abo -F "$marker" "$log" | tail -1 | cut -d: -f1)
+        at=$(tail -c "+$((from + 1))" "$log" | grep -abo -F "$marker" | head -1 | cut -d: -f1)
         [ -n "$at" ] && break
         sleep 0.1
     done
     tmux pipe-pane -t "$TMUX_PANE"
-    # The marker's offset is that of its text, which follows the 7 bytes of
-    # its escape-sequence prefix.
-    [ -n "$at" ] && truncate -s "$(( at - 7 ))" "$log"
+    if [ -n "$at" ]; then
+        # The offset is that of the marker's text, which follows the 7 bytes
+        # of its escape-sequence prefix.
+        truncate -s "$(( from + at - 7 ))" "$log"
+    else
+        printf '\njob: the copy of the pane closed before it caught up; the end of the output may be missing\n' >> "$log"
+    fi
     return "$rc"
 }
 
