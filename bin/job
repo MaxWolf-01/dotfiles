@@ -7,17 +7,18 @@
 # where the bugs live. `pgrep -f <pattern>` matches the waiting shell's own
 # command line and loops forever. `job wait` is that predicate, written once.
 #
-# Usage: job run  <name> [--cwd DIR] [--awake] -- <command> [args...]
+# Usage: job run  <name> [--cwd DIR] [--awake] [--tty] -- <command> [args...]
 #        job wait <name> [wait-flags]
 #        job wait --status FILE --log FILE [--pid PID] [wait-flags]
 #        job probe
 #        job log  <name> [lines]
 #        job stop <name>
 #        job rm   <name>
-#   run    starts <command> in a tmux session named job-<name>, with output
-#          going to the job's log, and returns after its first second: a
-#          command that has exited non-zero by then makes `run` exit 1 with
-#          the status line and the log's last line. Fails when <name>
+#   run    starts <command> in a tmux session named job-<name>, with its
+#          stdout and stderr going to the job's log and to the session's pane,
+#          and returns after its first second: a command that has exited
+#          non-zero by then makes `run` exit 1 with the status line and the
+#          log's last line. Fails when <name>
 #          already exists, running or done: names are unique until `job rm`,
 #          which is what stops one agent from reading another's build. Name
 #          jobs <project>-<activity> (api-migrate, docs-build); the name is
@@ -31,6 +32,14 @@
 #          command does, and a server or a watcher never ends, which is to say
 #          the laptop stops suspending until someone works out why.
 #          `nosleep --list` names every hold and how to clear it.
+#          Without --tty the command's stdin is empty and its stdout and stderr
+#          are a pipe, not a terminal: a question nobody expected gets
+#          end-of-input and fails the job rather than leaving it waiting, and
+#          the log holds no colours or progress-bar redraws.
+#          --tty gives the command the pane's terminal instead, for a command
+#          a human has to type into, such as a passphrase prompt: attach, then
+#          answer it in the pane. The log is then a copy of what the pane
+#          shows, carriage returns and escape sequences included.
 #   wait   blocks until the job ends, or until one of the flags below says to
 #          stop waiting. Nothing here ever touches the job: a wait that ends
 #          is a wait that ended, and killing is `job stop` or `job rm`. It
@@ -75,7 +84,7 @@
 #
 # State, plain text under $JOB_STATE_DIR (default ~/.local/state/jobs), one
 # directory per job:
-#   log      the command's stdout and stderr
+#   log      the command's stdout and stderr, or with --tty what the pane showed
 #   meta     pid, start time, cwd, command, written by the runner on entry
 #   status   exit code, end time, duration, written by the runner on exit;
 #            its presence is what makes a finished job knowable without
@@ -121,11 +130,12 @@ job_state() { # <status-file> <pid>
 cmd_run() {
     [ $# -ge 1 ] || die "run needs a name"
     paths "$1"; shift
-    cwd=$PWD awake=0
+    cwd=$PWD awake=0 tty=0
     while [ $# -gt 0 ]; do
         case $1 in
             --cwd)       cwd=${2:-} ; shift 2 || die "--cwd needs a directory" ;;
             --awake)     awake=1; shift ;;
+            --tty)       tty=1; shift ;;
             --)          shift; break ;;
             *)           die "run: unexpected argument '$1' (the command goes after --)" ;;
         esac
@@ -150,7 +160,7 @@ cmd_run() {
     tmux new-session -d -s "$session" -c "$cwd" || die "could not create tmux session $session"
     # printf %q quotes every word for the shell that tmux types this into, so
     # arguments with spaces, quotes or newlines reach the command unchanged.
-    line=$(printf 'JOB_STATE_DIR=%q JOB_AWAKE=%q %q __exec %q ' "$state_root" "$awake" "$self" "$name"; printf '%q ' "$@")
+    line=$(printf 'JOB_STATE_DIR=%q JOB_AWAKE=%q JOB_TTY=%q %q __exec %q ' "$state_root" "$awake" "$tty" "$self" "$name"; printf '%q ' "$@")
     tmux send-keys -t "=$session:" -l "$line"
     tmux send-keys -t "=$session:" Enter
 
@@ -193,7 +203,7 @@ load_caller_env() {
     while IFS= read -r -d '' kv; do
         key=${kv%%=*}
         case $key in
-            TMUX|TMUX_PANE|PWD|OLDPWD|SHLVL|_|JOB_STATE_DIR|JOB_AWAKE|JOB_LOG) continue ;;
+            TMUX|TMUX_PANE|PWD|OLDPWD|SHLVL|_|JOB_STATE_DIR|JOB_AWAKE|JOB_TTY) continue ;;
         esac
         [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$kv"
     done < "$dir/env"
@@ -206,9 +216,9 @@ load_caller_env() {
 # state, and must mean something really did go wrong.
 cmd_exec() {
     paths "$1"; shift
-    awake=${JOB_AWAKE:-0}
+    awake=${JOB_AWAKE:-0} tty=${JOB_TTY:-0}
     load_caller_env
-    printf 'pid=%s\nstarted=%s\ncwd=%s\nawake=%s\ncmd=%s\n' "$$" "$(iso)" "$PWD" "$awake" "$*" > "$meta"
+    printf 'pid=%s\nstarted=%s\ncwd=%s\nawake=%s\ntty=%s\ncmd=%s\n' "$$" "$(iso)" "$PWD" "$awake" "$tty" "$*" > "$meta"
     started=$(now)
     # The command runs in the foreground, in the runner's process group, so
     # Ctrl-C in the pane and `job stop` reach it and the runner alike. Not as a
@@ -222,26 +232,59 @@ cmd_exec() {
     # nosleep holds a systemd inhibitor for the command's lifetime and is a
     # no-op where there is nothing to inhibit, so it costs nothing to always
     # ask for it and saves the run that would have been suspended mid-flight.
-    # The redirect sits on the command rather than around nosleep, so that
-    # systemd-inhibit's own "<cmd> failed with exit status N" lands in the pane
-    # and not in the log, where it would sit under a status line that already
-    # gives the code, blaming the wrapper for what the command did.
-    export JOB_LOG=$log
-    if [ "$awake" = 1 ] && command -v nosleep >/dev/null; then
-        # --why, because the command line nosleep would otherwise show is this
-        # wrapper plus whatever environment the caller stuffed in: several
-        # hundred characters of PATH in front of the part that identifies it.
-        # `nosleep --list` is where that string is read, when a hold is
-        # refusing a suspend and the question is whose it is.
-        nosleep --why "job $name" bash -c 'exec "$@" >>"$JOB_LOG" 2>&1' job-exec "$@"
+    # --why, because the command line nosleep would otherwise show is this
+    # wrapper plus whatever environment the caller stuffed in: several hundred
+    # characters of PATH in front of the part that identifies it. `nosleep
+    # --list` is where that string is read, when a hold is refusing a suspend
+    # and the question is whose it is.
+    wrap=()
+    [ "$awake" = 1 ] && command -v nosleep >/dev/null && wrap=(nosleep --why "job $name")
+    if [ "$tty" = 1 ]; then
+        run_on_pane "$@"
     else
-        "$@" >> "$log" 2>&1
+        run_piped "$@"
     fi
     rc=$?
     # Written aside and moved into place, so whoever sees the file sees it whole.
     printf 'exit=%s ended=%s secs=%s\n' "$rc" "$(iso)" "$(( $(now) - started ))" > "$status.new"
     mv "$status.new" "$status"
     exit "$rc"
+}
+
+# The command's output reaches the pane through tee, so the command itself
+# sees a pipe. The redirects sit on the command rather than around nosleep, so
+# that systemd-inhibit's own "<cmd> failed with exit status N" lands in the pane
+# and not in the log, where it would sit under a status line that already gives
+# the code, blaming the wrapper for what the command did. tee ignores INT and
+# TERM: Ctrl-C and `job stop` are for the command, and a tee that died of them
+# would kill with SIGPIPE a command that prints on its way out.
+run_piped() {
+    "${wrap[@]}" bash -c 'exec "$@" </dev/null 2>&1' job-exec "$@" |
+        ( trap '' INT TERM; exec tee -a "$log" )
+    return "${PIPESTATUS[0]}"
+}
+
+# The command keeps the pane's terminal, and tmux copies the pane's output into
+# the log. tmux drops what it has not yet written to the copy when the copy is
+# closed, so the runner prints a marker the pane does not display, closes the
+# copy only once the marker has reached the log, and cuts the log there.
+run_on_pane() {
+    local rc marker at
+    tmux pipe-pane -t "$TMUX_PANE" "cat >> $(printf %q "$log")"
+    "${wrap[@]}" "$@"
+    rc=$?
+    marker="job-end-$$-$(now)"
+    printf '\033]9999;%s\007' "$marker"
+    for _ in $(seq 50); do
+        at=$(grep -abo -F "$marker" "$log" | tail -1 | cut -d: -f1)
+        [ -n "$at" ] && break
+        sleep 0.1
+    done
+    tmux pipe-pane -t "$TMUX_PANE"
+    # The marker's offset is that of its text, which follows the 7 bytes of
+    # its escape-sequence prefix.
+    [ -n "$at" ] && truncate -s "$(( at - 7 ))" "$log"
+    return "$rc"
 }
 
 # --- wait
