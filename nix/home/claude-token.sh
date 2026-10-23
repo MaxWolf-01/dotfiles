@@ -46,7 +46,7 @@ unset CLAUDE_CODE_OAUTH_TOKEN
 file=$HOME/.dotfiles/secrets/creds/env/claude-$account.env
 if [ -n "$account" ] && [ -f "$file" ]; then
     if ! plain=$("$sops" decrypt --input-type dotenv --output-type dotenv "$file"); then
-        echo "claude: could not decrypt $file, so the $account account has no token (is SOPS_AGE_KEY_FILE=${SOPS_AGE_KEY_FILE:-} there?)" >&2
+        echo "claude: could not decrypt $file, so the $account account has no token (is the age key SOPS_AGE_KEY_FILE names, '${SOPS_AGE_KEY_FILE:-}', there?)" >&2
         exit 1
     fi
     token=$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' <<<"$plain")
