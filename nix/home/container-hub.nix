@@ -30,15 +30,17 @@
 # Restart=always, not on-failure: the hub never exits on its own, so any exit,
 # a clean one included, leaves every agent's pages opening as plain tabs.
 #
-# A peer is another host's hub this one relays (the hub's --peer), reached
-# over ssh as max: ssh forwards the peer's socket to one here that only max
-# can open, since ssh makes it 0600 (StreamLocalBindMask) in a directory of
-# his. Not over the peer's tailnet port: the tailnet policy cannot tell max's
-# processes on pc from the dispatch workers beside them, so a grant from pc to
-# that port would let a worker drive the peer's sessions, and the workers hold
-# no ssh login to the peer. The forward is a unit of its own: a peer asleep or
-# out of reach is ssh failing and trying again every 30s, while the hub shows
-# what it last read of the peer.
+# A peer is another host's hub this one relays (the hub's --peer): every other
+# host of ./session-hosts.nix trusted as much as this one or less (that file
+# says why). It is reached over ssh as max: ssh forwards the peer's socket to
+# one here that only max can open, since ssh makes it 0600
+# (StreamLocalBindMask) in a directory of his. Not over the peer's tailnet
+# port: the tailnet policy cannot tell max's processes on pc from the dispatch
+# workers beside them, so a grant from pc to that port would let a worker
+# drive the peer's sessions, and the workers hold no ssh login to the peer.
+# The forward is a unit of its own: a peer asleep or out of reach is ssh
+# failing and trying again every 30s, while the hub shows what it last read of
+# the peer.
 { config, pkgs, lib, ... }:
 let
   cfg = config.containerHub;
@@ -48,6 +50,7 @@ let
   peerSocket = name: "${state}/peers/${name}.sock";
   scriptPath = lib.makeBinPath ((with pkgs; [ bash coreutils uv git curl ]) ++ [ config.programs.tmux.package ]);
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
+  peers = lib.filterAttrs (name: peer: name != cfg.host && peer.trust <= cfg.hosts.${cfg.host}.trust) cfg.hosts;
 in
 {
   options.containerHub = {
@@ -68,18 +71,33 @@ in
         port on the tailnet (the hub's --tailnet). A host whose serve table a
         system unit owns (pc) serves the socket from there instead.'';
     };
-    peers = lib.mkOption {
-      type = lib.types.attrsOf lib.types.str;
-      default = { };
-      example = { zephylux = "zephylux"; };
-      description = ''
-        The other hosts' hubs this one relays: the host name the hub tab
-        shows, to the ssh destination that reaches that host. Its hub listens
-        where this host's does, under the same home.'';
+    host = lib.mkOption {
+      type = lib.types.str;
+      description = "This host's name in `hosts`, which the hub tab shows its sessions under (the hub's --host).";
+    };
+    hosts = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          ssh = lib.mkOption {
+            type = lib.types.str;
+            description = "The ssh destination that reaches the host as max. Its hub listens where this host's does, under the same home.";
+          };
+          trust = lib.mkOption {
+            type = lib.types.int;
+            description = "How far the host is trusted, higher being further.";
+          };
+        };
+      });
+      default = import ./session-hosts.nix;
+      description = "The hosts that run max's sessions; ./session-hosts.nix says what they are for.";
     };
   };
 
   config.assertions = [
+    {
+      assertion = cfg.hosts ? ${cfg.host};
+      message = "containerHub: host ${cfg.host} is none of containerHub.hosts (${lib.concatStringsSep ", " (lib.attrNames cfg.hosts)})";
+    }
     {
       assertion = cfg.loopback || cfg.url != null;
       message = "containerHub: the hub needs an address a browser opens it at, its loopback port or a url";
@@ -94,11 +112,11 @@ in
     container-hub = {
       Unit.Description = "The container hub: every page an agent opens, in its orchestrator's unit";
       Service = {
-        ExecStart = lib.escapeShellArgs ([ "${dotfiles}/bin/container-hub" "--socket" socket ]
+        ExecStart = lib.escapeShellArgs ([ "${dotfiles}/bin/container-hub" "--socket" socket "--host" cfg.host ]
           ++ lib.optionals cfg.loopback [ "--port" port ]
           ++ lib.optionals (cfg.url != null) [ "--url" cfg.url ]
           ++ lib.optionals (cfg.tailnet != null) [ "--tailnet" cfg.tailnet ]
-          ++ lib.optionals (cfg.peers != { }) ([ "--peer" ] ++ lib.mapAttrsToList (name: _: "${name}=${peerSocket name}") cfg.peers));
+          ++ lib.optionals (peers != { }) ([ "--peer" ] ++ lib.mapAttrsToList (name: _: "${name}=${peerSocket name}") peers));
         # "-": the hub never waits on tailscale, so a laptop offline or with
         # tailscaled stopped keeps its hub. tailscale is the Ubuntu system
         # package in /usr/bin. max is its operator, which lets him proxy a port
@@ -111,7 +129,7 @@ in
       };
       Install.WantedBy = [ "default.target" ];
     };
-  } // lib.mapAttrs' (name: destination: lib.nameValuePair "container-hub-peer-${name}" {
+  } // lib.mapAttrs' (name: peer: lib.nameValuePair "container-hub-peer-${name}" {
     Unit = {
       Description = "The container hub's way to ${name}'s hub: its socket, forwarded over ssh";
       After = [ "ssh-agent.service" ];
@@ -126,11 +144,11 @@ in
       # StreamLocalBindUnlink: the socket a killed ssh left is made anew.
       ExecStart = lib.escapeShellArgs [ "${pkgs.openssh}/bin/ssh" "-N" "-oBatchMode=yes" "-oConnectTimeout=10"
         "-oServerAliveInterval=15" "-oServerAliveCountMax=3" "-oExitOnForwardFailure=yes"
-        "-oStreamLocalBindUnlink=yes" "-L" "${peerSocket name}:${socket}" destination ];
+        "-oStreamLocalBindUnlink=yes" "-L" "${peerSocket name}:${socket}" peer.ssh ];
       Environment = [ "SSH_AUTH_SOCK=%t/ssh-agent" ];
       Restart = "always";
       RestartSec = 30;
     };
     Install.WantedBy = [ "default.target" ];
-  }) cfg.peers;
+  }) peers;
 }

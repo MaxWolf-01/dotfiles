@@ -1,0 +1,164 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: full-path (nix)
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""Who relays whom, from the list of hosts that run max's sessions (nix/home/session-hosts.nix): Home Manager's
+container-hub module evaluated for each of three hosts, pc and zephylux trusted alike and a VPS trusted less, then
+three live hubs started with the peers it gave each, every one on a scratch HOME with one session of its own. The
+real hosts' configs are evaluated too. Run it directly; no framework. What one relay does is relay.test's.
+"""
+
+import http.client
+import json
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fakes  # noqa: E402  (a hub on a HOME of its own)
+from check import check, fail, finish, needs, settles  # noqa: E402
+
+needs("nix")
+REPO = Path(__file__).resolve().parents[2]
+SCRATCH = Path(tempfile.mkdtemp(prefix="hosts.", dir=fakes.RUN))
+HOSTS = {"pc": {"ssh": "pc", "trust": 2}, "zephylux": {"ssh": "max@zephylux", "trust": 2}, "vps": {"ssh": "vps.example", "trust": 1}}
+SESSIONS = {"pc": "aaaaaaaa-0000-4000-8000-000000000001", "zephylux": "bbbbbbbb-0000-4000-8000-000000000002",
+            "vps": "cccccccc-0000-4000-8000-000000000003"}
+
+# Each host's container-hub units, by name, to the command each runs: the module given HOSTS, and the real hosts'
+# configs given the real list.
+EXPR = """
+let
+  f = builtins.getFlake "git+file://%(repo)s";
+  pkgs = f.inputs.nixpkgs.legacyPackages.${builtins.currentSystem};
+  units = services: builtins.mapAttrs (_: unit: unit.Service.ExecStart)
+    (pkgs.lib.filterAttrs (name: _: pkgs.lib.hasPrefix "container-hub" name) services);
+  module = host: (f.inputs.home-manager.lib.homeManagerConfiguration {
+    inherit pkgs;
+    modules = [ (f.outPath + "/nix/home/container-hub.nix") {
+      home = { username = "max"; homeDirectory = "/home/max"; stateVersion = "26.05"; };
+      containerHub = { inherit host; hosts = builtins.fromJSON %(hosts)s; url = "https://${host}.example"; };
+    } ];
+  }).config.systemd.user.services;
+in {
+  three = builtins.mapAttrs (host: _: units (module host)) (builtins.fromJSON %(hosts)s);
+  real = {
+    pc = units f.nixosConfigurations.pc.config.home-manager.users.max.systemd.user.services;
+    zephylux = units f.homeConfigurations.zephyrus.config.systemd.user.services;
+  };
+}
+"""
+
+
+def argv(command) -> list[str]:
+    return shlex.split(command if isinstance(command, str) else " ".join(command))
+
+
+def relayed(units: dict) -> dict[str, str]:
+    """The hosts a host's hub relays (its --peer names), each to the ssh destination its forward reaches."""
+    hub = argv(units["container-hub"])
+    names = [peer.split("=", 1)[0] for peer in hub[hub.index("--peer") + 1:]] if "--peer" in hub else []
+    return {name: argv(units[f"container-hub-peer-{name}"])[-1] for name in names}
+
+
+def get(hub: fakes.Hub, path: str):
+    conn = fakes.Unix(hub.socket)
+    conn.request("GET", path)
+    r = conn.getresponse()
+    raw = r.read()
+    conn.close()
+    return r.status, json.loads(raw) if r.status == 200 else raw
+
+
+def post(hub: fakes.Hub, path: str, body: dict) -> dict:
+    conn = fakes.Unix(hub.socket)
+    conn.request("POST", path, body=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    answer = json.loads(conn.getresponse().read())
+    conn.close()
+    return answer
+
+
+def events(hub: fakes.Hub, path: str) -> list[dict]:
+    """The events a stream on a hub's socket sends from now on, as they arrive."""
+    heard = []
+
+    def listen() -> None:
+        try:
+            conn = fakes.Unix(hub.socket)
+            conn.timeout = 60
+            conn.request("GET", path)
+            for line in conn.getresponse():
+                if line.startswith(b"data:"):
+                    heard.append(json.loads(line[5:]))
+        except (OSError, http.client.HTTPException):
+            pass
+
+    threading.Thread(target=listen, daemon=True).start()
+    return heard
+
+
+evaluated = subprocess.run(["nix", "eval", "--json", "--impure", "--expr",
+                            EXPR % {"repo": REPO, "hosts": json.dumps(json.dumps(HOSTS))}], capture_output=True, text=True)
+if evaluated.returncode != 0:
+    fail("the container-hub module evaluates for every host", evaluated.stderr.strip()[-2000:])
+    finish()
+evaluated = json.loads(evaluated.stdout)
+peers = {host: relayed(units) for host, units in evaluated["three"].items()}
+
+# --- the module: who relays whom
+
+check("pc and zephylux, trusted alike, relay each other and the VPS trusted less, each over its entry's ssh login",
+      {"pc": {"zephylux": "max@zephylux", "vps": "vps.example"}, "zephylux": {"pc": "pc", "vps": "vps.example"}},
+      {host: peers[host] for host in ("pc", "zephylux")})
+check("the VPS relays neither, and holds no login to either", ({}, ["container-hub"]), (peers["vps"], list(evaluated["three"]["vps"])))
+real = {host: relayed(units) for host, units in evaluated["real"].items()}
+check("the real list: pc's hub and the laptop's relay each other", (True, True), ("zephylux" in real["pc"], "pc" in real["zephylux"]))
+
+# --- three hubs, each relaying what the module gave it
+
+hubs = {host: fakes.Hub(SCRATCH, host, "--url", f"http://{host}.invalid") for host in HOSTS}
+for host, hub in hubs.items():
+    hub.argv += ["--peer", *(f"{peer}={hubs[peer].socket}" for peer in peers[host])] if peers[host] else []
+processes = [hub.running(SESSIONS[host]) for host, hub in hubs.items()]
+pages = {host: fakes.page(hub.home / "notes" / f"{host}.html") for host, hub in hubs.items()}
+
+try:
+    for hub in hubs.values():
+        hub.start()
+
+    def rail(host: str) -> dict[str, list[str]]:
+        """The sessions the hub tab of `host` shows, by the host each runs on: its own, and each peer's, relayed."""
+        own = get(hubs[host], "/api/hub")[1]
+        shown = {own["host"]: [u["unit"] for u in own["units"]]}
+        for peer in own["peers"]:
+            index = get(hubs[host], f"/h/{peer}/api/hub")[1]
+            shown[index["host"]] = [u["unit"] for u in index["units"]]
+        return shown
+
+    every = {host: [session] for host, session in SESSIONS.items()}
+    check("pc's hub tab shows every host's sessions", every, rail("pc"))
+    check("...and so does zephylux's, the same rail", every, rail("zephylux"))
+    check("the VPS's hub tab shows its own alone", {"vps": [SESSIONS["vps"]]}, rail("vps"))
+    check("...and relays neither of the others", [404, 404], [get(hubs["vps"], f"/h/{host}/api/hub")[0] for host in ("pc", "zephylux")])
+
+    streams = [events(hubs[host], f"/h/{peer}/events") for host in HOSTS for peer in peers[host]]
+    settles("every hub's relayed event streams reach the host each relays", [{"type": "reached"}] * len(streams),
+            lambda: [heard[0] if heard else None for heard in streams])
+    opened = {host: post(hub, "/api/open", {"target": str(pages[host]), "session": SESSIONS[host]})["launch"]
+              for host, hub in hubs.items()}
+    check("with each host's event stream relayed by every hub that relays it, each still opens its own hub tab",
+          {host: True for host in HOSTS}, opened)
+finally:
+    for process in processes:
+        process.kill()
+    for hub in hubs.values():
+        if hub.proc and hub.proc.poll() is None:
+            hub.stop()
+
+finish()
