@@ -24,6 +24,13 @@
 # falling back to it when a run log goes missing would weaken the check without
 # saying so.
 #
+# One more thing runs out on a date rather than going quiet: the Claude Code
+# setup-token in each creds/env/claude-<account>.env, which stops working on its
+# CLAUDE__VALID_UNTIL. Each one is reported as expiring once it is within
+# TOKEN_WARN_DAYS of that date, so the yearly renewal is not found by a session
+# failing. A file whose values are all empty holds no token yet, and is passed
+# over.
+#
 # Units on another host are read over ssh. A target that is merely away (a host
 # that is off, a repository whose server is down) is expected unavailability,
 # not an alert: it is skipped and reported on stdout. A dead pc still surfaces
@@ -40,6 +47,9 @@ set -uo pipefail
 
 DEFAULT_MAX_AGE_DAYS=14
 RESTIC_CONFIG_GLOB="$HOME/.dotfiles/secrets/backup/restic/*/*.conf"
+CREDS_ENV_GLOB="$HOME/.dotfiles/secrets/creds/env/*.env"
+TOKEN_EXPIRY_VARIABLE=CLAUDE__VALID_UNTIL
+TOKEN_WARN_DAYS=30
 
 # systemd logs this message id when a unit's job finishes; JOB_RESULT says how it
 # went, so "done" is the last clean finish and failures never match.
@@ -53,6 +63,10 @@ Checks every restic config's newest snapshot against its max_age_days (default
 $DEFAULT_MAX_AGE_DAYS), and every unit in the config file against its bound there.
 With no positional arguments, checks every restic config under
   $RESTIC_CONFIG_GLOB
+Every credential file under
+  $CREDS_ENV_GLOB
+that defines $TOKEN_EXPIRY_VARIABLE is reported as expiring from $TOKEN_WARN_DAYS days before
+that date.
 Repos on a filesystem path that doesn't exist here are skipped: they belong to
 another host. A repo whose target cannot be reached is dated from the run log
 of the host that makes that backup (bin/backup-hosts), against the same
@@ -63,7 +77,8 @@ Exits 1 when it found something overdue or unreadable, 2 when the check itself
 could not run. The units treat 1 as success, so a red unit means a broken
 watchdog rather than an overdue backup.
 
-  --extra-days N  add N days to every bound, restic and unit alike. Two hosts
+  --extra-days N  add N days to every bound, restic and unit alike, and warn of
+                  an expiring token N days later. Two hosts
                   running this both cover everything, but the one with the
                   offset stays quiet unless the other stopped alerting (i.e.
                   died), so a healthy setup alerts only once.
@@ -246,6 +261,8 @@ away_verdict() {
 }
 
 overdue=""
+expiring=""
+expiring_count=0
 unchecked=""
 unreachable=""
 overdue_count=0
@@ -346,6 +363,57 @@ for config in "${restic_configs[@]}"; do
     fi
 done
 
+# --- account tokens: the days left before each one's expiry date
+
+shopt -s nullglob
+token_files=()
+for file in $CREDS_ENV_GLOB; do
+    grep -q "^$TOKEN_EXPIRY_VARIABLE=" "$file" && token_files+=("$file")
+done
+shopt -u nullglob
+
+# The date is encrypted with the token, so without the key no file can be read;
+# one line says so, as for the restic repos above.
+if [ ${#token_files[@]} -gt 0 ] && [ ! -f "${SOPS_AGE_KEY_FILE:-}" ]; then
+    unchecked="${unchecked}  token expiry: age key not available at '${SOPS_AGE_KEY_FILE:-}' (decrypt it first)"$'\n'
+    unchecked_count=$((unchecked_count + 1))
+    token_files=()
+fi
+
+warn_days=$((TOKEN_WARN_DAYS - extra_days))
+# Whole days from today's date to the expiry date: both read as UTC midnights, so
+# no daylight-saving change in between leaves a fraction of one.
+today=$(date -u -d "$(date +%F)" +%s)
+for file in "${token_files[@]}"; do
+    name=$(basename "$file" .env)
+    if ! plain=$(sops decrypt --input-type dotenv --output-type dotenv "$file" 2>/dev/null); then
+        unchecked="${unchecked}  ${name}: could not decrypt it to read $TOKEN_EXPIRY_VARIABLE"$'\n'
+        unchecked_count=$((unchecked_count + 1))
+        continue
+    fi
+    until=$(sed -n "s/^$TOKEN_EXPIRY_VARIABLE=//p" <<<"$plain")
+    if [ -z "$until" ]; then
+        grep -q '^[^#][^=]*=.' <<<"$plain" || { echo "no token: $name holds none yet"; continue; }
+        unchecked="${unchecked}  ${name}: holds a token but no $TOKEN_EXPIRY_VARIABLE"$'\n'
+        unchecked_count=$((unchecked_count + 1))
+        continue
+    fi
+    if ! expiry=$(date -u -d "$until" +%s 2>/dev/null); then
+        unchecked="${unchecked}  ${name}: $TOKEN_EXPIRY_VARIABLE is no date: $until"$'\n'
+        unchecked_count=$((unchecked_count + 1))
+        continue
+    fi
+    left=$(( (expiry - today) / 86400 ))
+    if [ "$left" -le "$warn_days" ]; then
+        if [ "$left" -lt 0 ]; then when="expired $((-left))d ago"; else when="expires in ${left}d"; fi
+        expiring="${expiring}  ${name}: token ${when}, ${until} (warns ${warn_days}d ahead); mint the next with \`claude setup-token\` and write it with \`sops creds/env/${name}.env\`"$'\n'
+        expiring_count=$((expiring_count + 1))
+    else
+        ok_count=$((ok_count + 1))
+        echo "ok: $name — token expires in ${left}d, $until (warns ${warn_days}d ahead)"
+    fi
+done
+
 # --- everything else: time since the last successful run
 
 # fd 3, not stdin: an ssh in here would otherwise drain the records still to read.
@@ -392,6 +460,7 @@ done 3<<<"$unit_records"
 
 message=""
 [ -n "$overdue" ] && message="Overdue:"$'\n'"$overdue"
+[ -n "$expiring" ] && message="${message}Expiring:"$'\n'"$expiring"
 [ -n "$unchecked" ] && message="${message}Could not check:"$'\n'"$unchecked"
 [ -n "$message" ] && message="${message}"$'\n'"$ok_count unit(s) fine."
 
@@ -411,19 +480,23 @@ subject_lead() {
 # Proton threads by subject and participants, and a subject that never changes
 # folds every alert this host ever sent into one conversation.
 #
-# Overdue leads when both are present. A unit past its bound is the alarm;
-# evidence that could not be read is a second-order problem, and its count says
-# enough. "unchecked" is the subject's name for the body's "Could not check:"
-# section — the body has the room to spell it out, a lock screen does not.
+# Overdue leads, then expiring. A unit past its bound is the alarm; a token
+# running out is weeks away; evidence that could not be read is a second-order
+# problem, and the counts of the ones that do not lead say enough. "unchecked"
+# is the subject's name for the body's "Could not check:" section — the body has
+# the room to spell it out, a lock screen does not.
 alert_subject() {
+    local kind count block
     if [ "$overdue_count" -gt 0 ]; then
-        printf '🕸️ %d overdue: %s' \
-            "$overdue_count" "$(subject_lead "$overdue" "$overdue_count")"
-        [ "$unchecked_count" -gt 0 ] && printf ' (+%d unchecked)' "$unchecked_count"
-        return 0
+        kind=overdue count=$overdue_count block=$overdue
+    elif [ "$expiring_count" -gt 0 ]; then
+        kind=expiring count=$expiring_count block=$expiring
+    else
+        kind=unchecked count=$unchecked_count block=$unchecked
     fi
-    printf '🕸️ %d unchecked: %s' \
-        "$unchecked_count" "$(subject_lead "$unchecked" "$unchecked_count")"
+    printf '🕸️ %d %s: %s' "$count" "$kind" "$(subject_lead "$block" "$count")"
+    [ "$kind" != expiring ] && [ "$expiring_count" -gt 0 ] && printf ' (+%d expiring)' "$expiring_count"
+    [ "$kind" != unchecked ] && [ "$unchecked_count" -gt 0 ] && printf ' (+%d unchecked)' "$unchecked_count"
     return 0
 }
 
@@ -465,6 +538,7 @@ if [ -n "$alert" ] && [ "$alert" != "delivered" ]; then
 fi
 "$run_log_bin" overdue-check "$outcome" "${reason_args[@]}" --stats "$(jq -n \
     --argjson overdue "$overdue_count" \
+    --argjson expiring "$expiring_count" \
     --argjson unchecked "$unchecked_count" \
     --argjson unreachable "$unreachable_count" \
     --argjson ok "$ok_count" \

@@ -14,6 +14,7 @@
 
   imports = [
     ../brave.nix
+    ../claude-token.nix
     ../container-hub.nix
     ../desktop.nix
     ../display-layout.nix
