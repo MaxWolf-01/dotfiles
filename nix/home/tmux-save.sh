@@ -30,9 +30,8 @@
 #   so restore.sh brings the session back rather than a fresh one. That command
 #   names the session's directory and its config dir, ~/.claude by unsetting
 #   CLAUDE_CONFIG_DIR: a restored pane's shell may hold another account's.
-#   It resumes nothing once the session's transcript has a release beside it
-#   (bin/container-hub --help): the session is another host's by then, and a
-#   save taken before the release would otherwise resume it here at boot.
+#   bin/tmux-resume-guard goes first, since a save taken before the session was
+#   released or forked elsewhere would otherwise resume it here at boot.
 set -u
 
 tmux=$1
@@ -73,7 +72,7 @@ done
 while IFS=$d read -r pid id cwd config; do
     account="env -u CLAUDE_CONFIG_DIR "
     [ "$config" = "$HOME/.claude" ] || printf -v account 'CLAUDE_CONFIG_DIR=%q ' "$config"
-    printf -v "resume[$pid]" 'cd %q && test -z "$(find %q/projects -maxdepth 2 -name %q.release.json)" && %sclaude --resume %s' \
+    printf -v "resume[$pid]" 'cd %q && tmux-resume-guard %q %q && %sclaude --resume %s' \
         "$cwd" "$config" "$id" "$account" "$id"
 done < <(((${#registries[@]})) && printf '%s\n' "${registries[@]}" | jq -rR 'index("\t") as $i
     | (.[$i + 1:] | fromjson? | select(.kind == "interactive")) as $s

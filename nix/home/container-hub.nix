@@ -104,6 +104,12 @@ in
       default = lib.filterAttrs (name: peer: name != cfg.host && peer.trust <= cfg.hosts.${cfg.host}.trust) cfg.hosts;
       description = "The hosts of `hosts` this one relays and pulls session copies of (./session-copies.nix): every other one trusted as much as this one or less.";
     };
+    relayedBy = lib.mkOption {
+      type = lib.types.attrs;
+      readOnly = true;
+      default = lib.filterAttrs (name: host: name != cfg.host && host.trust >= cfg.hosts.${cfg.host}.trust) cfg.hosts;
+      description = "The hosts of `hosts` whose hubs relay this one, and so may fork its sessions: every other one trusted as much as this one or more.";
+    };
   };
 
   config.assertions = [
@@ -120,6 +126,13 @@ in
       message = "containerHub: tailnet serves the loopback port, so it needs loopback";
     }
   ];
+
+  # What bin/tmux-resume-guard waits on at a restore: this host's name, and
+  # the ssh destination of each host whose hub tells this one of its forks.
+  config.xdg.configFile."container-hub/relayed-by.json".text = builtins.toJSON {
+    host = cfg.host;
+    relayedBy = lib.mapAttrs (_: host: host.ssh) cfg.relayedBy;
+  };
 
   config.systemd.user.services = {
     container-hub = {
