@@ -32,16 +32,12 @@
 #          command does, and a server or a watcher never ends, which is to say
 #          the laptop stops suspending until someone works out why.
 #          `nosleep --list` names every hold and how to clear it.
-#          Without --tty the command's stdin is empty and its stdout and stderr
-#          are a pipe, not a terminal: a question read from stdin gets
-#          end-of-input and fails the job rather than leaving it waiting, and
-#          the log holds no colours or progress-bar redraws. A prompt that
-#          opens /dev/tty itself (sudo, ssh's password and host-key questions,
-#          pinentry) still reaches the pane, and only the pane, and waits there.
-#          --tty gives the command the pane's terminal instead, for a command
-#          a human has to type into, such as a passphrase prompt: attach, then
-#          answer it in the pane. The log is then a copy of what the pane
-#          shows, carriage returns and escape sequences included.
+#          Without --tty the command's stdin is empty and its stdout and
+#          stderr are a pipe, so a question read from stdin fails the job
+#          instead of waiting, and the log holds no colours or redraws. A
+#          prompt that opens /dev/tty (sudo, ssh) still waits in the pane.
+#          --tty gives the command the pane's terminal, for a prompt a human
+#          answers after `tmux attach`; the log is then a copy of the pane.
 #   wait   blocks until the job ends, or until one of the flags below says to
 #          stop waiting. Nothing here ever touches the job: a wait that ends
 #          is a wait that ended, and killing is `job stop` or `job rm`. It
@@ -220,7 +216,7 @@ cmd_exec() {
     paths "$1"; shift
     awake=${JOB_AWAKE:-0} tty=${JOB_TTY:-0}
     load_caller_env
-    printf 'pid=%s\nstarted=%s\ncwd=%s\nawake=%s\ntty=%s\ncmd=%s\n' "$$" "$(iso)" "$PWD" "$awake" "$tty" "$*" > "$meta"
+    printf 'pid=%s\nstarted=%s\ncwd=%s\nawake=%s\ncmd=%s\n' "$$" "$(iso)" "$PWD" "$awake" "$*" > "$meta"
     started=$(now)
     # The command runs in the foreground, in the runner's process group, so
     # Ctrl-C in the pane and `job stop` reach it and the runner alike. Not as a
@@ -242,71 +238,31 @@ cmd_exec() {
     wrap=()
     [ "$awake" = 1 ] && command -v nosleep >/dev/null && wrap=(nosleep --why "job $name")
     if [ "$tty" = 1 ]; then
-        run_on_pane "$@"
+        tmux pipe-pane -t "$TMUX_PANE" "cat >> $(printf %q "$log")"
+        "${wrap[@]}" "$@"
+        rc=$?
+        tmux pipe-pane -t "$TMUX_PANE"
     else
-        run_piped "$@"
+        # $! is unset after a process substitution on a command's own redirect
+        # inside a function, hence the exec. tee is not a pipeline stage, which
+        # would hold the job open while a child the command left behind writes.
+        # tee ignores `job stop`'s TERM, as bash already has it ignore SIGINT,
+        # so a command printing on its way out does not die of SIGPIPE.
+        exec {out}> >(trap '' TERM; exec tee -a "$log")
+        copy=$!
+        # The redirects sit inside nosleep so systemd-inhibit's own failure
+        # message stays out of the log.
+        "${wrap[@]}" bash -c 'exec "$@" </dev/null 2>&1' job-exec "$@" >&"$out"
+        rc=$?
+        exec {out}>&-
+        # Lets tee copy the last lines before the status line says the job is
+        # done, without waiting on a child that is still writing.
+        for _ in $(seq 20); do kill -0 "$copy" 2>/dev/null && sleep 0.1 || break; done
     fi
-    rc=$?
     # Written aside and moved into place, so whoever sees the file sees it whole.
     printf 'exit=%s ended=%s secs=%s\n' "$rc" "$(iso)" "$(( $(now) - started ))" > "$status.new"
     mv "$status.new" "$status"
     exit "$rc"
-}
-
-# The command's output reaches the pane through tee, so the command itself
-# sees a pipe. The redirects sit on the command rather than around nosleep, so
-# that systemd-inhibit's own "<cmd> failed with exit status N" lands in the pane
-# and not in the log, where it would sit under a status line that already gives
-# the code, blaming the wrapper for what the command did. tee ignores INT and
-# TERM: Ctrl-C and `job stop` are for the command, and a tee that died of them
-# would kill with SIGPIPE a command that prints on its way out.
-# tee is a process substitution rather than a pipeline stage because a pipeline
-# ends when its last writer closes the pipe: a server the command started with
-# `&` would hold the job open long after the command's exit. The runner gives
-# tee a moment to copy the command's last lines, then writes the status line
-# whether or not something the command left behind is still writing.
-run_piped() {
-    local out copy rc
-    # Opened with exec rather than on the command's own redirect: bash leaves
-    # $! unset for a process substitution on a command run inside a function.
-    exec {out}> >(trap '' INT TERM; exec tee -a "$log")
-    copy=$!
-    "${wrap[@]}" bash -c 'exec "$@" </dev/null 2>&1' job-exec "$@" >&"$out" {out}>&-
-    rc=$?
-    exec {out}>&-
-    for _ in $(seq 20); do
-        kill -0 "$copy" 2>/dev/null || break
-        sleep 0.1
-    done
-    return "$rc"
-}
-
-# The command keeps the pane's terminal, and tmux copies the pane's output into
-# the log. tmux drops what it has not yet written to the copy when the copy is
-# closed, so the runner prints a marker the pane does not display, closes the
-# copy only once the marker has reached the log, and cuts the log there.
-run_on_pane() {
-    local rc marker from at
-    tmux pipe-pane -t "$TMUX_PANE" "cat >> $(printf %q "$log")"
-    "${wrap[@]}" "$@"
-    rc=$?
-    marker="job-end-$$-$(now)"
-    from=$(stat -c %s "$log")
-    printf '\033]9999;%s\007' "$marker"
-    for _ in $(seq 50); do
-        at=$(tail -c "+$((from + 1))" "$log" | grep -abo -F "$marker" | head -1 | cut -d: -f1)
-        [ -n "$at" ] && break
-        sleep 0.1
-    done
-    tmux pipe-pane -t "$TMUX_PANE"
-    if [ -n "$at" ]; then
-        # The offset is that of the marker's text, which follows the 7 bytes
-        # of its escape-sequence prefix.
-        truncate -s "$(( from + at - 7 ))" "$log"
-    else
-        printf '\njob: the copy of the pane closed before it caught up; the end of the output may be missing\n' >> "$log"
-    fi
-    return "$rc"
 }
 
 # --- wait
