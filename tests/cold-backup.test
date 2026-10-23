@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# tier: full-path (ZFS, as root)
+# Drive bin/cold-backup against two throwaway pools on files: a source shaped
+# like tank/max (an encrypted dataset with its own mountpoint, a plain one) and
+# a cold pool. Run as root: `sudo bash tests/cold-backup.test`.
+#
+# The cases are what the cold copy promises: it is the same data as the source
+# (same snapshot GUIDs), encrypted datasets stay encrypted without their keys,
+# nothing on the cold pool is ever mounted (a received mountpoint would land on
+# top of the source's), a second run adds its changes beside the first rather
+# than replacing it, and a run without the disk changes nothing on the source.
+
+set -uo pipefail
+
+bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/check.sh"
+
+[ "$(id -u)" = 0 ] || skip "needs root for zpool create"
+needs zpool zfs jq
+
+work=$(mktemp -d)
+chmod 755 "$work"  # the run log is written as the user who ran sudo
+src="cbsrc$$"
+cold="cbcold$$"
+cleanup() {
+    zpool destroy -f "$src" 2>/dev/null
+    zpool destroy -f "$cold" 2>/dev/null
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+mkdir -p "$work/dev" "$work/logs"
+chown "${SUDO_USER:-root}" "$work/logs"
+truncate -s 256M "$work/src.img" "$work/dev/cold.img"
+echo "a passphrase for the test" >"$work/key"
+
+zpool create -O mountpoint=none "$src" "$work/src.img"
+zfs create -o mountpoint="$work/data" "$src/max"
+zfs create "$src/max/plain"
+zfs create -o encryption=on -o keyformat=passphrase -o keylocation="file://$work/key" \
+    -o mountpoint="$work/data/secret" "$src/max/secret"
+echo one >"$work/data/plain/file"
+echo hidden >"$work/data/secret/file"
+
+export COLD_SOURCE="$src/max" COLD_POOL="$cold" COLD_DEVICE_DIR="$work/dev" RUN_LOG_DIR="$work/logs"
+
+"$bin_dir/cold-backup" init "$work/dev/cold.img" >/dev/null
+"$bin_dir/cold-backup" >/dev/null
+check "first run succeeds" 0 $?
+check "the cold pool is detached after a run" 1 "$(zpool list "$cold" >/dev/null 2>&1; echo $?)"
+
+echo two >"$work/data/plain/file"
+"$bin_dir/cold-backup" --no-scrub >/dev/null
+check "second run succeeds" 0 $?
+
+zpool import -N -d "$work/dev" "$cold"
+guid() { zfs get -H -o value guid "$1"; }
+src_snaps=$(zfs list -H -t snapshot -o name -d 1 "$src/max" | wc -l)
+cold_snaps=$(zfs list -H -t snapshot -o name -d 1 "$cold/max" | wc -l)
+check "the source keeps only the latest run's snapshot" 1 "$src_snaps"
+check "the cold pool keeps both runs" 2 "$cold_snaps"
+latest=$(zfs list -H -t snapshot -o name -s createtxg -d 1 "$src/max" | tail -1 | cut -d@ -f2)
+check "the cold plain dataset is the source's latest snapshot" \
+    "$(guid "$src/max/plain@$latest")" "$(guid "$cold/max/plain@$latest")"
+check "the cold secret dataset is the source's latest snapshot" \
+    "$(guid "$src/max/secret@$latest")" "$(guid "$cold/max/secret@$latest")"
+check "the secret stays encrypted on the cold pool" aes-256-gcm "$(zfs get -H -o value encryption "$cold/max/secret")"
+check "its key is not on the cold pool" unavailable "$(zfs get -H -o value keystatus "$cold/max/secret")"
+check "nothing on the cold pool is mounted" "" "$(zfs get -H -o name,value -r mounted "$cold" | awk '$2 == "yes"')"
+check "nothing on the cold pool has a mountpoint" "" \
+    "$(zfs get -H -o name,value -r -t filesystem mountpoint "$cold" | awk '$2 != "none"')"
+zpool export "$cold"
+
+mv "$work/dev/cold.img" "$work/cold.img"
+"$bin_dir/cold-backup" --no-scrub >/dev/null 2>&1
+check "a run without the disk fails" 1 $?
+check "and leaves the source's snapshots alone" "$latest" \
+    "$(zfs list -H -t snapshot -o name -d 1 "$src/max" | cut -d@ -f2)"
+
+check "every run is in the run log" "ok ok fail" \
+    "$(jq -r .outcome "$work/logs/cold-backup.jsonl" | tr '\n' ' ' | sed 's/ $//')"
+
+finish

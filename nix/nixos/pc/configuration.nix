@@ -18,6 +18,7 @@
     ./host-unlock.nix
     ../host-recorder.nix
     ./hardware-alerts.nix
+    ./cold-backup.nix
     ../journald.nix
     ../uv-python.nix
   ];
