@@ -23,8 +23,17 @@ let
 
   receive = pkgs.writeShellApplication {
     name = "host-unlock-receive";
-    runtimeInputs = with pkgs; [ cryptsetup coreutils getent systemd ];
+    runtimeInputs = with pkgs; [ cryptsetup coreutils getent systemd util-linux ];
     text = ''
+      # Already unlocked: the restarts below would end every user manager, and
+      # with it every tmux pane and dispatch worker, which run as its scopes.
+      if mountpoint -q /home; then
+        cat > /dev/null
+        ${makeHomes}
+        echo "xmg19: /home was already unlocked"
+        exit 0
+      fi
+
       # The key arrives on stdin and goes straight to cryptsetup.
       if [ ! -e /dev/mapper/home ]; then
         cryptsetup open --key-file=- /dev/disk/by-partlabel/disk-home-luks home
