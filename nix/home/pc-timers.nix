@@ -20,6 +20,11 @@ let
     bash coreutils jq uv sops curl
   ]);
 
+  # bin/session-copies is a uv script driving rsync over ssh; jq for bin/run-log.
+  sessionCopiesPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv rsync openssh jq
+  ]);
+
   # systemd for journalctl: the watchdog asks it when units without a run log
   # last finished cleanly, here and (over ssh) on the laptop.
   watchdogPath = "${backupPath}:${lib.makeBinPath [ pkgs.systemd ]}";
@@ -274,6 +279,40 @@ in
       OnCalendar = "hourly";
       Persistent = true;
       RandomizedDelaySec = "10m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- The laptop's sessions → ~/.local/share/session-copies ---
+  # What it copies: bin/session-copies --help. The copies are what this host's
+  # hub shows of the laptop's sessions. The laptop's backups keep its own
+  # sessions, so nothing backs these up here. While the ssh key is locked after
+  # a reboot, every run is a skip.
+
+  systemd.user.services.session-copies = {
+    Unit = {
+      Description = "Pull the laptop's sessions into session copies";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${sessionCopiesPath}" "SSH_AUTH_SOCK=${sshAuthSock}" ];
+      ExecStart = "${dotfiles}/bin/session-copies --sources max@zephylux --record";
+      # The first run copies every transcript the laptop has; later ones send
+      # what changed. oneshot has no start timeout of its own, and a hung run
+      # would make every later firing a silent no-op.
+      TimeoutStartSec = "2h";
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.session-copies = {
+    Unit.Description = "Session copies from the laptop (every 2 min)";
+    Timer = {
+      OnCalendar = "*:1/2";
+      Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
   };

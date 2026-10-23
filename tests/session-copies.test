@@ -1,0 +1,193 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Check what bin/session-copies pulls, where it lands, and what a peer that does not answer leaves. Run it directly;
+no framework.
+
+The pull runs as the timer runs it, as a subprocess, against homes in a scratch directory: an ssh stub on PATH
+plays each user@host by running the command it is handed in that user's home, so rsync and the probe are the real
+ones, and a host marked down answers as an unreachable one does. The registry entries that name a running process
+name this test's own, with its start time read from /proc.
+
+Example:
+
+    tests/session-copies.test
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import check, finish, needs
+
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "session-copies"
+DEAD_PID = 4194305  # above the kernel's pid_max ceiling, so no process ever has it
+
+SSH_STUB = r"""#!/usr/bin/env bash
+# The login is the first argument that is not an option, user@host or, as rsync passes it, `-l user host`; what
+# follows is the command, which ssh hands a shell.
+while [[ $1 == -* ]]; do [ "$1" = -l ] && { user=$2; shift; }; shift; done
+host=${1#*@}; user=${user:-${1%@*}}; shift
+home="$HOMES/$host/$user"
+[ -e "$HOMES/$host/down" ] && { echo "ssh: connect to host $host port 22: Connection timed out" >&2; exit 255; }
+[ -e "$HOMES/$host/locked" ] && { echo "$user@$host: Permission denied (publickey)." >&2; exit 255; }
+cd "$home" && HOME="$home" exec sh -c "$*"
+"""
+
+
+def started(pid: int) -> str:
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
+def write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def tree(root: Path) -> set[str]:
+    """Every file and link under root, by its path relative to root."""
+    return {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() or p.is_symlink()}
+
+
+def account(home: Path, name: str = ".claude") -> Path:
+    """An account directory as Claude Code leaves one: what the pull copies, and beside it what it must not."""
+    acct = home / name
+    write(acct / "projects/-home-x-repo/aaaa.jsonl", '{"type":"user"}\n')
+    write(acct / "projects/-home-x-repo/aaaa/subagents/agent-1.jsonl", "{}\n")
+    write(acct / "session-pages/aaaa/review.html", "<p>page</p>")
+    write(acct / "session-pages/bbbb/old.html", "<p>an ended session's page</p>")
+    pid = os.getpid()
+    write(acct / f"sessions/{pid}.json", json.dumps({"pid": pid, "sessionId": "aaaa", "procStart": started(pid)}))
+    write(acct / f"sessions/{pid}.0123abcd.key", "a key")
+    write(acct / f"sessions/{DEAD_PID}.json", json.dumps({"pid": DEAD_PID, "sessionId": "cccc", "procStart": "1"}))
+    write(acct / ".credentials.json", "{}")
+    write(acct / "settings.json", "{}")
+    write(acct / "plugins/cache/x", "")
+    write(acct / "projects/-home-x-repo/.git/HEAD", "ref: refs/heads/master\n")
+    (acct / "projects/-home-x-repo/link.jsonl").symlink_to(home / ".ssh-key")
+    return acct
+
+
+def main() -> None:
+    needs("rsync", "ssh")
+    work = Path(tempfile.mkdtemp(prefix="session-copies-test-"))
+    try:
+        run_cases(work)
+    finally:
+        shutil.rmtree(work)
+    finish()
+
+
+def run_cases(work: Path) -> None:
+    homes, stub, root, logs = work / "homes", work / "stub", work / "copies", work / "logs"
+    stub.mkdir()
+    (stub / "ssh").write_text(SSH_STUB)
+    (stub / "ssh-add").write_text("#!/bin/sh\nexit \"${AGENT_RC:-0}\"\n")
+    for exe in stub.iterdir():
+        exe.chmod(0o755)
+    env = {**os.environ, "PATH": f"{stub}:{os.environ['PATH']}", "HOMES": str(homes), "RUN_LOG_DIR": str(logs)}
+
+    def pull(*sources: str, **extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run([str(SCRIPT), "--sources", *sources, "--root", str(root), "--record"],
+                              env={**env, **extra}, capture_output=True, text=True, timeout=60, check=False)
+
+    def last_run() -> dict:
+        return json.loads((logs / "session-copies.jsonl").read_text().splitlines()[-1])
+
+    pid = os.getpid()
+    account(homes / "peer/max")
+    account(homes / "peer/max", ".claude-helferline")
+    (homes / "peer/max/.claude-work").symlink_to(homes / "peer/max/.claude")
+    worker = account(homes / "peer/agent")
+    write(homes / "peer/max/.claude.json", "{}")
+    write(homes / "peer/max/repos/x/agent/tickets/t.md", "a checkout")
+
+    # --- a pull copies each account's sessions, and nothing else of the home
+
+    done = pull("max@peer", "agent@peer")
+    check("a pull from two answering sources exits 0", 0, done.returncode)
+    check("the run log says ok, with both pulled", ("ok", 2), (last_run()["outcome"], last_run()["stats"]["pulled"]))
+    expected = {
+        f"{name}/{part}"
+        for name in (".claude", ".claude-helferline")
+        for part in ("projects/-home-x-repo/aaaa.jsonl", "projects/-home-x-repo/aaaa/subagents/agent-1.jsonl",
+                     "session-pages/aaaa/review.html", "session-pages/bbbb/old.html", f"sessions/{pid}.json")
+    }
+    check("max's copy holds each account's transcripts, every session page and the running session's registry entry,"
+          " and nothing else: no key, credentials, settings, plugins, .git, link, checkout or linked account",
+          expected, tree(root / "peer/max"))
+    check("each user's sessions land in a directory of their own",
+          {p for p in expected if p.startswith(".claude/")}, tree(root / "peer/agent"))
+
+    # --- a copy follows its source
+
+    with (worker / "projects/-home-x-repo/aaaa.jsonl").open("a") as f:
+        f.write('{"type":"assistant"}\n')
+    write(worker / "projects/-home-y/dddd.jsonl", "{}\n")
+    (worker / "session-pages/bbbb/old.html").unlink()
+    write(worker / f"sessions/{pid}.json", json.dumps({"pid": pid, "sessionId": "aaaa", "procStart": "1"}))
+    pull("agent@peer")
+    copy = root / "peer/agent/.claude"
+    check("a transcript the source appended to is appended in the copy",
+          '{"type":"user"}\n{"type":"assistant"}\n', (copy / "projects/-home-x-repo/aaaa.jsonl").read_text())
+    check("a new transcript arrives", True, (copy / "projects/-home-y/dddd.jsonl").exists())
+    check("a page the source deleted is gone from the copy", False, (copy / "session-pages/bbbb/old.html").exists())
+    check("an entry whose pid another process holds now is no running session", False,
+          (copy / f"sessions/{pid}.json").exists())
+
+    # --- a peer that does not answer is a skip, and its copy stays
+
+    before = tree(root / "peer")
+    write(homes / "peer/down", "")
+    write(worker / "projects/-home-y/eeee.jsonl", "{}\n")
+    done = pull("max@peer", "agent@peer")
+    check("with the peer down, the pull exits 0", 0, done.returncode)
+    check("and its run is a skip, saying so", ("skip", True),
+          (last_run()["outcome"], "does not answer" in (last_run()["reason"] or "")))
+    check("and the copies are as they were", before, tree(root / "peer"))
+
+    write(homes / "other/agent/.claude/projects/p/ffff.jsonl", "{}\n")
+    pull("agent@peer", "agent@other")
+    check("one peer down and another answering is an ok run, the skip counted",
+          ("ok", 1, 1), (last_run()["outcome"], last_run()["stats"]["pulled"], last_run()["stats"]["skipped"]))
+    check("the answering peer's copy is there", True, (root / "other/agent/.claude/projects/p/ffff.jsonl").exists())
+    (homes / "peer/down").unlink()
+
+    # --- a locked key is a skip; a refused one is a failure
+
+    write(homes / "peer/locked", "")
+    done = pull("agent@peer", AGENT_RC="1")
+    check("a key not in the ssh agent is a skip", (0, "skip"), (done.returncode, last_run()["outcome"]))
+    done = pull("agent@peer", AGENT_RC="0")
+    check("a key the agent holds and the peer refuses is a failure", (1, "fail"), (done.returncode, last_run()["outcome"]))
+    (homes / "peer/locked").unlink()
+
+    # --- a home with no account directory leaves the copy alone
+
+    shutil.move(homes / "peer/agent", work / "agent-home")
+    (homes / "peer/agent").mkdir()
+    before = tree(root / "peer/agent")
+    pull("agent@peer")
+    check("a source whose home holds no account directory (a home not yet unlocked) is a skip", "skip",
+          last_run()["outcome"])
+    check("and its copy is not emptied", before, tree(root / "peer/agent"))
+
+    # --- this host is never a source
+
+    this = os.uname().nodename
+    account(homes / this / "max")
+    done = pull(f"max@{this}")
+    check("a source on this host is left out", False, (root / this).exists())
+    check("and a run with nothing left to pull is a skip", (0, "skip"), (done.returncode, last_run()["outcome"]))
+
+
+if __name__ == "__main__":
+    main()

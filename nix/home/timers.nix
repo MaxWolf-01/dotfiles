@@ -24,6 +24,12 @@ let
     bash coreutils gnugrep git gh openssh jq # jq: bin/run-log builds its line with it
   ]);
 
+  # bin/session-copies is a uv script driving rsync over ssh; sed for
+  # worker-hosts --targets; jq for bin/run-log.
+  sessionCopiesPath = lib.makeBinPath (with pkgs; [
+    bash coreutils gnused uv rsync openssh jq
+  ]);
+
   recorderPath = lib.makeBinPath (with pkgs; [
     bash coreutils findutils
   ]);
@@ -768,6 +774,42 @@ in
     Unit.Description = "jarvis sync (every 30 min, offset 5 min behind browsing-archive)";
     Timer = {
       OnCalendar = "*:05/30";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- pc's and the worker hosts' sessions → ~/.local/share/session-copies ---
+  # What it copies: bin/session-copies --help. The working
+  # backups pick the copies up, which is how pc's and the workers' transcripts
+  # reach a restic snapshot at all. worker-hosts --targets names the worker
+  # users, so one whose host publishes a record is pulled without an edit here.
+  # Every 2 minutes because the copies stand in for pc's sessions while it is
+  # down, and a run with nothing new costs a file list per source.
+
+  systemd.user.services.session-copies = {
+    Unit = {
+      Description = "Pull the sessions of pc and the worker hosts into session copies";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${sessionCopiesPath}" "SSH_AUTH_SOCK=${sshAuthSock}" ];
+      ExecStart = "${dotfiles}/bin/session-copies --sources max@pc --worker-hosts --record";
+      # The first run copies every transcript a source has; later ones send
+      # what changed. oneshot has no start timeout of its own, and a hung run
+      # would make every later firing a silent no-op.
+      TimeoutStartSec = "2h";
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.session-copies = {
+    Unit.Description = "Session copies from pc and the worker hosts (every 2 min)";
+    Timer = {
+      OnCalendar = "*:0/2";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];

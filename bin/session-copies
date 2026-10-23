@@ -1,0 +1,231 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Pull other hosts' Claude Code sessions into this host's session copies.
+
+Each source is a user@host reached over ssh. From every account directory in its home (`~/.claude*/`), the pull
+copies the transcripts (`projects/`), the session pages (`session-pages/`) and the registry entry of each session
+whose process runs (`sessions/<pid>.json`), into `<root>/<host>/<user>/`, laid out as they are in the source's
+home. Nothing else of the account comes along: no credentials, settings, plugins or registry keys, and no `.git`
+directory anywhere. A copy mirrors its source: what the source deleted, the next pull deletes.
+
+A source on this host is left out, so a host's own sessions never land among its copies. A source that does not
+answer, or whose ssh agent holds no key, is skipped, and its copy stays as the last pull left it. The run is a skip
+when no source was pulled, and a failure when any source that answered could not be.
+
+Examples:
+
+    session-copies --sources max@pc agent@pc
+    session-copies --sources max@pc --worker-hosts --record
+    session-copies --sources max@zephylux --record
+"""
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import tyro
+
+UNIT = "session-copies"
+BIN = Path(__file__).resolve().parent
+# A peer that goes silent mid-pull (a lid closed, a network changed) ends ssh within 45s, not hours. accept-new as
+# worker-hosts has it: these are tailnet addresses, so a first connection is already inside WireGuard.
+SSH = ["ssh", "-oBatchMode=yes", "-oConnectTimeout=10", "-oServerAliveInterval=15", "-oServerAliveCountMax=3",
+       "-oStrictHostKeyChecking=accept-new"]
+# Symlinks, devices and special files are left out, and permissions are not carried over: the sender may be a worker
+# user, whose rsync is whatever binary it put on its own PATH, and a copy is data for reading, nothing else.
+RSYNC = ["rsync", "--recursive", "--times", "--delete", "--delete-excluded", "--prune-empty-dirs",
+         "--filter=. -", f"--rsh={' '.join(SSH)}"]
+# The account directories and the parts of each that are copied. A trailing slash matches a directory alone, so an
+# account directory that is a link to another is not copied twice.
+FILTER = """\
+- .git
++ /.claude*/
++ /.claude*/projects/***
++ /.claude*/session-pages/***
++ /.claude*/sessions/
++ /.claude*/sessions/*.json
+- *
+"""
+
+# Run on the source, by sh whatever the login shell is (zsh fails a glob that matches nothing). It names the
+# account directories, then each registry entry with the start time of the process its pid has now, in clock ticks
+# as /proc has it, empty where no such process runs. The start time is the 22nd field of /proc/<pid>/stat, the 20th
+# after the command's name, which may hold spaces and parentheses, so the line is cut at its last ")".
+PROBE = r"""
+for d in .claude*/; do
+  [ -d "$d" ] && [ ! -L "${d%/}" ] && echo "account ${d%/}"
+done
+for f in .claude*/sessions/*.json; do
+  [ -f "$f" ] || continue
+  pid=${f##*/}; pid=${pid%.json}
+  echo "entry $f $(sed 's/.*)//' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')"
+done
+"""
+
+
+@dataclass
+class Args:
+    sources: list[str] = field(default_factory=list)
+    """The user@host logins to pull from, each as ssh reaches it."""
+    worker_hosts: bool = False
+    """Pull from every worker host's user too (`worker-hosts --targets`), so a worker user is pulled once its host
+    publishes a record."""
+    root: Path = Path("~/.local/share/session-copies")
+    """Where the session copies live, one directory per source host and user."""
+    record: bool = False
+    """Append the outcome to the run log (bin/run-log). For the timer."""
+
+
+class Skipped(Exception):
+    """A source that could not be reached, for a reason this job does not control."""
+
+
+def main(args: Args) -> int:
+    root = args.root.expanduser()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(root / ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"{UNIT}: another pull into {root} is running; this one leaves it to finish", file=sys.stderr)
+            return 0
+        try:
+            sources = peers(args.sources + (worker_targets() if args.worker_hosts else []))
+        except Exception as e:
+            return report(args.record, "fail", str(e), {})
+        results = {source: pull_one(source, root) for source in sources}
+    return summarise(results, args.record)
+
+
+def peers(targets: list[str]) -> list[str]:
+    """The sources to pull, each once, less any on this host."""
+    for target in targets:
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]*@[A-Za-z0-9.-]+", target):
+            raise ValueError(f"not a user@host login: {target!r}")
+    this = os.uname().nodename
+    return [t for t in dict.fromkeys(targets) if t.split("@")[1] != this]
+
+
+def worker_targets() -> list[str]:
+    run = subprocess.run([str(BIN / "worker-hosts"), "--targets"], capture_output=True, text=True, check=False)
+    if run.returncode != 0:
+        raise RuntimeError(f"worker-hosts --targets exited {run.returncode}: {run.stderr.strip()[-300:]}")
+    return run.stdout.split()
+
+
+def pull_one(source: str, root: Path) -> tuple[str, str]:
+    """(outcome, reason) of pulling one source into its copy."""
+    user, host = source.split("@")
+    copy = root / host / user
+    try:
+        accounts, entries = probe(source)
+        if not accounts:
+            raise Skipped(f"{source} has no ~/.claude*/ directory")
+        copy.mkdir(parents=True, exist_ok=True)
+        rsync(source, copy)
+        prune(copy, entries)
+    except Skipped as e:
+        return "skip", str(e)
+    except Exception as e:
+        return "fail", str(e)
+    return "ok", ""
+
+
+def probe(source: str) -> tuple[list[str], dict[str, str]]:
+    """The source's account directories, and its registry entries by their path, each with the start time of the
+    process its pid names now, empty where none runs."""
+    try:
+        run = subprocess.run([*SSH, source, "sh -s"], input=PROBE, capture_output=True, text=True, timeout=120,
+                             check=False)
+    except subprocess.TimeoutExpired:
+        raise Skipped(f"{source} did not answer within 120s") from None
+    if run.returncode != 0:
+        raise unreachable(source, run.returncode, run.stderr) or RuntimeError(
+            f"probing {source} exited {run.returncode}: {run.stderr.strip()[-300:]}")
+    accounts, entries = [], {}
+    for line in run.stdout.splitlines():
+        kind, _, rest = line.partition(" ")
+        if kind == "account":
+            accounts.append(rest)
+        elif kind == "entry":
+            path, _, started = rest.partition(" ")
+            entries[path] = started.strip()
+    return accounts, entries
+
+
+def unreachable(source: str, code: int, stderr: str) -> Skipped | None:
+    """A Skipped saying why, where ssh's failure is the source not answering or this host's key being locked."""
+    if code != 255 or "Host key verification failed" in stderr:
+        return None
+    if "Permission denied" in stderr:
+        # The agent answers 1 with no key in it and 2 with no agent at all: a key not yet unlocked since a reboot.
+        if subprocess.run(["ssh-add", "-l"], capture_output=True, check=False).returncode != 0:
+            return Skipped(f"no key in the ssh agent to reach {source} with")
+        return None
+    return Skipped(f"{source} does not answer: {stderr.strip()[-200:]}")
+
+
+def rsync(source: str, copy: Path) -> None:
+    run = subprocess.run([*RSYNC, f"{source}:", f"{copy}/"], input=FILTER, capture_output=True, text=True,
+                         check=False)
+    if run.returncode == 255:
+        raise Skipped(f"{source} stopped answering mid-pull: {run.stderr.strip()[-200:]}")
+    if run.returncode not in (0, 24):  # 24: a file vanished while it was being copied, which the next pull settles
+        raise RuntimeError(f"rsync from {source} exited {run.returncode}: {run.stderr.strip()[-300:]}")
+
+
+def prune(copy: Path, entries: dict[str, str]) -> None:
+    """Remove each copied registry entry whose process did not run when the source was probed, so an entry in a
+    copy names a session that was running. Claude Code leaves the entry of a process that was killed behind."""
+    for path in copy.glob(".claude*/sessions/*.json"):
+        started = entries.get(str(path.relative_to(copy)), "")
+        if not started or not alive_as(path, started):
+            path.unlink(missing_ok=True)
+
+
+def alive_as(entry: Path, started: str) -> bool:
+    """The entry names the process that runs under its pid: the one that started when the entry says, where it
+    says, as the container hub's registry reads it."""
+    try:
+        recorded = json.loads(entry.read_text()).get("procStart")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return recorded is None or str(recorded) == started
+
+
+def summarise(results: dict[str, tuple[str, str]], record: bool) -> int:
+    outcomes = [outcome for outcome, _ in results.values()]
+    stats = {"pulled": outcomes.count("ok"), "skipped": outcomes.count("skip"), "failed": outcomes.count("fail")}
+    reason = "; ".join(why for outcome, why in results.values() if outcome != "ok")
+    if "fail" in outcomes:
+        outcome = "fail"
+    elif "ok" in outcomes:
+        outcome = "ok"
+        print(f"{UNIT}: pulled {', '.join(s for s, (o, _) in results.items() if o == 'ok')}")
+    else:
+        outcome, reason = "skip", reason or "no source to pull"
+    return report(record, outcome, reason, stats)
+
+
+def report(record: bool, outcome: str, reason: str, stats: dict) -> int:
+    if reason:
+        print(f"{UNIT}: {reason}", file=sys.stderr)
+    if record:
+        cmd = [str(BIN / "run-log"), UNIT, outcome, "--stats", json.dumps(stats)]
+        proc = subprocess.run(cmd + (["--reason", reason[:300]] if reason else []), capture_output=True,
+                              text=True, check=False)
+        if proc.returncode != 0:
+            print(f"{UNIT}: run-log failed: {proc.stderr.strip()}", file=sys.stderr)
+    return 1 if outcome == "fail" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(tyro.cli(Args, description=__doc__, config=(tyro.conf.OmitArgPrefixes,))))
