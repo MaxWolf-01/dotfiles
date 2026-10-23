@@ -4,12 +4,15 @@
 #
 # A worker user's record, nix/home/hosts/<config>/HOST.md, names its account;
 # the token is CLAUDE_CODE_OAUTH_TOKEN in secrets/creds/env/claude-<account>.env.
-# It lands in the user's ~/.config/claude-token, mode 600, which its shell
-# exports (nix/home/worker-claude-token.zsh). Then, on each host:
+# On each host:
 #
-#   1. a fresh shell there has to export that token, and `claude -p` has to
-#      answer on it; otherwise the browser login stays, and the run fails;
-#   2. `claude auth logout` drops the browser login, unless a claude session
+#   1. `claude -p` has to answer on the new token before it replaces the one
+#      the user held, in ~/.config/claude-token (mode 600), which its shell
+#      exports (nix/home/worker-claude-token.zsh); a token claude refuses is
+#      left out, and the run fails;
+#   2. a fresh shell there has to export that token; otherwise the browser
+#      login stays, and the run fails;
+#   3. `claude auth logout` drops the browser login, unless a claude session
 #      that started before the token is still running on it: that login stays
 #      until the session ends, and the run fails, naming the host to push again.
 #
@@ -35,9 +38,17 @@ case ${1:-} in -h|--help) usage; exit 0 ;; -*) die "unknown argument: $1" ;; esa
 # A frontmatter field of a HOST.md record.
 field() { sed -n '2,/^---$/p' "$1" | sed -n "s/^$2: *//p" | head -1; }
 
-# Writes stdin, the token, in place of the old one in one rename.
-read -r -d '' write_token <<'REMOTE'
-umask 077 && mkdir -p ~/.config && cat >~/.config/claude-token.new && mv ~/.config/claude-token.new ~/.config/claude-token
+# Writes stdin, the token, in place of the old one in one rename, once claude
+# answers on it. Prints why when it does not.
+read -r -d '' install_token <<'REMOTE'
+umask 077 && mkdir -p ~/.config && cat >~/.config/claude-token.new || exit 1
+if ! out=$(CLAUDE_CODE_OAUTH_TOKEN="$(cat ~/.config/claude-token.new)" timeout 120 claude -p ping --model haiku \
+    --strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-session-persistence --disable-slash-commands 2>&1); then
+  rm -f ~/.config/claude-token.new
+  echo "claude -p fails on the new token, so it keeps the token and login it had: $out"
+  exit 1
+fi
+mv ~/.config/claude-token.new ~/.config/claude-token
 REMOTE
 
 # Runs in the worker's own shell, which has read .zshenv: its environment is
@@ -45,11 +56,6 @@ REMOTE
 read -r -d '' check_and_logout <<'REMOTE'
 if [ "${CLAUDE_CODE_OAUTH_TOKEN-}" != "$(cat ~/.config/claude-token)" ]; then
   echo "token written, but its shell does not export it, so the browser login stays: is nix/home/worker-claude-token.zsh switched in on this host (nswitch)?"
-  exit 1
-fi
-if ! out=$(timeout 120 claude -p ping --model haiku --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-    --no-session-persistence --disable-slash-commands 2>&1); then
-  echo "token written, but claude -p fails on it, so the browser login stays: $out"
   exit 1
 fi
 on_login=0
@@ -99,19 +105,20 @@ for worker in "${workers[@]}"; do
     token[$account]=$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' <<<"$plain")
   fi
   if [ -z "${token[$account]}" ]; then
-    echo "skipped: $target — the $account token is not minted yet, so it stays on its browser login"
+    echo "skipped: $target: the $account token is not minted yet, so it stays on its browser login"
     continue
   fi
 
-  if ! printf '%s\n' "${token[$account]}" | ssh "${ssh_opts[@]}" "$target" "$write_token"; then
-    echo "FAILED: $target ($account) — could not write the token (host down, or its home locked?)"
-    failed=$((failed + 1))
-    continue
-  fi
-  if out=$(ssh "${ssh_opts[@]}" "$target" "$check_and_logout" </dev/null 2>&1); then
-    echo "ok: $target ($account) — $out"
+  out=$(printf '%s\n' "${token[$account]}" | ssh "${ssh_opts[@]}" "$target" "$install_token" 2>&1)
+  case $? in
+    0) out=$(ssh "${ssh_opts[@]}" "$target" "$check_and_logout" </dev/null 2>&1) ;;
+    255) out="could not reach it to write the token (host down, or its home locked?)"; false ;;
+    *) out=${out:-could not write the token}; false ;;
+  esac
+  if [ $? -eq 0 ]; then
+    echo "ok: $target ($account): $out"
   else
-    echo "FAILED: $target ($account) — ${out:-no answer}"
+    echo "FAILED: $target ($account): ${out:-no answer}"
     failed=$((failed + 1))
   fi
 done
