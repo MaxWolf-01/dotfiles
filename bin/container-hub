@@ -309,9 +309,10 @@ over the tab.
                               unit the fork's, with "forks" (the session forked), "directory" and "said" (the worktree
                               made for it, if any). 409 {"error", "confirm": {"state", "at"}} where the copy is not of an
                               ended session and "pulled" does not name its pull.
-    POST /api/release         {"to", "unit"?}, with the hub tab's token, which a peer's hub asks for as a local tool does:
-                              release the unit's session to the host `to`, or every idle or ended one without a
-                              unit. Answers {"released": [{"unit", "title", "at"}], "refused": [{"unit", "title",
+    POST /api/release         {"to", "unit"?, "accounts"?}, with the hub tab's token, which a peer's hub asks for as a
+                              local tool does: release the unit's session to the host `to`, or every idle or ended one
+                              without a unit, refusing one whose account is none of `accounts`, the account directories
+                              `to` has, where it names them. Answers {"released": [{"unit", "title", "at"}], "refused": [{"unit", "title",
                               "error"}]}; 409 {"error"} where the one unit asked for is refused.
     POST /api/receive         {"host", "unit"?}, from the hub tab with its X-Hub-Token: have the peer `host` release the
                               unit's session, or every idle or ended one, to this host, pull its copy, and take each
@@ -3435,8 +3436,9 @@ PULL = ""
 CLOSE_WAIT = 10.0
 """Seconds a release waits, after closing a session's panes, for its process to exit."""
 PULL_TRIES = 3
-PULL_WAIT = 90.0
-"""Seconds one pull may take: the tries together end before a relay of the request gives up on it (LONG_WAIT)."""
+MOVE_WAIT = 300.0
+"""Seconds a move may take, its release, its pulls and its take-over together: less than a relay of the request waits
+(LONG_WAIT), so the tab hears what moved rather than that the relay gave up."""
 
 
 def utc(at: float) -> str:
@@ -3471,16 +3473,19 @@ def elsewhere_refusal(session: str) -> str | None:
     its copy elsewhere, or released to another host."""
     if why := forked_refusal(session):
         return why
-    if said := own_release(session):
-        return f"this host released the session to {said['to']} at {utc(said['at'])}; it is {said['to']}'s now, and resumes there"
-    return None
+    return released_words(own_release(session))
+
+
+def released_words(said: dict | None) -> str | None:
+    """Why a session this host released goes on elsewhere: whose it is now."""
+    return said and f"this host released the session to {said['to']} at {utc(said['at'])}; it is {said['to']}'s now, and resumes there"
 
 
 def owner_refusal(session: str) -> str | None:
     """Why this host does not resume the session under its id, naming the host that does, where it knows one: only the
     session owner, the host whose own transcripts hold it unreleased, resumes it."""
-    if said := own_release(session):
-        return f"this host released the session to {said['to']} at {utc(said['at'])}; it is {said['to']}'s now, and resumes there"
+    if why := released_words(own_release(session)):
+        return why
     if any(HOME.glob(f".claude*/projects/*/{session}.jsonl")):
         return None
     for host in sorted(p.name for p in COPIES.glob("*") if p.is_dir()):
@@ -3501,6 +3506,9 @@ def release(body: dict) -> tuple[int, dict]:
     to = str(body["to"])
     if not re.fullmatch(r"[A-Za-z0-9.-]+", to) or to == HOST:
         return 400, {"error": f"{to!r} is no other host to release a session to"}
+    takes = body.get("accounts")
+    if takes is not None and not (isinstance(takes, list) and all(isinstance(a, str) for a in takes)):
+        return 400, {"error": "accounts is no list of account directories"}
     one = body.get("unit")
     if one is not None:
         try:
@@ -3518,7 +3526,7 @@ def release(body: dict) -> tuple[int, dict]:
             sessions = [u["session"] for u in units if u["session"] and not u.get("released") and not u.get("forked")]
         released, refused = [], []
         for session in sessions:
-            why, at = release_one(session, to)
+            why, at = release_one(session, to, takes)
             said = {"unit": session, "title": titles.get(session) or f"session {session[:8]}"}
             if why:
                 refused.append({**said, "error": why})
@@ -3532,8 +3540,9 @@ def release(body: dict) -> tuple[int, dict]:
     return 200, {"released": released, "refused": refused}
 
 
-def release_one(session: str, to: str) -> tuple[str, float]:
-    """Release one session to `to`: why not, else "" and when."""
+def release_one(session: str, to: str, takes: list[str] | None) -> tuple[str, float]:
+    """Release one session to `to`, which has the accounts `takes` (their directories' names, every one where None):
+    why not, else "" and when. A host without the session's account could never take it over."""
     if said := own_release(session):
         return f"it was released to {said['to']} at {utc(said['at'])} already", 0.0
     if why := forked_refusal(session):
@@ -3543,6 +3552,8 @@ def release_one(session: str, to: str) -> tuple[str, float]:
     written = list(HOME.glob(f".claude*/projects/*/{session}.jsonl"))
     if not written:
         return "Claude Code keeps no transcript of it on this host", 0.0
+    if takes is not None and (name := written[0].parents[2].name) not in takes:
+        return f"it runs under ~/{name}, an account {to} does not have", 0.0
     if pane := still_starting(session):
         return f"the hub started it in tmux pane {pane}, where Claude Code has not registered it", 0.0
     if entry := registry().get(session):
@@ -3581,11 +3592,13 @@ def receive(body: dict) -> tuple[int, dict]:
     host = str(body["host"])
     if host not in PEERS:
         return 400, {"error": f"this hub relays no host {host}, so it pulls no copy of its sessions to take one over from"}
-    ask = {"to": HOST, **({"unit": str(body["unit"])} if body.get("unit") is not None else {})}
+    deadline = time.monotonic() + MOVE_WAIT
+    left = lambda: max(1.0, deadline - time.monotonic())
+    ask = {"to": HOST, "accounts": [a.name for a in accounts()], **({"unit": str(body["unit"])} if body.get("unit") is not None else {})}
     try:
         for again in (False, True):
             status, _, raw = peer_request(host, "POST", "/api/release", {"Content-Type": "application/json",
-                                          "X-Hub-Token": peer_token(host, again)}, json.dumps(ask).encode(), LONG_WAIT)
+                                          "X-Hub-Token": peer_token(host, again)}, json.dumps(ask).encode(), left())
             if status != 403:  # a token the peer made anew since it was asked
                 break
         said = json.loads(raw)
@@ -3594,10 +3607,10 @@ def receive(body: dict) -> tuple[int, dict]:
     if status != 200:
         return status, said
     released = said["released"]
-    pulled = pull_releases(host, released) if released else ""
+    pulled = pull_releases(host, released, deadline) if released else ""
     taken = []
-    if not starting.acquire(timeout=LONG_WAIT):
-        return 409, {**said, "taken": [], "pulled": pulled, "error": "a start under way held this hub; each released session moves here at its resume"}
+    if not starting.acquire(timeout=left()):
+        return 200, {**said, "taken": [], "pulled": "a start under way held this hub; each released session moves here at its resume"}
     try:
         for r in released:
             if take_over(r["unit"]) == host:
@@ -3607,9 +3620,10 @@ def receive(body: dict) -> tuple[int, dict]:
     return 200, {**said, "taken": taken, "pulled": pulled}
 
 
-def pull_releases(host: str, released: list[dict]) -> str:
+def pull_releases(host: str, released: list[dict], deadline: float) -> str:
     """Run the pull until this host's copy of `host` holds every release it made (`released`, each with its "at"), up to
-    PULL_TRIES times: "" once it does, else why not. A pull already under way may have begun before the release."""
+    PULL_TRIES times and until the deadline (time.monotonic()): "" once it does, else why not. A pull already under way
+    may have begun before the release."""
     def missing() -> list[str]:
         out = []
         for r in released:
@@ -3622,8 +3636,10 @@ def pull_releases(host: str, released: list[dict]) -> str:
         return "this hub has no --pull, so the releases move here once the copies' own timer has pulled them"
     why = ""
     for _ in range(PULL_TRIES):
+        if (wait := deadline - time.monotonic()) < 1:
+            return why or "no time was left for a pull"
         try:
-            run = subprocess.run(shlex.split(PULL), capture_output=True, text=True, timeout=PULL_WAIT, check=False)
+            run = subprocess.run(shlex.split(PULL), capture_output=True, text=True, timeout=wait, check=False)
             why = f"the pull exited {run.returncode}: {run.stderr.strip()[-300:]}" if run.returncode else ""
         except (OSError, subprocess.TimeoutExpired) as e:
             why = f"the pull failed: {e}"
