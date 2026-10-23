@@ -10,6 +10,7 @@ disk goes: main()'s own start-up (the old containers moved in, each unit repaire
 
 import atexit
 import http.client
+import importlib.machinery
 import itertools
 import json
 import os
@@ -28,6 +29,24 @@ from pathlib import Path
 from check import BIN, bin_module  # tests/ is on sys.path in every test that imports this
 
 LOADS = itertools.count()
+
+
+def compiled_once(compile_source):
+    """A loader's source_to_code, compiled once per source text. A test loads the hub anew for every restart it
+    plays, and the hub loads diffview and the mx plugin's modules as it does: compiled every time, that was most of
+    a property's run. The hub writes no bytecode, so nothing else would keep them."""
+    codes = {}
+
+    def source_to_code(self, data, path, *args, **kwargs):
+        key = (bytes(data), str(path))
+        if key not in codes:
+            codes[key] = compile_source(self, data, path, *args, **kwargs)
+        return codes[key]
+
+    return source_to_code
+
+
+importlib.machinery.SourceFileLoader.source_to_code = compiled_once(importlib.machinery.SourceFileLoader.source_to_code)
 
 TICKET = "---\nstatus: {status}\n{parent}priority: 2\nsize: S\n---\n\n# {title}\n\n## Brief\n\n{brief}\n\n## Acceptance criteria\n\n## Comments\n"
 
@@ -181,6 +200,38 @@ class Unix(http.client.HTTPConnection):
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX)
         self.sock.connect(str(self.path_))
+
+
+def request(to: int | Path, method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60):
+    """(status, headers, body as JSON where it parses) of a request to a hub: at its port on 127.0.0.1, as a browser
+    reaches it, or at its socket, as a local tool does. A body of bytes goes as it is, any other as JSON."""
+    conn = Unix(to) if isinstance(to, Path) else http.client.HTTPConnection("127.0.0.1", to, timeout=timeout)
+    data = body if isinstance(body, bytes) or body is None else json.dumps(body).encode()
+    conn.request(method, path, body=data, headers={"Content-Type": "application/json", **(headers or {})})
+    r = conn.getresponse()
+    raw = r.read()
+    conn.close()
+    try:
+        return r.status, r.headers, json.loads(raw)
+    except ValueError:
+        return r.status, r.headers, raw
+
+
+def token(port: int) -> str:
+    """The token a hub hands its hub tab at its load, which the tab acts with."""
+    page = request(port, "GET", "/")[2].decode()
+    return page.split('name="hub-token" content="', 1)[1].split('"', 1)[0]
+
+
+def transcript(session: str, cwd: Path, *more: dict, branch: str = "ticket/x") -> str:
+    """A transcript as Claude Code writes one, in short: where it ran and on which branch, then `more`."""
+    return "".join(json.dumps(line, separators=(",", ":")) + "\n" for line in (
+        {"type": "user", "sessionId": session, "cwd": str(cwd), "gitBranch": branch, "entrypoint": "cli",
+         "message": {"role": "user", "content": "go"}}, *more))
+
+
+TURN_END = {"type": "system", "subtype": "turn_duration", "durationMs": 1000}
+"""The line Claude Code ends a turn with."""
 
 
 class World:
