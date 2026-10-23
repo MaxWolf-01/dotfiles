@@ -213,15 +213,16 @@ in
     };
   };
 
-  # Publish the public binding to the internet.
+  # tailscaled's serve table, and in it the public binding on the internet.
   #
   # tailscaled keeps its own address -> local port table. It is not in this repo
   # and it survives reboots, so this unit wipes it and rewrites it on every boot.
   # That only works while a single unit owns the table: a second unit that also
   # wipes would erase this line, and the funnel would go down with no error.
-  # To publish another service later, add its line here.
-  systemd.services.sftpgo-tailscale-funnel = {
-    description = "Tailscale Funnel forward to the SFTPGo web client";
+  # Another service on the table adds its own line to this unit's ExecStart, as
+  # the container hub does (container-hub.nix).
+  systemd.services.tailscale-serve = {
+    description = "tailscaled's serve table: the SFTPGo funnel, and what else pc serves";
     after = [ "tailscaled.service" "network-online.target" ];
     requires = [ "tailscaled.service" ];
     wants = [ "network-online.target" ];
