@@ -69,19 +69,15 @@
         specialArgs = { inherit self rime system; };
         modules = [
           disko.nixosModules.disko
-          catppuccin.nixosModules.catppuccin
           ./nix/nixos/xmg19/configuration.nix
           home-manager.nixosModules.home-manager
           {
             home-manager.useGlobalPkgs = true;
             home-manager.useUserPackages = true;
             home-manager.extraSpecialArgs = { inherit rime system; };
-            home-manager.users.max = {
-              imports = [
-                catppuccin.homeModules.catppuccin
-                ./nix/home/hosts/xmg19.nix
-              ];
-            };
+            home-manager.users.max = import ./nix/home/hosts/xmg19.nix;
+            home-manager.users.agent = import ./nix/home/hosts/xmg19-agent.nix;
+            home-manager.users.agent-hl = import ./nix/home/hosts/xmg19-agent-hl.nix;
             home-manager.backupFileExtension = "bak";
           }
         ];

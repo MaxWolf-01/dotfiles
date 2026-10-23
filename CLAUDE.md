@@ -82,12 +82,12 @@ Structure:
 - `nix/home/` holds one Home Manager module per concern: a program (`firefox.nix`, `ghostty.nix`, `tmux.nix`, ...), a desktop layer (`desktop.nix`, `gnome.nix`, `wayland.nix`), a toolchain (`dotnet.nix`), the systemd user timers (`timers.nix` and `pc-timers.nix`, one file per host that has them), a user (`worker.nix`), and `common.nix` for what every machine gets. `ls nix/home/` is the index; each module's own options say what it sets.
 - `nix/home/hosts/` is per-machine: stateVersion plus the imports that pick the tier below.
 - `docs/<host>.md` is a machine's hardware: which port drives which GPU, thermal limits, traps.
-- `nix/nixos/pc/` is PC's NixOS system config.
+- `nix/nixos/<host>/` is a NixOS host's system config (pc, xmg19); `nix/nixos/` itself holds the modules both import.
 
 Host tiers:
 - **CLI** (common.nix): every machine — shell, dev tools, restic, etc.
-- **Workstation** (+ desktop.nix, gnome.nix, display server): zephyrus, xmg19
-- **Server / NixOS** (nix/nixos/pc/ + pc-timers.nix): PC — headless, backup hub, GPU workers
+- **Workstation** (+ desktop.nix, gnome.nix, display server): zephyrus
+- **Server / NixOS** (nix/nixos/<host>/): headless. PC is the backup hub and runs pc-timers.nix; xmg19 is a low-trust worker host with the GPU queue, and a backup target
 
 Setup flow:
 - `./setup host <name>` — sets NIX_HOST, creates dirs. On non-NixOS: also installs Nix + runs first HM switch.
@@ -126,6 +126,12 @@ Custom systemd services need explicit `path` for any package whose binaries the 
 ## NixOS on a New Machine
 
 See `docs/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).
+
+## Unlocking a host after a reboot
+
+`host-unlock <host>`, run on zephylux, unlocks what a rebooted xmg19 or pc
+keeps locked. Run it whenever either was rebooted; `host-unlock --help` says
+what each gets.
 
 ## SFTPGo File Drop
 

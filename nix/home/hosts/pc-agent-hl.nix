@@ -7,4 +7,5 @@ import ../worker.nix {
     email = "maximilian.wolf@helferline.at";
   };
   record = ./pc-agent-hl/HOST.md;
+  body = ./pc-worker-body.md;
 }
