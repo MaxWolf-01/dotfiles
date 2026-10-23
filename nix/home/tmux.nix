@@ -36,9 +36,8 @@ let
   # to size its windows by; they resize to the first client that attaches.
   #
   # TMUX_RESTORED_AT_BOOT=1 is in the environment of the panes this restore
-  # creates and of nothing opened later, so a shell's startup can tell that
-  # nobody is at the pane to answer a prompt, and that the keys arriving are
-  # the resume command restore.sh types.
+  # creates, not of panes opened later, for zsh/zshrc to keep a prompt from
+  # taking the resume command restore.sh types.
   tmuxBoot = pkgs.writeShellScript "tmux-boot" ''
     PATH=${lib.makeBinPath [ pkgs.bash pkgs.coreutils pkgs.gawk pkgs.gnugrep pkgs.gnused pkgs.gnutar pkgs.gzip pkgs.tmux ]}:$PATH
     export TMUX_RESTORED_AT_BOOT=1

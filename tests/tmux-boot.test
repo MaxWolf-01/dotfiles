@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# tier: full-path (tmux, systemd)
+# Start pc's tmux-server unit, as built for max, the way his systemd starts it
+# at boot. Run it directly; no framework.
+#
+# The promises: the unit's start returns with the unit active and the tmux
+# server inside it; the last save is back, its Claude Code session resumed and
+# session 0 gone; the panes the restore made carry TMUX_RESTORED_AT_BOOT and a
+# window opened later does not; stopping the unit ends the server; with no save
+# the server comes up with one session, main.
+#
+# The unit's own boot script runs as a transient unit with the unit file's Type
+# and RemainAfterExit, under max's built tmux.conf. Only HOME, the tmux socket
+# directory and PATH differ from max's: a scratch HOME holding the config and a
+# save, a scratch TMUX_TMPDIR in place of the unit's %t, and a `claude` on PATH
+# that prints how it was started.
+
+set -uo pipefail
+# Run inside tmux, a client would otherwise talk to the server $TMUX names.
+unset TMUX
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$repo/tests/check.sh"
+
+needs nix systemd-run
+systemctl --user show-environment >/dev/null 2>&1 \
+    || skip "no systemd user manager to start the unit under"
+
+# The unit file and the tmux config alone, not the rest of max's home: each is
+# a store path whose string context names the derivation that builds it.
+built() {  # home-manager file name -> its store path, built
+    local expr="\"\${(builtins.getFlake \"git+file://$repo\").nixosConfigurations.pc.config.home-manager.users.max.xdg.configFile.\"$1\".source}\""
+    local drv
+    drv=$(nix eval --raw --impure --expr "builtins.head (builtins.attrNames (builtins.getContext $expr))") &&
+        nix build --no-link "$drv^out" &&
+        nix eval --raw --impure --expr "$expr"
+}
+unit=$(built systemd/user/tmux-server.service 2>/dev/null) || skip "could not build pc's tmux-server unit for max"
+conf=$(built tmux/tmux.conf 2>/dev/null) || skip "could not build max's tmux.conf on pc"
+boot=$(sed -n 's/^ExecStart=//p' "$unit")
+real_tmux=$(grep -o '/nix/store/[^ ]*-tmux-[0-9][^ /]*/bin/tmux' "$boot" | head -1)
+
+
+work=$(mktemp -d)
+units=()
+cleanup() {
+    for u in "${units[@]}"; do systemctl --user stop "$u" 2>/dev/null; done
+    TMUX_TMPDIR="$work/run" "$real_tmux" -L saved kill-server 2>/dev/null
+    rm -rf "$work"
+}
+trap cleanup EXIT
+home=$work/home
+mkdir -p "$home/.config/tmux" "$home/.tmux/resurrect" "$home/.claude/sessions" "$work/run" "$work/bin" "$work/project"
+ln -s "$conf" "$home/.config/tmux/tmux.conf"
+printf '#!/bin/sh\necho "resumed in $(pwd): $*"\n' >"$work/bin/claude"
+chmod +x "$work/bin/claude"
+
+# The save: a Claude Code session in one window, text in another, saved by
+# tmux-save.sh from a server of its own.
+S() { TMUX_TMPDIR="$work/run" HOME="$home" SHELL=/bin/sh "$real_tmux" -f "$conf" -L saved "$@"; }
+S new-session -d -s agents -x 120 -y 30 -c /tmp
+S send-keys -t agents:1 'sleep 600' Enter
+S new-window -t agents -c /tmp
+S send-keys -t agents:2 'echo before-the-reboot' Enter
+shell=$(S display -p -t agents:1 '#{pane_pid}')
+for _ in $(seq 50); do pid=$(ps -o pid= --ppid "$shell" | tr -d ' ') && [ -n "$pid" ] && break; sleep 0.1; done
+printf '{"pid":%s,"sessionId":"a-session","cwd":"%s","kind":"interactive"}' "$pid" "$work/project" >"$home/.claude/sessions/$pid.json"
+for _ in $(seq 50); do S capture-pane -p -t agents:2 | grep -q '^before-the-reboot$' && break; sleep 0.1; done
+shim=$work/shim-saved
+mkdir -p "$shim"
+printf '#!/bin/sh\nexec %s -f '"$conf"' -L saved "$@"\n' "$real_tmux" >"$shim/tmux"
+chmod +x "$shim/tmux"
+TMUX_TMPDIR="$work/run" HOME="$home" bash "$repo/nix/home/tmux-save.sh" "$shim/tmux" "$home/.tmux/resurrect"
+S kill-server
+
+boot_unit() {  # name -> starts the boot script as a transient unit, as the unit file says
+    units+=("$1")
+    systemd-run --user --quiet --unit="$1" \
+        -p Type="$(sed -n 's/^Type=//p' "$unit")" -p RemainAfterExit="$(sed -n 's/^RemainAfterExit=//p' "$unit")" \
+        -E HOME="$home" -E XDG_CONFIG_HOME="$home/.config" -E TMUX_TMPDIR="$work/run" -E SHELL=/bin/sh \
+        -E PATH="$work/bin:$PATH" "$boot"
+}
+T() { TMUX_TMPDIR="$work/run" "$real_tmux" "$@"; }
+# A pane's environment once its process has exec'd: before that it is a fork of the
+# server and carries the environment the server started with.
+env_of() {
+    local pid
+    for _ in $(seq 50); do [ "$(T display -p -t "$1" '#{pane_current_command}')" != tmux ] && break; sleep 0.1; done
+    pid=$(T display -p -t "$1" '#{pane_pid}')
+    tr '\0' '\n' <"/proc/$pid/environ" | grep -c '^TMUX_RESTORED_AT_BOOT=1$'
+}
+
+# --- Boot with a save ---
+boot_unit tmux-boot-check-$$
+for _ in $(seq 50); do T capture-pane -p -t agents:1 2>/dev/null | grep -q '^resumed' && break; sleep 0.1; done
+check "the unit is active once its start returns" "active exited" \
+    "$(systemctl --user show -P ActiveState tmux-boot-check-$$) $(systemctl --user show -P SubState tmux-boot-check-$$)"
+check "the saved session is back, session 0 gone" agents "$(T list-sessions -F '#{session_name}' | paste -sd' ')"
+check "the Claude Code session is resumed" "resumed in $work/project: --resume a-session" \
+    "$(T capture-pane -pJ -t agents:1 | grep '^resumed')"
+check "the other pane's text is back" 1 "$(T capture-pane -p -S - -t agents:2 | grep -c '^before-the-reboot$')"
+check "the tmux server runs in the unit" 1 \
+    "$(systemctl --user show -P ControlGroup tmux-boot-check-$$ | xargs -I{} cat /sys/fs/cgroup{}/cgroup.procs | xargs -r ps -o comm= -p | grep -c '^tmux')"
+check "a pane the restore made carries TMUX_RESTORED_AT_BOOT" 1 "$(env_of agents:1)"
+T new-window -t agents
+check "a window opened later does not" 0 "$(env_of agents:3)"
+systemctl --user stop tmux-boot-check-$$
+check "stopping the unit ends the server" none "$(T list-sessions >/dev/null 2>&1 && echo running || echo none)"
+
+# --- Boot with no save ---
+rm -rf "$home/.tmux/resurrect"
+boot_unit tmux-boot-check-empty-$$
+check "with no save the server comes up with one session, main" main "$(T list-sessions -F '#{session_name}' | paste -sd' ')"
+check "and its pane carries no TMUX_RESTORED_AT_BOOT" 0 "$(env_of main:1)"
+systemctl --user stop tmux-boot-check-empty-$$
+
+finish
