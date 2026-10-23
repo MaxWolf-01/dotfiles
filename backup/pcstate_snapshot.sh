@@ -20,7 +20,7 @@ stage="${1:-$HOME/.local/state/pcstate}"
 # tmpfs and is absent until the first interactive login after a reboot, and a
 # failed ExecStartPre would mark the unit failed on every such boot.
 if [ ! -f "${SOPS_AGE_KEY_FILE:-}" ]; then
-    echo "pcstate_snapshot: age key not available (SOPS_AGE_KEY_FILE=${SOPS_AGE_KEY_FILE:-}) — skipping (decrypt it first)"
+    echo "pcstate_snapshot: age key not available at '${SOPS_AGE_KEY_FILE:-}' — skipping (decrypt it first)"
     exit 0
 fi
 

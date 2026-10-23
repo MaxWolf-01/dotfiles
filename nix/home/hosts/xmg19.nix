@@ -1,4 +1,4 @@
-{ ... }:
+{ config, ... }:
 {
   home.username = "max";
   home.homeDirectory = "/home/max";
@@ -12,5 +12,5 @@
 
   targets.genericLinux.enable = false;
 
-  home.sessionVariables.SOPS_AGE_KEY_FILE = "/home/max/.local/secrets/age-key.txt";
+  home.sessionVariables.SOPS_AGE_KEY_FILE = "${config.home.homeDirectory}/.local/secrets/age-key.txt";
 }
