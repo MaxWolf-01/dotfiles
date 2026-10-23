@@ -2,6 +2,7 @@
 host: xmg19
 user: agent
 isolated: true
+account: personal
 ---
 
 # Worker host: agent@xmg19

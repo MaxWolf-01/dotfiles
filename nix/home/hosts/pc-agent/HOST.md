@@ -2,6 +2,7 @@
 host: pc
 user: agent
 isolated: true
+account: personal
 ---
 
 # Worker host: agent@pc
