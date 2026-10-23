@@ -112,8 +112,10 @@ served = lambda path: "/f" + urllib.parse.quote(str(path))
 """The address the hub serves a file at."""
 
 SELF_STARTED = started()
-RUN = Path(tempfile.mkdtemp(prefix="container-hub-test."))
-"""Every world's scratch directory, gone when the test ends."""
+RUN = Path(tempfile.mkdtemp(prefix="container-hub-test.", dir="/tmp"))
+"""Every world's scratch directory, gone when the test ends. In /tmp whatever $TMPDIR is: a world's HOME holds the
+hub's default socket, and under a deep TMPDIR such as the laptop devShell's (/var/tmp/nix-shell.XXXXXX) its path is
+too long for a unix socket."""
 atexit.register(shutil.rmtree, RUN, ignore_errors=True)
 WORLDS: list["World"] = []
 
