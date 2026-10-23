@@ -220,10 +220,13 @@ back. A fork is refused while the peer answers, and where this host's own transc
 the transcript a fork started from is never resumed here. The fork is a new session, with a session page of its own,
 whose directory the hub makes holding the fork record: which session of which host it forks, and how far into the
 copy's transcript it started. That page, and its stand-in, open with a link to the copy of the forked session's page,
-which the hub tab follows to that session's unit. The fork record travels with the fork's page directory, so the
-forked session's own host reads it from its copy of this one. From then that host's hub marks the session forked, with
-what its transcript holds past the fork's starting point, and types nothing more into it, nor hands it off or resumes
-it. Until then the relay on the forking host marks it so, and refuses typing, hand-off and resume for it.
+which the hub tab follows to that session's unit. The forked session's own host learns of the fork whichever comes
+first: this hub tells its hub, every few seconds that host answers, of every fork made here of its sessions, none
+included (POST /api/forked); and the fork record travels with the fork's page directory, so that host's next pull of
+this one brings it. From then that host's hub marks the session forked, with what its transcript holds past the
+fork's starting point, and types nothing more into it, nor hands it off or resumes it; its tmux restore resumes it no
+more either (bin/tmux-resume-guard). Until then the relay on the forking host marks it so, and refuses typing,
+hand-off and resume for it.
 
 A session moves to another host under its own id only by a release from its session owner, the host whose own
 transcripts hold it. The hub tab asks the receiving host's hub, which asks the owner's: the owner closes the session's
@@ -239,7 +242,7 @@ more into it, nor hands it off or resumes it; neither does any host but the one 
 names. A host that does not answer keeps its sessions: none of them is resumed elsewhere under its id, and a fork is
 the way to go on with one.
 
-Typing, dropping a file, handing off, jumping, closing, starting, resuming, forking and releasing each want the token the hub hands to a top-level load of /
+Typing, dropping a file, handing off, jumping, closing, starting, resuming, forking, releasing and telling of forks each want the token the hub hands to a top-level load of /
 alone, so a page the hub serves cannot act on a session by fetching their routes. It shares the tab's origin all the
 same, so a page that scripts the tab itself is not stopped; only a page served from another origin would be.
 
@@ -318,6 +321,11 @@ over the tab.
                               unit's session, or every idle or ended one, to this host, pull its copy, and take each
                               over. Answers as /api/release does, with "taken" (the sessions taken over) and "pulled"
                               (why the pull did not bring every release, "" where it did).
+    POST /api/forked          {"on", "forks"}, with the hub tab's token, which a peer's hub asks for as a local tool
+                              does: the forks the host `on` made of this host's sessions, each as its fork record has
+                              it, with "fork", the fork's own session. Kept under --state as told-forks/<on>.json,
+                              rewritten when it changes and at the first tell after the hub starts. Answers {"forks"},
+                              how many it kept.
     POST /api/serve           {"path"}: from a local tool only, serve a page with what sits beside it, or a
                               directory with everything under it, without making it a member. Answers {"url"}, at
                               the hub's --url.
@@ -2199,7 +2207,7 @@ open across a restart of the hub still sends."""
 PANE = re.compile(r"%\d+$")  # the registry names a pane as session:@window.%pane; the pane's id alone survives a move
 DROP_LIMIT = 200 * 2**20
 TOKENED = ("/api/type", "/api/drop", "/api/hand-off", "/api/jump", "/api/close-panes", "/api/start", "/api/resume", "/api/fork",
-           "/api/release", "/api/receive")
+           "/api/release", "/api/receive", "/api/forked")
 """The routes that want the token: each acts in a session's terminal, or saves what it is given."""
 
 
@@ -3201,23 +3209,34 @@ def forks(memo: dict | None = None) -> dict[tuple[str, str], dict]:
     if memo is not None and "forks" in memo:
         return memo["forks"]
     places = [*HOME.glob(f".claude*/{PAGES}"), *COPIES.glob(f"*/{USER}/.claude*/{PAGES}")]
-    seen = tuple(sorted((str(p), stamp(p)) for p in places))
+    told = sorted((STATE / TOLD).glob("*.json"))
+    seen = tuple(sorted((str(p), stamp(p)) for p in [*places, *told]))
     if seen != fork_look[0]:
-        fork_look = seen, fork_records(places)
+        fork_look = seen, fork_records(places, told)
     if memo is not None:
         memo["forks"] = fork_look[1]
     return fork_look[1]
 
 
-def fork_records(places: list[Path]) -> dict[tuple[str, str], dict]:
+def fork_records(places: list[Path], told: list[Path]) -> dict[tuple[str, str], dict]:
+    def records():
+        for record in (r for place in places for r in place.glob(f"*/{FORK_RECORD}")):
+            try:
+                yield {**json.loads(record.read_text()), "fork": record.parent.name}
+            except (OSError, ValueError, TypeError):
+                continue
+        for path in told:
+            try:
+                yield from json.loads(path.read_text())["forks"]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
     found: dict[tuple[str, str], dict] = {}
-    for record in (r for place in places for r in place.glob(f"*/{FORK_RECORD}")):
+    for said in records():
         try:
-            said = json.loads(record.read_text())
             key = str(said["host"]), str(said["session"])
-            said = {"on": str(said["on"]), "fork": record.parent.name, "at": float(said["at"]), "pulled": float(said["pulled"]),
+            said = {"on": str(said["on"]), "fork": str(said["fork"]), "at": float(said["at"]), "pulled": float(said["pulled"]),
                     "point": int(said["point"])}
-        except (OSError, ValueError, KeyError, TypeError):
+        except (KeyError, ValueError, TypeError):
             continue
         if key not in found or said["at"] > found[key]["at"]:
             found[key] = said
@@ -3273,6 +3292,54 @@ def fork_sources() -> dict[str, str]:
     host each is of."""
     held = read_json(STATE / "fork-sources.json")
     return held if isinstance(held, dict) else {}
+
+
+# --- forks told: the host that forked a session tells its owner at once when the owner answers again
+
+TOLD = "told-forks"
+"""Under --state, `<host>.json` for each host whose hub told this one of its forks of this host's sessions: {"at",
+"forks"}, each fork as its record has it, with "fork", the fork's own session. Rewritten when what it says changes,
+and at the first tell after this hub starts, so a file younger than the host's boot says the host was told since."""
+TELL_EVERY = 5  # seconds between two tells to each peer
+told_since_start: set[str] = set()
+
+
+def tell_forks() -> None:
+    """From the hub's start, every TELL_EVERY seconds, tell each peer that answers of the forks made here of its
+    sessions (`told`), none included: its tmux restore waits on that before it resumes a session at boot. A peer that
+    does not answer is told at the next round that it does."""
+    while True:
+        for host in PEERS:
+            tell(host)
+        time.sleep(TELL_EVERY)
+
+
+def tell(host: str) -> None:
+    mine = [{"host": h, "session": s, **said} for (h, s), said in forks().items() if h == host and said["on"] == HOST]
+    body = json.dumps({"on": HOST, "forks": mine}).encode()
+    try:
+        for again in (False, True):
+            status, _, _ = peer_request(host, "POST", "/api/forked", {"Content-Type": "application/json",
+                                        "X-Hub-Token": peer_token(host, again)}, body, READ_WAIT)
+            if status != 403:  # a token the peer made anew since it was asked
+                break
+    except (OSError, http.client.HTTPException, ValueError, KeyError):
+        pass
+
+
+def told(body: dict) -> tuple[int, dict]:
+    """A peer's tell of the forks it made of this host's sessions, kept (TOLD) for the hub, which marks those sessions
+    forked from then, and for bin/tmux-resume-guard."""
+    on = str(body["on"])
+    if not on or "/" in on or on.startswith(".") or on == HOST:
+        return 400, {"error": f"no host is named {on!r}"}
+    forks = [f for f in body["forks"] if isinstance(f, dict) and f.get("host") == HOST and f.get("on") == on]
+    path = STATE / TOLD / f"{on}.json"
+    with lock:
+        if on not in told_since_start or (read_json(path) or {}).get("forks") != forks:
+            write_json(path, {"at": time.time(), "forks": forks})
+            told_since_start.add(on)
+    return 200, {"forks": len(forks)}
 
 
 def fork(body: dict) -> tuple[int, dict]:
@@ -4470,6 +4537,8 @@ class Handler(BaseHTTPRequestHandler):
                 code, answer = release(body)
             elif path == "/api/receive":
                 code, answer = receive(body)
+            elif path == "/api/forked":
+                code, answer = told(body)
             elif path in ("/api/close", "/api/visit", "/api/dismiss"):
                 code, answer = mark(path.removeprefix("/api/"), body)
             else:
@@ -4728,6 +4797,7 @@ def main(args: Args) -> None:
     servers, held = listen(args)
     threading.Thread(target=watch_disk, args=(servers,), daemon=True).start()
     threading.Thread(target=keep_plugins_current, daemon=True).start()
+    threading.Thread(target=tell_forks, daemon=True).start()
     for server in servers[1:]:
         threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"container-hub on {args.socket}" + (f" and http://127.0.0.1:{args.port}/" if args.port else "")

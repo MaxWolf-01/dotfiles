@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Whether a tmux restore may resume a Claude Code session on this host. tmux-save
+# (nix/home/tmux-save.sh) saves a Claude Code pane with this ahead of
+# `claude --resume`, so the pane is left a shell, saying why, where it exits 1.
+#
+# Usage: tmux-resume-guard <config-dir> <session-id>
+#
+# A session is not resumed once its transcript has a release beside it, since it
+# is another host's then, nor once a fork record names it: another host's hub
+# forked it from its session copy while this host did not answer
+# (bin/container-hub --help). This host learns of such a fork when that hub
+# tells its own (told-forks/ under the hub's state), or when its pull of that
+# host brings the record (the session copies). Neither can have come before the
+# host booted, so the guard waits for one of the two from every host whose hub
+# relays this one (~/.config/container-hub/relayed-by.json), and resumes the
+# session once each has said it forked none of it.
+#
+# A host that is not on the tailnet is not waited for: one asleep or offline
+# cannot say, and a session nobody forked comes back at boot either way. A fork
+# made there is then learned of once it answers, and from then the hub refuses
+# to type into the session; this pane has resumed it already. A host on the
+# tailnet that says nothing is waited for up to TMUX_RESUME_GUARD_WAIT seconds
+# (120): its hub tells within a minute of this host's sshd answering, through
+# the ssh forward it retries every 30 s.
+set -u
+
+usage() { sed -n '2,/^set -u/{/^set -u/d;s/^# \{0,1\}//;p}' "$0"; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+[ $# -eq 2 ] || { usage >&2; exit 2; }
+config=$1 id=$2
+bound=${TMUX_RESUME_GUARD_WAIT:-120}
+hub_state=$HOME/.local/state/container-hub
+copies=$HOME/.local/share/session-copies
+hosts=${XDG_CONFIG_HOME:-$HOME/.config}/container-hub/relayed-by.json
+user=${USER:-$(id -un)}
+
+released=$(find "$config/projects" -maxdepth 2 -name "$id.release.json" -print -quit 2>/dev/null)
+if [ -n "$released" ]; then
+    echo "tmux-resume-guard: session $id was released to $(jq -r '.to // "another host"' "$released" 2>/dev/null); it resumes there, not here"
+    exit 1
+fi
+
+[ -f "$hosts" ] || exit 0
+me=$(jq -r .host "$hosts") || { echo "tmux-resume-guard: $hosts does not parse; resuming session $id unguarded"; exit 0; }
+declare -A dest=()
+while IFS=$'\t' read -r name ssh; do
+    [ -n "$name" ] && dest[$name]=$ssh
+done < <(jq -r '.relayedBy // {} | to_entries[] | [.key, .value] | @tsv' "$hosts")
+boot=$(awk '$1 == "btime" { print $2 }' /proc/stat)
+
+# The latest fork of this session any host told or any copy holds, as "<on>\t<at>\t<fork>"; nothing where none.
+fork_of() {
+    shopt -s nullglob
+    local f
+    {
+        for f in "$hub_state"/told-forks/*.json; do
+            jq -c '.forks[]?' "$f" 2>/dev/null
+        done
+        for f in "$copies"/*/"$user"/.claude*/session-pages/*/forked-from.json; do
+            jq -c --arg fork "$(basename "$(dirname "$f")")" '. + {fork: $fork}' "$f" 2>/dev/null
+        done
+    } | jq -rs --arg me "$me" --arg id "$id" \
+        'map(select(.host == $me and .session == $id)) | max_by(.at) // empty | [.on, (.at | floor), .fork] | @tsv'
+}
+
+# Whether `name` said what it forked since this host booted: a tell its hub sent, or a pull of it.
+heard() {
+    local told=$hub_state/told-forks/$1.json pulled=$copies/$1/$user.pulled.json
+    { [ -f "$told" ] && (($(stat -c %Y "$told") >= boot)); } ||
+        jq -e --argjson boot "$boot" '.at >= $boot' "$pulled" &>/dev/null
+}
+
+# Whether the host an ssh destination reaches is on the tailnet; yes where tailscale cannot say.
+online() {
+    local addr status
+    addr=$(ssh -G "$1" 2>/dev/null | awk '$1 == "hostname" { print tolower($2); exit }')
+    status=$(tailscale status --json 2>/dev/null) || return 0
+    jq -e --arg a "${addr:-$1}" '[.Peer[]? | ((.DNSName // "") | ascii_downcase | rtrimstr(".")) as $dns
+        | select(any((.TailscaleIPs // [])[]; . == $a) or $dns == $a or ($dns | split(".")[0]) == $a
+            or ((.HostName // "") | ascii_downcase) == $a)]
+        | length == 0 or any(.[]; .Online == true)' <<<"$status" &>/dev/null
+    (($? != 1))  # 1 is jq's false; an answer it cannot read says nothing
+}
+
+deadline=$((SECONDS + bound))
+said=""
+while :; do
+    if IFS=$'\t' read -r on at fork < <(fork_of) && [ -n "$on" ]; then
+        echo "tmux-resume-guard: session $id was forked on $on at $(date -d "@$at" '+%F %R') as ${fork:0:8}, while $me did not answer; it goes on there, and is not resumed here"
+        exit 1
+    fi
+    waiting=()
+    for name in "${!dest[@]}"; do
+        heard "$name" || ! online "${dest[$name]}" || waiting+=("$name")
+    done
+    ((${#waiting[@]})) || exit 0
+    if ((SECONDS >= deadline)); then
+        echo "tmux-resume-guard: ${waiting[*]} did not say within ${bound} s whether it forked session $id while $me did not answer; resuming it"
+        exit 0
+    fi
+    [ -n "$said" ] || echo "tmux-resume-guard: waiting up to ${bound} s for ${waiting[*]} to say whether it forked session $id while $me did not answer"
+    said=1
+    sleep 2
+done
