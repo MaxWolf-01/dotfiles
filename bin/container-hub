@@ -212,7 +212,8 @@ The hub tab forks such a session onto this host: the transcript is copied into t
 account of the same name, and Claude Code resumes it in a new tmux window as a start does, `--fork-session` under an id
 the hub picks, in the directory the session ran in. Where this host has no such directory, the hub makes one there: a
 worktree of the session's last branch as origin has it, in whichever of this host's repos holds that path. It refuses
-where this host's own branch of that name has commits origin's does not. A copy of an ended session forks at once. For
+where this host's own branch of that name has commits origin's does not. A directory this host has already it leaves
+as it is, since it may hold this host's own work, and says where it is on another branch or apart from origin's. A copy of an ended session forks at once. For
 any other, the tab asks the user first, naming the pull, and the hub forks only once the tab sends that pull's time
 back. A fork is refused while the peer answers, and where this host's own transcripts hold the session; the copy of
 the transcript a fork started from is never resumed here. The fork is a new session, with a session page of its own,
@@ -3289,11 +3290,42 @@ def fork(body: dict) -> tuple[int, dict]:
         if not answer.get("pane"):
             shutil.rmtree(pages, ignore_errors=True)
         if said and "error" in answer:
-            answer["error"] += f"; it {said}"
+            answer["error"] += f"; {said}"
         return code, {**answer, "forks": session, "directory": str(workdir), "said": said, "restored": ran,
                       "defaulted": [k for k in FLAGS if k not in ran]}
     finally:
         starting.release()
+
+
+FETCH_WAIT = 30  # seconds a fork waits on origin, which a train's network or a captive portal can hold forever
+
+
+def fetch(repo: Path, branch: str) -> str:
+    """Fetch the branch from the repo's origin: "" where it was, else a note that the branch is as last fetched."""
+    try:
+        run = subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "origin", branch], capture_output=True, text=True,
+                             timeout=FETCH_WAIT, check=False)
+        why = run.stderr.strip()[-200:] if run.returncode else ""
+    except subprocess.TimeoutExpired:
+        why = f"no answer within {FETCH_WAIT} s"
+    return f"; origin could not be fetched ({why}), so it is as last fetched" if why else ""
+
+
+def checkout_note(path: Path, branch: str) -> str:
+    """What the fork is to know of a directory this host has already, where it is a checkout: whether it is on the
+    branch the session was last on, and how that stands against what origin has of it. It is left as it is: it may
+    hold this host's own work."""
+    if not branch or branch == "HEAD" or not (top := git(path, "rev-parse", "--show-toplevel").strip()):
+        return ""
+    if (here := git(path, "rev-parse", "--abbrev-ref", "HEAD").strip()) != branch:
+        return f"this host's {path} is on {here}, where the session was last on {branch}"
+    stale = fetch(Path(top), branch)
+    counts = git(path, "rev-list", "--left-right", "--count", f"HEAD...refs/remotes/origin/{branch}").split()
+    if len(counts) != 2 or counts == ["0", "0"]:
+        return stale.removeprefix("; ")
+    ahead, behind = map(int, counts)
+    return (f"this host's {path} has {ahead} commit{'s' * (ahead != 1)} origin/{branch} does not, and lacks {behind} it has"
+            f"{stale}")
 
 
 def branch_of(transcript: Path) -> str:
@@ -3315,7 +3347,7 @@ def fork_directory(cwd: str, branch: str) -> tuple[Path | None, str]:
         return None, "the session's transcript names no directory it ran in"
     path = Path(cwd)
     if path.is_dir():
-        return path, ""
+        return path, checkout_note(path, branch)
     if not branch or branch == "HEAD":
         return None, f"{cwd} is not on this host, and the session's transcript names no branch to make a worktree of there"
     near = next((d for d in path.parents if d.is_dir()), None)
@@ -3323,11 +3355,9 @@ def fork_directory(cwd: str, branch: str) -> tuple[Path | None, str]:
     if not top:
         return None, f"{cwd} is not on this host, and no repo of this host's holds where it was"
     repo = Path(top)
-    fetched = subprocess.run(["git", "-C", top, "fetch", "--quiet", "origin", branch], capture_output=True, text=True,
-                             timeout=120, check=False)
+    stale = fetch(repo, branch)
     pushed = bool(git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}^{{commit}}"))
     local = bool(git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"))
-    stale = "" if fetched.returncode == 0 else f"; origin could not be fetched ({fetched.stderr.strip()[-200:]}), so it is as last fetched"
     behind = local and pushed and subprocess.run(["git", "-C", top, "merge-base", "--is-ancestor", f"refs/heads/{branch}",
                                                   f"refs/remotes/origin/{branch}"], capture_output=True, check=False).returncode == 0
     if local and pushed and not behind:
@@ -3614,12 +3644,25 @@ def kept_read(path: str) -> bool:
     return path == "/api/hub" or path.startswith("/api/u/")
 
 
+def local_time(at: float) -> str:
+    """A time a page names, in UTC as served, which LOCAL_TIMES puts in the reader's clock, with its date where that
+    is not today: a host can be down for days."""
+    return f'<time data-at="{at}">{datetime.fromtimestamp(at, UTC):%Y-%m-%d %H:%M} UTC</time>'
+
+
+LOCAL_TIMES = """<script>for (const t of document.querySelectorAll("time[data-at]")) {
+  const at = new Date(t.dataset.at * 1000), hm = { hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
+  t.textContent = at.toDateString() === new Date().toDateString() ? at.toLocaleTimeString([], hm)
+    : at.toLocaleString([], { day: "numeric", month: "short", ...hm });
+}</script>
+"""
+
+
 def unreachable_page(host: str, read: float | None, why: str) -> bytes:
     """What a page of a peer that does not answer shows in its place: that it does not, and when the relay last read
     it, in the reader's own clock. The hub tab knows it by its `hub-unreachable` meta, and loads it again once the peer
     answers."""
-    when = (f'The hub last read {html.escape(host)} at <time data-at="{read}">'
-            f'{datetime.fromtimestamp(read, UTC):%H:%M} UTC</time>.' if read else f"The hub has not read {html.escape(host)} yet.")
+    when = (f"The hub last read {html.escape(host)} at {local_time(read)}." if read else f"The hub has not read {html.escape(host)} yet.")
     return (UNREACHABLE_PAGE.replace("__HOST__", html.escape(host)).replace("__WHEN__", when)
             .replace("__WHY__", html.escape(why)).encode())
 
@@ -3640,9 +3683,7 @@ UNREACHABLE_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport"
 <main><h1>__HOST__ does not answer</h1>
 <p>Its pages show here once it does. __WHEN__</p>
 <p class="why">__WHY__</p></main>
-<script>for (const t of document.querySelectorAll("time[data-at]"))
-  t.textContent = new Date(t.dataset.at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });</script>
-"""
+""" + LOCAL_TIMES
 
 
 def marked(host: str, body: dict) -> dict:
@@ -3693,10 +3734,8 @@ def after_body(page: bytes, put: bytes) -> bytes:
 
 
 def copy_banner(host: str, at: float | None) -> bytes:
-    when = (f'<time data-at="{at}">{datetime.fromtimestamp(at, UTC):%H:%M} UTC</time>' if at else "a time it did not record")
-    return banner(f"{html.escape(host)} does not answer; this is its copy, as this host last pulled it at {when}") + (
-        b'<script>for (const t of document.querySelectorAll("time[data-at]")) t.textContent = new Date(t.dataset.at * 1000)'
-        b'.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });</script>')
+    when = local_time(at) if at else "a time it did not record"
+    return banner(f"{html.escape(host)} does not answer; this is its copy, as this host last pulled it at {when}") + LOCAL_TIMES.encode()
 
 
 def relayed_location(host: str, location: str) -> str:
