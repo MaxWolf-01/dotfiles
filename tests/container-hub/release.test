@@ -14,12 +14,15 @@ server.test's, and an idle session, whose pane a release closes, is refused here
 directly; no framework.
 """
 
-import http.client
 import json
 import os
 import pwd
+import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -34,6 +37,7 @@ WORKING = "cccccccc-0000-4000-8000-000000000003"  # at work on pc
 IDLE = "dddddddd-0000-4000-8000-000000000004"  # idle on pc, in no tmux pane
 NO_UNIT = "eeeeeeee-0000-4000-8000-000000000005"  # ended on pc, in no unit of its hub
 HELFER = "ffffffff-0000-4000-8000-000000000006"  # ended on pc, under an account the laptop does not have
+ELSEWHERE = "abababab-0000-4000-8000-000000000007"  # ended on pc, released by it to a third host
 SCRATCH = Path(tempfile.mkdtemp(prefix="release.", dir=fakes.RUN))
 PORT = free_port()
 USER = pwd.getpwuid(os.getuid()).pw_name
@@ -42,42 +46,23 @@ PC, PC_DEST = "tower", "tower-over-ssh"  # not "pc": a pull leaves out a source 
 
 def request(method: str, path: str, body=None, headers: dict | None = None):
     """(status, body as JSON where it parses) of a request to the laptop's port."""
-    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=300)
-    conn.request(method, path, body=None if body is None else json.dumps(body).encode(),
-                 headers={"Content-Type": "application/json", **(headers or {})})
-    r = conn.getresponse()
-    raw = r.read()
-    conn.close()
-    try:
-        return r.status, json.loads(raw)
-    except ValueError:
-        return r.status, raw
+    status, _, said = fakes.request(PORT, method, path, body, headers, timeout=300)
+    return status, said
 
 
 def on_pc(method: str, path: str, body=None):
     """(status, body as JSON) of a request to pc's hub on its socket, as a local tool there makes it."""
-    conn = fakes.Unix(pc.socket)
-    conn.request(method, path, body=None if body is None else json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    r = conn.getresponse()
-    raw = r.read()
-    conn.close()
-    return r.status, json.loads(raw)
+    status, _, said = fakes.request(pc.socket, method, path, body)
+    return status, said
 
 
-def token() -> str:
-    page = request("GET", "/")[1].decode()
-    return page.split('name="hub-token" content="', 1)[1].split('"', 1)[0]
+token = lambda: fakes.token(PORT)
 
 
 def lines(session: str, cwd: Path, title: str) -> str:
     """A transcript as Claude Code writes one, in short: where it ran, its title, two turns."""
-    return "".join(json.dumps(line, separators=(",", ":")) + "\n" for line in (
-        {"type": "user", "sessionId": session, "cwd": str(cwd), "gitBranch": "ticket/x", "entrypoint": "cli",
-         "message": {"role": "user", "content": "go"}},
-        {"type": "custom-title", "customTitle": title, "sessionId": session},
-        {"type": "system", "subtype": "turn_duration", "durationMs": 1000},
-        {"type": "user", "sessionId": session, "message": {"role": "user", "content": "and on"}},
-        {"type": "system", "subtype": "turn_duration", "durationMs": 1000}))
+    return fakes.transcript(session, cwd, {"type": "custom-title", "customTitle": title, "sessionId": session}, fakes.TURN_END,
+                            {"type": "user", "sessionId": session, "message": {"role": "user", "content": "and on"}}, fakes.TURN_END)
 
 
 laptop_copies = SCRATCH / "laptop-copies"
@@ -180,6 +165,30 @@ try:
           "repo of the laptop's holds that path", (409, True),
           (status, "no repo of this host's holds where it was" in answer.get("error", "")))
 
+    # --- a session the laptop took over, released back to pc
+
+    pulled = lambda: subprocess.run(shlex.split(pull), env=laptop.env, capture_output=True, check=True)
+    status, answer = request("POST", "/api/release", {"to": PC, "unit": STAYS}, {"X-Hub-Token": tab})
+    check("the laptop releases a session it took over back to pc", (200, [STAYS]), (status, [r["unit"] for r in answer.get("released", [])]))
+    pc_copy = pc.home / ".local/share/session-copies/laptop"  # pc's copy of the laptop, as its pull would leave it
+    shutil.copytree(laptop.home / ".claude/projects", pc_copy / USER / ".claude/projects")
+    fakes.page(pc_copy / f"{USER}.pulled.json", json.dumps({"at": time.time(), "home": str(laptop.home)}))
+    status, unit = request("GET", f"/h/{PC}/api/u/{STAYS}")
+    check("...which pc shows as its own again, no longer released", (200, None), (status, unit.get("released")))
+    status, answer = request("POST", f"/h/{PC}/api/resume", {"unit": STAYS}, {"X-Hub-Token": tab})
+    check("...and resumes, taking it over from its copy of the laptop, its release gone: as far as the directory it ran in, "
+          "which no host here has", (409, True, False),
+          (status, "no repo of this host's holds where it was" in answer.get("error", ""), (pc.home / ".claude/projects/-p" / f"{STAYS}.release.json").exists()))
+
+    # --- a session pc released to a third host
+
+    fakes.page(pc.home / ".claude/projects/-p" / f"{ELSEWHERE}.jsonl", lines(ELSEWHERE, both, "the third host's"))
+    fakes.page(pc.home / ".claude/projects/-p" / f"{ELSEWHERE}.release.json", json.dumps({"to": "vps", "at": time.time(), "from": PC}))
+    pulled()
+    status, answer = request("POST", "/api/resume", {"unit": ELSEWHERE}, {"X-Hub-Token": tab})
+    check("a session pc released to another host is not taken over by the laptop, which names that host", (409, True, False),
+          (status, "released the session to vps" in answer.get("error", ""), (laptop.home / ".claude/projects/-p" / f"{ELSEWHERE}.jsonl").exists()))
+
     # --- pc down: its sessions locked
 
     pc.stop()
@@ -196,6 +205,10 @@ try:
     status, answer = request("POST", "/api/resume", {"unit": MOVED}, {"X-Hub-Token": tab})
     check("a session taken over before pc went down resumes on the laptop all the same", (409, True),
           (status, "no tmux server runs" in answer.get("error", "")))
+    status, answer = request("POST", "/api/fork", {"host": PC, "session": STAYS}, {"X-Hub-Token": tab})
+    check("...and one the laptop released back to pc, which took it over, forks from pc's copy: not the laptop's own, "
+          "though its old transcript is still here", (409, True),
+          (status, "no repo of this host's holds where it was" in answer.get("error", "")))
 finally:
     for process in processes:
         process.kill()
