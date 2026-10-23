@@ -133,6 +133,10 @@ in
     };
     Service = {
       Type = "oneshot";
+      # Bounded for the reason timers.nix gives above its restic services: xmg19
+      # powered off mid-run is that dead sftp socket. A first run uploads all of
+      # phone, about 90 GB.
+      TimeoutStartSec = "6h";
       Environment = [
         "PATH=${backupPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
@@ -256,6 +260,8 @@ in
     };
     Service = {
       Type = "oneshot";
+      # Bounded as phone-xmg19 is.
+      TimeoutStartSec = "2h";
       Environment = [
         "PATH=${backupPath}"
         "SOPS_AGE_KEY_FILE=${ageKeyFile}"
@@ -278,17 +284,18 @@ in
 
   # --- Catch-up handle ---
   # "The backups can run now." secrets/zshrc starts it on login, when the age key
-  # is decrypted or the ssh key enters the agent, and zfs-unlock starts it when a
-  # dataset appears. It carries no Install section, so systemd itself never
-  # starts it: the timers cover the scheduled runs, this covers what skipped for
-  # want of a precondition.
+  # is decrypted or the ssh key enters the agent, zfs-unlock starts it when a
+  # dataset appears, and `host-unlock pc` once everything is unlocked. It
+  # carries no Install section, so systemd itself never starts it: the timers
+  # cover the scheduled runs, this covers what skipped for want of a
+  # precondition.
   #
   # It lists every unit rather than the ones a caller's event feeds, so a caller
-  # needs to know nothing about preconditions. The two with no source to gate on
-  # — youtube and pcstate — therefore run every time it fires, which for youtube
-  # means its 1% integrity check reads ~2 GB back from rsync.net. That is the
-  # price of the caller not having to know, and it is only paid on a login or an
-  # unlock.
+  # needs to know nothing about preconditions. The ones with no source to gate on
+  # (youtube and both pcstate units) therefore run every time it fires, which
+  # for youtube means its 1% integrity check reads ~2 GB back from rsync.net.
+  # That is the price of the caller not having to know, and it is only paid on
+  # a login or an unlock.
 
   systemd.user.targets.backup-catchup = {
     Unit = {

@@ -35,5 +35,5 @@ systemd unit or a script written for another host's PATH has to be given here.
 
 xmg19's `/home`, this user's home with it, stays locked after every boot until
 `host-unlock xmg19` on zephylux opens it, and no worker can run until then.
-When `worker-hosts` cannot read this record, or shows xmg19 up for minutes, the
-orchestrator runs `host-unlock xmg19` once.
+When `worker-hosts` shows xmg19's `/home` locked, or cannot read this record,
+the orchestrator runs `host-unlock xmg19`.

@@ -12,7 +12,7 @@
     isSystemUser = true;
     group = "backup";
     openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephylux
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHZifXbOmWESRCVMJmThjlFD3gdBrVH5ydol1Eo7EU9/" # pc
     ];
   };

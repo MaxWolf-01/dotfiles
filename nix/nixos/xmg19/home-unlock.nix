@@ -25,6 +25,18 @@ let
     name = "host-unlock-receive";
     runtimeInputs = with pkgs; [ cryptsetup coreutils getent systemd ];
     text = ''
+      # Already unlocked this boot: the restarts below would end every user
+      # manager, and with it every tmux pane and dispatch worker, which run as
+      # its scopes. The mark is written last, so a run that failed after the
+      # mount is finished by the next one.
+      mark=/run/host-unlock-done
+      if [ -e "$mark" ]; then
+        cat > /dev/null
+        ${makeHomes}
+        echo "xmg19: /home was already unlocked"
+        exit 0
+      fi
+
       # The key arrives on stdin and goes straight to cryptsetup.
       if [ ! -e /dev/mapper/home ]; then
         cryptsetup open --key-file=- /dev/disk/by-partlabel/disk-home-luks home
@@ -44,6 +56,7 @@ let
       for user in "''${linger_users[@]}"; do
         systemctl restart "user@$(id -u "$user").service"
       done
+      touch "$mark"
       echo "xmg19: /home unlocked"
     '';
   };
