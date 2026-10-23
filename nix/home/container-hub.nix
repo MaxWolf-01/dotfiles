@@ -95,8 +95,15 @@ in
           };
         };
       });
-      default = import ./session-hosts.nix;
-      description = "The hosts that run max's sessions; ./session-hosts.nix says what they are for.";
+      default =
+        let
+          listed = import ./session-hosts.nix;
+          names = map (h: h.name) listed;
+        in
+        # listToAttrs would keep the first of two entries of one name, and drop the other unsaid
+        assert lib.assertMsg (lib.allUnique names) "session-hosts.nix names a host more than once: ${lib.concatStringsSep ", " names}";
+        lib.listToAttrs (map (h: { inherit (h) name; value = removeAttrs h [ "name" ]; }) listed);
+      description = "The hosts that run max's sessions, by name; ./session-hosts.nix says what they are for.";
     };
     peers = lib.mkOption {
       type = lib.types.attrs;
