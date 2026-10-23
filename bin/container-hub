@@ -186,6 +186,17 @@ also answers the host's own users at its tailnet address, and the tailnet policy
 other than the hub's needs a firewall rule that keeps them off the port `tailscale serve` uses; pc's is in
 nix/nixos/pc/container-hub.nix.
 
+A hub can relay the hubs of other hosts, its peers (--peer), each reached at a unix socket of this user's: an ssh
+forward of the peer's own socket. A peer's API, its event stream and its pages answer here under /h/<host>/, as the
+peer answers them at its own root, so the hub tab shows every host's units from one address and acts on each unit
+through the hub of the host its session runs on. The tab names a unit's host on its row. This hub's guards (the
+Host, the Origin, the token) apply first; the peer then sees the request as one from a page of this hub's origin, and
+gets its own token, which the relay asks of it as a local tool may (/api/token). Where a peer does not answer, its
+rail's index and its units' details are answered as the peer last answered them, marked "unreachable", and kept on
+disk under --state, so the tab shows its units as they were last read and not as ended; anything else is refused,
+saying so. Its event stream then sends one event, {"type": "unreachable"}, and ends, for the tab to open again in a
+few seconds; a stream that reaches the peer starts with {"type": "reached"}.
+
 Typing, dropping a file, handing off, jumping, closing, starting and resuming each want the token the hub hands to a top-level load of /
 alone, so a page the hub serves cannot act on a session by fetching their routes. It shares the tab's origin all the
 same, so a page that scripts the tab itself is not stopped; only a page served from another origin would be.
@@ -258,7 +269,12 @@ over the tab.
                               "session_page". In their place "refusing", the urls of its pages that refuse to be
                               framed, and "agent_opened_at", the times an agent opened a page of it since the unit's
                               last visit. Beside the units, each account's 5h and weekly usage, as the statusline
-                              last had them.
+                              last had them, "host", this host's name, and "peers", the hosts it relays.
+    GET  /api/token           {"token"}: to a local tool on the socket alone, the token the hub tab acts with.
+    *    /h/<host>/<path>     a peer's /<path>, relayed, but for its hub tab (/ and /u/<key> go to this hub's tab at
+                              /u/<host>/<key>), its /api/token and its /api/serve. A read of /api/hub or /api/u/<key>
+                              while the peer does not answer is what it last answered, with "unreachable": {"at": when
+                              it was read, "why"}; anything else is 502, {"error", "unreachable"} for the API.
     GET  /api/u/<key>         one unit, its "number" null (the rail's index has it): {"unit", "session", "account", "title", "short", "tree", "repo", "state", "waiting_for",
                               "pane", "panes" (every pane its session's processes run in, as the registry names them),
                               "context" (its running session's context use, as the statusline last had it),
@@ -287,7 +303,7 @@ over the tab.
 Examples:
 
     container-hub --port 8377
-    container-hub --url https://pc.tail710178.ts.net:8377
+    container-hub --url https://pc.tail710178.ts.net:8377 --peer zephylux=~/.local/state/container-hub/peers/zephylux.sock
     container-hub --port 8377 --tailnet https://zephylux.tail710178.ts.net:8377
     container-hub --socket /tmp/hub.sock --port 18377 --state /tmp/hub-state
 """
@@ -295,6 +311,7 @@ Examples:
 import fcntl
 import hashlib
 import html
+import http.client
 import importlib.machinery
 import importlib.util
 import json
@@ -355,6 +372,7 @@ SOCKET_PATH_MAX = 107
 108, and each keeps one of them for the terminating NUL."""
 SOCKET = Path(os.environ.get("CONTAINER_HUB_SOCKET") or "~/.local/state/container-hub/hub.sock").expanduser()
 """Where the hub listens, and where claude-browser, diffview and the Stop hook look for it."""
+HOSTNAME = socket.gethostname().split(".")[0]
 
 
 @dataclass
@@ -378,6 +396,11 @@ class Args:
     """Seconds a hand-off waits, after the /clear it typed, for the new session to start."""
     start_wait: float = 30.0
     """Seconds a start or a resume waits, after typing Claude Code into its new window, for the session to register."""
+    host: str = HOSTNAME
+    """This host's name, which the hub tab gives each of its units' rows where it shows more than one host."""
+    peer: tuple[str, ...] = ()
+    """Another host's hub to relay, as <host>=<socket>: the unix socket that reaches that hub, such as an ssh forward
+    of its own socket."""
 
 
 # --------------------------------------------------------------------------
@@ -3061,6 +3084,117 @@ def with_links_caught(page: bytes) -> bytes:
     return page[:at] + CATCH_LINKS + page[at:]
 
 
+# --------------------------------------------------------------------------
+# relaying another host's hub: its API, its event stream and its pages, at /h/<host>/
+# --------------------------------------------------------------------------
+
+HOST = ""
+"""This host's name, as the hub tab names it on each unit's row (--host)."""
+PEERS: dict[str, Path] = {}
+"""The other hosts' hubs this one relays (--peer), by host name: the socket each is reached at."""
+RELAY = "/h/"
+READ_WAIT = 5.0
+"""Seconds a peer has to answer a read before it counts as unreachable. A peer asleep behind a forward that does not
+know it yet takes this long; one whose forward is down refuses at once."""
+ACT_WAIT = 120.0
+"""Seconds a peer has to answer an action: a start, a resume or a hand-off waits on a session there first."""
+SILENT_STREAM = 45.0
+"""Seconds of silence after which a peer's event stream counts as gone: a hub sends a keepalive every 15."""
+LAST_READS: dict[str, dict[str, dict]] = {}
+"""What each peer last answered to a read of its rail's index (/api/hub) or of one of its units (/api/u/<key>), by
+host and path, as {"at", "body"}: what the hub tab shows of the peer while it does not answer. Kept in
+--state/peers/<host>.json, so a hub started while a peer sleeps has it too."""
+KEPT_READS_WRITTEN: dict[str, float] = {}
+PEER_TOKENS: dict[str, str] = {}
+"""Each peer's token, which an action relayed to it carries in place of this hub's own."""
+relay_lock = threading.Lock()
+
+
+class PeerConnection(http.client.HTTPConnection):
+    """HTTP to a peer's hub over the unix socket it is reached at."""
+
+    def __init__(self, path: Path, timeout: float):
+        super().__init__("hub", timeout=timeout)
+        self.socket_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(str(self.socket_path))
+
+
+def peer_request(host: str, method: str, target: str, headers: dict[str, str], body: bytes | None,
+                 timeout: float) -> tuple[int, http.client.HTTPMessage, bytes]:
+    """The peer's answer, whole. Raises OSError or HTTPException where it does not answer."""
+    conn = PeerConnection(PEERS[host], timeout)
+    try:
+        conn.request(method, target, body=body, headers=headers)
+        answer = conn.getresponse()
+        return answer.status, answer.headers, answer.read()
+    finally:
+        conn.close()
+
+
+def peer_token(host: str, again: bool = False) -> str:
+    """The peer's token, asked of it as a local tool asks for the hub tab, which is what this hub is to it."""
+    if again or host not in PEER_TOKENS:
+        status, _, body = peer_request(host, "GET", "/api/token", {}, None, READ_WAIT)
+        if status != 200:
+            raise http.client.HTTPException(f"its hub would not give its token ({status})")
+        PEER_TOKENS[host] = json.loads(body)["token"]
+    return PEER_TOKENS[host]
+
+
+def last_reads_file(host: str) -> Path:
+    return STATE / "peers" / f"{host}.json"
+
+
+def last_reads(host: str) -> dict[str, dict]:
+    with relay_lock:
+        if host not in LAST_READS:
+            try:
+                LAST_READS[host] = read_json(last_reads_file(host)) or {}
+            except OSError as e:
+                print(f"what {host} last answered: {e}", file=sys.stderr, flush=True)
+                LAST_READS[host] = {}
+        return LAST_READS[host]
+
+
+def remember(host: str, path: str, body: bytes) -> None:
+    """A read the peer answered, kept for when it does not. Its rail's index lets go of the units it no longer has."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return
+    kept, now = last_reads(host), time.time()
+    with relay_lock:
+        changed = kept.get(path, {}).get("body") != data
+        kept[path] = {"at": now, "body": data}
+        if path == "/api/hub":
+            units = {"/api/u/" + u["unit"] for u in data.get("units", [])}
+            gone = [p for p in kept if p.startswith("/api/u/") and p not in units]
+            for p in gone:
+                del kept[p]
+            changed = changed or bool(gone)
+        # a read that changed nothing is written once a minute, for the time it was read at
+        if changed or now - KEPT_READS_WRITTEN.get(host, 0) > 60:
+            try:
+                write_json(last_reads_file(host), kept)
+                KEPT_READS_WRITTEN[host] = now
+            except OSError as e:
+                print(f"keeping what {host} answered: {e}", file=sys.stderr, flush=True)
+
+
+def kept(path: str) -> bool:
+    """A read of a peer whose answer the relay keeps."""
+    return path == "/api/hub" or path.startswith("/api/u/")
+
+
+def relayed_location(host: str, location: str) -> str:
+    """A redirect the peer answers, to a path of its own, as the address it has under the relay."""
+    return RELAY + host + location if location.startswith("/") and not location.startswith("//") else location
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -3156,6 +3290,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(403, b"forbidden", "text/plain")
         parts = urllib.parse.urlsplit(self.path)
         path = parts.path
+        if path.startswith(RELAY):
+            return self.relay("GET")
         if path == "/.health":  # a diffview page asks this before it offers its comment controls
             return self.send_json({"saves": diffview is not None, "url": URL})
         if path.startswith("/c/"):  # a container view's address, from before units
@@ -3171,7 +3307,11 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"trellis {name}: {e}", file=sys.stderr, flush=True)
                 return self.send(502, f"trellis could not be served: {e}".encode(), "text/plain")
         if path == "/api/hub":
-            return self.send_json(rail_index(hub_view()))
+            return self.send_json({**rail_index(hub_view()), "host": HOST, "peers": sorted(PEERS)})
+        if path == "/api/token":  # to a local tool alone: a hub that relays this one
+            if self.on_socket() and top_level(self.headers) and not self.headers.get("X-Forwarded-Host"):
+                return self.send_json({"token": TOKEN})
+            return self.send(403, b"forbidden", "text/plain")
         if path == "/api/start":
             return self.send_json(start_form())
         if path.startswith("/api/u/"):
@@ -3242,6 +3382,115 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 listeners.remove(q)
 
+    def relay(self, method: str) -> None:
+        """A request under /h/<host>/, carried to that host's hub as the same request to its own path. This hub's
+        guards go first, as they would on its own routes; the peer then sees what a page of this hub's origin sent
+        through `tailscale serve`, with the peer's token in place of this hub's."""
+        parts = urllib.parse.urlsplit(self.path)
+        host, _, rest = parts.path.removeprefix(RELAY).partition("/")
+        host, path = urllib.parse.unquote(host), "/" + rest
+        asked = urllib.parse.unquote(path)
+        if host not in PEERS:
+            return self.send(404, f"this hub relays no host {host}".encode(), "text/plain")
+        if path == "/" or path.startswith("/u/"):  # the peer's own hub tab: this one shows its units
+            return self.send(302, b"", "text/plain", {"Location": f"/u/{urllib.parse.quote(host)}/{path.removeprefix('/u/')}"
+                                                      if path.startswith("/u/") else "/"})
+        if asked in ("/api/token", "/api/serve"):  # this hub's to know, and local tools' to ask
+            return self.send(403, b"forbidden", "text/plain")
+        body = None
+        if method == "POST":
+            if asked.startswith("/f/"):
+                refused = diffview.write_refusal(self.headers, self.mine()) if diffview else (403, b"forbidden")
+                if refused:
+                    return self.send(refused[0], refused[1], "text/plain")
+            elif not self.own_origin():
+                return self.send(403, b"forbidden", "text/plain")
+            elif asked in TOKENED and not secrets.compare_digest(self.headers.get("X-Hub-Token") or "", TOKEN):
+                return self.send_json({"error": "only the hub tab itself acts on a session; reload the tab if it is one"}, 403)
+            size = int(self.headers.get("Content-Length") or 0)
+            if size > DROP_LIMIT:
+                return self.send_json({"error": f"over {DROP_LIMIT // 2**20} MB; give the session its path instead"}, 413)
+            body = self.rfile.read(size)
+        tab = urllib.parse.urlsplit(self.origins()[0])
+        headers = {"X-Forwarded-Host": tab.netloc, "X-Forwarded-Proto": tab.scheme,
+                   **{k: v for k in ("Origin", "Content-Type", "Accept", "Sec-Fetch-Dest") if (v := self.headers.get(k))}}
+        if asked == "/events":
+            return self.relay_stream(host, headers)
+        target = path + (f"?{parts.query}" if parts.query else "")
+        tokened = method == "POST" and asked in TOKENED
+        try:
+            for again in (False, True):
+                if tokened:
+                    headers["X-Hub-Token"] = peer_token(host, again)
+                status, got, answer = peer_request(host, method, target, headers, body, ACT_WAIT if method == "POST" else READ_WAIT)
+                if not (tokened and status == 403):  # a token the peer made anew since it was asked
+                    break
+        except (OSError, http.client.HTTPException, ValueError, KeyError) as e:
+            return self.unreachable(host, asked, method, str(e) or type(e).__name__)
+        if method == "GET" and status == 200 and kept(asked):
+            remember(host, asked, answer)
+        extra = {k: v for k in ("Cache-Control",) if (v := got.get(k))}
+        if location := got.get("Location"):
+            extra["Location"] = relayed_location(host, location)
+        self.send(status, answer, got.get("Content-Type") or "application/octet-stream", extra)
+
+    def unreachable(self, host: str, path: str, method: str, why: str) -> None:
+        """A peer that does not answer: a read the relay keeps is answered with what the peer last answered to it,
+        marked unreachable; anything else is refused, saying so."""
+        said = f"{host} does not answer: {why}"
+        last = last_reads(host).get(path) if method == "GET" and kept(path) else None
+        if last:
+            return self.send_json({**last["body"], "unreachable": {"at": last["at"], "why": said}})
+        if method == "POST" or path.startswith("/api/"):
+            return self.send_json({"error": said, "unreachable": {"at": None, "why": said}}, 502)
+        self.send(502, f"{said}; its pages show once it does".encode(), "text/plain; charset=utf-8")
+
+    def relay_stream(self, host: str, headers: dict[str, str]) -> None:
+        """The peer's event stream, after an event of the relay's own: {"type": "reached"} once the peer answers, or
+        {"type": "unreachable"} where it does not, and the stream ends there, to be opened again in 5 seconds. The
+        stream ends with the peer's, and a hub tab's EventSource opens it again as it would its own hub's."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            peer.settimeout(READ_WAIT)
+            try:
+                peer.connect(str(PEERS[host]))
+                peer.sendall(b"GET /events HTTP/1.0\r\nHost: hub\r\n" + b"".join(f"{k}: {v}\r\n".encode() for k, v in headers.items())
+                             + b"\r\n")
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    if not (got := peer.recv(4096)):
+                        raise ConnectionError("its hub closed the stream before answering")
+                    head += got
+                head, _, rest = head.partition(b"\r\n\r\n")
+                if head.split(b" ", 2)[1:2] != [b"200"]:
+                    raise ConnectionError(head.split(b"\r\n", 1)[0].decode(errors="replace"))
+            except (OSError, IndexError) as e:
+                self.wfile.write(f"retry: 5000\ndata: {json.dumps({'type': 'unreachable', 'why': f'{host} does not answer: {e}'})}\n\n".encode())
+                return
+            self.wfile.write(b'data: {"type": "reached"}\n\n' + rest)
+            self.wfile.flush()
+            heard = time.monotonic()
+            while not RESTARTING.is_set():
+                ready = select.select([peer, self.connection], [], [], 1)[0]
+                if self.connection in ready and self.peer_gone():
+                    return
+                if peer in ready:
+                    if not (got := peer.recv(65536)):
+                        return
+                    self.wfile.write(got)
+                    self.wfile.flush()
+                    heard = time.monotonic()
+                elif time.monotonic() - heard > SILENT_STREAM:  # a peer gone to sleep behind a forward that holds
+                    return
+        except OSError:
+            pass  # the hub tab went
+        finally:
+            peer.close()
+
     def peer_gone(self) -> bool:
         """An event stream's client sends nothing after its request, so its socket turning readable means it closed."""
         if not select.select([self.connection], [], [], 0)[0]:
@@ -3254,6 +3503,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.local():
             return self.send(403, b"forbidden", "text/plain")
+        if self.path.startswith(RELAY):
+            return self.relay("POST")
         path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
         if path.startswith("/f/") and diffview:
             if refused := diffview.write_refusal(self.headers, self.mine()):
@@ -3504,7 +3755,7 @@ def repair(data: dict) -> bool:
 
 
 def main(args: Args) -> None:
-    global STATE, TOKEN, TMUX_SOCKET, CLEAR_WAIT, START_WAIT, RELOADS_UNREAD, URL, TAILNET
+    global STATE, TOKEN, TMUX_SOCKET, CLEAR_WAIT, START_WAIT, RELOADS_UNREAD, URL, TAILNET, HOST
     if (handed := os.environ.get(LISTENING, "")).isdigit() and args.port is None:
         # a hub from before the socket ran this code on its unit's bare argv, handing over its port alone: keep it
         with socket.socket(fileno=os.dup(int(handed))) as port:
@@ -3521,6 +3772,12 @@ def main(args: Args) -> None:
         sys.exit(f"container-hub: the socket path {args.socket} is {length} bytes, over the {SOCKET_PATH_MAX} a unix "
                  "socket's path may hold; give --socket a shorter one, or set CONTAINER_HUB_SOCKET for the tools too")
     STATE = args.state.expanduser().resolve()
+    HOST = args.host
+    for peer in args.peer:
+        name, _, path = peer.partition("=")
+        if not name or not path or "/" in name or name == HOST:
+            sys.exit(f"container-hub: --peer {peer} is no <host>=<socket> of another host")
+        PEERS[name] = Path(path).expanduser()
     TMUX_SOCKET = args.tmux_socket
     CLEAR_WAIT, START_WAIT = args.clear_wait, args.start_wait
     STATE.mkdir(parents=True, exist_ok=True)

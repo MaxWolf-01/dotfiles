@@ -14,6 +14,9 @@
   # socket goes on the tailnet through the serve table pc's system config owns
   # (nix/nixos/pc/container-hub.nix).
   containerHub.url = "https://pc.tail710178.ts.net:8377";
+  # pc's hub is the address the phone uses, so it shows the laptop's sessions
+  # beside its own; the laptop's relays none, and never needs pc.
+  containerHub.peers.zephylux = "zephylux";
 
   tmuxServer.atBoot = true;
 
