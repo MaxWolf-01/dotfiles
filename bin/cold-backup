@@ -25,7 +25,10 @@ Usage: cold-backup [--no-scrub] [--notify]
                 unplugged, or what failed. The plug-in unit passes it.
 
 Keeps the last 12 runs as snapshots on the disk, and only the latest on tank,
-which is the next run's starting point. Records each run in
+which is the next run's starting point. Each run also writes the dotfiles and
+secrets repos to the disk, encrypted to the age key sops uses, beside a
+README.txt on restoring: the ZFS passphrases and restic passwords that open
+the copy are in the secrets repo. Records each run in
 ~/logs/runs/cold-backup.jsonl (bin/run-log). Runs itself with sudo.
 
 Exits 0 when the copy is on the disk, 1 when a step failed, 2 on a usage error.
@@ -36,6 +39,8 @@ EOF
 source_ds="${COLD_SOURCE:-tank/max}"
 pool="${COLD_POOL:-cold}"
 device_dir="${COLD_DEVICE_DIR:-/dev/disk/by-id}"
+bundle_repos="${COLD_BUNDLE_REPOS:-/home/max/.dotfiles /home/max/.dotfiles/secrets}"
+recipients_from="${COLD_RECIPIENTS_FROM:-/home/max/.dotfiles/secrets/.sops.yaml}"
 keep=12
 
 args=("$@")
@@ -138,6 +143,50 @@ done
 for s in $(snapshots "$dest" | head -n -"$keep"); do
     zfs destroy -r "$dest@$s"
 done
+
+write_restore_kit() {  # mountpoint
+    local mnt="$1" repo name r recipients=()
+    for r in $(grep -o 'age1[a-z0-9]*' "$recipients_from" | sort -u); do
+        recipients+=(-r "$r")
+    done
+    [ "${#recipients[@]}" -gt 0 ] || { echo "no age recipient in $recipients_from"; return 1; }
+    for repo in $bundle_repos; do
+        name=$(basename "$repo"); name=${name#.}
+        # git refuses a repo another user owns, so its owner makes the bundle.
+        as_user git -C "$repo" bundle create - --all 2>/dev/null \
+            | age "${recipients[@]}" >"$mnt/$name.bundle.age.new" \
+            || { echo "bundling $repo failed"; return 1; }
+        mv "$mnt/$name.bundle.age.new" "$mnt/$name.bundle.age"
+    done
+    cat >"$mnt/README.txt" <<EOF
+Cold copy of pc's tank/max, written by cold-backup (in the dotfiles repo).
+
+Opening it takes the age key, kept in Bitwarden under its path
+~/.local/secrets/age-key.txt. The key opens the repos here:
+
+  age -d -i age-key.txt secrets.bundle.age > secrets.bundle
+  git clone secrets.bundle secrets
+
+The secrets repo holds, sops-encrypted to the same key, the passphrases of the
+encrypted datasets and the restic passwords. To restore onto new disks:
+
+  zpool import -N cold
+  zfs send -R -w cold/max@<newest cold-* snapshot> | zfs receive <pool>/max
+  zfs load-key <pool>/max/<dataset>     # encrypted, phone, general
+
+Written $(date -I), with $source_ds@$new.
+EOF
+}
+
+# Mounted only while the kit is written: mountpoint=legacy never mounts by itself.
+restore="$pool/restore"
+zfs list "$restore" >/dev/null 2>&1 || zfs create -o mountpoint=legacy "$restore" \
+    || fail "zfs create $restore failed"
+mnt=$(mktemp -d)
+mount -t zfs "$restore" "$mnt" || fail "mounting $restore failed"
+kit_error=$(write_restore_kit "$mnt")
+umount "$mnt" && rmdir "$mnt"
+[ -z "$kit_error" ] || fail "restore kit: $kit_error"
 
 scrub_errors=null
 if [ "$scrub" = 1 ]; then

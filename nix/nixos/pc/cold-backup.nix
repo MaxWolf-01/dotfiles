@@ -15,7 +15,7 @@ in
   systemd.services.cold-backup = {
     description = "Copy tank/max onto the cold disk";
     path = [ config.boot.zfs.package ] ++ (with pkgs; [
-      bash coreutils util-linux getent gnused gnugrep gawk jq sops curl
+      bash coreutils util-linux getent gnused gnugrep gawk jq sops curl git age
     ]);
     # alert-send needs the age key, decrypted on max's first login after a
     # boot; until then the mail is undelivered and the run log keeps the record.
