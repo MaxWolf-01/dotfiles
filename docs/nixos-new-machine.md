@@ -122,5 +122,5 @@ an empty passphrase fails `luksFormat`.
 ## Current Setup
 
 - **pc**: NixOS, manual hardware-configuration.nix, ext4, no disko/facter
-- **xmg19**: NixOS via nixos-anywhere, disko (LUKS+LVM unlocked by the TPM, Samsung 1TB by stable ID, VG `vg-xmg19`), facter, Hyprland
+- **xmg19**: NixOS via nixos-anywhere, disko (LUKS+LVM unlocked by the TPM, Samsung 1TB by stable ID, VG `vg-xmg19`), facter, headless
 - **zephyrus**: Ubuntu 26.04 with standalone HM (NixOS planned)

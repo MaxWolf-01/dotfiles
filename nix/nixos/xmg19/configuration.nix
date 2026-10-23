@@ -43,14 +43,12 @@
   i18n.defaultLocale = "en_US.UTF-8";
   console.keyMap = "de-latin1-nodeadkeys";
 
-  # NVIDIA (GTX 1660 Ti = Turing)
+  # NVIDIA (GTX 1660 Ti = Turing). videoDrivers is how NixOS picks the driver;
+  # no X server runs here.
   services.xserver.videoDrivers = [ "nvidia" ];
   hardware.graphics.enable = true;
 
-  # XMG uses Clevo/Tongfang chassis (uniwill_wmi). tuxedo-drivers loads but
-  # Fn+F-key media combos send unmapped scancodes (0xf8 etc.) — no volume/brightness.
-  # Needs udev hwdb rules to map scancodes to keycodes. Ubuntu ships these; NixOS doesn't.
-  # TODO: add hwdb rules or find the right scancode→keycode mappings for this model.
+  # XMG uses Clevo/Tongfang chassis (uniwill_wmi).
   hardware.tuxedo-drivers.enable = true;
 
   boot = {
@@ -104,48 +102,20 @@
   systemd.services.host-recorder.path = [ config.hardware.nvidia.package.bin ];
 
   environment.systemPackages = with pkgs; [
-    git firefox
-    nvidia-vaapi-driver
+    git
     nvtopPackages.nvidia
   ];
 
-  # Hyprland
-  programs.hyprland = {
-    enable = true;
-    withUWSM = true;
-    xwayland.enable = true;
-  };
-
-  # Display manager (SDDM, Wayland-native)
-  services.displayManager.sddm = {
-    enable = true;
-    wayland.enable = true;
-  };
-
-  # PAM (needed for hyprlock)
-  security.pam.services.hyprlock = {};
-
-  # Audio
-  services.pipewire = {
-    enable = true;
-    alsa.enable = true;
-    alsa.support32Bit = true;
-    pulse.enable = true;
-  };
-  security.rtkit.enable = true;
-
-  # Bluetooth
-  hardware.bluetooth.enable = true;
-  services.blueman.enable = true;
+  # facter turns Bluetooth on wherever it finds the radio; nothing here uses it.
+  hardware.bluetooth.enable = false;
 
   # Power management (laptop)
   services.power-profiles-daemon.enable = true;
   services.thermald.enable = true;
   services.upower.enable = true;
-  services.udisks2.enable = true;
 
-  # A worker host never sleeps: the lid, logind's idle action and hypridle's
-  # suspend all leave it running, since systemd refuses every sleep state.
+  # A worker host never sleeps: the lid and logind's idle action leave it
+  # running, and systemd refuses every sleep state besides.
   # sleepfor's `rtcwake -m off` is a poweroff, not a sleep, and still works.
   systemd.sleep.settings.Sleep = {
     AllowSuspend = false;
@@ -206,7 +176,7 @@
   # User
   users.users.max = {
     isNormalUser = true;
-    extraGroups = [ "wheel" "docker" "networkmanager" "input" ];
+    extraGroups = [ "wheel" "docker" "networkmanager" ];
     shell = pkgs.zsh;
     linger = true;
     initialPassword = "max"; # change with passwd after first login
@@ -230,12 +200,6 @@
     automatic = true;
     dates = "weekly";
     options = "--delete-older-than 30d";
-  };
-
-  # Portal config for Hyprland (file picker, screen sharing)
-  xdg.portal = {
-    extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
-    config.common.default = [ "hyprland" "gtk" ];
   };
 
   system.configurationRevision = self.rev or self.dirtyRev or "unknown";

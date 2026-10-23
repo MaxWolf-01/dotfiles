@@ -6,8 +6,6 @@
 
   imports = [
     ../common.nix
-    ../ghostty.nix
-    ../hyprland.nix
   ];
 
   targets.genericLinux.enable = false;
