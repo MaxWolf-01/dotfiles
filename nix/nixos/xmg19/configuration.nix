@@ -4,6 +4,14 @@
   imports = [
     ./disk-config.nix
     ./home-unlock.nix
+    # About three quarters of the 31G, leaving max's sessions and the GPU
+    # driver room.
+    (import ../agent-user.nix {
+      memoryMax = "24G";
+      dispatcherKeys = [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
+      ];
+    })
     ../host-recorder.nix
     ../journald.nix
   ];

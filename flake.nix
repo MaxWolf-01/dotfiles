@@ -82,6 +82,8 @@
                 ./nix/home/hosts/xmg19.nix
               ];
             };
+            home-manager.users.agent = import ./nix/home/hosts/xmg19-agent.nix;
+            home-manager.users.agent-hl = import ./nix/home/hosts/xmg19-agent-hl.nix;
             home-manager.backupFileExtension = "bak";
           }
         ];
