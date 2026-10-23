@@ -12,6 +12,7 @@
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
       ];
     })
+    ./gpu-queue.nix
     ../host-recorder.nix
     ../journald.nix
   ];

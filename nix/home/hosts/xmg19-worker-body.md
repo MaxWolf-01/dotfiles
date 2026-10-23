@@ -7,8 +7,12 @@ inside the worktree.
 
 The GPU, a GTX 1660 Ti with 6G, through CUDA from any process. It powers itself
 off while nothing has it open and wakes when a program opens it. Two jobs on 6G
-crash each other, so run one at a time: `nvidia-smi` shows whether another
-process holds it.
+crash each other, so every GPU job runs through `gpu-run`, which queues it
+behind every user's and runs them one at a time:
+`job run train -- gpu-run --eta 2h -- python train.py`. `gpu-queue` shows
+what runs, what waits, and when yours is expected to start; a long wait is a
+reason to do other work first, or to ask. `gpu-run --help` says the rest.
+Nothing enforces the queue: a job run without it can crash someone else's.
 
 Python comes only through `uv`: there is no `python3` on PATH, so a one-off is
 `uv run python`. This is NixOS: `/usr/bin` holds `env` alone and `/bin` holds
