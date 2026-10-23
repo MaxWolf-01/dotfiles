@@ -62,35 +62,6 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- YouTube → xmg19 ---
-
-  systemd.user.services.youtube-xmg19 = {
-    Unit = {
-      Description = "Restic backup to xmg19 (YouTube archive)";
-      After = [ "network-online.target" "ssh-agent.service" ];
-      Wants = [ "network-online.target" "ssh-agent.service" ];
-    };
-    Service = {
-      Type = "oneshot";
-      Environment = [
-        "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
-        "SSH_AUTH_SOCK=${sshAuthSock}"
-      ];
-      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/youtube/xmg19.conf";
-    };
-  };
-
-  systemd.user.timers.youtube-xmg19 = {
-    Unit.Description = "Daily backup to xmg19 (YouTube archive)";
-    Timer = {
-      OnCalendar = "*-*-* 02:30:00";
-      Persistent = true;
-      RandomizedDelaySec = "5m";
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
-
   # --- Phone sync (rsync over Tailscale SSH) ---
 
   systemd.user.services.phone-sync = {
@@ -238,35 +209,6 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  # --- Encrypted → xmg19 ---
-
-  systemd.user.services.encrypted-xmg19 = {
-    Unit = {
-      Description = "Restic backup to xmg19 (encrypted data)";
-      After = [ "network-online.target" "ssh-agent.service" ];
-      Wants = [ "network-online.target" "ssh-agent.service" ];
-    };
-    Service = {
-      Type = "oneshot";
-      Environment = [
-        "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
-        "SSH_AUTH_SOCK=${sshAuthSock}"
-      ];
-      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/encrypted/xmg19.conf";
-    };
-  };
-
-  systemd.user.timers.encrypted-xmg19 = {
-    Unit.Description = "Weekly backup to xmg19 (encrypted data)";
-    Timer = {
-      OnCalendar = "weekly";
-      Persistent = true;
-      RandomizedDelaySec = "1h50m";
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
-
   # --- pc service state → rsync.net ---
   # pc-local app state (e.g. mdsr's spaced-repetition DB) that lives on pc's own
   # disk, not in a tank dataset. ExecStartPre stages consistent snapshots; the
@@ -358,9 +300,7 @@ in
         "phone-pc.service"
         "encrypted-rsyncnet.service"
         "pcstate-rsyncnet.service"
-        "youtube-xmg19.service"
         "phone-xmg19.service"
-        "encrypted-xmg19.service"
         "pcstate-xmg19.service"
       ];
     };
