@@ -10,6 +10,7 @@ disk goes: main()'s own start-up (the old containers moved in, each unit repaire
 
 import atexit
 import http.client
+import importlib.machinery
 import itertools
 import json
 import os
@@ -28,6 +29,24 @@ from pathlib import Path
 from check import BIN, bin_module  # tests/ is on sys.path in every test that imports this
 
 LOADS = itertools.count()
+
+
+def compiled_once(compile_source):
+    """A loader's source_to_code, compiled once per source text. A test loads the hub anew for every restart it
+    plays, and the hub loads diffview and the mx plugin's modules as it does: compiled every time, that was most of
+    a property's run. The hub writes no bytecode, so nothing else would keep them."""
+    codes = {}
+
+    def source_to_code(self, data, path, *args, **kwargs):
+        key = (bytes(data), str(path))
+        if key not in codes:
+            codes[key] = compile_source(self, data, path, *args, **kwargs)
+        return codes[key]
+
+    return source_to_code
+
+
+importlib.machinery.SourceFileLoader.source_to_code = compiled_once(importlib.machinery.SourceFileLoader.source_to_code)
 
 TICKET = "---\nstatus: {status}\n{parent}priority: 2\nsize: S\n---\n\n# {title}\n\n## Brief\n\n{brief}\n\n## Acceptance criteria\n\n## Comments\n"
 
