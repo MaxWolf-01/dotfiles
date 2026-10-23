@@ -119,6 +119,7 @@ in
   systemd.user.services.working-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (working data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -143,6 +144,7 @@ in
   systemd.user.services.working-pc = {
     Unit = {
       Description = "Restic backup to PC (working data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -167,6 +169,7 @@ in
   systemd.user.services.working-xmg19 = {
     Unit = {
       Description = "Restic backup to xmg19 (working data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -193,6 +196,7 @@ in
   systemd.user.services.jarvis-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (jarvis workspace via SSHFS)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -222,10 +226,20 @@ in
   # enters the agent and the units that skipped for want of it can run. It
   # carries no Install section, so systemd itself never starts it: the timers
   # cover the scheduled runs, this covers what a missing credential skipped.
+  #
+  # A Home Manager switch neither starts a backup nor waits on one. Its unit
+  # switcher, sd-switch, starts every active target whose unit file changed.
+  # This target becomes active only once every backup it pulled in has ended,
+  # as a target waits on what it wants, and StopWhenUnneeded stops it then (no
+  # unit wants it), so a switch never finds it active. Each backup it lists
+  # carries X-SwitchMethod=keep-old, so a switch lets a running one finish
+  # rather than stop it, start it again and wait on it; a changed backup applies
+  # from its next run.
 
   systemd.user.targets.backup-catchup = {
     Unit = {
       Description = "Run every backup whose preconditions are now met";
+      StopWhenUnneeded = true;
       Wants = [
         "working-rsyncnet.service"
         "working-pc.service"

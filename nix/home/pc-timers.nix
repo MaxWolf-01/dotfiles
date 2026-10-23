@@ -35,6 +35,7 @@ in
   systemd.user.services.youtube-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (YouTube archive)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -63,6 +64,7 @@ in
   systemd.user.services.phone-sync = {
     Unit = {
       Description = "Sync phone data via rsync over Tailscale";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
@@ -91,6 +93,7 @@ in
   systemd.user.services.phone-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (phone data)";
+      X-SwitchMethod = "keep-old";
       # Ordered after the sync so we never snapshot a half-copied tree. Wants,
       # not Requires: a failed or skipped sync should still leave us backing up
       # whatever already landed on disk.
@@ -123,6 +126,7 @@ in
   systemd.user.services.phone-xmg19 = {
     Unit = {
       Description = "Restic backup to xmg19 (phone data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
     };
@@ -155,6 +159,7 @@ in
   systemd.user.services.phone-pc = {
     Unit = {
       Description = "Restic backup local (phone data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "phone-sync.service" ];
       Wants = [ "network-online.target" "phone-sync.service" ];
     };
@@ -182,6 +187,7 @@ in
   systemd.user.services.encrypted-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (encrypted data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -214,6 +220,7 @@ in
   systemd.user.services.pcstate-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (pc service state)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -246,6 +253,7 @@ in
   systemd.user.services.pcstate-xmg19 = {
     Unit = {
       Description = "Restic backup to xmg19 (pc service state)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -286,10 +294,14 @@ in
   # for youtube means its 1% integrity check reads ~2 GB back from rsync.net.
   # That is the price of the caller not having to know, and it is only paid on
   # a login or an unlock.
+  #
+  # StopWhenUnneeded here and X-SwitchMethod=keep-old on each backup it lists:
+  # for the reason timers.nix gives above its catch-up target.
 
   systemd.user.targets.backup-catchup = {
     Unit = {
       Description = "Run every backup whose preconditions are now met";
+      StopWhenUnneeded = true;
       Wants = [
         "youtube-rsyncnet.service"
         "phone-sync.service"
