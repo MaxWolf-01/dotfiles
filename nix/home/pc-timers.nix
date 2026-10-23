@@ -285,16 +285,17 @@ in
   # --- Catch-up handle ---
   # "The backups can run now." secrets/zshrc starts it on login, when the age key
   # is decrypted or the ssh key enters the agent, zfs-unlock starts it when a
-  # dataset appears, and `host-unlock pc` once everything is unlocked. It carries no Install section, so systemd itself never
-  # starts it: the timers cover the scheduled runs, this covers what skipped for
-  # want of a precondition.
+  # dataset appears, and `host-unlock pc` once everything is unlocked. It
+  # carries no Install section, so systemd itself never starts it: the timers
+  # cover the scheduled runs, this covers what skipped for want of a
+  # precondition.
   #
   # It lists every unit rather than the ones a caller's event feeds, so a caller
   # needs to know nothing about preconditions. The ones with no source to gate on
-  # (youtube and both pcstate units) therefore run every time it fires, which for youtube
-  # means its 1% integrity check reads ~2 GB back from rsync.net. That is the
-  # price of the caller not having to know, and it is only paid on a login or an
-  # unlock.
+  # (youtube and both pcstate units) therefore run every time it fires, which
+  # for youtube means its 1% integrity check reads ~2 GB back from rsync.net.
+  # That is the price of the caller not having to know, and it is only paid on
+  # a login or an unlock.
 
   systemd.user.targets.backup-catchup = {
     Unit = {
