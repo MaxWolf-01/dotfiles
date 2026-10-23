@@ -26,6 +26,9 @@ for dir in "${dirs[@]}"; do
     candidate=${dir:-.}/claude
     [ -x "$candidate" ] && [ ! -d "$candidate" ] || continue
     [ "$(readlink -f "$candidate")" = "$self" ] && continue
+    # Another copy of this wrapper (a second Home Manager profile on PATH) would
+    # exec this one back, forever.
+    head -c 4096 "$candidate" | grep -aq claude-token.sh && continue
     real=$candidate
     break
 done
