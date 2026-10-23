@@ -28,7 +28,7 @@ let
     jq
     nodejs
     # mainProgram is the versioned `python3.14`; the record names what a worker types.
-    (python3 // { meta = python3.meta // { mainProgram = "python3"; }; })
+    (lib.addMetaAttrs { mainProgram = "python3"; } python3)
     ripgrep
     rsync
     tmux
