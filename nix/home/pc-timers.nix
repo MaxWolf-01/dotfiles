@@ -134,7 +134,6 @@ in
       TimeoutStartSec = "6h";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/xmg19.conf";
@@ -256,7 +255,6 @@ in
       TimeoutStartSec = "2h";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStartPre = "${dotfiles}/backup/pcstate_snapshot.sh ${home}/.local/state/pcstate-xmg19";
