@@ -30,17 +30,17 @@
 # Restart=always, not on-failure: the hub never exits on its own, so any exit,
 # a clean one included, leaves every agent's pages opening as plain tabs.
 #
-# A peer is another host's hub this one relays (the hub's --peer): every host
-# of ./session-hosts.nix this one trusts as much or less, which that file says
-# why. It is reached
-# over ssh as max: ssh forwards the peer's socket to one here that only max
-# can open, since ssh makes it 0600 (StreamLocalBindMask) in a directory of
-# his. Not over the peer's tailnet port: the tailnet policy cannot tell max's
-# processes on pc from the dispatch workers beside them, so a grant from pc to
-# that port would let a worker drive the peer's sessions, and the workers hold
-# no ssh login to the peer. The forward is a unit of its own: a peer asleep or
-# out of reach is ssh failing and trying again every 30s, while the hub shows
-# what it last read of the peer.
+# A peer is another host's hub this one relays (the hub's --peer): every other
+# host of ./session-hosts.nix trusted as much as this one or less (that file
+# says why). It is reached over ssh as max: ssh forwards the peer's socket to
+# one here that only max can open, since ssh makes it 0600
+# (StreamLocalBindMask) in a directory of his. Not over the peer's tailnet
+# port: the tailnet policy cannot tell max's processes on pc from the dispatch
+# workers beside them, so a grant from pc to that port would let a worker
+# drive the peer's sessions, and the workers hold no ssh login to the peer.
+# The forward is a unit of its own: a peer asleep or out of reach is ssh
+# failing and trying again every 30s, while the hub shows what it last read of
+# the peer.
 { config, pkgs, lib, ... }:
 let
   cfg = config.containerHub;
