@@ -7,8 +7,9 @@
 # Tested by tests/claude-token.test.
 { config, pkgs, ... }:
 {
-  # An ssh command's zsh reads .zshenv alone, so without these it finds the
-  # wrapper behind ~/.local/bin, or no real claude at all.
+  # An ssh command's zsh reads .zshenv alone, whose PATH these go in front of,
+  # in this order: without ~/.local/bin it finds no real claude, and with it
+  # alone the real claude comes before the wrapper.
   home.sessionPath = [
     "${config.home.profileDirectory}/bin"
     "${config.home.homeDirectory}/.local/bin"
