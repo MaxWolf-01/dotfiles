@@ -295,13 +295,8 @@ in
   # That is the price of the caller not having to know, and it is only paid on
   # a login or an unlock.
   #
-  # A Home Manager switch neither starts a backup nor waits on one. Its unit
-  # switcher, sd-switch, starts every active target whose unit file changed, so
-  # this one stops as soon as it has queued the backups (StopWhenUnneeded: no
-  # unit wants it) and is never active when a switch looks. Each backup it
-  # lists carries X-SwitchMethod=keep-old, so a switch lets a running one finish
-  # rather than stop it, start it again and wait on it; a changed backup applies
-  # from its next run.
+  # StopWhenUnneeded here and X-SwitchMethod=keep-old on each backup it lists:
+  # for the reason timers.nix gives above its catch-up target.
 
   systemd.user.targets.backup-catchup = {
     Unit = {

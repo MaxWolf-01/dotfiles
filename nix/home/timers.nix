@@ -228,10 +228,11 @@ in
   # cover the scheduled runs, this covers what a missing credential skipped.
   #
   # A Home Manager switch neither starts a backup nor waits on one. Its unit
-  # switcher, sd-switch, starts every active target whose unit file changed, so
-  # this one stops as soon as it has queued the backups (StopWhenUnneeded: no
-  # unit wants it) and is never active when a switch looks. Each backup it
-  # lists carries X-SwitchMethod=keep-old, so a switch lets a running one finish
+  # switcher, sd-switch, starts every active target whose unit file changed.
+  # This target becomes active only once every backup it pulled in has ended,
+  # as a target waits on what it wants, and StopWhenUnneeded stops it then (no
+  # unit wants it), so a switch never finds it active. Each backup it lists
+  # carries X-SwitchMethod=keep-old, so a switch lets a running one finish
   # rather than stop it, start it again and wait on it; a changed backup applies
   # from its next run.
 
