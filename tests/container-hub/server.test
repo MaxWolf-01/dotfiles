@@ -14,9 +14,9 @@ hub's module is loaded in this process on it, and the tmux it types into is a re
 own.
 
 What only the server does is checked last, over HTTP, against one hub on a free port, never 8377, in the same HOME
-and on the state the module left: its routes, the Host, Origin and token guards, what /f/ serves, the size caps,
-the event stream, the state-write protocol a diffview page saves by, claude-browser and diffview handing it pages,
-and a restart.
+and on the state the module left, and on its socket as a local tool and `tailscale serve` reach it: its routes, the
+Host, Origin and token guards, what /f/ serves, the size caps, the event stream, the state-write protocol a diffview
+page saves by, claude-browser and diffview handing it pages, a hub with no port as pc runs one, and a restart.
 """
 
 import contextlib
@@ -30,6 +30,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -552,7 +553,7 @@ while data := os.read(0, 4096):
     def request(method: str, path: str, body: dict | None = None, headers: dict | None = None,
                 origin: str = ORIGIN, data: bytes | None = None) -> tuple[int, dict | bytes]:
         data = data if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(origin + path, data=data, method=method,
+        req = urllib.request.Request(path if path.startswith("http") else origin + path, data=data, method=method,
                                      headers={"Content-Type": "application/json", **(headers or {})})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
@@ -564,8 +565,40 @@ while data := os.read(0, 4096):
         except ValueError:
             return status, raw
 
+    LAPTOP = "https://zephylux.example.ts.net:8377"
+    """Where tailscale serve puts the test hub's port, as the laptop's hub serves it: tailscaled forwards a request
+    there to the port, keeping the Host the browser sent and adding X-Forwarded-Host and X-Forwarded-Proto."""
+    HUB_SOCKET = HOME / ".local/state/container-hub/hub.sock"
+    """Where the test's hub listens beside its port, and where the tools look for it: its default, under HOME."""
+
+    class SocketConnection(http.client.HTTPConnection):
+        def __init__(self, path: Path):
+            super().__init__("localhost", timeout=60)
+            self.path = path
+
+        def connect(self) -> None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(self.timeout)
+            self.sock.connect(str(self.path))
+
+    def over_socket(method: str, path: str, body: dict | None = None, headers: dict | None = None,
+                    hub_socket: Path = HUB_SOCKET) -> tuple[int, dict | bytes]:
+        """request(), on a hub's socket, as a local tool or tailscaled asks it."""
+        conn = SocketConnection(hub_socket)
+        try:
+            conn.request(method, path, None if body is None else json.dumps(body).encode(),
+                         {"Content-Type": "application/json", **(headers or {})})
+            answer = conn.getresponse()
+            status, raw = answer.status, answer.read()
+        finally:
+            conn.close()
+        try:
+            return status, json.loads(raw)
+        except ValueError:
+            return status, raw
+
     def start() -> subprocess.Popen:
-        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(hub.STATE), *HUB_FLAGS],
+        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--tailnet", LAPTOP, "--state", str(hub.STATE), *HUB_FLAGS],
                                    env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("a"), start_new_session=True)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and started.poll() is None:
@@ -621,7 +654,7 @@ while data := os.read(0, 4096):
 
     # --- the routes, and who may use them
 
-    check("/.health says diffview pages can save", (200, {"saves": True}), request("GET", "/.health"))
+    check("/.health says diffview pages can save, and where the hub tab is", (200, {"saves": True, "url": ORIGIN}), request("GET", "/.health"))
     check("the hub tab is served at the root, and at a unit", (200, 200, True),
           (request("GET", "/")[0], request("GET", f"/u/{WORKER}")[0], b"trellis" in request("GET", "/")[1]))
     old_view = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
@@ -728,14 +761,14 @@ while data := os.read(0, 4096):
     # what a local tool shares: a directory of pages, or a page, served without joining a unit
     rendered_dir = page(SCRATCH / "rendered pages" / "nested" / "review.html")  # a space, which a url spells encoded
     status_code, shared = request("POST", "/api/serve", {"path": str(rendered_dir.parents[1])})
-    check("a local tool shares a directory and gets its address", (200, served(rendered_dir.parents[1]) + "/"),
+    check("a local tool shares a directory and gets its address", (200, ORIGIN + served(rendered_dir.parents[1]) + "/"),
           (status_code, shared.get("url")))
     check("...under which every page is served", 200, request("GET", shared["url"] + "nested/review.html")[0])
     check("...and the directory's address lists them, linked relative to it", True, b'href="nested/review.html"' in request("GET", shared["url"])[1])
     bare = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
-    bare.request("GET", shared["url"].rstrip("/"))
+    bare.request("GET", shared["url"].removeprefix(ORIGIN).rstrip("/"))
     moved = bare.getresponse()
-    check("...an address without the trailing slash is sent to the one with it", (301, shared["url"]),
+    check("...an address without the trailing slash is sent to the one with it", (301, shared["url"].removeprefix(ORIGIN)),
           (moved.status, moved.getheader("Location")))
     bare.close()
     check("a shared directory joins no unit", False,
@@ -755,7 +788,7 @@ while data := os.read(0, 4096):
     check("...while the rest of home stays unserved", 403, request("GET", served(HOME / "beside-notes.html"))[0])
     in_temp = page(TEMP_PAGE)
     beside_temp = page(TEMP_PAGE.with_name(TEMP_PAGE.stem + "-beside.html"))
-    serving = subprocess.run([BIN / "diffview", "--serve", str(in_temp)], env={**ENV, "CONTAINER_HUB_PORT": str(PORT)},
+    serving = subprocess.run([BIN / "diffview", "--serve", str(in_temp)], env=ENV,
                              capture_output=True, text=True, timeout=120)
     temp_url = serving.stdout.split(" at ")[-1].strip()
     check("diffview --serve takes a page sitting directly in the temp dir", (0, 200),
@@ -930,12 +963,13 @@ while data := os.read(0, 4096):
     local_state.parent.mkdir(parents=True)
     local_state.write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Personal"}}}}))
 
-    def browse(*args: str, cwd: Path = gamma, port: int = PORT, **sessions: str) -> list[str]:
-        """What claude-browser handed the browser; what it said on the way is in browse.said."""
+    def browse(*args: str, cwd: Path = gamma, hub_socket: Path | None = None, **sessions: str) -> list[str]:
+        """What claude-browser handed the browser; what it said on the way is in browse.said. It finds the hub on the
+        socket the test's hub takes by default, under HOME, unless given another."""
         record.unlink(missing_ok=True)
         browse.said = subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=True, capture_output=True, timeout=30, text=True,
-                                     env={**ENV, "CONTAINER_HUB_PORT": str(port), "CLAUDE_CODE_SESSION_ID": WORKER, **sessions,
-                                          "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
+                                     env={**ENV, **({"CONTAINER_HUB_SOCKET": str(hub_socket)} if hub_socket else {}),
+                                          "CLAUDE_CODE_SESSION_ID": WORKER, **sessions, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
         return record.read_text().splitlines() if record.exists() else []
 
     fresh = page(gamma / "agent/show/one-flow/figure.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
@@ -1000,12 +1034,12 @@ while data := os.read(0, 4096):
     elsewhere.shutdown()
     tab_came_and_went()
     unprofiled = subprocess.run([BIN / "claude-browser", str(by_origin)], cwd=gamma, capture_output=True,
-                                timeout=30, text=True, env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CONFIG_DIR": str(HOME / ".claude-nobody"),
+                                timeout=30, text=True, env={**ENV, "CLAUDE_CONFIG_DIR": str(HOME / ".claude-nobody"),
                                                             "CLAUDE_CODE_SESSION_ID": WORKER, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     check("a hub tab that has no Brave profile to open in is not said to open: only why not", (1, False, True),
           (unprofiled.returncode, "in unit" in unprofiled.stderr, "no profile named 'nobody'" in unprofiled.stderr))
     refused = subprocess.run([BIN / "claude-browser", "--nope", str(by_origin)], capture_output=True, text=True, timeout=30,
-                             env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+                             env={**ENV, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     check("claude-browser refuses an option it does not have, naming it", (1, True),
           (refused.returncode, "no option --nope" in refused.stderr))
     lane_page = page(gamma / "agent/show/one-flow/demo.html")
@@ -1016,7 +1050,7 @@ while data := os.read(0, 4096):
     check("...as does --lane=<lane>", "code", in_lane())
     record.unlink(missing_ok=True)
     no_lane = subprocess.run([BIN / "claude-browser", "--lane", "diff", str(lane_page)], capture_output=True, text=True, timeout=30,
-                             env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+                             env={**ENV, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     check("...and refuses a lane there is none of, opening nothing", (1, True, False, "code"),
           (no_lane.returncode, "no lane 'diff'" in no_lane.stderr, record.exists(), in_lane()))
     usage_text = subprocess.run([BIN / "claude-browser", "--help"], capture_output=True, text=True, timeout=30).stdout
@@ -1038,10 +1072,10 @@ while data := os.read(0, 4096):
         def log_message(self, *_):
             pass
 
-    other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NotAHub)
+    other = hub.ThreadingUnixServer(str(SCRATCH / "other.sock"), NotAHub)
     threading.Thread(target=other.serve_forever, daemon=True).start()
-    check("a service on the hub's port that answers 200 but is no hub: a plain tab", ["--profile-directory=Default", f"file://{fresh}"],
-          browse(str(fresh), port=other.server_address[1]))
+    check("a service on the hub's socket that answers 200 but is no hub: a plain tab", ["--profile-directory=Default", f"file://{fresh}"],
+          browse(str(fresh), hub_socket=SCRATCH / "other.sock"))
     check("...and claude-browser says so", True, "no container hub" in browse.said)
     other.shutdown()
 
@@ -1074,7 +1108,7 @@ while data := os.read(0, 4096):
     (worktree / "notes.txt").write_text("one\ntwo\n")
     watcher = subprocess.Popen([BIN / "diffview", f"{worktree}@HEAD..", "--watch", "--open", "--no-auto-summary"],
                                cwd=alpha, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                               env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
+                               env={**ENV, "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
                                     "DIFFVIEW_BROWSER": "claude-browser", "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     try:
         while (line := watcher.stdout.readline()) and "watching" not in line:
@@ -1164,6 +1198,92 @@ while data := os.read(0, 4096):
         check("...which is as it was", listed, served_list.read_text())
     else:
         skipped("the unreadable-file checks", "root reads a file of mode 0")
+
+    # --- the socket: how the host's own tools reach the hub, and what `tailscale serve` puts on the tailnet. tailscaled
+    # asks the socket as Host localhost, and says the address the browser asked at in X-Forwarded-Host.
+
+    TAILNET = "https://pc.example.ts.net:8377"
+    forwarded = {"X-Forwarded-Host": TAILNET.removeprefix("https://"), "X-Forwarded-Proto": "https"}
+    check("the hub's socket opens to its own user alone", 0o600, stat.S_IMODE(HUB_SOCKET.stat().st_mode))
+    served_tab = lambda dest: over_socket("GET", f"/u/{WORKER}", headers={**forwarded, "Sec-Fetch-Dest": dest})[1].decode()
+    check("the hub tab loaded through tailscale serve carries the token, and a page in it fetching the tab gets none",
+          (token, ""), (token_in(served_tab("document")), token_in(served_tab("empty"))))
+    visit = lambda headers: over_socket("POST", "/api/visit", {"unit": WORKER}, headers)[0]
+    check("a write from the tab on the tailnet is taken, and one from another site, or from no tailnet tab, refused",
+          (200, 403, 403, 403), (visit({**forwarded, "Origin": TAILNET}), visit({**forwarded, "Origin": "http://attacker.example"}),
+                                 visit({**forwarded, "Origin": ORIGIN}), visit({"Origin": TAILNET})))
+    jump = lambda token_sent: over_socket("POST", "/api/jump", {"unit": WORKER}, {**forwarded, "Origin": TAILNET, "X-Hub-Token": token_sent})
+    check("the tab on the tailnet acts on a session with the tab's token alone, which takes it to the hub's own reason",
+          (403, 409), (jump("")[0], jump(token)[0]))
+    by_tailnet = over_socket("POST", "/api/open", {"target": TAILNET + served(note), "unit": ORCHESTRATOR, "by": "user"},
+                             {**forwarded, "Origin": TAILNET})[1]
+    check("a link in the tab on the tailnet to a page the hub serves there is that page, already a member", (ORCHESTRATOR, "reopened"),
+          (by_tailnet.get("unit"), by_tailnet.get("action")))
+    on_tailnet = page(HOME / "on-tailnet.html")
+    over_socket("POST", "/api/serve", {"path": str(on_tailnet)})
+    saving = served(on_tailnet) + ".state.json"
+    check("a diffview page in the tab on the tailnet saves its comments, and a page of another site does not", (204, 403),
+          (over_socket("POST", saving, {**state, "savedAt": 2}, {**forwarded, "Origin": TAILNET})[0],
+           over_socket("POST", saving, {**state, "savedAt": 3}, {**forwarded, "Origin": "http://attacker.example"})[0]))
+    # the laptop's hub, whose user may serve a port but not a socket: tailscale serve puts its port on the tailnet
+    laptop = {"Host": LAPTOP.removeprefix("https://"), "X-Forwarded-Host": LAPTOP.removeprefix("https://"), "X-Forwarded-Proto": "https"}
+    laptop_tab = lambda dest: request("GET", f"/u/{WORKER}", headers={**laptop, "Sec-Fetch-Dest": dest})[1].decode()
+    check("the hub tab tailscale serve forwards to the port carries the token, and a page in it fetching the tab gets none",
+          (token, ""), (token_in(laptop_tab("document")), token_in(laptop_tab("empty"))))
+    port_visit = lambda headers: request("POST", "/api/visit", {"unit": WORKER}, headers)[0]
+    rebound = {"Host": f"attacker.example:{PORT}", "X-Forwarded-Host": laptop["Host"], "X-Forwarded-Proto": "https"}
+    check("a write from that tab is taken, and one from another site refused", (200, 403),
+          (port_visit({**laptop, "Origin": LAPTOP}), port_visit({**laptop, "Origin": "http://attacker.example"})))
+    by_laptop = request("POST", "/api/open", {"target": LAPTOP + served(note), "unit": ORCHESTRATOR, "by": "user"},
+                        {**laptop, "Origin": LAPTOP})[1]
+    check("...and a link in it to a page the hub serves there is that page, already a member", (ORCHESTRATOR, "reopened"),
+          (by_laptop.get("unit"), by_laptop.get("action")))
+    check("a page that pointed its own name at the port reads nothing, though it sends the tailnet's X-Forwarded-Host",
+          (403, 403), (request("GET", "/api/hub", headers=rebound)[0], request("GET", member_url, headers=rebound)[0]))
+    second = subprocess.run([BIN / "container-hub", "--port", str(free_port()), "--state", str(SCRATCH / "second-state")],
+                            env=ENV, capture_output=True, text=True, timeout=120)
+    check("a second hub on the socket exits, saying so, and the first still answers there", (1, True, 200),
+          (second.returncode, "another hub listens" in second.stderr, over_socket("GET", "/.health")[0]))
+
+    # pc's hub: no port, since other users run beside max there, and an address where tailscale serve puts its socket
+    pc_socket = SCRATCH / "pc.sock"
+    pc_hub = subprocess.Popen([BIN / "container-hub", "--socket", str(pc_socket), "--url", TAILNET, "--state", str(SCRATCH / "pc-state"),
+                               *HUB_FLAGS], env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "pc-hub.log").open("w"),
+                              start_new_session=True)
+
+    def pc_answers() -> dict | None:
+        try:
+            return over_socket("GET", "/.health", hub_socket=pc_socket)[1]
+        except OSError:
+            return None
+
+    try:
+        settles("a hub given an address and no port, as pc runs one, names that address", {"saves": True, "url": TAILNET},
+                pc_answers, within=60)
+        check("...and listens on no TCP port", [], listening_ports(pc_hub.pid))
+        on_pc = page(gamma / "agent/show/one-flow/on-pc.html")
+        check("claude-browser hands it a page, and with no hub tab listening opens the hub tab at that address",
+              ["--profile-directory=Default", f"{TAILNET}/u/{WORKER}"], [x.split("#")[0] for x in browse(str(on_pc), hub_socket=pc_socket)])
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.connect(str(pc_socket))
+        listener.sendall(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        listener.recv(4096)
+        listener.close()
+        time.sleep(2)  # a tab that came and went: the next open launches one at once; the hub looks once a second
+        no_brave = ":".join(d for d in [str(BIN), *ENV["PATH"].split(":")] if not (Path(d) / "brave").exists())
+        brave_less = subprocess.run([BIN / "claude-browser", str(page(gamma / "agent/show/one-flow/no-brave.html"))], cwd=gamma,
+                                    capture_output=True, text=True, timeout=30,
+                                    env={**ENV, "CONTAINER_HUB_SOCKET": str(pc_socket), "CLAUDE_CODE_SESSION_ID": WORKER, "PATH": no_brave})
+        check("on a host with no Brave, claude-browser says where the hub tab is that shows the page the hub took", (0, True, True),
+              (brave_less.returncode, f"in unit {WORKER}" in brave_less.stderr, f"open {TAILNET}/u/{WORKER}#" in brave_less.stderr))
+        pc_served = subprocess.run([BIN / "diffview", "--serve", str(alone)], env={**ENV, "CONTAINER_HUB_SOCKET": str(pc_socket)},
+                                   capture_output=True, text=True, timeout=120)
+        check("diffview --serve gives the page's address there", f"diffview: serving {alone} at {TAILNET}{served(alone)}",
+              pc_served.stdout.strip())
+    finally:
+        os.killpg(pc_hub.pid, signal.SIGKILL)
+        pc_hub.wait()
+
     # --- a hub as its user service runs it: no tracker on PATH, the mx plugin's under HOME; and here no diffview beside it
 
     lone_bin = SCRATCH / "lone-bin"
@@ -1181,7 +1301,8 @@ while data := os.read(0, 4096):
     (cache / "1.0.10/skills/session-page/session_page.py").write_text("def read_session(directory, transcript):\n    pass\n")
     service_port = free_port()
     service_hub = subprocess.Popen(
-        [lone_bin / "container-hub", "--port", str(service_port), "--state", str(SCRATCH / "service-state"), *HUB_FLAGS],
+        [lone_bin / "container-hub", "--socket", str(SCRATCH / "service.sock"), "--port", str(service_port),
+         "--state", str(SCRATCH / "service-state"), *HUB_FLAGS],
         env={**ENV, "HOME": str(service_home), "PATH": ":".join(d for d in ENV["PATH"].split(":") if not (Path(d) / "tracker").exists())},
         stdout=subprocess.DEVNULL, stderr=(SCRATCH / "service-hub.log").open("w"), start_new_session=True)
     try:
@@ -1199,7 +1320,8 @@ while data := os.read(0, 4096):
               service("GET", f"/api/u/{WORKER}")[1].get("tree"))
         check("...and with a session page reader it cannot use, marks nothing and serves the rail all the same",
               (200, None, ""), (lambda r: (r[0], r[1].get("needs_you"), r[1].get("status_line")))(service("GET", f"/api/u/{WORKER}")))
-        check("a hub with no diffview beside it says its pages cannot save", (200, {"saves": False}), service("GET", "/.health"))
+        check("a hub with no diffview beside it says its pages cannot save", (200, {"saves": False, "url": f"http://127.0.0.1:{service_port}"}),
+              service("GET", "/.health"))
     finally:
         os.killpg(service_hub.pid, signal.SIGKILL)
         service_hub.wait()
@@ -1237,9 +1359,11 @@ esac
     typed = lambda: (fake / "typed").read_text().splitlines() if (fake / "typed").exists() else []
     new_port = free_port()
     new_origin = f"http://127.0.0.1:{new_port}"
+    new_socket = SCRATCH / "new-hub.sock"
 
     def start_new() -> subprocess.Popen:
-        started = subprocess.Popen([new_bin / "container-hub", "--port", str(new_port), "--state", str(SCRATCH / "new-state"), *HUB_FLAGS],
+        started = subprocess.Popen([new_bin / "container-hub", "--socket", str(new_socket), "--port", str(new_port),
+                                    "--state", str(SCRATCH / "new-state"), *HUB_FLAGS],
                                    env={**ENV, "PATH": f"{fake / 'bin'}:{ENV['PATH']}"}, stdout=subprocess.DEVNULL,
                                    stderr=(SCRATCH / "new-hub.log").open("a"), start_new_session=True)
         settles("the hub from its own bin/ starts", True, lambda: started.poll() is None and answers(), within=60)
@@ -1264,10 +1388,10 @@ esac
     new_hub = start_new()
     try:
         settles("a session due a newer mx has /reload-plugins typed in at the hub's start", [f"{first} /reload-plugins"], typed)
-        serving = server_of(new_hub)
+        serving, bound = server_of(new_hub), new_socket.stat().st_ino
         events = urllib.request.urlopen(f"{new_origin}/events", timeout=30)
         connected(events)
-        script = (new_bin / "container-hub").read_text().replace('self.send_json({"saves": diffview is not None})',
+        script = (new_bin / "container-hub").read_text().replace('self.send_json({"saves": diffview is not None, "url": URL})',
                                                                  'self.send_json({"saves": diffview is not None, "new": True})')
         (new_bin / "container-hub").write_text(script)
         edited = time.monotonic()
@@ -1280,6 +1404,9 @@ esac
               (connected(reconnect), request("GET", "/.health", origin=new_origin)))
         reconnect.close()
         check("...in the hub's own process, under the one uv that started it", serving, server_of(new_hub))
+        check("...and on the socket it had, as well as its port, so a tool asking meanwhile waits rather than finds none",
+              (200, {"saves": True, "new": True}, bound),
+              (*over_socket("GET", "/.health", hub_socket=new_socket), new_socket.stat().st_ino))
         (new_bin / "container-hub").write_text(script + "\ndef half_written(\n")
         time.sleep(4)  # a watch round, and the wait for a whole file, twice over
         check("a script that does not compile leaves the hub on the code it runs", (None, (200, {"saves": True, "new": True})),
@@ -1303,6 +1430,25 @@ esac
         for process in processes:
             process.kill()
             process.wait()
+    # a hub from before the socket, which its unit started with no flags, runs this code once it lands on disk: what it
+    # hands over is its listening port's descriptor alone, and its argv names no port
+    before = socket.create_server(("127.0.0.1", 0))
+    before.set_inheritable(True)
+    before_origin = f"http://127.0.0.1:{before.getsockname()[1]}"
+    rolled_socket = SCRATCH / "rolled.sock"
+    rolled = subprocess.Popen([BIN / "container-hub", "--state", str(SCRATCH / "rolled-state"), *HUB_FLAGS], pass_fds=(before.fileno(),),
+                              env={**ENV, "CONTAINER_HUB_LISTENING": str(before.fileno()), "CONTAINER_HUB_SOCKET": str(rolled_socket)},
+                              stdout=subprocess.DEVNULL, stderr=(SCRATCH / "rolled.log").open("w"), start_new_session=True)
+    before.close()
+    try:
+        settles("a hub from before the socket that takes up this code keeps answering on its port, under the address it had",
+                (200, {"saves": True, "url": before_origin}),
+                lambda: request("GET", "/.health", origin=before_origin) if rolled.poll() is None else rolled.poll(), within=60)
+        check("...and listens on its socket too", 200, over_socket("GET", "/.health", hub_socket=rolled_socket)[0])
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(rolled.pid, signal.SIGKILL)
+        rolled.wait()
     check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
           TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
 finally:

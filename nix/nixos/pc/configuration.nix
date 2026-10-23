@@ -7,9 +7,11 @@
     ./copyparty.nix
     ./pihole.nix
     ./sftpgo.nix
+    ./tailscale-serve.nix
     ./tailnet-lock.nix
     ./hd-idle.nix
     ./agent-user.nix
+    ./container-hub.nix
     ./host-recorder.nix
     ./hardware-alerts.nix
     ../journald.nix

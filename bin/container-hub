@@ -73,7 +73,7 @@ root too, at its load and at every switch. A page's own scheme switch still flip
 
 A page on another origin (a running app, a local server) is framed in its pane where it allows framing, and the hub
 tab's keys and link handling do not reach inside it. A page refuses framing by its X-Frame-Options, or by a
-Content-Security-Policy whose frame-ancestors leaves out http://127.0.0.1:<port>. Such a page is a member all the
+Content-Security-Policy whose frame-ancestors leaves out the hub tab's origin. Such a page is a member all the
 same, though laid out nowhere. Its unit's session page lists it, and a click on its line, or ctrl+alt+shift+w, opens
 it as a browser tab. So does a click on a link to it in the hub tab; an agent opening it opens no tab. The hub asks
 the page at every open, and frames one that does not answer.
@@ -153,18 +153,29 @@ A step is refused, said in the box, and nothing more typed, where the session is
 longer holds it, its handoff is another or was committed again since the box offered it, or no new session starts in
 time.
 
+The hub listens on a unix socket (--socket) that only its own user can open, and on 127.0.0.1:<port> as well where
+it is given a port, which every user of the host can open. The tools on the host (claude-browser, diffview, the Stop
+hook) reach it on the socket, and a browser on another device through `tailscale serve`, which puts the socket on the
+tailnet over HTTPS. The hub knows that address by the X-Forwarded-Host tailscaled sends. Serving a socket takes root.
+Where the hub runs as a user, `tailscale serve` puts its port on the tailnet instead, and --tailnet names that address.
+tailscaled keeps the browser's Host when it forwards to the port, so the hub answers a request there whose Host is that
+address's host. A browser on the host itself uses the port. The hub's --url is the address the tools open and link.
+Who may open the hub over the tailnet is the tailnet policy's to say, and the hub has no login of its own. tailscaled
+also answers the host's own users at its tailnet address, and the tailnet policy does not cover them. A host with users
+other than the hub's needs a firewall rule that keeps them off the port `tailscale serve` uses; pc's is in
+nix/nixos/pc/container-hub.nix.
+
 Typing, dropping a file, handing off, jumping and closing each want the token the hub hands to a top-level load of /
 alone, so a page the hub serves cannot act on a session by fetching their routes. It shares the tab's origin all the
 same, so a page that scripts the tab itself is not stopped; only a page served from another origin would be.
 
 The hub runs its own code, and diffview's beside it, as they were when it started. Within a few seconds of either
-changing on disk it runs again, in the same process and on the same port, once the requests under way are answered: a
+changing on disk it runs again, in the same process and on the same sockets, once the requests under way are answered: a
 request made meanwhile waits for the new code, and the hub tab's event stream is back within a second. Code that does
 not compile it leaves on disk, and says so once in its log. container-hub.html it reads at every request anyway.
 
-The line the Stop hook prints under a finished turn links the hub tab at that session's unit, /u/<session id> on
-this hub (http://127.0.0.1:8377/u/<session id> on the default port), wherever the hub answers; where none does,
-the session page's file:// link.
+The line the Stop hook prints under a finished turn links the hub tab at that session's unit, /u/<session id> at the
+hub's --url, wherever the hub answers on its socket; where none does, the session page's file:// link.
 
 The rail shows what the statusline shows: each running session's context use, and each account's 5h and weekly
 usage, read from what the statusline keeps under `~/.cache/claude-statusline/`. A session with no file there shows
@@ -182,7 +193,8 @@ over the tab.
     POST /api/open            {"target", "session"?, "cwd"?, "unit"?, "title"?, "by"?, "lane"?}: a path, file:// URL or
                               URL becomes a member of its unit, or comes forward again if it is one. Every answer
                               carries "say", the line the caller prints, and "open", the absolute URL the caller
-                              opens in the browser, or null to open nothing. Beside them: {"unit", "id", "action",
+                              opens in the browser (at the hub's --url where it is the hub's), or null to open
+                              nothing. Beside them: {"unit", "id", "action",
                               "view", "launch"} for a member, where launch says no hub tab listens and open is the
                               hub tab at the member; {"skipped": why} for an agent's page; {"tab": why} for a link
                               clicked in the hub tab to a page that refuses framing, which joins no unit, and open
@@ -208,7 +220,8 @@ over the tab.
     POST /api/close-panes     {"unit"}, from the hub tab with its X-Hub-Token: kill every pane holding the session.
                               Answers {"closed": [panes]}; 409 {"error": why} where it closes none.
     POST /api/serve           {"path"}: from a local tool only, serve a page with what sits beside it, or a
-                              directory with everything under it, without making it a member. Answers {"url"}.
+                              directory with everything under it, without making it a member. Answers {"url"}, at
+                              the hub's --url.
     GET  /api/hub             {"units": [...], "usage": [...]}: the rail's index. Every unit, the numbered ones
                               first in the rail's order, then the dismissed, then the ended, each the latest turn
                               first, as /api/u/<key> has it but for its details: "members", "pages", "tickets" and
@@ -239,14 +252,17 @@ over the tab.
                               unit once a repo it watched is gone.
     POST /f/<page>.summary.json  a watched page asking its diffview watcher to write the summary again; 409 with
                               none running
-    GET  /.health             {"saves": true}: diffview pages served here can save
+    GET  /.health             {"saves": true, "url"}: diffview pages served here can save; the hub's --url
 
 Examples:
 
-    container-hub
-    container-hub --port 18377 --state /tmp/hub-state
+    container-hub --port 8377
+    container-hub --url https://pc.tail710178.ts.net:8377
+    container-hub --port 8377 --tailnet https://zephylux.tail710178.ts.net:8377
+    container-hub --socket /tmp/hub.sock --port 18377 --state /tmp/hub-state
 """
 
+import fcntl
 import hashlib
 import html
 import importlib.machinery
@@ -261,6 +277,7 @@ import shlex
 import secrets
 import shutil
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -289,6 +306,11 @@ TRELLIS = {  # fetched, not committed: its licence asks a sponsorship for commer
 TRELLIS_VERSION = "0.3.0"
 TRELLIS_URL = f"https://cdn.jsdelivr.net/npm/@danfessler/trellis@{TRELLIS_VERSION}/dist/"
 
+URL = ""
+"""The hub tab's address on this host (--url), with no trailing slash."""
+TAILNET = ""
+"""Where `tailscale serve` puts the hub's port (--tailnet), as an origin; empty where it puts none."""
+
 LOOSE = "loose"
 """The unit of the pages no session opened."""
 
@@ -297,10 +319,23 @@ LANES = ("session", "concept", "output", "code")
 FIGURE = re.compile(r"\.(svg|png|jpe?g|gif|webp|avif)$", re.IGNORECASE)
 
 
+SOCKET = Path(os.environ.get("CONTAINER_HUB_SOCKET") or "~/.local/state/container-hub/hub.sock").expanduser()
+"""Where the hub listens, and where claude-browser, diffview and the Stop hook look for it."""
+
+
 @dataclass
 class Args:
-    port: int = int(os.environ.get("CONTAINER_HUB_PORT") or 8377)
-    """Port to serve on, on 127.0.0.1; claude-browser looks for the hub on $CONTAINER_HUB_PORT too."""
+    socket: Path = SOCKET
+    """Unix socket to listen on, which only this user can open; $CONTAINER_HUB_SOCKET moves it, for the tools too."""
+    port: int | None = None
+    """Port to listen on as well, on 127.0.0.1. Every user of the host can open it, so it is only for a host where all
+    of them are this one."""
+    url: str | None = None
+    """The hub tab's address for a browser on this host's side, which the tools open and link. That is where
+    `tailscale serve` puts the socket, or http://127.0.0.1:<port> by default."""
+    tailnet: str | None = None
+    """Where `tailscale serve` puts the hub's port on the tailnet, on a host whose operator may serve a port but not a
+    socket."""
     state: Path = Path("~/.local/state/container-hub")
     """Directory the hub keeps each unit's members and the user's marks in, and the mx reloads it typed."""
     tmux_socket: Path | None = None
@@ -886,11 +921,11 @@ def page_of_path(path: Path, query: str = "") -> Page:
     return page
 
 
-def read_target(target: str, cwd: str | None, port: int) -> Page:
-    """A path, a file:// URL, one of this hub's URLs or any other URL, as the page it names."""
+def read_target(target: str, cwd: str | None, origins: tuple[str, ...]) -> Page:
+    """A path, a file:// URL, one of this hub's URLs (at one of its origins) or any other URL, as the page it names."""
     parts = urllib.parse.urlsplit(target)
-    if parts.scheme in ("http", "https") and parts.netloc in (f"127.0.0.1:{port}", f"localhost:{port}"):
-        return read_target(urllib.parse.urlunsplit(("", "", parts.path, parts.query, "")), cwd, port)
+    if parts.scheme in ("http", "https") and f"{parts.scheme}://{parts.netloc}" in origins:
+        return read_target(urllib.parse.urlunsplit(("", "", parts.path, parts.query, "")), cwd, origins)
     if parts.scheme == "file":
         return page_of_path(Path(urllib.parse.unquote(parts.path)), parts.query)
     if not parts.scheme and target.startswith("/f/"):
@@ -1181,7 +1216,7 @@ def share(body: dict) -> tuple[int, dict]:
         if path not in OPENED | SHARED:
             write_json(shared_file(), [*load_shared(), str(path)])  # first, so a share that cannot be kept is not served either
             (SHARED if path.is_dir() else OPENED).add(path)
-    return 200, {"url": "/f" + urllib.parse.quote(str(path)) + ("/" if path.is_dir() else "")}
+    return 200, {"url": URL + "/f" + urllib.parse.quote(str(path)) + ("/" if path.is_dir() else "")}
 
 
 def load_shared() -> list[str]:
@@ -1257,13 +1292,14 @@ def session_title(directory: Path) -> str | None:
     return next((line[2:] for line in md.read_text().splitlines() if line.startswith("# ")), None) if md.is_file() else None
 
 
-def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
+def open_page(body: dict, origins: tuple[str, ...], from_page: bool) -> tuple[int, dict]:
     """from_page says the hub tab asked, for a link clicked in a page in it. The tab may open only what it could
-    already read, so no page can widen what /f/ serves."""
+    already read, so no page can widen what /f/ serves. `origins` are the hub's own, the first the hub tab's that
+    would frame the page."""
     if (lane := body.get("lane")) is not None and lane not in LANES:
         return 400, {"error": f"no lane {lane}; the lanes are {', '.join(LANES)}"}
-    page = read_target(body["target"], body.get("cwd"), port)
-    refused = framing_refusal(page.url, port) if not page.path and not page.url.startswith("/") else None
+    page = read_target(body["target"], body.get("cwd"), origins)
+    refused = framing_refusal(page.url, origins[0]) if not page.path and not page.url.startswith("/") else None
     if refused and from_page:  # a link the user clicked, and a click is what may open a tab
         return 200, {"tab": refused, "say": f"opens as a browser tab, since {refused}", "open": body["target"]}
     if page.path and not page.path.exists():
@@ -1279,7 +1315,7 @@ def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
     key = page.session or (from_page and body.get("unit")) or session or LOOSE
     by = body.get("by") or "agent"
     if page.kind == "board":
-        return 200, open_board(page, key, port, by)
+        return 200, open_board(page, key, by)
     ticket, tracker = ticket_of(page, key if key != LOOSE else None, body.get("cwd"))
     mid = member_id(page.url)
     with lock:
@@ -1314,7 +1350,7 @@ def open_page(body: dict, port: int, from_page: bool) -> tuple[int, dict]:
     else:
         say = f"in unit {key}, lane {member_lane(member)}; " + ("the hub tab opens at the page" if launch else "the open hub tab shows the page")
     return 200, {"unit": key, "id": mid, "action": action, "launch": launch, "view": view, "say": say,
-                 "open": f"http://127.0.0.1:{port}{view}#{mid}" if launch else None}
+                 "open": f"{URL}{view}#{mid}" if launch else None}
 
 
 def copies(path: Path) -> bool:
@@ -1323,16 +1359,16 @@ def copies(path: Path) -> bool:
     return not (path.is_file() and servable(path))
 
 
-def copying(body: dict, port: int) -> tuple[int, dict]:
+def copying(body: dict, origins: tuple[str, ...]) -> tuple[int, dict]:
     """Which of a page's links a click copies, so the hub tab draws them as the code they are rather than as links."""
-    pages = [(t, read_target(t, None, port)) for t in body["targets"]]
+    pages = [(t, read_target(t, None, origins)) for t in body["targets"]]
     return 200, {"copies": [t for t, p in pages if p.path and p.path.exists() and copies(p.path)]}
 
 
-def framing_refusal(url: str, port: int) -> str | None:
-    """Why a page on another origin refuses to be framed in the hub tab, read off the headers it answers with, since
-    the browser tells the tab nothing of a frame it refused. None where it allows framing, and where it does not
-    answer at all: a server not up yet is framed, and shows once it is opened again."""
+def framing_refusal(url: str, tab: str) -> str | None:
+    """Why a page on another origin refuses to be framed in the hub tab at origin `tab`, read off the headers it
+    answers with, since the browser tells the tab nothing of a frame it refused. None where it allows framing, and
+    where it does not answer at all: a server not up yet is framed, and shows once it is opened again."""
     if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
         return "a frame shows only a page at an http or https address"
     try:  # curl rather than urllib: uv's Python finds no CA bundle on NixOS
@@ -1346,23 +1382,28 @@ def framing_refusal(url: str, port: int) -> str | None:
     ancestors = [d.split()[1:] for k, v in fields if k == "content-security-policy"
                  for d in re.split(r"[;,]", v) if d.split()[:1] and d.split()[0].lower() == "frame-ancestors"]
     if ancestors:  # where a page sets frame-ancestors, the browser ignores its X-Frame-Options
-        shut = next((s for s in ancestors if not any(admits_hub(x, port) for x in s)), None)
+        shut = next((s for s in ancestors if not any(admits_hub(x, tab) for x in s)), None)
         return None if shut is None else f"its Content-Security-Policy has frame-ancestors {' '.join(shut) or "'none'"}"
     options = [v for k, v in fields if k == "x-frame-options"]
     refuses = {o.strip().lower() for v in options for o in v.split(",")} & {"deny", "sameorigin"}
     return f"its X-Frame-Options is {', '.join(options)}" if refuses else None
 
 
+DEFAULT_PORTS = {"http": "80", "https": "443"}
 ANCESTOR = re.compile(r"(?:(?P<scheme>[a-z][a-z0-9+.-]*)://)?(?P<host>[^/:]+)(?::(?P<port>\*|\d+))?(?:/.*)?")
 
 
-def admits_hub(source: str, port: int) -> bool:
-    """A frame-ancestors source the hub tab's origin, http://127.0.0.1:<port>, matches. Read loosely where CSP is
-    strict: a source with no scheme counts whatever the page's own scheme, and a path never narrows it."""
-    source = source.lower()
-    found = ANCESTOR.fullmatch(source)
-    return source in ("*", "http:") or bool(found and found["scheme"] in (None, "http") and found["host"] == "127.0.0.1"
-                                              and found["port"] in ("*", str(port)))
+def admits_hub(source: str, tab: str) -> bool:
+    """A frame-ancestors source the hub tab's origin `tab` matches. Read loosely where CSP is strict: a source with no
+    scheme counts whatever the page's own scheme, an http one counts for https too, and a path never narrows it."""
+    source, parts = source.lower(), urllib.parse.urlsplit(tab)
+    if source in ("*", "http:", f"{parts.scheme}:"):
+        return True
+    if not (found := ANCESTOR.fullmatch(source)) or found["scheme"] not in (None, "http", parts.scheme):
+        return False
+    source_port = found["port"] or DEFAULT_PORTS.get(found["scheme"] or parts.scheme)
+    tab_port = str(parts.port or DEFAULT_PORTS[parts.scheme])
+    return found["host"] == parts.hostname and source_port in ("*", tab_port)
 
 
 def announce(event: dict) -> bool:
@@ -1380,13 +1421,13 @@ def announce(event: dict) -> bool:
     return launch
 
 
-def open_board(page: Page, key: str, port: int, by: str) -> dict:
+def open_board(page: Page, key: str, by: str) -> dict:
     """A board handed to the hub: shown over the hub tab, with the opener's unit, whose tickets it marks where it is
     that unit's tree's board."""
     launch = announce({"type": "board", "unit": key, "url": page.url, "by": by})
     return {"board": page.url, "launch": launch,
             "say": "the board opens over the hub tab" if launch else "the open hub tab shows the board over it",
-            "open": f"http://127.0.0.1:{port}/u/{key_path(key)}#board:{page.url}" if launch else None}
+            "open": f"{URL}/u/{key_path(key)}#board:{page.url}" if launch else None}
 
 
 def mark(what: str, body: dict) -> tuple[int, dict]:
@@ -2713,12 +2754,38 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_page(body, ctype)
         self.send(200, body, ctype)
 
-    def port(self) -> int:
-        return self.server.server_address[1]
+    def on_socket(self) -> bool:
+        return self.server.address_family == socket.AF_UNIX
 
     def local(self) -> bool:
-        """A web page can point a name at 127.0.0.1, so only these Host headers are answered."""
-        return (self.headers.get("Host") or "").lower() in (f"127.0.0.1:{self.port()}", f"localhost:{self.port()}")
+        """A web page can point a name it owns at 127.0.0.1, so on the port only the Host headers of the hub's own
+        origins are answered: a page cannot send another name's. Nothing a page names reaches the socket: only this
+        user's processes and tailscaled open it."""
+        if self.on_socket():
+            return True
+        return (self.headers.get("Host") or "").lower() in {urllib.parse.urlsplit(o).netloc for o in self.mine()}
+
+    def mine(self) -> tuple[str, ...]:
+        """The origins a page of the hub's own sends from over this connection. On the port, they are its two names
+        and its --tailnet. On the socket, it is the address `tailscale serve` was asked at, as tailscaled forwards it,
+        and none for a local tool. X-Forwarded-Host counts on the socket alone, since on the port a page that pointed
+        a name at 127.0.0.1 can send one too."""
+        if not self.on_socket():
+            port = self.server.server_address[1]
+            return f"http://127.0.0.1:{port}", f"http://localhost:{port}", *([TAILNET] if TAILNET else [])
+        host = self.headers.get("X-Forwarded-Host")
+        return (f"{self.headers.get('X-Forwarded-Proto') or 'http'}://{host}",) if host else ()
+
+    def origins(self) -> tuple[str, ...]:
+        """Every origin a URL of this hub may carry for this request, the hub tab's that sent it first, and the hub's
+        --url last."""
+        mine, sent = self.mine(), self.headers.get("Origin")
+        home = urllib.parse.urlunsplit(urllib.parse.urlsplit(URL)[:2] + ("", "", ""))
+        return tuple(dict.fromkeys([*([sent] if sent in mine else []), *mine, home]))
+
+    def own_origin(self) -> bool:
+        """Sent by no page, or by one of the hub's own, since a page on another site can POST to the hub all the same."""
+        return self.headers.get("Origin") in (None, *self.mine())
 
     def do_GET(self):
         if not self.local():
@@ -2726,7 +2793,7 @@ class Handler(BaseHTTPRequestHandler):
         parts = urllib.parse.urlsplit(self.path)
         path = parts.path
         if path == "/.health":  # a diffview page asks this before it offers its comment controls
-            return self.send_json({"saves": diffview is not None})
+            return self.send_json({"saves": diffview is not None, "url": URL})
         if path.startswith("/c/"):  # a container view's address, from before units
             return self.send(302, b"", "text/plain", {"Location": "/"})
         if path == "/" or path.startswith("/u/"):
@@ -2823,7 +2890,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(403, b"forbidden", "text/plain")
         path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
         if path.startswith("/f/") and diffview:
-            if refused := diffview.write_refusal(self):
+            if refused := diffview.write_refusal(self.headers, self.mine()):
                 return self.send(refused[0], refused[1], "text/plain")
             raw = self.rfile.read(int(self.headers["Content-Length"]))
             target = Path(path.removeprefix("/f")).resolve()
@@ -2837,7 +2904,7 @@ class Handler(BaseHTTPRequestHandler):
             code, body = diffview.write_state(target, raw)
             return self.send(code, body, "application/json" if code == 409 else "text/plain")
         # a page on another site can POST to loopback; only this origin's pages and local tools (no Origin) may write
-        if self.headers.get("Origin") not in (None, f"http://127.0.0.1:{self.port()}", f"http://localhost:{self.port()}"):
+        if not self.own_origin():
             return self.send(403, b"forbidden", "text/plain")
         if path in TOKENED and not secrets.compare_digest(self.headers.get("X-Hub-Token") or "", TOKEN):
             return self.send_json({"error": "only the hub tab itself acts on a session; reload the tab if it is one"}, 403)
@@ -2856,9 +2923,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
             if path == "/api/open":
-                code, answer = open_page(body, self.port(), from_page=self.headers.get("Origin") is not None)
+                code, answer = open_page(body, self.origins(), from_page=self.headers.get("Origin") is not None)
             elif path == "/api/copies":
-                code, answer = copying(body, self.port())
+                code, answer = copying(body, self.origins())
             elif path == "/api/serve":
                 # a page in the hub tab must not widen what it can read
                 code, answer = (403, {"error": "only a local tool may share"}) if self.headers.get("Origin") else share(body)
@@ -2912,15 +2979,17 @@ def restart_command() -> str:
     return "systemctl --user restart container-hub" if service else shlex.join(["setsid", "-f", str(Path(sys.argv[0]).resolve()), *sys.argv[1:]])
 
 
-def watch_disk(server: ThreadingHTTPServer) -> None:
+def watch_disk(servers: list[socketserver.BaseServer]) -> None:
     """A hub tab that is showing hears when the disk under it changes: a ticket's status, a page deleted, a new
     artefact, a session finishing a turn. Read only while a tab listens. A round that finds the hub's own code
-    changed stops the server, for main() to run the new code."""
+    changed stops the servers, for main() to run the new code."""
     failing = frozenset()
     while True:
         time.sleep(2)
         if code_changed():
-            return server.shutdown()
+            for server in servers:
+                server.shutdown()
+            return
         failing = watch_round(failing)
 
 
@@ -2954,8 +3023,8 @@ SCRIPT = Path(__file__).resolve()
 CODE = (SCRIPT, HERE / "diffview")
 LOADED = tuple(map(stamp, CODE))
 LISTENING = "CONTAINER_HUB_LISTENING"
-"""Where the hub run again finds the descriptor of its listening socket, which stays open across the exec: a
-connection made meanwhile waits in its queue for the new code rather than being refused."""
+"""Where the hub run again finds the descriptors of its listening sockets and of its lock, as JSON, which stay open
+across the exec: a connection made meanwhile waits in its queue for the new code rather than being refused."""
 RESTARTING = threading.Event()
 """Set once the hub is about to run again: each event stream ends, and its tab connects again a second later."""
 REFUSED_CODE: tuple | None = None
@@ -2997,8 +3066,8 @@ def dependencies(script: Path) -> str | None:
 DEPENDENCIES = dependencies(SCRIPT)
 
 
-def run_again(server: ThreadingHTTPServer) -> None:
-    """Exec the script anew in this process, on its flags and listening socket, once the requests under way are
+def run_again(held: dict[str, int]) -> None:
+    """Exec the script anew in this process, on its flags, lock and listening sockets, once the requests under way are
     answered and no paste is half typed. It runs on this interpreter, whose environment holds the script's packages,
     unless the script names others since: then through its `#!`, which has uv install them. Returns only where neither
     exec started."""
@@ -3009,8 +3078,9 @@ def run_again(server: ThreadingHTTPServer) -> None:
         # a hand-off waits up to --clear-wait for its new session, then types once more
         answered.wait_for(lambda: not answering, timeout=CLEAR_WAIT + 30)
     with typing, lock:
-        os.set_inheritable(server.fileno(), True)
-        env = {**os.environ, LISTENING: str(server.fileno())}
+        for fd in held.values():
+            os.set_inheritable(fd, True)
+        env = {**os.environ, LISTENING: json.dumps(held)}
         argv = [str(SCRIPT), *sys.argv[1:]]
         for command in ([sys.executable, *argv], argv) if dependencies(SCRIPT) == DEPENDENCIES else (argv,):
             try:
@@ -3064,7 +3134,19 @@ def repair(data: dict) -> bool:
 
 
 def main(args: Args) -> None:
-    global STATE, TOKEN, TMUX_SOCKET, CLEAR_WAIT, RELOADS_UNREAD
+    global STATE, TOKEN, TMUX_SOCKET, CLEAR_WAIT, RELOADS_UNREAD, URL, TAILNET
+    if (handed := os.environ.get(LISTENING, "")).isdigit() and args.port is None:
+        # a hub from before the socket ran this code on its unit's bare argv, handing over its port alone: keep it
+        with socket.socket(fileno=os.dup(int(handed))) as port:
+            args.port = port.getsockname()[1]
+    if args.url is None and args.port is None:
+        sys.exit("container-hub: no address a browser opens the hub at; give it --port, or --url where `tailscale serve` "
+                 "puts its socket")
+    URL = (args.url or f"http://127.0.0.1:{args.port}").rstrip("/")
+    if args.tailnet and args.port is None:
+        sys.exit("container-hub: --tailnet names where tailscale serve puts the hub's port; give it --port as well")
+    TAILNET = (args.tailnet or "").rstrip("/")
+    args.socket = args.socket.expanduser().absolute()
     STATE = args.state.expanduser().resolve()
     TMUX_SOCKET = args.tmux_socket
     CLEAR_WAIT = args.clear_wait
@@ -3099,20 +3181,56 @@ def main(args: Args) -> None:
     except OSError as e:
         RELOADS_UNREAD = True
         print(f"typing no /reload-plugins: {reloads_file()} could not be read ({e})", file=sys.stderr, flush=True)
-    listening = os.environ.pop(LISTENING, None)  # set where the hub runs again
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler, bind_and_activate=not listening)
-    if listening:
-        server.socket.close()
-        server.socket = socket.socket(fileno=int(listening))
-        os.set_inheritable(server.fileno(), False)
-        server.server_address = server.socket.getsockname()
-    server.daemon_threads = True
-    threading.Thread(target=watch_disk, args=(server,), daemon=True).start()
+    servers, held = listen(args)
+    threading.Thread(target=watch_disk, args=(servers,), daemon=True).start()
     threading.Thread(target=keep_plugins_current, daemon=True).start()
-    print(f"container-hub on http://127.0.0.1:{args.port}/, state in {STATE}", flush=True)
-    server.serve_forever()  # until the code on disk changes
-    run_again(server)
+    for server in servers[1:]:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"container-hub on {args.socket}" + (f" and http://127.0.0.1:{args.port}/" if args.port else "")
+          + f", at {URL}/, state in {STATE}", flush=True)
+    servers[0].serve_forever()  # until the code on disk changes
+    run_again(held)
     sys.exit(1)
+
+
+class ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+def listen(args: Args) -> tuple[list[socketserver.BaseServer], dict[str, int]]:
+    """The hub's servers, on its socket and on its port where it has one, and the descriptors run_again hands on.
+    The hub run again takes over those it had; a hub starting makes its socket anew, under a lock it holds for as
+    long as it runs, so a second hub on the same socket exits rather than taking it over."""
+    held = json.loads(os.environ.pop(LISTENING, None) or "{}")
+    if isinstance(held, int):  # the port of a hub from before the socket
+        held = {"port": held}
+    if "lock" not in held:
+        args.socket.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        held["lock"] = os.open(args.socket.with_name(args.socket.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(held["lock"], fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit(f"container-hub: another hub listens on {args.socket}")
+    os.set_inheritable(held["lock"], False)
+
+    def adopt(server: socketserver.BaseServer, name: str) -> socketserver.BaseServer:
+        if name in held:
+            server.socket.close()
+            server.socket = socket.socket(fileno=held[name])
+        held[name] = server.fileno()
+        os.set_inheritable(server.fileno(), False)
+        return server
+
+    unix = ThreadingUnixServer(str(args.socket), Handler, bind_and_activate=False)
+    if "socket" not in held:  # where a hub that died left its socket, the lock says it is gone
+        args.socket.unlink(missing_ok=True)
+        unix.server_bind()
+        os.chmod(args.socket, 0o600)
+        unix.server_activate()
+    servers = [adopt(unix, "socket")]
+    if args.port is not None:
+        servers.append(adopt(ThreadingHTTPServer(("127.0.0.1", args.port), Handler, bind_and_activate="port" not in held), "port"))
+    return servers, held
 
 
 if __name__ == "__main__":
