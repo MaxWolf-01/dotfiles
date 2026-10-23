@@ -9,8 +9,8 @@
 #
 # hub.mwolf.dev (bin/container-hub-address) tries each host's hub in this
 # order and opens the first that answers, so a host that is up the most comes
-# first. The name is also the host's tailnet name: the page finds its hub at
-# https://<name>.tail710178.ts.net:8377/.
+# first. The name is also the host's tailnet name, which the page finds its
+# hub by. Each name is one entry.
 #
 # A new host is an entry here and nothing else. A VPS, say, would be
 # `{ name = "vps"; ssh = "vps"; trust = 1; }`: pc and the laptop relay it and
