@@ -511,8 +511,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${calendarPath}"
-        # A unit's environment does not say where the age key is; a shell's does.
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets gcal,kusss,moodle ${secrets}/scripts/calendar-collect --record";
       # oneshot has no start timeout of its own; a hung run would leave every later
@@ -546,8 +544,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${jkuPath}"
-        # A unit's environment does not say where the age key is; a shell's does.
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets jku ${secrets}/scripts/jku-collect --record";
       # jku-collect's own budgets add up to 155 min (KUSSS_BUDGET 5, MOODLE_FIRST_BUDGET
@@ -580,8 +576,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${erstePath}"
-        # A unit's environment does not say where the age key is; a shell's does.
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets enable-banking ${secrets}/scripts/erste-collect fetch";
       # A read is a few pages, each answered in seconds; a run this long has hung.
@@ -659,8 +653,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${wakatimePath}"
-        # A unit's environment does not say where the age key is; a shell's does.
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets wakatime-lifelog-sync-oauth-app ${dotfiles}/bin/wakatime-sync --record";
       TimeoutStartSec = "30min";
@@ -783,7 +775,6 @@ in
       Environment = [
         "PATH=${syncPath}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${secrets}/scripts/jarvis-sync --record";
     };

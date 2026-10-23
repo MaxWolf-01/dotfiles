@@ -1,8 +1,10 @@
-{ ... }:
+{ config, ... }:
 {
   home.username = "max";
   home.homeDirectory = "/home/max";
   home.stateVersion = "26.05";
+
+  home.sessionVariables.SOPS_AGE_KEY_FILE = "${config.home.homeDirectory}/.local/secrets/age-key.txt";
 
   # This machine's capability record, read by a worker running locally and by
   # `worker-hosts` (bin/). No @TOOLCHAIN@ token: what is installed here is

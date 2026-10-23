@@ -43,6 +43,13 @@
     NPM_CONFIG_PREFIX = "${config.home.homeDirectory}/.local";
   };
 
+  # The age key's path, set by the host's own config, reaches every user unit
+  # and every app GNOME starts, not only shells: none of the scripts that call
+  # sops guesses it.
+  systemd.user.sessionVariables = lib.optionalAttrs
+    (config.home.sessionVariables ? SOPS_AGE_KEY_FILE)
+    { inherit (config.home.sessionVariables) SOPS_AGE_KEY_FILE; };
+
   # Ensure common dirs exist
   home.activation.createDirs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
     mkdir -p ~/tmp ~/logs
