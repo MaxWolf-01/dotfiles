@@ -420,6 +420,7 @@
     nvtopPackages.full
     openssh
     poppler-utils
+    python3
     python3Packages.ipdb
     restic
     ripgrep

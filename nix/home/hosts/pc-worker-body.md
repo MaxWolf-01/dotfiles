@@ -5,10 +5,9 @@ rootless `docker` confined to this user, `claude` with the `mx` plugin, and the
 public internet. Anything else a project needs comes from its own setup target,
 inside the worktree.
 
-Python comes only through `uv`: there is no `python3` on PATH, so a one-off is
-`uv run python`. This is NixOS: `/usr/bin` holds `env` alone and `/bin` holds
-`sh` alone. System binaries are under `/run/current-system/sw/bin`, which a
-systemd unit or a script written for another host's PATH has to be given here.
+This is NixOS: `/usr/bin` holds `env` alone and `/bin` holds `sh` alone.
+System binaries are under `/run/current-system/sw/bin`, which a systemd unit
+or a script written for another host's PATH has to be given here.
 
 ## Belongs elsewhere
 
