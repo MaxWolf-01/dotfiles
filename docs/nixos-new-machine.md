@@ -1,6 +1,6 @@
 # NixOS on a New Machine
 
-Last updated 2026-10-18 after xmg19's reinstall. Re-verify before acting — tools evolve fast.
+Last updated 2026-10-18 after xmg19's reinstall. Re-verify before acting: tools evolve fast.
 
 ## Quick Reference
 

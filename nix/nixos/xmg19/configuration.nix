@@ -116,7 +116,7 @@
 
   # A worker host never sleeps: the lid and logind's idle action leave it
   # running, and systemd refuses every sleep state besides.
-  # sleepfor's `rtcwake -m off` is a poweroff, not a sleep, and still works.
+  # sleepfor's (zsh/functions) `rtcwake -m off` is a poweroff, not a sleep, and still works.
   systemd.sleep.settings.Sleep = {
     AllowSuspend = false;
     AllowHibernation = false;
