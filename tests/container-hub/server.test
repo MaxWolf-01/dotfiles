@@ -30,7 +30,6 @@ import shlex
 import shutil
 import signal
 import socket
-import socketserver
 import stat
 import struct
 import subprocess
@@ -566,20 +565,24 @@ while data := os.read(0, 4096):
         except ValueError:
             return status, raw
 
-    class SocketServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-        daemon_threads = True
-
     HUB_SOCKET = HOME / ".local/state/container-hub/hub.sock"
     """Where the test's hub listens beside its port, and where the tools look for it: its default, under HOME."""
+
+    class SocketConnection(http.client.HTTPConnection):
+        def __init__(self, path: Path):
+            super().__init__("localhost", timeout=60)
+            self.path = path
+
+        def connect(self) -> None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(self.timeout)
+            self.sock.connect(str(self.path))
 
     def over_socket(method: str, path: str, body: dict | None = None, headers: dict | None = None,
                     hub_socket: Path = HUB_SOCKET) -> tuple[int, dict | bytes]:
         """request(), on a hub's socket, as a local tool or tailscaled asks it."""
-        conn = http.client.HTTPConnection("localhost", timeout=60)
-        conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conn.sock.settimeout(60)
+        conn = SocketConnection(hub_socket)
         try:
-            conn.sock.connect(str(hub_socket))
             conn.request(method, path, None if body is None else json.dumps(body).encode(),
                          {"Content-Type": "application/json", **(headers or {})})
             answer = conn.getresponse()
@@ -1066,7 +1069,7 @@ while data := os.read(0, 4096):
         def log_message(self, *_):
             pass
 
-    other = SocketServer(str(SCRATCH / "other.sock"), NotAHub)
+    other = hub.ThreadingUnixServer(str(SCRATCH / "other.sock"), NotAHub)
     threading.Thread(target=other.serve_forever, daemon=True).start()
     check("a service on the hub's socket that answers 200 but is no hub: a plain tab", ["--profile-directory=Default", f"file://{fresh}"],
           browse(str(fresh), hub_socket=SCRATCH / "other.sock"))
@@ -1102,7 +1105,7 @@ while data := os.read(0, 4096):
     (worktree / "notes.txt").write_text("one\ntwo\n")
     watcher = subprocess.Popen([BIN / "diffview", f"{worktree}@HEAD..", "--watch", "--open", "--no-auto-summary"],
                                cwd=alpha, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                               env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
+                               env={**ENV, "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
                                     "DIFFVIEW_BROWSER": "claude-browser", "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     try:
         while (line := watcher.stdout.readline()) and "watching" not in line:
@@ -1192,6 +1195,7 @@ while data := os.read(0, 4096):
         check("...which is as it was", listed, served_list.read_text())
     else:
         skipped("the unreadable-file checks", "root reads a file of mode 0")
+
     # --- the socket: how the host's own tools reach the hub, and what `tailscale serve` puts on the tailnet. tailscaled
     # asks the socket as Host localhost, and says the address the browser asked at in X-Forwarded-Host.
 
@@ -1206,16 +1210,14 @@ while data := os.read(0, 4096):
           (200, 403, 403, 403), (visit({**forwarded, "Origin": TAILNET}), visit({**forwarded, "Origin": "http://attacker.example"}),
                                  visit({**forwarded, "Origin": ORIGIN}), visit({"Origin": TAILNET})))
     jump = lambda token_sent: over_socket("POST", "/api/jump", {"unit": WORKER}, {**forwarded, "Origin": TAILNET, "X-Hub-Token": token_sent})
-    check("the tab on the tailnet acts on a session with the tab's token alone", (403, False),
-          (jump("")[0], "only the hub tab" in str(jump(token)[1])))
+    check("the tab on the tailnet acts on a session with the tab's token alone, which takes it to the hub's own reason",
+          (403, 409), (jump("")[0], jump(token)[0]))
     by_tailnet = over_socket("POST", "/api/open", {"target": TAILNET + served(note), "unit": ORCHESTRATOR, "by": "user"},
                              {**forwarded, "Origin": TAILNET})[1]
     check("a link in the tab on the tailnet to a page the hub serves there is that page, already a member", (ORCHESTRATOR, "reopened"),
           (by_tailnet.get("unit"), by_tailnet.get("action")))
     on_tailnet = page(HOME / "on-tailnet.html")
-    shared_here = over_socket("POST", "/api/serve", {"path": str(on_tailnet)})[1]
-    check("a local tool shares a page on the socket, and gets its address at the hub's --url", ORIGIN + served(on_tailnet),
-          shared_here.get("url"))
+    over_socket("POST", "/api/serve", {"path": str(on_tailnet)})
     saving = served(on_tailnet) + ".state.json"
     check("a diffview page in the tab on the tailnet saves its comments, and a page of another site does not", (204, 403),
           (over_socket("POST", saving, {**state, "savedAt": 2}, {**forwarded, "Origin": TAILNET})[0],
@@ -1368,7 +1370,7 @@ esac
     new_hub = start_new()
     try:
         settles("a session due a newer mx has /reload-plugins typed in at the hub's start", [f"{first} /reload-plugins"], typed)
-        serving = server_of(new_hub)
+        serving, bound = server_of(new_hub), new_socket.stat().st_ino
         events = urllib.request.urlopen(f"{new_origin}/events", timeout=30)
         connected(events)
         script = (new_bin / "container-hub").read_text().replace('self.send_json({"saves": diffview is not None, "url": URL})',
@@ -1384,7 +1386,9 @@ esac
               (connected(reconnect), request("GET", "/.health", origin=new_origin)))
         reconnect.close()
         check("...in the hub's own process, under the one uv that started it", serving, server_of(new_hub))
-        check("...and on its socket as well as its port", (200, {"saves": True, "new": True}), over_socket("GET", "/.health", hub_socket=new_socket))
+        check("...and on the socket it had, as well as its port, so a tool asking meanwhile waits rather than finds none",
+              (200, {"saves": True, "new": True}, bound),
+              (*over_socket("GET", "/.health", hub_socket=new_socket), new_socket.stat().st_ino))
         (new_bin / "container-hub").write_text(script + "\ndef half_written(\n")
         time.sleep(4)  # a watch round, and the wait for a whole file, twice over
         check("a script that does not compile leaves the hub on the code it runs", (None, (200, {"saves": True, "new": True})),
@@ -1408,6 +1412,25 @@ esac
         for process in processes:
             process.kill()
             process.wait()
+    # a hub from before the socket, which its unit started with no flags, runs this code once it lands on disk: what it
+    # hands over is its listening port's descriptor alone, and its argv names no port
+    before = socket.create_server(("127.0.0.1", 0))
+    before.set_inheritable(True)
+    before_origin = f"http://127.0.0.1:{before.getsockname()[1]}"
+    rolled_socket = SCRATCH / "rolled.sock"
+    rolled = subprocess.Popen([BIN / "container-hub", "--state", str(SCRATCH / "rolled-state"), *HUB_FLAGS], pass_fds=(before.fileno(),),
+                              env={**ENV, "CONTAINER_HUB_LISTENING": str(before.fileno()), "CONTAINER_HUB_SOCKET": str(rolled_socket)},
+                              stdout=subprocess.DEVNULL, stderr=(SCRATCH / "rolled.log").open("w"), start_new_session=True)
+    before.close()
+    try:
+        settles("a hub from before the socket that takes up this code keeps answering on its port, under the address it had",
+                (200, {"saves": True, "url": before_origin}),
+                lambda: request("GET", "/.health", origin=before_origin) if rolled.poll() is None else rolled.poll(), within=60)
+        check("...and listens on its socket too", 200, over_socket("GET", "/.health", hub_socket=rolled_socket)[0])
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(rolled.pid, signal.SIGKILL)
+        rolled.wait()
     check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
           TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
 finally:

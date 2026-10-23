@@ -8,8 +8,9 @@
 # a dispatch worker (agent-user.nix) reaches max's hub through that address
 # and acts in his sessions. max's own processes reach it on the socket, or
 # through this address as the rule lets them.
-{ pkgs, lib, ... }:
+{ pkgs, ... }:
 let
+  # The hub's port and socket, as nix/home/container-hub.nix gives them.
   port = 8377;
   socket = "/home/max/.local/state/container-hub/hub.sock";
   # Locally sent, to an address of pc's own, from any user but max. tcp-reset:
@@ -18,8 +19,9 @@ let
   rule = "OUTPUT -p tcp --dport ${toString port} -m addrtype --dst-type LOCAL -m owner ! --uid-owner max -j REJECT --reject-with tcp-reset";
 in
 {
-  # tailscale serve does not check the socket exists, so the line holds from
-  # boot, before max's user service makes it.
+  # On the serve table tailscale-serve.nix owns. tailscale serve does not check
+  # the socket exists, so the line holds from boot, before max's user service
+  # makes it.
   systemd.services.tailscale-serve.serviceConfig.ExecStart = [
     "${pkgs.tailscale}/bin/tailscale serve --bg --yes --https=${toString port} unix:${socket}"
   ];

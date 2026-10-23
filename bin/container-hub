@@ -156,11 +156,11 @@ time.
 The hub listens on a unix socket (--socket) that only its own user can open, and on 127.0.0.1:<port> as well where
 it is given a port, which every user of the host can open. The tools on the host (claude-browser, diffview, the Stop
 hook) reach it on the socket, and a browser on another device through `tailscale serve`, which puts the socket on the
-tailnet over HTTPS: the hub then knows its address by the X-Forwarded-Host tailscaled sends. A browser on the host
-itself uses the port. The hub's --url is the address the tools open and link. Who may open the hub over the tailnet
-is the tailnet policy's to say; the hub has no login of its own. tailscaled also answers the host's own users at its
-tailnet address, where the policy does not reach, so a host with users other than the hub's needs a firewall rule
-that keeps them off the port `tailscale serve` uses (pc's: nix/nixos/pc/container-hub.nix).
+tailnet over HTTPS. The hub knows that address by the X-Forwarded-Host tailscaled sends. A browser on the host itself
+uses the port. The hub's --url is the address the tools open and link. Who may open the hub over the tailnet is the
+tailnet policy's to say, and the hub has no login of its own. tailscaled also answers the host's own users at its
+tailnet address, and the tailnet policy does not cover them. A host with users other than the hub's needs a firewall
+rule that keeps them off the port `tailscale serve` uses; pc's is in nix/nixos/pc/container-hub.nix.
 
 Typing, dropping a file, handing off, jumping and closing each want the token the hub hands to a top-level load of /
 alone, so a page the hub serves cannot act on a session by fetching their routes. It shares the tab's origin all the
@@ -322,11 +322,11 @@ class Args:
     socket: Path = SOCKET
     """Unix socket to listen on, which only this user can open; $CONTAINER_HUB_SOCKET moves it, for the tools too."""
     port: int | None = None
-    """Port to listen on as well, on 127.0.0.1, which every user of the host can open: only for a host where all of
-    them are this one."""
+    """Port to listen on as well, on 127.0.0.1. Every user of the host can open it, so it is only for a host where all
+    of them are this one."""
     url: str | None = None
-    """The hub tab's address for a browser on this host's side, which the tools open and link: where `tailscale
-    serve` puts the socket, or http://127.0.0.1:<port> by default."""
+    """The hub tab's address for a browser on this host's side, which the tools open and link. That is where
+    `tailscale serve` puts the socket, or http://127.0.0.1:<port> by default."""
     state: Path = Path("~/.local/state/container-hub")
     """Directory the hub keeps each unit's members and the user's marks in, and the mx reloads it typed."""
     tmux_socket: Path | None = None
@@ -1380,17 +1380,21 @@ def framing_refusal(url: str, tab: str) -> str | None:
     return f"its X-Frame-Options is {', '.join(options)}" if refuses else None
 
 
+DEFAULT_PORTS = {"http": "80", "https": "443"}
 ANCESTOR = re.compile(r"(?:(?P<scheme>[a-z][a-z0-9+.-]*)://)?(?P<host>[^/:]+)(?::(?P<port>\*|\d+))?(?:/.*)?")
 
 
 def admits_hub(source: str, tab: str) -> bool:
     """A frame-ancestors source the hub tab's origin `tab` matches. Read loosely where CSP is strict: a source with no
     scheme counts whatever the page's own scheme, an http one counts for https too, and a path never narrows it."""
-    source, parts, default = source.lower(), urllib.parse.urlsplit(tab), {"http": "80", "https": "443"}
-    found = ANCESTOR.fullmatch(source)
-    return source in ("*", "http:", f"{parts.scheme}:") or bool(
-        found and found["scheme"] in (None, "http", parts.scheme) and found["host"] == parts.hostname
-        and (found["port"] or default.get(found["scheme"] or parts.scheme)) in ("*", str(parts.port or default[parts.scheme])))
+    source, parts = source.lower(), urllib.parse.urlsplit(tab)
+    if source in ("*", "http:", f"{parts.scheme}:"):
+        return True
+    if not (found := ANCESTOR.fullmatch(source)) or found["scheme"] not in (None, "http", parts.scheme):
+        return False
+    source_port = found["port"] or DEFAULT_PORTS.get(found["scheme"] or parts.scheme)
+    tab_port = str(parts.port or DEFAULT_PORTS[parts.scheme])
+    return found["host"] == parts.hostname and source_port in ("*", tab_port)
 
 
 def announce(event: dict) -> bool:
@@ -2769,7 +2773,7 @@ class Handler(BaseHTTPRequestHandler):
         return tuple(dict.fromkeys([*([sent] if sent in mine else []), *mine, home]))
 
     def own_origin(self) -> bool:
-        """Sent by no page, or by one of the hub's own: a page on another site can POST to the hub all the same."""
+        """Sent by no page, or by one of the hub's own, since a page on another site can POST to the hub all the same."""
         return self.headers.get("Origin") in (None, *self.mine())
 
     def do_GET(self):
@@ -3120,6 +3124,10 @@ def repair(data: dict) -> bool:
 
 def main(args: Args) -> None:
     global STATE, TOKEN, TMUX_SOCKET, CLEAR_WAIT, RELOADS_UNREAD, URL
+    if (handed := os.environ.get(LISTENING, "")).isdigit() and args.port is None:
+        # a hub from before the socket ran this code on its unit's bare argv, handing over its port alone: keep it
+        with socket.socket(fileno=os.dup(int(handed))) as port:
+            args.port = port.getsockname()[1]
     if args.url is None and args.port is None:
         sys.exit("container-hub: no address a browser opens the hub at; give it --port, or --url where `tailscale serve` "
                  "puts its socket")
@@ -3171,7 +3179,7 @@ def main(args: Args) -> None:
     sys.exit(1)
 
 
-class SocketServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
 
@@ -3180,6 +3188,8 @@ def listen(args: Args) -> tuple[list[socketserver.BaseServer], dict[str, int]]:
     The hub run again takes over those it had; a hub starting makes its socket anew, under a lock it holds for as
     long as it runs, so a second hub on the same socket exits rather than taking it over."""
     held = json.loads(os.environ.pop(LISTENING, None) or "{}")
+    if isinstance(held, int):  # the port of a hub from before the socket
+        held = {"port": held}
     if "lock" not in held:
         args.socket.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         held["lock"] = os.open(args.socket.with_name(args.socket.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
@@ -3187,23 +3197,25 @@ def listen(args: Args) -> tuple[list[socketserver.BaseServer], dict[str, int]]:
             fcntl.flock(held["lock"], fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             sys.exit(f"container-hub: another hub listens on {args.socket}")
-    servers: list[socketserver.BaseServer] = []
-    for name, made, address in (("socket", SocketServer, str(args.socket)), ("port", ThreadingHTTPServer, ("127.0.0.1", args.port))):
-        if name == "port" and args.port is None:
-            continue
-        server = made(address, Handler, bind_and_activate=name == "port" and name not in held)
+    os.set_inheritable(held["lock"], False)
+
+    def adopt(server: socketserver.BaseServer, name: str) -> socketserver.BaseServer:
         if name in held:
             server.socket.close()
             server.socket = socket.socket(fileno=held[name])
-        elif name == "socket":  # where a hub that died left its socket, the lock says it is gone
-            args.socket.unlink(missing_ok=True)
-            server.server_bind()
-            os.chmod(args.socket, 0o600)
-            server.server_activate()
         held[name] = server.fileno()
         os.set_inheritable(server.fileno(), False)
-        servers.append(server)
-    os.set_inheritable(held["lock"], False)
+        return server
+
+    unix = ThreadingUnixServer(str(args.socket), Handler, bind_and_activate=False)
+    if "socket" not in held:  # where a hub that died left its socket, the lock says it is gone
+        args.socket.unlink(missing_ok=True)
+        unix.server_bind()
+        os.chmod(args.socket, 0o600)
+        unix.server_activate()
+    servers = [adopt(unix, "socket")]
+    if args.port is not None:
+        servers.append(adopt(ThreadingHTTPServer(("127.0.0.1", args.port), Handler, bind_and_activate="port" not in held), "port"))
     return servers, held
 
 

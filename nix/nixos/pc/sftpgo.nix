@@ -213,29 +213,10 @@ in
     };
   };
 
-  # tailscaled's serve table, and in it the public binding on the internet.
-  #
-  # tailscaled keeps its own address -> local port table. It is not in this repo
-  # and it survives reboots, so this unit wipes it and rewrites it on every boot.
-  # That only works while a single unit owns the table: a second unit that also
-  # wipes would erase this line, and the funnel would go down with no error.
-  # Another service on the table adds its own line to this unit's ExecStart, as
-  # the container hub does (container-hub.nix).
-  systemd.services.tailscale-serve = {
-    description = "tailscaled's serve table: the SFTPGo funnel, and what else pc serves";
-    after = [ "tailscaled.service" "network-online.target" ];
-    requires = [ "tailscaled.service" ];
-    wants = [ "network-online.target" ];
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      Restart = "on-failure"; # tailscaled may not be logged in yet at boot
-      RestartSec = 10;
-      ExecStartPre = "${pkgs.tailscale}/bin/tailscale serve reset";
-      ExecStart = "${pkgs.tailscale}/bin/tailscale funnel --bg --yes --https=443 http://127.0.0.1:${toString publicPort}";
-    };
-  };
+  # The public binding on the internet, on the serve table tailscale-serve.nix owns.
+  systemd.services.tailscale-serve.serviceConfig.ExecStart = [
+    "${pkgs.tailscale}/bin/tailscale funnel --bg --yes --https=443 http://127.0.0.1:${toString publicPort}"
+  ];
 
   security.sudo.extraRules = [{
     users = [ "max" ];

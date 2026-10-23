@@ -6,11 +6,12 @@
 #
 # `tailscale serve` puts the socket on the tailnet at
 # https://<host>.tail710178.ts.net:8377/, so the phone opens the hub. 8377 is a
-# port Funnel cannot publish (it serves only 443, 8443 and 10000), so no slip
-# of the verb puts the hub on the internet. Which devices may open it is the
-# tailnet policy's (secrets/tailscale/policy.hujson). The socket's path is the
-# hub's default, ~/.local/state/container-hub/hub.sock; where tailscale serve
-# is told it, it is spelled out.
+# port Funnel cannot publish (it serves only 443, 8443 and 10000), so running
+# `tailscale funnel` by mistake where `tailscale serve` was meant cannot put
+# the hub on the internet. Which devices may open it is the tailnet policy's
+# (secrets/tailscale/policy.hujson). pc's system config names the same port and
+# socket (nix/nixos/pc/container-hub.nix); the tools find the socket as the
+# hub's default, which this one is.
 #
 # The hub is a uv PEP 723 script, so uv resolves its deps at run. git reads the
 # sessions' commits; curl fetches trellis on first use, and asks a page on
@@ -29,6 +30,8 @@
 { config, pkgs, lib, ... }:
 let
   cfg = config.containerHub;
+  port = "8377";
+  socket = "${config.home.homeDirectory}/.local/state/container-hub/hub.sock";
   scriptPath = lib.makeBinPath ((with pkgs; [ bash coreutils uv git curl ]) ++ [ config.programs.tmux.package ]);
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
 in
@@ -36,8 +39,8 @@ in
   options.containerHub = {
     loopback = lib.mkEnableOption ''
       the hub on 127.0.0.1:8377 as well, for a browser on this host. Every
-      user of the host can open that port, so only for a host where all of
-      them are max'';
+      user of the host can open that port, so it is only for a host where all
+      of them are max'';
     url = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -48,17 +51,22 @@ in
       serve table a system unit owns (pc) adds the hub's line there instead'';
   };
 
+  config.assertions = [{
+    assertion = cfg.loopback || cfg.url != null;
+    message = "containerHub: the hub needs an address a browser opens it at, its loopback port or a url";
+  }];
+
   config.systemd.user.services.container-hub = {
     Unit.Description = "The container hub: every page an agent opens, in its orchestrator's unit";
     Service = {
-      ExecStart = lib.escapeShellArgs ([ "${dotfiles}/bin/container-hub" ]
-        ++ lib.optionals cfg.loopback [ "--port" "8377" ]
+      ExecStart = lib.escapeShellArgs ([ "${dotfiles}/bin/container-hub" "--socket" socket ]
+        ++ lib.optionals cfg.loopback [ "--port" port ]
         ++ lib.optionals (cfg.url != null) [ "--url" cfg.url ]);
       # "-": the hub never waits on tailscale, so a laptop offline or with
       # tailscaled stopped keeps its hub. tailscale is the Ubuntu system
       # package in /usr/bin; max is its operator, so no sudo.
       ExecStartPost = lib.optional cfg.serve
-        "-/usr/bin/tailscale serve --bg --yes --https=8377 unix:%h/.local/state/container-hub/hub.sock";
+        "-/usr/bin/tailscale serve --bg --yes --https=${port} unix:${socket}";
       Environment = [ "PATH=${scriptPath}" "TMUX_TMPDIR=%t" ];
       Restart = "always";
       RestartSec = 2;
