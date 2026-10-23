@@ -13,10 +13,12 @@ view.test's.
 """
 
 import http.client
+import http.server
 import json
 import os
 import signal
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -121,17 +123,48 @@ def events(path: str) -> list[dict]:
     return heard
 
 
+class Stub(http.server.BaseHTTPRequestHandler):
+    """A peer that answers every request and records it: what pc's own guards let through to a peer."""
+    reached: list[str] = []
+
+    def answer(self):
+        Stub.reached.append(f"{self.command} {self.path}")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"token": "stub-token-stub-token-stub-token"}')
+
+    do_GET = do_POST = answer
+
+    def log_message(self, *_):
+        pass
+
+
+class UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+    def get_request(self):  # BaseHTTPRequestHandler wants a client address it can index
+        conn, _ = super().get_request()
+        return conn, ("stub", 0)
+
+
+SECOND = "bbbbbbbb-0000-4000-8000-000000000002"  # a session of the laptop's whose unit no tab reads
+stub = UnixHTTPServer(str(SCRATCH / "stub.sock"), Stub)
+threading.Thread(target=stub.serve_forever, daemon=True).start()
 laptop = Hub("laptop", "--url", "http://laptop.invalid")
-pc = Hub("pc", "--port", str(PORT), "--peer", f"laptop={laptop.socket}")
-# The session's process: not this test's, which a worker may run, and a hub leaves a dispatched worker's session off its
-# rail.
-process = subprocess.Popen(["sleep", "600"], env={k: v for k, v in laptop.env.items() if k != "DISPATCH_WORKLOG"})
-running = laptop.home / ".claude" / "sessions" / f"{process.pid}.json"
-running.parent.mkdir(parents=True)
-running.write_text(json.dumps({"pid": process.pid, "procStart": fakes.started(process.pid), "sessionId": SESSION, "status": "idle",
-                               "statusUpdatedAt": int(time.time() * 1000), "cwd": str(laptop.home)}))
+pc = Hub("pc", "--port", str(PORT), "--peer", f"laptop={laptop.socket}", f"stub={SCRATCH / 'stub.sock'}")
+# Each session's process: not this test's, which a worker may run, and a hub leaves a dispatched worker's session off
+# its rail.
+processes = []
+for session in (SESSION, SECOND):
+    processes.append(process := subprocess.Popen(["sleep", "600"], env={k: v for k, v in laptop.env.items() if k != "DISPATCH_WORKLOG"}))
+    running = laptop.home / ".claude" / "sessions" / f"{process.pid}.json"
+    running.parent.mkdir(parents=True, exist_ok=True)
+    running.write_text(json.dumps({"pid": process.pid, "procStart": fakes.started(process.pid), "sessionId": session,
+                                   "status": "idle", "statusUpdatedAt": int(time.time() * 1000), "cwd": str(laptop.home)}))
 shown = fakes.page(laptop.home / "notes" / "laptop.html", "<!doctype html><p>written on the laptop</p>")
 later = fakes.page(laptop.home / "notes" / "more" / "a.html")
+kept_by_pc = SCRATCH / "pc" / "state" / "peers" / "laptop.json"
 
 try:
     laptop.start()
@@ -142,13 +175,18 @@ try:
 
     own = request("GET", "/api/hub")[2]
     check("pc's index names its host and the hosts it relays, and holds none of the laptop's units",
-          ("pc", ["laptop"], []), (own["host"], own["peers"], [u["unit"] for u in own["units"]]))
+          ("pc", ["laptop", "stub"], []), (own["host"], own["peers"], [u["unit"] for u in own["units"]]))
     status, _, index = request("GET", "/h/laptop/api/hub")
-    check("the laptop's index answers under /h/laptop/, as the laptop's hub has it, its session a unit",
-          (200, "laptop", [SESSION], "idle"), (status, index["host"], [u["unit"] for u in index["units"]], index["units"][0]["state"]))
+    check("the laptop's index answers under /h/laptop/, as the laptop's hub has it, its sessions units",
+          (200, "laptop", [SESSION, SECOND], {"idle"}),
+          (status, index["host"], sorted(u["unit"] for u in index["units"]), {u["state"] for u in index["units"]}))
     status, _, unit = request("GET", f"/h/laptop/api/u/{SESSION}")
     check("...and one of its units", (200, SESSION, False), (status, unit["session"], "unreachable" in unit))
-    request("POST", "/api/open", {"target": str(shown), "session": SESSION}, to=laptop.socket)  # an agent there opens it
+    heard = events("/h/laptop/events")
+    settles("the relayed event stream opens with the relay's word that the laptop answers", [{"type": "reached"}], lambda: heard[:1])
+    opened = request("POST", "/api/open", {"target": str(shown), "session": SESSION}, to=laptop.socket)[2]  # an agent there
+    check("...and is no hub tab on the laptop: an agent's open there still has its caller open the laptop's", True, opened["launch"])
+    settles("...while the stream carries the laptop's own events", ["added"], lambda: [e["type"] for e in heard[1:]])
     status, _, body = request("GET", "/h/laptop" + fakes.served(shown))
     check("a page in the laptop's HOME is served under the same prefix", (200, True), (status, b"written on the laptop" in body))
     status, got, _ = request("GET", "/h/laptop" + fakes.served(shown.parent / "more"))
@@ -160,47 +198,47 @@ try:
 
     # --- acting on the host the session runs on
 
-    status, _, said = request("POST", "/h/laptop/api/dismiss", {"unit": SESSION})
+    status = request("POST", "/h/laptop/api/dismiss", {"unit": SESSION})[0]
     check("a mark goes to the laptop's hub, which keeps it", (200, True),
           (status, request("GET", f"/api/u/{SESSION}", to=laptop.socket)[2]["dismissed"]))
-    check("...and pc's keeps no unit of the laptop's", [], [u["unit"] for u in request("GET", "/api/hub")[2]["units"]])
-    status, _, said = request("POST", f"/h/laptop/api/drop?unit={SESSION}&name=shot.png", b"png bytes",
-                              {"Content-Type": "application/octet-stream"})
-    check("an action without pc's token is refused, and reaches no hub", (403, []),
-          (status, list(laptop.home.glob(".cache/container-hub/drops/**/*.png"))))
     status, _, said = request("POST", f"/h/laptop/api/drop?unit={SESSION}&name=shot.png", b"png bytes",
                               {"Content-Type": "application/octet-stream", "X-Hub-Token": tab})
     check("with pc's token, the laptop's hub acts, with its own: the file is saved in the laptop's HOME",
           (200, True, b"png bytes"), (status, said["path"].startswith(str(laptop.home)), Path(said["path"]).read_bytes()))
     status, _, said = request("POST", "/h/laptop/api/type", {"unit": SESSION, "text": "hi"}, {"X-Hub-Token": tab})
     check("...and a refusal is the laptop's own to say", (409, "the session runs in no tmux pane"), (status, said.get("error")))
-    status = request("POST", "/h/laptop/api/visit", {"unit": SESSION}, {"Origin": "https://elsewhere.example"})[0]
-    check("a page on another site cannot write through the relay", 403, status)
-    check("the laptop's token is pc's to ask, never a browser's", 403, request("GET", "/h/laptop/api/token")[0])
+
+    # --- pc's own guards, before anything reaches a peer
+
+    refused = [request("POST", f"/h/stub/api/drop?unit={SESSION}&name=x", b"x", {"Content-Type": "application/octet-stream"})[0],
+               request("POST", "/h/stub/api/visit", {"unit": SESSION}, {"Origin": "https://elsewhere.example"})[0],
+               request("GET", "/h/stub/api/token")[0], request("POST", "/h/stub/api/serve", {"path": "/"})[0]]
+    check("an action without pc's token, a write from another site, and the peer's token or sharing are refused by pc",
+          ([403] * 4, []), (refused, Stub.reached))
     check("pc's own token goes to no request on its port", 403, request("GET", "/api/token")[0])
     check("...nor to one `tailscale serve` forwards to its socket", 403,
           request("GET", "/api/token", headers={"X-Forwarded-Host": "pc.example:8377"}, to=pc.socket)[0])
     check("...but to a local tool on its socket, as the relay is to the laptop's", True,
           len(request("GET", "/api/token", to=pc.socket)[2]["token"]) >= 24)
 
-    # --- the laptop's events, through the relay
-
-    heard = events("/h/laptop/events")
-    settles("the relayed stream opens with the relay's word that the laptop answers", [{"type": "reached"}], lambda: heard[:1])
-    request("POST", "/api/open", {"target": str(later), "session": SESSION}, to=laptop.socket)
-    settles("...then carries the laptop's own events", ["added"], lambda: [e["type"] for e in heard[1:]])
-    request("GET", f"/h/laptop/api/u/{SESSION}")  # the hub tab reads the unit the event names
-
     # --- the laptop asleep
 
+    request("POST", "/api/open", {"target": str(later), "session": SESSION}, to=laptop.socket)
+    settles("the event of a page an agent opens on the laptop comes through", 2, lambda: sum(e["type"] == "added" for e in heard))
+    request("GET", f"/h/laptop/api/u/{SESSION}")  # the hub tab reads the unit the event names, which pc keeps
+    settles("pc keeps a unit no tab read, its details read by the relay itself", True,
+            lambda: kept_by_pc.exists() and f"/api/u/{SECOND}" in json.loads(kept_by_pc.read_text()))
     laptop.stop()
     status, _, index = request("GET", "/h/laptop/api/hub")
-    check("with the laptop down, its index is what it last answered, marked unreachable, its session not ended",
-          (200, [SESSION], "idle", True), (status, [u["unit"] for u in index["units"]], index["units"][0]["state"],
-                                          "laptop does not answer" in index["unreachable"]["why"]))
+    check("with the laptop down, its index is what it last answered, marked unreachable, its sessions not ended",
+          (200, [SESSION, SECOND], {"idle"}, True),
+          (status, sorted(u["unit"] for u in index["units"]), {u["state"] for u in index["units"]},
+           "laptop does not answer" in index["unreachable"]["why"]))
     status, _, unit = request("GET", f"/h/laptop/api/u/{SESSION}")
     check("...and so is its unit, with the page it opened last", (200, True, True),
           (status, bool(unit["unreachable"]), any(m["url"] == fakes.served(later) for m in unit["members"])))
+    status, _, unit = request("GET", f"/h/laptop/api/u/{SECOND}")
+    check("...and the unit no tab read", (200, SECOND, True), (status, unit.get("session"), bool(unit.get("unreachable"))))
     status, _, said = request("POST", "/h/laptop/api/type", {"unit": SESSION, "text": "hi"}, {"X-Hub-Token": tab})
     check("an action is refused, saying the laptop does not answer", (502, True), (status, said["error"].startswith("laptop does not answer")))
     check("a page is refused", 502, request("GET", "/h/laptop" + fakes.served(shown))[0])
@@ -208,14 +246,20 @@ try:
     settles("the stream says the laptop does not answer", ["unreachable"], lambda: [e["type"] for e in asleep[:1]])
     pc.stop()
     pc.start()
-    check("pc restarted while the laptop sleeps still has what the laptop last answered", ([SESSION], True),
-          ((index := request("GET", "/h/laptop/api/hub")[2]) and [u["unit"] for u in index["units"]], "unreachable" in index))
+    index = request("GET", "/h/laptop/api/hub")[2]
+    check("pc restarted while the laptop sleeps still has what the laptop last answered", ([SESSION, SECOND], True),
+          (sorted(u["unit"] for u in index["units"]), "unreachable" in index))
+    (SCRATCH / "laptop" / "state" / "token").unlink()  # the laptop's hub makes a token anew
     laptop.start()
     check("the laptop back, its index is live again", (200, False), (lambda r: (r[0], "unreachable" in r[2]))(request("GET", "/h/laptop/api/hub")))
+    status, _, said = request("POST", "/h/laptop/api/type", {"unit": SESSION, "text": "hi"}, {"X-Hub-Token": tab})
+    check("...and an action reaches it with its new token", (409, "the session runs in no tmux pane"), (status, said.get("error")))
 finally:
-    process.kill()
+    for process in processes:
+        process.kill()
     for hub in (pc, laptop):
         if hub.proc and hub.proc.poll() is None:
             hub.stop()
+    stub.shutdown()
 
 finish()
