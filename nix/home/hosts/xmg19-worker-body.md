@@ -23,8 +23,8 @@ or a script written for another host's PATH has to be given here.
 - **Work needing GitHub.** No credentials here: `gh` is unauthenticated and
   nothing can push or open a PR. History arrives by push from the orchestrator
   and leaves the same way.
-- **Work needing a secret.** None is stored here. A job that needs an API key
-  gets it passed in for that run.
+- **Work needing a secret.** The one stored here is the Claude token `claude`
+  runs on. A job that needs an API key gets it passed in for that run.
 - **Work needing another machine on the network.** xmg19 opens no tailnet
   connection at all; only the orchestrator's side can reach one.
 - **Driving a real browser.** Headless renders work; a session you can click

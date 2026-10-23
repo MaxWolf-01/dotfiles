@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# tier: fast
+# Drive bin/claude-token-push against the real worker records, with a stand-in ssh that
+# plays each worker user's home as a scratch directory and its shell as zsh reading
+# nix/home/worker-claude-token.zsh, as the user's .zshenv does. Run it directly; no framework.
+#
+# The promise: each worker user ends up holding its own account's token, never the other's,
+# and exported by its shell; its browser login goes only once claude answers on the token
+# and no session still runs on that login. A worker it could not finish keeps its login and
+# fails the run.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+work=$(mktemp -d)
+sessions=()
+trap 'kill "${sessions[@]}" 2>/dev/null; rm -rf "$work"' EXIT
+
+. "$repo/tests/check.sh"
+needs sops age-keygen zsh
+
+export HOME="$work/home"
+. "$repo/tests/claude-accounts.sh"
+accounts_key
+
+# The worker users and their accounts, as the ticket assigns them: `agent` is personal,
+# `agent-hl` Helferline.
+declare -A account_of=([agent@pc]=personal [agent@xmg19]=personal [agent-hl@pc]=helferline [agent-hl@xmg19]=helferline)
+declare -A minted=([personal]=personal-token [helferline]=helferline-token)
+
+mkdir -p "$work/bin" "$work/down" "$work/no-zshenv"
+cat >"$work/bin/ssh" <<EOF
+#!/usr/bin/env bash
+while [[ \$1 == -o ]]; do shift 2; done
+target=\$1; shift
+if [ -e "$work/down/\$target" ]; then echo "ssh: connect to host \${target#*@} port 22: Connection timed out" >&2; exit 255; fi
+home=$work/homes/\$target
+[ -e "$work/no-zshenv/\$target" ] && HOME=\$home exec zsh -fc "\$*"
+HOME=\$home exec zsh -fc "source $repo/nix/home/worker-claude-token.zsh; \$*"
+EOF
+# claude answers on a minted token and refuses any other; logout drops the browser login and
+# notes whether it saw a token in its environment.
+cat >"$work/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+case "$1 ${2-}" in
+    "-p ping") case "${CLAUDE_CODE_OAUTH_TOKEN-}" in
+        personal-token|helferline-token|personal-token-2027) echo pong ;;
+        *) echo "Invalid API key · Please run /login"; exit 1 ;;
+    esac ;;
+    "auth logout") [ -z "${CLAUDE_CODE_OAUTH_TOKEN+set}" ] || touch "$HOME/logout-saw-token"
+        rm -f "$HOME/.claude/.credentials.json" ;;
+    *) exit 64 ;;
+esac
+EOF
+# The claude sessions running as the user: the pids in its home's `sessions` file.
+printf '#!/usr/bin/env bash\ncat "$HOME/sessions" 2>/dev/null\n' >"$work/bin/pgrep"
+chmod +x "$work/bin/"*
+export PATH="$work/bin:$PATH"
+unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN
+
+# Every worker home holding a browser login and no token; the accounts' tokens as minted.
+reset() {
+    rm -rf "$work/homes" "$work/down/"* "$work/no-zshenv/"*
+    local target
+    for target in "${!account_of[@]}"; do
+        mkdir -p "$work/homes/$target/.claude"
+        echo '{"claudeAiOauth":{}}' >"$work/homes/$target/.claude/.credentials.json"
+    done
+    account_token personal "${minted[personal]}" 2027-10-01
+    account_token helferline "${minted[helferline]}" 2027-10-01
+}
+push() { out=$("$repo/bin/claude-token-push" "$@" 2>&1); status=$?; }
+token_of() { cat "$work/homes/$1/.config/claude-token" 2>/dev/null || echo none; }
+logged_in() { [ -e "$work/homes/$1/.claude/.credentials.json" ] && echo yes || echo no; }
+line_of() { grep -F " $1 " <<<"$out"; }
+# A session running as the user on <target>, started with or without a token in its environment.
+session() {
+    if [ "$2" = on-token ]; then env CLAUDE_CODE_OAUTH_TOKEN=x sleep 300 & else env -u CLAUDE_CODE_OAUTH_TOKEN sleep 300 & fi
+    sessions+=($!)
+    echo $! >>"$work/homes/$1/sessions"
+}
+
+# --- every worker user on its own account's token, and logged out
+
+reset
+push
+check "a push to every worker user succeeds" 0 "$status"
+for target in "${!account_of[@]}"; do
+    check "$target holds the ${account_of[$target]} token" "${minted[${account_of[$target]}]}" "$(token_of "$target")"
+    check "...in a file only it can read" 600 "$(stat -c %a "$work/homes/$target/.config/claude-token")"
+    check "...and its browser login is logged out" no "$(logged_in "$target")"
+    check "...by a logout that never saw the token" no "$([ -e "$work/homes/$target/logout-saw-token" ] && echo yes || echo no)"
+done
+check "the push never prints a token" no "$(grep -qE 'personal-token|helferline-token' <<<"$out" && echo yes || echo no)"
+check "max@zephylux, whose record names no account, is not a worker it pushes to" "" "$(grep zephylux <<<"$out")"
+
+account_token personal personal-token-2027 2028-10-01
+push agent@pc
+check "a renewal replaces the token a worker held" personal-token-2027 "$(token_of agent@pc)"
+
+# --- a worker it cannot finish keeps its browser login, and fails the run
+
+reset
+touch "$work/down/agent@xmg19"
+push
+check "a host that is down fails the run" 1 "$status"
+check "...is named" yes "$(line_of 'agent@xmg19' | grep -q '^FAILED' && echo yes || echo no)"
+check "...and the others are still pushed" personal-token "$(token_of agent@pc)"
+
+reset
+touch "$work/no-zshenv/agent-hl@pc"
+push agent-hl@pc
+check "a worker whose shell does not export the token fails" 1 "$status"
+check "...keeps its browser login" yes "$(logged_in agent-hl@pc)"
+check "...and says to switch the config in" yes "$(grep -q nswitch <<<"$out" && echo yes || echo no)"
+
+reset
+account_token helferline revoked-token 2027-10-01
+push agent-hl@xmg19
+check "a token claude refuses fails the run" 1 "$status"
+check "...and the worker keeps its browser login" yes "$(logged_in agent-hl@xmg19)"
+
+reset
+session agent@xmg19 on-login
+session agent@pc on-token
+push agent@xmg19 agent@pc
+check "a session still running on the browser login fails the run" 1 "$status"
+check "...keeps that login" yes "$(logged_in agent@xmg19)"
+check "...with the token in place for the sessions that start next" personal-token "$(token_of agent@xmg19)"
+check "...and names the host to push again" yes "$(line_of 'agent@xmg19' | grep -q 'push to this host again' && echo yes || echo no)"
+check "a session already on the token does not keep the login" no "$(logged_in agent@pc)"
+
+# --- what it leaves alone
+
+reset
+account_token helferline "" 2027-10-01
+push
+check "an account whose token is not minted yet does not fail the run" 0 "$status"
+check "...its workers get no token" none "$(token_of agent-hl@pc)"
+check "...and keep their browser login" yes "$(logged_in agent-hl@xmg19)"
+
+reset
+push agent@pc
+check "naming one worker pushes to it" personal-token "$(token_of agent@pc)"
+check "...and to no other" none "$(token_of agent@xmg19)"
+
+reset
+push agent@pc agent@nowhere
+check "an unknown worker is refused" 2 "$status"
+check "...before anything is pushed" none "$(token_of agent@pc)"
+push max@zephylux
+check "a record that names no account is refused as a target" 2 "$status"
+
+finish
