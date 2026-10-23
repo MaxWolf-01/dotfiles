@@ -12,6 +12,15 @@ let
   lingerUsers = lib.attrNames (lib.filterAttrs (_: u: u.isNormalUser && u.linger == true) config.users.users);
   hmUsers = lib.attrNames config.home-manager.users;
 
+  # Each home and its TMPDIR (below). A TMPDIR that does not exist fails every
+  # program that makes a temp file, nix and Home Manager's activation among
+  # them, so both the unlock and every switch make sure of it.
+  makeHomes = lib.concatMapStrings (user: ''
+    home=$(${pkgs.getent}/bin/getent passwd ${user} | ${pkgs.coreutils}/bin/cut -d: -f6)
+    group=$(${pkgs.coreutils}/bin/id -gn ${user})
+    ${pkgs.coreutils}/bin/install -d -m 700 -o ${user} -g "$group" "$home" "$home/.tmp"
+  '') homeUsers;
+
   receive = pkgs.writeShellApplication {
     name = "host-unlock-receive";
     runtimeInputs = with pkgs; [ cryptsetup coreutils getent systemd ];
@@ -22,16 +31,10 @@ let
       fi
       systemctl start home.mount
 
-      home_users=(${lib.escapeShellArgs homeUsers})
       hm_users=(${lib.escapeShellArgs hmUsers})
       linger_users=(${lib.escapeShellArgs lingerUsers})
 
-      for user in "''${home_users[@]}"; do
-        home=$(getent passwd "$user" | cut -d: -f6)
-        group=$(id -gn "$user")
-        install -d -m 700 -o "$user" -g "$group" "$home"
-        install -d -m 700 -o "$user" -g "$group" "$home/.tmp"
-      done
+      ${makeHomes}
 
       # What the boot skipped for want of /home (the conditions below).
       for user in "''${hm_users[@]}"; do
@@ -73,5 +76,15 @@ in
   # /tmp is neither. pam_env sets it for logins, ssh commands and user services
   # alike; a program that hardcodes /tmp still writes there.
   environment.sessionVariables.TMPDIR = "$HOME/.tmp";
+  # A switch with /home mounted can add a user the last unlock never saw.
+  # Before the Home Manager units it starts; at boot /home is not mounted yet.
+  system.activationScripts.home-tmp = {
+    deps = [ "users" ];
+    text = ''
+      if ${pkgs.util-linux}/bin/mountpoint -q /home; then
+        ${makeHomes}
+      fi
+    '';
+  };
   systemd.tmpfiles.rules = [ "d /root/.tmp 0700 root root -" ];
 }
