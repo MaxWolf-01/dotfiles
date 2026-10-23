@@ -1,0 +1,225 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "hypothesis"]
+# ///
+"""diffview's --notes in markdown, checked over generated notes files. Run it directly; no framework.
+
+The seam is diffview's build, in process, over two repos of the test's own, the second nested inside the
+first as a separate section: the page data it returns is what the page carries. highlight.js is left out,
+so nothing is fetched. The oracle is the JSON form, which the page already renders as it should: a
+markdown file and the JSON it stands for must give the same page. A second property feeds lines built from
+the pieces of the bullet form, well formed or not, and finds every one of them on the page.
+"""
+
+import contextlib
+import io
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from check import bin_module, check, checked, expect, finish, prop, run_properties  # noqa: E402
+from hypothesis import given  # noqa: E402
+from hypothesis import strategies as st  # noqa: E402
+
+diffview = bin_module("diffview")
+diffview.fetch_hljs = lambda langs: ""
+
+WORK = Path(tempfile.mkdtemp())
+OUTER, INNER = WORK / "outer", WORK / "outer" / "inner"
+LINES = 12
+COMMENTS = (1, 2, 3)
+"""The review comments saved beside every page, so a note can answer them."""
+
+
+def git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True)
+
+
+def make_repo(repo: Path, changed: list[str], untouched: list[str]) -> None:
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q")
+    for name in changed + untouched:
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text("".join(f"{name} line {i}\n" for i in range(1, LINES + 1)))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    for name in changed:
+        (repo / name).write_text("".join(f"{name} line {i}{' changed' if i % 4 == 0 else ''}\n" for i in range(1, LINES + 1)))
+    git(repo, "commit", "-qam", "edit")
+
+
+make_repo(OUTER, ["a.txt", "dir/b.txt"], ["c.txt"])
+make_repo(INNER, ["x.txt"], ["y.txt"])   # made after the outer one, so never part of its history
+FILES = {OUTER: ["a.txt", "dir/b.txt", "c.txt"], INNER: ["x.txt", "y.txt"]}
+SPECS = [f"{OUTER}@HEAD~1..HEAD", f"{INNER}@HEAD~1..HEAD"]
+STATE = {"savedAt": 1, "nextId": 4, "viewed": [], "verdict": [],
+         "comments": [{"id": c, "fileKey": "0:a.txt", "hi": 0, "side": "new", "start": 4, "end": 4, "text": "why?",
+                       "excerpt": ["+ a.txt line 4 changed"]} for c in COMMENTS]}
+pages = iter(range(10**9))
+
+
+def page(notes: str) -> dict:
+    """The page data diffview renders for a notes file holding this text."""
+    n = next(pages)
+    src, out = WORK / f"notes-{n}", WORK / f"page-{n}.html"
+    src.write_text(notes)
+    Path(f"{out}.state.json").write_text(json.dumps(STATE))
+    args = diffview.Args(sources=SPECS, output=str(out), auto_summary=False, notes=str(src))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        data = diffview.build(args, out, "")
+    return {k: v for k, v in data.items() if k not in ("generated", "key")}
+
+
+# --- what a notes file holds, drawn whole
+
+text_piece = st.text(st.characters(codec="utf-8", exclude_categories=["C", "Z"]) | st.sampled_from(" `:-*"), min_size=1, max_size=30) \
+    .map(str.strip).filter(bool)
+
+
+@st.composite
+def note(draw) -> dict:
+    """A note as the JSON says it, with how its bullet writes the path."""
+    # a line going on with a bullet's text is never itself a bullet or an Addressed line
+    lines = [draw(text_piece), *draw(st.lists(text_piece.filter(lambda s: s[0] not in "-*+" and not s.startswith("Addressed")), max_size=2))]
+    n = {"text": "\n".join(lines)}
+    if draw(st.booleans()):
+        n["re"] = f"C{draw(st.sampled_from(COMMENTS))}"
+        return n
+    root = draw(st.sampled_from([OUTER, INNER]))
+    n["path"] = draw(st.sampled_from(FILES[root]))
+    if root == INNER or draw(st.booleans()):   # the inner repo's files are told apart by their absolute path
+        n["source"] = str(root)
+    if draw(st.booleans()):
+        n["line"] = draw(st.integers(1, LINES))
+        if draw(st.booleans()):
+            n["end"] = draw(st.integers(n["line"], LINES))
+    return n
+
+
+def bullet(n: dict) -> str:
+    """The note as a bullet: a path with a source is written absolute, and lines past the first go on indented."""
+    first, *rest = n["text"].split("\n")
+    head = f"- A{n['id']} " if "id" in n else "- "
+    if "re" in n:
+        head += f"re {n['re']}"
+    else:
+        path = f"{n['source']}/{n['path']}" if "source" in n else n["path"]
+        head += f"`{path}" + (f":{n['line']}" if "line" in n else "") + (f"-{n['end']}" if "end" in n else "") + "`"
+    return "\n".join([f"{head}: {first}", *(f"  {line}" for line in rest)])
+
+
+# a prose line starts at its margin with a letter, so it is never a bullet nor goes on with one
+# a bullet on a file the page does not hold, or on a comment that is not there, is read as text
+stray_bullet = st.builds(lambda i, where, text: f"- {f'A{i} ' if i else ''}{where}: {text}",
+                         st.none() | st.integers(1, 40),
+                         st.sampled_from(["`nosuch.txt`", "`--watch`", "`dir/nope.txt:3`", "`/elsewhere/x.txt`", "re C9"]), text_piece)
+prose_line = st.from_regex(r"[A-Za-z][\w .,;:!?'\"()#*`-]{0,30}", fullmatch=True).filter(lambda s: not s.startswith("Addressed"))
+
+
+@st.composite
+def notes_file(draw) -> tuple[str, dict]:
+    """A markdown notes file and the JSON it stands for."""
+    notes = draw(st.lists(note(), max_size=6))
+    ids = draw(st.lists(st.integers(1, 40), min_size=len(notes), max_size=len(notes), unique=True))
+    for n, i in zip(notes, ids):
+        if draw(st.booleans()):
+            n["id"] = i
+    # --notes --help's rule: a bullet without an id takes the next one after the highest the file gives
+    given_ids = [n["id"] for n in notes if "id" in n]
+    next_id = max(given_ids, default=0) + 1
+    numbered = []
+    for n in notes:
+        if "id" not in n:
+            n, next_id = {"id": next_id, **n}, next_id + 1
+        numbered.append(n)
+
+    blocks, prose, resolved = [], [], []
+    queue = list(zip(notes, numbered))
+    while queue or draw(st.booleans()):
+        kind = draw(st.sampled_from(["note", "note", "prose", "stray", "blank", "addressed"] if queue else ["prose", "stray", "addressed"]))
+        if kind == "note":
+            written, _ = queue.pop(0)
+            blocks.append(bullet(written))
+        elif kind in ("prose", "stray"):
+            line = draw(prose_line if kind == "prose" else stray_bullet)
+            blocks.append(line)
+            prose.append(line)
+        elif kind == "blank":
+            blocks.append("")
+            prose.append("")
+        else:
+            cs = draw(st.lists(st.sampled_from(COMMENTS), min_size=1, max_size=3))
+            blocks.append("Addressed: " + ", ".join(f"C{c}" for c in cs))
+            resolved += [f"C{c}" for c in cs]
+    return "\n".join(blocks) + "\n", {"notes": numbered, "resolved": resolved, "text": re.sub(r"\n{3,}", "\n\n", "\n".join(prose)).strip()}
+
+
+@prop("A markdown notes file and the JSON it stands for give the same page.")
+@checked(25)
+@given(notes_file())
+def same_page(drawn: tuple[str, dict]) -> None:
+    markdown, as_json = drawn
+    expect((md := page(markdown)) == (js := page(json.dumps(as_json))),
+           f"the file:\n{markdown}\nmarkdown notes: {md['notes']}\nJSON notes:     {js['notes']}\n"
+           f"resolved: {md['agentResolved']} / {js['agentResolved']}\ntext: {md['agentText']!r} / {js['agentText']!r}")
+
+
+# --- any line built from the bullet form's pieces, well formed or not
+
+piece = st.sampled_from(["- ", "* ", "  ", "A7 ", "re C2 ", "`a.txt`", "`a.txt:3-5`", "`dir/b.txt:2`", ": ", ":", "Addressed: ",
+                         "C1", ", C3", "text", "`code`", "# ", "word ", "`nosuch.py:3`", "`--notes`", "re C9 "])
+
+
+def lands(n: dict, data: dict) -> bool:
+    """Whether the page shows a note: under its comment, or on a file a section holds, by the page's rule
+    that a note's path is the file's path or its tail."""
+    return "re" in n or any(f["path"] == n["path"] or f["path"].endswith("/" + n["path"]) for s in data["sources"] for f in s["files"])
+
+
+@prop("Every line of a markdown notes file shows on the page: in a note, in the block of agent notes, or as a comment it resolves.")
+@checked(40)
+@given(st.lists(st.lists(piece, max_size=6).map("".join), max_size=8))
+def nothing_dropped(lines: list[str]) -> None:
+    if sum(re.search(r"A7 (`|re )", line) is not None for line in lines) > 1:
+        lines = [line.replace("A7 ", "") for line in lines]   # one A7 at most: ids are unique, and a file reusing one is refused
+    data = page("\n".join(lines) + "\n")
+    # each line is looked for where it can only be once: the block's lines and the notes' continued lines are
+    # used up as they are found, and a bullet line ends with the text of the next note, in file order
+    block = Counter(line.strip() for line in data["agentText"].splitlines())
+    continued = Counter(line for n in data["notes"] for line in n["text"].split("\n")[1:])
+    ahead = [n["text"].split("\n")[0] for n in data["notes"] if lands(n, data)]
+    for line in lines:
+        if not (words := line.strip()):
+            continue
+        if block[words]:
+            block[words] -= 1
+        elif continued[words]:
+            continued[words] -= 1
+        elif ahead and words.endswith(ahead[0]):
+            ahead.pop(0)
+        else:
+            ids = re.findall(r"C(\d+)", line)
+            expect(line.startswith("Addressed:") and ids and all(int(c) in data["agentResolved"] for c in ids),
+                   f"{line!r} is nowhere on the page; it shows the notes {data['notes']} and the block {data['agentText']!r}")
+
+
+# --- examples
+
+check("a bullet's lines and the comments an Addressed line names reach the page, and the prose its block",
+      ([(1, "a.txt", 4, 5, "kept the order"), (2, "a.txt", None, None, "no lines")], [1, 3], "Some prose.\n\nMore."),
+      (lambda d: ([(n["id"], n["path"], n.get("line"), n.get("end"), n["text"]) for n in d["notes"]], d["agentResolved"], d["agentText"]))(
+          page("Some prose.\n\n- A1 `a.txt:4-5`: kept the order\n- `a.txt`: no lines\nAddressed: C1, C3\n\nMore.\n")))
+check("a bullet on a file the page does not hold is text, not a note shown nowhere", ([], "- `--watch`: keeps the page live"),
+      (lambda d: (d["notes"], d["agentText"]))(page("- `--watch`: keeps the page live\n")))
+check("a file that looks like JSON but does not parse shows whole, as the block", '{"notes": [', page('{"notes": [\n')["agentText"])
+
+run_properties()
+subprocess.run(["rm", "-rf", str(WORK)])
+finish()
