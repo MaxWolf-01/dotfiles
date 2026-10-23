@@ -41,6 +41,11 @@
 # The forward is a unit of its own: a peer asleep or out of reach is ssh
 # failing and trying again every 30s, while the hub shows what it last read of
 # the peer.
+#
+# A peer that releases sessions to this host (bin/container-hub --help) has
+# them pulled at once by the hub, which starts the session-copies service
+# (./session-copies.nix) rather than running a pull of its own: one place
+# says how this host pulls, and a run under way is waited out, not doubled.
 { config, pkgs, lib, ... }:
 let
   cfg = config.containerHub;
@@ -124,7 +129,8 @@ in
           ++ lib.optionals cfg.loopback [ "--port" port ]
           ++ lib.optionals (cfg.url != null) [ "--url" cfg.url ]
           ++ lib.optionals (cfg.tailnet != null) [ "--tailnet" cfg.tailnet ]
-          ++ lib.optionals (peers != { }) ([ "--peer" ] ++ lib.mapAttrsToList (name: _: "${name}=${peerSocket name}") peers));
+          ++ lib.optionals (peers != { }) ([ "--peer" ] ++ lib.mapAttrsToList (name: _: "${name}=${peerSocket name}") peers)
+          ++ lib.optionals (peers != { }) [ "--pull" "${config.systemd.user.systemctlPath} --user start session-copies.service" ]);
         # "-": the hub never waits on tailscale, so a laptop offline or with
         # tailscaled stopped keeps its hub. tailscale is the Ubuntu system
         # package in /usr/bin. max is its operator, which lets him proxy a port

@@ -1,0 +1,197 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""Drive a session's release from one host to another, as the laptop's hub takes over pc's: two live hubs, each on a
+scratch HOME of its own.
+
+"laptop" listens on a port, as a browser reaches it, and relays pc at pc's socket. Its --pull runs bin/session-copies
+through an ssh stub that lands in pc's HOME, so the copy it takes a session over from is the one a real pull leaves.
+Neither hub has a tmux server: a resume is followed as far as the tmux window Claude Code would start in, which is
+server.test's, and an idle session, whose pane a release closes, is refused here for running in none. Run it
+directly; no framework.
+"""
+
+import http.client
+import json
+import os
+import pwd
+import sys
+import tempfile
+import urllib.parse
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fakes  # noqa: E402  (a HOME's environment, and what Claude Code leaves on disk)
+from check import check, finish, free_port  # noqa: E402
+
+MOVED = "aaaaaaaa-0000-4000-8000-000000000001"  # ended on pc, moved to the laptop on its own
+STAYS = "bbbbbbbb-0000-4000-8000-000000000002"  # ended on pc, released only with every other one of pc's
+WORKING = "cccccccc-0000-4000-8000-000000000003"  # at work on pc
+IDLE = "dddddddd-0000-4000-8000-000000000004"  # idle on pc, in no tmux pane
+NO_UNIT = "eeeeeeee-0000-4000-8000-000000000005"  # ended on pc, in no unit of its hub
+SCRATCH = Path(tempfile.mkdtemp(prefix="release.", dir=fakes.RUN))
+PORT = free_port()
+USER = pwd.getpwuid(os.getuid()).pw_name
+PC, PC_DEST = "tower", "tower-over-ssh"  # not "pc": a pull leaves out a source on the host it runs on (copies.test)
+
+
+def request(method: str, path: str, body=None, headers: dict | None = None):
+    """(status, body as JSON where it parses) of a request to the laptop's port."""
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=300)
+    conn.request(method, path, body=None if body is None else json.dumps(body).encode(),
+                 headers={"Content-Type": "application/json", **(headers or {})})
+    r = conn.getresponse()
+    raw = r.read()
+    conn.close()
+    try:
+        return r.status, json.loads(raw)
+    except ValueError:
+        return r.status, raw
+
+
+def on_pc(method: str, path: str, body=None):
+    """(status, body as JSON) of a request to pc's hub on its socket, as a local tool there makes it."""
+    conn = fakes.Unix(pc.socket)
+    conn.request(method, path, body=None if body is None else json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    r = conn.getresponse()
+    raw = r.read()
+    conn.close()
+    return r.status, json.loads(raw)
+
+
+def token() -> str:
+    page = request("GET", "/")[1].decode()
+    return page.split('name="hub-token" content="', 1)[1].split('"', 1)[0]
+
+
+def lines(session: str, cwd: Path, title: str) -> str:
+    """A transcript as Claude Code writes one, in short: where it ran, its title, two turns."""
+    return "".join(json.dumps(line, separators=(",", ":")) + "\n" for line in (
+        {"type": "user", "sessionId": session, "cwd": str(cwd), "gitBranch": "ticket/x", "entrypoint": "cli",
+         "message": {"role": "user", "content": "go"}},
+        {"type": "custom-title", "customTitle": title, "sessionId": session},
+        {"type": "system", "subtype": "turn_duration", "durationMs": 1000},
+        {"type": "user", "sessionId": session, "message": {"role": "user", "content": "and on"}},
+        {"type": "system", "subtype": "turn_duration", "durationMs": 1000}))
+
+
+laptop_copies = SCRATCH / "laptop-copies"
+pc = fakes.Hub(SCRATCH, PC, "--url", f"http://{PC}.invalid")
+stub = SCRATCH / "stub"
+pull = f"{fakes.BIN / 'session-copies'} --sources {PC}={PC_DEST} --root {laptop_copies}"
+laptop = fakes.Hub(SCRATCH, "laptop", "--port", str(PORT), "--peer", f"{PC}={pc.socket}", "--copies", str(laptop_copies), "--pull", pull)
+laptop.env["PATH"] = f"{stub}:{laptop.env['PATH']}"
+fakes.page(stub / "ssh", f"""#!/usr/bin/env bash
+while [[ $1 == -* ]]; do shift; done
+[ "$1" = {PC_DEST} ] || {{ echo "ssh: Could not resolve hostname $1" >&2; exit 255; }}
+shift
+cd {pc.home} && HOME={pc.home} USER={USER} exec sh -c "$*"
+""").chmod(0o755)
+
+both = SCRATCH / "on-both"  # a directory both hosts have, as a checkout under the same home is
+both.mkdir()
+said = {s: lines(s, both if s != STAYS else SCRATCH / "pc-only" / "x", t) for s, t in
+        ((MOVED, "the moved one"), (STAYS, "the stayed one"), (WORKING, "the working one"), (IDLE, "the idle one"), (NO_UNIT, "no unit"))}
+for session, text in said.items():
+    fakes.page(pc.home / ".claude/projects/-p" / f"{session}.jsonl", text)
+fakes.page(pc.home / ".claude/projects/-p" / MOVED / "subagents/a.jsonl", "{}\n")
+for session in (MOVED, STAYS):
+    fakes.page(pc.home / ".claude/session-pages" / session / "index.html", f"<!doctype html><body><h1>{session[:8]}</h1><p>its turns</p>")
+    fakes.page(pc.home / ".claude/session-pages" / session / "turns/0001.md", "# a turn\n")
+(laptop.home / ".claude/projects").mkdir(parents=True)
+
+processes = []
+try:
+    pc.start()
+    laptop.start()
+    processes += [pc.running(WORKING), pc.running(IDLE)]
+    for entry in (pc.home / ".claude/sessions").glob("*.json"):
+        entry_said = json.loads(entry.read_text())
+        if entry_said["sessionId"] == WORKING:
+            entry.write_text(json.dumps({**entry_said, "status": "busy"}))
+    for session in (MOVED, STAYS):  # each a unit on pc, its session page opened
+        on_pc("POST", "/api/open", {"target": str(pc.home / ".claude/session-pages" / session / "index.html"), "session": session})
+    pc_unit = json.loads((SCRATCH / PC / "state/units" / f"{MOVED}.json").read_text())
+    tab = token()
+
+    # --- one session, released on pc and taken over by the laptop
+
+    status, answer = request("POST", "/api/receive", {"host": PC, "unit": MOVED})
+    check("a move wants the hub tab's token", 403, status)
+    status, answer = request("POST", "/api/receive", {"host": PC, "unit": MOVED}, {"X-Hub-Token": tab})
+    check("an ended session of pc's, moved to the laptop, is released on pc, pulled, and taken over by the laptop",
+          (200, [MOVED], [], [MOVED], ""), (status, [r["unit"] for r in answer.get("released", [])], answer.get("refused"),
+                                             answer.get("taken"), answer.get("pulled")))
+    own = laptop.home / ".claude/projects/-p"
+    check("...its whole history in the laptop's own transcripts, its agents' with it",
+          (said[MOVED], True), ((own / f"{MOVED}.jsonl").read_text(), (own / MOVED / "subagents/a.jsonl").is_file()))
+    check("...its page records in the laptop's own session pages, its turns with it",
+          (True, "# a turn\n"), ((laptop.home / ".claude/session-pages" / MOVED / "index.html").is_file(),
+                                 (laptop.home / ".claude/session-pages" / MOVED / "turns/0001.md").read_text()))
+    status, unit = request("GET", f"/api/u/{MOVED}")
+    check("...and its unit the one pc kept, under the same id, its session page the laptop's own",
+          (200, sorted(m["id"] for m in pc_unit["members"]), fakes.served(laptop.home / ".claude/session-pages" / MOVED / "index.html")),
+          (status, sorted(m["id"] for m in json.loads((SCRATCH / "laptop/state/units" / f"{MOVED}.json").read_text())["members"]),
+           unit.get("session_page", {}).get("url")))
+    status, unit = request("GET", f"/h/{PC}/api/u/{MOVED}")
+    check("pc shows the session released to the laptop", (200, "laptop"), (status, (unit.get("released") or {}).get("to")))
+    refused = [request("POST", f"/h/{PC}/api/{route}", {"unit": MOVED, "text": "hi", "offer": "hand-off"}, {"X-Hub-Token": tab})
+               for route in ("resume", "type", "hand-off")]
+    check("...and resumes it no more, nor types into it or hands it off, naming the host that owns it now", [(409, True)] * 3,
+          [(status, "it is laptop's now" in answer.get("error", "")) for status, answer in refused])
+    status, answer = request("POST", "/api/resume", {"unit": MOVED}, {"X-Hub-Token": tab})
+    check("the laptop resumes it under its own id, here as far as the tmux server this hub has none of", (409, True),
+          (status, "no tmux server runs" in answer.get("error", "")))
+    status, answer = request("POST", "/api/receive", {"host": PC, "unit": MOVED}, {"X-Hub-Token": tab})
+    check("a session released already is not released again", (409, True), (status, "released to laptop" in answer.get("error", "")))
+
+    # --- a session pc still owns
+
+    status, answer = request("POST", "/api/resume", {"unit": STAYS}, {"X-Hub-Token": tab})
+    check("resuming on the laptop a session pc owns is refused, naming pc", (409, True),
+          (status, f"the session is {PC}'s" in answer.get("error", "")))
+
+    # --- every idle or ended session of pc's at once
+
+    status, answer = request("POST", "/api/receive", {"host": PC}, {"X-Hub-Token": tab})
+    refused = {r["unit"]: (r["title"], r["error"]) for r in answer.get("refused", [])}
+    check("releasing pc releases every ended session of its units that it still owns, and the laptop takes each over",
+          (200, [STAYS], [STAYS]), (status, [r["unit"] for r in answer.get("released", [])], answer.get("taken")))
+    check("...and refuses the one at work and the idle one it cannot close, saying which and why",
+          {WORKING: ("the working one", True), IDLE: ("the idle one", True)},
+          {k: (title, ("at work" if k == WORKING else "runs in no tmux pane") in error) for k, (title, error) in refused.items()})
+    check("...and leaves a session of no unit where it is", False,
+          (laptop.home / ".claude/projects/-p" / f"{NO_UNIT}.jsonl").exists())
+    status, answer = request("POST", "/api/resume", {"unit": STAYS}, {"X-Hub-Token": tab})
+    check("a session taken over whose directory the laptop has not resumes in a worktree made there, refused where no "
+          "repo of the laptop's holds that path", (409, True),
+          (status, "no repo of this host's holds where it was" in answer.get("error", "")))
+
+    # --- pc down: its sessions locked
+
+    pc.stop()
+    processes.pop().kill()
+    processes.pop().kill()
+    status, answer = request("POST", "/api/resume", {"unit": NO_UNIT}, {"X-Hub-Token": tab})
+    check("with pc down, a session it never released is not resumed on the laptop, which names pc", (409, True),
+          (status, f"the session is {PC}'s" in answer.get("error", "")))
+    status, answer = request("POST", "/api/receive", {"host": PC, "unit": NO_UNIT}, {"X-Hub-Token": tab})
+    check("...nor moved there", (502, True), (status, f"{PC} does not answer" in answer.get("error", "")))
+    status, answer = request("POST", "/api/fork", {"host": PC, "session": MOVED}, {"X-Hub-Token": tab})
+    check("...and a session pc released is not forked from its copy: it resumes under its own id", (409, True),
+          (status, "released the session to laptop" in answer.get("error", "")))
+    status, answer = request("POST", "/api/resume", {"unit": MOVED}, {"X-Hub-Token": tab})
+    check("a session taken over before pc went down resumes on the laptop all the same", (409, True),
+          (status, "no tmux server runs" in answer.get("error", "")))
+finally:
+    for process in processes:
+        process.kill()
+    for hub in (laptop, pc):
+        if hub.proc and hub.proc.poll() is None:
+            hub.stop()
+
+finish()
