@@ -13,6 +13,7 @@
     ./host-recorder.nix
     ./hardware-alerts.nix
     ../journald.nix
+    ../uv-python.nix
   ];
 
   # Boot

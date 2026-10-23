@@ -462,6 +462,9 @@
     tree-sitter # parser builds for nvim-treesitter
     typescript-language-server
     vscode-langservers-extracted # html, cssls, jsonls, eslint
-  ];
+  ]
+  # A non-NixOS host has its own python3, and system tools such as gdctl import
+  # its apt-installed modules (gi), which a nix python3 ahead of it on PATH lacks.
+  ++ lib.optional (!config.targets.genericLinux.enable) python3;
 
 }
