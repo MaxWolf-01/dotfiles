@@ -11,4 +11,6 @@
   ];
 
   targets.genericLinux.enable = false;
+
+  home.sessionVariables.SOPS_AGE_KEY_FILE = "/home/max/.local/secrets/age-key.txt";
 }

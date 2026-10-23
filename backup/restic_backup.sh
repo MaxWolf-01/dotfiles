@@ -96,11 +96,15 @@ if [ -n "${require_mount:-}" ]; then
     fi
 fi
 
-# Abort if age key is not available (encrypted at rest, not yet decrypted)
-age_key="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
-if [ ! -f "$age_key" ]; then
-    echo "Skipping $config_name: age key not available at $age_key (decrypt it first)"
-    log_run skip --reason "age key not decrypted at $age_key"
+# Each host's Home Manager config says where its age key is (nix/home/hosts/).
+if [ -z "${SOPS_AGE_KEY_FILE:-}" ]; then
+    fail_out "SOPS_AGE_KEY_FILE is not set" \
+        "$config_name: SOPS_AGE_KEY_FILE is not set, so sops finds no age key. This host's Home Manager config (nix/home/hosts/) sets it; check: systemctl --user show-environment"
+fi
+# Skip while the key is still encrypted at rest (pc, until the first login)
+if [ ! -f "$SOPS_AGE_KEY_FILE" ]; then
+    echo "Skipping $config_name: age key not available at $SOPS_AGE_KEY_FILE (decrypt it first)"
+    log_run skip --reason "age key not decrypted at $SOPS_AGE_KEY_FILE"
     exit 0
 fi
 

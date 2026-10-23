@@ -24,9 +24,6 @@ let
   # last finished cleanly, here and (over ssh) on the laptop.
   watchdogPath = "${backupPath}:${lib.makeBinPath [ pkgs.systemd ]}";
 
-  # Age key on tmpfs (decrypted on first SSH login, see secrets/zshrc)
-  ageKeyFile = "/run/user/1000/age-key.txt";
-
   # ssh-agent socket (managed by services.ssh-agent in common.nix)
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
@@ -45,7 +42,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/youtube/rsyncnet.conf";
@@ -105,7 +101,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/rsyncnet.conf";
@@ -134,7 +129,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/pc.conf";
     };
@@ -162,7 +156,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/encrypted/rsyncnet.conf";
@@ -195,7 +188,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStartPre = "${dotfiles}/backup/pcstate_snapshot.sh";
@@ -262,7 +254,6 @@ in
       SuccessExitStatus = "1 2";
       Environment = [
         "PATH=${igSavesPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
       ];
       ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/data/encrypted/instagram-saves/saved.tsv --dest ${home}/data/encrypted/instagram-saves --require-mount ${home}/data/encrypted --record";
     };
@@ -298,7 +289,6 @@ in
       SuccessExitStatus = "1";
       Environment = [
         "PATH=${watchdogPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/bin/overdue-check";
