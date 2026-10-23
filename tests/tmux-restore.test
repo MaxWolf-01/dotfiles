@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# tier: full-path (tmux)
+# Drive nix/home/tmux-restore.sh, which `tms` and pc's boot unit run, against
+# throwaway tmux servers. Run it directly; no framework.
+#
+# The promises: with no server running it brings back the last save, a Claude
+# Code session resumed and the placeholder session 0 gone; when `last` names a
+# save that was never flushed, it restores the newest non-empty one with that
+# save's pane text; with a server running, or no save at all, it starts nothing.
+#
+# The save is tmux-save.sh's, of a server of its own, restored under the
+# resurrect options tmux.nix sets. Every server runs on its own socket under a
+# scratch TMUX_TMPDIR, with TMUX unset and HOME in the scratch dir, so nothing
+# here reaches the live server or ~/.tmux/resurrect.
+
+set -uo pipefail
+
+home_nix="$(cd "$(dirname "${BASH_SOURCE[0]}")/../nix/home" && pwd)"
+restore="$home_nix/tmux-restore.sh"
+resurrect=${TMUX_RESURRECT:-$(sed -n 's|^run-shell \(/nix/store/.*/resurrect\)/resurrect.tmux$|\1|p' ~/.config/tmux/tmux.conf)}
+. "$(dirname "${BASH_SOURCE[0]}")/check.sh"
+
+needs tmux jq
+[ -d "$resurrect/scripts" ] || skip "no resurrect plugin: TMUX_RESURRECT unset (the devShell sets it) and none in ~/.config/tmux/tmux.conf"
+
+work=$(mktemp -d)
+export TMUX_TMPDIR="$work/run" HOME="$work/home" SHELL=/bin/sh
+unset TMUX
+dir=$HOME/.tmux/resurrect
+mkdir -p "$TMUX_TMPDIR" "$dir" "$work/bin" "$HOME/.claude/sessions" "$work/project"
+real_tmux=$(command -v tmux)
+
+# The restoring server loads resurrect with tmux.nix's own options, as the live
+# config does.
+{
+    echo "run-shell $resurrect/resurrect.tmux"
+    sed -n 's/^ *\(set -g @resurrect-.*\)$/\1/p' "$home_nix/tmux.nix"
+} >"$work/tmux.conf"
+
+# A `tmux` for one throwaway server, first on PATH for restore.sh.
+shim() {  # socket config -> path of its shim
+    mkdir -p "$work/shim-$1"
+    printf '#!/usr/bin/env bash\nexec %s -f %s -L %s "$@"\n' "$real_tmux" "$2" "$1" >"$work/shim-$1/tmux"
+    chmod +x "$work/shim-$1/tmux"
+    echo "$work/shim-$1/tmux"
+}
+S=$(shim saved /dev/null)
+R=$(shim restored "$work/tmux.conf")
+trap '"$S" kill-server 2>/dev/null; "$R" kill-server 2>/dev/null; rm -rf "$work"' EXIT
+
+# A `claude` on the restored panes' PATH says how it was started.
+printf '#!/bin/sh\necho "resumed in $(pwd): $*"\n' >"$work/bin/claude"
+chmod +x "$work/bin/claude"
+run_restore() { PATH="$(dirname "$R"):$work/bin:$PATH" bash "$restore" "$R" "$dir" 120 30; }
+sessions() { "$R" list-sessions -F '#{session_name}' 2>/dev/null | sort | paste -sd' '; }
+wait_resumed() { for _ in $(seq 50); do "$R" capture-pane -p -t agents:0.0 2>/dev/null | grep -q '^resumed' && break; sleep 0.1; done; }
+
+# --- The save: a Claude Code session in one window, text in another ---
+"$S" new-session -d -s agents -x 120 -y 30 -c /tmp
+"$S" send-keys -t agents:0.0 'sleep 600' Enter
+"$S" new-window -t agents -c /tmp
+"$S" send-keys -t agents:1.0 'echo restored-text' Enter
+shell=$("$S" display -p -t agents:0.0 '#{pane_pid}')
+for _ in $(seq 50); do pid=$(ps -o pid= --ppid "$shell" | tr -d ' ') && [ -n "$pid" ] && break; sleep 0.1; done
+printf '{"pid":%s,"sessionId":"a-session","cwd":"%s","kind":"interactive"}' "$pid" "$work/project" \
+    >"$HOME/.claude/sessions/$pid.json"
+for _ in $(seq 50); do "$S" capture-pane -p -t agents:1.0 | grep -q '^restored-text$' && break; sleep 0.1; done
+bash "$home_nix/tmux-save.sh" "$S" "$dir"
+"$S" kill-server
+saved=$(readlink "$dir/last")
+saved_time=${saved#tmux_resurrect_}
+saved_time=${saved_time%.txt}
+
+# --- No server running: the last save comes back ---
+run_restore
+wait_resumed
+check "the saved session comes back, and session 0 goes" agents "$(sessions)"
+check "the Claude Code session is resumed in its directory" "resumed in $work/project: --resume a-session" \
+    "$("$R" capture-pane -pJ -t agents:0.0 | grep '^resumed')"
+check "a pane's text comes back" 1 "$("$R" capture-pane -p -S - -t agents:1.0 | grep -c '^restored-text$')"
+"$R" kill-server
+
+# --- A server running: nothing restored into it ---
+"$R" new-session -d -s other
+run_restore
+check "with a server running, its sessions stay as they are" other "$(sessions)"
+"$R" kill-server
+
+# --- `last` names a save that was never flushed ---
+# The newer state file is empty and the archive beside it unreadable, as power
+# loss mid-write leaves them.
+sleep 1.1
+: >"$dir/tmux_resurrect_29991231T000000.txt"
+ln -sfn tmux_resurrect_29991231T000000.txt "$dir/last"
+rm "$dir/pane_contents.tar.gz"
+: >"$dir/pane_contents.tar.gz"
+err=$(run_restore 2>&1 >/dev/null)
+wait_resumed
+check "an empty last save falls back to the newest non-empty one" "$saved" "$(readlink "$dir/last")"
+check "the fallback says which save it restored" \
+    "tmux-restore: 'last' save was empty/missing, restored from $saved_time" "$err"
+check "the fallback brings back that save's sessions" agents "$(sessions)"
+check "the fallback brings back that save's pane text" 1 \
+    "$("$R" capture-pane -p -S - -t agents:1.0 | grep -c '^restored-text$')"
+"$R" kill-server
+
+# --- No save at all: no server ---
+rm -rf "$dir"
+mkdir -p "$dir"
+run_restore
+check "with no save, no server is started" "none" "$("$R" list-sessions >/dev/null 2>&1 && echo running || echo none)"
+
+finish
