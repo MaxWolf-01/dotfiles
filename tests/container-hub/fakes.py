@@ -9,12 +9,15 @@ disk goes: main()'s own start-up (the old containers moved in, each unit repaire
 """
 
 import atexit
+import http.client
 import itertools
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -118,6 +121,66 @@ hub's default socket, and under a deep TMPDIR such as the laptop devShell's (/va
 too long for a unix socket."""
 atexit.register(shutil.rmtree, RUN, ignore_errors=True)
 WORLDS: list["World"] = []
+
+
+class Hub:
+    """A hub process on a HOME of its own under `scratch`, listening on its socket, with no tmux server to type into:
+    a host as another host's hub reaches it."""
+
+    def __init__(self, scratch: Path, name: str, *flags: str):
+        self.name, self.home, self.log = name, scratch / name / "home", scratch / f"{name}.log"
+        self.home.mkdir(parents=True)
+        self.socket = scratch / name / "hub.sock"
+        self.argv = [str(BIN / "container-hub"), "--socket", str(self.socket), "--state", str(scratch / name / "state"),
+                     "--host", name, "--tmux-socket", str(scratch / name / "no-tmux.sock"), *flags]
+        self.env = scrubbed(self.home)
+        self.proc = None
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(self.argv, env=self.env, stdout=subprocess.DEVNULL, stderr=self.log.open("a"),
+                                     start_new_session=True)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and self.proc.poll() is None:
+            try:
+                with socket.socket(socket.AF_UNIX) as s:
+                    s.connect(str(self.socket))
+                return
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError(f"{self.name}'s hub did not listen:\n{self.log.read_text()}")
+
+    def stop(self) -> None:
+        os.killpg(self.proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
+        self.proc.wait()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(self.proc.pid, 0)
+                time.sleep(0.05)
+            except ProcessLookupError:
+                break
+
+    def running(self, session: str) -> subprocess.Popen:
+        """A process of `session`, registered as Claude Code registers the one it runs, idle. Not this test's
+        process, which a worker may run, and a hub leaves a dispatched worker's session off its rail."""
+        process = subprocess.Popen(["sleep", "600"], env={k: v for k, v in self.env.items() if k != "DISPATCH_WORKLOG"})
+        entry = self.home / ".claude" / "sessions" / f"{process.pid}.json"
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(json.dumps({"pid": process.pid, "procStart": started(process.pid), "sessionId": session,
+                                     "status": "idle", "statusUpdatedAt": int(time.time() * 1000), "cwd": str(self.home)}))
+        return process
+
+
+class Unix(http.client.HTTPConnection):
+    """HTTP to a hub over its socket, as a local tool speaks to it."""
+
+    def __init__(self, path: Path):
+        super().__init__("hub", timeout=30)
+        self.path_ = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.connect(str(self.path_))
 
 
 class World:
