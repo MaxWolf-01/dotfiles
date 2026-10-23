@@ -4,8 +4,10 @@
 # finds its own, and where the hub listens: bin/container-hub --help. Up from
 # login, so the hub tab is the way back to every unit after a reboot.
 #
-# `tailscale serve` puts the socket on the tailnet at
-# https://<host>.tail710178.ts.net:8377/, so the phone opens the hub. 8377 is a
+# `tailscale serve` puts the hub on the tailnet at
+# https://<host>.tail710178.ts.net:8377/, so the phone opens it: the socket
+# where a root unit serves it (pc), the loopback port where the hub's own user
+# service does (the laptop), since serving a socket takes root. 8377 is a
 # port Funnel cannot publish (it serves only 443, 8443 and 10000), so running
 # `tailscale funnel` by mistake where `tailscale serve` was meant cannot put
 # the hub on the internet. Which devices may open it is the tailnet policy's
@@ -46,27 +48,40 @@ in
       default = null;
       description = "The hub tab's address the tools open and link (the hub's --url); its loopback port where unset.";
     };
-    serve = lib.mkEnableOption ''
-      the hub's own service putting its socket on the tailnet. A host whose
-      serve table a system unit owns (pc) adds the hub's line there instead'';
+    tailnet = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Where the hub's own service has `tailscale serve` put its loopback
+        port on the tailnet (the hub's --tailnet). A host whose serve table a
+        system unit owns (pc) serves the socket from there instead.'';
+    };
   };
 
-  config.assertions = [{
-    assertion = cfg.loopback || cfg.url != null;
-    message = "containerHub: the hub needs an address a browser opens it at, its loopback port or a url";
-  }];
+  config.assertions = [
+    {
+      assertion = cfg.loopback || cfg.url != null;
+      message = "containerHub: the hub needs an address a browser opens it at, its loopback port or a url";
+    }
+    {
+      assertion = cfg.tailnet == null || cfg.loopback;
+      message = "containerHub: tailnet serves the loopback port, so it needs loopback";
+    }
+  ];
 
   config.systemd.user.services.container-hub = {
     Unit.Description = "The container hub: every page an agent opens, in its orchestrator's unit";
     Service = {
       ExecStart = lib.escapeShellArgs ([ "${dotfiles}/bin/container-hub" "--socket" socket ]
         ++ lib.optionals cfg.loopback [ "--port" port ]
-        ++ lib.optionals (cfg.url != null) [ "--url" cfg.url ]);
+        ++ lib.optionals (cfg.url != null) [ "--url" cfg.url ]
+        ++ lib.optionals (cfg.tailnet != null) [ "--tailnet" cfg.tailnet ]);
       # "-": the hub never waits on tailscale, so a laptop offline or with
       # tailscaled stopped keeps its hub. tailscale is the Ubuntu system
-      # package in /usr/bin; max is its operator, so no sudo.
-      ExecStartPost = lib.optional cfg.serve
-        "-/usr/bin/tailscale serve --bg --yes --https=${port} unix:${socket}";
+      # package in /usr/bin. max is its operator, which lets him proxy a port
+      # without sudo, though not serve a socket.
+      ExecStartPost = lib.optional (cfg.tailnet != null)
+        "-/usr/bin/tailscale serve --bg --yes --https=${port} http://127.0.0.1:${port}";
       Environment = [ "PATH=${scriptPath}" "TMUX_TMPDIR=%t" ];
       Restart = "always";
       RestartSec = 2;

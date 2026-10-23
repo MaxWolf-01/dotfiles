@@ -12,7 +12,10 @@
 
   # Every process here is max's, so the hub keeps its loopback port beside the
   # socket, and the laptop's browser and tools reach it with no network at all.
-  containerHub = { loopback = true; serve = true; };
+  containerHub = {
+    loopback = true;
+    tailnet = "https://zephylux.tail710178.ts.net:8377";
+  };
 
   imports = [
     ../brave.nix
