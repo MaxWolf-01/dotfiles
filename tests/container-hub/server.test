@@ -58,6 +58,8 @@ CONTINUED = "34343434-0000-4000-8000-00000000000b"  # the session its /clear sta
 STALLED = "56565656-0000-4000-8000-00000000000c"  # a session a /clear starts blocked
 DOUBLED = "78787878-0000-4000-8000-000000000010"  # runs in two tmux panes at once
 STRAY = "9a9a9a9a-0000-4000-8000-000000000011"  # in the registry alone, with no unit
+LOST = "bcbcbcbc-0000-4000-8000-000000000014"  # ended, to be resumed in a directory that is gone, then where it never registers
+UNKNOWN = "dcdcdcdc-0000-4000-8000-000000000015"  # of no transcript on this host
 
 w = fakes.World(port=free_port(), tmux=True)
 SCRATCH, HOME, TEMP, ENV, PORT, clock, hub = w.scratch, w.home, w.temp, w.env, w.port, w.clock, w.hub
@@ -101,6 +103,17 @@ gone_process = subprocess.Popen(["true"])  # a pid whose process has exited
 gone_process.wait()
 hub_said = (SCRATCH / "module.log").open("w")
 sys.stderr = hub_said  # what the hub prints on the way, as its log would hold it; check() prints to stdout
+
+
+
+def stop_tmux() -> None:
+    """The world's tmux server killed, and gone: a client started while it shuts down meets it exiting."""
+    shown = subprocess.run([TMUX, "-S", TMUX_SOCKET, "display-message", "-p", "#{pid}"], env=ENV, capture_output=True, text=True)
+    subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+    deadline = time.monotonic() + 5
+    while shown.stdout.strip().isdigit() and Path(f"/proc/{shown.stdout.strip()}").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+
 
 hub_proc = None
 try:
@@ -197,7 +210,7 @@ try:
         registered(ORCHESTRATOR)
         registered(WORKER)
     finally:
-        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        stop_tmux()
     registered(ANSWERER, pid=gone_process.pid, started=None, tmux=f"answering:@0.{pane}")
     status_code, answer = typed("hello")
     check("an ended session is sent nothing", (409, True), (status_code, "ended" in answer.get("error", "")))
@@ -231,7 +244,7 @@ try:
         on_client = lambda name: next(
             (r.split()[1:] for r in tmux("list-clients", "-F", "#{client_name} #{session_name} #{pane_id}").splitlines() if r.split()[0] == name), None)
         acted = lambda: {"switch-client", "kill-pane", "load-buffer", "paste-buffer", "send-keys", "select-pane", "select-window",
-                         "kill-window", "kill-session", "kill-server"} & set(TMUX_CALLS.read_text().split())
+                         "kill-window", "kill-session", "kill-server", "new-window", "new-session"} & set(TMUX_CALLS.read_text().split())
         routes = {"/api/jump": hub.jump, "/api/close-panes": hub.close_panes}
         pane_route = lambda route, unit=DOUBLED: routes[route]({"unit": unit})
 
@@ -298,7 +311,7 @@ try:
             time.sleep(0.1)
         check("...after which its unit is an ended one, as any whose process exited", "ended", view(DOUBLED)["state"])
     finally:
-        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        stop_tmux()
         for c in clients:
             os.killpg(c.pid, signal.SIGKILL)
             c.wait()
@@ -480,7 +493,163 @@ while data := os.read(0, 4096):
             check("...and the new session's page takes the stand-in's place once it is rendered",
                   served(rendered_page.resolve()), view(CONTINUED)["session_page"]["url"])
         finally:
-            subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+            stop_tmux()
+
+    # --- hub-starts-and-resumes-sessions: a session started from the hub tab, and an ended one resumed, each in a new
+    # window of the tmux session `hub`, Claude Code typed into its shell
+
+    # Claude Code's stand-in, on the PATH of the panes' shells: it registers under the id it is given, as Claude Code
+    # does, idle in its pane unless `registers` says otherwise, that it does not register, or that it exits at once; records its
+    # arguments, account and directory, and every byte typed into it once it runs. A person's session, as the hub
+    # sees one started under max's own login: run inside a dispatched worker, it sheds the worker's DISPATCH_WORKLOG.
+    fake_bin, launched, typed_after, registers = SCRATCH / "fake-bin", SCRATCH / "launched", SCRATCH / "typed-after", SCRATCH / "registers"
+    fake_bin.mkdir()
+    (fake_bin / "claude").write_text(f"""#!{sys.executable}
+import json, os, sys, tty
+if "DISPATCH_WORKLOG" in os.environ:
+    os.execve(sys.argv[0], sys.argv, {{k: v for k, v in os.environ.items() if k != "DISPATCH_WORKLOG"}})
+args = sys.argv[1:]
+account = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+with open({str(launched)!r}, "a") as f:
+    f.write(json.dumps({{"args": args, "account": account, "cwd": os.getcwd()}}) + "\\n")
+change = json.load(open({str(registers)!r})) if os.path.exists({str(registers)!r}) else {{}}
+if change == "exit":  # Claude Code failing at its start, before it registers
+    sys.exit(1)
+if change is not None:
+    started = open(f"/proc/{{os.getpid()}}/stat").read().rsplit(")", 1)[1].split()[19]
+    entry = {{"pid": os.getpid(), "procStart": started, "kind": "interactive", "cwd": os.getcwd(), "status": "idle",
+             "sessionId": args[args.index("--session-id" if "--session-id" in args else "--resume") + 1],
+             "tmux": "hub:@0." + os.environ["TMUX_PANE"], **change}}
+    os.makedirs(account + "/sessions", exist_ok=True)
+    open(f"{{account}}/sessions/{{os.getpid()}}.json", "w").write(json.dumps(entry))
+tty.setraw(0)
+os.write(1, b"\\x1b[?2004h")
+out = open({str(typed_after)!r}, "ab", buffering=0)
+while data := os.read(0, 4096):
+    out.write(data)
+    os.write(1, data.replace(b"\\x1b", b""))
+""")
+    (fake_bin / "claude").chmod(0o755)
+    # the panes' shell is sh, with no rc file in the scratch HOME, so the PATH the server starts with reaches the stand-in
+    shell_conf = SCRATCH / "shell.tmux.conf"
+    shell_conf.write_text("set -g default-shell /bin/sh\n")
+    hub.START_WAIT = 5
+    runs = lambda: [json.loads(line) for line in launched.read_text().splitlines()] if launched.exists() else []
+
+    def reached(expected: bytes) -> bytes:
+        """What reached the session once it ran, once it is what was expected or a few seconds have passed."""
+        deadline = time.monotonic() + 5
+        while (typed_after.read_bytes() if typed_after.exists() else b"") != expected and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return typed_after.read_bytes() if typed_after.exists() else b""
+
+    def started_as(answer: dict) -> tuple:
+        """What a start or resume answered, what it ran, and the unit of its session as the hub tab reads it."""
+        u = view(answer.get("unit") or "") or {}
+        return answer.get("unit"), runs()[-1] if runs() else None, u.get("state"), u.get("number") is not None
+
+    status_code, answer = hub.start({"project": str(alpha)})
+    no_server = lambda: subprocess.run([TMUX, "-S", TMUX_SOCKET, "list-sessions"], env=ENV, capture_output=True).returncode != 0
+    check("with no tmux server running, nothing is started, saying why, and no server with it",
+          (409, True, True), (status_code, "no tmux server runs" in answer.get("error", ""), no_server()))
+    # the server's PATH holds the stand-in; this process's, as every client's the hub runs, does not
+    subprocess.run([TMUX, "-S", TMUX_SOCKET, "-f", shell_conf, "new-session", "-d", "-s", "elsewhere", "-x", "100", "-y", "20"],
+                   env={**ENV, "PATH": f"{fake_bin}:{ENV['PATH']}"}, check=True)
+    try:
+        windows = lambda: tmux("list-windows", "-t", "=hub", "-F", "#{window_name}").splitlines()
+        status_code, answer = hub.start({"project": str(alpha), "account": str(HOME / ".claude"), "model": "opus", "effort": "high",
+                                         "mode": "auto", "prompt": "map the columns\nthen import"})
+        session = answer.get("unit") or ""
+        check("a session started from the hub tab runs Claude Code under an id the hub picked, with what the form picked, in "
+              "a new window of the tmux session hub, in its project",
+              (200, (session, {"args": ["--session-id", session, "--model", "opus", "--effort", "high", "--permission-mode", "auto"],
+                               "account": str(HOME / ".claude"), "cwd": str(alpha)}, "idle", True), ["alpha"]),
+              (status_code, started_as(answer), windows()))
+        pane_pid = tmux("display-message", "-p", "-t", answer.get("pane") or "", "#{pane_pid}")
+        check("...Claude Code the window's command, run by the default shell, interactive, as its child: what tmux-save "
+              "saves as the session's resume", ("/bin/sh -ic", True),
+              (tmux("display-message", "-p", "-t", answer.get("pane") or "", "#{pane_start_command}")[:11],
+               any(json.loads(f.read_text()).get("sessionId") == session
+                   for f in (HOME / ".claude/sessions").glob("*.json")
+                   if subprocess.run(["ps", "-o", "ppid=", "-p", str(json.loads(f.read_text())["pid"])],
+                                     capture_output=True, text=True).stdout.strip() == pane_pid)))
+        check("...takes its first prompt once it is idle, typed as the box types it, a paste with its lines as Enters", b"\x1b[200~map the columns\rthen import\x1b[201~\r",
+              reached(b"\x1b[200~map the columns\rthen import\x1b[201~\r"))
+        check("...and the form defaults to what it picked, the project and the prompt aside",
+              {"account": str(HOME / ".claude"), "model": "opus", "effort": "high", "mode": "auto"}, hub.start_form()["last"])
+        (HOME / ".claude-other" / "projects").mkdir(parents=True, exist_ok=True)
+        typed_after.unlink(missing_ok=True)
+        status_code, answer = hub.start({"project": str(gamma), "account": str(HOME / ".claude-other")})
+        check("a session started under another account with Claude Code's defaults runs under that config dir alone, in "
+              "another window there, and nothing is typed into it",
+              (200, (answer.get("unit"), {"args": ["--session-id", answer.get("unit")], "account": str(HOME / ".claude-other"),
+                                          "cwd": str(gamma)}, "idle", True), ["alpha", "gamma"], b""),
+              (status_code, started_as(answer), windows(), reached(b"")))
+        check("...as the form then offers it, the accounts with their projects", (str(HOME / ".claude-other"), "", True),
+              (hub.start_form()["last"]["account"], hub.start_form()["last"]["model"], str(HOME / ".claude-other") in hub.start_form()["accounts"]))
+        refusals = [hub.start({"project": str(HOME / "nowhere")}), hub.start({"project": str(alpha), "account": str(HOME / ".ssh")}),
+                    hub.start({"project": str(alpha), "effort": "huge"}), hub.start({"project": str(alpha), "model": "opus; rm -rf ~"})]
+        check("a start in no directory, under no account of the host's, or with an effort or model Claude Code does not take, "
+              "starts nothing", ([400] * 4, 2), ([c for c, _ in refusals], len(runs())))
+
+        # an ended session, as its transcript records where it ran, and, where `lines` are given, how
+        def ran(session: str, cwd: Path, account: str = ".claude", lines: tuple[dict, ...] = ()) -> None:
+            page(HOME / account / "projects" / f"-{cwd.name}" / f"{session}.jsonl", "".join(
+                json.dumps({"sessionId": session, **line}) + "\n" for line in ({"type": "user", "cwd": str(cwd), "entrypoint": "cli"}, *lines)))
+        ran(STRANGER, alpha, ".claude-other", (
+            {"type": "user", "permissionMode": "acceptEdits"},
+            {"type": "assistant", "effort": "high", "message": {"model": "claude-opus-5-5"}}))
+        check("an ended session's unit is among the ended", "ended", view(STRANGER)["state"])
+        status_code, answer = hub.resume({"unit": STRANGER})
+        check("an ended session resumes from its unit under its own id, in a new window, in the directory, under the "
+              "account and on the model, effort and permission mode its transcript records, and runs again, numbered on the rail",
+              (200, (STRANGER, {"args": ["--resume", STRANGER, "--model", "claude-opus-5-5", "--effort", "high", "--permission-mode", "acceptEdits"],
+                                "account": str(HOME / ".claude-other"), "cwd": str(alpha)}, "idle", True),
+               {"model": "claude-opus-5-5", "effort": "high", "mode": "acceptEdits"}, []),
+              (status_code, started_as(answer), answer.get("restored"), answer.get("defaulted")))
+        before = len(runs())
+        status_code, answer = hub.resume({"unit": STRANGER})
+        check("resuming a session that still runs is refused, the box saying why, and nothing is started",
+              (409, True, before), (status_code, "still runs" in answer.get("error", "") and answer["error"].count("hub:@0.%") == 1, len(runs())))
+        check("...and so is a session there is no transcript of", (409, True), (lambda r: (r[0], "no transcript" in r[1]["error"]))(hub.resume({"unit": UNKNOWN})))
+        ran(LOST, HOME / "removed-worktree")
+        check("...and one whose directory is gone", (409, True), (lambda r: (r[0], "is gone" in r[1]["error"]))(hub.resume({"unit": LOST})))
+        registers.write_text(json.dumps(None))
+        ran(LOST, gamma)
+        status_code, answer = hub.resume({"unit": LOST})
+        check("a resume whose session does not register in time says so, naming its pane", (409, True),
+              (status_code, "had not registered" in answer.get("error", "") and answer.get("pane", "") in answer.get("error", "")))
+        before = len(runs())
+        status_code, answer = hub.resume({"unit": LOST})
+        check("...and a resume of it again is refused while that pane is there, nothing started", (409, True, before),
+              (status_code, "has not registered it" in answer.get("error", ""), len(runs())))
+        registered(LOST, file="lost")  # it registers there in the end, and a read of the hub sees it running
+        view(LOST)
+        (HOME / ".claude/sessions/lost.json").unlink()  # then it ends, its shell left in the pane
+        registers.write_text(json.dumps({}))
+        status_code, answer = hub.resume({"unit": LOST})
+        check("...until the hub has seen the session run, after which it resumes once it has ended", (200, LOST), (status_code, answer.get("unit")))
+        check("...on Claude Code's defaults where its transcript records no model, effort or permission mode, the answer "
+              "saying so", (["--resume", LOST], {}, ["model", "effort", "mode"]), (runs()[-1]["args"], answer.get("restored"), answer.get("defaulted")))
+        registers.write_text(json.dumps("exit"))
+        ran(UNKNOWN, gamma)
+        first = hub.resume({"unit": UNKNOWN})
+        before = len(runs())
+        status_code, answer = hub.resume({"unit": UNKNOWN})
+        check("a resume whose Claude Code exited before it registered, its shell left in the pane, is not refused again",
+              (409, True, 409, before + 1), (first[0], "had not registered" in first[1].get("error", ""), status_code, len(runs())))
+        registers.write_text(json.dumps({"status": "waiting", "waitingFor": "dialog open"}))
+        typed_after.unlink(missing_ok=True)
+        status_code, answer = hub.start({"project": str(alpha), "prompt": "go"})
+        check("a session that starts blocked in its terminal is a unit, but takes no first prompt, the box saying why",
+              (409, "waiting", True, b""), (status_code, (view(answer.get("unit") or "") or {}).get("state"),
+                                            "dialog open" in answer.get("error", ""), reached(b"")))
+        registers.unlink()
+    finally:
+        stop_tmux()
+        for registry_file in [*HOME.glob(".claude*/sessions/*.json")]:  # the fake sessions' processes went with the server
+            if json.loads(registry_file.read_text()).get("tmux", "").startswith("hub:"):
+                registry_file.unlink()
 
     # --- a page on another origin: framed in its unit's output lane, or listed where it refuses framing
 
@@ -696,16 +865,17 @@ while data := os.read(0, 4096):
         registered(ANSWERER, pid=int(pane_pid), started=start_of(pane_pid), tmux=f"guarded:@0.{pane}")
         TMUX_CALLS.write_text("")
         acting = [("/api/type", {"unit": ANSWERER, "text": "rm -rf ~"}), ("/api/jump", {"unit": ANSWERER}),
-                  ("/api/close-panes", {"unit": ANSWERER}), ("/api/hand-off", {"unit": ANSWERER, "offer": "write"})]
-        check("a page the hub serves can neither type, jump, close nor hand off without the tab's token, the session idle in its pane",
-              ([403] * 8, set(), b"", True),
+                  ("/api/close-panes", {"unit": ANSWERER}), ("/api/hand-off", {"unit": ANSWERER, "offer": "write"}),
+                  ("/api/start", {"project": str(alpha)}), ("/api/resume", {"unit": STRANGER})]
+        check("a page the hub serves can neither type, jump, close, hand off, start nor resume without the tab's token, the "
+              "session idle in its pane", ([403] * 12, set(), b"", True),
               ([request("POST", route, body, {"Origin": ORIGIN, "X-Hub-Token": t})[0] for route, body in acting for t in ("", "guessed")],
                acted(), arrives(b""), pane in tmux("list-panes", "-a", "-F", "#{pane_id}").split()))
         check("...which the tab's token types into", (200, b"\x1b[200~go on\x1b[201~\r"),
               (request("POST", "/api/type", {"unit": ANSWERER, "text": "go on"}, {"Origin": ORIGIN, "X-Hub-Token": token})[0],
                arrives(b"\x1b[200~go on\x1b[201~\r")))
     finally:
-        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        stop_tmux()
     dropped = lambda unit, t=token: request("POST", f"/api/drop?unit={unit}&name=x.png", None,
                                             {"Origin": ORIGIN, "X-Hub-Token": t, "Content-Type": "application/octet-stream"}, data=b"x")
     check("...nor drop a file into a box", (403, 403), (dropped(ANSWERER, "")[0], dropped(ANSWERER, "guessed")[0]))
@@ -1464,7 +1634,7 @@ finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(hub_proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
         hub_proc.wait()
-    subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+    stop_tmux()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 finish()
