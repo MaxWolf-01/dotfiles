@@ -175,7 +175,10 @@ in
       # BatchMode: no prompt waits on nobody, so a key still locked after a
       # reboot is a failure tried again. ExitOnForwardFailure: an ssh that
       # could not make the socket exits rather than holding nothing.
-      # StreamLocalBindUnlink: the socket a killed ssh left is made anew.
+      # StreamLocalBindUnlink: the socket a killed ssh left is made anew. The
+      # hub reads a socket made anew as a peer reached anew, and tells it
+      # again of the forks made of its sessions (`tell` in bin/container-hub),
+      # which is how a peer that rebooted hears of them.
       ExecStart = lib.escapeShellArgs [ "${pkgs.openssh}/bin/ssh" "-N" "-oBatchMode=yes" "-oConnectTimeout=10"
         "-oServerAliveInterval=15" "-oServerAliveCountMax=3" "-oExitOnForwardFailure=yes"
         "-oStreamLocalBindUnlink=yes" "-L" "${peerSocket name}:${socket}" peer.ssh ];
