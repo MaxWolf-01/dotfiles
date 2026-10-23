@@ -118,8 +118,6 @@
         packages = with pkgs; [ python3 fzf sops age ffmpeg restic dnsproxy openssl dig zbar notmuch strace ];
         # uv's Python finds no certificate store of its own on NixOS.
         SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-        # The resurrect plugin tmux.nix installs, for tests/tmux-restore.test on a host whose own tmux has none.
-        TMUX_RESURRECT = "${pkgs.tmuxPlugins.resurrect}/share/tmux-plugins/resurrect";
         # The Chromium Playwright downloads is linked for a conventional Linux; on NixOS it
         # runs through nix-ld, which finds its libraries here. Elsewhere this is unread.
         shellHook = ''

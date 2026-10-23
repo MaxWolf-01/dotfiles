@@ -73,9 +73,7 @@ For single-pane select: `z` (zoom) → Shift+select → `z` (unzoom)
 
 ## Persistence
 
-Sessions auto-save every 1min. After reboot, just run `tmux`. On pc the
-server is restored at boot, before anyone logs in (`tmuxServer.atBoot` in
-`nix/home/tmux.nix`), and `tms <name>` attaches to it.
+Sessions auto-save every 1min. After reboot, just run `tmux`.
 
 | Key | Action |
 |-----|--------|
