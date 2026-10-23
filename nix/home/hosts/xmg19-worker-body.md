@@ -14,10 +14,9 @@ what runs, what waits, and when yours is expected to start; a long wait is a
 reason to do other work first, or to ask. `gpu-run --help` says the rest.
 Nothing enforces the queue: a job run without it can crash someone else's.
 
-Python comes only through `uv`: there is no `python3` on PATH, so a one-off is
-`uv run python`. This is NixOS: `/usr/bin` holds `env` alone and `/bin` holds
-`sh` alone. System binaries are under `/run/current-system/sw/bin`, which a
-systemd unit or a script written for another host's PATH has to be given here.
+This is NixOS: `/usr/bin` holds `env` alone and `/bin` holds `sh` alone.
+System binaries are under `/run/current-system/sw/bin`, which a systemd unit
+or a script written for another host's PATH has to be given here.
 
 ## Belongs elsewhere
 
