@@ -1037,7 +1037,9 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "/tmp";
-      Environment = [ "PATH=${home}/.local/bin:${home}/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin" ];
+      # ~/.nix-profile/bin ahead of ~/.local/bin: its `claude` is the wrapper
+      # that hands the real one the account's token (claude-token.nix).
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
       ExecStart = "${dotfiles}/bin/claude-ping";
     };
   };

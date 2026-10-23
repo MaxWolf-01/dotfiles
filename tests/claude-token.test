@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# tier: fast
+# Drive nix/home/claude-token.sh, installed as the `claude` in front of a stand-in for
+# the real one, and check which token reaches it. Run it directly; no framework.
+#
+# The promise: whatever starts claude (a shell, the hub's resume command, claude-ping's
+# unit) starts it on the token of the account its CLAUDE_CONFIG_DIR names, and never on
+# another account's, not even one the caller already carries. An account with no token
+# minted yet runs on no token, and one whose token cannot be read does not start at all.
+# tmux-save.test holds the same promise for a restored session.
+#
+# HOME is a scratch directory holding a throwaway age key and the accounts' credential
+# files, so the wrapper finds them where it looks on a real host.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+. "$repo/tests/check.sh"
+needs sops age-keygen uv
+
+# uv's cache and Pythons stay where they are: the hub case below loads diffview through uv.
+uv_cache=$(uv cache dir) uv_python=$(uv python dir)
+export HOME="$work/home"
+. "$repo/tests/claude-accounts.sh"
+accounts_key
+account_token personal personal-token 2027-10-01
+account_token helferline helferline-token 2027-10-01
+account_token unminted ""
+
+# The stand-in for the real claude, where the installer puts it: it prints the token it
+# was handed, its pid, and its arguments one per line.
+mkdir -p "$HOME/.local/bin"
+cat >"$HOME/.local/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "token=${CLAUDE_CODE_OAUTH_TOKEN-none}"
+[ -z "${PID_FILE-}" ] || echo $$ >"$PID_FILE"
+printf 'arg=%s\n' "$@"
+STUB
+chmod +x "$HOME/.local/bin/claude"
+install_claude_wrapper "$HOME/.nix-profile/bin"
+outer_path=$PATH
+export PATH="$HOME/.nix-profile/bin:$HOME/.local/bin:$PATH"
+unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN
+
+token() { claude "$@" | sed -n 's/^token=//p'; }
+
+# --- each profile runs on its own account's token
+
+check "~/.claude, named by no CLAUDE_CONFIG_DIR, runs on the personal token" personal-token "$(token)"
+check "~/.claude named outright runs on the personal token" personal-token "$(CLAUDE_CONFIG_DIR=$HOME/.claude/ token)"
+check "~/.claude-helferline runs on the helferline token" helferline-token "$(CLAUDE_CONFIG_DIR=$HOME/.claude-helferline token)"
+check "a helferline session started from a personal session's shell drops the personal token" \
+    helferline-token "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$HOME/.claude-helferline token)"
+check "an account whose token is not minted yet runs on none, whatever the caller carries" \
+    none "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$HOME/.claude-unminted token)"
+check "an account with no credential file runs on none" \
+    none "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$HOME/.claude-elsewhere token)"
+check "a config dir outside ~/.claude* runs on none" \
+    none "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$work/scratch-profile token)"
+
+# --- the real claude gets the arguments, and the pid, the caller started
+
+expected=$'arg=-p\narg=a b\narg=it\'s "q"\narg=$HOME\narg=x\ny'
+check "every argument reaches the real claude byte for byte" "$expected" \
+    "$(claude -p 'a b' "it's \"q\"" '$HOME' $'x\ny' | grep -v '^token=')"
+PID_FILE="$work/pid" claude >/dev/null &
+started=$!
+wait "$started"
+check "the real claude keeps the pid its caller started, which tmux-save finds a session by" \
+    "$started" "$(cat "$work/pid")"
+
+# --- a token that cannot be read stops claude, rather than starting it on another login
+
+out=$(SOPS_AGE_KEY_FILE=$work/no-such-key claude 2>&1)
+check "an undecryptable credential file exits non-zero" 1 $?
+check "...without starting claude" "" "$(grep '^token=' <<<"$out")"
+check "...and names the file" yes "$(grep -q 'claude-personal.env' <<<"$out" && echo yes || echo no)"
+
+# --- the launchers: each reaches the wrapper, not the real claude behind it
+
+# A login shell's PATH as zsh/exports builds it over one that holds neither directory,
+# and the claude function zsh/functions puts in front of the binary.
+if zsh=$(command -v zsh); then
+    check "a shell starts claude on the profile's token" helferline-token "$(
+        CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$HOME/.claude-helferline PATH=$outer_path \
+            "$zsh" -fc "source $repo/zsh/exports; source $repo/zsh/functions 2>/dev/null; claude" | sed -n 's/^token=//p')"
+else
+    skipped "a shell starts claude on the profile's token" "zsh is not on PATH"
+fi
+
+# The command the hub offers for a session, run in a shell that carries the other
+# account's token. The hub runs under no config dir, so the command names the session's.
+mkdir -p "$HOME/.claude-helferline/projects/p" "$work/project"
+printf '{"type":"user","cwd":"%s"}\n' "$work/project" >"$HOME/.claude-helferline/projects/p/s1.jsonl"
+# Loaded the way the hub loads diffview, whose resume_command it serves.
+resume=$(UV_CACHE_DIR=$uv_cache UV_PYTHON_INSTALL_DIR=$uv_python uv run --quiet --no-project --with tyro python3 -B -c '
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("diffview", sys.argv[1])
+module = importlib.util.module_from_spec(importlib.util.spec_from_loader("diffview", loader))
+loader.exec_module(module)
+print(module.resume_command("s1"))' "$repo/bin/diffview")
+if [ -n "$resume" ]; then
+    check "the hub's resume command names the session's account" \
+        "cd $work/project && CLAUDE_CONFIG_DIR=$HOME/.claude-helferline claude --resume s1" "$resume"
+    check "the hub's resume command starts claude on that account's token" helferline-token \
+        "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token bash -c "$resume" | sed -n 's/^token=//p')"
+else
+    fail "the hub's resume command could not be read from bin/diffview"
+fi
+
+# claude-ping under its unit's own PATH, as timers.nix sets it.
+unit_path=$(awk '/systemd\.user\.services\.claude-ping = /{f=1} f && /"PATH=/{print; exit}' "$repo/nix/home/timers.nix" \
+    | sed -E 's/.*"PATH=([^"]*)".*/\1/')
+unit_path=${unit_path//'${home}'/$HOME}
+check "claude-ping's unit PATH reaches the wrapper before the real claude" personal-token \
+    "$(PATH="$unit_path:$PATH" "$repo/bin/claude-ping" | sed -n 's/^token=//p')"
+
+finish
