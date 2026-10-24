@@ -13,6 +13,7 @@
       ];
     })
     ./gpu-queue.nix
+    ./power-cap.nix
     ./backup-target.nix
     ../host-recorder.nix
     ../journald.nix
