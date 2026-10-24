@@ -116,11 +116,6 @@
     ];
     includes = [
       { path = "~/.gitconfig_local"; }
-      # work identity: anything under ~/work commits as the Helferline address
-      {
-        condition = "gitdir:~/work/";
-        contents.user.email = "maximilian.wolf@helferline.at";
-      }
     ];
     settings = {
       user.name = "Maximilian Wolf";
