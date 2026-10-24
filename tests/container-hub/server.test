@@ -14,9 +14,9 @@ hub's module is loaded in this process on it, and the tmux it types into is a re
 own.
 
 What only the server does is checked last, over HTTP, against one hub on a free port, never 8377, in the same HOME
-and on the state the module left: its routes, the Host, Origin and token guards, what /f/ serves, the size caps,
-the event stream, the state-write protocol a diffview page saves by, claude-browser and diffview handing it pages,
-and a restart.
+and on the state the module left, and on its socket as a local tool and `tailscale serve` reach it: its routes, the
+Host, Origin and token guards, what /f/ serves, the size caps, the event stream, the state-write protocol a diffview
+page saves by, claude-browser and diffview handing it pages, a hub with no port as pc runs one, and a restart.
 """
 
 import contextlib
@@ -30,6 +30,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -57,6 +58,10 @@ CONTINUED = "34343434-0000-4000-8000-00000000000b"  # the session its /clear sta
 STALLED = "56565656-0000-4000-8000-00000000000c"  # a session a /clear starts blocked
 DOUBLED = "78787878-0000-4000-8000-000000000010"  # runs in two tmux panes at once
 STRAY = "9a9a9a9a-0000-4000-8000-000000000011"  # in the registry alone, with no unit
+LOST = "bcbcbcbc-0000-4000-8000-000000000014"  # ended, to be resumed in a directory that is gone, then where it never registers
+UNKNOWN = "dcdcdcdc-0000-4000-8000-000000000015"  # of no transcript on this host
+FORKED = "fefefefe-0000-4000-8000-000000000016"  # a session of pc's, forked here from its copy
+RELEASED = "17171717-0000-4000-8000-000000000017"  # idle in a tmux pane, released to another host
 
 w = fakes.World(port=free_port(), tmux=True)
 SCRATCH, HOME, TEMP, ENV, PORT, clock, hub = w.scratch, w.home, w.temp, w.env, w.port, w.clock, w.hub
@@ -100,6 +105,17 @@ gone_process = subprocess.Popen(["true"])  # a pid whose process has exited
 gone_process.wait()
 hub_said = (SCRATCH / "module.log").open("w")
 sys.stderr = hub_said  # what the hub prints on the way, as its log would hold it; check() prints to stdout
+
+
+
+def stop_tmux() -> None:
+    """The world's tmux server killed, and gone: a client started while it shuts down meets it exiting."""
+    shown = subprocess.run([TMUX, "-S", TMUX_SOCKET, "display-message", "-p", "#{pid}"], env=ENV, capture_output=True, text=True)
+    subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+    deadline = time.monotonic() + 5
+    while shown.stdout.strip().isdigit() and Path(f"/proc/{shown.stdout.strip()}").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+
 
 hub_proc = None
 try:
@@ -196,7 +212,7 @@ try:
         registered(ORCHESTRATOR)
         registered(WORKER)
     finally:
-        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        stop_tmux()
     registered(ANSWERER, pid=gone_process.pid, started=None, tmux=f"answering:@0.{pane}")
     status_code, answer = typed("hello")
     check("an ended session is sent nothing", (409, True), (status_code, "ended" in answer.get("error", "")))
@@ -230,7 +246,7 @@ try:
         on_client = lambda name: next(
             (r.split()[1:] for r in tmux("list-clients", "-F", "#{client_name} #{session_name} #{pane_id}").splitlines() if r.split()[0] == name), None)
         acted = lambda: {"switch-client", "kill-pane", "load-buffer", "paste-buffer", "send-keys", "select-pane", "select-window",
-                         "kill-window", "kill-session", "kill-server"} & set(TMUX_CALLS.read_text().split())
+                         "kill-window", "kill-session", "kill-server", "new-window", "new-session"} & set(TMUX_CALLS.read_text().split())
         routes = {"/api/jump": hub.jump, "/api/close-panes": hub.close_panes}
         pane_route = lambda route, unit=DOUBLED: routes[route]({"unit": unit})
 
@@ -296,8 +312,26 @@ try:
         while view(DOUBLED).get("state") != "ended" and time.monotonic() < deadline:
             time.sleep(0.1)
         check("...after which its unit is an ended one, as any whose process exited", "ended", view(DOUBLED)["state"])
+
+        # --- sessions-move-by-release: a release closes an idle session's pane first, and refuses a blocked one
+        written = page(HOME / ".claude/projects/-w" / f"{RELEASED}.jsonl", json.dumps({"type": "user", "sessionId": RELEASED}) + "\n")
+        tmux("new-window", "-d", "-t", "working:", "sleep 600")
+        held, held_pid = tmux("display-message", "-p", "-t", "working:{end}", "#{pane_id} #{pane_pid}").split()
+        in_held = lambda status, **extra: registered(RELEASED, status, pid=int(held_pid), started=start_of(held_pid), tmux=f"working:@9.{held}", **extra)
+        record = written.with_name(f"{RELEASED}.release.json")
+        in_held("waiting", waiting_for="permission prompt")
+        status_code, answer = hub.release({"to": "laptop", "unit": RELEASED})
+        check("a release refuses a session blocked in its terminal, saying why, and closes nothing",
+              (409, True, True, False), (status_code, "blocked in its terminal" in answer.get("error", ""), held in "".join(panes()), record.exists()))
+        in_held("idle")
+        status_code, answer = hub.release({"to": "laptop", "unit": RELEASED})
+        check("a release of an idle session closes its pane, waits for its process to exit, then writes the release beside "
+              "its transcript, naming the host it goes to",
+              (200, [RELEASED], False, None, "laptop"),
+              (status_code, [r["unit"] for r in answer.get("released", [])], held in "".join(panes()), hub.registry().get(RELEASED),
+               json.loads(record.read_text())["to"] if record.exists() else None))
     finally:
-        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        stop_tmux()
         for c in clients:
             os.killpg(c.pid, signal.SIGKILL)
             c.wait()
@@ -479,7 +513,190 @@ while data := os.read(0, 4096):
             check("...and the new session's page takes the stand-in's place once it is rendered",
                   served(rendered_page.resolve()), view(CONTINUED)["session_page"]["url"])
         finally:
-            subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+            stop_tmux()
+
+    # --- hub-starts-and-resumes-sessions: a session started from the hub tab, and an ended one resumed, each in a new
+    # window of the tmux session `hub`, Claude Code typed into its shell
+
+    # Claude Code's stand-in, on the PATH of the panes' shells: it registers under the id it is given, as Claude Code
+    # does, idle in its pane unless `registers` says otherwise, that it does not register, or that it exits at once; records its
+    # arguments, account and directory, and every byte typed into it once it runs. A person's session, as the hub
+    # sees one started under max's own login: run inside a dispatched worker, it sheds the worker's DISPATCH_WORKLOG.
+    fake_bin, launched, typed_after, registers = SCRATCH / "fake-bin", SCRATCH / "launched", SCRATCH / "typed-after", SCRATCH / "registers"
+    fake_bin.mkdir()
+    (fake_bin / "claude").write_text(f"""#!{sys.executable}
+import json, os, sys, tty
+if "DISPATCH_WORKLOG" in os.environ:
+    os.execve(sys.argv[0], sys.argv, {{k: v for k, v in os.environ.items() if k != "DISPATCH_WORKLOG"}})
+args = sys.argv[1:]
+account = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+with open({str(launched)!r}, "a") as f:
+    f.write(json.dumps({{"args": args, "account": account, "cwd": os.getcwd()}}) + "\\n")
+change = json.load(open({str(registers)!r})) if os.path.exists({str(registers)!r}) else {{}}
+if change == "exit":  # Claude Code failing at its start, before it registers
+    sys.exit(1)
+if change is not None:
+    started = open(f"/proc/{{os.getpid()}}/stat").read().rsplit(")", 1)[1].split()[19]
+    entry = {{"pid": os.getpid(), "procStart": started, "kind": "interactive", "cwd": os.getcwd(), "status": "idle",
+             "sessionId": args[args.index("--session-id" if "--session-id" in args else "--resume") + 1],
+             "tmux": "hub:@0." + os.environ["TMUX_PANE"], **change}}
+    os.makedirs(account + "/sessions", exist_ok=True)
+    open(f"{{account}}/sessions/{{os.getpid()}}.json", "w").write(json.dumps(entry))
+tty.setraw(0)
+os.write(1, b"\\x1b[?2004h")
+out = open({str(typed_after)!r}, "ab", buffering=0)
+while data := os.read(0, 4096):
+    out.write(data)
+    os.write(1, data.replace(b"\\x1b", b""))
+""")
+    (fake_bin / "claude").chmod(0o755)
+    # the panes' shell is sh, with no rc file in the scratch HOME, so the PATH the server starts with reaches the stand-in
+    shell_conf = SCRATCH / "shell.tmux.conf"
+    shell_conf.write_text("set -g default-shell /bin/sh\n")
+    hub.START_WAIT = 5
+    NEVER_REGISTERS = 1.5  # the wait where the stand-in never registers, which each such resume sits out whole
+    runs = lambda: [json.loads(line) for line in launched.read_text().splitlines()] if launched.exists() else []
+
+    def reached(expected: bytes) -> bytes:
+        """What reached the session once it ran, once it is what was expected or a few seconds have passed."""
+        deadline = time.monotonic() + 5
+        while (typed_after.read_bytes() if typed_after.exists() else b"") != expected and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return typed_after.read_bytes() if typed_after.exists() else b""
+
+    def started_as(answer: dict) -> tuple:
+        """What a start or resume answered, what it ran, and the unit of its session as the hub tab reads it."""
+        u = view(answer.get("unit") or "") or {}
+        return answer.get("unit"), runs()[-1] if runs() else None, u.get("state"), u.get("number") is not None
+
+    status_code, answer = hub.start({"project": str(alpha)})
+    no_server = lambda: subprocess.run([TMUX, "-S", TMUX_SOCKET, "list-sessions"], env=ENV, capture_output=True).returncode != 0
+    check("with no tmux server running, nothing is started, saying why, and no server with it",
+          (409, True, True), (status_code, "no tmux server runs" in answer.get("error", ""), no_server()))
+    # the server's PATH holds the stand-in; this process's, as every client's the hub runs, does not
+    subprocess.run([TMUX, "-S", TMUX_SOCKET, "-f", shell_conf, "new-session", "-d", "-s", "elsewhere", "-x", "100", "-y", "20"],
+                   env={**ENV, "PATH": f"{fake_bin}:{ENV['PATH']}"}, check=True)
+    try:
+        windows = lambda: tmux("list-windows", "-t", "=hub", "-F", "#{window_name}").splitlines()
+        status_code, answer = hub.start({"project": str(alpha), "account": str(HOME / ".claude"), "model": "opus", "effort": "high",
+                                         "mode": "auto", "prompt": "map the columns\nthen import"})
+        session = answer.get("unit") or ""
+        check("a session started from the hub tab runs Claude Code under an id the hub picked, with what the form picked, in "
+              "a new window of the tmux session hub, in its project",
+              (200, (session, {"args": ["--session-id", session, "--model", "opus", "--effort", "high", "--permission-mode", "auto"],
+                               "account": str(HOME / ".claude"), "cwd": str(alpha)}, "idle", True), ["alpha"]),
+              (status_code, started_as(answer), windows()))
+        pane_pid = tmux("display-message", "-p", "-t", answer.get("pane") or "", "#{pane_pid}")
+        check("...Claude Code the window's command, run by the default shell, interactive, as its child: what tmux-save "
+              "saves as the session's resume", ("/bin/sh -ic", True),
+              (tmux("display-message", "-p", "-t", answer.get("pane") or "", "#{pane_start_command}")[:11],
+               any(json.loads(f.read_text()).get("sessionId") == session
+                   for f in (HOME / ".claude/sessions").glob("*.json")
+                   if subprocess.run(["ps", "-o", "ppid=", "-p", str(json.loads(f.read_text())["pid"])],
+                                     capture_output=True, text=True).stdout.strip() == pane_pid)))
+        check("...takes its first prompt once it is idle, typed as the box types it, a paste with its lines as Enters", b"\x1b[200~map the columns\rthen import\x1b[201~\r",
+              reached(b"\x1b[200~map the columns\rthen import\x1b[201~\r"))
+        check("...and the form defaults to what it picked, the project and the prompt aside",
+              {"account": str(HOME / ".claude"), "model": "opus", "effort": "high", "mode": "auto"}, hub.start_form()["last"])
+        (HOME / ".claude-other" / "projects").mkdir(parents=True, exist_ok=True)
+        typed_after.unlink(missing_ok=True)
+        status_code, answer = hub.start({"project": str(gamma), "account": str(HOME / ".claude-other")})
+        check("a session started under another account with Claude Code's defaults runs under that config dir alone, in "
+              "another window there, and nothing is typed into it",
+              (200, (answer.get("unit"), {"args": ["--session-id", answer.get("unit")], "account": str(HOME / ".claude-other"),
+                                          "cwd": str(gamma)}, "idle", True), ["alpha", "gamma"], b""),
+              (status_code, started_as(answer), windows(), reached(b"")))
+        check("...as the form then offers it, the accounts with their projects", (str(HOME / ".claude-other"), "", True),
+              (hub.start_form()["last"]["account"], hub.start_form()["last"]["model"], str(HOME / ".claude-other") in hub.start_form()["accounts"]))
+        refusals = [hub.start({"project": str(HOME / "nowhere")}), hub.start({"project": str(alpha), "account": str(HOME / ".ssh")}),
+                    hub.start({"project": str(alpha), "effort": "huge"}), hub.start({"project": str(alpha), "model": "opus; rm -rf ~"})]
+        check("a start in no directory, under no account of the host's, or with an effort or model Claude Code does not take, "
+              "starts nothing", ([400] * 4, 2), ([c for c, _ in refusals], len(runs())))
+
+        # an ended session, as its transcript records where it ran, and, where `lines` are given, how
+        def ran(session: str, cwd: Path, account: str = ".claude", lines: tuple[dict, ...] = ()) -> None:
+            page(HOME / account / "projects" / f"-{cwd.name}" / f"{session}.jsonl", "".join(
+                json.dumps({"sessionId": session, **line}) + "\n" for line in ({"type": "user", "cwd": str(cwd), "entrypoint": "cli"}, *lines)))
+        ran(STRANGER, alpha, ".claude-other", (
+            {"type": "user", "permissionMode": "acceptEdits"},
+            {"type": "assistant", "effort": "high", "message": {"model": "claude-opus-5-5"}}))
+        check("an ended session's unit is among the ended", "ended", view(STRANGER)["state"])
+        status_code, answer = hub.resume({"unit": STRANGER})
+        check("an ended session resumes from its unit under its own id, in a new window, in the directory, under the "
+              "account and on the model, effort and permission mode its transcript records, and runs again, numbered on the rail",
+              (200, (STRANGER, {"args": ["--resume", STRANGER, "--model", "claude-opus-5-5", "--effort", "high", "--permission-mode", "acceptEdits"],
+                                "account": str(HOME / ".claude-other"), "cwd": str(alpha)}, "idle", True),
+               {"model": "claude-opus-5-5", "effort": "high", "mode": "acceptEdits"}, []),
+              (status_code, started_as(answer), answer.get("restored"), answer.get("defaulted")))
+        before = len(runs())
+        status_code, answer = hub.resume({"unit": STRANGER})
+        check("resuming a session that still runs is refused, the box saying why, and nothing is started",
+              (409, True, before), (status_code, "still runs" in answer.get("error", "") and answer["error"].count("hub:@0.%") == 1, len(runs())))
+        check("...and so is a session there is no transcript of", (409, True), (lambda r: (r[0], "no transcript" in r[1]["error"]))(hub.resume({"unit": UNKNOWN})))
+        ran(LOST, HOME / "removed-worktree")
+        check("...and one whose directory is gone", (409, True), (lambda r: (r[0], "is gone" in r[1]["error"]))(hub.resume({"unit": LOST})))
+        hub.START_WAIT = NEVER_REGISTERS
+        registers.write_text(json.dumps(None))
+        ran(LOST, gamma)
+        status_code, answer = hub.resume({"unit": LOST})
+        check("a resume whose session does not register in time says so, naming its pane", (409, True),
+              (status_code, "had not registered" in answer.get("error", "") and answer.get("pane", "") in answer.get("error", "")))
+        before = len(runs())
+        status_code, answer = hub.resume({"unit": LOST})
+        check("...and a resume of it again is refused while that pane is there, nothing started", (409, True, before),
+              (status_code, "has not registered it" in answer.get("error", ""), len(runs())))
+        hub.START_WAIT = 5
+        registered(LOST, file="lost")  # it registers there in the end, and a read of the hub sees it running
+        view(LOST)
+        (HOME / ".claude/sessions/lost.json").unlink()  # then it ends, its shell left in the pane
+        registers.write_text(json.dumps({}))
+        status_code, answer = hub.resume({"unit": LOST})
+        check("...until the hub has seen the session run, after which it resumes once it has ended", (200, LOST), (status_code, answer.get("unit")))
+        check("...on Claude Code's defaults where its transcript records no model, effort or permission mode, the answer "
+              "saying so", (["--resume", LOST], {}, ["model", "effort", "mode"]), (runs()[-1]["args"], answer.get("restored"), answer.get("defaulted")))
+
+        # a session of pc, which does not answer, forked here from pc's copy of it, as the hub on "laptop"
+        was = hub.HOST, hub.COPIES
+        hub.HOST, hub.PEERS["pc"], hub.COPIES = "laptop", SCRATCH / "pc-does-not-answer.sock", SCRATCH / "copies"
+        copied = hub.COPIES / "pc" / hub.USER
+        page(copied / ".claude/projects/-alpha" / f"{FORKED}.jsonl", "".join(json.dumps(line) + "\n" for line in (
+            {"type": "user", "sessionId": FORKED, "cwd": str(alpha), "entrypoint": "cli"},
+            {"type": "assistant", "sessionId": FORKED, "effort": "high", "message": {"model": "claude-opus-5-5"}})))
+        page(hub.COPIES / "pc" / f"{hub.USER}.pulled.json", json.dumps({"at": clock.now - 300, "home": "/home/max"}))
+        status_code, answer = hub.fork({"host": "pc", "session": FORKED})
+        fork = answer.get("unit") or ""
+        record = json.loads((HOME / ".claude/session-pages" / fork / "forked-from.json").read_text()) if fork else {}
+        check("a session of a host that does not answer forks here from its copy: Claude Code resumes the copied "
+              "transcript under a new id the hub picks, in a new window, in the session's directory, on how it last ran, "
+              "and runs, numbered on the rail",
+              (200, True, (fork, {"args": ["--session-id", fork, "--resume", FORKED, "--fork-session", "--model", "claude-opus-5-5",
+                                           "--effort", "high"], "account": str(HOME / ".claude"), "cwd": str(alpha)}, "idle", True)),
+              (status_code, fork != FORKED, started_as(answer)))
+        check("...the fork's page directory holding its record: the session it forks, of which host, from how far into "
+              "the copy's transcript", ("pc", FORKED, (copied / ".claude/projects/-alpha" / f"{FORKED}.jsonl").stat().st_size, "laptop"),
+              (record.get("host"), record.get("session"), record.get("point"), record.get("on")))
+        check("...and its stand-in page opening with the session it forks", True,
+              f'href="{(copied / ".claude/session-pages" / FORKED / "index.html").as_uri()}"' in hub.stand_in_page(view(fork)).decode())
+        (hub.HOST, hub.COPIES), _ = was, hub.PEERS.pop("pc")
+        registers.write_text(json.dumps("exit"))  # the second resume starts again only once the first saw the stand-in exit
+        ran(UNKNOWN, gamma)
+        first = hub.resume({"unit": UNKNOWN})
+        before = len(runs())
+        status_code, answer = hub.resume({"unit": UNKNOWN})
+        check("a resume whose Claude Code exited before it registered, its shell left in the pane, is not refused again",
+              (409, True, 409, before + 1), (first[0], "had not registered" in first[1].get("error", ""), status_code, len(runs())))
+        registers.write_text(json.dumps({"status": "waiting", "waitingFor": "dialog open"}))
+        typed_after.unlink(missing_ok=True)
+        status_code, answer = hub.start({"project": str(alpha), "prompt": "go"})
+        check("a session that starts blocked in its terminal is a unit, but takes no first prompt, the box saying why",
+              (409, "waiting", True, b""), (status_code, (view(answer.get("unit") or "") or {}).get("state"),
+                                            "dialog open" in answer.get("error", ""), reached(b"")))
+        registers.unlink()
+    finally:
+        stop_tmux()
+        for registry_file in [*HOME.glob(".claude*/sessions/*.json")]:  # the fake sessions' processes went with the server
+            if json.loads(registry_file.read_text()).get("tmux", "").startswith("hub:"):
+                registry_file.unlink()
 
     # --- a page on another origin: framed in its unit's output lane, or listed where it refuses framing
 
@@ -552,7 +769,7 @@ while data := os.read(0, 4096):
     def request(method: str, path: str, body: dict | None = None, headers: dict | None = None,
                 origin: str = ORIGIN, data: bytes | None = None) -> tuple[int, dict | bytes]:
         data = data if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(origin + path, data=data, method=method,
+        req = urllib.request.Request(path if path.startswith("http") else origin + path, data=data, method=method,
                                      headers={"Content-Type": "application/json", **(headers or {})})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
@@ -564,17 +781,51 @@ while data := os.read(0, 4096):
         except ValueError:
             return status, raw
 
+    LAPTOP = "https://zephylux.example.ts.net:8377"
+    """Where tailscale serve puts the test hub's port, as the laptop's hub serves it: tailscaled forwards a request
+    there to the port, keeping the Host the browser sent and adding X-Forwarded-Host and X-Forwarded-Proto."""
+    HUB_SOCKET = HOME / ".local/state/container-hub/hub.sock"
+    """Where the test's hub listens beside its port, and where the tools look for it: its default, under HOME."""
+
+    class SocketConnection(http.client.HTTPConnection):
+        def __init__(self, path: Path):
+            super().__init__("localhost", timeout=60)
+            self.path = path
+
+        def connect(self) -> None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(self.timeout)
+            self.sock.connect(str(self.path))
+
+    def over_socket(method: str, path: str, body: dict | None = None, headers: dict | None = None,
+                    hub_socket: Path = HUB_SOCKET) -> tuple[int, dict | bytes]:
+        """request(), on a hub's socket, as a local tool or tailscaled asks it."""
+        conn = SocketConnection(hub_socket)
+        try:
+            conn.request(method, path, None if body is None else json.dumps(body).encode(),
+                         {"Content-Type": "application/json", **(headers or {})})
+            answer = conn.getresponse()
+            status, raw = answer.status, answer.read()
+        finally:
+            conn.close()
+        try:
+            return status, json.loads(raw)
+        except ValueError:
+            return status, raw
+
     def start() -> subprocess.Popen:
-        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--state", str(hub.STATE), *HUB_FLAGS],
+        started = subprocess.Popen([BIN / "container-hub", "--port", str(PORT), "--tailnet", LAPTOP, "--state", str(hub.STATE), *HUB_FLAGS],
                                    env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "hub.log").open("a"), start_new_session=True)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and started.poll() is None:
             try:
                 socket.create_connection(("127.0.0.1", PORT), timeout=1).close()
-                break
+                return started
             except OSError:
                 time.sleep(0.1)
-        return started
+        # the log goes with the scratch directory, so the reason goes here
+        why = "exited" if started.poll() is not None else "did not listen within 60 s"
+        raise RuntimeError(f"the hub {why} at start:\n{(SCRATCH / 'hub.log').read_text()}")
 
     def stop(proc: subprocess.Popen) -> None:
         os.killpg(proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
@@ -621,7 +872,10 @@ while data := os.read(0, 4096):
 
     # --- the routes, and who may use them
 
-    check("/.health says diffview pages can save", (200, {"saves": True}), request("GET", "/.health"))
+    check("/.health says diffview pages can save, and where the hub tab is", (200, {"saves": True, "url": ORIGIN}), request("GET", "/.health"))
+    with urllib.request.urlopen(f"{ORIGIN}/.health", timeout=10) as health:
+        check("/.health is readable from hub.mwolf.dev alone, which tells by it a hub that answers",
+              "https://hub.mwolf.dev", health.headers.get("Access-Control-Allow-Origin"))
     check("the hub tab is served at the root, and at a unit", (200, 200, True),
           (request("GET", "/")[0], request("GET", f"/u/{WORKER}")[0], b"trellis" in request("GET", "/")[1]))
     old_view = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
@@ -661,16 +915,17 @@ while data := os.read(0, 4096):
         registered(ANSWERER, pid=int(pane_pid), started=start_of(pane_pid), tmux=f"guarded:@0.{pane}")
         TMUX_CALLS.write_text("")
         acting = [("/api/type", {"unit": ANSWERER, "text": "rm -rf ~"}), ("/api/jump", {"unit": ANSWERER}),
-                  ("/api/close-panes", {"unit": ANSWERER}), ("/api/hand-off", {"unit": ANSWERER, "offer": "write"})]
-        check("a page the hub serves can neither type, jump, close nor hand off without the tab's token, the session idle in its pane",
-              ([403] * 8, set(), b"", True),
+                  ("/api/close-panes", {"unit": ANSWERER}), ("/api/hand-off", {"unit": ANSWERER, "offer": "write"}),
+                  ("/api/start", {"project": str(alpha)}), ("/api/resume", {"unit": STRANGER})]
+        check("a page the hub serves can neither type, jump, close, hand off, start nor resume without the tab's token, the "
+              "session idle in its pane", ([403] * 12, set(), b"", True),
               ([request("POST", route, body, {"Origin": ORIGIN, "X-Hub-Token": t})[0] for route, body in acting for t in ("", "guessed")],
                acted(), arrives(b""), pane in tmux("list-panes", "-a", "-F", "#{pane_id}").split()))
         check("...which the tab's token types into", (200, b"\x1b[200~go on\x1b[201~\r"),
               (request("POST", "/api/type", {"unit": ANSWERER, "text": "go on"}, {"Origin": ORIGIN, "X-Hub-Token": token})[0],
                arrives(b"\x1b[200~go on\x1b[201~\r")))
     finally:
-        subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+        stop_tmux()
     dropped = lambda unit, t=token: request("POST", f"/api/drop?unit={unit}&name=x.png", None,
                                             {"Origin": ORIGIN, "X-Hub-Token": t, "Content-Type": "application/octet-stream"}, data=b"x")
     check("...nor drop a file into a box", (403, 403), (dropped(ANSWERER, "")[0], dropped(ANSWERER, "guessed")[0]))
@@ -728,14 +983,14 @@ while data := os.read(0, 4096):
     # what a local tool shares: a directory of pages, or a page, served without joining a unit
     rendered_dir = page(SCRATCH / "rendered pages" / "nested" / "review.html")  # a space, which a url spells encoded
     status_code, shared = request("POST", "/api/serve", {"path": str(rendered_dir.parents[1])})
-    check("a local tool shares a directory and gets its address", (200, served(rendered_dir.parents[1]) + "/"),
+    check("a local tool shares a directory and gets its address", (200, ORIGIN + served(rendered_dir.parents[1]) + "/"),
           (status_code, shared.get("url")))
     check("...under which every page is served", 200, request("GET", shared["url"] + "nested/review.html")[0])
     check("...and the directory's address lists them, linked relative to it", True, b'href="nested/review.html"' in request("GET", shared["url"])[1])
     bare = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
-    bare.request("GET", shared["url"].rstrip("/"))
+    bare.request("GET", shared["url"].removeprefix(ORIGIN).rstrip("/"))
     moved = bare.getresponse()
-    check("...an address without the trailing slash is sent to the one with it", (301, shared["url"]),
+    check("...an address without the trailing slash is sent to the one with it", (301, shared["url"].removeprefix(ORIGIN)),
           (moved.status, moved.getheader("Location")))
     bare.close()
     check("a shared directory joins no unit", False,
@@ -755,7 +1010,7 @@ while data := os.read(0, 4096):
     check("...while the rest of home stays unserved", 403, request("GET", served(HOME / "beside-notes.html"))[0])
     in_temp = page(TEMP_PAGE)
     beside_temp = page(TEMP_PAGE.with_name(TEMP_PAGE.stem + "-beside.html"))
-    serving = subprocess.run([BIN / "diffview", "--serve", str(in_temp)], env={**ENV, "CONTAINER_HUB_PORT": str(PORT)},
+    serving = subprocess.run([BIN / "diffview", "--serve", str(in_temp)], env=ENV,
                              capture_output=True, text=True, timeout=120)
     temp_url = serving.stdout.split(" at ")[-1].strip()
     check("diffview --serve takes a page sitting directly in the temp dir", (0, 200),
@@ -875,6 +1130,30 @@ while data := os.read(0, 4096):
         pass
     check("an open tells a listening hub tab to reload the page, in its unit", ("reopened", WORKER, a["id"]),
           tuple(json.loads(line[5:])[k] for k in ("type", "unit", "id")))
+    tapped = page(alpha / "agent/show/csv-import/tapped.html")
+    status_code, answer = request("POST", "/api/open", {"unit": WORKER, "target": str(tapped), "by": "user", "aside": True}, {"Origin": ORIGIN})
+    while not (line := events.readline().decode()).startswith("data:"):
+        pass
+    check("a link tapped on the phone joins its unit minimized, and tells the hub tabs it is listed, opening nothing",
+          (200, "listed", None, ("listed", WORKER, answer["id"]), [True]),
+          (status_code, answer["action"], answer["open"], tuple(json.loads(line[5:])[k] for k in ("type", "unit", "id")),
+           [m["closed"] for m in members(WORKER) if m["id"] == answer["id"]]))
+    before = next(m for m in members(WORKER) if m["id"] == a["id"])
+    answer = request("POST", "/api/open", {"unit": WORKER, "target": str(alpha / "agent/show/csv-import/index.html"), "by": "user", "aside": True},
+                     {"Origin": ORIGIN})[1]
+    tapped_too = page(alpha / "agent/show/csv-import/tapped-too.html")
+    listed = request("POST", "/api/open", {"unit": WORKER, "target": str(tapped_too), "by": "user", "aside": True}, {"Origin": ORIGIN})[1]
+    while not (line := events.readline().decode()).startswith("data:"):
+        pass
+    check("...and one to a page the unit has open leaves it as it was, telling the hub tabs nothing", ("kept", before, listed["id"]),
+          (answer["action"], next(m for m in members(WORKER) if m["id"] == a["id"]), json.loads(line[5:])["id"]))
+    minimized = next(m for m in members(WORKER) if m["id"] == listed["id"])
+    request("POST", "/api/open", {"unit": WORKER, "target": str(tapped_too), "by": "user", "aside": True}, {"Origin": ORIGIN})
+    while not (line := events.readline().decode()).startswith("data:"):
+        pass
+    retapped = next(m for m in members(WORKER) if m["id"] == listed["id"])
+    check("...while one it has minimized stays minimized, now the one minimized last", ("listed", True, True),
+          (json.loads(line[5:])["type"], retapped["closed"], retapped["closed_at"] > minimized["closed_at"]))
     events.close()
     events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
     events.readline()
@@ -930,12 +1209,13 @@ while data := os.read(0, 4096):
     local_state.parent.mkdir(parents=True)
     local_state.write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Personal"}}}}))
 
-    def browse(*args: str, cwd: Path = gamma, port: int = PORT, **sessions: str) -> list[str]:
-        """What claude-browser handed the browser; what it said on the way is in browse.said."""
+    def browse(*args: str, cwd: Path = gamma, hub_socket: Path | None = None, **sessions: str) -> list[str]:
+        """What claude-browser handed the browser; what it said on the way is in browse.said. It finds the hub on the
+        socket the test's hub takes by default, under HOME, unless given another."""
         record.unlink(missing_ok=True)
         browse.said = subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=True, capture_output=True, timeout=30, text=True,
-                                     env={**ENV, "CONTAINER_HUB_PORT": str(port), "CLAUDE_CODE_SESSION_ID": WORKER, **sessions,
-                                          "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
+                                     env={**ENV, **({"CONTAINER_HUB_SOCKET": str(hub_socket)} if hub_socket else {}),
+                                          "CLAUDE_CODE_SESSION_ID": WORKER, **sessions, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
         return record.read_text().splitlines() if record.exists() else []
 
     fresh = page(gamma / "agent/show/one-flow/figure.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
@@ -1000,12 +1280,12 @@ while data := os.read(0, 4096):
     elsewhere.shutdown()
     tab_came_and_went()
     unprofiled = subprocess.run([BIN / "claude-browser", str(by_origin)], cwd=gamma, capture_output=True,
-                                timeout=30, text=True, env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CONFIG_DIR": str(HOME / ".claude-nobody"),
+                                timeout=30, text=True, env={**ENV, "CLAUDE_CONFIG_DIR": str(HOME / ".claude-nobody"),
                                                             "CLAUDE_CODE_SESSION_ID": WORKER, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     check("a hub tab that has no Brave profile to open in is not said to open: only why not", (1, False, True),
           (unprofiled.returncode, "in unit" in unprofiled.stderr, "no profile named 'nobody'" in unprofiled.stderr))
     refused = subprocess.run([BIN / "claude-browser", "--nope", str(by_origin)], capture_output=True, text=True, timeout=30,
-                             env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+                             env={**ENV, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     check("claude-browser refuses an option it does not have, naming it", (1, True),
           (refused.returncode, "no option --nope" in refused.stderr))
     lane_page = page(gamma / "agent/show/one-flow/demo.html")
@@ -1016,7 +1296,7 @@ while data := os.read(0, 4096):
     check("...as does --lane=<lane>", "code", in_lane())
     record.unlink(missing_ok=True)
     no_lane = subprocess.run([BIN / "claude-browser", "--lane", "diff", str(lane_page)], capture_output=True, text=True, timeout=30,
-                             env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+                             env={**ENV, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     check("...and refuses a lane there is none of, opening nothing", (1, True, False, "code"),
           (no_lane.returncode, "no lane 'diff'" in no_lane.stderr, record.exists(), in_lane()))
     usage_text = subprocess.run([BIN / "claude-browser", "--help"], capture_output=True, text=True, timeout=30).stdout
@@ -1038,10 +1318,10 @@ while data := os.read(0, 4096):
         def log_message(self, *_):
             pass
 
-    other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NotAHub)
+    other = hub.ThreadingUnixServer(str(SCRATCH / "other.sock"), NotAHub)
     threading.Thread(target=other.serve_forever, daemon=True).start()
-    check("a service on the hub's port that answers 200 but is no hub: a plain tab", ["--profile-directory=Default", f"file://{fresh}"],
-          browse(str(fresh), port=other.server_address[1]))
+    check("a service on the hub's socket that answers 200 but is no hub: a plain tab", ["--profile-directory=Default", f"file://{fresh}"],
+          browse(str(fresh), hub_socket=SCRATCH / "other.sock"))
     check("...and claude-browser says so", True, "no container hub" in browse.said)
     other.shutdown()
 
@@ -1074,7 +1354,7 @@ while data := os.read(0, 4096):
     (worktree / "notes.txt").write_text("one\ntwo\n")
     watcher = subprocess.Popen([BIN / "diffview", f"{worktree}@HEAD..", "--watch", "--open", "--no-auto-summary"],
                                cwd=alpha, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                               env={**ENV, "CONTAINER_HUB_PORT": str(PORT), "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
+                               env={**ENV, "CLAUDE_CODE_SESSION_ID": ORCHESTRATOR,
                                     "DIFFVIEW_BROWSER": "claude-browser", "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
     try:
         while (line := watcher.stdout.readline()) and "watching" not in line:
@@ -1164,6 +1444,97 @@ while data := os.read(0, 4096):
         check("...which is as it was", listed, served_list.read_text())
     else:
         skipped("the unreadable-file checks", "root reads a file of mode 0")
+
+    # --- the socket: how the host's own tools reach the hub, and what `tailscale serve` puts on the tailnet. tailscaled
+    # asks the socket as Host localhost, and says the address the browser asked at in X-Forwarded-Host.
+
+    TAILNET = "https://pc.example.ts.net:8377"
+    forwarded = {"X-Forwarded-Host": TAILNET.removeprefix("https://"), "X-Forwarded-Proto": "https"}
+    check("the hub's socket opens to its own user alone", 0o600, stat.S_IMODE(HUB_SOCKET.stat().st_mode))
+    served_tab = lambda dest: over_socket("GET", f"/u/{WORKER}", headers={**forwarded, "Sec-Fetch-Dest": dest})[1].decode()
+    check("the hub tab loaded through tailscale serve carries the token, and a page in it fetching the tab gets none",
+          (token, ""), (token_in(served_tab("document")), token_in(served_tab("empty"))))
+    visit = lambda headers: over_socket("POST", "/api/visit", {"unit": WORKER}, headers)[0]
+    check("a write from the tab on the tailnet is taken, and one from another site, or from no tailnet tab, refused",
+          (200, 403, 403, 403), (visit({**forwarded, "Origin": TAILNET}), visit({**forwarded, "Origin": "http://attacker.example"}),
+                                 visit({**forwarded, "Origin": ORIGIN}), visit({"Origin": TAILNET})))
+    jump = lambda token_sent: over_socket("POST", "/api/jump", {"unit": WORKER}, {**forwarded, "Origin": TAILNET, "X-Hub-Token": token_sent})
+    check("the tab on the tailnet acts on a session with the tab's token alone, which takes it to the hub's own reason",
+          (403, 409), (jump("")[0], jump(token)[0]))
+    by_tailnet = over_socket("POST", "/api/open", {"target": TAILNET + served(note), "unit": ORCHESTRATOR, "by": "user"},
+                             {**forwarded, "Origin": TAILNET})[1]
+    check("a link in the tab on the tailnet to a page the hub serves there is that page, already a member", (ORCHESTRATOR, "reopened"),
+          (by_tailnet.get("unit"), by_tailnet.get("action")))
+    on_tailnet = page(HOME / "on-tailnet.html")
+    over_socket("POST", "/api/serve", {"path": str(on_tailnet)})
+    saving = served(on_tailnet) + ".state.json"
+    check("a diffview page in the tab on the tailnet saves its comments, and a page of another site does not", (204, 403),
+          (over_socket("POST", saving, {**state, "savedAt": 2}, {**forwarded, "Origin": TAILNET})[0],
+           over_socket("POST", saving, {**state, "savedAt": 3}, {**forwarded, "Origin": "http://attacker.example"})[0]))
+    # the laptop's hub, whose user may serve a port but not a socket: tailscale serve puts its port on the tailnet
+    laptop = {"Host": LAPTOP.removeprefix("https://"), "X-Forwarded-Host": LAPTOP.removeprefix("https://"), "X-Forwarded-Proto": "https"}
+    laptop_tab = lambda dest: request("GET", f"/u/{WORKER}", headers={**laptop, "Sec-Fetch-Dest": dest})[1].decode()
+    check("the hub tab tailscale serve forwards to the port carries the token, and a page in it fetching the tab gets none",
+          (token, ""), (token_in(laptop_tab("document")), token_in(laptop_tab("empty"))))
+    port_visit = lambda headers: request("POST", "/api/visit", {"unit": WORKER}, headers)[0]
+    rebound = {"Host": f"attacker.example:{PORT}", "X-Forwarded-Host": laptop["Host"], "X-Forwarded-Proto": "https"}
+    check("a write from that tab is taken, and one from another site refused", (200, 403),
+          (port_visit({**laptop, "Origin": LAPTOP}), port_visit({**laptop, "Origin": "http://attacker.example"})))
+    by_laptop = request("POST", "/api/open", {"target": LAPTOP + served(note), "unit": ORCHESTRATOR, "by": "user"},
+                        {**laptop, "Origin": LAPTOP})[1]
+    check("...and a link in it to a page the hub serves there is that page, already a member", (ORCHESTRATOR, "reopened"),
+          (by_laptop.get("unit"), by_laptop.get("action")))
+    check("a page that pointed its own name at the port reads nothing, though it sends the tailnet's X-Forwarded-Host",
+          (403, 403), (request("GET", "/api/hub", headers=rebound)[0], request("GET", member_url, headers=rebound)[0]))
+    too_long = SCRATCH / ("s" * (108 - len(os.fsencode(SCRATCH)) - 1))  # 108 bytes in all
+    refused = subprocess.run([BIN / "container-hub", "--socket", str(too_long), "--port", str(free_port()),
+                              "--state", str(SCRATCH / "long-state")], env=ENV, capture_output=True, text=True, timeout=120)
+    check("a hub whose socket path is longer than a unix socket holds exits, naming the path and the limit", (1, True, True),
+          (refused.returncode, str(too_long) in refused.stderr, "107" in refused.stderr))
+    second = subprocess.run([BIN / "container-hub", "--port", str(free_port()), "--state", str(SCRATCH / "second-state")],
+                            env=ENV, capture_output=True, text=True, timeout=120)
+    check("a second hub on the socket exits, saying so, and the first still answers there", (1, True, 200),
+          (second.returncode, "another hub listens" in second.stderr, over_socket("GET", "/.health")[0]))
+
+    # pc's hub: no port, since other users run beside max there, and an address where tailscale serve puts its socket
+    pc_socket = SCRATCH / "pc.sock"
+    pc_hub = subprocess.Popen([BIN / "container-hub", "--socket", str(pc_socket), "--url", TAILNET, "--state", str(SCRATCH / "pc-state"),
+                               *HUB_FLAGS], env=ENV, stdout=subprocess.DEVNULL, stderr=(SCRATCH / "pc-hub.log").open("w"),
+                              start_new_session=True)
+
+    def pc_answers() -> dict | None:
+        try:
+            return over_socket("GET", "/.health", hub_socket=pc_socket)[1]
+        except OSError:
+            return None
+
+    try:
+        settles("a hub given an address and no port, as pc runs one, names that address", {"saves": True, "url": TAILNET},
+                pc_answers, within=60)
+        check("...and listens on no TCP port", [], listening_ports(pc_hub.pid))
+        on_pc = page(gamma / "agent/show/one-flow/on-pc.html")
+        check("claude-browser hands it a page, and with no hub tab listening opens the hub tab at that address",
+              ["--profile-directory=Default", f"{TAILNET}/u/{WORKER}"], [x.split("#")[0] for x in browse(str(on_pc), hub_socket=pc_socket)])
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.connect(str(pc_socket))
+        listener.sendall(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        listener.recv(4096)
+        listener.close()
+        time.sleep(2)  # a tab that came and went: the next open launches one at once; the hub looks once a second
+        no_brave = ":".join(d for d in [str(BIN), *ENV["PATH"].split(":")] if not (Path(d) / "brave").exists())
+        brave_less = subprocess.run([BIN / "claude-browser", str(page(gamma / "agent/show/one-flow/no-brave.html"))], cwd=gamma,
+                                    capture_output=True, text=True, timeout=30,
+                                    env={**ENV, "CONTAINER_HUB_SOCKET": str(pc_socket), "CLAUDE_CODE_SESSION_ID": WORKER, "PATH": no_brave})
+        check("on a host with no Brave, claude-browser says where the hub tab is that shows the page the hub took", (0, True, True),
+              (brave_less.returncode, f"in unit {WORKER}" in brave_less.stderr, f"open {TAILNET}/u/{WORKER}#" in brave_less.stderr))
+        pc_served = subprocess.run([BIN / "diffview", "--serve", str(alone)], env={**ENV, "CONTAINER_HUB_SOCKET": str(pc_socket)},
+                                   capture_output=True, text=True, timeout=120)
+        check("diffview --serve gives the page's address there", f"diffview: serving {alone} at {TAILNET}{served(alone)}",
+              pc_served.stdout.strip())
+    finally:
+        os.killpg(pc_hub.pid, signal.SIGKILL)
+        pc_hub.wait()
+
     # --- a hub as its user service runs it: no tracker on PATH, the mx plugin's under HOME; and here no diffview beside it
 
     lone_bin = SCRATCH / "lone-bin"
@@ -1181,7 +1552,8 @@ while data := os.read(0, 4096):
     (cache / "1.0.10/skills/session-page/session_page.py").write_text("def read_session(directory, transcript):\n    pass\n")
     service_port = free_port()
     service_hub = subprocess.Popen(
-        [lone_bin / "container-hub", "--port", str(service_port), "--state", str(SCRATCH / "service-state"), *HUB_FLAGS],
+        [lone_bin / "container-hub", "--socket", str(SCRATCH / "service.sock"), "--port", str(service_port),
+         "--state", str(SCRATCH / "service-state"), *HUB_FLAGS],
         env={**ENV, "HOME": str(service_home), "PATH": ":".join(d for d in ENV["PATH"].split(":") if not (Path(d) / "tracker").exists())},
         stdout=subprocess.DEVNULL, stderr=(SCRATCH / "service-hub.log").open("w"), start_new_session=True)
     try:
@@ -1199,7 +1571,8 @@ while data := os.read(0, 4096):
               service("GET", f"/api/u/{WORKER}")[1].get("tree"))
         check("...and with a session page reader it cannot use, marks nothing and serves the rail all the same",
               (200, None, ""), (lambda r: (r[0], r[1].get("needs_you"), r[1].get("status_line")))(service("GET", f"/api/u/{WORKER}")))
-        check("a hub with no diffview beside it says its pages cannot save", (200, {"saves": False}), service("GET", "/.health"))
+        check("a hub with no diffview beside it says its pages cannot save", (200, {"saves": False, "url": f"http://127.0.0.1:{service_port}"}),
+              service("GET", "/.health"))
     finally:
         os.killpg(service_hub.pid, signal.SIGKILL)
         service_hub.wait()
@@ -1237,9 +1610,11 @@ esac
     typed = lambda: (fake / "typed").read_text().splitlines() if (fake / "typed").exists() else []
     new_port = free_port()
     new_origin = f"http://127.0.0.1:{new_port}"
+    new_socket = SCRATCH / "new-hub.sock"
 
     def start_new() -> subprocess.Popen:
-        started = subprocess.Popen([new_bin / "container-hub", "--port", str(new_port), "--state", str(SCRATCH / "new-state"), *HUB_FLAGS],
+        started = subprocess.Popen([new_bin / "container-hub", "--socket", str(new_socket), "--port", str(new_port),
+                                    "--state", str(SCRATCH / "new-state"), *HUB_FLAGS],
                                    env={**ENV, "PATH": f"{fake / 'bin'}:{ENV['PATH']}"}, stdout=subprocess.DEVNULL,
                                    stderr=(SCRATCH / "new-hub.log").open("a"), start_new_session=True)
         settles("the hub from its own bin/ starts", True, lambda: started.poll() is None and answers(), within=60)
@@ -1264,11 +1639,11 @@ esac
     new_hub = start_new()
     try:
         settles("a session due a newer mx has /reload-plugins typed in at the hub's start", [f"{first} /reload-plugins"], typed)
-        serving = server_of(new_hub)
+        serving, bound = server_of(new_hub), new_socket.stat().st_ino
         events = urllib.request.urlopen(f"{new_origin}/events", timeout=30)
         connected(events)
-        script = (new_bin / "container-hub").read_text().replace('self.send_json({"saves": diffview is not None})',
-                                                                 'self.send_json({"saves": diffview is not None, "new": True})')
+        script = (new_bin / "container-hub").read_text().replace('{"saves": diffview is not None, "url": URL}',
+                                                                 '{"saves": diffview is not None, "new": True}')
         (new_bin / "container-hub").write_text(script)
         edited = time.monotonic()
         ended = ends(events, 20)
@@ -1280,6 +1655,9 @@ esac
               (connected(reconnect), request("GET", "/.health", origin=new_origin)))
         reconnect.close()
         check("...in the hub's own process, under the one uv that started it", serving, server_of(new_hub))
+        check("...and on the socket it had, as well as its port, so a tool asking meanwhile waits rather than finds none",
+              (200, {"saves": True, "new": True}, bound),
+              (*over_socket("GET", "/.health", hub_socket=new_socket), new_socket.stat().st_ino))
         (new_bin / "container-hub").write_text(script + "\ndef half_written(\n")
         time.sleep(4)  # a watch round, and the wait for a whole file, twice over
         check("a script that does not compile leaves the hub on the code it runs", (None, (200, {"saves": True, "new": True})),
@@ -1303,6 +1681,25 @@ esac
         for process in processes:
             process.kill()
             process.wait()
+    # a hub from before the socket, which its unit started with no flags, runs this code once it lands on disk: what it
+    # hands over is its listening port's descriptor alone, and its argv names no port
+    before = socket.create_server(("127.0.0.1", 0))
+    before.set_inheritable(True)
+    before_origin = f"http://127.0.0.1:{before.getsockname()[1]}"
+    rolled_socket = SCRATCH / "rolled.sock"
+    rolled = subprocess.Popen([BIN / "container-hub", "--state", str(SCRATCH / "rolled-state"), *HUB_FLAGS], pass_fds=(before.fileno(),),
+                              env={**ENV, "CONTAINER_HUB_LISTENING": str(before.fileno()), "CONTAINER_HUB_SOCKET": str(rolled_socket)},
+                              stdout=subprocess.DEVNULL, stderr=(SCRATCH / "rolled.log").open("w"), start_new_session=True)
+    before.close()
+    try:
+        settles("a hub from before the socket that takes up this code keeps answering on its port, under the address it had",
+                (200, {"saves": True, "url": before_origin}),
+                lambda: request("GET", "/.health", origin=before_origin) if rolled.poll() is None else rolled.poll(), within=60)
+        check("...and listens on its socket too", 200, over_socket("GET", "/.health", hub_socket=rolled_socket)[0])
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(rolled.pid, signal.SIGKILL)
+        rolled.wait()
     check("no tmux call, the hub's or the test's, went to a server other than the test's own", "",
           TMUX_REFUSED.read_text() if TMUX_REFUSED.exists() else "")
 finally:
@@ -1311,7 +1708,7 @@ finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(hub_proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
         hub_proc.wait()
-    subprocess.run([TMUX, "-S", TMUX_SOCKET, "kill-server"], env=ENV, capture_output=True, check=False)
+    stop_tmux()
     shutil.rmtree(SCRATCH, ignore_errors=True)
 
 finish()

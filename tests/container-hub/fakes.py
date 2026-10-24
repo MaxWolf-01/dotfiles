@@ -9,12 +9,16 @@ disk goes: main()'s own start-up (the old containers moved in, each unit repaire
 """
 
 import atexit
+import http.client
+import importlib.machinery
 import itertools
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -25,6 +29,24 @@ from pathlib import Path
 from check import BIN, bin_module  # tests/ is on sys.path in every test that imports this
 
 LOADS = itertools.count()
+
+
+def compiled_once(compile_source):
+    """A loader's source_to_code, compiled once per source text. A test loads the hub anew for every restart it
+    plays, and the hub loads diffview and the mx plugin's modules as it does: compiled every time, that was most of
+    a property's run. The hub writes no bytecode, so nothing else would keep them."""
+    codes = {}
+
+    def source_to_code(self, data, path, *args, **kwargs):
+        key = (bytes(data), str(path))
+        if key not in codes:
+            codes[key] = compile_source(self, data, path, *args, **kwargs)
+        return codes[key]
+
+    return source_to_code
+
+
+importlib.machinery.SourceFileLoader.source_to_code = compiled_once(importlib.machinery.SourceFileLoader.source_to_code)
 
 TICKET = "---\nstatus: {status}\n{parent}priority: 2\nsize: S\n---\n\n# {title}\n\n## Brief\n\n{brief}\n\n## Acceptance criteria\n\n## Comments\n"
 
@@ -112,10 +134,104 @@ served = lambda path: "/f" + urllib.parse.quote(str(path))
 """The address the hub serves a file at."""
 
 SELF_STARTED = started()
-RUN = Path(tempfile.mkdtemp(prefix="container-hub-test."))
-"""Every world's scratch directory, gone when the test ends."""
+RUN = Path(tempfile.mkdtemp(prefix="container-hub-test.", dir="/tmp"))
+"""Every world's scratch directory, gone when the test ends. In /tmp whatever $TMPDIR is: a world's HOME holds the
+hub's default socket, and under a deep TMPDIR such as the laptop devShell's (/var/tmp/nix-shell.XXXXXX) its path is
+too long for a unix socket."""
 atexit.register(shutil.rmtree, RUN, ignore_errors=True)
 WORLDS: list["World"] = []
+
+
+class Hub:
+    """A hub process on a HOME of its own under `scratch`, listening on its socket, with no tmux server to type into:
+    a host as another host's hub reaches it."""
+
+    def __init__(self, scratch: Path, name: str, *flags: str):
+        self.name, self.home, self.log = name, scratch / name / "home", scratch / f"{name}.log"
+        self.home.mkdir(parents=True)
+        self.socket = scratch / name / "hub.sock"
+        self.argv = [str(BIN / "container-hub"), "--socket", str(self.socket), "--state", str(scratch / name / "state"),
+                     "--host", name, "--tmux-socket", str(scratch / name / "no-tmux.sock"), *flags]
+        self.env = scrubbed(self.home)
+        self.proc = None
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(self.argv, env=self.env, stdout=subprocess.DEVNULL, stderr=self.log.open("a"),
+                                     start_new_session=True)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and self.proc.poll() is None:
+            try:
+                with socket.socket(socket.AF_UNIX) as s:
+                    s.connect(str(self.socket))
+                return
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError(f"{self.name}'s hub did not listen:\n{self.log.read_text()}")
+
+    def stop(self) -> None:
+        os.killpg(self.proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
+        self.proc.wait()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(self.proc.pid, 0)
+                time.sleep(0.05)
+            except ProcessLookupError:
+                break
+
+    def running(self, session: str) -> subprocess.Popen:
+        """A process of `session`, registered as Claude Code registers the one it runs, idle. Not this test's
+        process, which a worker may run, and a hub leaves a dispatched worker's session off its rail."""
+        process = subprocess.Popen(["sleep", "600"], env={k: v for k, v in self.env.items() if k != "DISPATCH_WORKLOG"})
+        entry = self.home / ".claude" / "sessions" / f"{process.pid}.json"
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(json.dumps({"pid": process.pid, "procStart": started(process.pid), "sessionId": session,
+                                     "status": "idle", "statusUpdatedAt": int(time.time() * 1000), "cwd": str(self.home)}))
+        return process
+
+
+class Unix(http.client.HTTPConnection):
+    """HTTP to a hub over its socket, as a local tool speaks to it."""
+
+    def __init__(self, path: Path):
+        super().__init__("hub", timeout=30)
+        self.path_ = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.connect(str(self.path_))
+
+
+def request(to: int | Path, method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60):
+    """(status, headers, body as JSON where it parses) of a request to a hub: at its port on 127.0.0.1, as a browser
+    reaches it, or at its socket, as a local tool does. A body of bytes goes as it is, any other as JSON."""
+    conn = Unix(to) if isinstance(to, Path) else http.client.HTTPConnection("127.0.0.1", to, timeout=timeout)
+    data = body if isinstance(body, bytes) or body is None else json.dumps(body).encode()
+    conn.request(method, path, body=data, headers={"Content-Type": "application/json", **(headers or {})})
+    r = conn.getresponse()
+    raw = r.read()
+    conn.close()
+    try:
+        return r.status, r.headers, json.loads(raw)
+    except ValueError:
+        return r.status, r.headers, raw
+
+
+def token(port: int) -> str:
+    """The token a hub hands its hub tab at its load, which the tab acts with."""
+    page = request(port, "GET", "/")[2].decode()
+    return page.split('name="hub-token" content="', 1)[1].split('"', 1)[0]
+
+
+def transcript(session: str, cwd: Path, *more: dict, branch: str = "ticket/x") -> str:
+    """A transcript as Claude Code writes one, in short: where it ran and on which branch, then `more`."""
+    return "".join(json.dumps(line, separators=(",", ":")) + "\n" for line in (
+        {"type": "user", "sessionId": session, "cwd": str(cwd), "gitBranch": branch, "entrypoint": "cli",
+         "message": {"role": "user", "content": "go"}}, *more))
+
+
+TURN_END = {"type": "system", "subtype": "turn_duration", "durationMs": 1000}
+"""The line Claude Code ends a turn with."""
 
 
 class World:
@@ -137,6 +253,8 @@ class World:
         self.temp.mkdir()  # beside HOME and not around it, so each guard is checked on its own
         self.port = port
         """The port the hub takes for its own, so that one of its addresses names a page it serves."""
+        self.origins = (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+        """The hub's own origins, as a request on that port knows them: the hub tab's first."""
         self.tmux_socket = self.scratch / "tmux.sock"
         self.tmux_refused, self.tmux_calls = self.scratch / "tmux-refused", self.scratch / "tmux-calls"
         shim = self.scratch / "shim" / "tmux"
@@ -166,6 +284,7 @@ exit 1
         self.hub = load(self.clock, (self.scratch / "state").resolve())
         self.hub.STATE.mkdir()
         self.hub.TMUX_SOCKET = self.tmux_socket
+        self.hub.URL = self.origins[0]
         WORLDS.append(self)
 
     def refused(self) -> str:
@@ -256,11 +375,11 @@ exit 1
 
     def opened(self, target, session: str | None = None, **body) -> dict:
         """What the hub answers an agent that opens a page, as claude-browser asks it."""
-        return self.hub.open_page({"target": str(target), **({"session": session} if session else {}), **body}, self.port, from_page=False)[1]
+        return self.hub.open_page({"target": str(target), **({"session": session} if session else {}), **body}, self.origins, from_page=False)[1]
 
     def clicked(self, target, unit: str, **body) -> dict:
         """What the hub answers the hub tab for a link clicked in a page of the unit."""
-        return self.hub.open_page({"target": str(target), "unit": unit, "by": "user", **body}, self.port, from_page=True)[1]
+        return self.hub.open_page({"target": str(target), "unit": unit, "by": "user", **body}, self.origins, from_page=True)[1]
 
     def rail(self) -> list[dict]:
         return self.hub.hub_view()["units"]

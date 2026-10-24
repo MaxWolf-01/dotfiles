@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# tier: full-path (tmux, systemd)
+# A save comes back with its Claude Code session resumed, through
+# nix/home/tmux-restore.sh as `tms` runs it and through pc's tmux-server unit as
+# max's systemd starts it at boot, both under his tmux.conf as built for pc. Run
+# it directly; no framework.
+#
+# Every server runs under a scratch HOME and TMUX_TMPDIR. The panes' shell puts
+# a `claude` first on PATH that prints how it was started, as zsh on pc puts its
+# own PATH over the unit's.
+
+set -uo pipefail
+unset TMUX XDG_CONFIG_HOME  # inside tmux, every client here would talk to that server
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$repo/tests/check.sh"
+needs nix tmux jq
+
+built() {  # home-manager file name -> its store path, built
+    local expr="\"\${(builtins.getFlake \"git+file://$repo\").nixosConfigurations.pc.config.home-manager.users.max.xdg.configFile.\"$1\".source}\""
+    local drv
+    drv=$(nix eval --raw --impure --expr "builtins.head (builtins.attrNames (builtins.getContext $expr))") &&
+        nix build --no-link "$drv^out" &&
+        nix eval --raw --impure --expr "$expr"
+}
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+unit=$(built systemd/user/tmux-server.service 2>"$work/errs") && conf=$(built tmux/tmux.conf 2>>"$work/errs") || {
+    fail "the unit and the tmux config build for max on pc" "$(tail -n 20 "$work/errs")"
+    finish
+}
+unit_path=$(sed -n 's/^Environment=PATH=//p' "$unit")
+tmux=$(PATH=$unit_path command -v tmux)
+
+export HOME=$work/home TMUX_TMPDIR=$work/run
+dir=$HOME/.tmux/resurrect
+mkdir -p "$HOME/.config/tmux" "$dir" "$HOME/.claude/sessions" "$TMUX_TMPDIR" "$work/bin" "$work/project"
+ln -s "$conf" "$HOME/.config/tmux/tmux.conf"
+printf '#!/bin/sh\necho "resumed in $(pwd): $*"\n' >"$work/bin/claude"
+printf '#!/bin/sh\nPATH=%s:$PATH exec /bin/sh "$@"\n' "$work/bin" >"$work/sh"
+chmod +x "$work/bin/claude" "$work/sh"
+export SHELL=$work/sh
+
+S() { "$tmux" -L saved "$@"; }
+T() { "$tmux" "$@"; }
+name=tmux-restore-test-$$
+trap 'systemctl --user stop "$name" 2>/dev/null; S kill-server 2>/dev/null; T kill-server 2>/dev/null; rm -rf "$work"' EXIT
+restore() { bash "$repo/nix/home/tmux-restore.sh" "$tmux" "$dir" 120 30; }
+sessions() { T list-sessions -F '#{session_name}' 2>/dev/null | paste -sd' '; }
+stop() {  # the server killed, and gone: a client started while it shuts down meets it exiting
+    local pid
+    pid=$(T display -p '#{pid}')
+    T kill-server
+    for _ in $(seq 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+}
+resumed() {  # [window]: what the Claude Code stand-in printed there, agents:1 by default
+    local at=${1:-agents:1}
+    for _ in $(seq 50); do T capture-pane -p -t "$at" 2>/dev/null | grep -q '^resumed' && break; sleep 0.1; done
+    T capture-pane -pJ -t "$at" | grep '^resumed'
+}
+
+# --- The save: a Claude Code session in one window, text in another ---
+S new-session -d -s agents -x 120 -y 30 -c /tmp
+S send-keys -t agents:1 'sleep 600' Enter
+S new-window -t agents -c /tmp
+S send-keys -t agents:2 'echo before-the-reboot' Enter
+# A window as the container hub starts a session in one (bin/container-hub, launch): Claude Code the window's command,
+# run by the default shell, interactive, which takes over the pane once it ends.
+S new-window -t agents -c /tmp -- "$SHELL" -ic "sleep 600; exec $SHELL -i"
+registered() {  # <window> <session id>: the registry file of the process the window's shell runs
+    local shell pid
+    shell=$(S display -p -t "$1" '#{pane_pid}')
+    for _ in $(seq 50); do pid=$(ps -o pid= --ppid "$shell" | tr -d ' ') && [ -n "$pid" ] && break; sleep 0.1; done
+    printf '{"pid":%s,"sessionId":"%s","cwd":"%s","kind":"interactive"}' "$pid" "$2" "$work/project" >"$HOME/.claude/sessions/$pid.json"
+}
+registered agents:1 a-session
+registered agents:3 a-hub-session
+for _ in $(seq 50); do S capture-pane -p -t agents:2 | grep -qE '(^|\$ )before-the-reboot$' && break; sleep 0.1; done
+printf '#!/bin/sh\nexec %s -L saved "$@"\n' "$tmux" >"$work/saved-tmux"
+chmod +x "$work/saved-tmux"
+bash "$repo/nix/home/tmux-save.sh" "$work/saved-tmux" "$dir"
+S kill-server
+saved=$(readlink "$dir/last")
+
+# --- tms: no server running ---
+restore
+check "the save's session comes back, session 0 gone" agents "$(sessions)"
+check "the Claude Code session is resumed in its directory" "resumed in $work/project: --resume a-session" "$(resumed)"
+check "...and so is one the container hub started as its window's command" "resumed in $work/project: --resume a-hub-session" \
+    "$(resumed agents:3)"
+check "a pane's text comes back" 1 "$(T capture-pane -p -S - -t agents:2 | grep -cE '(^|\$ )before-the-reboot$')"
+stop
+
+# --- tms: a server running ---
+T new-session -d -s other
+restore
+check "with a server running, nothing is restored into it" other "$(sessions)"
+stop
+
+# --- tms: `last` names a save power loss left empty ---
+sleep 1.1
+: >"$dir/tmux_resurrect_29991231T000000.txt"
+ln -sfn tmux_resurrect_29991231T000000.txt "$dir/last"
+rm "$dir/pane_contents.tar.gz"
+: >"$dir/pane_contents.tar.gz"
+restore 2>/dev/null
+check "an empty last save falls back to the newest non-empty one" "$saved" "$(readlink "$dir/last")"
+check "the fallback brings back that save's pane text" 1 "$(T capture-pane -p -S - -t agents:2 2>/dev/null | grep -cE '(^|\$ )before-the-reboot$')"
+stop
+
+# --- pc at boot: the unit, as the unit file says to run it ---
+if systemctl --user show-environment >/dev/null 2>&1; then
+    systemd-run --user --quiet --unit="$name" \
+        -p Type="$(sed -n 's/^Type=//p' "$unit")" -p RemainAfterExit="$(sed -n 's/^RemainAfterExit=//p' "$unit")" \
+        -E PATH="$unit_path" -E TMUX_TMPDIR="$TMUX_TMPDIR" -E HOME="$HOME" -E SHELL="$SHELL" \
+        $(sed -n 's/^ExecStart=//p' "$unit")
+    check "the unit is active once its start returns" "active exited" \
+        "$(systemctl --user show -P ActiveState "$name") $(systemctl --user show -P SubState "$name")"
+    check "the tmux server runs in the unit" 1 \
+        "$(xargs -r ps -o comm= -p <"/sys/fs/cgroup$(systemctl --user show -P ControlGroup "$name")/cgroup.procs" | grep -c '^tmux')"
+    check "at boot the Claude Code session is resumed" "resumed in $work/project: --resume a-session" "$(resumed)"
+    check "...and the one the container hub started" "resumed in $work/project: --resume a-hub-session" "$(resumed agents:3)"
+    systemctl --user stop "$name"
+else
+    skipped "the boot unit" "no systemd user manager to start it under"
+fi
+
+# --- tms: no save ---
+rm -rf "$dir"/*
+restore
+check "with no save, no server is started" "" "$(sessions)"
+
+finish

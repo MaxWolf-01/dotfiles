@@ -65,12 +65,13 @@ exec "$@"
 
 @contextlib.contextmanager
 def no_hub(how: str):
-    """A port with no hub on it: nothing listening, a socket that never answers, or a server that is not one."""
+    """A hub socket with no hub on it: nothing listening, a socket that never answers, or a server that is not one."""
+    path = Path(tempfile.mkdtemp(prefix="hub.", dir="/tmp")) / "hub.sock"  # SCRATCH can be too deep for a socket's path
     if how == "nothing":
-        yield port_beside_live_hub()
+        yield path
         return
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(path))
     s.listen(8)
     stop = False
     if how == "foreign":
@@ -84,7 +85,7 @@ def no_hub(how: str):
 
         threading.Thread(target=serve, daemon=True).start()
     try:
-        yield s.getsockname()[1]
+        yield path
     finally:
         stop = True
         s.close()
@@ -99,7 +100,7 @@ def port_beside_live_hub() -> int:
 
 @prop("With no hub answering, claude-browser hands the browser a plain tab of the URL or file it was given.")
 def no_hub_plain_tab():
-    """Nothing on the hub's port, a socket that accepts and never answers, and a server that is not a hub: each
+    """Nothing on the hub's socket, a socket that accepts and never answers, and a server that is not a hub: each
     time the browser gets the profile and the target, the file as a file:// URL of
     its real path, a URL as it was given, and a blank tab for no target, within a few seconds."""
     home = Path(tempfile.mkdtemp(prefix="no-hub-home.", dir=SCRATCH))
@@ -128,15 +129,15 @@ def no_hub_plain_tab():
         """One case, with a record of its own: the cases run at once, since a socket that never answers holds each
         for as long as claude-browser waits on it."""
         record = home / f"record-{n}"
-        with no_hub(how) as port:
-            env = fakes.tools_env(home, CLAUDE_CONFIG_DIR=str(home / ".claude"), CONTAINER_HUB_PORT=str(port),
+        with no_hub(how) as hub_socket:
+            env = fakes.tools_env(home, CLAUDE_CONFIG_DIR=str(home / ".claude"), CONTAINER_HUB_SOCKET=str(hub_socket),
                            CLAUDE_CODE_SESSION_ID="00000000-0000-4000-8000-000000000003", RECORD=str(record),
                            PATH=f"{stubs}:{BIN}:{os.environ['PATH']}")
             started = time.monotonic()
             run = subprocess.run([BIN / "claude-browser", *args], env=env, cwd=home / "repos" / "alpha",
                                  capture_output=True, text=True, timeout=30, check=False)
             took = time.monotonic() - started
-        at = f"claude-browser {' '.join(args)} with {how} on the hub's port"
+        at = f"claude-browser {' '.join(args)} with {how} on the hub's socket"
         assert run.returncode == 0, f"{at} exited {run.returncode}: {run.stderr}"
         assert took < 10, f"{at} took {took:.1f} s"
         deadline = time.monotonic() + 10
@@ -169,13 +170,16 @@ class NotThroughHub(Exception):
 
 @contextlib.contextmanager
 def hub_process():
-    """bin/container-hub on a port of its own, its HOME and state in a scratch directory: (its HOME, its origin)."""
+    """bin/container-hub on a port and a socket of its own, its HOME and state in a scratch directory: (its HOME, its
+    port, its socket)."""
     home = Path(tempfile.mkdtemp(prefix="hub-home.", dir=SCRATCH))
     port = port_beside_live_hub()
     log = home / "hub.log"
+    hub_socket = Path(tempfile.mkdtemp(prefix="hub.", dir="/tmp")) / "hub.sock"  # short enough for a socket's path
     with log.open("a") as out:
         proc = subprocess.Popen(
-            [BIN / "container-hub", "--port", str(port), "--state", str(home / ".local" / "state" / "container-hub")],
+            [BIN / "container-hub", "--socket", str(hub_socket), "--port", str(port),
+             "--state", str(home / ".local" / "state" / "container-hub")],
             env=fakes.tools_env(home), cwd=home, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         deadline = time.monotonic() + 60
@@ -187,11 +191,12 @@ def hub_process():
             if time.monotonic() > deadline:
                 raise HubError(f"the hub did not answer on port {port} within 60 s:\n{log.read_text()}")
             time.sleep(0.1)
-        yield home, port
+        yield home, port, hub_socket
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)  # `uv run` leads the group; the server is its child
         proc.wait()
+        shutil.rmtree(hub_socket.parent, ignore_errors=True)
 
 
 def request(origin: str, method: str, url: str, body: bytes | None = None, headers: dict | None = None) -> tuple[int, bytes, str]:
@@ -209,7 +214,7 @@ def diffview_served_by_hub():
     """The address it prints is on the hub's origin and answers with the page; the hub answers /.health with
     `saves: true`; and a state-file write to the page's address plus `.state.json`, from the hub's own
     origin, lands in the file beside the page."""
-    with hub_process() as (home, port):
+    with hub_process() as (home, port, hub_socket):
         origin = f"http://127.0.0.1:{port}"
         repo = home / "repos" / "alpha"
         repo.mkdir(parents=True)
@@ -227,7 +232,7 @@ def diffview_served_by_hub():
         browser = home / "browser"
         browser.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" > {record}\n')
         browser.chmod(0o755)
-        env = fakes.tools_env(home, CONTAINER_HUB_PORT=str(port), DIFFVIEW_BROWSER=str(browser))
+        env = fakes.tools_env(home, CONTAINER_HUB_SOCKET=str(hub_socket), DIFFVIEW_BROWSER=str(browser))
         run = subprocess.run([BIN / "diffview", f"{repo}@HEAD~1..HEAD", "-o", str(page), "--open",
                               "--no-auto-summary"], cwd=repo, env=env, capture_output=True, text=True, timeout=120,
                              check=False)

@@ -37,6 +37,9 @@ let
     uv
     xvfb-run
   ];
+
+  # max's own value, from his Claude Code settings in the agents repo.
+  cleanupPeriodDays = 99999;
 in
 {
   home.username = name;
@@ -66,6 +69,30 @@ in
   programs.zsh.envExtra = ''
     if (( $(</proc/self/oom_score_adj) < 500 )); then echo 500 >/proc/self/oom_score_adj; fi
   '' + builtins.readFile ./worker-claude-token.zsh;
+
+  # Claude Code deletes transcripts older than cleanupPeriodDays, 30 by
+  # default, and a worker's transcripts are kept for good, as max's are: the
+  # laptop's session copies carry them into its backups. Merged into the
+  # settings file rather than owned by home-manager, because `claude plugin
+  # install` and dispatch's plugin updates write that file too.
+  home.activation.claudeKeepsTranscripts = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+    settings="$HOME/.claude/settings.json"
+    if ! ${pkgs.jq}/bin/jq -e '.cleanupPeriodDays == ${toString cleanupPeriodDays}' "$settings" > /dev/null 2>&1; then
+      if [[ -v DRY_RUN ]]; then
+        echo "would set cleanupPeriodDays in $settings"
+      else
+        mkdir -p "$(dirname "$settings")"
+        [[ -s $settings ]] || echo '{}' > "$settings"
+        tmp=$(mktemp "$settings.hm-XXXXXX")
+        if ${pkgs.jq}/bin/jq '.cleanupPeriodDays = ${toString cleanupPeriodDays}' "$settings" > "$tmp"; then
+          mv "$tmp" "$settings"
+        else
+          rm -f "$tmp"
+          echo "claude: $settings is not JSON jq can read, so cleanupPeriodDays is not set; transcripts older than 30 days will be deleted" >&2
+        fi
+      fi
+    fi
+  '';
 
   # Commit identity. There is no GitHub credential here; the identity matters
   # because the commits leave this host by push and land in `git log`.

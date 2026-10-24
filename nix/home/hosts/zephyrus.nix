@@ -14,6 +14,18 @@
 
   home.file."HOST.md".source = ./zephyrus/HOST.md;
 
+  # Every process here is max's, so the hub keeps its loopback port beside the
+  # socket, and the laptop's browser and tools reach it with no network at all.
+  containerHub = {
+    host = "zephylux";
+    loopback = true;
+    tailnet = "https://zephylux.tail710178.ts.net:8377";
+  };
+
+  # The working backups here are the only ones that keep the worker users'
+  # transcripts, so the laptop is the host that pulls them.
+  sessionCopies.workerHosts = true;
+
   imports = [
     ../brave.nix
     ../claude-token.nix

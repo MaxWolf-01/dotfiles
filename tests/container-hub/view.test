@@ -25,6 +25,7 @@ Examples:
 import http.server
 import json
 import os
+import pwd
 import random
 import re
 import shlex
@@ -135,8 +136,8 @@ class World:
             raise
 
     def build(self, browser, run: Path, name: str) -> None:
-        # A scenario named twice runs twice. The name is cut short because tmux's socket lives in here, and a
-        # unix socket's path fits in 108 bytes, under a TMPDIR as long as the devShell's too.
+        # A scenario named twice runs twice. The name is cut short because tmux's socket and the hub's live in here, and
+        # a unix socket's path fits in 108 bytes, under a TMPDIR as long as the devShell's too.
         self.scratch = Path(tempfile.mkdtemp(dir=run, prefix=f"{name[:24]}."))
         self.home = self.scratch / "home"
         self.code = self.home / "repos" / "alpha"
@@ -198,7 +199,8 @@ exit 1
 
         self.port = free_port()
         self.origin = f"http://127.0.0.1:{self.port}"
-        self.hub_args = [str(BIN / "container-hub"), "--port", str(self.port), "--state", str(self.scratch / "state"),
+        self.hub_args = [str(BIN / "container-hub"), "--socket", str(self.scratch / "hub.sock"), "--port", str(self.port),
+                         "--state", str(self.scratch / "state"),
                          "--tmux-socket", str(self.tmux_socket)]
         self.start_hub()
         os.utime(self.pages[0], (self.t0 - 100, self.t0 - 100))  # the session page's render: ORCHESTRATOR's last turn
@@ -1765,7 +1767,7 @@ def an_account_hidden(w: World) -> None:
     check("...and out of the layout, the overview's too", False, v.evaluate(f"ws.views().some(v => v.params.group === {json.dumps(work)})"))
     v.keyboard.press("Control+Alt+f")
     v.keyboard.type(work[:8])
-    settles("...and out of the search", "no orchestrator matches",
+    settles("...and out of the search", "no session matches",
             lambda: v.evaluate("document.querySelector('#units .found-none')?.textContent ?? null"))
     v.keyboard.press("Escape")
     check("...the others staying", True, ORCHESTRATOR in w.rail_units())
@@ -1983,6 +1985,178 @@ def links_between_session_pages(w: World) -> None:
 
 
 @scenario
+def start_and_resume(w: World) -> None:
+    """hub-starts-and-resumes-sessions: the form that starts a session, and the resume on an ended session's row and in its
+    box, each saying in place what the hub answered. The hub's answers are made up here: what it does in tmux is
+    server.test's."""
+    v = w.view
+    ended = session_id(0x12)
+    w.opened(w.page("show/old/index.html", "<h1>old</h1>"), ended)  # a unit whose session runs nowhere
+    transcript = w.home / ".claude" / "projects" / "-alpha" / f"{ended}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({"type": "user", "cwd": str(w.code), "entrypoint": "cli", "sessionId": ended}) + "\n")
+    (w.scratch / "state" / "last-start.json").write_text(json.dumps({"account": str((w.home / ".claude").resolve()), "model": "sonnet",
+                                                                      "effort": "low", "mode": ""}))
+    sent, answers = [], []
+
+    def answering(route) -> None:
+        sent.append((route.request.url.rsplit("/", 1)[-1], route.request.post_data_json))
+        code, body = answers.pop(0)
+        route.fulfill(status=code, content_type="application/json", body=json.dumps(body))
+    v.route("**/api/resume", answering)
+    v.route("**/api/start", lambda route: answering(route) if route.request.method == "POST" else route.continue_())
+
+    row = v.locator(".unit", has=v.locator(f'button[title="session {ended}"]'))
+    until(lambda: row.locator(".resume").count(), "the ended session's row")
+    answers.append((409, {"error": "the session still runs (in hub:@0.%3); a second process of it would write its transcript twice"}))
+    row.locator(".resume").click()
+    settles("a resume on an ended session's row goes into its unit, and a resume the hub refuses is said in its box",
+            (ended, "not resumed: the session still runs (in hub:@0.%3); a second process of it would write its transcript twice"),
+            lambda: (w.current(), v.evaluate(f"{BOX}.querySelector('.how').textContent")))
+    check("...having asked the hub to resume that session", [("resume", {"unit": ended})], sent)
+    answers.append((200, {"unit": ended, "view": f"/u/{ended}", "pane": "%3", "restored": {"model": "claude-opus-5-5", "effort": "high"},
+                          "defaulted": ["mode"]}))
+    settles("its box offers the resume too, once the refusal has been read", True,
+            lambda: v.evaluate(f"!!{BOX}.querySelector('.how .resume-now')"), within=10)
+    v.locator(f"#session-box .reply .how .resume-now").click()
+    settles("...whose resume the hub carries out is said there too, with what it restored and what it left to Claude Code",
+            "resumed in tmux pane %3 on claude-opus-5-5, at high effort; its permission mode recorded nowhere in its transcript, "
+            "so Claude Code's default",
+            lambda: v.evaluate(f"{BOX}.querySelector('.how').textContent"))
+
+    v.keyboard.press("Control+Alt+c")
+    field = lambda name: v.evaluate(f"(f => f.elements['{name}']?.value)(document.querySelector('#starter form'))")
+    settles("ctrl+alt+c opens the form that starts a session, each choice but the project and the prompt as the last start "
+            "on this host picked it, the projects its transcripts ran in offered",
+            (True, str(w.code), str((w.home / ".claude").resolve()), "sonnet", "low", "", [str(w.code)]),
+            lambda: (v.evaluate("document.getElementById('starter').open"), field("project"), field("account"), field("model"), field("effort"), field("mode"),
+                     PROJECTS(v)))
+    v.locator("#start-prompt").fill("map the columns")
+    answers.append((409, {"error": "no tmux server runs; start one (tms), so that its saved sessions come back first"}))
+    v.locator("#start-prompt").press("Control+Enter")
+    settles("a start the hub refuses is said in the form, which stays open",
+            (True, "not started: no tmux server runs; start one (tms), so that its saved sessions come back first"),
+            lambda: (v.evaluate("document.getElementById('starter').open"), v.evaluate("document.querySelector('#starter .say').textContent")))
+    check("...having sent what the form holds", ("start", {"project": str(w.code), "account": str((w.home / ".claude").resolve()),
+                                                         "model": "sonnet", "effort": "low", "mode": "", "prompt": "map the columns"}), sent[-1])
+    answers.append((200, {"unit": ORCHESTRATOR, "view": f"/u/{ORCHESTRATOR}", "pane": "%4"}))
+    v.locator("#start-project").press("Enter")
+    settles("a start the hub carries out closes the form and goes to the new session's unit", (False, ORCHESTRATOR),
+            lambda: (v.evaluate("document.getElementById('starter').open"), w.current()))
+
+
+PROJECTS = lambda tab: tab.evaluate("[...document.querySelectorAll('#start-projects li .path')].map(p => p.title)")
+FORM_PICKS = """(f => [f.elements.project.value, ...['account', 'model', 'effort', 'mode'].map(n => f.elements[n]?.value),
+    document.activeElement.closest('#starter .field')?.id || document.activeElement.id])(document.querySelector('#starter form'))"""
+
+
+@scenario
+def starting_from_the_keyboard(w: World) -> None:
+    """hub-start-form-ergonomics: the + on the rail's head opens the form; its projects are the latest first, found as
+    fzf finds, and every other choice is a row of segments; the keyboard walks it and enter starts. Ten projects, each
+    the cwd of a transcript a minute older than the one before; alpha holds an agent repo."""
+    v = w.view
+    names = ["dotfiles", "alpha", "jarvis", "lifelog", "yapit", "obsidian/knowledge-base", "scratch/plot-sweep", "work/helferline",
+             "repos-old/dot-files-2019", "notes"]
+    dirs = [w.code if n == "alpha" else w.home / "repos" / n for n in names]
+    for i, d in enumerate(dirs):
+        d.mkdir(parents=True, exist_ok=True)
+        transcript = w.home / ".claude" / "projects" / f"-p{i}" / f"{session_id(0x40 + i)}.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({"type": "user", "cwd": str(d), "entrypoint": "cli", "sessionId": session_id(0x40 + i)}) + "\n")
+        os.utime(transcript, (w.t0 - 60 * i, w.t0 - 60 * i))
+    (w.scratch / "state" / "last-start.json").write_text(json.dumps({"account": str((w.home / ".claude").resolve()), "model": "opus",
+                                                                      "effort": "high", "mode": "auto"}))
+    sent = []
+
+    def answering(route) -> None:
+        sent.append(route.request.post_data_json)
+        route.fulfill(status=409, content_type="application/json", body=json.dumps({"error": "no tmux server runs"}))
+    v.route("**/api/start", lambda route: answering(route) if route.request.method == "POST" else route.continue_())
+    shots = os.environ.get("HUB_START_FORM_SCREENSHOTS")
+
+    v.locator("#start-button").click()
+    settles("the + on the rail's head opens the form, its projects the latest first, an agent repo's checkout named so",
+            (True, [str(d) for d in dirs], "agent repo"),
+            lambda: (v.evaluate("document.getElementById('starter').open"), PROJECTS(v),
+                     v.evaluate("document.querySelector('#start-projects li:nth-child(2) .v-meta')?.textContent")))
+    check("every choice but the project and the first prompt is a row of segments, each in sight, the last start's picked",
+          {"host": 1, "account": ["claude"],
+           "model": ["default", "fable", "opus", "sonnet", "haiku", ""], "effort": ["default", "low", "medium", "high", "xhigh", "max"],
+           "mode": ["default", "manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"],
+           "picked": ["claude", "opus", "high", "auto"]},
+          v.evaluate("""(() => { const rows = Object.fromEntries([...document.querySelectorAll('#starter .seg')].map(r =>
+              [r.dataset.name, [...r.querySelectorAll('label')].map(l => l.querySelector('span')?.textContent ?? '')]));
+              rows.host = rows.host.length; // this host alone: the world has no peer
+              rows.picked = [...document.querySelectorAll('#starter .seg:not(#start-host) label:has(:checked) span')].map(s => s.textContent);
+              return rows; })()"""))
+    if shots:
+        v.screenshot(path=f"{shots}/desk.png")
+        v.evaluate("document.documentElement.dataset.theme = 'night'")
+        v.wait_for_timeout(400)  # the colours' transitions
+        v.screenshot(path=f"{shots}/desk-night.png")
+        v.evaluate("delete document.documentElement.dataset.theme")
+
+    v.keyboard.type("~/rep/dot-f")
+    check("a path typed to find a project picks the project it finds, the path as typed offered after it",
+          ([str(dirs[8]), "~/rep/dot-f"], str(dirs[8])), (PROJECTS(v), v.evaluate(FORM_PICKS)[0]))
+    v.keyboard.press("ControlOrMeta+a")
+    v.keyboard.type("/srv/new-project")
+    check("...and one that finds none is picked as typed", (["/srv/new-project"], "/srv/new-project"), (PROJECTS(v), v.evaluate(FORM_PICKS)[0]))
+    v.keyboard.press("ControlOrMeta+a")
+    v.keyboard.type("dtfl")
+    check("typing finds projects as fzf does, its letters in order and apart, ranked as fzf 0.74 ranks them, under ~",
+          ([str(dirs[8]), str(dirs[0])], ["~/repos/repos-old/dot-files-2019", "~/repos/dotfiles"]),
+          (PROJECTS(v), v.evaluate("[...document.querySelectorAll('#start-projects li .path')].map(p => p.textContent)")))
+    v.keyboard.press("Control+j")
+    check("ctrl+j picks the next one found", str(dirs[0]), v.evaluate(FORM_PICKS)[0])
+    v.keyboard.press("ArrowDown")
+    v.keyboard.press("ArrowDown")
+    v.keyboard.press("ArrowRight")
+    v.keyboard.press("l")
+    check("↓ ↓ walks to the model, whose pick → and l move along its row",
+          [str(dirs[0]), str((w.home / ".claude").resolve()), "haiku", "high", "auto", "start-model"], v.evaluate(FORM_PICKS))
+    v.keyboard.press("l")
+    v.keyboard.type("opus[1m]")
+    v.keyboard.press("j")
+    check("past the last model, a name typed in, where j is a letter of it", "opus[1m]j", v.evaluate(FORM_PICKS)[2])
+    v.keyboard.press("Backspace")
+    v.keyboard.press("ArrowDown")
+    v.keyboard.press("h")
+    v.keyboard.press("h")
+    v.keyboard.press("j")
+    v.keyboard.press("ArrowLeft")
+    v.keyboard.press("k")
+    v.keyboard.press("k")
+    v.keyboard.press("ArrowUp")
+    v.keyboard.press("k")
+    v.keyboard.press("ArrowUp")
+    check("j and k walk between the rows, h and ← along them; ↑ walks out of the typed model's name, and from the project to the host",
+          [str(dirs[0]), str((w.home / ".claude").resolve()), "opus[1m]", "low", "acceptEdits", "start-host"], v.evaluate(FORM_PICKS))
+    v.keyboard.press("Enter")
+    settles("enter starts, with what the form holds", [{"project": str(dirs[0]), "account": str((w.home / ".claude").resolve()),
+                                                       "model": "opus[1m]", "effort": "low", "mode": "acceptEdits", "prompt": ""}], lambda: sent)
+    check("the start button wears the accent, as the primary action does", True,
+          v.evaluate("""(() => { const probe = document.createElement('i'); probe.style.color = 'var(--accent)'; document.body.append(probe);
+              const accent = getComputedStyle(probe).color; probe.remove();
+              return getComputedStyle(document.querySelector('#starter [type=submit]')).backgroundColor === accent; })()"""))
+    v.keyboard.press("Control+Alt+c")
+    settles("ctrl+alt+c still folds it away", False, lambda: v.evaluate("document.getElementById('starter').open"))
+
+    ph = phone_tab(w)
+    ph.locator("#start-button").click()
+    settles("on a phone, the + opens it too, and it fits the screen's width", (True, True),
+            lambda: (ph.evaluate("document.getElementById('starter').open"),
+                     ph.evaluate("(c => c.scrollWidth <= c.clientWidth && c.getBoundingClientRect().right <= innerWidth)(document.querySelector('#starter .card'))")))
+    if shots:
+        ph.keyboard.press("Escape")  # the phone's own keyboard is up over a field in use; the shot shows the form whole
+        ph.locator("#start-button").click()
+        ph.evaluate("document.activeElement.blur()")
+        ph.screenshot(path=f"{shots}/phone.png")
+    ph.context.close()
+
+
+@scenario
 def finding_an_orchestrator(w: World) -> None:
     """hub-session-search: finding an orchestrator by its session id, its short id or its title, the ended ones folded
     under "N more" included. Ended sessions, more than the ended list shows, each titled by the title Claude Code keeps
@@ -2049,7 +2223,7 @@ def finding_an_orchestrator(w: World) -> None:
     v.keyboard.press("Enter")
     settles("...and enter goes to it", ORCHESTRATOR, w.current)
     search("nothing-is-called-this", [], "a query nothing matches finds nothing")
-    check("...and says so", "no orchestrator matches", v.locator("#units .found-none").text_content())
+    check("...and says so", "no session matches", v.locator("#units .found-none").text_content())
     v.keyboard.press("Escape")
     w.frame_of(ORCHESTRATOR)
     w.focus_session()
@@ -2064,6 +2238,428 @@ def finding_an_orchestrator(w: World) -> None:
     settles("a session id the query starts is found before one it is only inside of", (sorted(prefixed), True),
             lambda: (sorted(found()[:len(prefixed)]), set(inside) <= set(found()[len(prefixed):])))
     v.keyboard.press("Escape")
+
+
+
+@scenario
+def finding_a_session_no_unit_holds(w: World) -> None:
+    """hub-finds-every-session: an ended session that never opened a page, so no unit on the rail, found by the search
+    from the host's index of its transcripts and gone to as its unit, which resumes from there."""
+    v = w.view
+    quiet = session_id(0x31)
+    fakes.page(w.home / ".claude/projects/-alpha" / f"{quiet}.jsonl", "".join(json.dumps(line, separators=(",", ":")) + "\n" for line in (
+        {"type": "user", "sessionId": quiet, "cwd": str(w.code), "entrypoint": "cli", "message": {"content": "go"}},
+        {"type": "ai-title", "aiTitle": "Quiet refactor of the parser", "sessionId": quiet})))
+    rail_names = lambda: v.evaluate("[...document.querySelectorAll('#units .name, #aside-units .name')].map(e => e.textContent)")
+    until(rail_names, "the rail")
+    check("an ended session that never opened a page is not on the rail", False, "Quiet refactor of the parser" in rail_names())
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type("quiet parser")
+    settles("ctrl+alt+f finds it all the same, by its title", ["Quiet refactor of the parser"],
+            lambda: v.evaluate("[...document.querySelectorAll('#units .name')].map(e => e.textContent)"))
+    v.keyboard.press("Enter")
+    stand_in = lambda: v.evaluate("document.querySelector('#session-frames > .current iframe')?.contentDocument?.body?.textContent ?? ''")
+    settles("...and enter goes to it as its unit: its session page the hub's stand-in, the session listed among the ended",
+            (quiet, True, True), lambda: (w.current(), "This session has rendered no session page yet" in stand_in(),
+                                          "Quiet refactor of the parser" in rail_names()))
+    sent = []
+
+    def answering(route) -> None:
+        sent.append(route.request.post_data_json)
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps({"unit": quiet, "view": f"/u/{quiet}", "pane": "%5", "restored": {}, "defaulted": []}))
+    v.route("**/api/resume", answering)
+    settles("its box offers to resume it", True, lambda: v.evaluate(f"!!{BOX}?.querySelector('.how .resume-now')"))
+    v.locator("#session-box .reply .how .resume-now").click()
+    settles("...which asks this host's hub to resume that session", [{"unit": quiet}], lambda: sent)
+    v.locator(f'button[title="session {ORCHESTRATOR}"]').click()
+    settles("once you leave it, the rail is as it was", (ORCHESTRATOR, False),
+            lambda: (w.current(), "Quiet refactor of the parser" in rail_names()))
+
+
+# ---- at phone width
+
+PHONE = {"width": 393, "height": 852}
+# what is in sight at phone width: the screen, and whether a page is over it
+SCREEN = "[document.body.dataset.screen, document.body.classList.contains('paging')]"
+# the widest of the hub tab and the frames in sight, against the screen's width: equal where nothing scrolls sideways
+WIDEST = """[Math.max(...[document, ...[...document.querySelectorAll('#session-frames > .current iframe, #page iframe')]
+  .map((f) => f.contentDocument ?? f)].map((d) => d.documentElement?.scrollWidth ?? 0)), innerWidth]"""
+PAGED = "document.querySelector('#page iframe')?.getAttribute('src') ?? null"
+POSTED = "(what) => posts.filter((p) => p === '/api/' + what).length"
+
+
+def phone_tab(w: World):
+    """A hub tab on a phone: a profile of its own, at a phone's size, touch for a pointer."""
+    context = w.context.browser.new_context(viewport=PHONE, is_mobile=True, has_touch=True)
+    context.add_init_script(RECORD_POSTS)
+    page = w.fresh_tab("window.wc && document.body.dataset.screen", context=context)
+    page.on("pageerror", lambda e: w.errors.append(str(e)))
+    return page
+
+
+@scenario
+def on_the_phone(w: World) -> None:
+    """hub-phone-layout: on a phone, max goes from the rail to a session, reads its page, answers in its box and opens
+    one of its pages, without zooming or scrolling sideways, and the phone's back gesture steps back the way he came."""
+    p = w.pane()
+    ph = phone_tab(w)
+    try:
+        check("a phone opens the hub at the rail, the bar at the bottom under it", (["rail", False], True),
+              (ph.evaluate(SCREEN), ph.locator("#tabs").is_visible()))
+        check("...the rail alone in sight", (True, False), (w.shown("rail-side", ph), w.shown("session-side", ph)))
+        ph.locator(f'#units button[title="session {ANSWERING}"] .name').tap()
+        w.frame_at(f"/{ANSWERING}/index.html", ph)
+        settles("a tap on a session's row goes to its session page, with its box", (["session", False], ANSWERING, True, False),
+                lambda: (ph.evaluate(SCREEN), w.current(ph), w.shown("session-side", ph), w.shown("rail-side", ph)))
+        check("...the bar naming the session", "session 00000011", ph.locator('#tabs [data-screen="session"] .label').text_content())
+        settles("...nothing wider than the screen", [PHONE["width"]] * 2, lambda: ph.evaluate(WIDEST))
+        box = ph.locator("#session-box textarea")
+        box.tap()
+        box.press_sequentially("yes")
+        box.press("Enter")
+        box.press_sequentially("the second way")
+        check("enter in the box makes a new line, as a phone's keyboard does, and sends nothing", ("yes\nthe second way", b"", 0),
+              (box.input_value(), p.arrived(), ph.evaluate(POSTED, "type")))
+        check("...the bar out of the way while the box has the keyboard", False, ph.locator("#tabs").is_visible())
+        ph.locator("#session-box .send").tap()
+        settles("its send button types it into the session's pane", b"\x1b[200~yes\rthe second way\x1b[201~\r", p.arrived)
+        settles("...and empties the box, the keyboard leaving it", ("", True), lambda: (box.input_value(), ph.locator("#tabs").is_visible()))
+        check("jump, which moves a terminal at the desk, is not under a phone's box; close is",
+              (False, True), (ph.locator("#session-box .jump").is_visible(), ph.locator("#session-box .acts button:not(.jump)").is_visible()))
+
+        ph.locator('#tabs [data-screen="pages"]').tap()
+        settles("the pages tab lists the unit's pages", (["pages", False], ["index.html"]),
+                lambda: (ph.evaluate(SCREEN), [b.text_content() for b in ph.locator("#pages li b").all()]))
+        ph.locator("#pages li button").first.tap()
+        w.frame_at("/unit-1/index.html", ph)
+        settles("a tap on one opens it over everything, the bar too", (["pages", True], False),
+                lambda: (ph.evaluate(SCREEN), ph.locator("#tabs").is_visible()))
+        settles("...nothing wider than the screen", [PHONE["width"]] * 2, lambda: ph.evaluate(WIDEST))
+        check("...and asks the hub nothing, so the desk shows the unit as it did", 0, ph.evaluate(POSTED, "open"))
+        ph.reload()
+        ph.wait_for_function("window.wc && document.body.dataset.screen", timeout=30000)
+        settles("a reload stays where the phone was, the page over its pages", (["pages", True], "/unit-1/index.html"),
+                lambda: (ph.evaluate(SCREEN), (ph.evaluate(PAGED) or "")[-len("/unit-1/index.html"):]))
+        fresh = w.fresh_tab("window.wc && document.body.dataset.screen", context=ph.context)
+        check("...while a hub tab opened afresh starts at the rail, whatever session it was in last", ["rail", False], fresh.evaluate(SCREEN))
+        fresh.close()
+        for back, where in (("the page", ["pages", False]), ("the pages", ["session", False]), ("the session page", ["rail", False])):
+            ph.go_back()
+            settles(f"the back gesture leaves {back}", where, lambda: ph.evaluate(SCREEN))
+    finally:
+        ph.context.close()
+
+
+@scenario
+def links_on_the_phone(w: World) -> None:
+    """hub-phone-layout: on a phone, a line of the session page opens its page over the screens, ‹ › step through
+    the unit's pages there, and a link inside a page opens where it goes in its place. phone-links-leave-the-desk-alone:
+    a link to a page the unit does not list yet joins the unit's pages, and the desk's layout and focus stay as they were."""
+    desk = (w.docked(), w.focused())
+    ph = phone_tab(w)
+    try:
+        ph.locator('#tabs [data-screen="session"]').tap()
+        session = w.frame_at(f"/{ORCHESTRATOR}/index.html", ph)
+        settles("the session tab, with no session gone to yet, is the rail's first", (["session", False], ORCHESTRATOR),
+                lambda: (ph.evaluate(SCREEN), w.current(ph)))
+        session.locator(w.line_link("map-columns/sketch.html")).tap()
+        settles("a line of its session page opens the page over everything, even one nobody opened, asking the hub nothing",
+                (True, "/sketch.html", 0), lambda: (ph.evaluate(SCREEN)[1], (ph.evaluate(PAGED) or "")[-12:], ph.evaluate(POSTED, "open")))
+        check("...headed by what its line says of it, and where it is among the unit's pages", ("sketch", "3/3"),
+              (ph.locator("#page .title b").text_content(), ph.locator("#page .at").text_content()))
+        ph.locator("#page .next").tap()
+        settles("› steps on to the unit's next page, round to its first", "/csv-import/index.html",
+                lambda: (ph.evaluate(PAGED) or "")[-len("/csv-import/index.html"):])
+        ph.locator("#page .next").tap()
+        settles("› again, its next", "/map-columns/index.html", lambda: (ph.evaluate(PAGED) or "")[-len("/map-columns/index.html"):])
+        ph.frame_locator("#page iframe").locator("#link").tap()
+        settles("a link inside it opens where it goes, in its place", "/map-columns/other.html",
+                lambda: (ph.evaluate(PAGED) or "")[-len("/map-columns/other.html"):])
+        settles("...the desk's tab hears of it, and lists it minimized", [True],
+                lambda: w.view.evaluate("wc.state.members.filter((m) => m.url.endsWith('/other.html')).map((m) => m.closed)"))
+        check("...its layout and focus as they were before the phone came", desk, (w.docked(), w.focused()))
+        w.view.keyboard.press("Control+Alt+1")
+        settles("...and once the desk is in the unit", ORCHESTRATOR, w.current)
+        w.view.keyboard.press("Control+Alt+Shift+W")
+        settles("...where ctrl+alt+shift+w brings back the page the phone looked at", True,
+                lambda: w.view.evaluate("ws.views().some((v) => v.params.url.endsWith('/other.html'))"))
+        ph.go_back()
+        settles("...and back goes back to the page it was clicked in", "/map-columns/index.html",
+                lambda: (ph.evaluate(PAGED) or "")[-len("/map-columns/index.html"):])
+        ph.locator("#page .shut").tap()
+        settles("✕ closes the page, back to the session page", ["session", False], lambda: ph.evaluate(SCREEN))
+        ph.locator('#tabs [data-screen="pages"]').tap()
+        settles("the pages tab lists the page the link went to", True,
+                lambda: any(b.text_content().endswith("other.html") for b in ph.locator("#pages li b").all()))
+    finally:
+        ph.context.close()
+
+
+@scenario
+def a_window_made_narrow(w: World) -> None:
+    """hub-phone-layout: the desk's layout is a matter of width alone. A window made narrow takes the phone's, and
+    made wide again it gets back the desk's, in the unit it was in."""
+    w.enter()
+    w.view.set_viewport_size(PHONE)
+    settles("narrow, the tab shows the session page of the unit it was in, alone", (["session", False], True, False),
+            lambda: (w.view.evaluate(SCREEN), w.shown("session-side"), w.shown("rail-side")))
+    w.view.set_viewport_size(VIEWPORT)
+    settles("wide again, the desk's: the rail, the session page and the unit's panes", (False, True, True, [LEFT]),
+            lambda: (w.view.evaluate("document.body.classList.contains('phone')"), w.shown("rail-side"), w.shown("session-side"), w.on_screen()))
+
+
+# ---- another host's sessions, through the hub that relays its hub
+
+PEER = session_id(0x21)  # a session on the laptop, in a tmux pane
+
+
+@scenario
+def a_peers_sessions(w: World) -> None:
+    """hub-relays-peer-backends: the world's hub is pc's, relaying a laptop's hub on a HOME of its own. The laptop's
+    session runs in a pane of the world's tmux server, which the laptop's hub types into."""
+    home = w.scratch / "lap"
+    (home / ".claude/sessions").mkdir(parents=True)
+    (home / ".claude/projects").mkdir()  # an account the form offers
+    env = {**w.env, "HOME": str(home)}
+    lap = [str(BIN / "container-hub"), "--socket", str(w.scratch / "lap.sock"), "--url", "http://laptop.invalid",
+           "--state", str(w.scratch / "lap-state"), "--host", "laptop", "--tmux-socket", str(w.tmux_socket)]
+
+    def start_laptop() -> subprocess.Popen:
+        hub = subprocess.Popen(lap, env=env, stdout=subprocess.DEVNULL, stderr=(w.scratch / "lap.log").open("a"), start_new_session=True)
+        until(lambda: (w.scratch / "lap.sock").exists() or hub.poll() is not None, "the laptop's hub to listen")
+        return hub
+
+    def stop(hub: subprocess.Popen) -> None:
+        os.killpg(hub.pid, signal.SIGKILL)
+        hub.wait()
+
+    received, recorder = w.scratch / "lap-received", w.scratch / "recorder.py"
+    recorder.write_text("import os, sys, tty\ntty.setraw(0)\nos.write(1, b'\\x1b[?2004h')\nout = open(sys.argv[1], 'ab', buffering=0)\n"
+                        "while data := os.read(0, 4096):\n    out.write(data)\n")
+    w.tmux("-f", "/dev/null", "new-session", "-d", "-s", "lap", "-x", "100", "-y", "20", f"exec {sys.executable} {recorder} {received}")
+    pane, pid = w.tmux("display-message", "-p", "-t", "lap:", "#{pane_id} #{pane_pid}").split()
+    (home / ".claude/sessions" / f"{pid}.json").write_text(json.dumps({
+        "pid": int(pid), "procStart": started(pid), "sessionId": PEER, "status": "idle", "statusUpdatedAt": int(w.t0 * 1000) - 50_000,
+        "tmux": f"lap:@1.{pane}"}))
+    laptop = start_laptop()
+    try:
+        shown = home / "notes" / "laptop.html"
+        shown.parent.mkdir()
+        shown.write_text("<!doctype html><h1>written on the laptop</h1>")
+        figure = home / "notes" / "figure.svg"
+        figure.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20"/></svg>')
+        # the page in the right pane, a frame there, beside the figure in the left, an image there
+        for opened in ({"target": str(shown), "lane": "code"}, {"target": str(figure)}):
+            subprocess.run(["curl", "-sf", "--unix-socket", str(w.scratch / "lap.sock"), "-H", "Content-Type: application/json", "-d",
+                            json.dumps({**opened, "session": PEER}), "http://hub/api/open"], check=True, capture_output=True)
+        w.kill_hub()
+        w.hub_args += ["--host", "pc", "--peer", f"laptop={w.scratch / 'lap.sock'}"]
+        w.start_hub()
+        w.view.reload()
+        key = f"laptop/{PEER}"
+        w.view.wait_for_function(f"window.wc && wc.state.units.some(u => u.unit === {json.dumps(key)})", timeout=30000)
+        hosts = lambda: w.view.evaluate("[...document.querySelectorAll('#units .nav')].map(b => [b.title.replace('session ', ''), b.querySelector('.host')?.textContent])")
+        settles("one rail holds both hosts' sessions, each row naming its host", sorted([[ORCHESTRATOR, "pc"], [PEER, "laptop"]]),
+                lambda: sorted(hosts()))
+        w.view.locator(f'#units button[title="session {PEER}"] .name').click()
+        until(lambda: w.current() == key, "the laptop's unit")
+        check("its session page is the laptop's hub's, through the relay", f"/h/laptop/pages/{PEER}",
+              urllib.parse.urlsplit(until(w.sidebar_url, "the session sidebar")).path)
+        w.frame_at("/laptop.html")  # its page, in its pane
+        box = lambda: w.view.evaluate(f"(b => b && [b.dataset.state, b.querySelector('.how').textContent])({BOX})")
+        settles("the box types into the laptop's pane, and offers to move its session here", ["waiting", "idle · enter types into tmux session lapmove to pc"], box)
+        w.view.evaluate(f"{BOX}.querySelector('textarea').focus()")
+        w.view.keyboard.type("from pc")
+        w.view.keyboard.press("Enter")
+        settles("...and what it sends, the laptop's hub types there", b"\x1b[200~from pc\x1b[201~\r",
+                lambda: received.read_bytes() if received.exists() else b"")
+
+        stop(laptop)
+        aside = lambda: w.view.evaluate("[...document.querySelectorAll('#aside-units > *')].map(e => e.tagName === 'H2' ? e.textContent.replace(/; as read at .*/, '') : e.querySelector('.nav').title.replace('session ', ''))")
+        settles("with the laptop down, its session shows under the laptop, as last read, and not among the ended",
+                ["laptop does not answer", PEER], aside, within=20)
+        check("...its mark the state it was last read in, faded", ["idle", True],
+              w.view.evaluate(f"(m => [m.dataset.state, 'unreachable' in m.dataset])(document.querySelector('#aside-units button[title=\"session {PEER}\"] .mark'))"))
+        settles("...and its box sends nothing, saying why", "none", lambda: (box() or [None])[0])
+        settles("...in so many words", True, lambda: box()[1].startswith("laptop does not answer; as read at "))
+        check("...and offers none of what it refuses: no jump, no close, no handoff", [False, False],
+              w.view.evaluate(f"(b => [b.querySelector('.acts').checkVisibility(), b.querySelector('.offer')?.checkVisibility() ?? false])({BOX})"))
+        # A tab opened while the laptop is down: each page of its unit is a notice in the hub's style, in place of the page.
+        notices = lambda page: page.evaluate("""[...document.querySelectorAll('#session-frames > .current iframe, #work iframe')]
+          .filter(f => f.getAttribute('src').startsWith('/h/laptop/') && !f.closest('.figure')).map(f => {
+            const d = f.contentDocument, own = d?.querySelector('meta[name="hub-unreachable"]');
+            return [f.getAttribute('src').split('/').pop(), own ? d.querySelector('h1').textContent : null];
+          }).concat([...document.querySelectorAll('#work .figure')].filter(b => b.querySelector('img').getAttribute('src').startsWith('/h/laptop/'))
+            .map(b => ['figure.svg', b.querySelector('.unreachable')?.contentDocument?.querySelector('h1')?.textContent ?? null])).sort()""")
+        figures = lambda page: page.evaluate("document.querySelectorAll('#work .figure img').length")
+        desk = w.fresh_tab()
+        down = sorted([[PEER, "laptop does not answer"], ["laptop.html", "laptop does not answer"], ["figure.svg", "laptop does not answer"]])
+        settles("a tab opened with the laptop down shows a notice in place of the session page, a page and a figure", down,
+                lambda: notices(desk), within=20)
+        check("...the figure an image of the tab's, the notice in its place", 1, figures(desk))
+        check("...saying when the hub last read the laptop", True, desk.evaluate(
+            "/The hub last read laptop at \\d\\d:\\d\\d\\b/.test(document.querySelector('#session-frames > .current iframe').contentDocument.body.textContent)"))
+        phone = w.fresh_tab()
+        phone.set_viewport_size(PHONE)
+        notice_fits = lambda: phone.evaluate("""(f => { const d = f?.contentDocument; return !!d?.querySelector('meta[name="hub-unreachable"]')
+            && d.documentElement.scrollWidth <= d.documentElement.clientWidth && f.checkVisibility(); })(document.querySelector('#session-frames > .current iframe'))""")
+        settles("...and at phone width, the notice fitting the screen", True, notice_fits, within=20)
+        check("...under a box with no send button", False, phone.evaluate(f"{BOX}.querySelector('.send').checkVisibility()"))
+        phone.close()
+        w.view.locator("#start").click()
+        starts_on = lambda: w.view.evaluate("[...document.querySelectorAll('#start-host input')].map(o => o.value)")
+        settles("...and the form that starts a session offers this host alone", ["pc"], starts_on)
+        w.view.keyboard.press("Escape")
+        laptop = start_laptop()
+        settles("the laptop back, its session is numbered on the rail again", True,
+                lambda: w.view.evaluate(f"!!wc.state.units.find(u => u.unit === {json.dumps(key)})?.number"), within=20)
+        settles("...and the tab opened while it was down shows its pages in place of the notices",
+                sorted([[PEER, None], ["laptop.html", None], ["figure.svg", None]]), lambda: notices(desk), within=20)
+        desk.close()
+        w.view.locator("#start").click()
+        settles("...and the form names the host a session starts on: either", ["pc", "laptop"], starts_on)
+        w.view.locator("#start-host label", has_text="laptop").click()
+        settles("...offering, for the laptop, what the laptop's hub offers", True,
+                lambda: w.view.evaluate(f"[...document.querySelectorAll('#start-account input')].some(o => o.value.startsWith({json.dumps(str(home))}))"))
+        # A directory only the laptop has, and a model no hub takes: pc's hub would refuse the directory, the laptop's
+        # refuses the model, before it starts anything.
+        w.view.fill("#start-project", str(shown.parent))
+        w.view.fill("#start-model .other [type=text]", "no model!")
+        w.view.locator("#starter button[type=submit]").click()
+        settles("...and starts it there: the laptop's hub is the one that answers", "not started: 'no model!' is no model name",
+                lambda: w.view.evaluate("document.querySelector('#starter .say').textContent"))
+        w.view.keyboard.press("Escape")
+        on_laptop = lambda: json.loads(subprocess.run(["curl", "-sf", "--unix-socket", str(w.scratch / "lap.sock"), f"http://hub/api/u/{PEER}"],
+                                                      check=True, capture_output=True).stdout)
+        w.view.keyboard.press("Control+Alt+d")
+        settles("ctrl+alt+d sets the laptop's session aside on the laptop's hub", True, lambda: on_laptop()["dismissed"])
+        w.view.keyboard.press("Control+Alt+x")
+        w.view.keyboard.press("Control+Alt+x")
+        settles("ctrl+alt+x twice closes the laptop's session's pane, through the laptop's hub", False,
+                lambda: pane in subprocess.run([w.tmux_shim, "-S", w.tmux_socket, "list-panes", "-a", "-F", "#{pane_id}"],
+                                               env=w.env, capture_output=True, text=True).stdout.split())  # its server goes with its last pane
+    finally:
+        stop(laptop)
+
+
+COPIED = session_id(0x22)  # a session on the laptop, idle at the last pull of it, the laptop down since
+GONE = session_id(0x25)  # a session on the laptop, ended before the last pull, and no unit
+
+
+@scenario
+def a_down_hosts_copies(w: World) -> None:
+    """hub-shows-copies-and-forks: the world's hub is pc's, relaying a laptop that never answers, whose sessions pc
+    pulled: one of them idle at the last pull, with its session page."""
+    copy, laptop_home = w.scratch / "copies" / "laptop" / pwd.getpwuid(os.getuid()).pw_name, "/home/someone"
+    fakes.page(copy / ".claude/projects/-p" / f"{COPIED}.jsonl", json.dumps(
+        {"type": "user", "sessionId": COPIED, "cwd": str(w.home), "message": {"content": "go"}}) + "\n")
+    fakes.page(copy / ".claude/session-pages" / COPIED / "index.html", "<!doctype html><body><h1>on the laptop</h1><p>its turns</p>")
+    fakes.page(copy / ".claude/sessions/100.json", json.dumps({"pid": 100, "sessionId": COPIED, "status": "idle"}))
+    fakes.page(copy / ".claude/projects/-p" / f"{GONE}.jsonl", "".join(json.dumps(line, separators=(",", ":")) + "\n" for line in (
+        {"type": "user", "sessionId": GONE, "cwd": str(w.home), "entrypoint": "cli", "message": {"content": "go"}},
+        {"type": "ai-title", "aiTitle": "Long gone on the laptop", "sessionId": GONE})))
+    pulled = w.t0 - 600
+    fakes.page(copy.with_name(copy.name + ".pulled.json"), json.dumps({"at": pulled, "home": laptop_home}))
+    w.kill_hub()
+    w.hub_args += ["--host", "pc", "--peer", f"laptop={w.scratch / 'no-laptop.sock'}", "--copies", str(w.scratch / "copies")]
+    w.start_hub()
+    w.view.reload()
+    key = f"laptop/{COPIED}"
+    w.view.wait_for_function(f"window.wc && wc.state.units.some(u => u.unit === {json.dumps(key)})", timeout=30000)
+    at = datetime.fromtimestamp(pulled).strftime("%H:%M")  # as the tab says a time, in the browser's zone, which is this host's
+    row = f'#aside-units button[title="session {COPIED}"]'
+    check("the laptop down, its session idle at the last pull is listed under it, with when its copy was pulled and the "
+          "session's state then", ["laptop does not answer", f"copy · idle {at}"],
+          [w.view.evaluate(f"document.querySelector('{row}').closest('.unit').previousElementSibling.textContent.replace(/; as read at .*/, '')"),
+           w.view.evaluate(f"document.querySelector('{row} .copy').textContent")])
+    w.view.locator(f"{row} .name").click()
+    until(lambda: w.current() == key, "the laptop's unit")
+    page = lambda: w.view.evaluate("document.querySelector('#session-frames > .current iframe')?.contentDocument?.body?.textContent ?? ''")
+    settles("its session page opens, from the copy, saying so", (True, True),
+            lambda: ("its turns" in page(), "this is its copy, as this host last pulled it at" in page()))
+    how = lambda: w.view.evaluate(f"{BOX}?.querySelector('.how')?.textContent ?? ''")  # none while the tab loads
+    settles("its box sends nothing, says how current the copy is, and offers to fork it here", True,
+            lambda: f"Its copy was pulled at {at}, when its turn had ended with nothing left running" in how() and how().endswith("fork onto pc"))
+    w.view.evaluate(f"{BOX}.querySelector('.how .resume-now').click()")
+    settles("a fork of an idle session asks first, naming the pull", True,
+            lambda: f"so it may be behind: pulled at {at}. Fork from it all the same?" in how() and how().endswith("fork anyway"))
+    w.view.evaluate(f"{BOX}.querySelector('.how .resume-now').click()")
+    settles("...and once asked again, pc's hub forks it, here to say it has no tmux server to start it in", True,
+            lambda: how().startswith("not forked: no tmux server runs"))
+    fakes.page(w.home / ".claude/session-pages" / session_id(0x23) / "forked-from.json", json.dumps(
+        {"host": "laptop", "session": COPIED, "point": 0, "pulled": pulled, "at": pulled + 60, "on": "pc", "page": str(copy)}))
+    w.view.reload()  # as the tab reads every host again once it has forked
+    settles("a session forked here shows so, on its row and in its box, which offers to fork it no more", (True, True, False),
+            lambda: (w.view.evaluate(f"document.querySelector('{row} .forked')?.textContent === 'forked on pc'"),
+                     how().startswith(f"forked on pc at {datetime.fromtimestamp(pulled + 60).strftime('%H:%M')} as {session_id(0x23)[:8]}"),
+                     w.view.evaluate(f"!!document.querySelector('{row}')?.closest('.unit').querySelector('.resume')")), within=30)
+    w.view.keyboard.press("Control+Alt+f")
+    w.view.keyboard.type("long gone")
+    settles("the search finds a session of the laptop's the rail does not list, ended before the last pull, from the copy",
+            ["Long gone on the laptop"], lambda: w.view.evaluate("[...document.querySelectorAll('#units .name')].map(e => e.textContent)"))
+    w.view.keyboard.press("Enter")
+    settles("...and goes to it as its unit, whose box offers to fork it here", (f"laptop/{GONE}", True),
+            lambda: (w.current(), how().endswith("fork onto pc")))
+
+
+MOVING = session_id(0x24)  # a session on the laptop, ended there, which the tab moves to pc
+
+
+@scenario
+def a_session_moved(w: World) -> None:
+    """sessions-move-by-release: the world's hub is pc's, relaying a laptop whose ended session the tab moves to pc. pc
+    pulls the laptop's copy through an ssh stub that lands in the laptop's HOME."""
+    home, user = w.scratch / "lap", pwd.getpwuid(os.getuid()).pw_name
+    fakes.page(home / ".claude/projects/-p" / f"{MOVING}.jsonl", json.dumps(
+        {"type": "user", "sessionId": MOVING, "cwd": str(w.home), "message": {"content": "go"}}) + "\n")
+    page = fakes.page(home / ".claude/session-pages" / MOVING / "index.html", "<!doctype html><body><h1>moving</h1><p>its turns</p>")
+    env = {**w.env, "HOME": str(home)}
+    laptop = subprocess.Popen([str(BIN / "container-hub"), "--socket", str(w.scratch / "lap.sock"), "--url", "http://laptop.invalid",
+                               "--state", str(w.scratch / "lap-state"), "--host", "laptop", "--tmux-socket", str(w.tmux_socket)],
+                              env=env, stdout=subprocess.DEVNULL, stderr=(w.scratch / "lap.log").open("a"), start_new_session=True)
+    try:
+        until(lambda: (w.scratch / "lap.sock").exists() or laptop.poll() is not None, "the laptop's hub to listen")
+        subprocess.run(["curl", "-sf", "--unix-socket", str(w.scratch / "lap.sock"), "-H", "Content-Type: application/json", "-d",
+                        json.dumps({"target": str(page), "session": MOVING}), "http://hub/api/open"], check=True, capture_output=True)
+        stub = w.scratch / "stub"
+        fakes.page(stub / "ssh", f"""#!/usr/bin/env bash
+while [[ $1 == -* ]]; do shift; done
+shift
+cd {home} && HOME={home} USER={user} exec sh -c "$*"
+""").chmod(0o755)
+        copies = w.scratch / "copies"
+        w.kill_hub()
+        w.env["PATH"] = f"{stub}:{w.env['PATH']}"
+        w.hub_args += ["--host", "pc", "--peer", f"laptop={w.scratch / 'lap.sock'}", "--copies", str(copies),
+                       "--pull", f"{BIN / 'session-copies'} --sources laptop=lap-over-ssh --root {copies}"]
+        w.start_hub()
+        w.view.reload()
+        key = f"laptop/{MOVING}"
+        w.view.wait_for_function(f"window.wc && wc.state.units.some(u => u.unit === {json.dumps(key)})", timeout=30000)
+        check("the rail offers to move every idle or ended session of each host to the other",
+              ["move laptop's idle and ended sessions to pc", "move pc's idle and ended sessions to laptop"],
+              w.view.evaluate("[...document.querySelectorAll('#host-moves .move-host')].map(b => b.textContent)"))
+        row = f'#aside-units button[title="session {MOVING}"]'
+        w.view.locator(f"{row} .name").click()
+        until(lambda: w.current() == key, "the laptop's unit")
+        how = lambda: w.view.evaluate(f"{BOX}?.querySelector('.how')?.textContent ?? ''")
+        move = f"[...{BOX}.querySelectorAll('.how .resume-now')].find(b => b.textContent.startsWith('move to'))"
+        settles("the box of an ended session of the laptop's offers to resume it, and to move it to pc", True,
+                lambda: how().endswith("resumemove to pc"))
+        w.view.evaluate(f"{move}.click()")
+        settles("...a click asks to be confirmed", True, lambda: how().endswith("move to pc? again to confirm"))
+        w.view.evaluate(f"{move}.click()")
+        until(lambda: w.current() == MOVING, "pc's unit of the moved session", within=120)
+        check("...and once confirmed, the laptop releases it and pc takes it over: the tab goes to pc's unit of it, under "
+              "the same id, its session page pc's own copy of the laptop's",
+              f"/f{w.home}/.claude/session-pages/{MOVING}/index.html", urllib.parse.unquote(urllib.parse.urlsplit(until(w.sidebar_url, "the session sidebar")).path))
+        settles("...which pc offers to resume", True, lambda: how().endswith("resumemove to laptop"))
+        settles("the laptop's row of it says it was released to pc", True,
+                lambda: w.view.evaluate(f"[...document.querySelectorAll('{row} .released')].some(e => e.textContent === 'released to pc')"))
+    finally:
+        os.killpg(laptop.pid, signal.SIGKILL)
+        laptop.wait()
 
 
 # ---- running them

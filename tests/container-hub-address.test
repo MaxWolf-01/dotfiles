@@ -1,0 +1,341 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: full-path (nix, npx, wrangler dev, Chromium, the network)
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["playwright>=1.50", "tyro>=1.0.14"]
+# ///
+"""Check bin/container-hub-address, which builds hub.mwolf.dev. Run it directly; no framework.
+
+Three seams:
+
+- build: the script run on a copy of the repo's layout holding a hosts list of its own, out of name order. The
+  oracle is that list and the hub address the script's --help gives.
+- site: `wrangler dev` serving what build wrote, fetched over HTTP.
+- page: the built page in headless Chromium, its hubs swapped for fakes, with Chrome's Local Network Access in
+  force: the page's port is declared public and the hubs' local (--ip-address-space-overrides), and each hub is
+  reached by name (--host-resolver-rules), since Chrome checks a name's address space only once it has connected,
+  where it checks an IP literal's before. Headless dismisses every prompt and Chrome remembers a dismissal, so
+  each case starts from a fresh profile. A host that is down is a name resolving to 10.255.255.1, whose SYN goes
+  nowhere.
+
+wrangler comes through npx, which needs the network the first time it runs.
+
+Examples:
+
+    tests/container-hub-address.test
+    tests/container-hub-address.test --only page
+"""
+
+import http.server
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import tyro
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import Skip, expect, finish, free_port, needs, prop, run_properties  # noqa: E402
+
+REPO = Path(__file__).resolve().parents[1]
+SCRIPT = REPO / "bin/container-hub-address"
+
+
+def build(script: Path, out: Path) -> None:
+    r = subprocess.run([str(script), "build", str(out)], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    expect(r.returncode == 0, f"{script.name} build exited {r.returncode}: {r.stderr.strip()[-800:]}")
+
+
+def hub_list(page: str) -> list[dict]:
+    m = re.search(r'<script type="application/json" id="hub-list">(.*?)</script>', page, re.S)
+    expect(m is not None, "the built page holds no hub list")
+    return json.loads(m.group(1))
+
+
+# --- build
+
+
+def layout(tmp: Path, hosts_nix: str) -> Path:
+    """A copy of the repo's layout around the script, holding a hosts list of its own: the script to run there."""
+    (tmp / "bin").mkdir(parents=True)
+    (tmp / "nix/home").mkdir(parents=True)
+    for name in ("container-hub-address", "container-hub-address.html"):
+        shutil.copy2(REPO / "bin" / name, tmp / "bin" / name)
+    (tmp / "nix/home/session-hosts.nix").write_text(hosts_nix)
+    return tmp / "bin/container-hub-address"
+
+
+@prop("build: a host added to the list reaches the page with no other edit, in the list's order, not by name")
+def added_host(tmp: Path) -> None:
+    script = layout(tmp / "added", """[
+  { name = "zephylux"; ssh = "zephylux"; trust = 2; }
+  { name = "pc"; ssh = "pc"; trust = 2; }
+  { name = "athena"; ssh = "athena.example"; trust = 1; }
+]
+""")
+    build(script, tmp / "added/site")
+    built = hub_list((tmp / "added/site/public/index.html").read_text())
+    expect(built == [{"name": "zephylux", "url": "https://zephylux.tail710178.ts.net:8377/"},
+                     {"name": "pc", "url": "https://pc.tail710178.ts.net:8377/"},
+                     {"name": "athena", "url": "https://athena.tail710178.ts.net:8377/"}],
+           f"the list holds zephylux, pc, athena; the page {built}")
+
+
+@prop("build: a list that names a host twice is refused, and nothing is written")
+def named_twice(tmp: Path) -> None:
+    script = layout(tmp / "twice", """[
+  { name = "pc"; ssh = "pc"; trust = 2; }
+  { name = "zephylux"; ssh = "zephylux"; trust = 2; }
+  { name = "pc"; ssh = "pc"; trust = 1; }
+]
+""")
+    r = subprocess.run([str(script), "build", str(tmp / "twice/site")], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    expect(r.returncode != 0 and "pc" in r.stderr and not (tmp / "twice/site").exists(),
+           f"build exited {r.returncode}: {r.stderr.strip()[-400:]}")
+
+
+# --- site
+
+
+@prop("site: / is the page, every answer says noindex and no-referrer, and any other path is a 404, by wrangler dev")
+def site(tmp: Path) -> None:
+    needs("npx")
+    out = tmp / "site"
+    build(SCRIPT, out)
+    port = free_port()
+    # its own process group, so stopping it stops the workerd processes it starts
+    dev = subprocess.Popen(["npx", "--yes", "wrangler@4.140.0", "dev", "--config", str(out / "wrangler.json"),
+                            "--ip", "127.0.0.1", "--port", str(port)],
+                           cwd=out, env={**os.environ, "WRANGLER_SEND_METRICS": "false"},
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           start_new_session=True)
+    try:
+        base = f"http://127.0.0.1:{port}"
+        for _ in range(240):
+            try:
+                urllib.request.urlopen(base + "/", timeout=2)
+                break
+            except urllib.error.HTTPError:
+                break
+            except OSError:
+                expect(dev.poll() is None, f"wrangler dev exited {dev.returncode}")
+                time.sleep(0.5)
+        page = (out / "public/index.html").read_bytes()
+        for path, status in (("/", 200), ("/nope", 404), ("/wrangler.json", 404)):
+            try:
+                r = urllib.request.urlopen(base + path, timeout=10)
+                got, headers, body = r.status, r.headers, r.read()
+            except urllib.error.HTTPError as e:
+                got, headers, body = e.code, e.headers, e.read()
+            expect(got == status, f"{path} answered {got}")
+            if status == 200:
+                expect(body == page and headers.get("content-type", "").startswith("text/html"),
+                       f"{path} answered {headers.get('content-type')}, not the built page")
+            expect(headers.get("x-robots-tag") == "noindex, nofollow" and headers.get("referrer-policy") == "no-referrer",
+                   f"{path} answered X-Robots-Tag {headers.get('x-robots-tag')!r}, Referrer-Policy {headers.get('referrer-policy')!r}")
+    finally:
+        os.killpg(dev.pid, signal.SIGTERM)
+        try:
+            dev.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(dev.pid, signal.SIGKILL)
+
+
+# --- page
+
+hits: list[int] = []
+
+
+class Hub(http.server.BaseHTTPRequestHandler):
+    """A hub: its /.health readable from the page's origin, as the real hub's is from hub.mwolf.dev."""
+
+    status = 200
+    delay = 0.0
+
+    def do_GET(self):
+        hits.append(self.server.server_address[1])
+        time.sleep(self.delay)
+        body = b'{"saves": true}'
+        self.send_response(self.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if self.status == 200:
+            self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", ""))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):  # the browser has gone on, or its case has ended
+            pass
+
+    def log_message(self, *_):
+        pass
+
+
+class SlowHub(Hub):
+    """A hub further away, as pc over a relay: it answers well inside the page's deadline, after the other."""
+
+    delay = 0.5
+
+
+class Gateway(Hub):
+    """tailscale serve on a host whose hub is down: a 502, which no page may read."""
+
+    status = 502
+
+
+def serve(handler, port: int = 0) -> int:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server.server_address[1]
+
+
+def hanging() -> int:
+    """A hub that hangs: the kernel takes its connections, and nothing ever answers them."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(16)
+    return s.getsockname()[1]
+
+
+DOWN = "http://down.test:8377/"
+DEADLINE_MS = 1500
+"""How long the page waits on a hub in these cases, well over a SlowHub's answer."""
+
+
+@dataclass
+class Case:
+    name: str
+    hubs: list  # a port of 127.0.0.1, or DOWN
+    permission: str | None  # granted or denied; None: never set, so headless dismisses the prompt
+    ends: str  # the hub the browser ends on, by its place in hubs, or the page's status
+    notes: list[str] = field(default_factory=list)
+    late: bool = False  # hubs[0] comes up, and the permission is granted, once the page has given up
+
+
+@prop("page: it opens the first hub in the list's order that answers, shows every link where none does, and tells a refusal from no answer")
+def page(tmp: Path) -> None:
+    from playwright.sync_api import Error, sync_playwright
+
+    exe = os.environ.get("CHROMIUM") or shutil.which("chromium")
+    out = tmp / "page"
+    build(SCRIPT, out)
+    # A hub that never answers costs a case the whole deadline, and seven cases have one: the page's 4 s, cut here.
+    built = (out / "public/index.html").read_text().replace("DEADLINE_MS = 4000;", f"DEADLINE_MS = {DEADLINE_MS};", 1)
+    assert f"DEADLINE_MS = {DEADLINE_MS};" in built, "the page names its deadline in another form: cut it here anew"
+    up_a, up_b, slow, gateway = serve(Hub), serve(Hub), serve(SlowHub), serve(Gateway)
+    hang, refusing, late = hanging(), free_port(), free_port()
+    none = "No hub answered. Off the tailnet, none can."
+    unasked = "No hub answered. Off the tailnet, none can; on it, allow this page to look for them when asked."
+    refused = "This browser does not let this page look for the hubs."
+    cases = [
+        Case("both up, pc the slower", [slow, up_b], "granted", "0"),
+        Case("pc refuses", [refusing, up_b], "granted", "1"),
+        Case("pc's hub down behind its tailscale serve", [gateway, up_b], "granted", "1"),
+        Case("pc's hub hangs", [hang, up_b], "granted", "1"),
+        Case("pc down", [DOWN, up_b], "granted", "1"),
+        Case("only the third answers", [refusing, DOWN, up_b], "granted", "2"),
+        Case("none answers", [refusing, DOWN], "granted", none, ["does not answer", "does not answer"]),
+        Case("refused, both up", [up_a, up_b], "denied", refused, ["", ""]),
+        Case("never asked, both up", [up_a, up_b], None, refused, ["", ""]),
+        Case("never asked, pc down, the laptop up", [DOWN, up_b], None, refused, ["", ""]),
+        Case("never asked, none answers", [refusing, DOWN], None, unasked, ["does not answer", "does not answer"]),
+        Case("allowed late", [late, DOWN], None, "0", late=True),
+    ]
+
+    def url(hub) -> str:
+        return hub if isinstance(hub, str) else f"http://hub.test:{hub}/"
+
+    site_page = {"html": b""}
+
+    class Site(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(site_page["html"])
+
+        def log_message(self, *_):
+            pass
+
+    site_port = serve(Site)
+    origin = f"http://127.0.0.1:{site_port}"
+    local = [f"127.0.0.1:{p}=local" for p in (up_a, up_b, slow, gateway, hang, refusing, late)]
+    args = [f"--ip-address-space-overrides=127.0.0.1:{site_port}=public," + ",".join(local),
+            "--host-resolver-rules=MAP hub.test 127.0.0.1, MAP down.test 10.255.255.1"]
+    wrong = []
+    with sync_playwright() as pw:
+        for case in cases:
+            hubs = [{"name": f"host{i}", "url": url(h)} for i, h in enumerate(case.hubs)]
+            site_page["html"] = re.sub(r'(id="hub-list">).*?(</script>)', lambda m: m[1] + json.dumps(hubs) + m[2],
+                                       built, count=1, flags=re.S).encode()
+            profile = tempfile.mkdtemp(dir=tmp)
+            try:
+                context = pw.chromium.launch_persistent_context(profile, executable_path=exe, args=args)
+            except Error as e:
+                if exe or "Executable doesn't exist" not in str(e):
+                    raise
+                raise Skip("no Chromium: `make install` fetches Playwright's, $CHROMIUM names one, or one is on PATH")
+            try:
+                cdp = context.new_cdp_session(context.pages[0])
+                grant = lambda setting: [cdp.send("Browser.setPermission", {"permission": {"name": p}, "setting": setting, "origin": origin})
+                                         for p in ("local-network", "loopback-network")]
+                if case.permission:
+                    grant(case.permission)
+                tab = context.new_page()
+                hits.clear()
+                tab.goto(origin + "/")
+                tab.wait_for_function(f"() => !location.href.startsWith('{origin}') || "
+                                      "/^No hub|does not let/.test(document.getElementById('status')?.textContent)",
+                                      timeout=15_000)
+                if case.late:
+                    serve(Hub, case.hubs[0])
+                    grant("granted")
+                    tab.wait_for_url(url(case.hubs[0]), timeout=15_000)
+                tab.wait_for_timeout(300)
+                if case.ends.isdigit():
+                    target = url(case.hubs[int(case.ends)])
+                    if tab.url != target:
+                        wrong.append(f"{case.name}: ended on {tab.url}, not {target}")
+                else:
+                    status = tab.evaluate("() => document.getElementById('status').textContent")
+                    notes = tab.evaluate("() => [...document.querySelectorAll('#hubs .meta')].map(n => n.textContent)")
+                    links = tab.evaluate("() => [...document.querySelectorAll('#hubs a')].map(a => a.href)")
+                    if not status.startswith(case.ends) or notes != case.notes or links != [h["url"] for h in hubs]:
+                        wrong.append(f"{case.name}: said {status!r}, notes {notes}, links {links}")
+                    if case.permission == "denied" and hits:
+                        wrong.append(f"{case.name}: a hub was reached all the same")
+            finally:
+                context.close()
+    expect(not wrong, "\n".join(wrong))
+
+
+@dataclass
+class Args:
+    only: list[str] = field(default_factory=list)
+    """Run only these seams: build, site, page."""
+    keep: bool = False
+    """Keep the scratch directory, and print where it is."""
+
+
+def main(args: Args) -> None:
+    needs("nix")
+    with tempfile.TemporaryDirectory(prefix="container-hub-address-test-", delete=not args.keep) as tmp:
+        run_properties(lambda check: check(Path(tmp)), [f"{seam}: " for seam in args.only])
+        if args.keep:
+            print(f"kept {tmp}")
+    finish()
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__, config=(tyro.conf.OmitArgPrefixes,)))

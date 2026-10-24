@@ -7,6 +7,7 @@
     ./copyparty.nix
     ./pihole.nix
     ./sftpgo.nix
+    ./tailscale-serve.nix
     ./tailnet-lock.nix
     ./hd-idle.nix
     (import ../agent-user.nix {
@@ -15,6 +16,7 @@
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
       ];
     })
+    ./container-hub.nix
     ./host-unlock.nix
     ../host-recorder.nix
     ./hardware-alerts.nix
