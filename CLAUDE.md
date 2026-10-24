@@ -44,7 +44,7 @@ NEVER include any work related details whatsoever in commit messages, PRs, issue
 
 Global `~/.claude` config lives in `~/repos/github/MaxWolf-01/agents` (`claude/`), not here. `.claude/` in this repo is dotfiles-local.
 
-On zephylux, `claude` on PATH is a wrapper that starts the real one on the setup-token of the account its `CLAUDE_CONFIG_DIR` names (`nix/home/claude-token.sh` says how). A unit that runs claude puts `~/.nix-profile/bin` ahead of `~/.local/bin`, or it skips the wrapper. The worker users on pc and xmg19 get their account's token from `claude-token-push` (`--help`).
+`claude` on PATH is a wrapper in front of the real one (`nix/home/claude-token.sh` says how). On zephylux each profile runs on its own `/login`, until `claude-account <name>` switches every `claude` started from then on to that account's setup-token (`claude-account --help`); on pc each profile always runs on its account's token. A unit that runs claude puts `~/.nix-profile/bin` ahead of `~/.local/bin`, or it skips the wrapper, and sets `CLAUDE_ACCOUNT_SWITCH=ignore` (`ownLogin` in `timers.nix`), or the switch moves it too. The worker users on pc and xmg19 get their account's token from `claude-token-push` (`--help`).
 
 ## Scripts (`bin/`)
 
