@@ -14,12 +14,25 @@
 # host: you read a description when a machine is down and you need to know
 # whether it was the one you wanted.
 #
+# A record's frontmatter names the account its user's claude is logged into
+# (`account:`), and two fields dispatch places workers by: `slots:`, how many
+# workers the machine runs at once, whichever of its users runs them (every
+# record of one machine carries the same count), and `has:`, the capabilities a
+# spawn can ask for by name (`gpu`). A machine with no slot count is never
+# chosen by placement, only named.
+#
 # Usage:
 #   worker-hosts             every host, with live state
 #   worker-hosts agent@pc    one host's whole record, from the host while it is up
 #   worker-hosts --targets   every user@host, one per line, nothing probed: the
 #                            list itself, for a script that goes to the hosts on
 #                            its own
+#   worker-hosts --readings  what placement reads, a tab-separated line per
+#                            record: user@host, machine, account, slots, the
+#                            machine's users (comma-separated), has, isolated,
+#                            state (up, locked or unreachable), this user's
+#                            running claude, the machine's, threads, 5-minute
+#                            load. A field the record or host lacks is `-`.
 set -uo pipefail
 
 repo="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
@@ -50,8 +63,17 @@ lead() {
   ' "$1"
 }
 
-# Runs on the host, one round trip. Everything the renderer needs comes back as
-# key=value lines, so a field a host cannot answer is simply absent from them.
+# Every worker user of the machine a record names: the users placement counts its workers among.
+machine_users() {
+  local r
+  for r in "${records[@]}"; do
+    [ "$(field "$r" host)" = "$(field "$1" host)" ] && field "$r" user
+  done | paste -sd, -
+}
+
+# Runs on the host, one round trip, after a line setting `users` to the machine's
+# worker users. Everything the renderer needs comes back as key=value lines, so
+# a field a host cannot answer is simply absent from them.
 read -r -d '' remote_probe <<'REMOTE'
 awk '{d = int($1 / 86400); h = int(($1 % 86400) / 3600); print "uptime=" d "d " h "h"}' /proc/uptime
 echo "cores=$(nproc)"
@@ -77,6 +99,9 @@ elif command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null |
     awk -F', *' 'NF == 4 && $2 ~ /^[0-9]+$/ {print "gpu=" $1 "|" $2 "|" $3 "|" $4}'
 fi
+# A worker is its claude process: a tmux session outlives the worker it ran.
+echo "claude=$(pgrep -c -x claude -u "$(id -un)")"
+echo "used=$(pgrep -c -x claude -u "$users")"
 tmux list-panes -a -F 'worker=#{session_name}|#{pane_current_path}' 2>/dev/null | grep '^worker=dispatch-' | sort -u
 exit 0
 REMOTE
@@ -84,13 +109,33 @@ REMOTE
 # stderr is kept, not discarded: an unauthorized key and a machine that is off
 # both produce no output, and only the error tells you which one you are
 # looking at -- one of them you can fix in a minute.
-probe() { ssh "${ssh_opts[@]}" "$1" bash -s <<<"$remote_probe" > "$2" 2> "$2.err"; }
+probe() { # <record> <result>
+  ssh "${ssh_opts[@]}" "$(target "$1")" bash -s <<<"users=$(machine_users "$1")
+$remote_probe" > "$2" 2> "$2.err"
+}
+
+# A key's value in a probe's result, `-` where the host gave none.
+answer() { local v; v=$(sed -n "s/^$2=//p" "$1" | head -1); echo "${v:--}"; }
+
+reading() { # <record> <result>
+  local state=up
+  if [ ! -s "$2" ]; then state=unreachable; elif grep -qx 'locked=1' "$2"; then state=locked; fi
+  local -a f=("$(target "$1")" "$(field "$1" host)" "$(field "$1" account)" "$(field "$1" slots)"
+    "$(machine_users "$1")" "$(field "$1" has | tr -d ' ')" "$(field "$1" isolated)" "$state")
+  if [ "$state" = up ]; then
+    f+=("$(answer "$2" claude)" "$(answer "$2" used)" "$(answer "$2" cores)" "$(answer "$2" load5)")
+  else
+    f+=(- - - -)
+  fi
+  local i; for i in "${!f[@]}"; do f[i]=${f[i]:--}; done
+  (IFS=$'\t'; echo "${f[*]}")
+}
 
 gib() { awk -v k="${1:-0}" 'BEGIN { g = k / 1048576; printf (g < 10 ? "%.1fG" : "%.0fG"), g }'; }
 
 render() {
   local name=$1 record=$2 result=$3
-  local uptime cores cpu load5 memtotal memavail arc gpu gname gutil gused gtotal workers
+  local uptime cores cpu load5 memtotal memavail arc gpu gname gutil gused gtotal workers slots
 
   if [ -s "$result" ]; then
     uptime=$(sed -n 's/^uptime=//p' "$result")
@@ -114,8 +159,8 @@ render() {
   memtotal=$(sed -n 's/^memtotal_kb=//p' "$result")
   memavail=$(sed -n 's/^memavail_kb=//p' "$result")
   arc=$(sed -n 's/^arc_kb=//p' "$result")
-  printf '  load %s of %s cores (%s)   mem %s free of %s' \
-    "${load5:-?}" "${cores:-?}" "${cpu:-?}" \
+  printf '  load %s of %s threads, %s each (%s)   mem %s free of %s' \
+    "${load5:-?}" "${cores:-?}" "$(awk -v l="${load5:-0}" -v t="${cores:-1}" 'BEGIN { printf "%.2f", l / t }')" "${cpu:-?}" \
     "$(gib $(( ${memavail:-0} + ${arc:-0} )))" "$(gib "${memtotal:-0}")"
 
   gpu=$(sed -n 's/^gpu=//p' "$result" | head -1)
@@ -139,20 +184,31 @@ render() {
   workers=$(sed -n 's/^worker=//p' "$result" |
     while IFS='|' read -r session path; do printf '%s (%s), ' "$session" "${path##*/}"; done)
   workers=${workers%, }
-  printf '  workers: %s\n\n' "${workers:-none}"
+  slots=$(field "$record" slots)
+  if [ -n "$slots" ]; then
+    printf '  workers: %s claude running here; %s of %s slots used on %s\n' "$(answer "$result" claude)" \
+      "$(answer "$result" used)" "$slots" "$(field "$record" host)"
+  else
+    printf '  workers: %s claude running here; %s has no slot count\n' "$(answer "$result" claude)" "$(field "$record" host)"
+  fi
+  printf '  sessions: %s\n\n' "${workers:-none}"
 }
 
 host=""
 targets_only=false
+readings=false
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --targets) targets_only=true ;;
+    --readings) readings=true ;;
     -*) die "unknown argument: $1" ;;
     *) [ -z "$host" ] || die "one host at a time: $host, $1"; host=$1 ;;
   esac
   shift
 done
+
+! $readings || [ -z "$host" ] || die "--readings takes no host"
 
 records=("$hosts_dir"/*/HOST.md)
 [ -e "${records[0]}" ] || die "no worker hosts: nothing matches $hosts_dir/*/HOST.md"
@@ -186,9 +242,14 @@ trap 'rm -rf "$results"' EXIT
 # Keyed by the record's own directory, not by the machine it names: two records
 # on one machine would otherwise be handed each other's answers.
 for record in "${records[@]}"; do
-  probe "$(target "$record")" "$results/$(basename "$(dirname "$record")")" &
+  probe "$record" "$results/$(basename "$(dirname "$record")")" &
 done
 wait
+
+if $readings; then
+  for record in "${records[@]}"; do reading "$record" "$results/$(basename "$(dirname "$record")")"; done
+  exit 0
+fi
 
 for record in "${records[@]}"; do
   render "$(target "$record")" "$record" "$results/$(basename "$(dirname "$record")")"

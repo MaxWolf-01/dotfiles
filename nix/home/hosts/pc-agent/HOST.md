@@ -2,6 +2,7 @@
 host: pc
 user: agent
 isolated: true
+slots: 6
 account: personal
 ---
 

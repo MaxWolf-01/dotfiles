@@ -2,6 +2,8 @@
 host: xmg19
 user: agent-hl
 isolated: true
+slots: 8
+has: gpu
 account: helferline
 ---
 
