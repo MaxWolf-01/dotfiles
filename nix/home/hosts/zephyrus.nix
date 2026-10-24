@@ -10,6 +10,8 @@
   # `worker-hosts` (bin/). No @TOOLCHAIN@ token: what is installed here is
   # spread across common.nix and its imports rather than one list, so the
   # record points at the config instead of enumerating it.
+  claudeToken.mode = "switch";
+
   home.file."HOST.md".source = ./zephyrus/HOST.md;
 
   imports = [

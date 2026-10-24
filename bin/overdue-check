@@ -24,12 +24,12 @@
 # falling back to it when a run log goes missing would weaken the check without
 # saying so.
 #
-# One more thing runs out on a date rather than going quiet: the Claude Code
-# setup-token in each creds/env/claude-<account>.env, which stops working on its
-# CLAUDE__VALID_UNTIL. Each one is reported as expiring once it is within
-# TOKEN_WARN_DAYS of that date, so the yearly renewal is not found by a session
-# failing. A file whose values are all empty holds no token yet, and is passed
-# over.
+# One more thing runs out on a date rather than going quiet: a credential in
+# creds/env/ that stops working on the date its <NAME>__VALID_UNTIL gives (the
+# Claude Code setup-tokens' CLAUDE__VALID_UNTIL among them). Each one is reported
+# as expiring once it is within EXPIRY_WARN_DAYS of that date, at every daily run
+# until the date moves, so a renewal is not found by a session failing. A file
+# whose values are all empty holds no credential yet, and is passed over.
 #
 # Units on another host are read over ssh. A target that is merely away (a host
 # that is off, a repository whose server is down) is expected unavailability,
@@ -48,8 +48,11 @@ set -uo pipefail
 DEFAULT_MAX_AGE_DAYS=14
 RESTIC_CONFIG_GLOB="$HOME/.dotfiles/secrets/backup/restic/*/*.conf"
 CREDS_ENV_GLOB="$HOME/.dotfiles/secrets/creds/env/*.env"
-TOKEN_EXPIRY_VARIABLE=CLAUDE__VALID_UNTIL
-TOKEN_WARN_DAYS=30
+EXPIRY_VARIABLE_SUFFIX=__VALID_UNTIL
+EXPIRY_WARN_DAYS=7
+# --extra-days never brings an expiry warning nearer than this: a backup host that
+# warned only on the day itself would let the renewal be found by a failure.
+EXPIRY_LATEST_WARN_DAYS=3
 
 # systemd logs this message id when a unit's job finishes; JOB_RESULT says how it
 # went, so "done" is the last clean finish and failures never match.
@@ -63,9 +66,9 @@ Checks every restic config's newest snapshot against its max_age_days (default
 $DEFAULT_MAX_AGE_DAYS), and every unit in the config file against its bound there.
 With no positional arguments, checks every restic config under
   $RESTIC_CONFIG_GLOB
-Every credential file under
+Every credential under
   $CREDS_ENV_GLOB
-that defines $TOKEN_EXPIRY_VARIABLE is reported as expiring from $TOKEN_WARN_DAYS days before
+that defines a <NAME>$EXPIRY_VARIABLE_SUFFIX is reported as expiring from $EXPIRY_WARN_DAYS days before
 that date.
 Repos on a filesystem path that doesn't exist here are skipped: they belong to
 another host. A repo whose target cannot be reached is dated from the run log
@@ -78,7 +81,8 @@ could not run. The units treat 1 as success, so a red unit means a broken
 watchdog rather than an overdue backup.
 
   --extra-days N  add N days to every bound, restic and unit alike, and warn of
-                  an expiring token N days later. Two hosts
+                  an expiring credential N days later, but
+                  never later than $EXPIRY_LATEST_WARN_DAYS days before its date. Two hosts
                   running this both cover everything, but the one with the
                   offset stays quiet unless the other stopped alerting (i.e.
                   died), so a healthy setup alerts only once.
@@ -280,25 +284,26 @@ if [ ${#restic_configs[@]} -eq 0 ]; then
     shopt -u nullglob
 fi
 
-# The credential files that date a token. The date is encrypted with the token.
+# The credential files that date a credential. The date is encrypted with it, but
+# a dotenv file's names are not.
 shopt -s nullglob
-token_files=()
+dated_files=()
 for file in $CREDS_ENV_GLOB; do
-    grep -q "^$TOKEN_EXPIRY_VARIABLE=" "$file" && token_files+=("$file")
+    grep -q "^[A-Za-z0-9_]*$EXPIRY_VARIABLE_SUFFIX=" "$file" && dated_files+=("$file")
 done
 shopt -u nullglob
 
-# Without the key every repo and every token's date would read as unreadable,
+# Without the key every repo and every credential's date would read as unreadable,
 # which is a screen of confusing lines in place of one true one. Report it once
 # and drop both — but carry on: the unit checks need no key, and on pc the key
 # lives on tmpfs and is only decrypted at the first interactive login, so every
 # run after a reboot lands here. Giving up would leave that reboot silent in
 # both directions.
-if { [ ${#restic_configs[@]} -gt 0 ] || [ ${#token_files[@]} -gt 0 ]; } && [ ! -f "${SOPS_AGE_KEY_FILE:-}" ]; then
-    unchecked="  age key: not available at '${SOPS_AGE_KEY_FILE:-}' (decrypt it first), so no restic repo or token date was read"$'\n'
+if { [ ${#restic_configs[@]} -gt 0 ] || [ ${#dated_files[@]} -gt 0 ]; } && [ ! -f "${SOPS_AGE_KEY_FILE:-}" ]; then
+    unchecked="  age key: not available at '${SOPS_AGE_KEY_FILE:-}' (decrypt it first), so no restic repo or credential date was read"$'\n'
     unchecked_count=1
     restic_configs=()
-    token_files=()
+    dated_files=()
 fi
 
 probe_err=$(mktemp)
@@ -373,43 +378,56 @@ for config in "${restic_configs[@]}"; do
     fi
 done
 
-# --- account tokens: the days left before each one's expiry date
+# --- dated credentials: the days left before each one's expiry date
 
-warn_days=$((TOKEN_WARN_DAYS - extra_days))
+warn_days=$((EXPIRY_WARN_DAYS - extra_days))
+[ "$warn_days" -ge "$EXPIRY_LATEST_WARN_DAYS" ] || warn_days=$EXPIRY_LATEST_WARN_DAYS
 # Whole days from today's date to the expiry date: both read as UTC midnights, so
 # no daylight-saving change in between leaves a fraction of one.
 today=$(date -u -d "$(date +%F)" +%s)
-for file in "${token_files[@]}"; do
+
+# How to renew what <file name> holds, for the alert.
+renewal() {
+    local name="$1"
+    case $name in
+        claude-*)
+            echo -n "mint the next with \`claude setup-token\`, write it with \`sops ~/.dotfiles/secrets/creds/env/${name}.env\`, push it to the worker users with \`claude-token-push\`"
+            # Jarvis and skilltree's pi each keep a copy of the personal token;
+            # everything else on an account reads its file at every start.
+            [ "$name" = claude-personal ] && echo -n ", then rerun \`make auth\` in jarvis and \`make pi-claude-auth\` in skilltree"
+            echo ;;
+        *)  echo "renew it, and write it and its new date with \`sops ~/.dotfiles/secrets/creds/env/${name}.env\`" ;;
+    esac
+}
+
+for file in "${dated_files[@]}"; do
     name=$(basename "$file" .env)
     if ! plain=$(sops decrypt --input-type dotenv --output-type dotenv "$file" 2>/dev/null); then
-        unchecked="${unchecked}  ${name}: could not decrypt it to read $TOKEN_EXPIRY_VARIABLE"$'\n'
+        unchecked="${unchecked}  ${name}: could not decrypt it to read its $EXPIRY_VARIABLE_SUFFIX date"$'\n'
         unchecked_count=$((unchecked_count + 1))
         continue
     fi
-    until=$(sed -n "s/^$TOKEN_EXPIRY_VARIABLE=//p" <<<"$plain")
-    if [ -z "$until" ]; then
-        grep -q '^[^#][^=]*=.' <<<"$plain" || { echo "no token: $name holds none yet"; continue; }
-        unchecked="${unchecked}  ${name}: holds a token but no $TOKEN_EXPIRY_VARIABLE"$'\n'
-        unchecked_count=$((unchecked_count + 1))
-        continue
-    fi
-    if ! expiry=$(date -u -d "$until" +%s 2>/dev/null); then
-        unchecked="${unchecked}  ${name}: $TOKEN_EXPIRY_VARIABLE is no date: $until"$'\n'
-        unchecked_count=$((unchecked_count + 1))
-        continue
-    fi
-    left=$(( (expiry - today) / 86400 ))
-    if [ "$left" -le "$warn_days" ]; then
-        if [ "$left" -lt 0 ]; then when="expired $((-left))d ago"; else when="expires in ${left}d"; fi
-        renew="mint the next with \`claude setup-token\`, write it with \`sops ~/.dotfiles/secrets/creds/env/${name}.env\`, push it to the worker users with \`claude-token-push\`"
-        # Jarvis and skilltree's pi each keep a copy of the personal token; everything
-        # else on an account reads its file at every start.
-        [ "$name" = claude-personal ] && renew="$renew, then rerun \`make auth\` in jarvis and \`make pi-claude-auth\` in skilltree"
-        expiring="${expiring}  ${name}: token ${when}, ${until} (warns ${warn_days}d ahead); ${renew}"$'\n'
-        expiring_count=$((expiring_count + 1))
-    else
-        echo "ok: $name — token expires in ${left}d, $until (warns ${warn_days}d ahead)"
-    fi
+    while IFS='=' read -r variable until; do
+        if [ -z "$until" ]; then
+            grep -q '^[^#][^=]*=.' <<<"$plain" || { echo "no credential: $name holds none yet"; continue; }
+            unchecked="${unchecked}  ${name}: holds a credential but no date in $variable"$'\n'
+            unchecked_count=$((unchecked_count + 1))
+            continue
+        fi
+        if ! expiry=$(date -u -d "$until" +%s 2>/dev/null); then
+            unchecked="${unchecked}  ${name}: $variable is no date: $until"$'\n'
+            unchecked_count=$((unchecked_count + 1))
+            continue
+        fi
+        left=$(( (expiry - today) / 86400 ))
+        if [ "$left" -le "$warn_days" ]; then
+            if [ "$left" -lt 0 ]; then when="expired $((-left))d ago"; else when="expires in ${left}d"; fi
+            expiring="${expiring}  ${name}: $variable ${when}, ${until} (warns ${warn_days}d ahead); $(renewal "$name")"$'\n'
+            expiring_count=$((expiring_count + 1))
+        else
+            echo "ok: $name — $variable expires in ${left}d, $until (warns ${warn_days}d ahead)"
+        fi
+    done < <(grep "^[A-Za-z0-9_]*$EXPIRY_VARIABLE_SUFFIX=" <<<"$plain")
 done
 
 # --- everything else: time since the last successful run
@@ -478,8 +496,8 @@ subject_lead() {
 # Proton threads by subject and participants, and a subject that never changes
 # folds every alert this host ever sent into one conversation.
 #
-# Overdue leads, then expiring. A unit past its bound is the alarm; a token
-# running out is weeks away; evidence that could not be read is a second-order
+# Overdue leads, then expiring. A unit past its bound is the alarm; a credential
+# running out is days away; evidence that could not be read is a second-order
 # problem, and the counts of the ones that do not lead say enough. "unchecked"
 # is the subject's name for the body's "Could not check:" section — the body has
 # the room to spell it out, a lock screen does not.
