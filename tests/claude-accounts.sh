@@ -22,9 +22,10 @@ account_token() {
     sops encrypt --in-place --age "$(age-keygen -y "$SOPS_AGE_KEY_FILE")" "$file"
 }
 
-# The wrapper as the `claude` in <dir>, as nix/home/claude-token.nix installs it.
+# install_claude_wrapper <dir> [profile|switch]: the wrapper as the `claude` in <dir>, as
+# nix/home/claude-token.nix installs it, in pc's mode unless named.
 install_claude_wrapper() {
     mkdir -p "$1"
-    printf '#!/usr/bin/env bash\nexec bash %q %q "$0" "$@"\n' "$claude_token_sh" "$(command -v sops)" >"$1/claude"
+    printf '#!/usr/bin/env bash\nexec bash %q %q "$0" %q "$@"\n' "$claude_token_sh" "$(command -v sops)" "${2:-profile}" >"$1/claude"
     chmod +x "$1/claude"
 }
