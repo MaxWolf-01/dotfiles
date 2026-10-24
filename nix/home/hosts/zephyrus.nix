@@ -1,13 +1,17 @@
-{ ... }:
+{ config, ... }:
 {
   home.username = "max";
   home.homeDirectory = "/home/max";
   home.stateVersion = "26.05";
 
+  home.sessionVariables.SOPS_AGE_KEY_FILE = "${config.home.homeDirectory}/.local/secrets/age-key.txt";
+
   # This machine's capability record, read by a worker running locally and by
   # `worker-hosts` (bin/). No @TOOLCHAIN@ token: what is installed here is
   # spread across common.nix and its imports rather than one list, so the
   # record points at the config instead of enumerating it.
+  claudeToken.mode = "switch";
+
   home.file."HOST.md".source = ./zephyrus/HOST.md;
 
   # Every process here is max's, so the hub keeps its loopback port beside the
@@ -24,6 +28,7 @@
 
   imports = [
     ../brave.nix
+    ../claude-token.nix
     ../container-hub.nix
     ../desktop.nix
     ../display-layout.nix

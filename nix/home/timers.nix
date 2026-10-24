@@ -39,6 +39,10 @@ let
     bash coreutils uv jq
   ]);
 
+  # In a unit that runs claude: its profile's own login, whichever account `claude-account`
+  # switched the laptop's sessions to (nix/home/claude-token.sh).
+  ownLogin = "CLAUDE_ACCOUNT_SWITCH=ignore";
+
   # The retros' units: claude for the retro's stages, uv for its scripts, jq for both run logs.
   retroPath = "${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin";
 
@@ -108,7 +112,7 @@ let
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
 {
-  # TimeoutStartSec on the three restic services: Type=oneshot disables the start
+  # TimeoutStartSec on the restic services: Type=oneshot disables the start
   # timeout by default, so a restic blocked on a dead sftp socket or a hung sshfs
   # read never dies. It holds the repo lock — restic only breaks a lock whose
   # owner has exited, and a task in uninterruptible sleep still exists — and the
@@ -119,6 +123,7 @@ in
   systemd.user.services.working-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (working data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -143,6 +148,7 @@ in
   systemd.user.services.working-pc = {
     Unit = {
       Description = "Restic backup to PC (working data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -164,11 +170,37 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  systemd.user.services.working-xmg19 = {
+    Unit = {
+      Description = "Restic backup to xmg19 (working data)";
+      X-SwitchMethod = "keep-old";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      TimeoutStartSec = "2h";
+      Environment = [ "PATH=${backupPath}" "SSH_AUTH_SOCK=${sshAuthSock}" ];
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/working/xmg19.conf";
+    };
+  };
+
+  systemd.user.timers.working-xmg19 = {
+    Unit.Description = "Daily backup to xmg19 (working data)";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "50m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Jarvis VPS workspace → rsync.net (via SSHFS) ---
 
   systemd.user.services.jarvis-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (jarvis workspace via SSHFS)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -198,13 +230,24 @@ in
   # enters the agent and the units that skipped for want of it can run. It
   # carries no Install section, so systemd itself never starts it: the timers
   # cover the scheduled runs, this covers what a missing credential skipped.
+  #
+  # A Home Manager switch neither starts a backup nor waits on one. Its unit
+  # switcher, sd-switch, starts every active target whose unit file changed.
+  # This target becomes active only once every backup it pulled in has ended,
+  # as a target waits on what it wants, and StopWhenUnneeded stops it then (no
+  # unit wants it), so a switch never finds it active. Each backup it lists
+  # carries X-SwitchMethod=keep-old, so a switch lets a running one finish
+  # rather than stop it, start it again and wait on it; a changed backup applies
+  # from its next run.
 
   systemd.user.targets.backup-catchup = {
     Unit = {
       Description = "Run every backup whose preconditions are now met";
+      StopWhenUnneeded = true;
       Wants = [
         "working-rsyncnet.service"
         "working-pc.service"
+        "working-xmg19.service"
         "jarvis-rsyncnet.service"
       ];
     };
@@ -269,7 +312,7 @@ in
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
       # ${home}/bin for run-log and alert-send: the script records each run and
       # mails what needs a person with them
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/report.sh";
     };
   };
@@ -294,7 +337,7 @@ in
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
       # ${home}/bin for run-log and alert-send: the script records each run and
       # mails what needs a person with them
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/dep-scout.sh";
     };
   };
@@ -331,7 +374,7 @@ in
       Type = "oneshot";
       TimeoutStartSec = "12h"; # a real run takes an hour or two
       TimeoutStopSec = "3min";
-      Environment = [ "PATH=${retroPath}" ];
+      Environment = [ "PATH=${retroPath}" ownLogin ];
       ExecStart = "${dotfiles}/bin/workflow-retro ${home}/repos/github/MaxWolf-01/agents";
     };
   };
@@ -355,7 +398,7 @@ in
       Type = "oneshot";
       TimeoutStartSec = "${toString (2 * builtins.length repoRetros)}h"; # up to two hours a repo
       TimeoutStopSec = "3min";
-      Environment = [ "PATH=${retroPath}" ];
+      Environment = [ "PATH=${retroPath}" ownLogin ];
       ExecStart = "${dotfiles}/bin/workflow-retro --repos ${home}/repos/github/MaxWolf-01/agents";
     };
   };
@@ -486,8 +529,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${calendarPath}"
-        # A unit's environment does not say where the age key is; a shell's does.
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets gcal,kusss,moodle ${secrets}/scripts/calendar-collect --record";
       # oneshot has no start timeout of its own; a hung run would leave every later
@@ -521,8 +562,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${jkuPath}"
-        # A unit's environment does not say where the age key is; a shell's does.
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets jku ${secrets}/scripts/jku-collect --record";
       # jku-collect's own budgets add up to 155 min (KUSSS_BUDGET 5, MOODLE_FIRST_BUDGET
@@ -555,8 +594,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${erstePath}"
-        # A unit's environment does not say where the age key is; a shell's does.
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets enable-banking ${secrets}/scripts/erste-collect fetch";
       # A read is a few pages, each answered in seconds; a run this long has hung.
@@ -634,8 +671,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${wakatimePath}"
-        # A unit's environment does not say where the age key is; a shell's does.
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${dotfiles}/bin/with-secrets wakatime-lifelog-sync-oauth-app ${dotfiles}/bin/wakatime-sync --record";
       TimeoutStartSec = "30min";
@@ -758,7 +793,6 @@ in
       Environment = [
         "PATH=${syncPath}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
-        "SOPS_AGE_KEY_FILE=${home}/.local/secrets/age-key.txt"
       ];
       ExecStart = "${secrets}/scripts/jarvis-sync --record";
     };
@@ -1007,7 +1041,9 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "/tmp";
-      Environment = [ "PATH=${home}/.local/bin:${home}/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin" ];
+      # ~/.nix-profile/bin ahead of ~/.local/bin: its `claude` is the wrapper
+      # (claude-token.nix), and the ping has to open the profile's own window.
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
       ExecStart = "${dotfiles}/bin/claude-ping";
     };
   };

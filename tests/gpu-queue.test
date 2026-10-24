@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# tier: fast
+# Drive bin/gpu-run and bin/gpu-queue against a queue in a scratch directory. Run it directly; no framework.
+#
+# What a caller relies on: jobs run one at a time in the order they were queued, gpu-run exits with its command's
+# code, a waiting job that is stopped or dies leaves the line, and gpu-queue shows each job with what its owner
+# declared and when it is expected to start, summed from the estimates ahead of it. Every job here runs as the user
+# running the test, so of two users sharing one queue it checks only that every entry is readable by every user.
+
+set -uo pipefail
+
+bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
+scratch=$(mktemp -d)
+pids=()
+cleanup() {
+    for pid in "${pids[@]}"; do kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null; done
+    rm -rf "$scratch"
+}
+trap cleanup EXIT
+
+. "$(dirname "${BASH_SOURCE[0]}")/check.sh"
+
+needs jq flock
+
+export GPU_QUEUE_DIR="$scratch/queue" GPU_QUEUE_POLL=0.05
+mkdir -m 1777 "$GPU_QUEUE_DIR"
+# A Claude Code session registry with two sessions in it: the one whose id the jobs inherit, and another read first.
+export HOME="$scratch/home" CLAUDE_CODE_SESSION_ID=0e7a51c2-9f4b-4c1e-8d2a-5b6c7d8e9f00
+mkdir -p "$HOME/.claude/sessions"
+echo '{"pid":2,"sessionId":"7d1f0b3a-0000-4000-8000-000000000000","name":"dotfiles-12"}' >"$HOME/.claude/sessions/0.json"
+echo '{"pid":1,"sessionId":"0e7a51c2-9f4b-4c1e-8d2a-5b6c7d8e9f00","name":"dotfiles-74"}' >"$HOME/.claude/sessions/1.json"
+
+# Job control puts each job started in the background in a process group of its own, as `job run` does.
+set -m
+
+# Starts gpu-run in the background and sets $pid to it. A background job of a script ignores SIGINT whenever job
+# control is not fully on, as under `make test` in a terminal, where this script is not the terminal's foreground;
+# env restores it, so Ctrl-C reaches gpu-run as it does in a `job run` pane.
+start() {
+    env --default-signal=INT "$bin/gpu-run" "$@" >>"$scratch/stderr" 2>&1 &
+    pid=$!
+    pids+=("$pid")
+}
+
+# Waits, up to 10 s, until the queue's JSON satisfies the jq condition given.
+until_queue() {
+    for _ in $(seq 200); do
+        "$bin/gpu-queue" --json | jq -e "$1" >/dev/null && return 0
+        sleep 0.05
+    done
+    fail "the queue never reached: $1" "$("$bin/gpu-queue")"
+    return 1
+}
+
+# Each job's command logs its start, then holds the GPU until the test creates its release file.
+holder() {
+    echo "echo start $1 >>$scratch/order; until [ -e $scratch/release-$1 ]; do sleep 0.05; done; echo end $1 >>$scratch/order; exit $2"
+}
+
+# Writes a live entry by hand, as any user can: entry <seq> <name> <eta> <started|null> [<note>]. A sleep stands in
+# for its gpu-run.
+entry() {
+    sleep 1000 &
+    local holder_pid=$! fields
+    pids+=("$holder_pid")
+    read -ra fields <<<"$(sed 's/.*) //' "/proc/$holder_pid/stat")"
+    jq -n --argjson seq "$1" --arg name "$2" --argjson eta "$3" --argjson started "$4" --arg note "${5:-}" \
+        --argjson pid "$holder_pid" --arg start "${fields[19]}" --argjson queued "$(date +%s)" \
+        '{seq: $seq, user: "max", pid: $pid, start: $start, name: $name, note: $note, command: "train", eta: $eta,
+          queued: $queued, started: $started, session: null, short: null}' >"$GPU_QUEUE_DIR/$1.json"
+}
+
+# --- the order jobs run in, and whose exit code gpu-run returns
+
+start --eta 1h --name first -- sh -c "$(holder first 0)"
+first=$pid
+until_queue 'length == 1 and .[0].state == "running"'
+start --eta 30m --name second -- sh -c "$(holder second 7)"
+second=$pid
+until_queue 'length == 2'
+check "a job queued behind a running one waits" "start first" "$(cat "$scratch/order")"
+touch "$scratch/release-first"
+wait "$first"
+check "the first job's gpu-run exits with its command's code" 0 "$?"
+until_queue 'length == 1 and .[0].name == "second" and .[0].state == "running"'
+touch "$scratch/release-second"
+wait "$second"
+check "the second job's gpu-run exits with its command's code" 7 "$?"
+check "the two jobs ran one after the other, in the order they were queued" \
+    "start first|end first|start second|end second" "$(paste -sd'|' "$scratch/order")"
+check "a job that ended leaves the queue" "[]" "$("$bin/gpu-queue" --json | jq -c .)"
+
+# --- jobs queued at the same moment, as two workers in one wave queue them
+
+rm -f "$scratch"/order "$scratch"/release-*
+racers=()
+for n in 1 2 3 4 5; do
+    start --eta 1m --name "racer$n" -- sh -c "$(holder "racer$n" 0)"
+    racers+=("$pid")
+done
+until_queue 'length == 5'
+check "every job queued at once gets a place of its own" 5 "$("$bin/gpu-queue" --json | jq 'map(.seq) | unique | length')"
+touch "$scratch"/release-racer{1,2,3,4,5}
+wait "${racers[@]}"
+check "jobs queued at once still run one at a time" "" \
+    "$(awk '$1 == "start" && open {print "overlap: " $2} $1 == "start" {open = 1} $1 == "end" {open = 0}' "$scratch/order")"
+
+# --- what gpu-queue shows
+
+rm -f "$scratch"/order "$scratch"/release-*
+t0=$(date +%s)
+start --eta 2h --name train --note $'can be paused;\nask dotfiles-74' -- sh -c "$(holder train 0)"
+train=$pid
+until_queue 'length == 1 and .[0].state == "running"'
+check "a running job's start is when it got the GPU, kept in its entry" true \
+    "$(jq -s --argjson t0 "$t0" '.[0].started | . != null and . >= $t0 and . <= $t0 + 10' "$GPU_QUEUE_DIR"/[0-9]*.json)"
+start --eta 1h30m --name eval -- sh -c "$(holder eval 0)"
+until_queue 'length == 2'
+start --eta 45m -- sh -c "$(holder third 0)"
+until_queue 'length == 3'
+json=$("$bin/gpu-queue" --json)
+check "the running job's estimate is its --eta in seconds" 7200 "$(jq '.[0].eta' <<<"$json")"
+check "the first waiting job is expected to start when the running one's estimate runs out" \
+    "$(jq '.[0].started + 7200' <<<"$json")" "$(jq '.[1].expected_start' <<<"$json")"
+check "a later waiting job is expected to start after every estimate ahead of it" \
+    "$(jq '.[0].started + 7200 + 5400' <<<"$json")" "$(jq '.[2].expected_start' <<<"$json")"
+check "each entry carries its owner and session" \
+    "$(id -un) $CLAUDE_CODE_SESSION_ID dotfiles-74" "$(jq -r '.[1] | "\(.user) \(.session) \(.short)"' <<<"$json")"
+check "a job given no --name is named after its command" sh "$(jq -r '.[2].name' <<<"$json")"
+table=$("$bin/gpu-queue")
+row() { grep -E "^$1 " <<<"$table"; }
+failures_before=$failures
+for want in "$(id -un)" train dotfiles-74 2h running; do
+    [[ $(row 1) == *"$want"* ]] || fail "the running job's row shows $want" "$table"
+done
+for want in eval dotfiles-74 1h30m "expected $(jq -r '.[1].expected_start | strflocaltime("%H:%M")' <<<"$json")"; do
+    [[ $(row 2) == *"$want"* ]] || fail "the waiting job's row shows $want" "$table"
+done
+grep -q "note: can be paused; ask dotfiles-74" <<<"$table" ||
+    fail "the running job's note is shown, its newline a space" "$table"
+[ "$failures" -eq "$failures_before" ] && passed "gpu-queue shows the running and the waiting jobs"
+
+# --- leaving the queue
+
+waiting=$(jq '.[1].seq' <<<"$json")
+eval_pid=${pids[-2]}
+kill -TERM -- "-$eval_pid"  # what `job stop` sends: TERM to the whole process group
+wait "$eval_pid"
+check "a waiting job stopped as \`job stop\` stops it exits 143" 143 "$?"
+check "a stopped waiting job leaves the queue" "[]" "$("$bin/gpu-queue" --json | jq --argjson s "$waiting" -c '[.[] | select(.seq == $s)]')"
+third_pid=${pids[-1]}
+kill -INT -- "-$third_pid"  # what Ctrl-C sends
+wait "$third_pid"
+check "a waiting job stopped with Ctrl-C exits 130" 130 "$?"
+check "only the running job is left" '["train"]' "$("$bin/gpu-queue" --json | jq -c 'map(.name)')"
+[ -e "$scratch/order" ] && ! grep -qE 'eval|third' "$scratch/order"
+check "a stopped waiting job's command never ran" 0 "$?"
+
+old_umask=$(umask)
+umask 077
+start --eta 10m --name doomed -- true
+umask "$old_umask"
+until_queue 'length == 2'
+doomed=$(ls "$GPU_QUEUE_DIR" | sort -n | tail -1)
+check "an entry queued under umask 077 is readable by every user" 644 "$(stat -c %a "$GPU_QUEUE_DIR/$doomed")"
+kill -KILL "$pid"
+wait "$pid" 2>/dev/null
+check "a job whose gpu-run died is not listed" '["train"]' "$("$bin/gpu-queue" --json | jq -c 'map(.name)')"
+[ ! -e "$GPU_QUEUE_DIR/$doomed" ]
+check "its owner's next look at the queue removes its entry" 0 "$?"
+touch "$scratch/release-train"
+wait "$train"
+
+# A dead entry ahead of a new job holds nothing up: here one whose process is gone, as after a reboot.
+echo '{"seq": 1, "user": "someone", "pid": 1, "start": "-1", "name": "ghost", "note": "", "command": "x",
+       "eta": 3600, "queued": 0, "started": 0, "session": null, "short": null}' >"$GPU_QUEUE_DIR/1.json"
+timeout 10 "$bin/gpu-run" --eta 1m -- true 2>/dev/null
+check "a job queued behind a dead entry runs at once" 0 "$?"
+check "the queued command runs under its caller's umask" 0077 "$(umask 077; "$bin/gpu-run" --eta 1m -- sh -c umask 2>/dev/null)"
+
+# --- what gpu-run refuses
+
+out=$("$bin/gpu-run" -- true 2>&1)
+check "gpu-run without --eta is refused" 2 "$?"
+[[ $out == *"--eta <duration> is required"*"expected start"* ]] || fail "the refusal says why the estimate is needed" "$out"
+for bad in 90 5x 0m; do
+    "$bin/gpu-run" --eta "$bad" -- true 2>/dev/null
+    check "--eta $bad is refused" 2 "$?"
+done
+"$bin/gpu-run" --eta 1m --note "$(printf 'x%.0s' $(seq 301))" -- true 2>/dev/null
+check "a note over 300 characters is refused" 2 "$?"
+"$bin/gpu-run" --eta 1m --note $'paused? \e]52;c;aGk=\a' -- true 2>/dev/null
+check "a note holding a control character is refused" 2 "$?"
+"$bin/gpu-run" --eta 1m --name $'a\eb' -- true 2>/dev/null
+check "a name holding a control character is refused" 2 "$?"
+check "nothing refused was queued" "[]" "$("$bin/gpu-queue" --json | jq -c .)"
+
+# --- a job past its estimate, and the jobs behind it
+
+now=$(date +%s)
+# The note is planted with an escape that would set the clipboard of whoever reads the queue.
+entry 5 long 600 $((now - 3600)) $'x\e]52;c;aGk=\ay'
+entry 6 next 600 null
+entry 9 ninth 60 null
+entry 10 tenth 60 null
+table=$("$bin/gpu-queue")
+grep -qE "^1 +max +long " <<<"$table" && passed "the # column is the position in the queue" ||
+    fail "the # column is the position in the queue" "$table"
+[[ $table == *"overrunning by 50m"* ]] && passed "a running job past its estimate shows as overrunning" ||
+    fail "a running job past its estimate shows as overrunning" "$table"
+[[ $table != *$'\e'* && $table == *"note: x ]52;c;aGk= y"* ]] &&
+    passed "an entry's control characters never reach the terminal" ||
+    fail "an entry's control characters never reach the terminal" "$(cat -v <<<"$table")"
+json=$("$bin/gpu-queue" --json)
+check "the job behind an overrunning one is expected to start now" true \
+    "$(jq --argjson now "$(date +%s)" '.[1].expected_start | . >= $now - 2 and . <= $now + 2' <<<"$json")"
+check "entries run in the order of their numbers, 10 after 9" "[5,6,9,10]" "$(jq -c 'map(.seq)' <<<"$json")"
+
+CLAUDE_CODE_SESSION_ID=ffffffff-1111-4111-8111-111111111111 start --eta 90s --name eleventh -- true
+until_queue 'length == 5'
+check "a job queued behind entry 10 is entry 11" 11 "$("$bin/gpu-queue" --json | jq '.[-1].seq')"
+check "--eta 90s is 90 seconds" 90 "$("$bin/gpu-queue" --json | jq '.[-1].eta')"
+check "a session the registry does not hold is shown by the start of its id" ffffffff \
+    "$("$bin/gpu-queue" --json | jq -r '.[-1].short')"
+kill -TERM -- "-$pid"
+wait "$pid" 2>/dev/null
+rm -f "$GPU_QUEUE_DIR"/[0-9]*.json
+
+# --- under the name Nix installs it by
+
+mkdir "$scratch/wrapped"
+cp "$bin/gpu-queue" "$scratch/wrapped/.gpu-run-wrapped"
+out=$("$scratch/wrapped/.gpu-run-wrapped" --eta 1d -- true 2>&1)
+check "the wrapped gpu-run runs a job as gpu-run" "0 gpu-run: true has the GPU" "$? $out"
+
+finish

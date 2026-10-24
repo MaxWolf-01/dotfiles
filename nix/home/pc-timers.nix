@@ -24,9 +24,6 @@ let
   # last finished cleanly, here and (over ssh) on the laptop.
   watchdogPath = "${backupPath}:${lib.makeBinPath [ pkgs.systemd ]}";
 
-  # Age key on tmpfs (decrypted on first SSH login, see secrets/zshrc)
-  ageKeyFile = "/run/user/1000/age-key.txt";
-
   # ssh-agent socket (managed by services.ssh-agent in common.nix)
   sshAuthSock = "/run/user/1000/ssh-agent";
 in
@@ -38,6 +35,7 @@ in
   systemd.user.services.youtube-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (YouTube archive)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -45,7 +43,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/youtube/rsyncnet.conf";
@@ -67,6 +64,7 @@ in
   systemd.user.services.phone-sync = {
     Unit = {
       Description = "Sync phone data via rsync over Tailscale";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
@@ -95,6 +93,7 @@ in
   systemd.user.services.phone-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (phone data)";
+      X-SwitchMethod = "keep-old";
       # Ordered after the sync so we never snapshot a half-copied tree. Wants,
       # not Requires: a failed or skipped sync should still leave us backing up
       # whatever already landed on disk.
@@ -105,7 +104,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/rsyncnet.conf";
@@ -122,11 +120,46 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Phone → xmg19 ---
+  # After the sync for the reason phone-rsyncnet gives.
+
+  systemd.user.services.phone-xmg19 = {
+    Unit = {
+      Description = "Restic backup to xmg19 (phone data)";
+      X-SwitchMethod = "keep-old";
+      After = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" "phone-sync.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # Bounded for the reason timers.nix gives above its restic services: xmg19
+      # powered off mid-run is that dead sftp socket. A first run uploads all of
+      # phone, about 90 GB.
+      TimeoutStartSec = "6h";
+      Environment = [
+        "PATH=${backupPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/xmg19.conf";
+    };
+  };
+
+  systemd.user.timers.phone-xmg19 = {
+    Unit.Description = "Daily backup to xmg19 (phone data)";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Phone → PC local ---
 
   systemd.user.services.phone-pc = {
     Unit = {
       Description = "Restic backup local (phone data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "phone-sync.service" ];
       Wants = [ "network-online.target" "phone-sync.service" ];
     };
@@ -134,7 +167,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/phone/pc.conf";
     };
@@ -155,6 +187,7 @@ in
   systemd.user.services.encrypted-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (encrypted data)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -162,7 +195,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/encrypted/rsyncnet.conf";
@@ -188,6 +220,7 @@ in
   systemd.user.services.pcstate-rsyncnet = {
     Unit = {
       Description = "Restic backup to rsync.net (pc service state)";
+      X-SwitchMethod = "keep-old";
       After = [ "network-online.target" "ssh-agent.service" ];
       Wants = [ "network-online.target" "ssh-agent.service" ];
     };
@@ -195,7 +228,6 @@ in
       Type = "oneshot";
       Environment = [
         "PATH=${backupPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStartPre = "${dotfiles}/backup/pcstate_snapshot.sh";
@@ -213,23 +245,63 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- pc service state → xmg19 ---
+  # Stages into a tree of its own (base_path in pcstate/xmg19.conf): staging
+  # starts by deleting the tree, and sharing pcstate-rsyncnet's would let one
+  # run delete it under the other's restic.
+
+  systemd.user.services.pcstate-xmg19 = {
+    Unit = {
+      Description = "Restic backup to xmg19 (pc service state)";
+      X-SwitchMethod = "keep-old";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # Bounded as phone-xmg19 is.
+      TimeoutStartSec = "2h";
+      Environment = [
+        "PATH=${backupPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStartPre = "${dotfiles}/backup/pcstate_snapshot.sh ${home}/.local/state/pcstate-xmg19";
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/pcstate/xmg19.conf";
+    };
+  };
+
+  systemd.user.timers.pcstate-xmg19 = {
+    Unit.Description = "Weekly backup to xmg19 (pc service state)";
+    Timer = {
+      OnCalendar = "weekly";
+      Persistent = true;
+      RandomizedDelaySec = "50m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Catch-up handle ---
   # "The backups can run now." secrets/zshrc starts it on login, when the age key
-  # is decrypted or the ssh key enters the agent, and zfs-unlock starts it when a
-  # dataset appears. It carries no Install section, so systemd itself never
-  # starts it: the timers cover the scheduled runs, this covers what skipped for
-  # want of a precondition.
+  # is decrypted or the ssh key enters the agent, zfs-unlock starts it when a
+  # dataset appears, and `host-unlock pc` once everything is unlocked. It
+  # carries no Install section, so systemd itself never starts it: the timers
+  # cover the scheduled runs, this covers what skipped for want of a
+  # precondition.
   #
   # It lists every unit rather than the ones a caller's event feeds, so a caller
-  # needs to know nothing about preconditions. The two with no source to gate on
-  # — youtube and pcstate — therefore run every time it fires, which for youtube
-  # means its 1% integrity check reads ~2 GB back from rsync.net. That is the
-  # price of the caller not having to know, and it is only paid on a login or an
-  # unlock.
+  # needs to know nothing about preconditions. The ones with no source to gate on
+  # (youtube and both pcstate units) therefore run every time it fires, which
+  # for youtube means its 1% integrity check reads ~2 GB back from rsync.net.
+  # That is the price of the caller not having to know, and it is only paid on
+  # a login or an unlock.
+  #
+  # StopWhenUnneeded here and X-SwitchMethod=keep-old on each backup it lists:
+  # for the reason timers.nix gives above its catch-up target.
 
   systemd.user.targets.backup-catchup = {
     Unit = {
       Description = "Run every backup whose preconditions are now met";
+      StopWhenUnneeded = true;
       Wants = [
         "youtube-rsyncnet.service"
         "phone-sync.service"
@@ -237,6 +309,8 @@ in
         "phone-pc.service"
         "encrypted-rsyncnet.service"
         "pcstate-rsyncnet.service"
+        "phone-xmg19.service"
+        "pcstate-xmg19.service"
       ];
     };
   };
@@ -262,7 +336,6 @@ in
       SuccessExitStatus = "1 2";
       Environment = [
         "PATH=${igSavesPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
       ];
       ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/data/encrypted/instagram-saves/saved.tsv --dest ${home}/data/encrypted/instagram-saves --require-mount ${home}/data/encrypted --record";
     };
@@ -298,7 +371,6 @@ in
       SuccessExitStatus = "1";
       Environment = [
         "PATH=${watchdogPath}"
-        "SOPS_AGE_KEY_FILE=${ageKeyFile}"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/bin/overdue-check";

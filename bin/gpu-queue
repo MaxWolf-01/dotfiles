@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# The GPU queue: GPU jobs on this host wait their turn, one at a time, first
+# come first served, in one line shared by every user.
+#
+# Usage: gpu-run --eta <duration> [--name <name>] [--note <text>] -- <command> [args...]
+#        gpu-queue [--json]
+#   gpu-run    queues <command>, waits for its turn, runs it, and exits with
+#              its exit code. Stopping a waiting gpu-run (Ctrl-C, `job stop`)
+#              takes it off the queue. For a log and a wake-up when it ends,
+#              run it under job: `job run train -- gpu-run --eta 2h -- python train.py`.
+#     --eta    how long the job expects to run, required: 90s, 45m, 2h, 1h30m,
+#              1d. A job past its estimate shows as overrunning and keeps
+#              running; nothing kills it.
+#     --name   what the queue calls the job, the command's own name by default.
+#     --note   a few words for whoever else is waiting, 300 characters at most:
+#              what the job is for, whether it can be paused, who to ask.
+#   gpu-queue  lists the running job and the waiting ones in order, each with
+#              its user, name, Claude Code session short id, estimate, and
+#              expected start, which is summed from the estimates ahead of it.
+#     --json   the same as a JSON array; times are epoch seconds.
+#
+# Use is cooperative: nothing stops a process from taking the GPU without
+# gpu-run, and a job that does crashes whichever one runs through it.
+#
+# The queue is a directory every user can write to, sticky as /tmp is, holding
+# one file per job, <n>.json, n allocated under a lock and one past the highest
+# there. The live entry with the lowest n runs; an entry whose gpu-run is gone
+# is skipped by everyone, and removed by its owner's next gpu-run or gpu-queue,
+# the only user the sticky bit lets remove it.
+#
+# Environment: GPU_QUEUE_DIR (the queue, /run/gpu-queue by default),
+# GPU_QUEUE_POLL (seconds between looks while waiting, 2 by default).
+set -euo pipefail
+
+dir=${GPU_QUEUE_DIR:-/run/gpu-queue}
+poll=${GPU_QUEUE_POLL:-2}
+note_max=300
+# Which of its two names it was called by. Nix installs it under each, wrapped, as .<name>-wrapped.
+me=${0##*/}
+me=${me#.}
+me=${me%-wrapped}
+
+die() {
+    echo "$me: $*" >&2
+    exit 2
+}
+
+usage() {
+    sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d'
+}
+
+# A process's start time in clock ticks since boot, which tells it apart from
+# a later process given the same pid.
+proc_start() {
+    local stat
+    stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    stat=${stat##*) }
+    read -ra fields <<<"$stat"
+    echo "${fields[19]}"
+}
+
+# The live entries, lowest number first, as a JSON array, after removing this
+# user's dead ones.
+live_entries() {
+    local f pid start live=()
+    for f in "$dir"/[0-9]*.json; do
+        [ -e "$f" ] || continue
+        read -r pid start < <(jq -r '"\(.pid) \(.start)"' "$f" 2>/dev/null) || continue
+        if [ "$(proc_start "$pid" || true)" = "$start" ]; then
+            live+=("$f")
+        elif [ -O "$f" ]; then
+            rm -f "$f"
+        fi
+    done
+    if [ ${#live[@]} -eq 0 ]; then
+        echo '[]'
+    else
+        jq -s 'sort_by(.seq)' "${live[@]}"
+    fi
+}
+
+# The queue with what is computed from it: each entry's state, and each
+# waiting one's expected start. The running job is expected to end at its
+# start plus its estimate, and once it overruns, at any moment.
+annotated() {
+    live_entries | jq --argjson now "$(date +%s)" '
+        reduce .[] as $e ({at: $now, out: []};
+            if (.out | length) == 0 then
+                ($e.started // $now) as $s
+                | ($s + $e.eta) as $end
+                | .at = ([$end, $now] | max)
+                | .out += [$e + {state: "running", started: $s, expected_start: null, overrunning: ($end < $now)}]
+            else
+                .out += [$e + {state: "waiting", expected_start: .at, overrunning: false}]
+                | .at += $e.eta
+            end)
+        | .out'
+}
+
+show_queue() {
+    annotated | jq -r --argjson now "$(date +%s)" '
+        def dur: (if . < 60 then "\(.)s" else
+                  [(./86400 | floor | select(. > 0) | "\(.)d"),
+                   (./3600 % 24 | floor | select(. > 0) | "\(.)h"),
+                   (./60 % 60 | floor | select(. > 0) | "\(.)m")] | join("") end);
+        def clock: strflocaltime("%H:%M");
+        def pad($w): tostring | . + (" " * ([$w - length, 0] | max) // "");
+        # Anyone can write an entry, so what it says reaches the terminal without its control characters.
+        def clean: gsub("[\\p{Cc}\\s]+"; " ");
+        if length == 0 then "the GPU queue is empty" else
+        [to_entries[] | (.key + 1) as $pos | .value
+         | {pos: ($pos | tostring), user: (.user | clean), name: (.name | clean), session: (.short // "-" | clean),
+                eta: (.eta | dur),
+                start: (if .state == "running" then
+                            "running since \(.started | clock), "
+                            + (if .overrunning then "overrunning by \(($now - .started - .eta) | dur)"
+                               else "\((.started + .eta - $now) | dur) left" end)
+                        else
+                            "expected \(.expected_start | clock)"
+                            + (if .expected_start > $now then " (in \((.expected_start - $now) | dur))" else "" end)
+                            + ", queued \(.queued | clock)"
+                        end),
+                command: (.command | clean), note: (.note // "" | clean)}] as $rows
+        | [{pos: "#", user: "USER", name: "NAME", session: "SESSION", eta: "ETA", start: "START"}] + $rows
+        | (map(.pos | length) | max) as $wp | (map(.user | length) | max) as $wu
+        | (map(.name | length) | max) as $wn | (map(.session | length) | max) as $ws
+        | (map(.eta | length) | max) as $we
+        | .[] | (" " * ($wp + 2)) as $indent
+        | "\(.pos | pad($wp))  \(.user | pad($wu))  \(.name | pad($wn))  \(.session | pad($ws))  \(.eta | pad($we))  \(.start)"
+          + (if .command then "\n\($indent)$ \(.command)" else "" end)
+          + (if (.note // "") != "" then "\n\($indent)note: \(.note)" else "" end)
+        end'
+}
+
+# Seconds in a duration written as 90s, 45m, 2h, 1h30m or 1d.
+seconds_of() {
+    local rest=$1 total=0
+    [[ $rest =~ ^([0-9]+[dhms])+$ ]] || return 1
+    while [[ $rest =~ ^([0-9]+)([dhms])(.*)$ ]]; do
+        case ${BASH_REMATCH[2]} in
+            d) total=$((total + 10#${BASH_REMATCH[1]} * 86400)) ;;
+            h) total=$((total + 10#${BASH_REMATCH[1]} * 3600)) ;;
+            m) total=$((total + 10#${BASH_REMATCH[1]} * 60)) ;;
+            s) total=$((total + 10#${BASH_REMATCH[1]})) ;;
+        esac
+        rest=${BASH_REMATCH[3]}
+    done
+    [ "$total" -gt 0 ] || return 1
+    echo "$total"
+}
+
+# The session's name in Claude Code's session registry, as the container hub
+# and the status line show it, else the first 8 characters of its id.
+short_id() {
+    local sid=$1 files=() name=""
+    for f in "$HOME"/.claude*/sessions/*.json; do
+        [ -e "$f" ] && files+=("$f")
+    done
+    [ ${#files[@]} -eq 0 ] ||
+        name=$(jq -r --arg s "$sid" 'select(.sessionId == $s) | .name // empty' "${files[@]}" 2>/dev/null | head -1)
+    echo "${name:-${sid:0:8}}"
+}
+
+# Replaces this job's entry with stdin, whole, and readable by every user
+# whatever umask the caller runs under: an entry another user cannot read is
+# one their gpu-run cannot see, and runs beside.
+write_entry() {
+    (umask 022; cat >"$entry.tmp")
+    mv "$entry.tmp" "$entry"
+}
+
+cmd_run() {
+    local eta="" name="" note=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -h|--help) usage; exit 0 ;;
+            --eta) [ $# -ge 2 ] || die "--eta needs a duration"; eta=$2; shift 2 ;;
+            --name) [ $# -ge 2 ] || die "--name needs a value"; name=$2; shift 2 ;;
+            --note) [ $# -ge 2 ] || die "--note needs a value"; note=$2; shift 2 ;;
+            --) shift; break ;;
+            *) die "unknown option $1; the command goes after --" ;;
+        esac
+    done
+    [ $# -gt 0 ] || die "no command; usage: gpu-run --eta <duration> [--name <name>] [--note <text>] -- <command>"
+    [ -n "$eta" ] || die "--eta <duration> is required: the queue sums the estimates of the jobs ahead of each waiting one into its expected start, which is how whoever queues after you plans around the wait. Give your best guess (45m, 2h); a job past it keeps running."
+    local secs
+    secs=$(seconds_of "$eta") || die "--eta $eta is not a duration; write it as 90s, 45m, 2h, 1h30m or 1d"
+    [ ${#note} -le $note_max ] || die "--note is ${#note} characters; the queue takes $note_max at most"
+    name=${name:-${1##*/}}
+    note=${note//[$'\n\t']/ }
+    [[ $name != *[[:cntrl:]]* ]] || die "--name holds a control character"
+    [[ $note != *[[:cntrl:]]* ]] || die "--note holds a control character"
+    [ -d "$dir" ] && [ -w "$dir" ] ||
+        die "no writable GPU queue at $dir; xmg19 makes it (nix/nixos/xmg19/gpu-queue.nix), and GPU_QUEUE_DIR points a test elsewhere"
+
+    local session=${CLAUDE_CODE_SESSION_ID:-} short=null seq entry
+    [ -z "$session" ] || short=$(jq -n --arg s "$(short_id "$session")" '$s')
+    # Taken with a read-only descriptor, which flock needs no more than: on
+    # xmg19 the lock file is root's, and elsewhere whoever made it first owns it.
+    [ -e "$dir/.lock" ] || (umask 022; : >>"$dir/.lock")
+    exec 9<"$dir/.lock"
+    flock 9
+    seq=$(find "$dir" -maxdepth 1 -name '[0-9]*.json' -printf '%f\n' | sed 's/\.json$//' | sort -n | tail -1)
+    seq=$((10#${seq:-0} + 1))
+    entry=$dir/$seq.json
+    trap 'rm -f "$entry" "$entry.tmp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    jq -n --argjson seq "$seq" --arg user "$(id -un)" --argjson pid $$ --arg start "$(proc_start $$)" \
+        --arg name "$name" --arg note "$note" --arg command "$(printf "%q " "$@")" --argjson eta "$secs" \
+        --argjson queued "$(date +%s)" --arg session "$session" --argjson short "$short" \
+        '{seq: $seq, user: $user, pid: $pid, start: $start, name: $name, note: $note, command: ($command | rtrimstr(" ")),
+          eta: $eta, queued: $queued, started: null, session: (if $session == "" then null else $session end),
+          short: $short}' | write_entry
+    flock -u 9
+    exec 9<&-
+
+    local ahead
+    ahead=$(annotated | jq -r --argjson seq "$seq" '
+        [.[] | select(.seq <= $seq)] | "\(length - 1) \(.[-1].expected_start // 0 | strflocaltime("%H:%M"))"')
+    if [ "${ahead% *}" -gt 0 ]; then
+        echo "gpu-run: $name waits behind ${ahead% *} in the GPU queue, expected to start ${ahead#* }; gpu-queue shows the line" >&2
+        until [ "$(live_entries | jq '.[0].seq')" = "$seq" ]; do
+            sleep "$poll"
+        done
+    fi
+    jq --argjson t "$(date +%s)" '.started = $t' "$entry" | write_entry
+    echo "gpu-run: $name has the GPU" >&2
+
+    local rc=0
+    "$@" || rc=$?
+    exit "$rc"
+}
+
+case $me in
+    gpu-run) cmd_run "$@" ;;
+    *)
+        case ${1:-} in
+            -h|--help) usage ;;
+            --json) annotated ;;
+            "") show_queue ;;
+            *) die "unknown option $1; gpu-queue takes --json or nothing" ;;
+        esac
+        ;;
+esac

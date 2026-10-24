@@ -19,9 +19,8 @@ stage="${1:-$HOME/.local/state/pcstate}"
 # just like restic_backup.sh does. Skip rather than fail: on pc the key lives on
 # tmpfs and is absent until the first interactive login after a reboot, and a
 # failed ExecStartPre would mark the unit failed on every such boot.
-age_key="${SOPS_AGE_KEY_FILE:-$HOME/.local/secrets/age-key.txt}"
-if [ ! -f "$age_key" ]; then
-    echo "pcstate_snapshot: age key not available at $age_key — skipping (decrypt it first)"
+if [ ! -f "${SOPS_AGE_KEY_FILE:-}" ]; then
+    echo "pcstate_snapshot: age key not available at '${SOPS_AGE_KEY_FILE:-}' — skipping (decrypt it first)"
     exit 0
 fi
 

@@ -8,7 +8,7 @@ mechanisms deliver it:
 | --- | --- |
 | zephylux | local failover chain, `bin/dns-failover-install` |
 | phone | tailnet DNS: tailscaled forwards to Mullvad over DoH |
-| xmg19 | tailnet DNS; offline, and planned to opt out as a server (`agent/tickets/xmg19-offsite-server-planning.md`) |
+| xmg19 | unfiltered beyond Quad9's malware list: Quad9 over opportunistic DoT, and the LAN router |
 | pc | unfiltered: the LAN router, via dhcpcd + resolvconf |
 | jarvis, yapit-prod | unfiltered: each VPS's own resolver |
 
@@ -39,7 +39,7 @@ What follows from the shape:
   reboots). MagicDNS still works: the front routes `ts.net` to tailscaled's
   internal resolver, which answers regardless of that preference.
 
-## Tailnet DNS (phone, xmg19 until repurposed)
+## Tailnet DNS (phone)
 
 tailscaled claims all DNS on a device that accepts tailnet DNS: applications
 talk to the local stub, the stub hands everything to `100.100.100.100`, and
@@ -72,8 +72,8 @@ Two consequences:
   server the blocklists are a liability: no browser to protect, and a blocked
   domain is a silent `NXDOMAIN`.
 
-The servers are therefore opted out with `--accept-dns=false`. pc stores it in
-`services.tailscale.extraSetFlags`; the VPSes do not run NixOS, so there it is
+The servers are therefore opted out with `--accept-dns=false`. pc and xmg19
+store it in `services.tailscale.extraSetFlags`; the VPSes do not run NixOS, so there it is
 imperative state — re-apply with `ssh <host> tailscale set --accept-dns=false`
 after any reinstall.
 

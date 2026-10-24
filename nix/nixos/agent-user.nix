@@ -3,13 +3,20 @@
 #
 # Workers here run with permission prompts bypassed, so the unix user is the
 # only boundary between a worker and the rest of the machine: no read access to
-# max's home or the HDD pool mounted inside it, none to the other worker's home
-# (both are mode 700, the NixOS default), no wheel, no sudo, no docker group, no
-# outgoing tailnet. Two users rather than two config dirs under one user
-# because the Helferline account is shared with a whole team: a session on it
-# must not be able to read the personal account's transcripts, worktrees or
-# plugin cache. A home boundary covers exactly what is inside a home; dispatch's
-# scratch dir and worker logs under /tmp are outside it.
+# max's home or anything mounted inside it (pc's HDD pool), none to the other
+# worker's home (both are mode 700, the NixOS default), no wheel, no sudo, no
+# docker group, no outgoing tailnet. Two users rather than two config dirs
+# under one user because the Helferline account is shared with a whole team: a
+# session on it must not be able to read the personal account's transcripts,
+# worktrees or plugin cache. A home boundary covers exactly what is inside a
+# home; dispatch's scratch dir and worker logs under /tmp are outside it.
+#
+# A function of what differs between the hosts that import it: memoryMax is
+# the workers' memory ceiling (below), dispatcherKeys the public key of each
+# machine that dispatches to them. Without its key a machine gets "Permission
+# denied (publickey)" from these users, and `worker-hosts` shows that message
+# in place of the host's state.
+{ memoryMax, dispatcherKeys }:
 { pkgs, lib, ... }:
 
 let
@@ -20,13 +27,6 @@ let
     agent-hl = { uid = 1002; description = "dispatch workers, Helferline account"; };
   };
   names = lib.attrNames workers;
-
-  # One key per machine that dispatches here. Without its key a machine gets
-  # "Permission denied (publickey)" from these users, and `worker-hosts` shows
-  # that message in place of the host's state.
-  dispatcherKeys = [
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
-  ];
 
   # Tailscale ACLs are per-node and cannot separate unix users, so the tailnet
   # boundary is drawn by uid instead. The firewall's reload script re-runs
@@ -59,9 +59,9 @@ in
     {
       # rwx------ on /home/max. The workers are in no group of max's and there
       # are no ACLs, so this directory mode is the only thing that denies them
-      # /home/max, and with it the pool's datasets, which mount inside it. 700
-      # is already the NixOS default for normal users; it is pinned here so the
-      # boundary does not depend on that default staying put.
+      # /home/max, and with it whatever mounts inside it, pc's pool among them.
+      # 700 is already the NixOS default for normal users; it is pinned here so
+      # the boundary does not depend on that default staying put.
       max.homeMode = "700";
     }
   ];
@@ -69,11 +69,12 @@ in
 
   # The workers' memory ceiling. logind parents every user's slice to
   # user.slice, so it holds max's sessions too. At the ceiling the OOM killer
-  # ranks by size plus oom_score_adj; the workers' 500 puts them before max's
-  # processes (200 or less) up to 3 GiB larger. No swap: a swapping cgroup
-  # stalls pc long before the killer acts.
+  # ranks by size plus oom_score_adj, in thousandths of the ceiling; the
+  # workers' 500 puts them before max's processes (200 or less) up to 30% of
+  # the ceiling larger, 3 GiB on pc's 10G. No swap: a swapping cgroup stalls
+  # the host long before the killer acts.
   systemd.slices.user.sliceConfig = {
-    MemoryMax = "10G";
+    MemoryMax = memoryMax;
     MemorySwapMax = 0;
   };
 
@@ -94,8 +95,9 @@ in
   # The uid rules above only see packets the workers' own processes send.
   # tailscaled originates its own as root, and its control socket is world
   # readable -- which hands any local user the full tailnet inventory and
-  # `tailscale ping` to any node. Mutations are already gated in-process by
-  # --operator=max, so what leaks is disclosure and a probe, not control.
+  # `tailscale ping` to any node. Mutations are already gated in-process to
+  # root and the host's --operator, if it names one, so what leaks is
+  # disclosure and a probe, not control.
   # Closing the directory rather than the socket keeps that operator access
   # working: max is in wheel, the workers are in no group but their own. systemd
   # recreates this directory on every start, so the mode belongs on the unit

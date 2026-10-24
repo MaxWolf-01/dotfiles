@@ -69,19 +69,15 @@
         specialArgs = { inherit self rime system; };
         modules = [
           disko.nixosModules.disko
-          catppuccin.nixosModules.catppuccin
           ./nix/nixos/xmg19/configuration.nix
           home-manager.nixosModules.home-manager
           {
             home-manager.useGlobalPkgs = true;
             home-manager.useUserPackages = true;
             home-manager.extraSpecialArgs = { inherit rime system; };
-            home-manager.users.max = {
-              imports = [
-                catppuccin.homeModules.catppuccin
-                ./nix/home/hosts/xmg19.nix
-              ];
-            };
+            home-manager.users.max = import ./nix/home/hosts/xmg19.nix;
+            home-manager.users.agent = import ./nix/home/hosts/xmg19-agent.nix;
+            home-manager.users.agent-hl = import ./nix/home/hosts/xmg19-agent-hl.nix;
             home-manager.backupFileExtension = "bak";
           }
         ];
@@ -116,7 +112,7 @@
       # What the test suites need beyond uv and a host's own tools: `nix develop -c make test`.
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [ python3 fzf sops age ffmpeg restic dnsproxy openssl dig zbar notmuch strace ];
-        # uv's Python finds no certificate store of its own on NixOS.
+        # uv's Python reads /etc/ssl/cert.pem, which a NixOS host has only once it runs nix/nixos/uv-python.nix.
         SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         # The Chromium Playwright downloads is linked for a conventional Linux; on NixOS it
         # runs through nix-ld, which finds its libraries here. Elsewhere this is unread.

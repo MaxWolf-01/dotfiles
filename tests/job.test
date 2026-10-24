@@ -20,6 +20,9 @@ cleanup() {
     # SIGKILLing a runner (the `gone` case below) orphans the inhibitor its
     # nosleep took, and an orphan outlives the session that made it.
     pkill -f 'systemd-inhibit.*--why=job jt-' 2>/dev/null
+    # So does the tee copying that runner's output to its pane, held open by a
+    # command still writing to it; tee ignores TERM, which is for the command.
+    pkill -KILL -f "tee -a $JOB_STATE_DIR/" 2>/dev/null
     rm -rf "$JOB_STATE_DIR"
 }
 trap cleanup EXIT
@@ -34,7 +37,9 @@ needs tmux
 "$job" wait jt-ok --interval 1 >/dev/null
 check "a command that exits 0 waits to 0" 0 $?
 
-"$job" run jt-fail -- bash -c 'echo doomed; exit 7' >/dev/null
+# The output passes through a pipe to the pane, whose last stage exits 0: the
+# code a wait reports is the command's, not the pipe's.
+"$job" run jt-fail -- bash -c 'echo doomed; exit 7' >/dev/null 2>&1
 "$job" wait jt-fail --interval 1 >/dev/null
 check "a command that exits non-zero waits to 1" 1 $?
 check "the status line keeps the real exit code" \
@@ -78,6 +83,113 @@ check "a runner killed without a status line waits to 4" 4 $?
 check "stop exits 0" 0 $?
 check "a stopped job still wrote its status" \
     "143" "$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$JOB_STATE_DIR/jt-watch/status")"
+
+# A command that cleans up on TERM gets to say so in its log, after the signal
+# has reached everything else in the job.
+"$job" run jt-stop-says -- bash -c 'trap "sleep 0.5; echo cleaned up; exit 5" TERM; echo ready; while :; do sleep 0.1; done' >/dev/null
+"$job" wait jt-stop-says --watch ready --interval 1 >/dev/null
+"$job" stop jt-stop-says >/dev/null
+check "a stopped command's last words reach the log" \
+    "cleaned up" "$(grep -o 'cleaned up' "$JOB_STATE_DIR/jt-stop-says/log")"
+
+# --- a command that dies at once is a failed start, not a started job
+
+# A server on a taken port exits in its first moments; reporting it started
+# had a worker measure the neighbour's server for twenty minutes.
+early=$("$job" run jt-early -- bash -c 'echo starting; echo "address 8000 already in use"; exit 2' 2>&1)
+check "run of a command that fails at once exits 1" 1 $?
+check "and says so with the log's last line" \
+    "address 8000 already in use" "$(grep -o 'address 8000 already in use' <<<"$early")"
+
+# --- signals reach the command as they would in place
+
+# A shell starts a background command with SIGINT and SIGQUIT ignored, and the
+# whole tree under it inherits that: Ctrl-C in the pane, or a `timeout -s INT`
+# inside the command, then never lands.
+ignored() { # <job>: SIGINT and SIGQUIT bits of the command's ignored mask, or "none"
+    local mask
+    mask=$(sed -n 's/^SigIgn:\s*//p' "$JOB_STATE_DIR/$1/log")
+    [ -n "$mask" ] || { echo "no SigIgn line"; return; }
+    (( 0x$mask & 0x6 )) && echo "$mask" || echo none
+}
+"$job" run jt-sigs -- bash -c 'bash -c "grep SigIgn /proc/self/status"' >/dev/null
+"$job" wait jt-sigs --interval 1 >/dev/null
+check "a job's processes take SIGINT and SIGQUIT with their default action" none "$(ignored jt-sigs)"
+"$job" run jt-sigs-awake --awake -- bash -c 'bash -c "grep SigIgn /proc/self/status"' >/dev/null
+"$job" wait jt-sigs-awake --interval 1 >/dev/null
+check "and so do an --awake job's" none "$(ignored jt-sigs-awake)"
+
+# Ctrl-C in the pane stops the command itself, and the status line holds the
+# exit the command chose, not one the wrapper made up.
+"$job" run jt-ctrlc -- bash -c 'trap "echo interrupted; exit 3" INT; echo ready; while :; do sleep 0.1; done' >/dev/null
+"$job" wait jt-ctrlc --watch ready --interval 1 >/dev/null
+tmux send-keys -t "=job-jt-ctrlc:" C-c
+"$job" wait jt-ctrlc --deadline 10 --interval 1 >/dev/null
+check "Ctrl-C in the pane waits to the command's own exit" 1 $?
+check "the status line keeps the exit the command chose" \
+    "3" "$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$JOB_STATE_DIR/jt-ctrlc/status")"
+
+"$job" run jt-ctrlc-plain -- sleep 6131 >/dev/null
+tmux send-keys -t "=job-jt-ctrlc-plain:" C-c
+"$job" wait jt-ctrlc-plain --deadline 10 --interval 1 >/dev/null
+check "a command that takes Ctrl-C's default dies of it" \
+    "130" "$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$JOB_STATE_DIR/jt-ctrlc-plain/status")"
+check "and leaves nothing running" "" "$(pgrep -f 'sleep 6131')"
+
+# --- the output is in the pane as well as the log
+
+pane() { tmux capture-pane -p -J -t "=job-$1:"; }
+
+# A human attaching to a job's session saw a blank pane, and once typed a
+# passphrase blind into a prompt it was not showing.
+"$job" run jt-pane -- bash -c 'echo to-stdout; echo to-stderr >&2; [ -t 1 ] || echo stdout-is-a-pipe; [ -t 2 ] || echo stderr-is-a-pipe' >/dev/null
+"$job" wait jt-pane --interval 1 >/dev/null
+check "a job's stdout and stderr reach its log" \
+    "to-stderr to-stdout" "$(grep -o 'to-std[a-z]*' "$JOB_STATE_DIR/jt-pane/log" | sort | paste -sd' ')"
+check "and its pane" \
+    "to-stderr to-stdout" "$(pane jt-pane | grep -xo 'to-std[a-z]*' | sort | paste -sd' ')"
+check "while the command sees a pipe on both" \
+    "stderr-is-a-pipe stdout-is-a-pipe" "$(grep -o 'std[a-z]*-is-a-pipe' "$JOB_STATE_DIR/jt-pane/log" | sort | paste -sd' ')"
+
+# A question nobody expected gets end-of-input, so the job fails instead of
+# waiting on an answer nobody will type.
+"$job" run jt-stdin -- bash -c 'sleep 1.5; if read -r answer; then echo "answered $answer"; else echo end-of-input; exit 4; fi' >/dev/null
+"$job" wait jt-stdin --deadline 10 --interval 1 >/dev/null
+check "a job that asks a question on stdin gets end-of-input and waits to 1" 1 $?
+check "because its stdin was empty" "end-of-input" "$(cat "$JOB_STATE_DIR/jt-stdin/log")"
+
+# What a command leaves running is not the job: the status line follows the
+# command's own exit, as it did when the output went to the log alone.
+"$job" run jt-leftover -- bash -c 'sleep 60 & echo $! > "$1"; echo up' _ "$JOB_STATE_DIR/leftover.pid" >/dev/null
+"$job" wait jt-leftover --deadline 10 --interval 1 >/dev/null
+check "a job whose command left a child writing is done when the command is" 0 $?
+check "and the command's output still reached the log" "up" "$(cat "$JOB_STATE_DIR/jt-leftover/log")"
+kill "$(cat "$JOB_STATE_DIR/leftover.pid")"
+
+# A daemon sends its output elsewhere, so nothing of the job's is left running.
+"$job" run jt-daemon -- bash -c 'sleep 60 </dev/null >/dev/null 2>&1 & echo $! > "$1"' _ "$JOB_STATE_DIR/daemon.pid" >/dev/null
+"$job" wait jt-daemon --interval 1 >/dev/null
+check "a daemon the command started holds no copy of the job's output open" \
+    "" "$(pgrep -f "tee -a $JOB_STATE_DIR/jt-daemon/log")"
+kill "$(cat "$JOB_STATE_DIR/daemon.pid")"
+
+# --tty is for the prompt a human answers: the command reads the pane.
+"$job" run jt-tty --tty -- bash -c '[ -t 0 ] && [ -t 1 ] && echo on-a-terminal; read -r -s -p "passphrase: " pw; echo; echo "read ${#pw} characters"; exit 7' >/dev/null
+"$job" wait jt-tty --watch 'passphrase:' --deadline 10 --interval 1 >/dev/null
+check "a --tty job shows its prompt" 3 $?
+tmux send-keys -t "=job-jt-tty:" -l hunter2
+tmux send-keys -t "=job-jt-tty:" Enter
+"$job" wait jt-tty --deadline 10 --interval 1 >/dev/null
+check "a --tty job waits to its command's exit" 1 $?
+check "and its status line keeps the command's own code" \
+    "7" "$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$JOB_STATE_DIR/jt-tty/status")"
+check "the command had the pane's terminal and read what was typed into it" \
+    "on-a-terminal
+read 7 characters" "$(pane jt-tty | grep -oE '^(on-a-terminal|read [0-9]+ characters)')"
+check "and the log holds a copy of what the pane showed" \
+    "on-a-terminal
+passphrase: 
+read 7 characters" "$(tr -d '\r' < "$JOB_STATE_DIR/jt-tty/log")"
 
 # --- a name is taken until it is given back
 

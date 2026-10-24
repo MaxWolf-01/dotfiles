@@ -44,6 +44,8 @@ NEVER include any work related details whatsoever in commit messages, PRs, issue
 
 Global `~/.claude` config lives in `~/repos/github/MaxWolf-01/agents` (`claude/`), not here. `.claude/` in this repo is dotfiles-local.
 
+`claude` on PATH is a wrapper in front of the real one (`nix/home/claude-token.sh` says how). On zephylux each profile runs on its own `/login`, until `claude-account <name>` switches every `claude` started from then on to that account's setup-token (`claude-account --help`); on pc each profile always runs on its account's token. A unit that runs claude puts `~/.nix-profile/bin` ahead of `~/.local/bin`, or it skips the wrapper, and sets `CLAUDE_ACCOUNT_SWITCH=ignore` (`ownLogin` in `timers.nix`), or the switch moves it too. The worker users on pc and xmg19 get their account's token from `claude-token-push` (`--help`).
+
 ## Scripts (`bin/`)
 
 `bin/` contains standalone scripts on `$PATH` (`~/bin`). These are available everywhere — interactive shells, Claude Code, cron, systemd timers, ssh. Prefer scripts over shell functions for anything that doesn't need to modify the current shell's state (cd, export, source, etc.).
@@ -80,14 +82,14 @@ tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
 Structure:
 - `flake.nix` defines all hosts. PC is a NixOS system (with HM as a module); laptops are HM standalone.
 - `nix/home/` holds one Home Manager module per concern: a program (`firefox.nix`, `ghostty.nix`, `tmux.nix`, ...), a desktop layer (`desktop.nix`, `gnome.nix`, `wayland.nix`), a toolchain (`dotnet.nix`), the systemd user timers (`timers.nix` and `pc-timers.nix`, one file per host that has them), a user (`worker.nix`), and `common.nix` for what every machine gets. `ls nix/home/` is the index; each module's own options say what it sets.
-- `nix/home/hosts/` is per-machine: stateVersion plus the imports that pick the tier below, and the options a module declares where what it does differs by host (`containerHub`, `sessionCopies`, `tmuxServer`).
+- `nix/home/hosts/` is per-machine: stateVersion, the imports that pick the tier below, the options a module declares where what it does differs by host (`containerHub`, `sessionCopies`, `tmuxServer`), and, on a host that holds the age key, where it is (`SOPS_AGE_KEY_FILE`).
 - `docs/<host>.md` is a machine's hardware: which port drives which GPU, thermal limits, traps.
-- `nix/nixos/pc/` is PC's NixOS system config.
+- `nix/nixos/<host>/` is a NixOS host's system config (pc, xmg19); `nix/nixos/` itself holds the modules both import.
 
 Host tiers:
 - **CLI** (common.nix): every machine — shell, dev tools, restic, etc.
-- **Workstation** (+ desktop.nix, gnome.nix, display server): zephyrus, xmg19
-- **Server / NixOS** (nix/nixos/pc/ + pc-timers.nix): PC — headless, backup hub, GPU workers
+- **Workstation** (+ desktop.nix, gnome.nix, display server): zephyrus
+- **Server / NixOS** (nix/nixos/<host>/): headless. PC is the backup hub and runs pc-timers.nix; xmg19 is a low-trust worker host with the GPU queue, and a backup target
 
 Setup flow:
 - `./setup host <name>` — sets NIX_HOST, creates dirs. On non-NixOS: also installs Nix + runs first HM switch.
@@ -126,6 +128,12 @@ Custom systemd services need explicit `path` for any package whose binaries the 
 ## NixOS on a New Machine
 
 See `docs/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).
+
+## Unlocking a host after a reboot
+
+`host-unlock <host>`, run on zephylux, unlocks what a rebooted xmg19 or pc
+keeps locked. Run it whenever either was rebooted; `host-unlock --help` says
+what each gets.
 
 ## SFTPGo File Drop
 
@@ -191,7 +199,7 @@ The quartz repo (`~/repos/obsidian/quartz-knowledge-base/`) deploys to the Cloud
 Worker `mwolf-dev` on push to `v4` (`.github/workflows/deploy.yml`). The Worker serves
 mwolf.dev and www.mwolf.dev, and that repo's `wrangler.jsonc` says how.
 
-The site's images and videos live in the R2 bucket `mwolf-dev-media` on max's
+The site's images, videos, `.mp3` recordings and PDFs live in the R2 bucket `mwolf-dev-media` on max's
 Cloudflare account, flat by file name, and the site links them at
 `https://media.mwolf.dev/<file name>` (Quartz's `mediaBaseUrl`). The bucket is
 reached only through that custom domain; its `r2.dev` URL is off. It was made

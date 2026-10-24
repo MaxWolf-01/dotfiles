@@ -1,10 +1,11 @@
 # agent-hl@pc: dispatch workers on the Helferline Claude account. Record in ./pc-agent-hl/.
 import ../worker.nix {
   name = "agent-hl";
-  # The work identity, as the includeIf on ~/work/ gives it on max's machines.
+  # One identity everywhere, work repos included: max's noreply address.
   identity = {
     name = "Maximilian Wolf";
-    email = "maximilian.wolf@helferline.at";
+    email = "69987866+MaxWolf-01@users.noreply.github.com";
   };
   record = ./pc-agent-hl/HOST.md;
+  body = ./pc-worker-body.md;
 }

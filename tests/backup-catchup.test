@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# tier: fast
+# Every Home Manager configuration defining backup-catchup.target gives it
+# StopWhenUnneeded=true and gives each unit it wants X-SwitchMethod=keep-old.
+# Those two settings are how a switch avoids starting or waiting on a backup
+# (why: nix/home/timers.nix, above its catch-up target), so a change that
+# drops them for another way to do that replaces this test with them.
+# Read from the flake's evaluation alone: nothing is built.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$repo/tests/check.sh"
+
+needs nix jq
+
+errors=$(mktemp)
+trap 'rm -f "$errors"' EXIT
+
+# Every configuration's catch-up target, if it has one: whether it stops when
+# unneeded, and the switch method of each unit it wants.
+catchup='u:
+  let
+    t = u.targets.backup-catchup or null;
+    wants = t.Unit.Wants or [ ];
+    unit = w:
+      let m = builtins.match "(.*)\\.([a-z]+)" w;
+      in (u.${builtins.elemAt m 1 + "s"} or { }).${builtins.elemAt m 0} or null;
+  in
+  if t == null then null else {
+    stopWhenUnneeded = t.Unit.StopWhenUnneeded or null;
+    wants = map (w: { name = w; value = (unit w).Unit.X-SwitchMethod or null; })
+      (if builtins.isList wants then wants else [ wants ]);
+  }'
+
+if ! home=$(nix eval --json "$repo#homeConfigurations" \
+        --apply "cs: builtins.mapAttrs (name: c: ($catchup) c.config.systemd.user) cs" 2>"$errors") ||
+   ! nixos=$(nix eval --json "$repo#nixosConfigurations" \
+        --apply "cs: builtins.mapAttrs (host: c: builtins.mapAttrs (user: hc: ($catchup) hc.systemd.user)
+                   (c.config.home-manager.users or { })) cs" 2>"$errors"); then
+    fail "the flake's configurations evaluate" "$(tail -20 "$errors")"
+    finish
+fi
+
+# One line per configuration that defines the target: its name, then the facts as JSON.
+hosts=$(jq -n --argjson home "$home" --argjson nixos "$nixos" -r '
+    ($home | to_entries[] | select(.value) | [.key, .value]),
+    ($nixos | to_entries[] | .key as $host | .value | to_entries[] | select(.value)
+        | ["\($host)/\(.key)", .value])
+    | "\(.[0]) \(.[1] | tojson)"')
+
+check "the laptop and pc each define the catch-up target" \
+    "pc/max zephyrus" "$(cut -d' ' -f1 <<<"$hosts" | sort | xargs)"
+
+while read -r host facts; do
+    check "$host: the catch-up target stops when unneeded" \
+        true "$(jq -r .stopWhenUnneeded <<<"$facts")"
+    check "$host: every unit the catch-up target wants keeps running through a switch" \
+        "" "$(jq -r '.wants[] | select(.value != "keep-old") | "\(.name): X-SwitchMethod=\(.value)"' <<<"$facts")"
+done < <(printf '%s\n' "$hosts" | grep .)
+
+finish

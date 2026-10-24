@@ -43,6 +43,13 @@
     NPM_CONFIG_PREFIX = "${config.home.homeDirectory}/.local";
   };
 
+  # The age key's path, set by the host's own config, reaches every user unit
+  # and every app GNOME starts, not only shells: none of the scripts that call
+  # sops guesses it.
+  systemd.user.sessionVariables = lib.optionalAttrs
+    (config.home.sessionVariables ? SOPS_AGE_KEY_FILE)
+    { inherit (config.home.sessionVariables) SOPS_AGE_KEY_FILE; };
+
   # Ensure common dirs exist
   home.activation.createDirs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
     mkdir -p ~/tmp ~/logs
@@ -109,11 +116,6 @@
     ];
     includes = [
       { path = "~/.gitconfig_local"; }
-      # work identity: anything under ~/work commits as the Helferline address
-      {
-        condition = "gitdir:~/work/";
-        contents.user.email = "maximilian.wolf@helferline.at";
-      }
     ];
     settings = {
       user.name = "Maximilian Wolf";
@@ -334,9 +336,12 @@
         HostName = "100.124.59.34";
         User = "root";
       };
+      # accept-new for the reason given at zephylux below: the backups pc writes
+      # here as `backup@xmg19` are its first connection to this host.
       "xmg xmg19" = {
         HostName = "100.97.152.25";
         User = "max";
+        StrictHostKeyChecking = "accept-new";
       };
       # accept-new so an unattended job can reach here on a machine that has
       # never had an interactive ssh to it — pc's overdue-check reads this
@@ -462,6 +467,9 @@
     tree-sitter # parser builds for nvim-treesitter
     typescript-language-server
     vscode-langservers-extracted # html, cssls, jsonls, eslint
-  ];
+  ]
+  # A non-NixOS host has its own python3, and system tools such as gdctl import
+  # its apt-installed modules (gi), which a nix python3 ahead of it on PATH lacks.
+  ++ lib.optional (!config.targets.genericLinux.enable) python3;
 
 }

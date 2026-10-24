@@ -31,6 +31,16 @@
 # - pc: k10temp's Tctl and CCD temperatures, the NVMe drive's composite
 #   temperature, the six board temperatures gigabyte_wmi reports (the driver
 #   names none of them, so they are columns wmi1_c to wmi6_c), and acpitz.
+# - xmg19, the XMG Core: the CPU package (coretemp), the chipset
+#   (pch_cannonlake) and acpitz temperatures, each NVMe drive's composite
+#   temperature by its maker (samsung_c holds the system disk, patriot_c
+#   /home), and the dGPU: its runtime power state (gpu_pm: active or
+#   suspended), and, from nvidia-smi, its temperature, power draw and
+#   utilization. The chassis reports no fan speed, so there are no fan
+#   columns. nvidia-smi wakes a suspended GPU, so it is asked only while the
+#   GPU is awake: every sample while the last answer showed it busy, else once
+#   a minute, leaving an idle GPU the quiet it needs to suspend again. A sample
+#   it is not asked in has those three fields empty.
 #
 # Any other host records the core alone.
 #
@@ -54,12 +64,14 @@
 # down to the smallest (host-recorder-report).
 #
 # The sampling loop is bash-builtin only — no command substitutions, no awk,
-# no date, no children. This runs 17k times a day forever; forks made it cost
-# ~1% of a core (measured 49 ms CPU per sample), builtins take it to ~5 ms —
-# the floor set by the sysfs/EC sensor reads themselves. On pc a sample costs
-# ~4 ms, and the core's own reads under 1 ms of it: gigabyte_wmi's six board
-# temperatures are an ACPI method call each (~0.4 ms). A ranking costs ~22 ms
-# there, 2 ms a sample spread over the minute.
+# no date, no children, save xmg19's nvidia-smi, the only way to read its GPU.
+# This runs 17k times a day forever; forks made it cost ~1% of a core
+# (measured 49 ms CPU per sample), builtins take it to ~5 ms, the floor set
+# by the sysfs/EC sensor reads themselves. On pc a sample costs ~4 ms, and the
+# core's own reads under 1 ms of it: gigabyte_wmi's six board temperatures are
+# an ACPI method call each (~0.4 ms). A ranking costs ~22 ms there, 2 ms a
+# sample spread over the minute. An nvidia-smi query costs ~25 ms of CPU
+# (measured on pc), so xmg19 under a GPU job pays about 0.5% of a core.
 #
 # HOST_RECORDER_ROOT stands in for / : every /sys and /proc path is read under
 # it, which is how tests/host-recorder/properties.test runs the recorder on a
@@ -102,15 +114,17 @@ CORE_HEADER="time,mhz_max,load1,mem_avail_mb,swap_used_mb,mem_some_avg10,mem_ful
 # sensors_<set>_read, which sets SENSORS to its fields, and its columns here.
 # SENSOR_SET maps the kernel's host name to a set, named as the repo names the
 # host (nix/home/hosts/<name>): the laptop is zephylux to the kernel.
-declare -A SENSOR_SET=([zephylux]=zephyrus [pc]=pc)
+declare -A SENSOR_SET=([zephylux]=zephyrus [pc]=pc [xmg19]=xmg19)
 declare -A SENSOR_COLUMNS=(
     [zephyrus]="pkg_c,cpu_c,board_c,cpu_rpm,gpu_rpm,profile,spl_w,sppt_w,ac,bat_pct,bat_w,dgpu_disable,dgpu_port,dgpu_drv"
     [pc]="cpu_c,ccd1_c,nvme_c,board_c,wmi1_c,wmi2_c,wmi3_c,wmi4_c,wmi5_c,wmi6_c"
+    [xmg19]="pkg_c,pch_c,board_c,samsung_c,patriot_c,gpu_pm,gpu_c,gpu_w,gpu_util"
 )
 
 ATTRS=$ROOT/sys/class/firmware-attributes/asus-armoury/attributes
-# Fixed addresses rather than a lookup: in Integrated mode the dGPU is off the
-# bus, so at startup there is often nothing to find.
+# Fixed addresses rather than a lookup: in Integrated mode the zephyrus's dGPU
+# is off the bus, so at startup there is often nothing to find. xmg19's dGPU
+# sits at the same address.
 DGPU=$ROOT/sys/bus/pci/devices/0000:01:00.0
 DGPU_PORT=$ROOT/sys/bus/pci/devices/0000:00:01.0
 
@@ -245,6 +259,63 @@ sensors_pc_read() {
         wmi+=",$t"
     done
     SENSORS="$CPU_C,$CCD1_C,$NVME_C,$BOARD_C$wmi"
+}
+
+# --- xmg19's sensor set ---
+
+sensors_xmg19_find() {
+    hwmon_by_name coretemp       CORETEMP
+    hwmon_by_name pch_cannonlake PCH
+    zone_by_type  acpitz         ZONE_BOARD
+    nvme_by_model 'Samsung*'     SAMSUNG
+    nvme_by_model 'Patriot*'     PATRIOT
+}
+
+# coretemp's temp1 is Package id 0.
+sensors_xmg19_read() {
+    millideg "${CORETEMP:+$CORETEMP/temp1_input}" PKG_C
+    millideg "${PCH:+$PCH/temp1_input}"           PCH_C
+    millideg "$ZONE_BOARD"                        BOARD_C
+    millideg "${SAMSUNG:+$SAMSUNG/temp1_input}"   SAMSUNG_C
+    millideg "${PATRIOT:+$PATRIOT/temp1_input}"   PATRIOT_C
+    rd "$DGPU/power/runtime_status"               GPU_PM
+    nvidia_gpu
+    SENSORS="$PKG_C,$PCH_C,$BOARD_C,$SAMSUNG_C,$PATRIOT_C,$GPU_PM,$GPU_C,$GPU_W,$GPU_UTIL"
+}
+
+# GPU_C, GPU_W and GPU_UTIL, when nvidia_gpu asks nvidia-smi this sample (see
+# the header for when); GPU_TICK counts samples to the next ask while the GPU
+# idles. A field nvidia-smi answers [N/A] is empty.
+#
+# A wedged driver can hold nvidia-smi for good, which must not stop the rows,
+# since that is when they matter. So an answer gets 2 s, and while a query
+# that ran out of time is still alive (GPU_STUCK, its pid) none is started,
+# rather than leave one more stuck process behind every sample.
+GPU_BUSY=0
+GPU_TICK=0
+GPU_STUCK=
+nvidia_gpu() {
+    local tick=$GPU_TICK c w util
+    GPU_C='' GPU_W='' GPU_UTIL=''
+    GPU_TICK=$(((tick + 1) % TOP_EVERY))
+    [ "$GPU_PM" = active ] || { GPU_BUSY=0; return 0; }
+    ((GPU_BUSY || !tick)) || return 0
+    GPU_BUSY=0
+    if [ -n "$GPU_STUCK" ]; then
+        [ -e "/proc/$GPU_STUCK" ] && return 0
+        GPU_STUCK=
+    fi
+    IFS=', ' read -rt 2 c w util < <(nvidia-smi --query-gpu=temperature.gpu,power.draw,utilization.gpu \
+        --format=csv,noheader,nounits 2>/dev/null)
+    case $? in
+        0) ;;
+        1) return 0 ;;
+        *) GPU_STUCK=$!; return 0 ;;
+    esac
+    [[ $c == [0-9]* ]] && GPU_C=$c
+    [[ $w == [0-9]* ]] && GPU_W=$w
+    [[ $util =~ ^[0-9]+$ ]] && GPU_UTIL=$util && ((util)) && GPU_BUSY=1
+    return 0
 }
 
 # --- the core ---
@@ -503,6 +574,18 @@ hwmon_by_name() {  # hwmon_by_name <name> <var>: that device's directory
     for mon in "$ROOT"/sys/class/hwmon/hwmon*; do
         rd "$mon/name" n
         [ "$n" = "$1" ] && { printf -v "$2" '%s' "$mon"; return 0; }
+    done
+}
+
+nvme_by_model() {  # nvme_by_model <pattern> <var>: the drive whose model matches
+    local mon n model
+    printf -v "$2" ''
+    for mon in "$ROOT"/sys/class/hwmon/hwmon*; do
+        rd "$mon/name" n
+        [ "$n" = nvme ] || continue
+        rd "$mon/device/model" model
+        # shellcheck disable=SC2053  # a pattern, deliberately
+        [[ $model == $1 ]] && { printf -v "$2" '%s' "$mon"; return 0; }
     done
 }
 

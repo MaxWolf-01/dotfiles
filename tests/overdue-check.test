@@ -64,8 +64,10 @@ export ALERTS_SENT="$work/alerts.log"
 export HOME="$work/home"
 mkdir -p "$HOME/logs/runs" "$HOME/.local/secrets"
 # The repo cases need a key file to exist at all; none of them needs sops, since
-# their password command is a `cat`.
-touch "$HOME/.local/secrets/age-key.txt"
+# their password command is a `cat`. The token cases at the end do, and carry a
+# key of their own.
+export SOPS_AGE_KEY_FILE="$HOME/.local/secrets/age-key.txt"
+touch "$SOPS_AGE_KEY_FILE"
 
 # HOME is redirected, so alert-send's default config path lands on this
 # throwaway channel rather than the real one.
@@ -450,7 +452,7 @@ rc=$?
 check "a missing age key does not abort the run" 1 "$rc"
 check "...it is reported as something that could not be checked" \
     "yes" \
-    "$(grep -q 'age key not available' <<<"$out" && echo yes || echo no)"
+    "$(grep -q 'age key: not available' <<<"$out" && echo yes || echo no)"
 check "...and the units are still checked" \
     "yes" \
     "$(grep -q 'locked-key-unit' <<<"$out" && echo yes || echo no)"
@@ -504,5 +506,103 @@ reject "the retired ntfy_topic setting" "ntfy_topic: a-topic"
 
 out=$("$bin_dir/overdue-check" --config "$work/does-not-exist.conf" 2>&1); rc=$?
 check "a missing config refuses to run" 2 "$rc"
+
+# --- a dated credential is named from 7 days before its <NAME>__VALID_UNTIL, every run
+#
+# The date is encrypted with the credential, so these cases carry a real age key and
+# the credential files; each case writes the files it needs.
+
+if command -v sops >/dev/null && command -v age-keygen >/dev/null; then
+    . "$(dirname "${BASH_SOURCE[0]}")/claude-accounts.sh"
+    accounts_key
+    creds="$HOME/.dotfiles/secrets/creds/env"
+    # Calendar days from today, counted in UTC: "+8 days" in local time comes out a
+    # day short when a daylight-saving change falls in between, just after midnight.
+    in_days() { date -u -d "$(date +%F) $1 days" +%F; }
+    tokens() {  # account valid-until, ... : those accounts' files and no others
+        rm -f "${creds:?}"/*.env
+        while [ $# -gt 0 ]; do account_token "$1" some-token "$2"; shift 2; done
+    }
+    # A credential that is not Claude's: time-tac.env, its key and its date.
+    time_tac() {
+        printf 'TIME_TAC_API_KEY=some-key\nTIME_TAC__VALID_UNTIL=%s\n' "$1" >"$creds/time-tac.env"
+        sops encrypt --in-place --age "$(age-keygen -y "$SOPS_AGE_KEY_FILE")" "$creds/time-tac.env"
+    }
+    reported() {  # <file name> <variable> <days>: whether the alert names it
+        grep -q "$1: $2 expires in $3d, $(in_days "$3")" "$ALERTS_SENT" && echo yes || echo no
+    }
+
+    for days in 6 7; do
+        tokens personal "$(in_days "$days")"
+        time_tac "$(in_days "$days")"
+        run <<<""
+        check "a Claude token and another credential $days days from their expiry are reported" 1 "$rc"
+        check "...in one notification" 1 "$(sent_count)"
+        check "...which names the Claude token, its days left and its date" yes \
+            "$(reported claude-personal CLAUDE__VALID_UNTIL "$days")"
+        check "...and the other credential" yes "$(reported time-tac TIME_TAC__VALID_UNTIL "$days")"
+    done
+    check "...whose subject names them as expiring" "🕸️ 2 expiring: claude-personal +1" "$(subject)"
+    check "...and every step a renewal of the personal token takes, its copies in Jarvis and skilltree among them" yes \
+        "$(grep 'claude-personal: ' "$ALERTS_SENT" | grep 'claude setup-token' | grep 'creds/env/claude-personal.env' | grep 'claude-token-push' | grep 'make auth' | grep -q 'make pi-claude-auth' && echo yes || echo no)"
+    check "...and where the other one is written" yes \
+        "$(grep 'time-tac: ' "$ALERTS_SENT" | grep -q 'sops ~/.dotfiles/secrets/creds/env/time-tac.env' && echo yes || echo no)"
+
+    tokens personal "$(in_days 8)"
+    time_tac "$(in_days 8)"
+    run <<<""
+    check "neither is reported 8 days from its expiry" 0 "$rc"
+    check "...and nothing is sent" 0 "$(sent_count)"
+
+    tokens helferline "$(in_days 6)"
+    run <<<""
+    check "the Helferline token's renewal steps name no copy of the personal one" no \
+        "$(grep 'claude-helferline: ' "$ALERTS_SENT" | grep -qE 'make (auth|pi-claude-auth)' && echo yes || echo no)"
+
+    tokens personal "$(in_days -3)"
+    run <<<""
+    check "a token past its expiry says how long ago" yes \
+        "$(grep -q "claude-personal: CLAUDE__VALID_UNTIL expired 3d ago" "$ALERTS_SENT" && echo yes || echo no)"
+
+    tokens personal "$(in_days 6)"
+    run --extra-days 2 <<<""
+    check "--extra-days warns that much later, as the second host" 0 "$rc"
+    tokens personal "$(in_days 4)"
+    run --extra-days 7 <<<""
+    check "...but no later than 3 days ahead" 0 "$rc"
+    tokens personal "$(in_days 3)"
+    run --extra-days 7 <<<""
+    check "...where it does warn" 1 "$rc"
+
+    tokens
+    account_token personal "" ""
+    run <<<""
+    check "an account whose token is not minted yet is passed over" 0 "$rc"
+
+    tokens personal ""
+    run <<<""
+    check "a token with no expiry date could not be checked" "🕸️ 1 unchecked: claude-personal" "$(subject)"
+
+    tokens personal "$(in_days 6)" helferline "$(in_days 200)"
+    log_line expiry-stale-unit ok 9
+    run <<<"expiry-stale-unit $this_host 3 run-log"
+    check "an overdue unit leads the subject, and the expiring token is counted" \
+        "🕸️ 1 overdue: expiry-stale-unit ($this_host) (+1 expiring)" "$(subject)"
+    check "...while a token far from its expiry is fine" yes \
+        "$(grep -q 'ok: claude-helferline — CLAUDE__VALID_UNTIL expires in 200d' <<<"$out" && echo yes || echo no)"
+    tokens
+
+    # one locked key is one line, whatever it keeps from being read
+    tokens personal "$(in_days 6)"
+    out=$(SOPS_AGE_KEY_FILE="$work/no-such-key" "$bin_dir/overdue-check" \
+        --config "$work/locked.conf" "$work/some-repo.conf" --dry-run 2>&1)
+    check "a missing age key is one line for the repos and the tokens alike" 1 "$(grep -c 'age key' <<<"$out")"
+    check "...and no token reads as undecryptable on its own" 0 "$(grep -c 'could not decrypt' <<<"$out")"
+    out=$(SOPS_AGE_KEY_FILE="$work/no-such-key" "$bin_dir/overdue-check" --config "$work/locked.conf" --dry-run 2>&1)
+    check "...even on a host with tokens and no restic repo" 1 "$(grep -c 'age key: not available' <<<"$out")"
+    tokens
+else
+    skipped "the token expiry cases" "sops or age-keygen is not on PATH"
+fi
 
 finish

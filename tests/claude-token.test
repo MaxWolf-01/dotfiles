@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# tier: fast
+# Drive nix/home/claude-token.sh, installed as the `claude` in front of a stand-in for
+# the real one, and check which token reaches it. Run it directly; no framework.
+#
+# The promise, in the wrapper's two modes. On pc (profile), claude starts on the token of
+# the account its CLAUDE_CONFIG_DIR names. On zephylux (switch), whatever starts claude (a
+# shell, the hub's resume command) starts it on the profile's own login, or, once
+# `claude-account` has switched the laptop, on that account's token in every profile;
+# claude-ping's unit is never switched. In both, claude never runs on a token the caller
+# already carries, and one whose token cannot be read does not start at all.
+# tmux-save.test holds the same promise for a restored session.
+#
+# HOME is a scratch directory holding a throwaway age key and the accounts' credential
+# files, so the wrapper finds them where it looks on a real host.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+. "$repo/tests/check.sh"
+needs sops age-keygen uv nix jq
+
+# uv's cache and Pythons stay where they are: the hub case below loads diffview through uv.
+uv_cache=$(uv cache dir) uv_python=$(uv python dir)
+export HOME="$work/home"
+. "$repo/tests/claude-accounts.sh"
+accounts_key
+account_token personal personal-token 2027-10-01
+account_token helferline helferline-token 2027-10-01
+account_token unminted ""
+
+# The stand-in for the real claude, where the installer puts it: it prints the token it
+# was handed, its pid, and its arguments one per line.
+mkdir -p "$HOME/.local/bin"
+cat >"$HOME/.local/bin/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "token=${CLAUDE_CODE_OAUTH_TOKEN-none}"
+[ -z "${PID_FILE-}" ] || echo $$ >"$PID_FILE"
+printf 'arg=%s\n' "$@"
+STUB
+chmod +x "$HOME/.local/bin/claude"
+install_claude_wrapper "$HOME/.nix-profile/bin"
+outer_path=$PATH
+export PATH="$HOME/.nix-profile/bin:$HOME/.local/bin:$PATH"
+unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN
+
+token() { claude "$@" | sed -n 's/^token=//p'; }
+
+# --- pc: each profile runs on its own account's token
+
+check "~/.claude, named by no CLAUDE_CONFIG_DIR, runs on the personal token" personal-token "$(token)"
+check "~/.claude named outright runs on the personal token" personal-token "$(CLAUDE_CONFIG_DIR=$HOME/.claude/ token)"
+check "~/.claude-helferline runs on the helferline token" helferline-token "$(CLAUDE_CONFIG_DIR=$HOME/.claude-helferline token)"
+check "a helferline session started from a personal session's shell drops the personal token" \
+    helferline-token "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$HOME/.claude-helferline token)"
+check "an account whose token is not minted yet runs on none, whatever the caller carries" \
+    none "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$HOME/.claude-unminted token)"
+check "an account with no credential file runs on none" \
+    none "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$HOME/.claude-elsewhere token)"
+check "a config dir outside ~/.claude* runs on none" \
+    none "$(CLAUDE_CODE_OAUTH_TOKEN=personal-token CLAUDE_CONFIG_DIR=$work/scratch-profile token)"
+
+# --- the real claude gets the arguments, and the pid, the caller started
+
+expected=$'arg=-p\narg=a b\narg=it\'s "q"\narg=$HOME\narg=x\ny'
+check "every argument reaches the real claude byte for byte" "$expected" \
+    "$(claude -p 'a b' "it's \"q\"" '$HOME' $'x\ny' | grep -v '^token=')"
+PID_FILE="$work/pid" claude >/dev/null &
+started=$!
+wait "$started"
+check "the real claude keeps the pid its caller started, which tmux-save finds a session by" \
+    "$started" "$(cat "$work/pid")"
+install_claude_wrapper "$work/second-profile/bin"
+check "a second copy of the wrapper on PATH is passed over, not exec'd back and forth" personal-token \
+    "$(PATH="$HOME/.nix-profile/bin:$work/second-profile/bin:$PATH" timeout 10 claude | sed -n 's/^token=//p')"
+
+# --- a token that cannot be read stops claude, rather than starting it on another login
+
+out=$(SOPS_AGE_KEY_FILE=$work/no-such-key claude 2>&1)
+check "an undecryptable credential file exits non-zero" 1 $?
+check "...without starting claude" "" "$(grep '^token=' <<<"$out")"
+check "...and names the file" yes "$(grep -q 'claude-personal.env' <<<"$out" && echo yes || echo no)"
+
+# --- zephylux: each profile on its own login, unless `claude-account` switched the laptop
+
+# The laptop's wrapper, in place of pc's. Every launcher below starts claude from a caller
+# that carries the other account's token, which the wrapper has to drop.
+install_claude_wrapper "$HOME/.nix-profile/bin" switch
+claude_account() { PATH="$repo/bin:$PATH" claude-account "$@"; }
+
+# A shell: a login shell's PATH as zsh/exports builds it over one that holds neither
+# directory, and the claude function zsh/functions puts in front of the binary.
+zsh=$(command -v zsh || true)
+shell_token() {  # <config dir>
+    CLAUDE_CODE_OAUTH_TOKEN=stray-token CLAUDE_CONFIG_DIR=$1 PATH=$outer_path \
+        "$zsh" -fc "source $repo/zsh/exports; source $repo/zsh/functions 2>/dev/null; claude" | sed -n 's/^token=//p'
+}
+
+# The command the hub offers for a session, loaded the way the hub loads diffview, whose
+# resume_command it serves. The hub runs under no config dir, so the command names the
+# session's, and runs here in a shell that carries none.
+mkdir -p "$HOME/.claude-helferline/projects/p" "$HOME/.claude/projects/p" "$work/project"
+printf '{"type":"user","cwd":"%s"}\n' "$work/project" >"$HOME/.claude-helferline/projects/p/s1.jsonl"
+printf '{"type":"user","cwd":"%s"}\n' "$work/project" >"$HOME/.claude/projects/p/s2.jsonl"
+resumes=$(UV_CACHE_DIR=$uv_cache UV_PYTHON_INSTALL_DIR=$uv_python uv run --quiet --no-project --with tyro python3 -B -c '
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("diffview", sys.argv[1])
+module = importlib.util.module_from_spec(importlib.util.spec_from_loader("diffview", loader))
+loader.exec_module(module)
+print(module.resume_command("s1")); print(module.resume_command("s2"))' "$repo/bin/diffview")
+resume_helferline=$(sed -n 1p <<<"$resumes") resume_personal=$(sed -n 2p <<<"$resumes")
+hub_token() {  # <resume command>
+    env -u CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN=stray-token bash -c "$1" | sed -n 's/^token=//p'
+}
+
+# claude-ping under its unit's own environment, read from zephylux's evaluated config, with
+# its home mapped into the scratch one.
+unit_env=$(nix eval --json "$repo#homeConfigurations.zephyrus.config.systemd.user.services.claude-ping.Service.Environment" \
+    2>"$work/nix-errors" | jq -r '.[]' | sed "s|/home/max|$HOME|g")
+[ -n "$unit_env" ] || fail "claude-ping's unit environment evaluates from the flake" "$(tail -20 "$work/nix-errors")"
+ping_token() {
+    local vars=() var
+    while IFS= read -r var; do
+        # This host's tools (bash, sed) behind the unit's own directories.
+        [[ $var == PATH=* ]] && var="$var:$PATH"
+        vars+=("$var")
+    done <<<"$unit_env"
+    env -u CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN=stray-token "${vars[@]}" "$repo/bin/claude-ping" | sed -n 's/^token=//p'
+}
+
+# Which token each launcher starts claude on, in each profile, one line apiece.
+launched() {
+    if [ -n "$zsh" ]; then
+        echo "shell, ~/.claude: $(shell_token "$HOME/.claude")"
+        echo "shell, ~/.claude-helferline: $(shell_token "$HOME/.claude-helferline")"
+    fi
+    echo "hub, ~/.claude: $(hub_token "$resume_personal")"
+    echo "hub, ~/.claude-helferline: $(hub_token "$resume_helferline")"
+}
+everywhere() {  # <token>: launched's lines, every one on that token
+    [ -z "$zsh" ] || printf 'shell, ~/.claude: %s\nshell, ~/.claude-helferline: %s\n' "$1" "$1"
+    printf 'hub, ~/.claude: %s\nhub, ~/.claude-helferline: %s' "$1" "$1"
+}
+[ -n "$zsh" ] || skipped "a shell starts claude on the account in force" "zsh is not on PATH"
+
+check "the hub's resume command names a helferline session's account" \
+    "cd $work/project && CLAUDE_CONFIG_DIR=$HOME/.claude-helferline claude --resume s1" "$resume_helferline"
+check "with no switch, every launcher starts claude on the profile's own login, in either profile" \
+    "$(everywhere none)" "$(launched)"
+check "...and claude-ping on its own login" none "$(ping_token)"
+check "with no switch, claude-account says each profile is on its own login" \
+    "off (each profile on its own /login)" "$(claude_account)"
+
+claude_account helferline >/dev/null
+check "after claude-account helferline, every launcher starts claude on the helferline token, in either profile" \
+    "$(everywhere helferline-token)" "$(launched)"
+check "...while claude-ping stays on its own login" none "$(ping_token)"
+check "...and claude-account says so" "helferline (every profile on its token)" "$(claude_account)"
+
+claude_account personal >/dev/null
+check "switching to personal puts a helferline profile on the personal token" personal-token \
+    "$(hub_token "$resume_helferline")"
+
+claude_account off >/dev/null
+check "after claude-account off, every launcher is back on the profile's own login" \
+    "$(everywhere none)" "$(launched)"
+check "...and claude-ping still on its own" none "$(ping_token)"
+
+out=$(claude_account unminted 2>&1)
+check "claude-account refuses an account whose token is not minted yet" 2 $?
+check "...and leaves the laptop as it was" "$(everywhere none)" "$(launched)"
+out=$(claude_account elsewhere 2>&1)
+check "claude-account refuses an account with no credential file" 2 $?
+
+# The switch names an account whose token went away after it was set.
+echo unminted >"$HOME/.config/claude-account"
+out=$(claude 2>&1)
+check "a switch to an account with no token stops claude" 1 $?
+check "...without starting it on the profile's own login" "" "$(grep '^token=' <<<"$out")"
+check "...and says how to go back" yes "$(grep -q 'claude-account off' <<<"$out" && echo yes || echo no)"
+claude_account off >/dev/null
+
+# --- pc, where Home Manager is a NixOS module and installs the wrapper in /etc/profiles/per-user/max
+
+# The files that build pc's PATH, read from the flake's evaluation alone, nothing built:
+# /etc/zshenv runs NixOS's set-environment, ~/.zshenv Home Manager's session variables,
+# and ~/.zshrc sources zsh/. Each path of pc's is mapped into the scratch directory, and
+# the age key pc's config names is this test's. secrets/zshrc, which pc's .zshrc also
+# sources, is not in this checkout.
+if ! command -v nix >/dev/null || ! zsh=$(command -v zsh); then
+    skipped "pc's PATH reaches the wrapper" "nix or zsh is not on PATH"
+elif ! pc_files=$(nix eval --json "$repo#nixosConfigurations.pc.config" --apply 'c: let
+          max = c.home-manager.users.max.home; env = c.system.build.setEnvironment; vars = max.sessionVariablesPackage;
+        in { inherit (max) profileDirectory; setEnvironment = { path = env.outPath; inherit (env) text; };
+             sessionVars = { path = "${vars.outPath}/etc/profile.d/hm-session-vars.sh"; inherit (vars) text; };
+             etcZshenv = c.environment.etc.zshenv.text;
+             zshenv = max.file.".config/zsh/.zshenv".text; zshrc = max.file.".config/zsh/.zshrc".text; }' \
+        2>"$work/nix-errors"); then
+    fail "pc's shell startup files evaluate from the flake" "$(tail -20 "$work/nix-errors")"
+else
+    pc=$work/pc
+    field() { jq -r "$1" <<<"$pc_files"; }
+    pc_root() {
+        sed -e "s|/etc/profiles/per-user/|$pc/etc/profiles/per-user/|g" -e "s|/home/max|$HOME|g" \
+            -e "s|/run/user/1000/age-key.txt|$SOPS_AGE_KEY_FILE|g" \
+            -e "s|$(field .setEnvironment.path)|$pc/set-environment|g" \
+            -e "s|$(field .sessionVars.path)|$pc/hm-session-vars.sh|g"
+    }
+    mkdir -p "$pc" "$HOME/.config/zsh"
+    field .setEnvironment.text | pc_root >"$pc/set-environment"
+    field .sessionVars.text | pc_root >"$pc/hm-session-vars.sh"
+    field .etcZshenv | pc_root >"$pc/etc-zshenv"
+    field .zshenv | pc_root >"$HOME/.config/zsh/.zshenv"
+    field .zshrc | pc_root >"$HOME/.config/zsh/.zshrc"
+    cp -r "$repo/zsh" "$HOME/.dotfiles/zsh"
+    pc_root <"$repo/zsh/exports" >"$HOME/.dotfiles/zsh/exports"
+    check "pc's Home Manager profile is the per-user one this case maps" /etc/profiles/per-user/max \
+        "$(field .profileDirectory)"
+    # pc's wrapper is the per-user profile's alone; the one the cases above put in
+    # ~/.nix-profile would pass each call back to it, round and round.
+    rm "$HOME/.nix-profile/bin/claude"
+    install_claude_wrapper "$pc/etc/profiles/per-user/max/bin"
+    # A shell sshd starts carries next to nothing, but a token here proves the wrapper ran.
+    # set-environment replaces PATH whole; this host's tools (bash, sed) go behind pc's
+    # directories. The .zshrc's plugins live in pc's store, which this host may not hold;
+    # what fails to load of them is no part of PATH.
+    pc_zsh() {
+        env -i HOME="$HOME" USER=max CLAUDE_CODE_OAUTH_TOKEN=helferline-token \
+            "$zsh" -fc "source $pc/etc-zshenv; source $HOME/.config/zsh/.zshenv; $1; PATH=\$PATH:$outer_path; claude" \
+            </dev/null 2>/dev/null | sed -n 's/^token=//p'
+    }
+    check "an ssh command on pc starts claude on the personal token" personal-token "$(pc_zsh :)"
+    check "an interactive shell on pc starts claude on the personal token" personal-token \
+        "$(pc_zsh "source $HOME/.config/zsh/.zshrc")"
+fi
+
+finish

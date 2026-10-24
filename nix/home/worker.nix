@@ -1,16 +1,18 @@
-# Home Manager for a dispatch worker user on pc. nix/nixos/pc/agent-user.nix
-# creates the users; this is a function of what differs between them: the
-# user's name, the identity its commits carry, and the HOST.md record it
-# publishes. It does not import common.nix, which is max's environment (his git
-# identity, ssh hosts, symlinks into ~/.dotfiles); a worker user gets only what
-# a worker needs.
+# Home Manager for a dispatch worker user on pc or xmg19.
+# nix/nixos/agent-user.nix creates the users; this is a function of what
+# differs between them: the user's name, the identity its commits carry, the
+# HOST.md record it publishes, and the body that record shares with the host's
+# other worker user. It does not import common.nix, which is max's environment
+# (his git identity, ssh hosts, symlinks into ~/.dotfiles); a worker user gets
+# only what a worker needs.
 #
-# Done by hand once per user, over `ssh -t <user>@pc`, because it needs a
-# browser login: install claude (`curl -fsSL https://claude.ai/install.sh |
-# bash`), log in (`claude`, then the URL flow), install the plugin (`claude
-# plugin marketplace add MaxWolf-01/agents`, `claude plugin install
-# mx@MaxWolf-01`). Dispatch updates the plugin at the start of every run.
-{ name, identity, record }:
+# Done by hand once per user, over `ssh <user>@<host>`: install claude (`curl
+# -fsSL https://claude.ai/install.sh | bash`) and the plugin (`claude plugin
+# marketplace add MaxWolf-01/agents`, `claude plugin install mx@MaxWolf-01`).
+# Dispatch updates the plugin at the start of every run. Claude signs in with
+# no browser: `claude-token-push` on zephylux gives the user its account's
+# token.
+{ name, identity, record, body }:
 { config, osConfig, pkgs, lib, ... }:
 
 let
@@ -27,6 +29,8 @@ let
     gnumake
     jq
     nodejs
+    # mainProgram is the versioned `python3.14`; the record names what a worker types.
+    (lib.addMetaAttrs { mainProgram = "python3"; } python3)
     ripgrep
     rsync
     tmux
@@ -52,19 +56,19 @@ in
 
   # This user's own rootless daemon. Set per user rather than through
   # `virtualisation.docker.rootless.setSocketVariable`, which would export it
-  # for max too; see nix/nixos/pc/agent-user.nix.
+  # for max too; see nix/nixos/agent-user.nix.
   home.sessionVariables.DOCKER_HOST =
     "unix:///run/user/${toString osConfig.users.users.${name}.uid}/docker.sock";
 
-  # `ssh <user>@pc <cmd>` runs a non-login zsh, which reads .zshenv and nothing
+  # `ssh <user>@<host> <cmd>` runs a non-login zsh, which reads .zshenv and nothing
   # else; that is where home-manager puts the session variables and PATH above.
   programs.zsh.enable = true;
 
   # Every process an ssh command starts inherits it; why 500 is beside the
-  # memory ceiling in nix/nixos/pc/agent-user.nix.
+  # memory ceiling in nix/nixos/agent-user.nix.
   programs.zsh.envExtra = ''
     if (( $(</proc/self/oom_score_adj) < 500 )); then echo 500 >/proc/self/oom_score_adj; fi
-  '';
+  '' + builtins.readFile ./worker-claude-token.zsh;
 
   # Claude Code deletes transcripts older than cleanupPeriodDays, 30 by
   # default, and a worker's transcripts are kept for good, as max's are: the
@@ -128,11 +132,10 @@ in
   # inside that is the package list above. Two sources, no copies.
   home.file."HOST.md".text =
     let
-      body = builtins.readFile ./hosts/pc-worker-body.md;
       tools = lib.concatStringsSep " " (
         map (c: "`${c}`") (lib.sort lib.lessThan (map (p: p.meta.mainProgram) toolchain))
       );
     in
     builtins.replaceStrings [ "@TOOLCHAIN@" ] [ tools ]
-      (builtins.replaceStrings [ "@BODY@\n" ] [ body ] (builtins.readFile record));
+      (builtins.replaceStrings [ "@BODY@\n" ] [ (builtins.readFile body) ] (builtins.readFile record));
 }
