@@ -6,11 +6,12 @@
 # (his git identity, ssh hosts, symlinks into ~/.dotfiles); a worker user gets
 # only what a worker needs.
 #
-# Done by hand once per user, over `ssh -t <user>@<host>`, because it needs a
-# browser login: install claude (`curl -fsSL https://claude.ai/install.sh |
-# bash`), log in (`claude`, then the URL flow), install the plugin (`claude
-# plugin marketplace add MaxWolf-01/agents`, `claude plugin install
-# mx@MaxWolf-01`). Dispatch updates the plugin at the start of every run.
+# Done by hand once per user, over `ssh <user>@<host>`: install claude (`curl
+# -fsSL https://claude.ai/install.sh | bash`) and the plugin (`claude plugin
+# marketplace add MaxWolf-01/agents`, `claude plugin install mx@MaxWolf-01`).
+# Dispatch updates the plugin at the start of every run. Claude signs in with
+# no browser: `claude-token-push` on zephylux gives the user its account's
+# token.
 { name, identity, record, body }:
 { config, osConfig, pkgs, lib, ... }:
 
@@ -64,7 +65,7 @@ in
   # memory ceiling in nix/nixos/agent-user.nix.
   programs.zsh.envExtra = ''
     if (( $(</proc/self/oom_score_adj) < 500 )); then echo 500 >/proc/self/oom_score_adj; fi
-  '';
+  '' + builtins.readFile ./worker-claude-token.zsh;
 
   # Commit identity. There is no GitHub credential here; the identity matters
   # because the commits leave this host by push and land in `git log`.

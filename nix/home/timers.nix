@@ -39,6 +39,10 @@ let
     bash coreutils uv jq
   ]);
 
+  # In a unit that runs claude: its profile's own login, whichever account `claude-account`
+  # switched the laptop's sessions to (nix/home/claude-token.sh).
+  ownLogin = "CLAUDE_ACCOUNT_SWITCH=ignore";
+
   # The retros' units: claude for the retro's stages, uv for its scripts, jq for both run logs.
   retroPath = "${home}/.nix-profile/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin";
 
@@ -308,7 +312,7 @@ in
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
       # ${home}/bin for run-log and alert-send: the script records each run and
       # mails what needs a person with them
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/report.sh";
     };
   };
@@ -333,7 +337,7 @@ in
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
       # ${home}/bin for run-log and alert-send: the script records each run and
       # mails what needs a person with them
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ];
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/dep-scout.sh";
     };
   };
@@ -370,7 +374,7 @@ in
       Type = "oneshot";
       TimeoutStartSec = "12h"; # a real run takes an hour or two
       TimeoutStopSec = "3min";
-      Environment = [ "PATH=${retroPath}" ];
+      Environment = [ "PATH=${retroPath}" ownLogin ];
       ExecStart = "${dotfiles}/bin/workflow-retro ${home}/repos/github/MaxWolf-01/agents";
     };
   };
@@ -394,7 +398,7 @@ in
       Type = "oneshot";
       TimeoutStartSec = "${toString (2 * builtins.length repoRetros)}h"; # up to two hours a repo
       TimeoutStopSec = "3min";
-      Environment = [ "PATH=${retroPath}" ];
+      Environment = [ "PATH=${retroPath}" ownLogin ];
       ExecStart = "${dotfiles}/bin/workflow-retro --repos ${home}/repos/github/MaxWolf-01/agents";
     };
   };
@@ -1037,7 +1041,9 @@ in
     Service = {
       Type = "oneshot";
       WorkingDirectory = "/tmp";
-      Environment = [ "PATH=${home}/.local/bin:${home}/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin" ];
+      # ~/.nix-profile/bin ahead of ~/.local/bin: its `claude` is the wrapper
+      # (claude-token.nix), and the ping has to open the profile's own window.
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
       ExecStart = "${dotfiles}/bin/claude-ping";
     };
   };

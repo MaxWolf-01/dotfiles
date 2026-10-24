@@ -5,6 +5,7 @@
   home.stateVersion = "24.05";
 
   imports = [
+    ../claude-token.nix
     ../common.nix
     ../pc-timers.nix
   ];
