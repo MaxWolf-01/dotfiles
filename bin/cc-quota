@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
 # Print how much of each Claude plan's quota is used and when it resets, for every Claude
-# Code profile on this machine: ~/.claude and each ~/.claude-NAME that holds a login, has a
-# statusline reading, or has sessions (projects/).
+# Code profile on this machine: ~/.claude and each ~/.claude-NAME that holds a login.
 # Usage: cc-quota [--json]
 #
-# A profile holding a login is read from Anthropic's OAuth usage endpoint with its current
-# access token, never refreshed: a refresh rotates the token Claude Code holds. A profile on a
-# setup-token has no login, and the endpoint refuses that token, so it is read from what its
-# statusline last saw instead: the newest ~/.cache/claude-statusline/<session>.json whose
-# config_dir is the profile and which carries rate_limits. That holds the 5-hour and weekly
-# buckets alone, as they stood when that session last rendered its statusline; a bucket whose
-# reset has passed since reads as 0% used, its next reset unknown. A login that expired, or that
-# the endpoint refuses, falls back to the statusline too. With no reading, the profile's error is
-# reported: opening claude in that profile on its login renews an expired one.
+# It reads Anthropic's OAuth usage endpoint with the profile's current access token
+# and never refreshes it: a refresh rotates the token Claude Code holds. An expired one is
+# reported, and opening claude in that profile renews it.
 #
 # Then each Console org that receives a Max plan's monthly API credits: what it has spent since
 # the day of the month the grant arrives, CC_QUOTA_GRANT_DAY (default 10). No public API reads a
@@ -25,9 +18,8 @@
 # environment); set empty, it leaves the orgs out.
 #
 # --json prints the same report as one line of JSON, for a history to append it to: at (UTC),
-# profiles (name, plan, buckets of name, used %, resets_at, dollars_left, dollars_limit; or, read
-# from the statusline, name, seen_at and buckets of name, used %, resets_at; or name and error),
-# and consoles (entry, org, since, spent in dollars, counted through yesterday; or entry
+# profiles (name, plan, buckets of name, used %, resets_at, dollars_left, dollars_limit; or name and
+# error), and consoles (entry, org, since, spent in dollars, counted through yesterday; or entry
 # and error).
 set -euo pipefail
 json=false
@@ -43,69 +35,30 @@ now=${CC_QUOTA_NOW:-$(date +%s)}
 
 failed() { jq -nc --arg n "$1" --arg e "$2" '{name: $n, error: $e}'; }
 
-# Each profile dir's newest statusline reading that carries rate_limits, by the dir's physical
-# path, and when it was written. The readings reach one jq as a JSON text sequence, so one that a
-# write left half done is passed over alone. Session ids name the files, so a name needs no escaping.
-declare -A newest newest_at
-statusline=$HOME/.cache/claude-statusline
-while IFS=$'\t' read -r at config file; do
-	config=$(cd -P -- "${config/#\~/$HOME}" 2>/dev/null && pwd -P) || continue
-	((at > ${newest_at[$config]:--1})) || continue
-	newest_at[$config]=$at newest[$config]=$statusline/$file
-done < <(
-	for file in "$statusline"/*.json; do
-		[[ -f $file && ${file##*/} =~ ^[A-Za-z0-9._-]+$ ]] || continue
-		body=
-		IFS= read -rd '' body <"$file" || true
-		printf '\x1e{"file": "%s", "reading": %s}\n' "${file##*/}" "$body"
-	done | jq -r --seq '.file as $f | .reading
-		| select((.rate_limits | type == "object" and length > 0) and (.written_at | type == "number") and (.config_dir | type == "string"))
-		| [(.written_at | floor), .config_dir, $f] | @tsv' 2>/dev/null
-)
-
-# A profile's report from its statusline reading: seen <name> <reading>. Buckets as the
-# endpoint's below, under the statusline's names (five_hour, seven_day).
-seen() {
-	jq -c --arg n "$1" --argjson now "$now" '{name: $n, seen_at: (.written_at | floor | todate), buckets: [
-		.rate_limits | to_entries[] | select(.value | type == "object" and .used_percentage != null)
-		| .value.resets_at as $r
-		| {name: .key} + if $r != null and $r <= $now then {used: 0, resets_at: null}
-			else {used: (.value.used_percentage | round), resets_at: ($r | if . then round + 30 | . - . % 60 | todate else null end)} end]}' "$2"
-}
-
 # Every profile's report, one JSON object each.
 profiles=()
 for dir in "$HOME/.claude" "$HOME"/.claude-*/; do
 	dir=${dir%/}
-	[[ -d $dir ]] || continue
 	creds=$dir/.credentials.json
+	[[ -f $creds ]] || continue
 	name=${dir##*/.claude-}
 	[[ $name == "$dir" ]] && name=default
-	error=
-	if [[ ! -f $creds ]]; then
-		:
-	elif (($(jq -r '.claudeAiOauth.expiresAt // 0' "$creds") < now * 1000)); then
-		error="token expired; open claude in this profile to renew it"
-	elif ! usage=$(curl -sSf "$api/api/oauth/usage" -H "Authorization: Bearer $(jq -r .claudeAiOauth.accessToken "$creds")" -H 'anthropic-beta: oauth-2025-04-20'); then
-		error="the usage endpoint refused the request"
-	else
-		# Every bucket the reply fills in, so one Anthropic adds later shows up under its own name.
-		# Reset times jitter around the minute (04:59:59.85, then 05:00:00.24), so they are rounded to it.
-		profiles+=("$(jq -c --arg n "$name" --arg p "$(jq -r '.claudeAiOauth.subscriptionType // "?"' "$creds")" '{name: $n, plan: $p, buckets: [
-			to_entries[] | select(.value | type == "object" and has("utilization") and .resets_at != null)
-			| {name: .key, used: (.value.utilization | round),
-			   resets_at: (.value.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdate + 30 | . - . % 60 | todate),
-			   dollars_left: .value.remaining_dollars, dollars_limit: .value.limit_dollars}]}' <<<"$usage")")
+	if (($(jq -r '.claudeAiOauth.expiresAt // 0' "$creds") < now * 1000)); then
+		profiles+=("$(failed "$name" "token expired; open claude in this profile to renew it")")
 		continue
 	fi
-	found=${newest[$(cd -P -- "$dir" && pwd -P)]:-}
-	if [[ -n $found ]]; then
-		profiles+=("$(seen "$name" "$found")")
-	elif [[ -n $error ]]; then
-		profiles+=("$(failed "$name" "$error")")
-	elif [[ -d $dir/projects ]]; then
-		profiles+=("$(failed "$name" "no login, and no statusline reading that carries rate_limits")")
+	token=$(jq -r .claudeAiOauth.accessToken "$creds")
+	if ! usage=$(curl -sSf "$api/api/oauth/usage" -H "Authorization: Bearer $token" -H 'anthropic-beta: oauth-2025-04-20'); then
+		profiles+=("$(failed "$name" "the usage endpoint refused the request")")
+		continue
 	fi
+	# Every bucket the reply fills in, so one Anthropic adds later shows up under its own name.
+	# Reset times jitter around the minute (04:59:59.85, then 05:00:00.24), so they are rounded to it.
+	profiles+=("$(jq -c --arg n "$name" --arg p "$(jq -r '.claudeAiOauth.subscriptionType // "?"' "$creds")" '{name: $n, plan: $p, buckets: [
+		to_entries[] | select(.value | type == "object" and has("utilization") and .resets_at != null)
+		| {name: .key, used: (.value.utilization | round),
+		   resets_at: (.value.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdate + 30 | . - . % 60 | todate),
+		   dollars_left: .value.remaining_dollars, dollars_limit: .value.limit_dollars}]}' <<<"$usage")")
 done
 
 # One Console org's spend as a JSON object: console <entry> <key> <grant day>.
@@ -203,33 +156,21 @@ when() {
 	fi
 }
 
-ago() { # ago <instant>: how long before now it was, to the minute
-	local gone=$((now - $1))
-	if ((gone < 3600)); then echo "$((gone / 60))m"
-	elif ((gone < 86400)); then echo "$((gone / 3600))h $((gone % 3600 / 60))m"
-	else echo "$((gone / 86400))d $((gone % 86400 / 3600))h"
-	fi
-}
-
 row() { # row <label> <used %> <detail>
 	printf '  %-13s %s %4s  %s\n' "$1" "$(bar "$2")" "$2%" "$3"
 }
 
 jq -r '(.profiles[] | if .error then ["error", .name, .error]
-		else (if .seen_at then ["seen", .name, (.seen_at | fromdate)] else ["heading", .name, .plan] end),
-			(.buckets[] | ["bucket", .name, .used, (.resets_at | if . then fromdate else null end), .dollars_left, .dollars_limit]) end),
+		else ["heading", .name, .plan], (.buckets[] | ["bucket", .name, .used, (.resets_at | fromdate), .dollars_left, .dollars_limit]) end),
 	(.consoles[] | if .error then ["error", "console \(.org // .entry)", .error]
 		else ["heading", "console \(.org)", .entry], ["spend", .spent, .since] end)
 	| map(. // "" | tostring) | @tsv' <<<"$report" |
 	while IFS=$'\t' read -r kind a b c d e; do
 		case $kind in
 		heading) printf '%s%s%s %s%s%s\n' "$bold" "$a" "$off" "$dim" "$b" "$off" ;;
-		seen) printf '%s%s%s %sas its statusline saw it %s ago%s\n' "$bold" "$a" "$off" "$dim" "$(ago "$b")" "$off" ;;
 		error) printf '%s%s%s %s%s%s\n' "$bold" "$a" "$off" "$red" "$b" "$off" ;;
 		bucket)
-			if [[ -z $c ]]; then
-				row "$(label "$a")" "$b" "${dim}next reset unknown$off"
-			elif [[ -n $d ]]; then
+			if [[ -n $d ]]; then
 				row "$(label "$a")" "$b" "\$$(printf %.2f "$d") of \$$(printf %.0f "$e") left${dim}, expires $(when "$c")$off"
 			else
 				row "$(label "$a")" "$b" "${dim}resets $(when "$c")$off"
