@@ -5,12 +5,15 @@
 # host-unlock-receive below. Until then xmg19 runs without a /home: sshd,
 # tailscale and the backups landing in /srv work, and a login lands in a home
 # that is not there.
-{ config, pkgs, lib, ... }:
+{ config, pkgs, lib, utils, ... }:
 
 let
   homeUsers = lib.attrNames (lib.filterAttrs (_: u: u.isNormalUser) config.users.users);
   lingerUsers = lib.attrNames (lib.filterAttrs (_: u: u.isNormalUser && u.linger == true) config.users.users);
-  hmUsers = lib.attrNames config.home-manager.users;
+  # Home Manager's unit names, which escape the user name as systemd does a
+  # path: agent-hl's is home-manager-agent\x2dhl.
+  hmUnits = map (u: "home-manager-${utils.escapeSystemdPath u}")
+    (lib.attrNames config.home-manager.users);
 
   # Each home and its TMPDIR (below). A TMPDIR that does not exist fails every
   # program that makes a temp file, nix and Home Manager's activation among
@@ -43,14 +46,14 @@ let
       fi
       systemctl start home.mount
 
-      hm_users=(${lib.escapeShellArgs hmUsers})
+      hm_units=(${lib.escapeShellArgs hmUnits})
       linger_users=(${lib.escapeShellArgs lingerUsers})
 
       ${makeHomes}
 
       # What the boot skipped for want of /home (the conditions below).
-      for user in "''${hm_users[@]}"; do
-        systemctl restart "home-manager-$user.service"
+      for unit in "''${hm_units[@]}"; do
+        systemctl restart "$unit.service"
       done
       # A lingering user's manager started at boot without the units in its home.
       for user in "''${linger_users[@]}"; do
@@ -80,7 +83,7 @@ in
   # which waits 90 s for a device that is not there while logins wait on it.
   # The user managers are left to start: logins wait on them, and one that
   # skips itself costs every login a 25 s timeout.
-  systemd.services = lib.genAttrs (map (u: "home-manager-${u}") hmUsers) (_: {
+  systemd.services = lib.genAttrs hmUnits (_: {
     unitConfig.ConditionPathIsMountPoint = "/home";
     unitConfig.RequiresMountsFor = lib.mkForce [ ];
   });
