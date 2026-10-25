@@ -106,6 +106,10 @@
   environment.systemPackages = with pkgs; [
     git
     nvtopPackages.nvidia
+    # Without it zsh garbles a ghostty session (typed text shows twice). Ghostty's
+    # own ssh-terminfo copies it into ~/.terminfo, which here sits behind the
+    # locked /home after every boot.
+    ghostty.terminfo
   ];
 
   # facter turns Bluetooth on wherever it finds the radio; nothing here uses it.
