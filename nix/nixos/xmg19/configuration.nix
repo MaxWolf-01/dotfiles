@@ -50,9 +50,6 @@
   services.xserver.videoDrivers = [ "nvidia" ];
   hardware.graphics.enable = true;
 
-  # XMG uses Clevo/Tongfang chassis (uniwill_wmi).
-  hardware.tuxedo-drivers.enable = true;
-
   boot = {
     # systemd in stage 1 is what reads the TPM: cryptroot unlocks unattended
     # (disk-config.nix), so a reboot or an rtcwake wake-up comes all the way up.
