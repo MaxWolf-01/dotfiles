@@ -85,9 +85,8 @@ in
   # to user.slice, max's included, and what is left above memoryMax is the
   # system's. Within it max's slice is protected up to sessionsReserve, so
   # reclaim takes the workers' memory first, and the workers together hold
-  # memoryMax less what max's sessions use. One worker may use all of that: a
-  # large build or a training run fits where a per-worker limit would refuse
-  # it. At the ceiling the OOM killer ranks by size plus oom_score_adj, in
+  # memoryMax less what max's sessions use, any one worker all of it. At the
+  # ceiling the OOM killer ranks by size plus oom_score_adj, in
   # thousandths of the ceiling; the workers' 500 puts them before max's
   # processes (200 or less) up to 30% of the ceiling larger, 3 GiB on pc's
   # 10G. No swap: a swapping cgroup stalls the host long before the killer
@@ -102,10 +101,8 @@ in
     sliceConfig.MemoryLow = sessionsReserve;
   };
 
-  # The slots, held in a directory every worker user shares (`host-slots
-  # --help`), and counted against the count this machine declares. Only the
-  # workers take slots, so only they get the tool. Sticky, as /tmp is: every
-  # worker user adds slots, and removes only their own.
+  # The slots (`host-slots --help`), in a directory every worker user shares.
+  # Only the workers take slots, so only they get the tool.
   home-manager.users = lib.genAttrs names (_: { home.packages = [ host-slots ]; });
   systemd.tmpfiles.rules = [
     "d /run/host-slots 1777 root root -"
