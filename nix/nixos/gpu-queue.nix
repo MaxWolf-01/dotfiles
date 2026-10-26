@@ -10,7 +10,7 @@ let
   # with, so a project's own shell still comes first.
   gpu-queue = pkgs.runCommand "gpu-queue" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
     for name in gpu-queue gpu-run; do
-      install -Dm755 ${../../../bin/gpu-queue} $out/bin/$name
+      install -Dm755 ${../../bin/gpu-queue} $out/bin/$name
       patchShebangs $out/bin/$name
       wrapProgram $out/bin/$name --suffix PATH : ${lib.makeBinPath (with pkgs; [ coreutils findutils gnused jq util-linux ])}
     done

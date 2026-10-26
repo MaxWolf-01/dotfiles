@@ -2,7 +2,7 @@
 host: pc
 user: agent-hl
 isolated: true
-slots: 6
+withholds: gpu
 account: helferline
 ---
 

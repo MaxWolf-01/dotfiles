@@ -11,12 +11,14 @@
 # worktrees or plugin cache. A home boundary covers exactly what is inside a
 # home; dispatch's scratch dir and worker logs under /tmp are outside it.
 #
-# A function of what differs between the hosts that import it: memoryMax is
-# the workers' memory ceiling (below), dispatcherKeys the public key of each
-# machine that dispatches to them. Without its key a machine gets "Permission
-# denied (publickey)" from these users, and `worker-hosts` shows that message
-# in place of the host's state.
-{ memoryMax, dispatcherKeys }:
+# A function of what differs between the hosts that import it: how the machine
+# takes work (memoryMax and sessionsReserve, its memory, below; slots, how many
+# dispatched runs it holds at once, whichever worker user runs them), and
+# dispatcherKeys, the public key of each machine that dispatches to the
+# workers. Without its key a machine gets "Permission denied (publickey)" from
+# these users, and `worker-hosts` shows that message in place of the host's
+# state.
+{ memoryMax, sessionsReserve, slots, dispatcherKeys }:
 { pkgs, lib, ... }:
 
 let
@@ -27,6 +29,15 @@ let
     agent-hl = { uid = 1002; description = "dispatch workers, Helferline account"; };
   };
   names = lib.attrNames workers;
+  # max's uid, pinned so the slice sessionsReserve protects keeps its name.
+  maxUid = 1000;
+
+  host-slots = pkgs.runCommand "host-slots" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+    install -Dm755 ${../../bin/host-slots} $out/bin/host-slots
+    patchShebangs $out/bin/host-slots
+    wrapProgram $out/bin/host-slots --set HOST_SLOTS ${toString slots} \
+      --prefix PATH : ${lib.makeBinPath (with pkgs; [ coreutils gnugrep util-linux ])}
+  '';
 
   # Tailscale ACLs are per-node and cannot separate unix users, so the tailnet
   # boundary is drawn by uid instead. The firewall's reload script re-runs
@@ -63,20 +74,41 @@ in
       # 700 is already the NixOS default for normal users; it is pinned here so
       # the boundary does not depend on that default staying put.
       max.homeMode = "700";
+      max.uid = maxUid;
     }
   ];
   users.groups = lib.mapAttrs (_: w: { gid = w.uid; }) workers;
 
-  # The workers' memory ceiling. logind parents every user's slice to
-  # user.slice, so it holds max's sessions too. At the ceiling the OOM killer
-  # ranks by size plus oom_score_adj, in thousandths of the ceiling; the
-  # workers' 500 puts them before max's processes (200 or less) up to 30% of
-  # the ceiling larger, 3 GiB on pc's 10G. No swap: a swapping cgroup stalls
-  # the host long before the killer acts.
+  # The memory every user's sessions share: logind parents each user's slice
+  # to user.slice, max's included, and what is left above memoryMax is the
+  # system's. Within it max's slice is protected up to sessionsReserve, so
+  # reclaim takes the workers' memory first, and the workers together hold
+  # memoryMax less what max's sessions use. One worker may use all of that: a
+  # large build or a training run fits where a per-worker limit would refuse
+  # it. At the ceiling the OOM killer ranks by size plus oom_score_adj, in
+  # thousandths of the ceiling; the workers' 500 puts them before max's
+  # processes (200 or less) up to 30% of the ceiling larger, 3 GiB on pc's
+  # 10G. No swap: a swapping cgroup stalls the host long before the killer
+  # acts.
   systemd.slices.user.sliceConfig = {
     MemoryMax = memoryMax;
     MemorySwapMax = 0;
   };
+  # A drop-in on the slice logind makes from user-.slice, named by uid.
+  systemd.slices."user-${toString maxUid}" = {
+    overrideStrategy = "asDropin";
+    sliceConfig.MemoryLow = sessionsReserve;
+  };
+
+  # The slots, held in a directory every worker user shares (`host-slots
+  # --help`), and counted against the count this machine declares. Only the
+  # workers take slots, so only they get the tool. Sticky, as /tmp is: every
+  # worker user adds slots, and removes only their own.
+  home-manager.users = lib.genAttrs names (_: { home.packages = [ host-slots ]; });
+  systemd.tmpfiles.rules = [
+    "d /run/host-slots 1777 root root -"
+    "f /run/host-slots/lock 0644 root root -"
+  ];
 
   # Rootless docker, for the workers alone. Two things about the upstream module
   # make "just enable it" wrong here: its user service is wantedBy every

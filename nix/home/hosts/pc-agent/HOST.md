@@ -2,7 +2,7 @@
 host: pc
 user: agent
 isolated: true
-slots: 6
+withholds: gpu
 account: personal
 ---
 

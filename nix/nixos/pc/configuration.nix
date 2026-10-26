@@ -11,6 +11,8 @@
     ./hd-idle.nix
     (import ../agent-user.nix {
       memoryMax = "10G";
+      sessionsReserve = "2G";
+      slots = 6;
       dispatcherKeys = [
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
       ];
@@ -20,6 +22,7 @@
     ./hardware-alerts.nix
     ../journald.nix
     ../uv-python.nix
+    ../gpu-queue.nix
   ];
 
   # Boot
