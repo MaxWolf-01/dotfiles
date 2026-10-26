@@ -24,6 +24,12 @@
     config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/ruff";
   xdg.configFile."oyo/config.toml".source =
     config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/oyo/config.toml";
+  # uv's Python for a script or project that pins none of its own. Left to itself uv
+  # takes the newest it has, which can be newer than a compiled package's wheels: with
+  # no wheel for that version, uv builds the package against Nix's glibc, and on
+  # Ubuntu the result fails to load (DuckDB has no 3.15 wheel). Raise it once
+  # DuckDB publishes wheels for the next version.
+  xdg.configFile."uv/.python-version".text = "3.14\n";
   home.file.".vimrc".source =
     config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.dotfiles/vim/vimrc";
   home.file.".pythonrc".source =
