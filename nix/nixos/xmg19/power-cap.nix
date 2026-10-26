@@ -23,6 +23,13 @@ let
   '';
 in
 {
+  # One busy thread at the 4.5GHz turbo draws ~22W into a single core, which
+  # runs it ~15°C hotter than the same 22W spread over all six, and the fan
+  # follows the hottest core. Capped at 3.4GHz, one thread drew ~10W at 55°C
+  # with the fan at its idle floor, for ~81% of its speed (2026-10-24, as
+  # max_perf_pct 75). All-core load runs near 2.5GHz under PL1, below the cap.
+  powerManagement.cpufreq.max = 3400000;
+
   hardware.cpu.x86.msr.enable = true;
   hardware.cpu.x86.msr.settings.allow-writes = "on";
 
