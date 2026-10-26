@@ -37,11 +37,12 @@
 #                            none now, but one may once a slot frees or a
 #                            host is back; 1: none ever could.
 #
-# Placement takes, of the hosts up on that account with a slot free, every
-# capability, and the memory for one more worker, the machine whose tasks
-# waited least for a CPU in the last 10 s (/proc/pressure/cpu), then the one
-# holding fewer slots. CPU weights share a machine between its workers, so a
-# busy one stays usable; its pressure says how contended it is.
+# Placement keeps the hosts up on that account that have a slot free, offer
+# every capability asked for, and have 2G free for one more worker. Of those it
+# ranks first the machine whose tasks waited least for a CPU in the last 10 s
+# (/proc/pressure/cpu), then the one holding fewer slots. Pressure, not load:
+# each worker's CPU weight keeps a machine running many processes responsive,
+# and pressure says how contended it is.
 set -uo pipefail
 
 repo="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
@@ -86,9 +87,11 @@ awk '$1 == "some" {sub("avg10=", "", $2); print "pressure=" $2}' /proc/pressure/
 awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print "memtotal_kb=" t; print "memavail_kb=" a}' /proc/meminfo
 # Every user's sessions share user.slice's ceiling, the workers' among them.
 users=/sys/fs/cgroup/user.slice
+# Its inactive file cache counts as used, but the kernel reclaims it on demand.
 if grep -qx '[0-9]*' "$users/memory.max" 2>/dev/null; then
   echo "users_max_kb=$(($(cat "$users/memory.max") / 1024))"
-  echo "users_used_kb=$(($(cat "$users/memory.current") / 1024))"
+  inactive=$(awk '$1 == "inactive_file" {print $2}' "$users/memory.stat")
+  echo "users_used_kb=$(( ($(cat "$users/memory.current") - ${inactive:-0}) / 1024 ))"
 fi
 # The ZFS ARC is evictable but counts as used, so MemAvailable understates a
 # host with a pool by the size of it -- gigabytes, on this one.
@@ -140,8 +143,7 @@ capabilities() { # <record> <result>
 }
 
 # The memory free for workers and the most they may use, in KiB: the machine's,
-# held to what user.slice's ceiling leaves. The ZFS ARC is evictable but counts
-# as used, so MemAvailable understates a host with a pool by the size of it.
+# the ARC added back, held to what user.slice's ceiling leaves.
 memory() { # <result>
   awk -F= '{ v[$1] = $2 }
     END {
@@ -158,7 +160,8 @@ memory() { # <result>
 # What the placer reads of one record, tab-separated: user@host, machine,
 # account, isolated, state (up, locked or unreachable), slots held, slot count,
 # capabilities, memory free for workers and the most they may use (KiB), CPU
-# pressure (avg10). A field the host did not answer is `-`.
+# pressure (avg10), and what the record withholds. A field the host did not
+# answer is `-`.
 reading() { # <record> <result>
   local state=up
   if [ ! -s "$2" ]; then state=unreachable; elif grep -qx 'locked=1' "$2"; then state=locked; fi
@@ -169,20 +172,25 @@ reading() { # <record> <result>
   else
     f+=(- - "$(capabilities "$1" /dev/null)" - - -)
   fi
+  f+=("$(field "$1" withholds | tr -d ' ')")
   local i; for i in "${!f[@]}"; do f[i]=${f[i]:--}; done
   (IFS=$'\t'; echo "${f[*]}")
 }
 
-# The placer: of the readings on stdin, the user@hosts a spawn on <account>
-# needing every <capability> may start on now, best first, each with whether
-# it is isolated. Returns 3 where none can now but one may later (a host down,
-# or every slot held, or the memory taken), 1 where none ever could.
+# The placer, on the readings on stdin: what `--place` prints and returns.
+# A host that is down may take the spawn once back, unless its record
+# withholds what the spawn needs.
 place() { # <account> [<capability>...]
   local account=$1 out rc; shift
   out=$(awk -F'\t' -v account="$account" -v needs="$*" -v worker="$worker_kb" '
     BEGIN { n = split(needs, need, " ") }
     $3 != account { next }
-    $5 != "up" { later = 1; next }
+    $5 != "up" {
+      split($12, kept, ","); split("", withheld)
+      for (i in kept) withheld[kept[i]] = 1
+      for (i = 1; i <= n; i++) if (need[i] in withheld) next
+      later = 1; next
+    }
     $7 !~ /^[0-9]+$/ { next }
     {
       split($8, listed, ","); split("", has)
@@ -214,7 +222,7 @@ gib() { awk -v k="${1:-0}" 'BEGIN { g = k / 1048576; printf (g < 10 ? "%.1fG" : 
 
 render() {
   local name=$1 record=$2 result=$3
-  local uptime cores cpu pressure memtotal memavail arc gpu gname gutil gused gtotal workers slots
+  local uptime cores cpu pressure free most gpu gname gutil gused gtotal workers slots
 
   if [ -s "$result" ]; then
     uptime=$(sed -n 's/^uptime=//p' "$result")
@@ -235,11 +243,9 @@ render() {
   cpu=$(sed -n 's/^cpu=//p' "$result" |
     sed 's/(R)//g; s/(TM)//g; s/ [0-9]*-Core Processor//; s/ Processor//; s/ CPU @.*//; s/  */ /g')
   pressure=$(sed -n 's/^pressure=//p' "$result")
-  memtotal=$(sed -n 's/^memtotal_kb=//p' "$result")
-  memavail=$(sed -n 's/^memavail_kb=//p' "$result")
-  arc=$(sed -n 's/^arc_kb=//p' "$result")
-  printf '  cpu %s%% waiting, %s threads (%s)   mem %s free of %s' \
-    "${pressure:-?}" "${cores:-?}" "${cpu:-?}" "$(gib $(( ${memavail:-0} + ${arc:-0} )))" "$(gib "${memtotal:-0}")"
+  read -r free most < <(memory "$result")
+  printf '  cpu %s%% waiting, %s threads (%s)   mem %s free for workers of %s' \
+    "${pressure:-?}" "${cores:-?}" "${cpu:-?}" "$(gib "$free")" "$(gib "$most")"
 
   gpu=$(sed -n 's/^gpu=//p' "$result" | head -1)
   if [ "$gpu" = asleep ]; then
@@ -281,6 +287,7 @@ targets_only=false
 account=""
 needs=()
 on=""
+only=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -307,6 +314,8 @@ if $targets_only; then
   exit 0
 fi
 
+known() { die "no such worker host: $1 (have: $(for r in "${records[@]}"; do target "$r"; done | paste -sd' ' -))"; }
+
 if [ -n "$host" ]; then
   for record in "${records[@]}"; do
     [ "$(target "$record")" = "$host" ] || continue
@@ -322,12 +331,12 @@ if [ -n "$host" ]; then
     fi
     exit 0
   done
-  die "no such worker host: $host (have: $(for r in "${records[@]}"; do target "$r"; done | paste -sd' ' -))"
+  known "$host"
 fi
 
 if [ -n "$on" ]; then
   for record in "${records[@]}"; do [ "$(target "$record")" != "$on" ] || only=$record; done
-  [ -n "${only:-}" ] || die "no such worker host: $on"
+  [ -n "$only" ] || known "$on"
   records=("$only")
 fi
 
@@ -346,8 +355,8 @@ if [ -n "$account" ]; then
   place "$account" "${needs[@]}" <<<"$readings"
   case $? in
     0) exit 0 ;;
-    3) echo "worker-hosts: no host on account $account${needs:+ offering ${needs[*]}} can take a worker now" >&2; exit 3 ;;
-    *) echo "worker-hosts: no host on account $account${on:+ ($on)} with a slot count${needs:+ offers ${needs[*]}}" >&2; exit 1 ;;
+    3) echo "worker-hosts: no host on account $account${on:+ ($on)}${needs[0]:+ that offers ${needs[*]}} can take a worker now; the readings above say why" >&2; exit 3 ;;
+    *) echo "worker-hosts: no host on account $account${on:+ ($on)}${needs[0]:+ that offers ${needs[*]}} counts slots; the readings above say why" >&2; exit 1 ;;
   esac
 fi
 

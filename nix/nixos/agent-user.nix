@@ -29,7 +29,7 @@ let
     agent-hl = { uid = 1002; description = "dispatch workers, Helferline account"; };
   };
   names = lib.attrNames workers;
-  # Pinned below, as the name of the slice the session reserve protects.
+  # max's uid, pinned so the slice sessionsReserve protects keeps its name.
   maxUid = 1000;
 
   host-slots = pkgs.runCommand "host-slots" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
@@ -79,16 +79,17 @@ in
   ];
   users.groups = lib.mapAttrs (_: w: { gid = w.uid; }) workers;
 
-  # The memory every user's sessions share: logind parents each user's slice to
-  # user.slice, max's included, and what is left above memoryMax is the
+  # The memory every user's sessions share: logind parents each user's slice
+  # to user.slice, max's included, and what is left above memoryMax is the
   # system's. Within it max's slice is protected up to sessionsReserve, so
   # reclaim takes the workers' memory first, and the workers together hold
-  # memoryMax less what max's sessions use. No worker carries a limit of its
-  # own: one may use all the workers have. At the ceiling the OOM killer ranks
-  # by size plus oom_score_adj, in thousandths of the ceiling; the workers' 500
-  # puts them before max's processes (200 or less) up to 30% of the ceiling
-  # larger, 3 GiB on pc's 10G. No swap: a swapping cgroup stalls the host long
-  # before the killer acts.
+  # memoryMax less what max's sessions use. One worker may use all of that: a
+  # large build or a training run fits where a per-worker limit would refuse
+  # it. At the ceiling the OOM killer ranks by size plus oom_score_adj, in
+  # thousandths of the ceiling; the workers' 500 puts them before max's
+  # processes (200 or less) up to 30% of the ceiling larger, 3 GiB on pc's
+  # 10G. No swap: a swapping cgroup stalls the host long before the killer
+  # acts.
   systemd.slices.user.sliceConfig = {
     MemoryMax = memoryMax;
     MemorySwapMax = 0;
@@ -100,8 +101,14 @@ in
   };
 
   # The slots, held in a directory every worker user shares (`host-slots
-  # --help`), and counted against the count this machine declares.
+  # --help`), and counted against the count this machine declares. Only the
+  # workers take slots, so only they get the tool. Sticky, as /tmp is: every
+  # worker user adds slots, and removes only their own.
   home-manager.users = lib.genAttrs names (_: { home.packages = [ host-slots ]; });
+  systemd.tmpfiles.rules = [
+    "d /run/host-slots 1777 root root -"
+    "f /run/host-slots/lock 0644 root root -"
+  ];
 
   # Rootless docker, for the workers alone. Two things about the upstream module
   # make "just enable it" wrong here: its user service is wantedBy every
