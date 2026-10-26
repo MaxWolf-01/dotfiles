@@ -55,6 +55,20 @@
     mkdir -p ~/tmp ~/logs
   '';
 
+  # Home Manager loads its session variables once per login, and every process
+  # the login starts inherits the guard that says so. A GNOME session that began
+  # before a switch therefore hands each new terminal the guard but not the
+  # variables the switch added. Loaded here, ahead of Home Manager's own line,
+  # wherever they came from another generation; a variable a parent shell set by
+  # hand still reaches its children, since they share its generation.
+  home.file."${lib.removePrefix "${config.home.homeDirectory}/" config.programs.zsh.dotDir}/.zshenv".text = lib.mkBefore ''
+    if [[ ''${__HM_SESS_VARS_FROM-} != ${config.home.sessionVariablesPackage} ]]; then
+      unset __HM_SESS_VARS_SOURCED
+      . "${config.home.sessionVariablesPackage}/etc/profile.d/hm-session-vars.sh"
+      export __HM_SESS_VARS_FROM=${config.home.sessionVariablesPackage}
+    fi
+  '';
+
   programs.zsh = {
     enable = true;
     dotDir = "${config.xdg.configHome}/zsh";
