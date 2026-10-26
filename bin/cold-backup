@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Copy all of tank/max onto the cold-storage disk, a ZFS pool of its own that
+# is plugged into pc only while this runs, and kept somewhere else otherwise.
+#
+# Each run snapshots tank/max with all its datasets and sends what changed
+# since the last run's snapshot. Encrypted datasets travel still encrypted
+# (a raw send), so the disk never needs their keys, and nothing on it is ever
+# mounted: the pool's mountpoint is none, and the received datasets inherit it.
+
+set -uo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: cold-backup [--no-scrub] [--notify]
+       cold-backup init DEVICE
+
+  (no command)  attach the cold pool, send what changed on tank/max since the
+                last run, read the whole pool back (scrub), and detach it.
+                The disk can be unplugged once it prints "done". On pc,
+                plugging the disk in starts this (nix/nixos/pc/cold-backup.nix).
+  init DEVICE   create the cold pool on DEVICE, a /dev/disk/by-id path.
+                ERASES everything on DEVICE.
+  --no-scrub    skip the read-back, which takes ~2-3 h over USB.
+  --notify      mail the outcome through bin/alert-send: when the disk can be
+                unplugged, or what failed. The plug-in unit passes it.
+
+Keeps the last 12 runs as snapshots on the disk, and only the latest on tank,
+which is the next run's starting point. Each run also writes the dotfiles and
+secrets repos to the disk, encrypted to the age key sops uses, beside a
+README.txt on restoring: the ZFS passphrases and restic passwords that open
+the copy are in the secrets repo. Records each run in
+~/logs/runs/cold-backup.jsonl (bin/run-log). Runs itself with sudo.
+
+Exits 0 when the copy is on the disk, 1 when a step failed, 2 on a usage error.
+EOF
+}
+
+# Overridable so tests/cold-backup.test can run against throwaway pools.
+source_ds="${COLD_SOURCE:-tank/max}"
+pool="${COLD_POOL:-cold}"
+device_dir="${COLD_DEVICE_DIR:-/dev/disk/by-id}"
+bundle_repos="${COLD_BUNDLE_REPOS:-/home/max/.dotfiles /home/max/.dotfiles/secrets}"
+recipients_from="${COLD_RECIPIENTS_FROM:-/home/max/.dotfiles/secrets/.sops.yaml}"
+keep=12
+
+args=("$@")
+scrub=1
+notify=0
+cmd=run
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --no-scrub) scrub=0; shift ;;
+        --notify) notify=1; shift ;;
+        init) cmd=init; device="${2:-}"; [ -n "$device" ] || { usage >&2; exit 2; }; shift 2 ;;
+        *) echo "cold-backup: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+# The caller's PATH comes along: root's lacks jq, which run-log needs.
+[ "$(id -u)" = 0 ] || exec sudo env "PATH=$PATH" "${BASH_SOURCE[0]}" "${args[@]}"
+
+bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The plug-in unit runs as root without sudo; the logs and the alert channel
+# are max's.
+run_user="${SUDO_USER:-max}"
+as_user() {
+    runuser -u "$run_user" -- env HOME="$(getent passwd "$run_user" | cut -d: -f6)" "$@"
+}
+
+log_run() {  # outcome reason stats
+    local log_args=(cold-backup "$1" --stats "$3")
+    [ -n "$2" ] && log_args+=(--reason "$2")
+    as_user "$bin_dir/run-log" "${log_args[@]}" || true
+}
+
+mail() {  # subject body
+    [ "$notify" = 1 ] || return 0
+    as_user "$bin_dir/alert-send" "$1" <<<"$2" || echo "cold-backup: mail undelivered: $1" >&2
+}
+
+fail() {  # reason [stats]
+    echo "cold-backup: $1" >&2
+    log_run fail "$1" "${2:-"{}"}"
+    mail "❌ cold-backup: $1" "The cold copy did not update. Details: journalctl -u cold-backup on pc."
+    exit 1
+}
+
+if [ "$cmd" = init ]; then
+    [ -e "$device" ] || { echo "cold-backup: no such device: $device" >&2; exit 2; }
+    zpool create -o ashift=12 -O compression=lz4 -O atime=off \
+        -O mountpoint=none -O canmount=off "$pool" "$device" || exit 1
+    zpool export "$pool"
+    echo "cold-backup: pool $pool created on $device; run cold-backup to fill it"
+    exit 0
+fi
+
+dest="$pool/${source_ds##*/}"
+
+if ! zpool list "$pool" >/dev/null 2>&1; then
+    # -N mounts nothing, should a dataset on the disk ever gain a mountpoint.
+    zpool import -N -d "$device_dir" "$pool" 2>/dev/null \
+        || fail "cold pool $pool not found under $device_dir: is the disk plugged in?"
+fi
+trap 'zpool export "$pool" 2>/dev/null' EXIT
+
+snapshots() {  # dataset -> its cold-* snapshot names, oldest first
+    zfs list -H -t snapshot -o name -s createtxg -d 1 "$1" 2>/dev/null \
+        | sed -n 's/^[^@]*@\(cold-.*\)$/\1/p'
+}
+
+source_snaps=$(snapshots "$source_ds")
+dest_snaps=$(snapshots "$dest")
+# The newest snapshot both sides have is where this run's changes start.
+base=$(grep -Fxf <(printf '%s\n' "$dest_snaps") <<<"$source_snaps" | tail -1)
+if zfs list "$dest" >/dev/null 2>&1 && [ -z "$base" ]; then
+    fail "$dest exists but shares no snapshot with $source_ds, so there is no starting point for a send"
+fi
+
+new="cold-$(date +%Y-%m-%dT%H%M%S)"
+zfs snapshot -r "$source_ds@$new" || fail "zfs snapshot -r $source_ds@$new failed"
+
+echo "cold-backup: sending $source_ds@$new${base:+ (changes since $base)} to $dest"
+# -R takes every dataset below, -w sends raw. Without -F, receive refuses rather
+# than destroy the disk's older snapshots, which tank no longer has. -x
+# mountpoint drops tank's own mountpoints, so the copies inherit none.
+if [ -n "$base" ]; then
+    zfs send -R -w -I "@$base" "$source_ds@$new" | zfs receive -u -x mountpoint "$dest"
+else
+    zfs send -R -w "$source_ds@$new" | zfs receive -u -x mountpoint "$dest"
+fi
+statuses=("${PIPESTATUS[@]}")
+if [ "${statuses[0]}" != 0 ] || [ "${statuses[1]}" != 0 ]; then
+    zfs destroy -r "$source_ds@$new"
+    fail "zfs send | receive failed (send ${statuses[0]}, receive ${statuses[1]})"
+fi
+
+# tank keeps the latest snapshot only: each one holds on to whatever was
+# deleted after it.
+for s in $source_snaps; do
+    zfs destroy -r "$source_ds@$s"
+done
+for s in $(snapshots "$dest" | head -n -"$keep"); do
+    zfs destroy -r "$dest@$s"
+done
+
+write_restore_kit() {  # mountpoint
+    local mnt="$1" repo name r recipients=()
+    for r in $(grep -o 'age1[a-z0-9]*' "$recipients_from" | sort -u); do
+        recipients+=(-r "$r")
+    done
+    [ "${#recipients[@]}" -gt 0 ] || { echo "no age recipient in $recipients_from"; return 1; }
+    for repo in $bundle_repos; do
+        name=$(basename "$repo"); name=${name#.}
+        # git refuses a repo another user owns, so its owner makes the bundle.
+        as_user git -C "$repo" bundle create - --all 2>/dev/null \
+            | age "${recipients[@]}" >"$mnt/$name.bundle.age.new" \
+            || { echo "bundling $repo failed"; return 1; }
+        mv "$mnt/$name.bundle.age.new" "$mnt/$name.bundle.age"
+    done
+    cat >"$mnt/README.txt" <<EOF
+Cold copy of pc's tank/max, written by cold-backup (in the dotfiles repo).
+
+Opening it takes the age key, kept in Bitwarden under its path
+~/.local/secrets/age-key.txt. The key opens the repos here:
+
+  age -d -i age-key.txt secrets.bundle.age > secrets.bundle
+  git clone secrets.bundle secrets
+
+The secrets repo holds, sops-encrypted to the same key, the passphrases of the
+encrypted datasets and the restic passwords. To restore onto new disks:
+
+  zpool import -N cold
+  zfs send -R -w cold/max@<newest cold-* snapshot> | zfs receive <pool>/max
+  zfs load-key <pool>/max/<dataset>     # encrypted, phone, general
+
+Written $(date -I), with $source_ds@$new.
+EOF
+}
+
+# Mounted only while the kit is written: mountpoint=legacy never mounts by itself.
+restore="$pool/restore"
+zfs list "$restore" >/dev/null 2>&1 || zfs create -o mountpoint=legacy "$restore" \
+    || fail "zfs create $restore failed"
+mnt=$(mktemp -d)
+mount -t zfs "$restore" "$mnt" || fail "mounting $restore failed"
+kit_error=$(write_restore_kit "$mnt")
+umount "$mnt" && rmdir "$mnt"
+[ -z "$kit_error" ] || fail "restore kit: $kit_error"
+
+scrub_errors=null
+if [ "$scrub" = 1 ]; then
+    echo "cold-backup: reading the pool back (scrub)"
+    zpool scrub -w "$pool" || fail "zpool scrub $pool failed"
+    scrub_errors=$(zpool status "$pool" | sed -n 's/.*scan: scrub repaired .* with \([0-9]*\) errors.*/\1/p')
+fi
+stats=$(jq -nc --arg snapshot "$new" --arg base "$base" \
+    --argjson used "$(zpool list -Hp -o allocated "$pool")" \
+    --argjson free "$(zpool list -Hp -o free "$pool")" \
+    --argjson scrub_errors "${scrub_errors:-null}" '$ARGS.named')
+[ -n "$scrub_errors" ] || scrub_errors=null
+if [ "$(zpool list -H -o health "$pool")" != ONLINE ] || { [ "$scrub_errors" != null ] && [ "$scrub_errors" != 0 ]; }; then
+    zpool status -v "$pool" >&2
+    fail "cold pool $pool is not healthy after the run" "$stats"
+fi
+
+log_run ok "" "$stats"
+zpool export "$pool" || fail "zpool export $pool failed: unplugging now may damage it" "$stats"
+trap - EXIT
+echo "cold-backup: done, $new is on the disk; it can be unplugged"
+mail "✅ cold-backup: done, unplug the disk" "$new is on the cold disk, and the pool is detached.
+$(jq -r '"Used \(.used / 1e9 | floor) GB, free \(.free / 1e9 | floor) GB."' <<<"$stats")"
