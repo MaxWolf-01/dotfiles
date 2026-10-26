@@ -2,8 +2,6 @@
 host: xmg19
 user: agent
 isolated: true
-slots: 8
-has: gpu
 account: personal
 ---
 
