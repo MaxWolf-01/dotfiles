@@ -304,8 +304,9 @@ over the tab.
     POST /api/dismiss         {"unit"}: out of the numbers until its session next finishes a turn.
     POST /api/type            {"unit", "text"}, from the hub tab with its X-Hub-Token: type the text into the unit's
                               session and press Enter. 409 {"error": why} where nothing may be typed.
-    POST /api/hand-off        {"unit", "offer", "path"?, "at"?}, from the hub tab with its X-Hub-Token: what the unit's box
-                              offered, as /api/u/<key> gave its "handoff". "hand-off" answers {"unit", "view", "pane", "handoff"},
+    POST /api/hand-off        {"unit", "offer", "path"?, "at"?, "behind"?}, from the hub tab with its X-Hub-Token: what the
+                              unit's box offered, as /api/u/<key> gave its "handoff", "offer" the one clicked: "update" is
+                              also taken where it offered to hand off. "hand-off" answers {"unit", "view", "pane", "handoff"},
                               "unit" the new session's;
                               "write" or "update" answers {"asked", "pane"};
                               409 {"error": why, "unit"?} where a step is refused, "unit" the new session's once it started.
@@ -366,10 +367,12 @@ over the tab.
     GET  /api/u/<key>         one unit, its "number" null (the rail's index has it), or, for a session the search lists
                               that has no unit, the unit it would be, kept nowhere: {"unit", "session", "account", "title", "short", "tree", "repo", "state", "waiting_for",
                               "pane", "panes" (every pane its session's processes run in, as the registry names them),
-                              "context" (its running session's context use, as the statusline last had it),
+                              "context" (its running session's context use, and the model and effort it runs on, as the
+                              statusline last had them),
                               "last", "number", "status_line", "needs_you" ({"questions", "unseen"}, where it
                               needs you), "board", "worked_on" (the tickets the board marks),
-                              "dismissed", "handoff" (what its box offers: {"offer", "path"?, "url"?, "at"?, its last commit}, as above),
+                              "dismissed", "handoff" (what its box offers: {"offer", "path"?, "url"?, "at"?, its last commit,
+                              "behind"?, a prompt sent since that commit}, as above),
                               "background" (what its idle session left running in the background, oldest first:
                               [{"what", "command", "at", "watcher"}]),
                               "forked" (where its session was forked from a copy: {"on", "session", "at", "pulled",
@@ -792,13 +795,15 @@ NOTIFIED_LINE = re.compile(rb'^\{.*<tool-use-id>.*$', re.MULTILINE)
 NOTIFIED = re.compile(r"<(?:tool-use|task)-id>(\S+?)</(?:tool-use|task)-id>")
 TURN_START = re.compile(rb'^\{"type":"api-request",', re.MULTILINE)
 TURN_END_LINE = re.compile(rb'^\{.*"subtype":"turn_duration".*$', re.MULTILINE)
-NOTHING_READ: dict = {"custom": None, "ai": None, "prompted": None, "background": {}, "agents": {}, "ended": None}
+HANDOFF_WRITE = re.compile(rb'"file_path":\s*"([^"]*/handoffs/[^"/]+\.md)"')
+NOTHING_READ: dict = {"custom": None, "ai": None, "prompted": None, "background": {}, "agents": {}, "ended": None, "handoffs": ()}
 
 
 def transcript_read(session: str, memo: dict) -> dict:
     """What the hub reads of a session's transcript: its titles, when the user last sent it a prompt (`prompted_at`),
-    the commands it left running in the background (`still_running`), and when its last turn ended while none has
-    started since (`turn_marks`). A transcript only grows, so what was read of it is kept while it grows, and a read
+    the commands it left running in the background (`still_running`), when its last turn ended while none has
+    started since (`turn_marks`), and every file in a `handoffs/` directory a tool call of its named (`handoffs`), which
+    finds a handoff it wrote in another project's agent repo. A transcript only grows, so what was read of it is kept while it grows, and a read
     takes only what was added since."""
     found = read_of(transcript(session, memo))
     if found is None:
@@ -838,6 +843,8 @@ def read_of(path: Path | None) -> dict | None:
         found["prompted"] = max([found["prompted"] or 0, *prompts]) or None
         found["background"], found["agents"] = still_running(whole, found["background"], found["agents"])
         found["ended"] = turn_marks(whole, found["ended"])
+        named = [m[1].decode(errors="replace") for m in HANDOFF_WRITE.finditer(whole)]
+        found["handoffs"] = tuple(dict.fromkeys([*found["handoffs"], *named]))
         transcripts_read[path] = (st.st_size, st.st_mtime, read + len(whole), found)
     return found
 
@@ -999,12 +1006,15 @@ def statusline_inputs() -> list[dict]:
 
 
 def context_use(inputs: list[dict]) -> dict[str, dict]:
-    """Each session's context use, by its id: `used_percentage` and `total_input_tokens`."""
+    """Each session's context use, by its id: `used_percentage` and `total_input_tokens`, with the `model` (its display
+    name) and `effort` it runs on, each None where the input names none."""
     found = {}
     for d in inputs:
         window = d.get("context_window")
         if isinstance(d.get("session_id"), str) and isinstance(window, dict):
-            found[d["session_id"]] = {k: window.get(k) for k in ("used_percentage", "total_input_tokens")}
+            model, effort = (d.get(k) if isinstance(d.get(k), dict) else {} for k in ("model", "effort"))
+            found[d["session_id"]] = {**{k: window.get(k) for k in ("used_percentage", "total_input_tokens")},
+                                      "model": model.get("display_name"), "effort": effort.get("level")}
     return found
 
 
@@ -2851,9 +2861,11 @@ def reload_round() -> None:
 # --------------------------------------------------------------------------
 
 CLEAR_WAIT = Args.clear_wait
-FIRST_TURN = "continue"
-"""What starts the new session's first turn: the mx plugin's SessionStart hook has already told it which handoff to
-pick up, and how."""
+def pickup_line(handoff: str) -> str:
+    """What starts the new session's first turn: the line the handoff skill gives the user to type, naming the handoff,
+    since the mx plugin's SessionStart hook finds none outside the agent repo of the session's working directory."""
+    return (f"Continue from {handoff}: first run `{handoff_hooks({}).PICKUP} {handoff}`, which prints the handoff in full, "
+            "retires it and links the session pages.")
 REQUESTS = {
     "write": "/mx:handoff continuation: write the continuation handoff for the session that takes over from this one, "
              "and commit it",
@@ -2876,8 +2888,9 @@ PANES_HELD: dict[tuple, float] = {}
 
 def handoff_offer(entry: dict | None, memo: dict) -> dict | None:
     """What a unit's box offers its session, where it runs idle in a pane the hub can type into, in a project with an
-    agent repo: {"offer": "hand-off"} with its fresh handoff, {"offer": "update"} with its stale one, or {"offer":
-    "write"}; a handoff as {"path", "url"}. Looked for only where the registry says idle and names a pane."""
+    agent repo: {"offer": "hand-off"} with its committed handoff, "behind" where a prompt came after that commit,
+    {"offer": "update"} with one edited since, or {"offer": "write"}; a handoff as {"path", "url"}. Looked for only
+    where the registry says idle and names a pane."""
     if not entry or entry.get("status") != "idle" or not PANE.search(str(entry.get("tmux") or "")):
         return None
     try:
@@ -2888,27 +2901,31 @@ def handoff_offer(entry: dict | None, memo: dict) -> dict | None:
 
 
 def handoff_state(entry: dict, memo: dict) -> dict | None:
-    """The session's continuation handoff, which a /clear in its process would hand the new session, and so what may be
-    done with it: the newest one in the agent repo of its working directory naming it, as the mx plugin's own hook
-    (`checkpoint.py started`) finds it. It is fresh, and handed off from, while it is committed, unedited since, and
-    its last commit is newer than the user's last prompt to the session. None in no project with an agent repo."""
+    """The session's continuation handoff, and so what may be done with it: the newest one naming it, in the agent repo
+    of its working directory (where the mx plugin's own hook, `checkpoint.py started`, looks) or any other its
+    transcript names. It is handed off from while it is committed and unedited since, which `pickup.py` asks; it is
+    behind where the user prompted the session after its last commit. None where neither has one, outside any project
+    with an agent repo."""
     hooks = handoff_hooks(memo)
     if not hooks or not entry.get("cwd"):
         return None
-    handoffs = handoffs_dir(hooks, str(entry["cwd"]))
-    if not handoffs:
+    session = str(entry["sessionId"])
+    handoffs, read = handoffs_dir(hooks, str(entry["cwd"])), transcript_read(session, memo)
+    if not handoffs and not read["handoffs"]:
         return None
     try:
-        written = [p for p in handoffs.glob("*.md") if hooks.continuation_of(p, str(entry["sessionId"]))]
+        found = {p.resolve() for p in [*(handoffs.glob("*.md") if handoffs else ()), *map(Path, read["handoffs"])] if p.is_file()}
+        written = [p for p in found if hooks.continuation_of(p, session)]
         newest = max(written, key=lambda p: p.stat().st_mtime, default=None)
-    except OSError:  # one picked up between the glob and the read: looked at again at the next read
+    except OSError:  # one picked up between the look and the read: looked at again at the next read
         return None
     if not newest:
         return {"offer": "write"}
-    newest = newest.resolve()
-    at, prompted = committed_at(newest), transcript_read(str(entry["sessionId"]), memo)["prompted"]
-    fresh = at is not None and (prompted is None or at > prompted)
-    return {"offer": "hand-off" if fresh else "update", "path": str(newest), "url": page_of_path(newest).url, "at": at}
+    at, prompted = committed_at(newest), read["prompted"]
+    if at is None:
+        return {"offer": "update", "path": str(newest), "url": page_of_path(newest).url, "at": at}
+    return {"offer": "hand-off", "path": str(newest), "url": page_of_path(newest).url, "at": at,
+            "behind": prompted is not None and prompted >= at}
 
 
 def handoffs_dir(hooks, cwd: str) -> Path | None:
@@ -2961,7 +2978,7 @@ def hand_off(body: dict) -> tuple[int, dict]:
     if not handing_off.acquire(blocking=False):
         return 409, {"error": "another hand-off is under way; try again once it is done"}
     try:
-        return hand_off_in(body["unit"], {k: body.get(k) for k in ("offer", "path", "at")})
+        return hand_off_in(body["unit"], {k: body.get(k) for k in ("offer", "path", "at", "behind")})
     except (OSError, subprocess.TimeoutExpired) as e:  # no tmux on PATH, or a server that does not answer
         return 502, {"error": f"tmux: {e}"}
     finally:
@@ -2986,7 +3003,9 @@ def hand_off_in(key: str, shown: dict) -> tuple[int, dict]:
     if not pane:
         return 409, {"error": why}
     offered = shown["offer"]
-    if {k: state.get(k) for k in shown} != shown:  # a handoff committed again since may say what the user never read
+    # a handoff committed again since may say what the user never read
+    taken = {"write": ("write",), "update": ("update", "hand-off"), "hand-off": ("hand-off",)}.get(offered, ())
+    if state["offer"] not in taken or any(state.get(k) != shown.get(k) for k in ("path", "at", "behind")):
         return 409, {"error": f"the session's handoff has changed since the box offered to {offered}; read what it offers now"}
     if offered != "hand-off":
         if failed := paste(pane, REQUESTS[offered].format(path=state.get("path"))):
@@ -3002,7 +3021,7 @@ def hand_off_in(key: str, shown: dict) -> tuple[int, dict]:
     pane, why = pane_in(new)
     if not pane:
         return 409, {"error": f"/clear typed, and session {session[:8]} started, but {why}; nothing more typed", "unit": session}
-    if failed := paste(pane, FIRST_TURN):
+    if failed := paste(pane, pickup_line(state["path"])):
         return 502, {"error": failed, "unit": session}
     return 200, {"unit": session, "view": "/u/" + key_path(session), "pane": pane, "handoff": state["path"]}
 
@@ -4084,7 +4103,7 @@ READS = ("read_session", "in_order", "open_questions", "Chat", "RecordError", "i
 """What the hub uses of the reader: an mx plugin from before chat turns has no `in_order` and no `Chat`."""
 
 
-HOOK_USES = ("handoffs_of", "continuation_of")
+HOOK_USES = ("handoffs_of", "continuation_of", "PICKUP")
 """What the hub uses of the mx plugin's handoff hooks: an mx plugin from before /clear picked up a handoff has neither."""
 
 
