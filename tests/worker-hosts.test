@@ -30,14 +30,15 @@ case \$target in
     *) HOME=$scratch/home exec bash -s ;;
 esac
 EOF
-# Nor are the test runner's processes, threads, slots or GPU: claude runs twice here, the machine has 12
-# threads, pc holds 2 of its 6 slots (taken through the real host-slots) and zephylux counts none, and each has
-# a GPU, which pc's records withhold.
+# The test runner's processes, threads, slots and GPU are stand-ins too: claude runs twice here, the machine has
+# 12 threads, pc holds 2 of its 6 slots (taken through the real host-slots) and zephylux counts none, and each
+# has a GPU, which pc's records withhold.
 printf '#!/bin/sh\necho 2\n' >"$scratch/bin/pgrep"
 printf '#!/bin/sh\necho 12\n' >"$scratch/bin/nproc"
 printf '#!/bin/sh\necho "NVIDIA GeForce GTX 1650, 0, 460, 4096"\n' >"$scratch/bin/nvidia-smi"
 ln -s "$bin/host-slots" "$scratch/bin/host-slots"
 chmod +x "$scratch/bin/ssh" "$scratch/bin/pgrep" "$scratch/bin/nproc" "$scratch/bin/nvidia-smi"
+mkdir -m 1777 "$scratch/slots"; : >"$scratch/slots/lock"
 for _ in 1 2; do
     sleep 300 & holders+=($!)
     HOST_SLOTS=6 HOST_SLOTS_DIR=$scratch/slots "$bin/host-slots" take $! "sleep 300" 2>/dev/null
@@ -92,8 +93,31 @@ printf '%s\n' memtotal_kb=16000000 memavail_kb=2000000 arc_kb=500000 users_max_k
     >"$scratch/arc"
 check "free memory counts the ZFS ARC as free, and workers use at most the ceiling" "2500000 10000000" \
     "$(run memory "$scratch/arc")"
-printf '%s\n' --- 'host: box' 'user: agent' 'has: docker' 'withholds: gpu' --- >"$scratch/HOST.md"
+printf '%s\n' memtotal_kb=16000000 memavail_kb=9000000 users_max_kb=10485760 users_used_kb=1000000 \
+    users_reserved_kb=2097152 >"$scratch/reserved"
+check "the most workers may use leaves out what max's sessions are protected up to" "8388608" \
+    "$(run memory "$scratch/reserved" | cut -d' ' -f2)"
+
+# The probe's own arithmetic, on a stand-in for user.slice: 6G in use of which 2G is reclaimable cache, and max's
+# slice protected up to 2G.
+users=$scratch/user.slice
+mkdir -p "$users/user-1000.slice" "$users/user-1001.slice"
+echo 10737418240 >"$users/memory.max"
+echo 6442450944 >"$users/memory.current"
+printf 'anon 4294967296\ninactive_file 2147483648\n' >"$users/memory.stat"
+echo 2147483648 >"$users/user-1000.slice/memory.low"
+echo 0 >"$users/user-1001.slice/memory.low"
+probe_said=$(bash -c 'source "$1"; printf "%s\n" "$remote_probe"' check "$bin/worker-hosts" |
+    WORKER_HOSTS_USERS_SLICE=$users bash -s 2>/dev/null | grep '^users_')
+check "the probe reads user.slice's ceiling, its use less reclaimable cache, and what its slices reserve" \
+    "$(printf '%s\n' users_max_kb=10485760 users_used_kb=4194304 users_reserved_kb=2097152)" "$probe_said"
+
+printf '%s\n' --- 'host: box' 'user: agent' 'has: docker' --- >"$scratch/HOST.md"
 printf '%s\n' arch=x86_64 'gpu=asleep' >"$scratch/probed"
+check "a host offers what was probed, an asleep GPU among it, and its record's has:" "docker,gpu,x86_64" \
+    "$(run capabilities "$scratch/HOST.md" "$scratch/probed")"
+printf '%s\n' --- 'host: box' 'user: agent' 'has: docker' 'withholds: gpu' --- >"$scratch/HOST.md"
+printf '%s\n' arch=x86_64 'gpu=GeForce|0|460|4096' >"$scratch/probed"
 check "a host offers what was probed and its record's has:, less its withholds:" "docker,x86_64" \
     "$(run capabilities "$scratch/HOST.md" "$scratch/probed")"
 echo locked=1 >"$scratch/locked"
@@ -142,6 +166,10 @@ places "memory the spawn needs is the most the workers may use" "agent@xmg19" pe
 places "every machine full waits" "exit 3" personal < <(r agent@pc held=6; r agent@xmg19 slots=2 held=2)
 places "a machine whose memory is taken waits" "exit 3" personal < <(r agent@pc free=0)
 places "a host down may take it once back, so the spawn waits" "exit 3" personal gpu < <(r agent@pc state=unreachable)
+places "a host down whose record has what the spawn needs may take it once back" "exit 3" personal docker \
+    < <(r agent@pc offers=x86_64; r agent@xmg19 state=locked offers=docker)
+places "a host down offers no capability a probe cannot find and its record does not name" "exit 1" personal docker \
+    < <(r agent@pc offers=x86_64; r agent@xmg19 state=locked offers=-)
 places "a host down whose record withholds what the spawn needs never takes it" "exit 1" personal gpu \
     < <(r agent@pc state=unreachable withholds=gpu)
 places "a capability no host up offers, and none down, is never placed" "exit 1" personal gpu \
@@ -150,6 +178,16 @@ places "an account no record names is never placed" "exit 1" personal < <(r agen
 out=$(r agent@pc; r max@zephylux isolated=false pressure=9)
 check "each host comes with whether it is isolated" "$(printf 'agent@pc\tisolated\nmax@zephylux\tnot isolated')" \
     "$(run place personal <<<"$out")"
+
+# A reading as `reading` makes it from an up host's answer, placed: the placer reads the fields `reading` writes.
+printf '%s\n' --- 'host: box' 'user: agent' 'isolated: true' 'account: personal' --- >"$scratch/HOST.md"
+printf '%s\n' held=1 slots=6 arch=x86_64 memtotal_kb=16000000 memavail_kb=9000000 pressure=2.50 \
+    'gpu=GeForce|0|460|4096' >"$scratch/up"
+check "an up host's reading names its slots, capabilities, memory and pressure in the placer's order" \
+    "$(printf '%s\t' agent@box box personal true up 1 6 gpu,x86_64 9000000 16000000 2.50)-" \
+    "$(run reading "$scratch/HOST.md" "$scratch/up")"
+check "and the placer places on it" "$(printf 'agent@box\tisolated')" \
+    "$(run reading "$scratch/HOST.md" "$scratch/up" | run place personal gpu)"
 
 # --- one host's record, read from the checkout
 

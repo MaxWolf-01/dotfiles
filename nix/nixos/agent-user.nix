@@ -11,13 +11,15 @@
 # worktrees or plugin cache. A home boundary covers exactly what is inside a
 # home; dispatch's scratch dir and worker logs under /tmp are outside it.
 #
-# A function of what differs between the hosts that import it: how the machine
-# takes work (memoryMax and sessionsReserve, its memory, below; slots, how many
-# dispatched runs it holds at once, whichever worker user runs them), and
-# dispatcherKeys, the public key of each machine that dispatches to the
-# workers. Without its key a machine gets "Permission denied (publickey)" from
-# these users, and `worker-hosts` shows that message in place of the host's
-# state.
+# A function of what differs between the hosts that import it:
+#   memoryMax        the memory every user's sessions share (below)
+#   sessionsReserve  how much of it max's sessions are protected up to (below)
+#   slots            how many dispatched runs the machine holds at once,
+#                    whichever worker user runs them
+#   dispatcherKeys   the public key of each machine that dispatches to the
+#                    workers. Without its key a machine gets "Permission denied
+#                    (publickey)" from these users, and `worker-hosts` shows
+#                    that message in place of the host's state.
 { memoryMax, sessionsReserve, slots, dispatcherKeys }:
 { pkgs, lib, ... }:
 
