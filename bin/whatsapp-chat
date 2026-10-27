@@ -1,0 +1,366 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "wa-crypt-tools"]
+# ///
+"""Print a WhatsApp chat as plain text, read from the phone's own encrypted backup.
+
+Each run copies the newest full backup (msgstore.db.crypt15) from the phone over
+the ssh alias phone, decrypts it with the 64-digit key in
+secrets/creds/raw/whatsapp-backup-key, and reads the chat from it. The encrypted
+copy stays in ~/.cache/whatsapp-chat; the decrypted database lives only in
+XDG_RUNTIME_DIR, which is RAM, and is rebuilt when a newer backup arrives. When
+the phone does not answer, the cached backup is read.
+
+Messages are as recent as the phone's last full backup, whose time goes to stderr
+on every run. Newer daily increments on the phone are not read; stderr says when
+there are some.
+
+Names come from the phone's address book where Termux:API answers
+termux-contact-list over that ssh, else from the name a person set in WhatsApp,
+else their number. You are "me".
+
+Examples:
+
+    whatsapp-chat list
+    whatsapp-chat list --query hikers
+    whatsapp-chat show anna --last 50
+    whatsapp-chat show 175 --since 7d
+    whatsapp-chat show "Adventure Hikers" --since 2026-10-01 --offline
+"""
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import zlib
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Annotated
+
+import tyro
+
+PHONE = "phone"
+PHONE_DIR = "storage/shared/Android/media/com.whatsapp/WhatsApp/Databases"
+BACKUP = "msgstore.db.crypt15"
+KEY = Path.home() / ".dotfiles/secrets/creds/raw/whatsapp-backup-key"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "whatsapp-chat"
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "whatsapp-chat"
+SSH = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+
+# An address-book number written without a country code ("0660 …") is read as one
+# from here, which is where every such entry in this address book was saved.
+HOME_COUNTRY_CODE = "43"
+
+# message.message_type, as the side tables that hold each type's details name them.
+# Types 7 (system notices: joins, leaves, number changes) are left out of a chat.
+KINDS = {
+    1: "image",
+    2: "audio",
+    3: "video",
+    4: "contact",
+    5: "location",
+    9: "document",
+    13: "gif",
+    14: "contacts",
+    15: "deleted",
+    16: "live location",
+    20: "sticker",
+    64: "deleted by admin",
+    66: "poll",
+    90: "call",
+}
+SYSTEM = 7
+
+# How many of the chats an ambiguous name matches `show` lists, most recent first.
+AMBIGUOUS_SHOWN = 15
+
+
+@dataclass
+class List:
+    """Chats, most recently active first."""
+
+    query: str = ""
+    """Only chats whose name contains this, ignoring case."""
+    limit: int = 30
+    """How many chats to print; 0 prints all."""
+    offline: bool = False
+    """Read the cached backup without asking the phone for a newer one."""
+
+
+@dataclass
+class Show:
+    """One chat's messages, oldest first."""
+
+    chat: Annotated[str, tyro.conf.Positional]
+    """The chat: its id from `list`, or part of its name, ignoring case. A name
+    that matches several chats prints them and exits 2."""
+    last: int = 100
+    """Print only the newest this many messages; 0 prints all of them."""
+    since: str = ""
+    """Only messages from this point on: a date (2026-10-01), a date and time
+    (2026-10-01T18:00), or an age (90m, 12h, 7d, 2w)."""
+    offline: bool = False
+    """Read the cached backup without asking the phone for a newer one."""
+
+
+Cmd = Annotated[List, tyro.conf.subcommand(name="list")] | Annotated[Show, tyro.conf.subcommand(name="show")]
+
+
+def main() -> None:
+    cmd = tyro.cli(Cmd, description=__doc__)
+    os.umask(0o077)
+    if not cmd.offline:
+        pull()
+    db = sqlite3.connect(f"file:{decrypted()}?mode=ro", uri=True)
+    names = Names(db, contacts())
+    if isinstance(cmd, List):
+        print_chats(db, names, cmd.query, cmd.limit)
+    else:
+        print_chat(db, names, pick_chat(db, names, cmd.chat), cmd.last, since(cmd.since))
+
+
+# --- getting the database --------------------------------------------------------
+
+
+def pull() -> None:
+    """The newest backup and address book into CACHE, or a note on stderr of why not."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    rsync = subprocess.run(
+        ["rsync", "-t", "-e", " ".join(SSH), f"{PHONE}:{PHONE_DIR}/{BACKUP}", str(CACHE / BACKUP)],
+        capture_output=True,
+        text=True,
+    )
+    if rsync.returncode != 0:
+        if not (CACHE / BACKUP).exists():
+            sys.exit(f"whatsapp-chat: could not copy the backup from the phone, and none is cached:\n{rsync.stderr.strip()}")
+        note(f"the phone did not answer, so this reads the cached backup ({rsync.stderr.strip().splitlines()[-1]})")
+        return
+
+    newer = subprocess.run(
+        SSH + [PHONE, f"find {PHONE_DIR} -maxdepth 1 -name 'msgstore-increment-*.db.crypt15' -newer {PHONE_DIR}/{BACKUP}"],
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    if newer:
+        note(f"{len(newer)} newer incremental backup(s) on the phone are not read; a full backup from WhatsApp brings them in")
+
+    book = subprocess.run(SSH + [PHONE, "termux-contact-list"], capture_output=True, text=True)
+    try:
+        entries = json.loads(book.stdout)
+    except json.JSONDecodeError:
+        return  # no Termux:API on the phone: names fall back to what WhatsApp holds
+    (CACHE / "contacts.json").write_text(json.dumps(entries))
+
+
+def decrypted() -> Path:
+    """The plain database for the cached backup, decrypting it only when the backup is newer."""
+    from wa_crypt_tools.lib.db.dbfactory import DatabaseFactory
+    from wa_crypt_tools.lib.key.keyfactory import KeyFactory
+
+    backup = CACHE / BACKUP
+    plain = RUNTIME / "msgstore.db"
+    stamp = backup.stat().st_mtime
+    note(f"backup of {datetime.fromtimestamp(stamp):%Y-%m-%d %H:%M}, {age(datetime.now().timestamp() - stamp)} old")
+    if plain.exists() and plain.stat().st_mtime == stamp:
+        return plain
+
+    sops = subprocess.run(["sops", "-d", str(KEY)], capture_output=True, text=True)
+    if sops.returncode != 0:
+        sys.exit(f"whatsapp-chat: could not decrypt the backup key {KEY}:\n{sops.stderr.strip()}")
+    with backup.open("rb") as f:
+        db = DatabaseFactory.from_file(f)
+        data = zlib.decompress(db.decrypt(KeyFactory.from_hex(sops.stdout.strip()), f.read()))
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    partial = plain.with_suffix(".partial")
+    partial.write_bytes(data)
+    os.utime(partial, (stamp, stamp))
+    partial.replace(plain)
+    return plain
+
+
+def contacts() -> dict[str, str]:
+    """Address-book names by phone number, digits only with country code."""
+    path = CACHE / "contacts.json"
+    if not path.exists():
+        return {}
+    return {number(e["number"]): e["name"] for e in json.loads(path.read_text()) if e.get("number") and e.get("name")}
+
+
+def number(written: str) -> str:
+    digits = re.sub(r"\D", "", written)
+    if written.lstrip().startswith("+"):
+        return digits
+    if digits.startswith("00"):
+        return digits[2:]
+    if digits.startswith("0"):
+        return HOME_COUNTRY_CODE + digits[1:]
+    return digits
+
+
+# --- names -----------------------------------------------------------------------
+
+
+class Names:
+    """What to call the person or group behind a row of the jid table.
+
+    WhatsApp addresses a person by phone number (`…@s.whatsapp.net`) or, increasingly, by an
+    opaque id (`…@lid`); jid_map pairs the two where WhatsApp knows both. A name is looked up
+    under either.
+    """
+
+    def __init__(self, db: sqlite3.Connection, book: dict[str, str]):
+        self.jids = {i: (user, server) for i, user, server in db.execute("select _id, user, server from jid")}
+        self.phone_of = dict(db.execute("select lid_row_id, jid_row_id from jid_map"))
+        self.lid_of = {phone: lid for lid, phone in self.phone_of.items()}
+        self.chosen = dict(db.execute("select lid_row_id, display_name from lid_display_name"))
+        self.subjects = dict(db.execute("select jid_row_id, subject from chat where subject is not null"))
+        self.book = book
+
+    def __call__(self, jid: int) -> str:
+        if jid in self.subjects:
+            return self.subjects[jid]
+        user, server = self.jids.get(jid, ("?", "?"))
+        phone = jid if server == "s.whatsapp.net" else self.phone_of.get(jid)
+        lid = jid if server == "lid" else self.lid_of.get(jid)
+        number = self.jids[phone][0] if phone in self.jids else None
+        chosen = self.chosen.get(lid, "")
+        # WhatsApp shows a stranger's number masked ("+43∙∙∙∙∙∙∙∙44") in place of a name.
+        masked = "∙" in chosen
+        if number and number in self.book:
+            return self.book[number]
+        if chosen and not masked:
+            return chosen
+        if number:
+            return f"+{number}"
+        return chosen or f"{user}@{server}"
+
+
+# --- chats -----------------------------------------------------------------------
+
+
+@dataclass
+class Chat:
+    id: int
+    jid: int
+    kind: str
+    name: str
+    messages: int
+    last: int | None
+
+
+def chats(db: sqlite3.Connection, names: Names) -> list[Chat]:
+    kinds = {"g.us": "group", "newsletter": "channel", "broadcast": "broadcast"}
+    rows = db.execute(
+        """select c._id, c.jid_row_id, j.server, count(m._id), max(m.timestamp)
+           from chat c join jid j on j._id = c.jid_row_id
+           left join message m on m.chat_row_id = c._id and m.message_type != ?
+           group by c._id order by max(m.timestamp) desc""",
+        (SYSTEM,),
+    )
+    return [Chat(i, jid, kinds.get(server, "dm"), names(jid), n, last) for i, jid, server, n, last in rows if n]
+
+
+def print_chats(db: sqlite3.Connection, names: Names, query: str, limit: int) -> None:
+    found = [c for c in chats(db, names) if query.casefold() in c.name.casefold()]
+    for c in found[:limit] if limit else found:
+        print(f"{c.id:>6}  {when(c.last)}  {c.messages:>7}  {c.kind:<9}  {c.name}")
+
+
+def pick_chat(db: sqlite3.Connection, names: Names, wanted: str) -> Chat:
+    every = chats(db, names)
+    if wanted.isdigit() and (by_id := [c for c in every if c.id == int(wanted)]):
+        return by_id[0]
+    key = wanted.casefold()
+    found = [c for c in every if c.name.casefold() == key] or [c for c in every if key in c.name.casefold()]
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        sys.exit(f"whatsapp-chat: no chat matches {wanted!r}; `whatsapp-chat list` shows them all")
+    print(f"whatsapp-chat: {len(found)} chats match {wanted!r}; name one by its id:", file=sys.stderr)
+    for c in found[:AMBIGUOUS_SHOWN]:
+        print(f"{c.id:>6}  {when(c.last)}  {c.kind:<9}  {c.name}", file=sys.stderr)
+    if len(found) > AMBIGUOUS_SHOWN:
+        print(f"   and {len(found) - AMBIGUOUS_SHOWN} more; `whatsapp-chat list --query` shows them all", file=sys.stderr)
+    sys.exit(2)
+
+
+# --- messages --------------------------------------------------------------------
+
+
+def print_chat(db: sqlite3.Connection, names: Names, chat: Chat, last: int, after: datetime | None) -> None:
+    rows = db.execute(
+        """select m.from_me, m.sender_jid_row_id, m.timestamp, m.message_type, m.text_data,
+                  mm.raw_transcription_text,
+                  q.message_row_id is not null, q.from_me, q.sender_jid_row_id, q.message_type, q.text_data
+           from message m
+           left join message_media mm on mm.message_row_id = m._id
+           left join message_quoted q on q.message_row_id = m._id
+           where m.chat_row_id = ? and m.message_type != ? and m.timestamp >= ?
+           order by m.sort_id desc limit ?""",
+        (chat.id, SYSTEM, int(after.timestamp() * 1000) if after else 0, last or -1),
+    ).fetchall()
+    note(f"{len(rows)} of {chat.messages} messages in {chat.name}")
+
+    def who(from_me: int, sender: int | None) -> str:
+        if from_me:
+            return "me"
+        return names(sender) if sender else chat.name
+
+    for from_me, sender, ts, kind, text, said, quotes, q_me, q_sender, q_kind, q_text in reversed(rows):
+        head = f"[{when(ts)}] {who(from_me, sender)}"
+        if quotes:
+            head += f" (replying to {who(q_me, q_sender)}: {shorten(body(q_kind, q_text, None))})"
+        lines = body(kind, text, said).splitlines() or [""]
+        print(f"{head}: {lines[0]}")
+        for line in lines[1:]:
+            print(f"    {line}")
+
+
+def body(kind: int, text: str | None, said: str | None) -> str:
+    """A message as text: what was written, with media named in brackets ahead of its caption."""
+    if kind == 0:
+        return text or ""
+    label = KINDS.get(kind, f"type {kind}")
+    caption = said if kind == 2 and said else text
+    return f"[{label}] {caption}" if caption else f"[{label}]"
+
+
+def shorten(text: str, width: int = 80) -> str:
+    flat = " ".join(text.split())
+    return f'"{flat if len(flat) <= width else flat[: width - 1] + "…"}"'
+
+
+# --- time ------------------------------------------------------------------------
+
+
+def since(spec: str) -> datetime | None:
+    if not spec:
+        return None
+    if m := re.fullmatch(r"(\d+)([mhdw])", spec):
+        unit = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[m[2]]
+        return datetime.now() - timedelta(**{unit: int(m[1])})
+    try:
+        return datetime.fromisoformat(spec)
+    except ValueError:
+        sys.exit(f"whatsapp-chat: --since takes a date, a date and time, or an age like 7d, not {spec!r}")
+
+
+def when(ms: int | None) -> str:
+    return f"{datetime.fromtimestamp(ms / 1000):%Y-%m-%d %H:%M}" if ms else " " * 16
+
+
+def age(seconds: float) -> str:
+    hours = seconds / 3600
+    return f"{int(seconds // 60)} min" if hours < 1 else f"{hours:.0f} h" if hours < 48 else f"{hours / 24:.0f} days"
+
+
+def note(text: str) -> None:
+    print(f"whatsapp-chat: {text}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

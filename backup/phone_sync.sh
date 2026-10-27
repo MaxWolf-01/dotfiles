@@ -33,7 +33,9 @@ IO_TIMEOUT=180
 # Directories to sync: phone_path → local_subdir
 #
 # WhatsApp keeps its media under Android/media/, outside the shared picture and
-# document trees, so nothing above reaches it.
+# document trees, so nothing above reaches it. Its Databases folder holds the
+# chat history, as backups encrypted with the 64-digit key in
+# secrets/creds/raw/whatsapp-backup-key (bin/whatsapp-chat reads them).
 declare -A DIRS=(
     ["~/storage/dcim"]="DCIM"
     ["~/storage/pictures"]="Pictures"
@@ -41,6 +43,7 @@ declare -A DIRS=(
     ["~/storage/shared/Documents"]="Documents"
     ["~/storage/shared/Recordings"]="Recordings"
     ["~/storage/shared/Android/media/com.whatsapp/WhatsApp/Media"]="WhatsApp"
+    ["~/storage/shared/Android/media/com.whatsapp/WhatsApp/Databases"]="WhatsApp-Databases"
 )
 
 # Pre-flight: ZFS dataset must be mounted
