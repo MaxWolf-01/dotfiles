@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # tier: full-path (ZFS, as root)
-# Drive bin/cold-backup against two throwaway pools on files: a source shaped
-# like tank/max (an encrypted dataset with its own mountpoint, a plain one) and
-# a cold pool. Run as root: `sudo bash tests/cold-backup.test`.
+# Drive bin/cold-backup against throwaway pools on files: a source shaped like
+# tank/max (an encrypted dataset with its own mountpoint, a plain one, and a
+# restic one) and two cold disks shaped like pc's: "big" takes all of the
+# source, "small" only its restic dataset, and big's pool name is the start of
+# small's, as cold is of cold-sandisk. Run as root:
+# `sudo env PATH=$PATH bash tests/cold-backup.test`.
 #
 # The cases are what the cold copy promises: it is the same data as the source
 # (same snapshot GUIDs), encrypted datasets stay encrypted without their keys,
-# nothing on the cold pool is ever mounted (a received mountpoint would land on
-# top of the source's), a second run adds its changes beside the first rather
-# than replacing it, and a run without the disk changes nothing on the source.
+# nothing on a cold pool is ever mounted (a received mountpoint would land on
+# top of the source's), a run adds its changes beside the last one rather than
+# replacing it, and a run without its disk changes nothing on the source. With
+# two disks, each holds only its own datasets and its own runs, and the runs of
+# one, interleaved with the other's, never break the other's next run.
 
 set -uo pipefail
 
@@ -21,25 +26,30 @@ needs zpool zfs jq git age age-keygen
 work=$(mktemp -d)
 chmod 755 "$work"  # the run log is written as the user who ran sudo
 src="cbsrc$$"
-cold="cbcold$$"
+big="cbcold$$"
+small="cbcold$$-small"
 cleanup() {
     zpool destroy -f "$src" 2>/dev/null
-    zpool destroy -f "$cold" 2>/dev/null
+    zpool destroy -f "$big" 2>/dev/null
+    zpool destroy -f "$small" 2>/dev/null
     rm -rf "$work"
 }
 trap cleanup EXIT
 
 mkdir -p "$work/dev" "$work/logs"
 chown "${SUDO_USER:-root}" "$work/logs"
-truncate -s 256M "$work/src.img" "$work/dev/cold.img"
+# Named <bus>-<serial>, as /dev/disk/by-id names a disk.
+truncate -s 256M "$work/src.img" "$work/dev/file-big$$" "$work/dev/file-small$$"
 echo "a passphrase for the test" >"$work/key"
 
 zpool create -O mountpoint=none "$src" "$work/src.img"
 zfs create -o mountpoint="$work/data" "$src/max"
 zfs create "$src/max/plain"
+zfs create "$src/max/restic"
 zfs create -o encryption=on -o keyformat=passphrase -o keylocation="file://$work/key" \
     -o mountpoint="$work/data/secret" "$src/max/secret"
 echo one >"$work/data/plain/file"
+echo one >"$work/data/restic/file"
 
 # Stand-ins for the dotfiles repo and the age key sops encrypts to.
 git init -q "$work/repo"
@@ -49,50 +59,98 @@ age-keygen -o "$work/age-key.txt" 2>/dev/null
 age-keygen -y "$work/age-key.txt" >"$work/recipients"
 echo hidden >"$work/data/secret/file"
 
-export COLD_SOURCE="$src/max" COLD_POOL="$cold" COLD_DEVICE_DIR="$work/dev" RUN_LOG_DIR="$work/logs" \
+jq -n --arg src "$src" --arg big "$big" --arg small "$small" --arg pid "$$" '{
+    big:   {serial: "big\($pid)",   pool: $big,   source: "\($src)/max",        unit: "cold-backup"},
+    small: {serial: "small\($pid)", pool: $small, source: "\($src)/max/restic", unit: "cold-backup-small"}
+}' >"$work/disks.json"
+
+export COLD_DISKS="$work/disks.json" COLD_DEVICE_DIR="$work/dev" RUN_LOG_DIR="$work/logs" \
     COLD_BUNDLE_REPOS="$work/repo" COLD_RECIPIENTS_FROM="$work/recipients"
 
-"$bin_dir/cold-backup" init "$work/dev/cold.img" >/dev/null
-"$bin_dir/cold-backup" >/dev/null
-check "first run succeeds" 0 $?
-check "the cold pool is detached after a run" 1 "$(zpool list "$cold" >/dev/null 2>&1; echo $?)"
+"$bin_dir/cold-backup" init big >/dev/null
+check "init finds the big disk by its serial" 0 $?
+"$bin_dir/cold-backup" init small >/dev/null
+check "init finds the small disk by its serial" 0 $?
 
+"$bin_dir/cold-backup" big >/dev/null
+check "big's first run succeeds" 0 $?
+check "the big pool is detached after a run" 1 "$(zpool list "$big" >/dev/null 2>&1; echo $?)"
+"$bin_dir/cold-backup" small >/dev/null
+check "small's first run succeeds" 0 $?
+check "the small pool is detached after a run" 1 "$(zpool list "$small" >/dev/null 2>&1; echo $?)"
+
+# Each run below starts from a snapshot the other disk's runs have been made
+# beside and pruned around.
 echo two >"$work/data/plain/file"
-"$bin_dir/cold-backup" --no-scrub >/dev/null
-check "second run succeeds" 0 $?
+echo two >"$work/data/restic/file"
+"$bin_dir/cold-backup" --no-scrub big >/dev/null
+check "big's second run succeeds" 0 $?
+"$bin_dir/cold-backup" --no-scrub small >/dev/null
+check "small's second run succeeds" 0 $?
+echo three >"$work/data/restic/file"
+"$bin_dir/cold-backup" --no-scrub big >/dev/null
+check "big's third run succeeds" 0 $?
 
-zpool import -N -d "$work/dev" "$cold"
+snaps() { zfs list -H -t snapshot -o name -d 1 "$1" | wc -l; }
+check "the source keeps only big's latest snapshot" 1 "$(snaps "$src/max")"
+check "the restic dataset keeps the latest snapshot of each disk" 2 "$(snaps "$src/max/restic")"
+latest() {  # dataset pool -> the newest snapshot of the pool's runs
+    zfs list -H -t snapshot -o name -s createtxg -d 1 "$1" | cut -d@ -f2 | grep -E "^$2-[0-9]{4}-" | tail -1
+}
+big_latest=$(latest "$src/max" "$big")
+small_latest=$(latest "$src/max/restic" "$small")
+
+zpool import -N -d "$work/dev" "$big"
+zpool import -N -d "$work/dev" "$small"
 guid() { zfs get -H -o value guid "$1"; }
-src_snaps=$(zfs list -H -t snapshot -o name -d 1 "$src/max" | wc -l)
-cold_snaps=$(zfs list -H -t snapshot -o name -d 1 "$cold/max" | wc -l)
-check "the source keeps only the latest run's snapshot" 1 "$src_snaps"
-check "the cold pool keeps both runs" 2 "$cold_snaps"
-latest=$(zfs list -H -t snapshot -o name -s createtxg -d 1 "$src/max" | tail -1 | cut -d@ -f2)
-check "the cold plain dataset is the source's latest snapshot" \
-    "$(guid "$src/max/plain@$latest")" "$(guid "$cold/max/plain@$latest")"
-check "the cold secret dataset is the source's latest snapshot" \
-    "$(guid "$src/max/secret@$latest")" "$(guid "$cold/max/secret@$latest")"
-check "the secret stays encrypted on the cold pool" aes-256-gcm "$(zfs get -H -o value encryption "$cold/max/secret")"
-check "its key is not on the cold pool" unavailable "$(zfs get -H -o value keystatus "$cold/max/secret")"
-check "nothing on the cold pool is mounted" "" "$(zfs get -H -o name,value -r mounted "$cold" | awk '$2 == "yes"')"
-check "nothing on the cold pool mounts by itself" "" \
-    "$(zfs get -H -o name,value -r -t filesystem mountpoint "$cold" | awk '$2 != "none" && $2 != "legacy"')"
-mkdir "$work/restore"
-mount -t zfs "$cold/restore" "$work/restore"
-age -d -i "$work/age-key.txt" "$work/restore/repo.bundle.age" >"$work/repo.bundle" 2>/dev/null
-check "the repo on the cold pool opens with the age key" "the repo's only commit" \
-    "$(git clone -q "$work/repo.bundle" "$work/clone" 2>/dev/null && git -C "$work/clone" log -1 --format=%s)"
-check "the restore instructions are beside it" 0 "$(grep -q 'zfs load-key' "$work/restore/README.txt"; echo $?)"
-umount "$work/restore"
-zpool export "$cold"
+check "the big pool keeps all three of its runs" 3 "$(snaps "$big/max")"
+check "the small pool keeps both of its runs" 2 "$(snaps "$small/restic")"
+check "the small disk receives only its own dataset" "$small $small/restic $small/restore" \
+    "$(zfs list -H -o name -r "$small" | sort | tr '\n' ' ' | sed 's/ $//')"
+check "the big pool holds no snapshot of small's runs" "" \
+    "$(zfs list -H -t snapshot -o name -r "$big" | grep -- "@$small-")"
+check "the small pool holds no snapshot of big's runs" "" \
+    "$(zfs list -H -t snapshot -o name -r "$small" | grep -v -- "@$small-")"
+check "the big plain dataset is the source's latest snapshot" \
+    "$(guid "$src/max/plain@$big_latest")" "$(guid "$big/max/plain@$big_latest")"
+check "the big secret dataset is the source's latest snapshot" \
+    "$(guid "$src/max/secret@$big_latest")" "$(guid "$big/max/secret@$big_latest")"
+check "the big restic dataset is the source's latest snapshot" \
+    "$(guid "$src/max/restic@$big_latest")" "$(guid "$big/max/restic@$big_latest")"
+check "the small restic dataset is the source's latest snapshot" \
+    "$(guid "$src/max/restic@$small_latest")" "$(guid "$small/restic@$small_latest")"
+check "the secret stays encrypted on the cold pool" aes-256-gcm "$(zfs get -H -o value encryption "$big/max/secret")"
+check "its key is not on the cold pool" unavailable "$(zfs get -H -o value keystatus "$big/max/secret")"
+for pool in "$big" "$small"; do
+    check "nothing on $pool is mounted" "" "$(zfs get -H -o name,value -r mounted "$pool" | awk '$2 == "yes"')"
+    check "nothing on $pool mounts by itself" "" \
+        "$(zfs get -H -o name,value -r -t filesystem mountpoint "$pool" | awk '$2 != "none" && $2 != "legacy"')"
+done
+for pool in "$big" "$small"; do
+    mkdir "$work/restore-$pool"
+    mount -t zfs "$pool/restore" "$work/restore-$pool"
+    age -d -i "$work/age-key.txt" "$work/restore-$pool/repo.bundle.age" >"$work/repo-$pool.bundle" 2>/dev/null
+    check "the repo on $pool opens with the age key" "the repo's only commit" \
+        "$(git clone -q "$work/repo-$pool.bundle" "$work/clone-$pool" 2>/dev/null && git -C "$work/clone-$pool" log -1 --format=%s)"
+done
+check "big's restore instructions name the dataset to unlock" 0 \
+    "$(grep -qF 'zfs load-key <pool>/max/secret' "$work/restore-$big/README.txt"; echo $?)"
+check "small's restore instructions name its pool" 0 \
+    "$(grep -qF "zpool import -N $small" "$work/restore-$small/README.txt"; echo $?)"
+umount "$work/restore-$big" "$work/restore-$small"
+zpool export "$big"
+zpool export "$small"
 
-mv "$work/dev/cold.img" "$work/cold.img"
-"$bin_dir/cold-backup" --no-scrub >/dev/null 2>&1
-check "a run without the disk fails" 1 $?
-check "and leaves the source's snapshots alone" "$latest" \
-    "$(zfs list -H -t snapshot -o name -d 1 "$src/max" | cut -d@ -f2)"
+# Only big's disk is plugged in now.
+mv "$work/dev/file-small$$" "$work/small.img"
+"$bin_dir/cold-backup" --no-scrub small >/dev/null 2>&1
+check "a run without its disk fails" 1 $?
+check "and leaves the source's snapshots alone" "$small_latest $big_latest" \
+    "$(zfs list -H -t snapshot -o name -s createtxg -d 1 "$src/max/restic" | cut -d@ -f2 | tr '\n' ' ' | sed 's/ $//')"
 
-check "every run is in the run log" "ok ok fail" \
+check "every big run is in its run log" "ok ok ok" \
     "$(jq -r .outcome "$work/logs/cold-backup.jsonl" | tr '\n' ' ' | sed 's/ $//')"
+check "every small run is in its own run log" "ok ok fail" \
+    "$(jq -r .outcome "$work/logs/cold-backup-small.jsonl" | tr '\n' ' ' | sed 's/ $//')"
 
 finish
