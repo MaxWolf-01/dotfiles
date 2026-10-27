@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
-# Copy all of tank/max onto the cold-storage disk, a ZFS pool of its own that
-# is plugged into pc only while this runs, and kept somewhere else otherwise.
+# Copy a tank dataset onto a cold disk, a ZFS pool of its own that is plugged
+# into pc only while this runs, and kept somewhere else otherwise. Which disks
+# there are, and what each one copies into which pool, is the table in
+# nix/nixos/pc/cold-disks.json.
 #
-# Each run snapshots tank/max with all its datasets and sends what changed
-# since the last run's snapshot. Encrypted datasets travel still encrypted
-# (a raw send), so the disk never needs their keys, and nothing on it is ever
-# mounted: the pool's mountpoint is none, and the received datasets inherit it.
+# Each run snapshots the disk's source with all its datasets and sends what
+# changed since the last run's snapshot. Encrypted datasets travel still
+# encrypted (a raw send), so the disk never needs their keys, and nothing on it
+# is ever mounted: the pool's mountpoint is none, and the received datasets
+# inherit it.
 
 set -uo pipefail
 
-usage() {
-    cat <<'EOF'
-Usage: cold-backup [--no-scrub] [--notify]
-       cold-backup init DEVICE
+disks_file="${COLD_DISKS:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/nix/nixos/pc/cold-disks.json}"
 
-  (no command)  attach the cold pool, send what changed on tank/max since the
+usage() {
+    cat <<EOF
+Usage: cold-backup [--no-scrub] [--notify] DISK
+       cold-backup init DISK
+
+  DISK          a cold disk, from $disks_file:
+$(jq -r 'to_entries[] | "                  \(.key): \(.value.source) into pool \(.value.pool)"' "$disks_file" 2>/dev/null)
+  (no command)  attach DISK's pool, send what changed on its source since the
                 last run, read the whole pool back (scrub), and detach it.
                 The disk can be unplugged once it prints "done". On pc,
                 plugging the disk in starts this (nix/nixos/pc/cold-backup.nix).
-  init DEVICE   create the cold pool on DEVICE, a /dev/disk/by-id path.
-                ERASES everything on DEVICE.
-  --no-scrub    skip the read-back, which takes ~2-3 h over USB.
+  init DISK     create DISK's pool on the disk the table's serial names, found
+                under /dev/disk/by-id. ERASES everything on that disk.
+  --no-scrub    skip the read-back, which takes hours over USB on a full disk.
   --notify      mail the outcome through bin/alert-send: when the disk can be
                 unplugged, or what failed. The plug-in unit passes it.
 
@@ -29,15 +36,13 @@ which is the next run's starting point. Each run also writes the dotfiles and
 secrets repos to the disk, encrypted to the age key sops uses, beside a
 README.txt on restoring: the ZFS passphrases and restic passwords that open
 the copy are in the secrets repo. Records each run in
-~/logs/runs/cold-backup.jsonl (bin/run-log). Runs itself with sudo.
+~/logs/runs/<the disk's unit>.jsonl (bin/run-log). Runs itself with sudo.
 
 Exits 0 when the copy is on the disk, 1 when a step failed, 2 on a usage error.
 EOF
 }
 
 # Overridable so tests/cold-backup.test can run against throwaway pools.
-source_ds="${COLD_SOURCE:-tank/max}"
-pool="${COLD_POOL:-cold}"
 device_dir="${COLD_DEVICE_DIR:-/dev/disk/by-id}"
 bundle_repos="${COLD_BUNDLE_REPOS:-/home/max/.dotfiles /home/max/.dotfiles/secrets}"
 recipients_from="${COLD_RECIPIENTS_FROM:-/home/max/.dotfiles/secrets/.sops.yaml}"
@@ -47,15 +52,23 @@ args=("$@")
 scrub=1
 notify=0
 cmd=run
+disk=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --no-scrub) scrub=0; shift ;;
         --notify) notify=1; shift ;;
-        init) cmd=init; device="${2:-}"; [ -n "$device" ] || { usage >&2; exit 2; }; shift 2 ;;
-        *) echo "cold-backup: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+        init) cmd=init; shift ;;
+        -*) echo "cold-backup: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+        *)  [ -z "$disk" ] || { echo "cold-backup: one disk at a time, not $disk and $1" >&2; exit 2; }
+            disk="$1"; shift ;;
     esac
 done
+[ -n "$disk" ] || { echo "cold-backup: which disk?" >&2; usage >&2; exit 2; }
+
+IFS=$'\t' read -r serial pool source_ds unit < <(jq -r --arg disk "$disk" \
+    '.[$disk] // empty | [.serial, .pool, .source, .unit] | @tsv' "$disks_file")
+[ -n "${unit:-}" ] || { echo "cold-backup: no disk $disk in $disks_file" >&2; usage >&2; exit 2; }
 
 # The caller's PATH comes along: root's lacks jq, which run-log needs.
 [ "$(id -u)" = 0 ] || exec sudo env "PATH=$PATH" "${BASH_SOURCE[0]}" "${args[@]}"
@@ -69,7 +82,7 @@ as_user() {
 }
 
 log_run() {  # outcome reason stats
-    local log_args=(cold-backup "$1" --stats "$3")
+    local log_args=("$unit" "$1" --stats "$3")
     [ -n "$2" ] && log_args+=(--reason "$2")
     as_user "$bin_dir/run-log" "${log_args[@]}" || true
 }
@@ -82,16 +95,30 @@ mail() {  # subject body
 fail() {  # reason [stats]
     echo "cold-backup: $1" >&2
     log_run fail "$1" "${2:-"{}"}"
-    mail "❌ cold-backup: $1" "The cold copy did not update. Details: journalctl -u cold-backup on pc."
+    mail "❌ $unit: $1" "The cold copy on $disk did not update. Details: journalctl -u $unit on pc."
     exit 1
 }
 
 if [ "$cmd" = init ]; then
-    [ -e "$device" ] || { echo "cold-backup: no such device: $device" >&2; exit 2; }
-    zpool create -o ashift=12 -O compression=lz4 -O atime=off \
+    device=$(for link in "$device_dir"/*-"$serial"; do
+        [ -e "$link" ] && readlink -f "$link"
+    done | sort -u)
+    [ "$(grep -c . <<<"$device")" = 1 ] \
+        || { echo "cold-backup: no single disk under $device_dir has the serial $serial: is $disk plugged in?" >&2; exit 1; }
+    # -f would write over the disk's own pool too, so `init` typed for a run
+    # is refused here rather than erase the cold copy.
+    if zpool list "$pool" >/dev/null 2>&1 \
+        || zpool import -d "$device_dir" 2>/dev/null | grep -qE "^\s*pool: $pool\$"; then
+        echo "cold-backup: $disk already holds the pool $pool; to start over, zpool destroy it first" >&2
+        exit 1
+    fi
+    # -f writes over anything else the disk holds, such as a LUKS volume, which
+    # zpool refuses otherwise. The device is the one the serial names, so -f
+    # cannot land on a disk the table does not.
+    zpool create -f -o ashift=12 -O compression=lz4 -O atime=off \
         -O mountpoint=none -O canmount=off "$pool" "$device" || exit 1
     zpool export "$pool"
-    echo "cold-backup: pool $pool created on $device; run cold-backup to fill it"
+    echo "cold-backup: pool $pool created on $device; run cold-backup $disk to fill it"
     exit 0
 fi
 
@@ -100,13 +127,17 @@ dest="$pool/${source_ds##*/}"
 if ! zpool list "$pool" >/dev/null 2>&1; then
     # -N mounts nothing, should a dataset on the disk ever gain a mountpoint.
     zpool import -N -d "$device_dir" "$pool" 2>/dev/null \
-        || fail "cold pool $pool not found under $device_dir: is the disk plugged in?"
+        || fail "cold pool $pool not found under $device_dir: is $disk plugged in?"
 fi
 trap 'zpool export "$pool" 2>/dev/null' EXIT
 
-snapshots() {  # dataset -> its cold-* snapshot names, oldest first
+# A run's snapshots are named after its disk's pool, and each run sees only its
+# own: where two disks' sources overlap (tank/max holds tank/max/restic), each
+# would otherwise take the other's snapshots for its own and destroy them.
+own="^$pool-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}\$"
+snapshots() {  # dataset -> this disk's snapshot names, oldest first
     zfs list -H -t snapshot -o name -s createtxg -d 1 "$1" 2>/dev/null \
-        | sed -n 's/^[^@]*@\(cold-.*\)$/\1/p'
+        | sed 's/^[^@]*@//' | grep -E "$own"
 }
 
 source_snaps=$(snapshots "$source_ds")
@@ -117,15 +148,16 @@ if zfs list "$dest" >/dev/null 2>&1 && [ -z "$base" ]; then
     fail "$dest exists but shares no snapshot with $source_ds, so there is no starting point for a send"
 fi
 
-new="cold-$(date +%Y-%m-%dT%H%M%S)"
+new="$pool-$(date +%Y-%m-%dT%H%M%S)"
 zfs snapshot -r "$source_ds@$new" || fail "zfs snapshot -r $source_ds@$new failed"
 
 echo "cold-backup: sending $source_ds@$new${base:+ (changes since $base)} to $dest"
-# -R takes every dataset below, -w sends raw. Without -F, receive refuses rather
+# -R takes every dataset below, -w sends raw. -i, not -I: what lies between the
+# two on tank is other disks' snapshots. Without -F, receive refuses rather
 # than destroy the disk's older snapshots, which tank no longer has. -x
 # mountpoint drops tank's own mountpoints, so the copies inherit none.
 if [ -n "$base" ]; then
-    zfs send -R -w -I "@$base" "$source_ds@$new" | zfs receive -u -x mountpoint "$dest"
+    zfs send -R -w -i "@$base" "$source_ds@$new" | zfs receive -u -x mountpoint "$dest"
 else
     zfs send -R -w "$source_ds@$new" | zfs receive -u -x mountpoint "$dest"
 fi
@@ -143,9 +175,13 @@ done
 for s in $(snapshots "$dest" | head -n -"$keep"); do
     zfs destroy -r "$dest@$s"
 done
+# A first, full send carries every snapshot the source has, other disks' too.
+zfs list -H -t snapshot -o name -r "$dest" | while read -r s; do
+    grep -qE "$own" <<<"${s#*@}" || zfs destroy "$s"
+done
 
 write_restore_kit() {  # mountpoint
-    local mnt="$1" repo name r recipients=()
+    local mnt="$1" repo name r recipients=() encrypted
     for r in $(grep -o 'age1[a-z0-9]*' "$recipients_from" | sort -u); do
         recipients+=(-r "$r")
     done
@@ -158,8 +194,12 @@ write_restore_kit() {  # mountpoint
             || { echo "bundling $repo failed"; return 1; }
         mv "$mnt/$name.bundle.age.new" "$mnt/$name.bundle.age"
     done
+    # The datasets that are their own encryption root, as named after a restore.
+    encrypted=$(zfs get -H -o name,value -r -t filesystem encryptionroot "$dest" \
+        | awk -v n="${#pool}" '$1 == $2 { print "  zfs load-key <pool>" substr($1, n + 1) }')
+    [ -n "$encrypted" ] || encrypted=$'\nNothing here is ZFS-encrypted.'
     cat >"$mnt/README.txt" <<EOF
-Cold copy of pc's tank/max, written by cold-backup (in the dotfiles repo).
+Cold copy of pc's $source_ds, written by cold-backup $disk (in the dotfiles repo).
 
 Opening it takes the age key, kept in Bitwarden under its path
 ~/.local/secrets/age-key.txt. The key opens the repos here:
@@ -170,9 +210,9 @@ Opening it takes the age key, kept in Bitwarden under its path
 The secrets repo holds, sops-encrypted to the same key, the passphrases of the
 encrypted datasets and the restic passwords. To restore onto new disks:
 
-  zpool import -N cold
-  zfs send -R -w cold/max@<newest cold-* snapshot> | zfs receive <pool>/max
-  zfs load-key <pool>/max/<dataset>     # encrypted, phone, general
+  zpool import -N $pool
+  zfs send -R -w $dest@<newest $pool-* snapshot> | zfs receive <pool>/${dest#*/}
+$encrypted
 
 Written $(date -I), with $source_ds@$new.
 EOF
@@ -207,6 +247,6 @@ fi
 log_run ok "" "$stats"
 zpool export "$pool" || fail "zpool export $pool failed: unplugging now may damage it" "$stats"
 trap - EXIT
-echo "cold-backup: done, $new is on the disk; it can be unplugged"
-mail "✅ cold-backup: done, unplug the disk" "$new is on the cold disk, and the pool is detached.
+echo "cold-backup: done, $new is on $disk; it can be unplugged"
+mail "✅ $unit: done, unplug the disk" "$new is on the cold disk $disk, and the pool is detached.
 $(jq -r '"Used \(.used / 1e9 | floor) GB, free \(.free / 1e9 | floor) GB."' <<<"$stats")"

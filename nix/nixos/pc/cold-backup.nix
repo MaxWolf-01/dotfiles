@@ -1,19 +1,22 @@
-# Plugging the cold disk into pc starts bin/cold-backup, which copies tank/max
-# onto it and mails when it can be unplugged. What a run does: cold-backup --help.
+# Plugging a cold disk into pc starts bin/cold-backup for that disk, which
+# copies its share of tank onto it and mails when it can be unplugged. The
+# disks are the table in cold-disks.json, which the script reads too. What a
+# run does: cold-backup --help.
 { config, pkgs, lib, ... }:
 
 let
-  # The 2 TB Seagate FireCuda (USB), matched by udev's ID_SERIAL so no other
-  # disk starts a run.
-  coldDiskSerial = "Seagate_FireCuda_HDD_00000000NAD31L08-0:0";
+  # Each disk is matched by udev's ID_SERIAL, so no other disk starts its run.
+  # It is the part of the disk's /dev/disk/by-id name after the bus: udev names
+  # the link <ID_BUS>-<ID_SERIAL>.
+  disks = builtins.fromJSON (builtins.readFile ./cold-disks.json);
 in
 {
-  services.udev.extraRules = ''
-    ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_SERIAL}=="${coldDiskSerial}", TAG+="systemd", ENV{SYSTEMD_WANTS}+="cold-backup.service"
-  '';
+  services.udev.extraRules = lib.concatStrings (lib.mapAttrsToList (name: disk: ''
+    ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_SERIAL}=="${disk.serial}", TAG+="systemd", ENV{SYSTEMD_WANTS}+="${disk.unit}.service"
+  '') disks);
 
-  systemd.services.cold-backup = {
-    description = "Copy tank/max onto the cold disk";
+  systemd.services = lib.mapAttrs' (name: disk: lib.nameValuePair disk.unit {
+    description = "Copy ${disk.source} onto the cold disk ${name}";
     path = [ config.boot.zfs.package ] ++ (with pkgs; [
       bash coreutils util-linux getent gnused gnugrep gawk jq sops curl git age
     ]);
@@ -24,9 +27,9 @@ in
       Type = "oneshot";
       # The pool's partitions appear a moment after the disk itself.
       ExecStartPre = "${pkgs.systemd}/bin/udevadm settle";
-      ExecStart = "/home/max/.dotfiles/bin/cold-backup --notify";
-      # The first run sends all of tank/max, and every run scrubs: hours.
+      ExecStart = "/home/max/.dotfiles/bin/cold-backup --notify ${name}";
+      # A first run sends all of its source, and every run scrubs: hours.
       TimeoutStartSec = "infinity";
     };
-  };
+  }) disks;
 }

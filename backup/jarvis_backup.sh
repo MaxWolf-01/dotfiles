@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Backup jarvis VPS workspace via SSHFS mount + restic.
-# Mounts the docker volume from jarvis, runs restic_backup.sh, unmounts.
+# Mounts the docker volume from jarvis at the config's base_path, runs
+# restic_backup.sh, unmounts.
 #
 # Usage: jarvis_backup.sh <restic_config_file>
 #   e.g.: jarvis_backup.sh ~/.dotfiles/secrets/backup/restic/jarvis/rsyncnet.conf
 
 set -euo pipefail
 
-MOUNTPOINT="/tmp/jarvis-backup"
 REMOTE="root@jarvis:/var/lib/docker/volumes/jarvis_jarvis-workspace/_data"
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 
@@ -18,6 +18,7 @@ if [ -z "$config_file" ] || [ ! -f "$config_file" ]; then
 fi
 
 config_name="$("$SCRIPT_DIR/../bin/restic-config-name" "$config_file")"
+MOUNTPOINT="$(source "$config_file" && echo "$base_path")"
 
 log_run() {
     "$SCRIPT_DIR/../bin/run-log" "$config_name" "$@" || true

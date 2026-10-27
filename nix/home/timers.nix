@@ -225,6 +225,39 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Jarvis VPS workspace → PC (via SSHFS) ---
+  # A copy on tank/max/restic, which the cold disks carry. It mounts jarvis at
+  # a path of its own (base_path in jarvis/pc.conf), so it can run beside
+  # jarvis-rsyncnet.
+
+  systemd.user.services.jarvis-pc = {
+    Unit = {
+      Description = "Restic backup to PC (jarvis workspace via SSHFS)";
+      X-SwitchMethod = "keep-old";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      TimeoutStartSec = "2h";
+      Environment = [
+        "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/backup/jarvis_backup.sh ${secrets}/backup/restic/jarvis/pc.conf";
+    };
+  };
+
+  systemd.user.timers.jarvis-pc = {
+    Unit.Description = "Daily backup to PC (jarvis workspace)";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "40m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Catch-up handle ---
   # "The backups can run now." secrets/zshrc starts it on login, when the ssh key
   # enters the agent and the units that skipped for want of it can run. It
@@ -249,6 +282,7 @@ in
         "working-pc.service"
         "working-xmg19.service"
         "jarvis-rsyncnet.service"
+        "jarvis-pc.service"
       ];
     };
   };

@@ -280,6 +280,35 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- pc service state → PC local ---
+  # A copy on tank/max/restic, which the cold disks carry. Stages into a tree
+  # of its own, as pcstate-xmg19 does.
+
+  systemd.user.services.pcstate-pc = {
+    Unit = {
+      Description = "Restic backup local (pc service state)";
+      X-SwitchMethod = "keep-old";
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${backupPath}"
+      ];
+      ExecStartPre = "${dotfiles}/backup/pcstate_snapshot.sh ${home}/.local/state/pcstate-pc";
+      ExecStart = "${dotfiles}/backup/restic_backup.sh ${secrets}/backup/restic/pcstate/pc.conf";
+    };
+  };
+
+  systemd.user.timers.pcstate-pc = {
+    Unit.Description = "Weekly local backup (pc service state)";
+    Timer = {
+      OnCalendar = "weekly";
+      Persistent = true;
+      RandomizedDelaySec = "40m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Catch-up handle ---
   # "The backups can run now." secrets/zshrc starts it on login, when the age key
   # is decrypted or the ssh key enters the agent, zfs-unlock starts it when a
@@ -290,7 +319,7 @@ in
   #
   # It lists every unit rather than the ones a caller's event feeds, so a caller
   # needs to know nothing about preconditions. The ones with no source to gate on
-  # (youtube and both pcstate units) therefore run every time it fires, which
+  # (youtube and the pcstate units) therefore run every time it fires, which
   # for youtube means its 1% integrity check reads ~2 GB back from rsync.net.
   # That is the price of the caller not having to know, and it is only paid on
   # a login or an unlock.
@@ -311,6 +340,7 @@ in
         "pcstate-rsyncnet.service"
         "phone-xmg19.service"
         "pcstate-xmg19.service"
+        "pcstate-pc.service"
       ];
     };
   };
