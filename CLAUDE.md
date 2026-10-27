@@ -89,7 +89,7 @@ Structure:
 Host tiers:
 - **CLI** (common.nix): every machine — shell, dev tools, restic, etc.
 - **Workstation** (+ desktop.nix, gnome.nix, display server): zephyrus
-- **Server / NixOS** (nix/nixos/<host>/): headless. PC is the backup hub and runs pc-timers.nix; xmg19 is a low-trust worker host with the GPU queue, and a backup target
+- **Server / NixOS** (nix/nixos/<host>/): headless. PC is the backup hub and runs pc-timers.nix; xmg19 is a low-trust worker host and a backup target; both carry the GPU queue
 
 Setup flow:
 - `./setup host <name>` — sets NIX_HOST, creates dirs. On non-NixOS: also installs Nix + runs first HM switch.

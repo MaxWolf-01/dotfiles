@@ -2,6 +2,7 @@
 host: pc
 user: agent
 isolated: true
+withholds: gpu
 account: personal
 ---
 

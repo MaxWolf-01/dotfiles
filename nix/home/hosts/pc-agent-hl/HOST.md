@@ -2,6 +2,7 @@
 host: pc
 user: agent-hl
 isolated: true
+withholds: gpu
 account: helferline
 ---
 

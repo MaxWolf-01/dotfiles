@@ -3,14 +3,16 @@
 # Drive bin/worker-hosts with a stand-in ssh that plays each host's answer locally. Run it directly; no framework.
 #
 # What an orchestrator relies on: a host whose /home is locked shows as locked, with the command that unlocks it,
-# rather than as an idle host ready for work; and the record printed for a host it cannot read is that host's own,
-# whose "After a reboot" names the right unlock.
+# rather than as an idle host ready for work; the record printed for a host it cannot read is that host's own,
+# whose "After a reboot" names the right unlock; and a spawn is placed on the hosts that can take it now, best
+# first, told apart from one that has to wait and one no host could ever take.
 
 set -uo pipefail
 
 bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)"
 scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
+holders=()
+trap 'kill "${holders[@]}" 2>/dev/null; rm -rf "$scratch"' EXIT
 
 . "$(dirname "${BASH_SOURCE[0]}")/check.sh"
 
@@ -24,12 +26,24 @@ target=\$1; shift
 [ "\$*" = "bash -s" ] || { echo "ssh: connect to host \$target port 22: Connection timed out" >&2; exit 255; }
 case \$target in
     *@xmg19) HOME=$scratch/missing exec bash -s ;;
+    *@pc) HOST_SLOTS=6 HOST_SLOTS_DIR=$scratch/slots HOME=$scratch/home exec bash -s ;;
     *) HOME=$scratch/home exec bash -s ;;
 esac
 EOF
-# Neither the real GPU nor the test runner's tmux server is asked anything.
-printf '#!/bin/sh\nexit 9\n' >"$scratch/bin/nvidia-smi"
-chmod +x "$scratch/bin/ssh" "$scratch/bin/nvidia-smi"
+# The test runner's processes, threads, slots and GPU are stand-ins too: claude runs twice here, the machine has
+# 12 threads, pc holds 2 of its 6 slots (taken through the real host-slots) and zephylux counts none, and each
+# has a GPU, which pc's records withhold.
+printf '#!/bin/sh\necho 2\n' >"$scratch/bin/pgrep"
+printf '#!/bin/sh\necho 12\n' >"$scratch/bin/nproc"
+printf '#!/bin/sh\necho "NVIDIA GeForce GTX 1650, 0, 460, 4096"\n' >"$scratch/bin/nvidia-smi"
+ln -s "$bin/host-slots" "$scratch/bin/host-slots"
+chmod +x "$scratch/bin/ssh" "$scratch/bin/pgrep" "$scratch/bin/nproc" "$scratch/bin/nvidia-smi"
+mkdir -m 1777 "$scratch/slots"; : >"$scratch/slots/lock"
+for _ in 1 2; do
+    sleep 300 & holders+=($!)
+    HOST_SLOTS=6 HOST_SLOTS_DIR=$scratch/slots "$bin/host-slots" take $! "sleep 300" 2>/dev/null
+done
+# The test runner's tmux server is asked nothing.
 export PATH="$scratch/bin:$PATH" TMUX_TMPDIR="$scratch"
 unset TMUX
 
@@ -42,9 +56,118 @@ section() { awk -v h="$1 — " 'index($0, h) == 1 {on = 1} on && NF == 0 {exit} 
     fail "a host whose home is locked shows as locked, with the unlock to run" "$out"
 [[ $(section agent@xmg19) != *"workers:"* ]] && passed "a locked host shows no resources as if ready" ||
     fail "a locked host shows no resources as if ready" "$out"
-[[ $(section agent@pc) == *"workers: none"* && $(section agent@pc) != *locked* ]] &&
+[[ $(section agent@pc) == *"sessions: none"* && $(section agent@pc) != *locked* ]] &&
     passed "a host whose home is there shows its resources, not locked" ||
     fail "a host whose home is there shows its resources, not locked" "$out"
+
+[[ $(section agent@pc) == *"workers: 2 claude running here; 2 of 6 slots held on pc"* ]] &&
+    passed "a host counts its user's claude, and the slots its machine says are held of its count" ||
+    fail "a host counts its user's claude, and the slots its machine says are held of its count" "$(section agent@pc)"
+[[ $(section max@zephylux) == *"zephylux has no slot count"* ]] &&
+    passed "a machine that counts no slots says so" ||
+    fail "a machine that counts no slots says so" "$(section max@zephylux)"
+arch=$(uname -m)
+check "a host offers what was read off it, less what its record withholds" "  offers: $arch" \
+    "$(section agent@pc | grep '^  offers:')"
+check "a host offers its GPU where its record withholds none" "  offers: gpu, $arch" \
+    "$(section max@zephylux | grep '^  offers:')"
+
+# --- placing a spawn
+
+out=$("$bin/worker-hosts" --place personal --needs gpu 2>&1)
+check "a GPU no host on the account offers now, with one locked, is waited for" 3 "$?"
+[[ $out == *"agent@pc"*"2 of 6 slots held on pc"*"offers $arch"* && $out == *"agent@xmg19"*locked* ]] &&
+    passed "the placer shows the readings it chose from" || fail "the placer shows the readings it chose from" "$out"
+
+# --- a reading, from a probe's answer
+
+# Sourced, worker-hosts runs nothing; `run <function> <args>` calls one of its functions.
+run() { bash -c 'source "$1"; shift; "$@"' check "$bin/worker-hosts" "$@"; }
+printf '%s\n' memtotal_kb=16000000 memavail_kb=9000000 arc_kb=500000 users_max_kb=10000000 users_used_kb=6000000 \
+    >"$scratch/bound"
+check "free memory for workers is what user.slice's ceiling leaves, when that is less" "4000000 10000000" \
+    "$(run memory "$scratch/bound")"
+printf '%s\n' memtotal_kb=16000000 memavail_kb=2000000 arc_kb=500000 users_max_kb=10000000 users_used_kb=1000000 \
+    >"$scratch/arc"
+check "free memory counts the ZFS ARC as free, and workers use at most the ceiling" "2500000 10000000" \
+    "$(run memory "$scratch/arc")"
+printf '%s\n' memtotal_kb=16000000 memavail_kb=9000000 users_max_kb=10485760 users_used_kb=1000000 \
+    users_reserved_kb=2097152 >"$scratch/reserved"
+check "the most workers may use leaves out what max's sessions are protected up to" "8388608" \
+    "$(run memory "$scratch/reserved" | cut -d' ' -f2)"
+
+printf '%s\n' --- 'host: box' 'user: agent' 'has: docker' --- >"$scratch/HOST.md"
+printf '%s\n' arch=x86_64 'gpu=asleep' >"$scratch/probed"
+check "a host offers what was probed, an asleep GPU among it, and its record's has:" "docker,gpu,x86_64" \
+    "$(run capabilities "$scratch/HOST.md" "$scratch/probed")"
+printf '%s\n' --- 'host: box' 'user: agent' 'has: docker' 'withholds: gpu' --- >"$scratch/HOST.md"
+printf '%s\n' arch=x86_64 'gpu=GeForce|0|460|4096' >"$scratch/probed"
+check "a host offers what was probed and its record's has:, less its withholds:" "docker,x86_64" \
+    "$(run capabilities "$scratch/HOST.md" "$scratch/probed")"
+echo locked=1 >"$scratch/locked"
+check "a locked host's reading counts nothing, and carries what its record says" \
+    "$(printf '%s\t' agent@box box - - locked - - docker - - -)gpu" "$(run reading "$scratch/HOST.md" "$scratch/locked")"
+
+# The placer on readings directly, each line in the field order of `reading`'s comment.
+r() { # <user@host> [<field>=<value>]...
+    local -A f=([account]=personal [isolated]=true [state]=up [held]=0 [slots]=6 [offers]=x86_64 [free]=8388608
+        [most]=10485760 [pressure]=1.00 [withholds]=-)
+    local t=$1 kv; shift
+    for kv; do f[${kv%%=*}]=${kv#*=}; done
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$t" "${t#*@}" "${f[account]}" "${f[isolated]}" \
+        "${f[state]}" "${f[held]}" "${f[slots]}" "${f[offers]}" "${f[free]}" "${f[most]}" "${f[pressure]}" \
+        "${f[withholds]}"
+}
+# Checks that a spawn on <account> needing every <capability> is placed on <expected>: the user@hosts best first,
+# or `exit <n>`. The readings come on stdin.
+places() { # <what> <expected> <account> [<capability>...]
+    local what=$1 expected=$2 out rc; shift 2
+    out=$(run place "$@")
+    rc=$?
+    [ "$rc" -eq 0 ] && out=$(cut -f1 <<<"$out" | paste -sd' ' -) || out="exit $rc"
+    check "$what" "$expected" "$out"
+}
+places "the machine whose tasks waited least for a CPU first" "agent@pc agent@xmg19" personal \
+    < <(r agent@xmg19 pressure=12.50; r agent@pc pressure=3.00)
+places "a machine with every slot held is passed over" "agent@xmg19" personal \
+    < <(r agent@pc held=6 pressure=0; r agent@xmg19 slots=8 held=7 pressure=9)
+places "an unreachable or locked machine is passed over" "agent@laptop" personal \
+    < <(r agent@pc state=unreachable; r agent@xmg19 state=locked; r agent@laptop pressure=40)
+places "a machine whose pressure is unknown is passed over" "agent@xmg19" personal \
+    < <(r agent@pc pressure=-; r agent@xmg19 pressure=30)
+places "only the spawn's account" "agent-hl@pc" helferline \
+    < <(r agent@pc pressure=0; r agent-hl@pc account=helferline pressure=5)
+places "only a machine offering every capability the spawn needs" "agent@xmg19" personal gpu docker \
+    < <(r agent@pc offers=docker pressure=0; r agent@xmg19 offers=gpu,docker,x86_64 pressure=5; r agent@laptop offers=gpu)
+places "a machine with no slot count is never placed on" "agent@pc" personal \
+    < <(r max@zephylux slots=- held=- pressure=0; r agent@pc pressure=50)
+places "at one pressure, the machine holding fewer slots first" "agent@xmg19 agent@pc" personal \
+    < <(r agent@pc slots=12 held=10 pressure=2; r agent@xmg19 slots=12 held=9 pressure=2)
+places "a machine without the memory for another worker is passed over" "agent@xmg19" personal \
+    < <(r agent@pc free=1048576 pressure=0; r agent@xmg19 pressure=20)
+places "memory the spawn needs is the most the workers may use" "agent@xmg19" personal mem=16G \
+    < <(r agent@pc most=10485760 pressure=0; r agent@xmg19 most=25165824 pressure=20)
+places "every machine full waits" "exit 3" personal < <(r agent@pc held=6; r agent@xmg19 slots=2 held=2)
+places "a machine whose memory is taken waits" "exit 3" personal < <(r agent@pc free=0)
+places "a host down may take it once back, so the spawn waits" "exit 3" personal gpu < <(r agent@pc state=unreachable)
+places "a host down whose record withholds what the spawn needs never takes it" "exit 1" personal gpu \
+    < <(r agent@pc state=unreachable withholds=gpu)
+places "a capability no host up offers, and none down, is never placed" "exit 1" personal gpu \
+    < <(r agent@pc offers=docker; r max@zephylux slots=- held=- offers=gpu)
+places "an account no record names is never placed" "exit 1" personal < <(r agent-hl@pc account=helferline)
+out=$(r agent@pc; r max@zephylux isolated=false pressure=9)
+check "each host comes with whether it is isolated" "$(printf 'agent@pc\tisolated\nmax@zephylux\tnot isolated')" \
+    "$(run place personal <<<"$out")"
+
+# A reading as `reading` makes it from an up host's answer, placed: the placer reads the fields `reading` writes.
+printf '%s\n' --- 'host: box' 'user: agent' 'isolated: true' 'account: personal' --- >"$scratch/HOST.md"
+printf '%s\n' held=1 slots=6 arch=x86_64 memtotal_kb=16000000 memavail_kb=9000000 pressure=2.50 \
+    'gpu=GeForce|0|460|4096' >"$scratch/up"
+check "an up host's reading names its slots, capabilities, memory and pressure in the placer's order" \
+    "$(printf '%s\t' agent@box box personal true up 1 6 gpu,x86_64 9000000 16000000 2.50)-" \
+    "$(run reading "$scratch/HOST.md" "$scratch/up")"
+check "and the placer places on it" "$(printf 'agent@box\tisolated')" \
+    "$(run reading "$scratch/HOST.md" "$scratch/up" | run place personal gpu)"
 
 # --- one host's record, read from the checkout
 

@@ -8,11 +8,13 @@
     # driver room.
     (import ../agent-user.nix {
       memoryMax = "24G";
+      sessionsReserve = "2G";
+      slots = 8;
       dispatcherKeys = [
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPyy5xWC5my4ZPkc7mUEPKi/SfqdUEeq12pMKo5D/D4p" # zephyrus
       ];
     })
-    ./gpu-queue.nix
+    ../gpu-queue.nix
     ./power-cap.nix
     ./backup-target.nix
     ../host-recorder.nix

@@ -14,12 +14,35 @@
 # host: you read a description when a machine is down and you need to know
 # whether it was the one you wanted.
 #
+# A record's frontmatter names the account its user's claude is logged into
+# (`account:`). A spawn asks for capabilities by name, and a machine's are
+# read off it where they are facts: its architecture (`x86_64`), `gpu`, and
+# `mem=<N>G`, met where the workers may use N GiB. The record adds what no
+# probe tells (`has:`) and keeps back what placement must not offer by itself
+# (`withholds:`). A machine without slots (`host-slots`) is never chosen by
+# placement, only named.
+#
 # Usage:
 #   worker-hosts             every host, with live state
 #   worker-hosts agent@pc    one host's whole record, from the host while it is up
 #   worker-hosts --targets   every user@host, one per line, nothing probed: the
 #                            list itself, for a script that goes to the hosts on
 #                            its own
+#   worker-hosts --place <account> [--needs <capability>]...
+#                            the user@hosts a spawn on <account> with every
+#                            <capability> may start on now, best first. Each
+#                            line is user@host, a tab, and `isolated` or `not
+#                            isolated`. The readings it chose from go to
+#                            stderr. Exit 3: none now, but one may once a
+#                            slot frees or a host is back; 1: none ever
+#                            could.
+#
+# Placement keeps the hosts up on that account that have a slot free, offer
+# every capability asked for, and have 2G free for one more worker. Of those it
+# ranks first the machine whose tasks waited least for a CPU in the last 10 s
+# (/proc/pressure/cpu), then the one holding fewer slots. Load average
+# overstates a machine running many processes that its workers' CPU weights
+# keep responsive; pressure measures how long its tasks waited for a CPU.
 set -uo pipefail
 
 repo="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
@@ -59,8 +82,21 @@ echo "cores=$(nproc)"
 # host-unlock: the login still works, into /, but no worker can run.
 [ -d "$HOME" ] || echo "locked=1"
 awk -F': ' '/^model name/ {print "cpu=" $2; exit}' /proc/cpuinfo
-awk '{print "load5=" $2}' /proc/loadavg
+echo "arch=$(uname -m)"
+awk '$1 == "some" {sub("avg10=", "", $2); print "pressure=" $2}' /proc/pressure/cpu
 awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print "memtotal_kb=" t; print "memavail_kb=" a}' /proc/meminfo
+# Every user's sessions share user.slice's ceiling, the workers' among them.
+users=/sys/fs/cgroup/user.slice
+# Its inactive file cache counts as used, but the kernel reclaims it on demand.
+if grep -qx '[0-9]*' "$users/memory.max" 2>/dev/null; then
+  echo "users_max_kb=$(($(cat "$users/memory.max") / 1024))"
+  inactive=$(awk '$1 == "inactive_file" {print $2}' "$users/memory.stat")
+  echo "users_used_kb=$(( ($(cat "$users/memory.current") - ${inactive:-0}) / 1024 ))"
+  # What a user's slice is protected up to (max's sessions reserve) is never
+  # the workers' to use.
+  cat "$users"/user-*.slice/memory.low 2>/dev/null |
+    awk '/^[0-9]+$/ {s += $1} END {print "users_reserved_kb=" int(s / 1024)}'
+fi
 # The ZFS ARC is evictable but counts as used, so MemAvailable understates a
 # host with a pool by the size of it -- gigabytes, on this one.
 if [ -r /proc/spl/kstat/zfs/arcstats ]; then
@@ -77,6 +113,11 @@ elif command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null |
     awk -F', *' 'NF == 4 && $2 ~ /^[0-9]+$/ {print "gpu=" $1 "|" $2 "|" $3 "|" $4}'
 fi
+echo "claude=$(pgrep -c -x claude -u "$(id -un)")"
+if command -v host-slots >/dev/null 2>&1 && read -r held slots < <(host-slots count); then
+  echo "held=$held"
+  echo "slots=$slots"
+fi
 tmux list-panes -a -F 'worker=#{session_name}|#{pane_current_path}' 2>/dev/null | grep '^worker=dispatch-' | sort -u
 exit 0
 REMOTE
@@ -84,17 +125,113 @@ REMOTE
 # stderr is kept, not discarded: an unauthorized key and a machine that is off
 # both produce no output, and only the error tells you which one you are
 # looking at -- one of them you can fix in a minute.
-probe() { ssh "${ssh_opts[@]}" "$1" bash -s <<<"$remote_probe" > "$2" 2> "$2.err"; }
+probe() { # <record> <result>
+  ssh "${ssh_opts[@]}" "$(target "$1")" bash -s <<<"$remote_probe" > "$2" 2> "$2.err"
+}
+
+# A key's value in a probe's result, `-` where the host gave none.
+answer() { local v; v=$(sed -n "s/^$2=//p" "$1" | head -1); echo "${v:--}"; }
+
+# A worker fits where this much memory is free for workers: a claude's few
+# hundred MB, and room for the checks it runs.
+worker_kb=$((2 * 1048576))
+
+# The capabilities a spawn may ask of this record's host, comma-separated: what
+# the probe read off the machine and the record's has:, less its withholds:.
+capabilities() { # <record> <result>
+  local -a probed=()
+  [ "$(answer "$2" arch)" = - ] || probed+=("$(answer "$2" arch)")
+  ! grep -q '^gpu=' "$2" || probed+=(gpu)
+  printf '%s\n' "${probed[@]}" $(field "$1" has | tr ',' ' ') |
+    grep -vxF -f <(field "$1" withholds | tr ', ' '\n\n' | grep .) | sort -u | paste -sd, -
+}
+
+# The memory free for workers and the most they may use, in KiB: the machine's,
+# the ARC added back, held to what user.slice's ceiling leaves; the most, to
+# that ceiling less what its slices reserve for their own users.
+memory() { # <result>
+  awk -F= '{ v[$1] = $2 }
+    END {
+      free = v["memavail_kb"] + v["arc_kb"]; most = v["memtotal_kb"]
+      if (v["users_max_kb"] != "") {
+        left = v["users_max_kb"] - v["users_used_kb"]
+        if (left < free) free = left
+        ceiling = v["users_max_kb"] - v["users_reserved_kb"]
+        if (ceiling < most) most = ceiling
+      }
+      if (v["memtotal_kb"] == "") print "- -"; else printf "%d %d\n", free < 0 ? 0 : free, most
+    }' "$1"
+}
+
+# What the placer reads of one record, tab-separated: user@host, machine,
+# account, isolated, state (up, locked or unreachable), slots held, slot count,
+# capabilities, memory free for workers and the most they may use (KiB), CPU
+# pressure (avg10), and what the record withholds. A field the host did not
+# answer is `-`.
+reading() { # <record> <result>
+  local state=up
+  if [ ! -s "$2" ]; then state=unreachable; elif grep -qx 'locked=1' "$2"; then state=locked; fi
+  local -a f=("$(target "$1")" "$(field "$1" host)" "$(field "$1" account)" "$(field "$1" isolated)" "$state")
+  if [ "$state" = up ]; then
+    # shellcheck disable=SC2046 # memory gives two fields
+    f+=("$(answer "$2" held)" "$(answer "$2" slots)" "$(capabilities "$1" "$2")" $(memory "$2") "$(answer "$2" pressure)")
+  else
+    f+=(- - "$(capabilities "$1" /dev/null)" - - -)
+  fi
+  f+=("$(field "$1" withholds | tr -d ' ')")
+  local i; for i in "${!f[@]}"; do f[i]=${f[i]:--}; done
+  (IFS=$'\t'; echo "${f[*]}")
+}
+
+# The placer, on the readings on stdin: what `--place` prints and returns.
+# A host that is down may take the spawn once back, unless its record
+# withholds what the spawn needs.
+place() { # <account> [<capability>...]
+  local account=$1 out rc; shift
+  out=$(awk -F'\t' -v account="$account" -v needs="$*" -v worker="$worker_kb" '
+    BEGIN { n = split(needs, need, " ") }
+    $3 != account { next }
+    $5 != "up" {
+      split($12, kept, ","); split("", withheld)
+      for (i in kept) withheld[kept[i]] = 1
+      for (i = 1; i <= n; i++) if (need[i] in withheld) next
+      later = 1; next
+    }
+    $7 !~ /^[0-9]+$/ { next }
+    {
+      split($8, listed, ","); split("", has)
+      for (i in listed) has[listed[i]] = 1
+      for (i = 1; i <= n; i++) {
+        if (need[i] ~ /^mem=[0-9]+G$/) { if ($10 !~ /^[0-9]+$/ || $10 < substr(need[i], 5) * 1048576) next }
+        else if (!(need[i] in has)) next
+      }
+      later = 1
+      if ($6 !~ /^[0-9]+$/ || $6 + 0 >= $7 + 0 || $9 !~ /^[0-9]+$/ || $9 < worker || $11 !~ /^[0-9.]+$/) next
+      printf "%s\t%d\t%s\t%s\n", $11, $6, $1, $4 == "true" ? "isolated" : "not isolated"
+    }
+    END { exit !later }')
+  rc=$?
+  if [ -n "$out" ]; then sort -t $'\t' -k1,1n -k2,2n -k3,3 <<<"$out" | cut -f3,4; return 0; fi
+  [ "$rc" -eq 0 ] && return 3 || return 1
+}
+
+# The readings on stdin, as a person reads them.
+show() {
+  awk -F'\t' '{
+    free = $9 ~ /^[0-9]+$/ ? sprintf("%.1fG", $9 / 1048576) : "-"
+    printf "  %-18s %-11s %-11s %s of %s slots held on %s   cpu %s%% waiting   %s free for workers   offers %s\n",
+      $1, $3, $5, $6, $7, $2, $11, free, $8
+  }'
+}
 
 gib() { awk -v k="${1:-0}" 'BEGIN { g = k / 1048576; printf (g < 10 ? "%.1fG" : "%.0fG"), g }'; }
 
 render() {
   local name=$1 record=$2 result=$3
-  local uptime cores cpu load5 memtotal memavail arc gpu gname gutil gused gtotal workers
+  local cpu free most gpu gname gutil gused gtotal workers slots
 
   if [ -s "$result" ]; then
-    uptime=$(sed -n 's/^uptime=//p' "$result")
-    printf '%s — up %s\n' "$name" "${uptime:-?}"
+    printf '%s — up %s\n' "$name" "$(answer "$result" uptime)"
   else
     printf '%s — unreachable: %s\n' "$name" "$(head -1 "$result.err" 2>/dev/null || echo "no answer")"
   fi
@@ -106,17 +243,12 @@ render() {
     return
   fi
 
-  cores=$(sed -n 's/^cores=//p' "$result")
   # The model as the vendor writes it carries decoration no reader wants.
   cpu=$(sed -n 's/^cpu=//p' "$result" |
     sed 's/(R)//g; s/(TM)//g; s/ [0-9]*-Core Processor//; s/ Processor//; s/ CPU @.*//; s/  */ /g')
-  load5=$(sed -n 's/^load5=//p' "$result")
-  memtotal=$(sed -n 's/^memtotal_kb=//p' "$result")
-  memavail=$(sed -n 's/^memavail_kb=//p' "$result")
-  arc=$(sed -n 's/^arc_kb=//p' "$result")
-  printf '  load %s of %s cores (%s)   mem %s free of %s' \
-    "${load5:-?}" "${cores:-?}" "${cpu:-?}" \
-    "$(gib $(( ${memavail:-0} + ${arc:-0} )))" "$(gib "${memtotal:-0}")"
+  read -r free most < <(memory "$result")
+  printf '  cpu %s%% waiting, %s threads (%s)   mem %s free for workers of %s' \
+    "$(answer "$result" pressure)" "$(answer "$result" cores)" "${cpu:--}" "$(gib "$free")" "$(gib "$most")"
 
   gpu=$(sed -n 's/^gpu=//p' "$result" | head -1)
   if [ "$gpu" = asleep ]; then
@@ -139,24 +271,43 @@ render() {
   workers=$(sed -n 's/^worker=//p' "$result" |
     while IFS='|' read -r session path; do printf '%s (%s), ' "$session" "${path##*/}"; done)
   workers=${workers%, }
-  printf '  workers: %s\n\n' "${workers:-none}"
+  slots=$(answer "$result" slots)
+  if [ "$slots" != - ]; then
+    printf '  workers: %s claude running here; %s of %s slots held on %s\n' "$(answer "$result" claude)" \
+      "$(answer "$result" held)" "$slots" "$(field "$record" host)"
+  else
+    printf '  workers: %s claude running here; %s has no slot count\n' "$(answer "$result" claude)" "$(field "$record" host)"
+  fi
+  printf '  offers: %s\n' "$(capabilities "$record" "$result" | sed 's/,/, /g')"
+  printf '  sessions: %s\n\n' "${workers:-none}"
 }
+
+# Sourced, as the checks source it, it defines the functions above and runs nothing.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
 host=""
 targets_only=false
+account=""
+needs=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --targets) targets_only=true ;;
+    --place) account=${2:-}; [ -n "$account" ] || die "--place takes the account a record names"; shift ;;
+    --needs)
+      [[ ${2:-} =~ ^([a-z0-9_-]+|mem=[0-9]+G)$ ]] || die "--needs takes a capability: a word, or mem=<N>G"
+      needs+=("$2"); shift ;;
     -*) die "unknown argument: $1" ;;
     *) [ -z "$host" ] || die "one host at a time: $host, $1"; host=$1 ;;
   esac
   shift
 done
 
+[ -n "$account" ] || [ ${#needs[@]} -eq 0 ] || die "--needs goes with --place"
+[ -z "$account" ] || [ -z "$host" ] || die "--place takes no host"
+
 records=("$hosts_dir"/*/HOST.md)
 [ -e "${records[0]}" ] || die "no worker hosts: nothing matches $hosts_dir/*/HOST.md"
-
 if $targets_only; then
   [ -z "$host" ] || die "--targets takes no host"
   for record in "${records[@]}"; do target "$record"; done
@@ -186,9 +337,20 @@ trap 'rm -rf "$results"' EXIT
 # Keyed by the record's own directory, not by the machine it names: two records
 # on one machine would otherwise be handed each other's answers.
 for record in "${records[@]}"; do
-  probe "$(target "$record")" "$results/$(basename "$(dirname "$record")")" &
+  probe "$record" "$results/$(basename "$(dirname "$record")")" &
 done
 wait
+
+if [ -n "$account" ]; then
+  readings=$(for record in "${records[@]}"; do reading "$record" "$results/$(basename "$(dirname "$record")")"; done)
+  { echo "worker-hosts: placing from these readings:"; show <<<"$readings"; } >&2
+  place "$account" "${needs[@]}" <<<"$readings"
+  case $? in
+    0) exit 0 ;;
+    3) echo "worker-hosts: no host on account $account${needs[0]:+ that offers ${needs[*]}} can take a worker now; the readings above say why" >&2; exit 3 ;;
+    *) echo "worker-hosts: no host on account $account${needs[0]:+ that offers ${needs[*]}} counts slots; the readings above say why" >&2; exit 1 ;;
+  esac
+fi
 
 for record in "${records[@]}"; do
   render "$(target "$record")" "$record" "$results/$(basename "$(dirname "$record")")"
