@@ -1,0 +1,171 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "wa-crypt-tools"]
+# ///
+"""Drive how bin/whatsapp-chat reads a decrypted WhatsApp database. Run it directly; no framework.
+
+The promises here: a person is called by their address-book name whichever way the number
+was saved, else by the name they set in WhatsApp, else by their full number, and never by
+the masked number WhatsApp shows for strangers when the full one is known; a chat is found
+by id or by name, an exact name winning over a partial one, and a name matching several
+chats exits 2; a chat prints oldest first, cut to the newest messages or to a start time,
+without system notices, with replies and media named.
+
+The database is a fixture built here with only the columns the script reads, in the
+shape of a 2.26 backup. Copying from the phone and decrypting are not covered.
+"""
+
+import io
+import sqlite3
+import sys
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import bin_module, check, finish  # noqa: E402
+
+wc = bin_module("whatsapp-chat")
+
+SCHEMA = """
+create table jid (_id integer primary key, user text, server text);
+create table jid_map (lid_row_id integer primary key, jid_row_id integer);
+create table lid_display_name (lid_row_id integer primary key, display_name text);
+create table chat (_id integer primary key, jid_row_id integer, subject text);
+create table message (_id integer primary key, chat_row_id integer, from_me integer, sender_jid_row_id integer,
+                      timestamp integer, message_type integer, text_data text, sort_id integer);
+create table message_media (message_row_id integer primary key, raw_transcription_text text);
+create table message_quoted (message_row_id integer primary key, from_me integer, sender_jid_row_id integer,
+                             message_type integer, text_data text);
+"""
+
+
+def ms(stamp: str) -> int:
+    return int(datetime.fromisoformat(stamp).timestamp() * 1000)
+
+
+def fixture() -> sqlite3.Connection:
+    db = sqlite3.connect(":memory:")
+    db.executescript(SCHEMA)
+    db.executemany(
+        "insert into jid values (?, ?, ?)",
+        [
+            (1, "436601111111", "s.whatsapp.net"),  # Anna: in the address book
+            (2, "436602222222", "s.whatsapp.net"),  # Ben: a WhatsApp name only, reached through his lid
+            (3, "436603333333", "s.whatsapp.net"),  # Cleo: masked name, number known
+            (11, "900000000000002", "lid"),
+            (12, "900000000000003", "lid"),
+            (13, "900000000000004", "lid"),  # Dan: lid only, masked name
+            (20, "120363000000000001", "g.us"),
+            (21, "120363000000000002", "g.us"),
+        ],
+    )
+    db.executemany("insert into jid_map values (?, ?)", [(11, 2), (12, 3)])
+    db.executemany(
+        "insert into lid_display_name values (?, ?)",
+        [(11, "Ben B"), (12, "+43∙∙∙∙∙∙∙∙33"), (13, "+49∙∙∙∙∙∙∙∙44")],
+    )
+    db.executemany(
+        "insert into chat values (?, ?, ?)",
+        [(100, 1, None), (101, 2, None), (102, 20, "Hikers"), (103, 21, "Hikers Vienna"), (104, 3, None)],
+    )
+    messages = [
+        # Anna's DM
+        (1, 100, 0, None, ms("2026-10-01T09:00"), 0, "first line\nsecond line", 1),
+        (2, 100, 1, None, ms("2026-10-02T09:00"), 0, "hi back", 2),
+        (3, 100, 0, None, ms("2026-10-03T09:00"), 1, "a caption", 3),
+        (4, 100, 0, None, ms("2026-10-04T09:00"), 2, None, 4),
+        (5, 100, 0, None, ms("2026-10-05T09:00"), 99, None, 5),
+        # the group
+        (10, 102, 0, None, ms("2026-10-01T10:00"), 7, None, 10),
+        (11, 102, 0, 11, ms("2026-10-01T10:01"), 0, "from ben", 11),
+        (12, 102, 0, 13, ms("2026-10-01T10:02"), 0, "from dan", 12),
+        (13, 102, 1, None, ms("2026-10-01T10:03"), 0, "agreed", 13),
+        (14, 103, 0, 12, ms("2026-09-01T10:00"), 0, "other group", 14),
+        (15, 101, 0, None, ms("2026-08-01T10:00"), 0, "ben's dm", 15),
+        (16, 104, 0, None, ms("2026-07-01T10:00"), 0, "cleo's dm", 16),
+    ]
+    db.executemany("insert into message values (?, ?, ?, ?, ?, ?, ?, ?)", messages)
+    db.execute("insert into message_media values (4, 'what was said')")
+    db.execute("insert into message_quoted values (13, 0, 11, 0, 'from ben, quoted')")
+    return db
+
+
+def run(fn, *args) -> tuple[str, str, int | None]:
+    out, err = io.StringIO(), io.StringIO()
+    code = None
+    with redirect_stdout(out), redirect_stderr(err):
+        try:
+            fn(*args)
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else 1
+    return out.getvalue(), err.getvalue(), code
+
+
+db = fixture()
+book = {wc.number(n): name for n, name in [("+43 660 1111111", "Anna")]}
+names = wc.Names(db, book)
+
+# --- names
+check("an address-book number with a + reads as written", "436601111111", wc.number("+43 660 1111111"))
+check("an address-book number with 00 drops it", "436601111111", wc.number("0043 660 1111111"))
+check("an address-book number with a leading 0 gets the home country code", "436601111111", wc.number("0660/1111111"))
+check("a person in the address book has that name", "Anna", names(1))
+check("a person with only a WhatsApp name has it, reached through the lid map", "Ben B", names(2))
+check("the same person addressed by lid has the same name", "Ben B", names(11))
+check("a masked WhatsApp name loses to the full number", "+436603333333", names(12))
+check("a lid with no number keeps its masked name", "+49∙∙∙∙∙∙∙∙44", names(13))
+check("a group is its subject", "Hikers", names(20))
+
+# --- picking a chat
+every = wc.chats(db, names)
+check("chats run most recent first, empty of system notices",
+      [(100, 5), (102, 3), (103, 1), (101, 1), (104, 1)], [(c.id, c.messages) for c in every])
+check("a chat is found by its id", 104, wc.pick_chat(db, names, "104").id)
+check("an exact name wins over a partial match", 102, wc.pick_chat(db, names, "hikers").id)
+check("part of a name finds the one chat holding it", 103, wc.pick_chat(db, names, "vienna").id)
+_, err, code = run(wc.pick_chat, db, names, "e")
+check("a name matching several chats exits 2", 2, code)
+check("and lists them", True, "Hikers Vienna" in err and "Ben B" in err)
+_, _, code = run(wc.pick_chat, db, names, "nobody")
+check("a name matching nothing exits 1", 1, code)
+
+# --- printing a chat
+anna = wc.pick_chat(db, names, "anna")
+out, _, _ = run(wc.print_chat, db, names, anna, 0, None)
+check(
+    "a chat prints oldest first, its media named, a voice note by what was said",
+    [
+        "[2026-10-01 09:00] Anna: first line",
+        "    second line",
+        "[2026-10-02 09:00] me: hi back",
+        "[2026-10-03 09:00] Anna: [image] a caption",
+        "[2026-10-04 09:00] Anna: [audio] what was said",
+        "[2026-10-05 09:00] Anna: [type 99]",
+    ],
+    out.splitlines(),
+)
+out, _, _ = run(wc.print_chat, db, names, anna, 2, None)
+check("--last keeps the newest messages", ["[2026-10-04 09:00]", "[2026-10-05 09:00]"], [line[:18] for line in out.splitlines()])
+out, _, _ = run(wc.print_chat, db, names, anna, 0, datetime.fromisoformat("2026-10-03T09:00"))
+check("--since keeps what was sent from then on", 3, len(out.splitlines()))
+out, _, _ = run(wc.print_chat, db, names, wc.pick_chat(db, names, "102"), 0, None)
+check(
+    "a group names each sender and the one replied to, without system notices",
+    [
+        "[2026-10-01 10:01] Ben B: from ben",
+        "[2026-10-01 10:02] +49∙∙∙∙∙∙∙∙44: from dan",
+        '[2026-10-01 10:03] me (replying to Ben B: "from ben, quoted"): agreed',
+    ],
+    out.splitlines(),
+)
+
+# --- --since
+check("an age counts back from now", True, abs((datetime.now() - wc.since("2h")).total_seconds() - 7200) < 5)
+check("a date is its midnight", datetime(2026, 10, 1), wc.since("2026-10-01"))
+_, err, code = run(wc.since, "yesterday")
+check("anything else is refused", 1, code)
+
+finish()
