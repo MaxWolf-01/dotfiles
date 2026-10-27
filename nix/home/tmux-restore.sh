@@ -21,6 +21,9 @@ if [ ! -s "$last" ]; then
     done
 fi
 [ -s "$last" ] || exit 0
+# The save this restore types its resumes from, which a save a minute on no longer holds where a resume failed:
+# tmux-resume-restored.sh types them again from it.
+ln -sfn "$(readlink "$last")" "$dir/restored"
 
 # Session "0" exists only during restore; the save skips while it is present.
 "$tmux" new-session -d -s 0 -x "$cols" -y "$lines"

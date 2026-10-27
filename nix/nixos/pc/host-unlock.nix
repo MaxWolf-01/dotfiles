@@ -55,8 +55,8 @@ let
           sudo /run/current-system/sw/bin/host-unlock-zfs "''${2:-}"
           ;;
         finish)
-          systemctl --user start --no-block backup-catchup.target
-          echo "pc: unlocked, backups catching up"
+          systemctl --user start --no-block tmux-resume-restored.service backup-catchup.target
+          echo "pc: unlocked, sessions resuming, backups catching up"
           ;;
         *)
           echo "usage: host-unlock-receive age-key|ssh-key|zfs <dataset>|finish, the secret on stdin" >&2
