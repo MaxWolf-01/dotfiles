@@ -6,6 +6,12 @@ let
     exec ${pkgs.bash}/bin/bash ${./tmux-restore.sh} ${tmux} "$HOME/.tmux/resurrect" "$@"
   '';
 
+  # Tested by tests/tmux-restore.test.
+  tmuxResumeRestored = pkgs.writeShellScript "tmux-resume-restored" ''
+    PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.gawk ]}
+    exec ${pkgs.bash}/bin/bash ${./tmux-resume-restored.sh} ${tmux} "$HOME/.tmux/resurrect"
+  '';
+
   tms = pkgs.writeShellScriptBin "tms" ''
     if [ -z "$1" ] || [ "$1" = "0" ]; then
       echo "Usage: tms <session-name> (name '0' is reserved)"
@@ -60,6 +66,16 @@ in
       ExecStart = "${tmuxRestore} 200 50";
     };
     Install.WantedBy = [ "default.target" ];
+  };
+
+  # What host-unlock-receive's finish starts on pc, once the account tokens can be read (tmux-resume-restored.sh).
+  config.systemd.user.services.tmux-resume-restored = lib.mkIf config.tmuxServer.atBoot {
+    Unit.Description = "Resume the Claude Code sessions the boot's restore could not";
+    Service = {
+      Type = "oneshot";
+      Environment = [ "TMUX_TMPDIR=%t" ];
+      ExecStart = toString tmuxResumeRestored;
+    };
   };
 
   # Systemd timer for tmux session auto-save (more reliable than continuum)
