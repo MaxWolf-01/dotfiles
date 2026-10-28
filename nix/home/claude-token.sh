@@ -17,9 +17,13 @@
 #            switched.
 #
 # An account's token is CLAUDE_CODE_OAUTH_TOKEN in
-# secrets/creds/env/claude-<account>.env, and reaches claude in that variable. A
-# token inherited from the caller is dropped first, so a session started from
-# another account's shell never runs on that account's token.
+# secrets/creds/env/claude-<account>.env, and reaches claude in that variable,
+# with the account's name in CLAUDE_ACCOUNT, which claude's hooks inherit: the
+# mx plugin's session-page hook names the session's account from it. Where
+# claude gets no token, it runs on the profile's own login and gets no
+# CLAUDE_ACCOUNT either. Both are dropped from the caller's environment first,
+# so a session started from another account's shell never runs on, or is named
+# for, that account.
 #
 # The real claude is the next one on PATH after this wrapper, and is exec'd,
 # so it keeps the pid the caller started: tmux-save finds a session's pane by
@@ -48,7 +52,7 @@ if [ -z "$real" ]; then
     exit 127
 fi
 
-unset CLAUDE_CODE_OAUTH_TOKEN
+unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_ACCOUNT
 account=""
 switched=""
 case $mode in
@@ -80,7 +84,7 @@ if [ -n "$account" ] && [ -f "$file" ]; then
         exit 1
     fi
     token=$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' <<<"$plain")
-    [ -z "$token" ] || export CLAUDE_CODE_OAUTH_TOKEN=$token
+    [ -z "$token" ] || export CLAUDE_CODE_OAUTH_TOKEN=$token CLAUDE_ACCOUNT=$account
 fi
 if [ -n "$switched" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
     echo "claude: \`claude-account\` switched this laptop to '$switched', which has no token in $file; \`claude-account off\` goes back to each profile's own login" >&2
