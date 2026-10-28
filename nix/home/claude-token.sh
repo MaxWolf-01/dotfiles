@@ -18,11 +18,12 @@
 #
 # An account's token is CLAUDE_CODE_OAUTH_TOKEN in
 # secrets/creds/env/claude-<account>.env, and reaches claude in that variable,
-# with the account's name in CLAUDE_ACCOUNT, which claude's hooks inherit (the
-# session page names it). Where claude gets no token, it runs on the profile's
-# own login and gets no CLAUDE_ACCOUNT either. Both are dropped from the caller's
-# environment first, so a session started from another account's shell never
-# runs on, or is named for, that account.
+# with the account's name in CLAUDE_ACCOUNT, which claude's hooks inherit: the
+# mx plugin's session-page hook names the session's account from it. Where
+# claude gets no token, it runs on the profile's own login and gets no
+# CLAUDE_ACCOUNT either. Both are dropped from the caller's environment first,
+# so a session started from another account's shell never runs on, or is named
+# for, that account.
 #
 # The real claude is the next one on PATH after this wrapper, and is exec'd,
 # so it keeps the pid the caller started: tmux-save finds a session's pane by
