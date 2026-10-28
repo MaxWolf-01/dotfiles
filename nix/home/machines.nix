@@ -98,14 +98,14 @@ let
         type = types.listOf step;
         default = [ ];
         description = ''
-          What it keeps locked after a boot, as the steps `host-unlock <name>`
+          What it keeps locked after a boot, as the steps `hosts unlock <name>`
           runs in order to open it; none where nothing is locked. Each host's
           receiving end is its host-unlock-receive.'';
       };
       timers = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "The file of its timers, from the repo's root, whose restic backups it runs (bin/backup-hosts).";
+        description = "The file of its timers, from the repo's root, whose restic backups it runs (`hosts backups`).";
       };
       workers = mkOption {
         type = types.listOf worker;

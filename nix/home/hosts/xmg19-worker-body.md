@@ -33,6 +33,6 @@ or a script written for another host's PATH has to be given here.
 ## After a reboot
 
 xmg19's `/home`, this user's home with it, stays locked after every boot until
-`host-unlock xmg19` on zephylux opens it, and no worker can run until then.
-When `worker-hosts` shows xmg19's `/home` locked, or cannot read this record,
-the orchestrator runs `host-unlock xmg19`.
+`hosts unlock xmg19` on zephylux opens it, and no worker can run until then.
+When `hosts` shows xmg19's `/home` locked, or cannot read this record,
+the orchestrator runs `hosts unlock xmg19`.

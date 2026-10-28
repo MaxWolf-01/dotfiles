@@ -1,0 +1,547 @@
+#!/usr/bin/env bash
+# Every machine max runs and the worker users dispatch sends workers to: what
+# each is for, its state, and what it is carrying now; and the acts on them.
+#
+# Usage:
+#   hosts                    every worker user, with its machine's live state
+#   hosts --watch            the same, redrawn every 10 s until interrupted
+#   hosts --json             the readings placement decides from, as JSON, with
+#                            each worker user's description; with --watch, one
+#                            line of JSON every 10 s
+#   hosts <user@host>        one worker user's whole record, from the host while
+#                            it is up
+#   hosts <host>             the record of each worker user on that machine
+#   hosts unlock <host>      unlock what <host> keeps locked after a boot
+#   hosts place <account> [--needs <capability>]...
+#                            the user@hosts a spawn on <account> with every
+#                            <capability> may start on now, best first. Each
+#                            line is user@host, a tab, and `isolated` or `not
+#                            isolated`. The readings it chose from go to
+#                            stderr. Exit 3: none now, but one may once a
+#                            slot frees or a host is back; 1: none ever
+#                            could.
+#   hosts targets [--json]   every user@host, one per line, nothing probed: the
+#                            list itself, for a script that goes to the hosts on
+#                            its own. --json gives each with its account.
+#   hosts backups            which machine runs which restic backup: one
+#                            `<unit><TAB><host>` line per unit, sorted
+#
+# The list is nix/home/machines.nix, which Home Manager writes out as
+# ~/.config/machines.json (MACHINES_FILE points elsewhere). A machine carrying
+# two worker users (pc) appears twice, once per account, each line showing
+# that user's workers.
+#
+# Probes run in parallel with a connect timeout, so an unreachable host costs
+# that timeout and delays none of the others. Its description still prints,
+# which is why the record's hand-written half lives in the checkout,
+# nix/home/hosts/<host>-<user>/HOST.md, and not only on the host: you read a
+# description when a machine is down and you need to know whether it was the
+# one you wanted.
+#
+# A worker user's entry names the account its claude is logged into
+# (`account`). One that names none (max@zephylux) runs a worker on the
+# dispatcher's own profile, so it takes a spawn on any account, but only from
+# a dispatcher on that machine. A spawn asks for capabilities by name, and a machine's are
+# read off it where they are facts: its architecture (`x86_64`), `gpu`, and
+# `mem=<N>G`, met where the workers may use N GiB. The entry adds what no
+# probe tells (`has`) and keeps back what placement must not offer by itself
+# (`withholds`). A machine without slots (`host-slots`) is never chosen by
+# placement, only named; an entry that says `placement = "last"` (the laptop) is
+# chosen only when no other host can take the spawn.
+#
+# Placement keeps the hosts up on that account that have a slot free, offer
+# every capability asked for, and have 2G free for one more worker. Of those it
+# ranks a `placement = "last"` entry after every other, then first the machine
+# whose tasks waited least for a CPU in the last 10 s (/proc/pressure/cpu),
+# then the one holding fewer slots. Load average
+# overstates a machine running many processes that its workers' CPU weights
+# keep responsive; pressure measures how long its tasks waited for a CPU.
+#
+# An unlock runs the steps its machine's entry gives (`unlock`) in order, run
+# on zephylux, which holds the secrets: each a command on the host over ssh,
+# handed a secret from secrets/creds/raw/ or the age key on stdin. Safe to run
+# again: whatever is already unlocked is left as it is.
+#
+# A backup repository is judged by the age of its newest snapshot, so when its
+# target is away the only evidence left is the run log of the machine that
+# makes the backup, and only the timer file its entry names (`timers`) says
+# which machine that is. bin/overdue-check reads `hosts backups` for that.
+set -uo pipefail
+
+repo="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
+hosts_dir="$repo/nix/home/hosts"
+machines="${MACHINES_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/machines.json}"
+# Trust on first use, as common.nix grants it per host: these are tailnet
+# addresses, so a first connection is already inside WireGuard. Without it a
+# machine that has never reached the host reports it down rather than new.
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+watch_seconds=10
+
+usage() { sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//;$d'; }
+die() { echo "hosts: $1" >&2; exit 2; }
+
+need_machines() {
+  [ -r "$machines" ] || die "no machines list at $machines; Home Manager writes it (nix/home/machines.nix)"
+}
+
+# Every worker user's entry, one JSON object per line, its machine's name as `host`.
+entries() { jq -c '.[] | .name as $host | .workers[] | . + {host: $host}' "$machines"; }
+
+# A field of a worker user's entry, a list joined by commas; nothing where it is unset.
+field() {
+  jq -r --arg k "$2" '.[$k] | if . == null then empty elif type == "array" then join(",") else tostring end' <<<"$1"
+}
+
+# The worker user's name, and the ssh target: user@host.
+target() { echo "$(field "$1" user)@$(field "$1" host)"; }
+
+# The hand-written half of its record.
+record_file() { echo "$hosts_dir/$(field "$1" host)-$(field "$1" user)/HOST.md"; }
+
+# The paragraph under the title: what the machine is for, in its owner's words.
+lead() {
+  awk '
+    NR == 1 && $0 == "---" { fm = 1; next }
+    fm { if ($0 == "---") fm = 0; next }
+    /^# / { started = 1; next }
+    started && NF == 0 && body != "" { exit }
+    started && NF > 0 { body = body (body == "" ? "" : " ") $0 }
+    END { print body }
+  ' "$1"
+}
+
+# Runs on the host, one round trip. Everything the renderer needs comes back as
+# key=value lines, so a field a host cannot answer is simply absent from them.
+read -r -d '' remote_probe <<'REMOTE'
+awk '{d = int($1 / 86400); h = int(($1 % 86400) / 3600); print "uptime=" d "d " h "h"}' /proc/uptime
+echo "cores=$(nproc)"
+# A home on a volume of its own that no boot opens (xmg19's) is missing until
+# `hosts unlock`: the login still works, into /, but no worker can run.
+[ -d "$HOME" ] || echo "locked=1"
+awk -F': ' '/^model name/ {print "cpu=" $2; exit}' /proc/cpuinfo
+echo "arch=$(uname -m)"
+awk '$1 == "some" {sub("avg10=", "", $2); print "pressure=" $2}' /proc/pressure/cpu
+awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print "memtotal_kb=" t; print "memavail_kb=" a}' /proc/meminfo
+# Every user's sessions share user.slice's ceiling, the workers' among them.
+users=/sys/fs/cgroup/user.slice
+# Its inactive file cache counts as used, but the kernel reclaims it on demand.
+if grep -qx '[0-9]*' "$users/memory.max" 2>/dev/null; then
+  echo "users_max_kb=$(($(cat "$users/memory.max") / 1024))"
+  inactive=$(awk '$1 == "inactive_file" {print $2}' "$users/memory.stat")
+  echo "users_used_kb=$(( ($(cat "$users/memory.current") - ${inactive:-0}) / 1024 ))"
+  # What a user's slice is protected up to (max's sessions reserve) is never
+  # the workers' to use.
+  cat "$users"/user-*.slice/memory.low 2>/dev/null |
+    awk '/^[0-9]+$/ {s += $1} END {print "users_reserved_kb=" int(s / 1024)}'
+fi
+# The ZFS ARC is evictable but counts as used, so MemAvailable understates a
+# host with a pool by the size of it -- gigabytes, on this one.
+if [ -r /proc/spl/kstat/zfs/arcstats ]; then
+  awk '$1 == "size" {print "arc_kb=" int($3 / 1024)}' /proc/spl/kstat/zfs/arcstats
+fi
+# The filesystems a worker writes to, rather than the machine's disks: a pool
+# this user cannot reach never appears, and nothing here has to know that.
+df -P -h "$HOME" /tmp | awk 'NR > 1 && !seen[$1]++ {print "df=" $6 "|" $4 "|" $2}'
+# Asking the driver wakes a GPU that has powered itself off (xmg19's), so one
+# that has is reported asleep, unasked.
+if grep -qsx suspended /sys/bus/pci/drivers/nvidia/0000:*/power/runtime_status; then
+  echo "gpu=asleep"
+elif command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null |
+    awk -F', *' 'NF == 4 && $2 ~ /^[0-9]+$/ {print "gpu=" $1 "|" $2 "|" $3 "|" $4}'
+fi
+echo "claude=$(pgrep -c -x claude -u "$(id -un)")"
+if command -v host-slots >/dev/null 2>&1 && read -r held slots < <(host-slots count); then
+  echo "held=$held"
+  echo "slots=$slots"
+fi
+tmux list-panes -a -F 'worker=#{session_name}|#{pane_current_path}' 2>/dev/null | grep '^worker=dispatch-' | sort -u
+exit 0
+REMOTE
+
+# stderr is kept, not discarded: an unauthorized key and a machine that is off
+# both produce no output, and only the error tells you which one you are
+# looking at -- one of them you can fix in a minute.
+probe() { # <entry> <result>
+  ssh "${ssh_opts[@]}" "$(target "$1")" bash -s <<<"$remote_probe" > "$2" 2> "$2.err"
+}
+
+# Probes every entry in parallel, each result in <dir>/<user@host>.
+probe_all() { # <dir> <entry>...
+  local dir=$1 entry; shift
+  for entry; do probe "$entry" "$dir/$(target "$entry")" & done
+  wait
+}
+
+# A key's value in a probe's result, `-` where the host gave none.
+answer() { local v; v=$(sed -n "s/^$2=//p" "$1" | head -1); echo "${v:--}"; }
+
+# A worker fits where this much memory is free for workers: a claude's few
+# hundred MB, and room for the checks it runs.
+worker_kb=$((2 * 1048576))
+
+# The capabilities a spawn may ask of this worker user's host, comma-separated:
+# what the probe read off the machine and the entry's has, less its withholds.
+capabilities() { # <entry> <result>
+  local -a probed=()
+  [ "$(answer "$2" arch)" = - ] || probed+=("$(answer "$2" arch)")
+  ! grep -q '^gpu=' "$2" || probed+=(gpu)
+  printf '%s\n' "${probed[@]}" $(field "$1" has | tr ',' ' ') |
+    grep -vxF -f <(field "$1" withholds | tr ', ' '\n\n' | grep .) | sort -u | paste -sd, -
+}
+
+# The memory free for workers and the most they may use, in KiB: the machine's,
+# the ARC added back, held to what user.slice's ceiling leaves; the most, to
+# that ceiling less what its slices reserve for their own users.
+memory() { # <result>
+  awk -F= '{ v[$1] = $2 }
+    END {
+      free = v["memavail_kb"] + v["arc_kb"]; most = v["memtotal_kb"]
+      if (v["users_max_kb"] != "") {
+        left = v["users_max_kb"] - v["users_used_kb"]
+        if (left < free) free = left
+        ceiling = v["users_max_kb"] - v["users_reserved_kb"]
+        if (ceiling < most) most = ceiling
+      }
+      if (v["memtotal_kb"] == "") print "- -"; else printf "%d %d\n", free < 0 ? 0 : free, most
+    }' "$1"
+}
+
+# What the placer, the view and --json read of one worker user, tab-separated:
+# user@host, machine, account, isolated, state (up, locked or unreachable),
+# slots held, slot count, capabilities, memory free for workers and the most
+# they may use (KiB), CPU pressure (avg10), what its entry withholds, and its
+# placement. A field the host did not answer is `-`.
+reading() { # <entry> <result>
+  local state=up
+  if [ ! -s "$2" ]; then state=unreachable; elif grep -qx 'locked=1' "$2"; then state=locked; fi
+  local -a f=("$(target "$1")" "$(field "$1" host)" "$(field "$1" account)" "$(field "$1" isolated)" "$state")
+  if [ "$state" = up ]; then
+    # shellcheck disable=SC2046 # memory gives two fields
+    f+=("$(answer "$2" held)" "$(answer "$2" slots)" "$(capabilities "$1" "$2")" $(memory "$2") "$(answer "$2" pressure)")
+  else
+    f+=(- - "$(capabilities "$1" /dev/null)" - - -)
+  fi
+  f+=("$(field "$1" withholds | tr -d ' ')" "$(field "$1" placement)")
+  local i; for i in "${!f[@]}"; do f[i]=${f[i]:--}; done
+  (IFS=$'\t'; echo "${f[*]}")
+}
+
+# The placer, on the readings on stdin: what `hosts place` prints and returns.
+# A host that is down may take the spawn once back, unless its entry
+# withholds what the spawn needs.
+place() { # <account> [<capability>...]
+  local account=$1 out rc; shift
+  out=$(awk -F'\t' -v account="$account" -v needs="$*" -v worker="$worker_kb" -v here="$(id -un)@$(uname -n)" '
+    BEGIN { n = split(needs, need, " ") }
+    $3 != account && !($3 == "-" && $1 == here) { next }
+    $5 != "up" {
+      split($12, kept, ","); split("", withheld)
+      for (i in kept) withheld[kept[i]] = 1
+      for (i = 1; i <= n; i++) if (need[i] in withheld) next
+      later = 1; next
+    }
+    $7 !~ /^[0-9]+$/ { next }
+    {
+      split($8, listed, ","); split("", has)
+      for (i in listed) has[listed[i]] = 1
+      for (i = 1; i <= n; i++) {
+        if (need[i] ~ /^mem=[0-9]+G$/) { if ($10 !~ /^[0-9]+$/ || $10 < substr(need[i], 5) * 1048576) next }
+        else if (!(need[i] in has)) next
+      }
+      later = 1
+      if ($6 !~ /^[0-9]+$/ || $6 + 0 >= $7 + 0 || $9 !~ /^[0-9]+$/ || $9 < worker || $11 !~ /^[0-9.]+$/) next
+      printf "%d\t%s\t%d\t%s\t%s\n", $13 == "last", $11, $6, $1, $4 == "true" ? "isolated" : "not isolated"
+    }
+    END { exit !later }')
+  rc=$?
+  if [ -n "$out" ]; then sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4 <<<"$out" | cut -f4,5; return 0; fi
+  [ "$rc" -eq 0 ] && return 3 || return 1
+}
+
+# The readings on stdin, one line each, as the placer shows what it chose from.
+show() {
+  awk -F'\t' '{
+    free = $9 ~ /^[0-9]+$/ ? sprintf("%.1fG", $9 / 1048576) : "-"
+    printf "  %-18s %-11s %-11s %s of %s slots held on %s   cpu %s%% waiting   %s free for workers   offers %s\n",
+      $1, $3, $5, $6, $7, $2, $11, free, $8
+  }'
+}
+
+# The readings on stdin, each followed by a tab and its worker user's
+# description, as a JSON array: `-` is null, numbers are numbers, lists are lists.
+readings_json() {
+  jq -Rn '
+    def num: if . == null then null else tonumber end;
+    def list: if . == null then [] else split(",") end;
+    [inputs | split("\t") | map(if . == "-" or . == "" then null else . end) | {
+      target: .[0], host: .[1], account: .[2],
+      isolated: (if .[3] == null then null else .[3] == "true" end),
+      state: .[4], slots_held: (.[5] | num), slots: (.[6] | num), offers: (.[7] | list),
+      free_kb: (.[8] | num), most_kb: (.[9] | num), cpu_pressure: (.[10] | num),
+      withholds: (.[11] | list), placement: .[12], description: .[13]
+    }]'
+}
+
+gib() { awk -v k="${1:-0}" 'BEGIN { g = k / 1048576; printf (g < 10 ? "%.1fG" : "%.0fG"), g }'; }
+
+# One worker user as a person reads it: its state, slots, memory, pressure and
+# offers from its reading, so it never shows what placement would read
+# otherwise; the rest (uptime, CPU model, GPU, disks, sessions) from the probe.
+render() { # <reading> <entry> <result>
+  local entry=$2 result=$3
+  local -a r
+  IFS=$'\t' read -r -a r <<<"$1"
+  local name=${r[0]} host=${r[1]} state=${r[4]} held=${r[5]} slots=${r[6]} offers=${r[7]}
+  local free=${r[8]} most=${r[9]} pressure=${r[10]}
+  local cpu gpu gname gutil gused gtotal sessions
+
+  if [ "$state" = unreachable ]; then
+    printf '%s — unreachable: %s\n' "$name" "$(head -1 "$result.err" 2>/dev/null || echo "no answer")"
+  else
+    printf '%s — up %s\n' "$name" "$(answer "$result" uptime)"
+  fi
+
+  lead "$(record_file "$entry")" | fmt -w 76 | sed 's/^/  /'
+  case $state in
+    unreachable) echo; return ;;
+    locked) printf '  /home locked: no worker can run until `hosts unlock %s` on zephylux\n\n' "$host"; return ;;
+  esac
+
+  # The model as the vendor writes it carries decoration no reader wants.
+  cpu=$(sed -n 's/^cpu=//p' "$result" |
+    sed 's/(R)//g; s/(TM)//g; s/ [0-9]*-Core Processor//; s/ Processor//; s/ CPU @.*//; s/  */ /g')
+  printf '  cpu %s%% waiting, %s threads (%s)   mem %s free for workers of %s' \
+    "$pressure" "$(answer "$result" cores)" "${cpu:--}" "$(gib "${free/-/0}")" "$(gib "${most/-/0}")"
+
+  gpu=$(sed -n 's/^gpu=//p' "$result" | head -1)
+  if [ "$gpu" = asleep ]; then
+    printf '   gpu asleep'
+  elif [ -n "$gpu" ]; then
+    IFS='|' read -r gname gutil gused gtotal <<<"$gpu"
+    gname=${gname#NVIDIA }
+    printf '   gpu %s %s%%, %s free' "$gname" "$gutil" "$(gib $(( (gtotal - gused) * 1024 )))"
+  fi
+  echo
+
+  printf '  disk'
+  sed -n 's/^df=//p' "$result" | while IFS='|' read -r mount avail size; do
+    printf '   %s %s free of %s' "$mount" "$avail" "$size"
+  done
+  echo
+
+  # The worktree directory names the repo, feature and ticket a session is on,
+  # which its name alone does not on a host shared by several dispatchers.
+  sessions=$(sed -n 's/^worker=//p' "$result" |
+    while IFS='|' read -r session path; do printf '%s (%s), ' "$session" "${path##*/}"; done)
+  sessions=${sessions%, }
+  if [ "$slots" != - ]; then
+    printf '  workers: %s claude running here; %s of %s slots held on %s\n' "$(answer "$result" claude)" \
+      "$held" "$slots" "$host"
+  else
+    printf '  workers: %s claude running here; %s has no slot count\n' "$(answer "$result" claude)" "$host"
+  fi
+  printf '  offers: %s\n' "${offers//,/, }"
+  printf '  sessions: %s\n\n' "${sessions:-none}"
+}
+
+# --- the commands
+
+# Every worker user probed once: the view, or with --json the readings.
+view() { # json|text <entry>...
+  local how=$1 entry; shift
+  # Set here, not once for the script: --watch runs this in a subshell of its own.
+  results=$(mktemp -d)
+  trap 'rm -rf "$results"' EXIT
+  probe_all "$results" "$@"
+  for entry; do
+    local result="$results/$(target "$entry")" r
+    r=$(reading "$entry" "$result")
+    if [ "$how" = json ]; then
+      printf '%s\t%s\n' "$r" "$(lead "$(record_file "$entry")")"
+    else
+      render "$r" "$entry" "$result"
+    fi
+  done | if [ "$how" = json ]; then readings_json; else cat; fi
+  rm -rf "$results"
+}
+
+# One worker user's record. The host's copy carries the generated toolchain,
+# so ask the host first and say when you got the checked-in one, its
+# frontmatter the entry's. @BODY@ is the machine's shared tools-and-limits file
+# beside the records, <host>-worker-body.md. A locked xmg19 lands here too: its
+# HOST.md is in the home `hosts unlock` opens.
+record() { # <entry>
+  local t; t=$(target "$1")
+  ssh "${ssh_opts[@]}" "$t" cat HOST.md 2>/dev/null && return
+  echo "hosts: $t is unreachable — the checked-in record follows" >&2
+  { printf '%s\n\n' "$(field "$1" frontmatter)"
+    sed -e "/^@BODY@$/{r $hosts_dir/$(field "$1" host)-worker-body.md" -e 'd}' "$(record_file "$1")"; } |
+    sed 's/@TOOLCHAIN@/(unknown: the tool list is spliced in on the host)/'
+}
+
+cmd_view() { # [--watch] [--json] [<host or user@host>]
+  local host="" how=text watch=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --watch) watch=true ;;
+      --json) how=json ;;
+      -*) die "unknown argument: $1; hosts --help says what it takes" ;;
+      *) [ -z "$host" ] || die "one host at a time: $host, $1"; host=$1 ;;
+    esac
+    shift
+  done
+  [ -z "$host" ] || { [ "$how" = text ] && ! $watch; } || die "--watch and --json take no host"
+
+  need_machines
+  local -a all
+  mapfile -t all < <(entries)
+  [ ${#all[@]} -gt 0 ] || die "no worker hosts: no machine in $machines lists a worker user"
+
+  if [ -n "$host" ]; then
+    local entry found=false
+    for entry in "${all[@]}"; do
+      [ "$(target "$entry")" = "$host" ] || [ "$(field "$entry" host)" = "$host" ] || continue
+      $found && echo
+      found=true
+      record "$entry"
+    done
+    $found || die "no such host or worker user: $host (have: $(for e in "${all[@]}"; do target "$e"; done | paste -sd' ' -))"
+    return 0
+  fi
+
+  if ! $watch; then view "$how" "${all[@]}"; return; fi
+  # Drawn whole before the screen is cleared, so a slow probe never leaves it blank.
+  local out
+  while :; do
+    if [ "$how" = json ]; then
+      view json "${all[@]}" | jq -c .
+    else
+      out=$(view text "${all[@]}")
+      printf '\033[H\033[2J%s\n\n  %s, every %s s; Ctrl-C ends it\n' "$out" "$(date +%T)" "$watch_seconds"
+    fi
+    sleep "$watch_seconds"
+  done
+}
+
+cmd_place() { # <account> [--needs <capability>]...
+  local account=${1:-} needs=() readings entry
+  [ -n "$account" ] && [[ $account != -* ]] || die "place takes the account a worker user is on"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --needs)
+        [[ ${2:-} =~ ^([a-z0-9_-]+|mem=[0-9]+G)$ ]] || die "--needs takes a capability: a word, or mem=<N>G"
+        needs+=("$2"); shift ;;
+      *) die "unknown argument to place: $1" ;;
+    esac
+    shift
+  done
+
+  need_machines
+  local -a all
+  mapfile -t all < <(entries)
+  [ ${#all[@]} -gt 0 ] || die "no worker hosts: no machine in $machines lists a worker user"
+  results=$(mktemp -d)
+  trap 'rm -rf "$results"' EXIT
+  probe_all "$results" "${all[@]}"
+  readings=$(for entry in "${all[@]}"; do reading "$entry" "$results/$(target "$entry")"; done)
+  rm -rf "$results"
+  { echo "hosts: placing from these readings:"; show <<<"$readings"; } >&2
+  place "$account" "${needs[@]}" <<<"$readings"
+  case $? in
+    0) exit 0 ;;
+    3) echo "hosts: no host on account $account${needs[0]:+ that offers ${needs[*]}} can take a worker now; the readings above say why" >&2; exit 3 ;;
+    *) echo "hosts: no host on account $account${needs[0]:+ that offers ${needs[*]}} counts slots; the readings above say why" >&2; exit 1 ;;
+  esac
+}
+
+cmd_targets() { # [--json]
+  case ${1:-} in
+    "") need_machines; jq -r '.[] | .name as $host | .workers[] | "\(.user)@\($host)"' "$machines" ;;
+    --json) need_machines; jq '[.[] | .name as $host | .workers[] | {target: "\(.user)@\($host)", account}]' "$machines" ;;
+    *) die "targets takes only --json, not $1" ;;
+  esac
+}
+
+cmd_unlock() { # <host>
+  local name=${1:-} secrets="$HOME/.dotfiles/secrets" age_key machine dest age run secret
+  [ -n "$name" ] && [ $# -eq 1 ] || die "unlock takes one host"
+  age_key="${SOPS_AGE_KEY_FILE:-}"
+  [ -n "$age_key" ] || { echo "hosts unlock: SOPS_AGE_KEY_FILE is not set; the Home Manager config of this host, in nix/home/hosts/, sets it" >&2; exit 1; }
+  need_machines
+  machine=$(jq -c --arg name "$name" '.[] | select(.name == $name and .unlock != [])' "$machines")
+  if [ -z "$machine" ]; then
+    echo "hosts unlock: no unlock known for '$name' ($(jq -r '[.[] | select(.unlock != []) | .name] | join(", ")' "$machines"))" >&2
+    exit 1
+  fi
+  if jq -e 'any(.unlock[]; .ageKey)' <<<"$machine" >/dev/null && [ ! -r "$age_key" ]; then
+    echo "hosts unlock: no age key at $age_key" >&2
+    exit 1
+  fi
+
+  dest=$(jq -r .ssh <<<"$machine")
+  # ssh joins its command's words with spaces, so the step's command goes as one.
+  # The secret comes last: read drops an empty field anywhere before the last.
+  while IFS=$'\t' read -r age run secret; do
+    if [ -n "$secret" ]; then
+      sops -d "$secrets/creds/raw/$secret" | ssh "$dest" "$run"
+    elif [ "$age" = true ]; then
+      ssh "$dest" "$run" < "$age_key"
+    else
+      ssh "$dest" "$run" < /dev/null
+    fi || { echo "hosts unlock: '$run' on $dest failed; the steps after it were not run" >&2; exit 1; }
+  done < <(jq -r '.unlock[] | [.ageKey, (.run | join(" ")), .secret // ""] | @tsv' <<<"$machine")
+}
+
+# Matched in bash, with no awk: of the two systemd units that run
+# bin/overdue-check, one carries no awk and no /usr/bin.
+cmd_backups() {
+  [ $# -eq 0 ] || die "backups takes no argument: $1"
+  need_machines
+  local -A timer_files=()
+  local host timers file line conf unit pairs="" clash
+  while IFS=$'\t' read -r host timers; do
+    timer_files[$host]="$repo/$timers"
+  done < <(jq -r '.[] | select(.timers) | [.name, .timers] | @tsv' "$machines")
+  [ ${#timer_files[@]} -gt 0 ] ||
+    die "no machine in $machines names a timer file (\`timers\`), so nothing says which host runs a backup"
+
+  for host in "${!timer_files[@]}"; do
+    file="${timer_files[$host]}"
+    [ -f "$file" ] || die "no timer definitions at $file — nothing says which backups $host runs"
+    while IFS= read -r line; do
+      while [[ "$line" =~ (backup/restic/[a-z0-9_-]+/[a-z0-9_-]+\.conf) ]]; do
+        conf="${BASH_REMATCH[1]}"
+        line="${line#*"$conf"}"
+        unit="$("$repo/bin/restic-config-name" "$conf")" || exit 2
+        pairs="${pairs}${unit}	${host}"$'\n'
+      done
+    done < "$file"
+  done
+
+  # A unit two timers on one host both name is still one unit on one host.
+  pairs=$(sort -u <<<"${pairs%$'\n'}")
+  # An empty answer would tell every reader that no host runs any backup: the
+  # watchdog would date each away repository against the wrong host's log. A
+  # path spelled differently in a timer file is enough to get here.
+  [ -n "$pairs" ] ||
+    die "no restic backup found in ${timer_files[*]} — either no timer runs one, or the paths there changed shape"
+  # Two hosts backing up into one repository is a race nobody wrote down, and it
+  # would make the run log this answer points at ambiguous.
+  clash=$(cut -f1 <<<"$pairs" | uniq -d)
+  [ -z "$clash" ] || die "these backups are run by more than one host: $(tr '\n' ' ' <<<"$clash")"
+  printf '%s\n' "$pairs"
+}
+
+# Sourced, as the checks source it, it defines the functions above and runs nothing.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+
+case ${1:-} in
+  -h|--help) usage; exit 0 ;;
+  unlock|place|targets|backups)
+    command=$1; shift
+    case ${1:-} in -h|--help) usage; exit 0 ;; esac
+    "cmd_$command" "$@" ;;
+  *) cmd_view "$@" ;;
+esac

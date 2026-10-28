@@ -1,5 +1,5 @@
 # What pc keeps locked after a boot, and the command that unlocks it with the
-# secrets `host-unlock pc` (bin/) sends from zephylux, one per ssh call, on
+# secrets `hosts unlock pc` (bin/hosts) sends from zephylux, one per ssh call, on
 # stdin: the age key (decrypted to tmpfs), the SSH key's passphrase (the key
 # goes into the agent), and the passphrases of the encrypted ZFS datasets.
 # Without it they wait for max's first login (secrets/zshrc) and `zfs-unlock`,
