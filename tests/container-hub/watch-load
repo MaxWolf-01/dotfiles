@@ -1,0 +1,223 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro"]
+# ///
+"""What a container hub with a tab listening costs a host: its CPU while nothing changes, and while sessions work,
+hearing the disk's changes against reading it every 2 s (--poll), and the inotify watches it holds.
+
+Each mode starts a hub of its own on a scratch socket and state, with one listener on its event stream, waits for its
+first reads to finish, then measures the CPU of its processes (the hub's and the commands it ran) over --seconds
+while nothing writes, and again while --busy sessions write their transcripts and statusline files. The hub's tmux
+socket is one no server listens on, so it types into no session.
+
+The world it reads is a synthetic one (load.py: --units units, --running of whose sessions run) under a scratch HOME,
+or with --real, this user's own HOME and a copy of the hub's state, the sessions' own work being the load.
+
+Examples:
+
+    tests/container-hub/watch-load
+    tests/container-hub/watch-load --units 300 --running 32 --busy 8 --seconds 60 --out result.json
+    tests/container-hub/watch-load --real --seconds 120
+"""
+
+import json
+import os
+import random
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+import tyro
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import load  # noqa: E402
+
+HUB = HERE.parents[1] / "bin" / "container-hub"
+TICK = os.sysconf("SC_CLK_TCK")
+
+
+@dataclass
+class Args:
+    units: int = 300
+    """Units in the synthetic world."""
+    running: int = 32
+    """Of them, the ones whose sessions run."""
+    busy: int = 8
+    """Of those, the ones at work during the load: each appends a line to its transcript every --write seconds and
+    rewrites its statusline file every second."""
+    write: float = 0.5
+    """Seconds between two lines a busy session writes to its transcript."""
+    seconds: float = 60.0
+    """Seconds each measurement lasts."""
+    warmup: float = 30.0
+    """Seconds a hub is given to make its first reads before it is measured."""
+    modes: tuple[Literal["events", "poll"], ...] = ("events", "poll")
+    """The hubs measured, one after the other: hearing the disk, and reading it every 2 s."""
+    runs: int = 1
+    """Times the modes are measured, in turn."""
+    real: bool = False
+    """Measure on this user's own HOME, and a copy of --state, with no synthetic load."""
+    state: Path = Path("~/.local/state/container-hub")
+    """With --real, the hub state copied for each hub measured."""
+    out: Path | None = None
+    """Where the results go as JSON, besides stdout."""
+
+
+def main(args: Args) -> None:
+    scratch = Path(tempfile.mkdtemp(prefix="watch-load.", dir="/tmp"))  # a short path: a unix socket's is bounded
+    procs: list[subprocess.Popen] = []
+    try:
+        home, state, sessions = Path.home(), None, []
+        if not args.real:
+            home, state = scratch / "home", scratch / "state"
+            home.mkdir()
+            reader = max(Path.home().glob(".claude*/plugins/cache/*/mx/*/skills/session-page/session_page.py"),
+                         key=lambda p: tuple(int(x) if x.isdigit() else 0 for x in p.parents[2].name.split(".")), default=None)
+            if reader:  # the newest mx plugin, where the hub finds its session page reader and its tracker
+                (home / ".claude/plugins/cache/market/mx").mkdir(parents=True)
+                (home / ".claude/plugins/cache/market/mx" / reader.parents[2].name).symlink_to(reader.parents[2])
+            sessions = load.build(home, state, args.units, args.running)
+            procs = load.run(home, sessions)
+        results = {"host": socket.gethostname(), "units": None if args.real else args.units,
+                   "running": None if args.real else args.running, "busy": None if args.real else args.busy,
+                   "write": args.write, "seconds": args.seconds, "runs": []}
+        for run in range(args.runs):
+            for mode in args.modes:
+                mode_state = scratch / f"state-{mode}-{run}"
+                shutil.copytree(state or args.state.expanduser(), mode_state, symlinks=True)
+                results["runs"].append({"mode": mode, **measure(args, f"{mode}-{run}", home, mode_state, scratch, sessions)})
+                print(json.dumps(results["runs"][-1]), flush=True)
+        if args.out:
+            args.out.write_text(json.dumps(results, indent=1) + "\n")
+        print(json.dumps(results, indent=1))
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def measure(args: Args, mode: str, home: Path, state: Path, scratch: Path, sessions: list[str]) -> dict:
+    sock = scratch / f"{mode}.sock"
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "DISPATCH_", "CONTAINER_HUB", "TMUX"))}
+    env.update(HOME=str(home), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", **uv_dirs())
+    argv = [str(HUB), "--socket", str(sock), "--state", str(state), "--host", "watch-load", "--url", "http://watch-load.invalid",
+            "--tmux-socket", str(scratch / "no-tmux.sock"), *(["--poll"] if mode.startswith("poll") else [])]
+    log = (scratch / f"{mode}.log").open("w")
+    hub = subprocess.Popen(argv, env=env, stdout=log, stderr=log, start_new_session=True)
+    try:
+        try:
+            listener = listen(sock)
+        except OSError:
+            sys.exit(f"the {mode} hub never listened on {sock}:\n" + (scratch / f"{mode}.log").read_text())
+        time.sleep(args.warmup)
+        heard = listener.heard
+        idle = cpu_over(hub.pid, args.seconds)
+        heard_idle, heard = listener.heard - heard, listener.heard
+        stop = threading.Event()
+        writer = threading.Thread(target=work, args=(home, sessions[:args.busy], args.write, stop), daemon=True)
+        if not args.real:
+            writer.start()
+        busy = None if args.real else cpu_over(hub.pid, args.seconds)
+        stop.set()
+        said = (scratch / f"{mode}.log").read_text().splitlines()
+        return {"idle_cpu_percent": idle, "busy_cpu_percent": busy, "watches": watches(hub.pid),
+                "told_idle": heard_idle, "told_busy": listener.heard - heard,
+                "errors": [line for line in said if line.startswith(("watching:", "listing ", "Traceback"))], "log": said[-8:]}
+    finally:
+        os.killpg(hub.pid, 9)
+        hub.wait()
+
+
+def uv_dirs() -> dict[str, str]:
+    """uv's own directories, which would otherwise move into a scratch HOME, where `tracker` installs anew."""
+    return {k: subprocess.run(["uv", *a], capture_output=True, text=True, check=True).stdout.strip()
+            for k, a in (("UV_CACHE_DIR", ("cache", "dir")), ("UV_PYTHON_INSTALL_DIR", ("python", "dir")))}
+
+
+class listen(threading.Thread):
+    """A hub tab's event stream, read and counted."""
+
+    def __init__(self, sock: Path):
+        super().__init__(daemon=True)
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                self.s = socket.socket(socket.AF_UNIX)
+                self.s.connect(str(sock))
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.2)
+        self.s.sendall(b"GET /events HTTP/1.1\r\nHost: hub\r\n\r\n")
+        self.heard = 0
+        self.start()
+
+    def run(self) -> None:
+        while chunk := self.s.recv(65536):
+            self.heard += chunk.count(b"data: ")
+
+
+def group_ticks(sid: int) -> int:
+    """CPU ticks of every process of the session, with the children each has waited for."""
+    total = 0
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit():
+            try:
+                fields = (d / "stat").read_text().rsplit(")", 1)[1].split()
+            except OSError:
+                continue
+            if int(fields[3]) == sid:  # the session id, the 6th field
+                total += sum(int(fields[i]) for i in (11, 12, 13, 14))  # utime stime cutime cstime
+    return total
+
+
+def cpu_over(sid: int, seconds: float) -> float:
+    """Percent of one core the hub's processes used over `seconds`."""
+    before, start = group_ticks(sid), time.monotonic()
+    time.sleep(seconds)
+    return round(100 * (group_ticks(sid) - before) / TICK / (time.monotonic() - start), 3)
+
+
+def watches(sid: int) -> int:
+    """The inotify watches the hub's processes hold."""
+    count = 0
+    for d in Path("/proc").iterdir():
+        try:
+            if d.name.isdigit() and int((d / "stat").read_text().rsplit(")", 1)[1].split()[3]) == sid:
+                for info in (d / "fdinfo").iterdir():
+                    count += sum(line.startswith("inotify wd:") for line in info.read_text().splitlines())
+        except OSError:
+            continue
+    return count
+
+
+def work(home: Path, busy: list[str], every: float, stop: threading.Event) -> None:
+    """The busy sessions at work: a transcript line each every `every` seconds, a statusline file each every second."""
+    line = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "y" * 1800}]}}) + "\n"
+    transcripts = [next((home / ".claude" / "projects").glob(f"*/{s}.jsonl")) for s in busy]
+    n, last = 0, 0.0
+    while not stop.is_set():
+        for t in random.sample(transcripts, len(transcripts)):
+            with t.open("a") as f:
+                f.write(line)
+        if time.monotonic() - last >= 1:
+            last = time.monotonic()
+            for s in busy:
+                load.statusline(home, s, n)
+            n += 1
+        stop.wait(every)
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__))
