@@ -3,6 +3,7 @@ host: zephylux
 user: max
 isolated: false
 placement: last
+withholds: gpu
 ---
 
 # Worker host: max@zephylux
