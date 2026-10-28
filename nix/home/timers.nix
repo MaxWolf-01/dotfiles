@@ -14,7 +14,7 @@ let
   ]);
 
   # uv runs lifelog for the collectors' last runs jarvis-sync ships; jq because
-  # bin/run-log builds its line with it; curl, sops and gnugrep for the cc-quota
+  # bin/run-log builds its line with it; curl, sops and gnugrep for the `clawd quota`
   # report it ships, the last two through with-secrets.
   syncPath = lib.makeBinPath (with pkgs; [
     bash coreutils rsync openssh uv jq curl sops gnugrep
@@ -39,8 +39,8 @@ let
     bash coreutils uv jq
   ]);
 
-  # In a unit that runs claude: its profile's own login, whichever account `claude-account`
-  # switched the laptop's sessions to (nix/home/claude-token.sh).
+  # In a unit that runs claude: its profile's own login, whichever account `clawd use`
+  # switched the personal profile's sessions to (nix/home/claude-token.sh).
   ownLogin = "CLAUDE_ACCOUNT_SWITCH=ignore";
 
   # The retros' units: claude for the retro's stages, uv for its scripts, jq for both run logs.
@@ -1078,7 +1078,7 @@ in
       # ~/.nix-profile/bin ahead of ~/.local/bin: its `claude` is the wrapper
       # (claude-token.nix), and the ping has to open the profile's own window.
       Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
-      ExecStart = "${dotfiles}/bin/claude-ping";
+      ExecStart = "${dotfiles}/bin/clawd ping";
     };
   };
 

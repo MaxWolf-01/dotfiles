@@ -9,7 +9,7 @@
 # -fsSL https://claude.ai/install.sh | bash`) and the plugin (`claude plugin
 # marketplace add MaxWolf-01/agents`, `claude plugin install mx@MaxWolf-01`).
 # Dispatch updates the plugin at the start of every run. Claude signs in with
-# no browser: `claude-token-push` on zephylux gives the user its account's
+# no browser: `clawd push` on zephylux gives the user its account's
 # token.
 { name, identity }:
 { config, osConfig, pkgs, lib, ... }:
