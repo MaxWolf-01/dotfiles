@@ -150,9 +150,10 @@ def migration_codes(link: str) -> Iterator[Code]:
         if number == 1:
             p = dict(protobuf_fields(value))
             name, issuer = p.get(2, b"").decode(), p.get(3, b"").decode()
-            # Google writes the name as "Issuer:account" where the site's QR code did.
-            if issuer and name.startswith(f"{issuer}:"):
-                name = name[len(issuer) + 1 :]
+            # Google writes the name as "Issuer:account" where the site's QR code did, at times with + for spaces.
+            prefix, sep, rest = name.partition(":")
+            if issuer and sep and prefix.replace("+", " ") == issuer:
+                name = rest
             kind = "hotp" if p.get(6) == 1 else "totp"
             params = {"secret": base64.b32encode(p[1]).decode().rstrip("=")}
             if issuer:
@@ -204,32 +205,44 @@ def varint(buf: bytes, i: int) -> tuple[int, int]:
 
 # Words that name no service: an issuer "Google Account" and a login "accounts.google.com" share only "google".
 NOISE = {"www", "com", "net", "org", "io", "dev", "de", "at", "app", "login", "account", "accounts", "auth", "https",
-         "http", "mail", "the"}
+         "http", "mail", "the", "api", "dash", "dashboard", "admin", "manager", "console", "portal", "web", "my", "id",
+         "sso", "secure"}
 
 
 def words(text: str) -> set[str]:
     return {w for w in re.split(r"[^a-z0-9]+", text.casefold()) if len(w) > 1 and w not in NOISE}
 
 
-def login_words(item: dict) -> set[str]:
-    hosts = [urlparse(u["uri"] if "://" in u["uri"] else f"//{u['uri']}").hostname or ""
-             for u in item["login"].get("uris") or [] if u.get("uri")]
-    return words(item["name"]) | {w for h in hosts for w in words(h)}
+def hosts(item: dict) -> list[str]:
+    return [urlparse(u["uri"] if "://" in u["uri"] else f"//{u['uri']}").hostname or ""
+            for u in item["login"].get("uris") or [] if u.get("uri")]
 
 
-def propose(codes: list[Code], logins: list[dict]) -> dict[Code, dict | None]:
-    """Each code's best login: the most shared words between the code's issuer (its account where it names none)
-    and the login's name and sites, ties broken by the account matching the login's username."""
-    proposals: dict[Code, dict | None] = {}
+def score(code: Code, item: dict) -> tuple | None:
+    """How well the login fits the code, compared as a tuple, or None where they share no word naming the service.
+
+    In order: words of the code's issuer (its account where it names none) in the login's name or sites; of those, the
+    ones in its sites; the account equal to the login's username, a leading @ aside; words they share; and the login
+    having a website, which the browser extension fills, over an Android app's entry only."""
+    service = words(code.issuer or code.account)
+    site_words = {w for h in hosts(item) for w in words(h)}
+    shared = service & (words(item["name"]) | site_words)
+    if not shared:
+        return None
+    username = item["login"].get("username") or ""
+    same_user = bool(username) and code.account.casefold().lstrip("@") == username.casefold().lstrip("@")
+    user_words = len((words(code.account) | service) & words(username))
+    web = any(u.get("uri", "").startswith("http") for u in item["login"].get("uris") or [])
+    return len(shared), len(shared & site_words), same_user, user_words, web
+
+
+def propose(codes: list[Code], logins: list[dict]) -> dict[Code, list[dict]]:
+    """Each code's best-fitting logins: one where a login fits best, several where they tie, none where none fits."""
+    proposals: dict[Code, list[dict]] = {}
     for code in codes:
-        wanted = words(code.issuer or code.account)
-        best, best_score = None, (0, False)
-        for item in logins:
-            shared = len(wanted & login_words(item))
-            same_user = bool(code.account) and code.account.casefold() == (item["login"].get("username") or "").casefold()
-            if shared and (shared, same_user) > best_score:
-                best, best_score = item, (shared, same_user)
-        proposals[code] = best
+        scored = [(s, item) for item in logins if (s := score(code, item))]
+        best = max((s for s, _ in scored), default=None)
+        proposals[code] = [item for s, item in scored if s == best]
     return proposals
 
 
@@ -243,18 +256,32 @@ PLAN_HEAD = """\
 PLAN_LINE = re.compile(r"^(\d+)\s.*->\s*(\S+)")
 
 
-def render_plan(codes: list[Code], logins: list[dict], proposals: dict[Code, dict | None]) -> str:
+def render_plan(codes: list[Code], logins: list[dict], proposals: dict[Code, list[dict]]) -> str:
     width = max(len(c.label) for c in codes)
     lines = [PLAN_HEAD]
+    taken: dict[str, int] = {}
     for n, code in enumerate(codes, 1):
-        item = proposals[code]
-        if item is None:
-            lines.append(f"{n:<3} {code.label:<{width}} -> -  # no login matched\n")
+        candidates = proposals[code]
+        item = candidates[0] if len(candidates) == 1 else None
+        pair = f"{code.label:<{width}} -> {item['id'] if item else '-'}  # "
+        line, off = f"{n:<3} {pair}", f"#{n:<2} {pair}"
+        if not candidates:
+            lines.append(line + "no login matched\n")
+        elif item is None:
+            lines.append(line + f"{len(candidates)} logins fit equally well; write the id of the right one:\n")
+            lines += [f"#     {c['id']}  {describe(c)}\n" for c in candidates]
+        elif "bitwarden" in words(code.issuer):
+            lines.append(off + f"{describe(item)}: Bitwarden's own code stays outside the vault, "
+                         "where a locked vault cannot lock it away\n")
+        elif item["id"] in taken:
+            lines.append(off + f"{describe(item)}: code {taken[item['id']]} goes there already, "
+                         "and a login holds one code\n")
         elif item["login"].get("totp"):
-            lines.append(f"#{n:<2} {code.label:<{width}} -> {item['id']}  # {describe(item)}: already has a code; "
-                         "uncomment to replace it\n")
+            lines.append(off + f"{describe(item)}: already has a code; uncomment to replace it\n")
         else:
-            lines.append(f"{n:<3} {code.label:<{width}} -> {item['id']}  # {describe(item)}\n")
+            lines.append(line + f"{describe(item)}\n")
+        if item:
+            taken.setdefault(item["id"], n)
     lines.append("\n# Logins in the vault:\n")
     lines += [f"# {i['id']}  {describe(i)}\n" for i in sorted(logins, key=lambda i: i["name"].casefold())]
     return "".join(lines)
@@ -276,6 +303,8 @@ def parse_plan(text: str, codes: list[Code], ids: set[str]) -> list[tuple[Code, 
             sys.exit(f"plan line {line!r}: there is no code {n}; nothing was written")
         if target != "new" and target not in ids:
             sys.exit(f"plan line {line!r}: no login has the id {target}; nothing was written")
+        if target != "new" and (twice := next((k for k, (_, t) in chosen.items() if t == target and k != n), None)):
+            sys.exit(f"codes {twice} and {n} both go into login {target}, which holds one code; nothing was written")
         chosen[n] = (codes[n - 1], target)
     return list(chosen.values())
 
