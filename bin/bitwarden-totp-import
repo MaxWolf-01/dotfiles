@@ -5,9 +5,8 @@
 # ///
 """Move 2FA codes from a Google Authenticator export into the matching Bitwarden logins.
 
-Reads the export's QR codes from the webcam, or from the images and text files given
-(text: otpauth-migration:// or otpauth:// links, one per line, # starts a comment).
-The webcam window closes once every QR code of the export has been read, or on q.
+Reads the export's QR codes from screenshots or photos of them, or from text files of
+the otpauth-migration:// links they hold, one per line.
 
 Each code is matched to a login in the vault by its issuer and account name, and the
 proposed pairs open in $VISUAL or $EDITOR. The file holds no secrets, only the codes'
@@ -20,9 +19,8 @@ Bitwarden generates TOTP codes only; an HOTP (counter-based) code is reported an
 
 Examples:
 
-    bitwarden-totp-import
-    bitwarden-totp-import --dry-run
-    bitwarden-totp-import export-1.png export-2.png
+    bitwarden-totp-import --dry-run ~/Pictures/export-*.png
+    bitwarden-totp-import ~/Pictures/export-*.png
 """
 
 import base64
@@ -37,17 +35,16 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
+import cv2
 import tyro
 
 
 @dataclass
 class Args:
-    sources: tyro.conf.Positional[tuple[Path, ...]] = ()
-    """Images of the export's QR codes, or text files of links. None: read the webcam."""
-    camera: int = 0
-    """Which webcam to read, by OpenCV's number for it."""
+    sources: tyro.conf.Positional[tuple[Path, ...]]
+    """Images of the export's QR codes, or text files of their links."""
     dry_run: bool = False
     """Print the proposed pairs and stop, writing nothing."""
 
@@ -66,7 +63,9 @@ class Code:
 
 
 def main(args: Args) -> None:
-    codes = list(dict.fromkeys(read_sources(args.sources) if args.sources else read_camera(args.camera)))
+    if not args.sources:
+        sys.exit("name the screenshots of the export's QR codes; --help says more")
+    codes = list(dict.fromkeys(read_sources(args.sources)))
     if not codes:
         sys.exit("no codes found in what was read")
     hotp = [c for c in codes if c.kind == "hotp"]
@@ -116,8 +115,6 @@ def read_sources(paths: Iterable[Path]) -> Iterator[Code]:
         if not path.exists():
             sys.exit(f"{path}: no such file")
         if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
-            import cv2
-
             image = cv2.imread(str(path))
             if image is None:
                 sys.exit(f"{path}: not an image OpenCV can read")
@@ -125,44 +122,15 @@ def read_sources(paths: Iterable[Path]) -> Iterator[Code]:
             if not links:
                 sys.exit(f"{path}: no QR code found in it")
         else:
-            links = [ln.strip() for ln in path.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+            links = path.read_text().split()
         for link in links:
-            yield from parse_link(link)
-
-
-def read_camera(camera: int) -> list[Code]:
-    """Shows the webcam in a window until every QR code of every export it saw has been read, or q is pressed."""
-    import cv2
-
-    capture = cv2.VideoCapture(camera)
-    if not capture.isOpened():
-        sys.exit(f"camera {camera} did not open; is another program using it? --camera picks another")
-    links: dict[str, tuple[int, int, int]] = {}
-    try:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                sys.exit(f"camera {camera} stopped sending frames")
-            for text in qr_texts(frame):
-                if text.startswith(MIGRATION) and text not in links:
-                    links[text] = migration_batch(text)
-            batches = {(batch, size) for batch, _, size in links.values()}
-            expected = sum(size for _, size in batches)
-            cv2.putText(frame, f"{len(links)} of {expected or '?'} QR codes read; q to finish",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2)
-            cv2.imshow("bitwarden-totp-import", frame)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27) or (links and len(links) == expected):
-                break
-    finally:
-        capture.release()
-        cv2.destroyAllWindows()
-    return [code for link in links for code in parse_link(link)]
+            if not link.startswith(MIGRATION):
+                sys.exit(f"{path}: {link[:30]}... is not a Google Authenticator export link")
+            yield from migration_codes(link)
 
 
 def qr_texts(image) -> list[str]:
     """Every QR code's text in the image. Two of OpenCV's detectors, since each reads codes the other misses."""
-    import cv2
-
     texts: list[str] = []
     for detector in (cv2.QRCodeDetector(), cv2.QRCodeDetectorAruco()):
         ok, decoded, _, _ = detector.detectAndDecodeMulti(image)
@@ -171,30 +139,8 @@ def qr_texts(image) -> list[str]:
     return texts
 
 
-def parse_link(link: str) -> Iterator[Code]:
-    if link.startswith(MIGRATION):
-        yield from migration_codes(link)
-    elif link.startswith("otpauth://"):
-        yield otpauth_code(link)
-    else:
-        sys.exit(f"not an otpauth link: {link[:40]}")
-
-
-def otpauth_code(link: str) -> Code:
-    url = urlparse(link)
-    label = unquote(url.path.lstrip("/"))
-    issuer = parse_qs(url.query).get("issuer", [""])[0]
-    prefix, sep, account = label.partition(":")
-    if sep:
-        issuer = issuer or prefix
-    else:
-        account = label
-    return Code(issuer.strip(), account.strip(), link, "hotp" if url.netloc == "hotp" else "totp")
-
-
 # Google Authenticator's export is a protobuf MigrationPayload, base64 in the link's data parameter:
 #   1 otp_parameters (repeated): 1 secret, 2 name, 3 issuer, 4 algorithm, 5 digits, 6 type, 7 counter
-#   2 version, 3 batch_size, 4 batch_index, 5 batch_id
 ALGORITHMS = {0: "SHA1", 1: "SHA1", 2: "SHA256", 3: "SHA512", 4: "MD5"}
 DIGITS = {0: 6, 1: 6, 2: 8}
 
@@ -221,12 +167,6 @@ def migration_codes(link: str) -> Iterator[Code]:
             yield Code(issuer.strip(), name.strip(), f"otpauth://{kind}/{label}?{urlencode(params)}", kind)
 
 
-def migration_batch(link: str) -> tuple[int, int, int]:
-    """(batch_id, batch_index, batch_size): which QR code of which export this link is."""
-    fields = dict(protobuf_fields(migration_payload(link)))
-    return fields.get(5, 0), fields.get(4, 0), fields.get(3, 1)
-
-
 def migration_payload(link: str) -> bytes:
     data = parse_qs(urlparse(link).query).get("data")
     if not data:
@@ -244,9 +184,6 @@ def protobuf_fields(buf: bytes) -> Iterator[tuple[int, int | bytes]]:
         elif wire == 2:
             size, i = varint(buf, i)
             value, i = buf[i : i + size], i + size
-        elif wire in (1, 5):
-            size = 8 if wire == 1 else 4
-            value, i = int.from_bytes(buf[i : i + size], "little"), i + size
         else:
             raise ValueError(f"protobuf wire type {wire} in the export, which this reader does not know")
         yield number, value
