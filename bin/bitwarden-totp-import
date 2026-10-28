@@ -1,0 +1,381 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "opencv-python"]
+# ///
+"""Move 2FA codes from a Google Authenticator export into the matching Bitwarden logins.
+
+Reads the export's QR codes from the webcam, or from the images and text files given
+(text: otpauth-migration:// or otpauth:// links, one per line, # starts a comment).
+The webcam window closes once every QR code of the export has been read, or on q.
+
+Each code is matched to a login in the vault by its issuer and account name, and the
+proposed pairs open in $VISUAL or $EDITOR. The file holds no secrets, only the codes'
+names and the logins' ids. What is left in it when the editor closes is written into
+each login's TOTP field through the Bitwarden CLI (`bw`), which must be logged in; a
+locked vault asks for the master password. A login that already has a code is
+proposed commented out, so it keeps its code unless you uncomment the line.
+
+Bitwarden generates TOTP codes only; an HOTP (counter-based) code is reported and skipped.
+
+Examples:
+
+    bitwarden-totp-import
+    bitwarden-totp-import --dry-run
+    bitwarden-totp-import export-1.png export-2.png
+"""
+
+import base64
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
+
+import tyro
+
+
+@dataclass
+class Args:
+    sources: tyro.conf.Positional[tuple[Path, ...]] = ()
+    """Images of the export's QR codes, or text files of links. None: read the webcam."""
+    camera: int = 0
+    """Which webcam to read, by OpenCV's number for it."""
+    dry_run: bool = False
+    """Print the proposed pairs and stop, writing nothing."""
+
+
+@dataclass(frozen=True)
+class Code:
+    issuer: str
+    account: str
+    uri: str
+    """An otpauth:// link carrying the secret, the form Bitwarden's TOTP field takes."""
+    kind: Literal["totp", "hotp"] = "totp"
+
+    @property
+    def label(self) -> str:
+        return f"{self.issuer} ({self.account})" if self.issuer and self.account else self.issuer or self.account
+
+
+def main(args: Args) -> None:
+    codes = list(dict.fromkeys(read_sources(args.sources) if args.sources else read_camera(args.camera)))
+    if not codes:
+        sys.exit("no codes found in what was read")
+    hotp = [c for c in codes if c.kind == "hotp"]
+    codes = [c for c in codes if c.kind == "totp"]
+    for c in hotp:
+        print(f"skipped {c.label}: an HOTP code, which Bitwarden cannot generate", file=sys.stderr)
+
+    session = unlock()
+    logins = [i for i in json.loads(bw("list", "items", session=session)) if i.get("type") == 1]
+    plan = render_plan(codes, logins, propose(codes, logins))
+    if args.dry_run:
+        print(plan, end="")
+        return
+
+    with tempfile.NamedTemporaryFile("w+", suffix=".txt", prefix="bitwarden-totp-") as f:
+        f.write(plan)
+        f.flush()
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+        if subprocess.run([*shlex.split(editor), f.name]).returncode != 0:
+            sys.exit(f"{editor} exited with an error; nothing was written")
+        chosen = parse_plan(Path(f.name).read_text(), codes, {i["id"] for i in logins})
+
+    for code, target in chosen:
+        if target == "new":
+            item = json.loads(bw("get", "template", "item", session=session))
+            login = json.loads(bw("get", "template", "item.login", session=session))
+            item |= {"type": 1, "name": code.issuer or code.account}
+            item["login"] = login | {"username": code.account, "password": None, "totp": code.uri, "uris": []}
+            bw("create", "item", session=session, stdin=encode(item))
+            print(f"created a login for {code.label}")
+        else:
+            item = json.loads(bw("get", "item", target, session=session))
+            item["login"]["totp"] = code.uri
+            bw("edit", "item", target, session=session, stdin=encode(item))
+            print(f"{code.label} -> {item['name']}")
+    if chosen:
+        print("Sync the browser extension (Settings > Vault > Sync) to see the codes there.")
+
+
+# --- reading the export
+
+MIGRATION = "otpauth-migration://"
+
+
+def read_sources(paths: Iterable[Path]) -> Iterator[Code]:
+    for path in paths:
+        if not path.exists():
+            sys.exit(f"{path}: no such file")
+        if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            import cv2
+
+            image = cv2.imread(str(path))
+            if image is None:
+                sys.exit(f"{path}: not an image OpenCV can read")
+            links = qr_texts(image)
+            if not links:
+                sys.exit(f"{path}: no QR code found in it")
+        else:
+            links = [ln.strip() for ln in path.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+        for link in links:
+            yield from parse_link(link)
+
+
+def read_camera(camera: int) -> list[Code]:
+    """Shows the webcam in a window until every QR code of every export it saw has been read, or q is pressed."""
+    import cv2
+
+    capture = cv2.VideoCapture(camera)
+    if not capture.isOpened():
+        sys.exit(f"camera {camera} did not open; is another program using it? --camera picks another")
+    links: dict[str, tuple[int, int, int]] = {}
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                sys.exit(f"camera {camera} stopped sending frames")
+            for text in qr_texts(frame):
+                if text.startswith(MIGRATION) and text not in links:
+                    links[text] = migration_batch(text)
+            batches = {(batch, size) for batch, _, size in links.values()}
+            expected = sum(size for _, size in batches)
+            cv2.putText(frame, f"{len(links)} of {expected or '?'} QR codes read; q to finish",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2)
+            cv2.imshow("bitwarden-totp-import", frame)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27) or (links and len(links) == expected):
+                break
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
+    return [code for link in links for code in parse_link(link)]
+
+
+def qr_texts(image) -> list[str]:
+    """Every QR code's text in the image. Two of OpenCV's detectors, since each reads codes the other misses."""
+    import cv2
+
+    texts: list[str] = []
+    for detector in (cv2.QRCodeDetector(), cv2.QRCodeDetectorAruco()):
+        ok, decoded, _, _ = detector.detectAndDecodeMulti(image)
+        if ok:
+            texts += [t for t in decoded if t and t not in texts]
+    return texts
+
+
+def parse_link(link: str) -> Iterator[Code]:
+    if link.startswith(MIGRATION):
+        yield from migration_codes(link)
+    elif link.startswith("otpauth://"):
+        yield otpauth_code(link)
+    else:
+        sys.exit(f"not an otpauth link: {link[:40]}")
+
+
+def otpauth_code(link: str) -> Code:
+    url = urlparse(link)
+    label = unquote(url.path.lstrip("/"))
+    issuer = parse_qs(url.query).get("issuer", [""])[0]
+    prefix, sep, account = label.partition(":")
+    if sep:
+        issuer = issuer or prefix
+    else:
+        account = label
+    return Code(issuer.strip(), account.strip(), link, "hotp" if url.netloc == "hotp" else "totp")
+
+
+# Google Authenticator's export is a protobuf MigrationPayload, base64 in the link's data parameter:
+#   1 otp_parameters (repeated): 1 secret, 2 name, 3 issuer, 4 algorithm, 5 digits, 6 type, 7 counter
+#   2 version, 3 batch_size, 4 batch_index, 5 batch_id
+ALGORITHMS = {0: "SHA1", 1: "SHA1", 2: "SHA256", 3: "SHA512", 4: "MD5"}
+DIGITS = {0: 6, 1: 6, 2: 8}
+
+
+def migration_codes(link: str) -> Iterator[Code]:
+    for number, value in protobuf_fields(migration_payload(link)):
+        if number == 1:
+            p = dict(protobuf_fields(value))
+            name, issuer = p.get(2, b"").decode(), p.get(3, b"").decode()
+            # Google writes the name as "Issuer:account" where the site's QR code did.
+            if issuer and name.startswith(f"{issuer}:"):
+                name = name[len(issuer) + 1 :]
+            kind = "hotp" if p.get(6) == 1 else "totp"
+            params = {"secret": base64.b32encode(p[1]).decode().rstrip("=")}
+            if issuer:
+                params["issuer"] = issuer
+            if ALGORITHMS[p.get(4, 0)] != "SHA1":
+                params["algorithm"] = ALGORITHMS[p[4]]
+            if DIGITS[p.get(5, 0)] != 6:
+                params["digits"] = str(DIGITS[p[5]])
+            if kind == "hotp":
+                params["counter"] = str(p.get(7, 0))
+            label = quote(f"{issuer}:{name}" if issuer else name, safe="")
+            yield Code(issuer.strip(), name.strip(), f"otpauth://{kind}/{label}?{urlencode(params)}", kind)
+
+
+def migration_batch(link: str) -> tuple[int, int, int]:
+    """(batch_id, batch_index, batch_size): which QR code of which export this link is."""
+    fields = dict(protobuf_fields(migration_payload(link)))
+    return fields.get(5, 0), fields.get(4, 0), fields.get(3, 1)
+
+
+def migration_payload(link: str) -> bytes:
+    data = parse_qs(urlparse(link).query).get("data")
+    if not data:
+        sys.exit(f"migration link without data: {link[:40]}")
+    return base64.b64decode(data[0] + "=" * (-len(data[0]) % 4))
+
+
+def protobuf_fields(buf: bytes) -> Iterator[tuple[int, int | bytes]]:
+    i = 0
+    while i < len(buf):
+        key, i = varint(buf, i)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, i = varint(buf, i)
+        elif wire == 2:
+            size, i = varint(buf, i)
+            value, i = buf[i : i + size], i + size
+        elif wire in (1, 5):
+            size = 8 if wire == 1 else 4
+            value, i = int.from_bytes(buf[i : i + size], "little"), i + size
+        else:
+            raise ValueError(f"protobuf wire type {wire} in the export, which this reader does not know")
+        yield number, value
+
+
+def varint(buf: bytes, i: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = buf[i]
+        i += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, i
+        shift += 7
+
+
+# --- matching codes to logins
+
+# Words that name no service: an issuer "Google Account" and a login "accounts.google.com" share only "google".
+NOISE = {"www", "com", "net", "org", "io", "dev", "de", "at", "app", "login", "account", "accounts", "auth", "https",
+         "http", "mail", "the"}
+
+
+def words(text: str) -> set[str]:
+    return {w for w in re.split(r"[^a-z0-9]+", text.casefold()) if len(w) > 1 and w not in NOISE}
+
+
+def login_words(item: dict) -> set[str]:
+    hosts = [urlparse(u["uri"] if "://" in u["uri"] else f"//{u['uri']}").hostname or ""
+             for u in item["login"].get("uris") or [] if u.get("uri")]
+    return words(item["name"]) | {w for h in hosts for w in words(h)}
+
+
+def propose(codes: list[Code], logins: list[dict]) -> dict[Code, dict | None]:
+    """Each code's best login: the most shared words between the code's issuer (its account where it names none)
+    and the login's name and sites, ties broken by the account matching the login's username."""
+    proposals: dict[Code, dict | None] = {}
+    for code in codes:
+        wanted = words(code.issuer or code.account)
+        best, best_score = None, (0, False)
+        for item in logins:
+            shared = len(wanted & login_words(item))
+            same_user = bool(code.account) and code.account.casefold() == (item["login"].get("username") or "").casefold()
+            if shared and (shared, same_user) > best_score:
+                best, best_score = item, (shared, same_user)
+        proposals[code] = best
+    return proposals
+
+
+# --- the plan the editor shows
+
+PLAN_HEAD = """\
+# Each line puts one 2FA code into one Bitwarden login: the code's number, then the login's id.
+# Change an id to one from the list at the bottom, write "new" to make a login for the code,
+# or delete the line to skip it. Nothing is written until you save and close the editor.
+"""
+PLAN_LINE = re.compile(r"^(\d+)\s.*->\s*(\S+)")
+
+
+def render_plan(codes: list[Code], logins: list[dict], proposals: dict[Code, dict | None]) -> str:
+    width = max(len(c.label) for c in codes)
+    lines = [PLAN_HEAD]
+    for n, code in enumerate(codes, 1):
+        item = proposals[code]
+        if item is None:
+            lines.append(f"{n:<3} {code.label:<{width}} -> -  # no login matched\n")
+        elif item["login"].get("totp"):
+            lines.append(f"#{n:<2} {code.label:<{width}} -> {item['id']}  # {describe(item)}: already has a code; "
+                         "uncomment to replace it\n")
+        else:
+            lines.append(f"{n:<3} {code.label:<{width}} -> {item['id']}  # {describe(item)}\n")
+    lines.append("\n# Logins in the vault:\n")
+    lines += [f"# {i['id']}  {describe(i)}\n" for i in sorted(logins, key=lambda i: i["name"].casefold())]
+    return "".join(lines)
+
+
+def describe(item: dict) -> str:
+    user = item["login"].get("username")
+    return f"{item['name']} ({user})" if user else item["name"]
+
+
+def parse_plan(text: str, codes: list[Code], ids: set[str]) -> list[tuple[Code, str]]:
+    chosen: dict[int, tuple[Code, str]] = {}
+    for line in text.splitlines():
+        m = PLAN_LINE.match(line)
+        if not m or m[2] == "-":
+            continue
+        n, target = int(m[1]), m[2]
+        if not 1 <= n <= len(codes):
+            sys.exit(f"plan line {line!r}: there is no code {n}; nothing was written")
+        if target != "new" and target not in ids:
+            sys.exit(f"plan line {line!r}: no login has the id {target}; nothing was written")
+        chosen[n] = (codes[n - 1], target)
+    return list(chosen.values())
+
+
+# --- the Bitwarden CLI
+
+
+def unlock() -> str:
+    """A session key for bw: $BW_SESSION's where it unlocks the vault, else one from bw unlock, which prompts."""
+    session = os.environ.get("BW_SESSION", "")
+    status = json.loads(bw("status", session=session))["status"]
+    if status == "unauthenticated":
+        sys.exit("bw is not logged in: run `bw login` first")
+    if status == "unlocked":
+        return session
+    run = subprocess.run(["bw", "unlock", "--raw"], stdout=subprocess.PIPE, text=True)
+    if run.returncode != 0 or not run.stdout.strip():
+        sys.exit("bw unlock failed; nothing was written")
+    return run.stdout.strip()
+
+
+def bw(*args: str, session: str, stdin: str | None = None) -> str:
+    """Runs bw, a secret passed on stdin, never as an argument, where ps would show it."""
+    command = ["bw", *args, *(["--session", session] if session else [])]
+    try:
+        run = subprocess.run(command, input=stdin, capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("bw is not on PATH: it is the Bitwarden CLI, nixpkgs#bitwarden-cli")
+    if run.returncode != 0:
+        sys.exit(f"bw {' '.join(args[:2])} failed: {run.stderr.strip() or run.stdout.strip()}")
+    return run.stdout
+
+
+def encode(item: dict) -> str:
+    """The base64 JSON that bw create and bw edit read, what `bw encode` makes."""
+    return base64.b64encode(json.dumps(item).encode()).decode()
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__))

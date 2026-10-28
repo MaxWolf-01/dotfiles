@@ -1,0 +1,203 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "opencv-python", "qrcode[pil]"]
+# ///
+"""Drive bin/bitwarden-totp-import. Run it directly; no framework.
+
+The promises here: a Google Authenticator export reads as the codes it holds, from a
+link or from a photo of its QR code; each code goes into the login it names, a login
+that already has a code keeps it, and nothing is created or written that the plan in
+the editor does not say; no secret ever appears in bw's arguments.
+
+The export links are the examples extract_otp_secrets publishes, with its decoded
+output as the oracle (github.com/scito/extract_otp_secrets, example_export.txt and
+example_output.json). bw is a stand-in on PATH that keeps its vault in a JSON file.
+"""
+
+import base64
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import qrcode
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import bin_module, check, finish  # noqa: E402
+
+bti = bin_module("bitwarden-totp-import")
+
+SECRET = "7KSQL2JTUDIS5EF65KLMRQIIGY"
+ONE_WITH_ISSUER = ("otpauth-migration://offline?data=CjUKEPqlBekzoNEukL7qlsjBCDYSDnBpQHJhc3BiZXJyeXBpGgtyYXNwYmVycnlw"
+                   "aSABKAEwAhABGAEgACjr4JKK%2B%2F%2F%2F%2F%2F8B")
+TWO = ("otpauth-migration://offline?data=CigKEPqlBekzoNEukL7qlsjBCDYSDnBpQHJhc3BiZXJyeXBpIAEoATACCjUKEPqlBekzoNEukL7q"
+       "lsjBCDYSDnBpQHJhc3BiZXJyeXBpGgtyYXNwYmVycnlwaSABKAEwAhABGAEgACiQ7OOa%2Bf%2F%2F%2F%2F8B")
+HOTP = "otpauth-migration://offline?data=CiUKEPqlBekzoNEukL7qlsjBCDYSCWhvdHAgZGVtbyABKAEwATgEEAEYASAAKNuv15j6%2F%2F%2F%2F%2FwE%3D"
+UNICODE = ("otpauth-migration://offline?data=CjYKEPqlBekzoNEukL7qlsjBCDYSHGVuY29kaW5nOiDCv8Okw4TDqcOJPyAoZGVtbykgASgBMAIQ"
+           "ARgBIAAorfCurv%2F%2F%2F%2F%2F%2FAQ%3D%3D")
+
+
+def decoded(link: str) -> list[tuple]:
+    out = []
+    for c in bti.migration_codes(link):
+        q = parse_qs(urlparse(c.uri).query)
+        out.append((c.issuer, c.account, q["secret"][0], c.kind, q.get("counter", [None])[0]))
+    return out
+
+
+check("an export with one code reads as it", [("raspberrypi", "pi@raspberrypi", SECRET, "totp", None)],
+      decoded(ONE_WITH_ISSUER))
+check("an export with two codes reads as both, in order",
+      [("", "pi@raspberrypi", SECRET, "totp", None), ("raspberrypi", "pi@raspberrypi", SECRET, "totp", None)],
+      decoded(TWO))
+check("an HOTP code keeps its counter", [("", "hotp demo", SECRET, "hotp", "4")], decoded(HOTP))
+check("a name outside ASCII survives", [("", "encoding: ¿äÄéÉ? (demo)", SECRET, "totp", None)], decoded(UNICODE))
+check("a single QR code is batch 0 of 1", (0, 1), bti.migration_batch(ONE_WITH_ISSUER)[1:])
+check("an otpauth link's label names issuer and account",
+      bti.Code("GitHub", "max", "otpauth://totp/GitHub:max?secret=AB", "totp"),
+      bti.otpauth_code("otpauth://totp/GitHub:max?secret=AB"))
+
+with tempfile.TemporaryDirectory() as tmp:
+    image = Path(tmp) / "export.png"
+    qrcode.make(TWO).save(image)
+    check("a photo of the QR code reads as the link does", list(bti.migration_codes(TWO)),
+          list(bti.read_sources([image])))
+
+
+# --- the vault
+
+FAKE_BW = r'''#!/usr/bin/env python3
+import base64, json, os, sys
+path = os.environ["FAKE_BW_VAULT"]
+vault = json.load(open(path))
+args = sys.argv[1:]
+vault["argv"].append(args)
+session = args[args.index("--session") + 1] if "--session" in args else ""
+args = [a for a in args if a != "--session" and a != session]
+out = None
+if args == ["status"]:
+    out = {"status": "unlocked" if session == "key" else "locked"}
+elif args == ["unlock", "--raw"]:
+    vault["unlocked"] = True
+    print("key", end="")
+elif session != "key":
+    sys.exit("vault is locked")
+elif args == ["list", "items"]:
+    out = vault["items"]
+elif args[:2] == ["get", "item"]:
+    out = next(i for i in vault["items"] if i["id"] == args[2])
+elif args == ["get", "template", "item"]:
+    out = {"type": 1, "name": "Item name", "notes": None, "login": None, "fields": [], "folderId": None}
+elif args == ["get", "template", "item.login"]:
+    out = {"uris": [], "username": "jdoe", "password": "myp@ssword123", "totp": "JBSWY3DPEHPK3PXP"}
+elif args[:2] == ["edit", "item"]:
+    new = json.loads(base64.b64decode(sys.stdin.read()))
+    vault["items"] = [new if i["id"] == args[2] else i for i in vault["items"]]
+elif args == ["create", "item"]:
+    new = json.loads(base64.b64decode(sys.stdin.read())) | {"id": f"new-{len(vault['items'])}"}
+    vault["items"].append(new)
+else:
+    sys.exit(f"fake bw does not know {args}")
+json.dump(vault, open(path, "w"))
+if out is not None:
+    print(json.dumps(out))
+'''
+
+
+def login(id: str, name: str, user: str, uris=(), totp=None) -> dict:
+    return {"id": id, "type": 1, "name": name,
+            "login": {"username": user, "password": "pw", "totp": totp, "uris": [{"uri": u} for u in uris]}}
+
+
+VAULT = [
+    login("gh", "GitHub", "max", ["https://github.com/login"]),
+    login("gh-work", "GitHub work", "max-work", ["https://github.com"]),
+    login("proton", "Proton", "max@mwolf.dev", ["account.proton.me"]),
+    login("amazon", "Amazon", "max@mwolf.dev", ["amazon.de"], totp="otpauth://totp/old?secret=OLD"),
+    {"id": "note", "type": 2, "name": "GitHub recovery codes"},
+]
+LINKS = [
+    "otpauth://totp/GitHub:max-work?secret=WORKSECRET&issuer=GitHub",
+    "otpauth://totp/Proton:max%40mwolf.dev?secret=PROTONSECRET&issuer=Proton",
+    "otpauth://totp/Amazon:max%40mwolf.dev?secret=AMAZONSECRET&issuer=Amazon",
+    "otpauth://totp/Obscure%20Forum:max?secret=FORUMSECRET&issuer=Obscure%20Forum",
+    "otpauth://hotp/Bank:max?secret=BANKSECRET&counter=3",
+]
+SECRETS = ["WORKSECRET", "PROTONSECRET", "AMAZONSECRET", "FORUMSECRET", "BANKSECRET"]
+
+
+def run(editor: str, session: str = "key", dry_run: bool = False) -> tuple[dict, int | str | None, str]:
+    """main() against a fresh vault, with editor as $EDITOR: the vault afterwards, the exit, what it printed."""
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "bw").write_text(FAKE_BW)
+        (tmp / "bw").chmod(0o755)
+        (tmp / "vault.json").write_text(json.dumps({"items": VAULT, "argv": []}))
+        (tmp / "links.txt").write_text("# an export\n" + "\n".join(LINKS) + "\n")
+        env = {"PATH": f"{tmp}:{os.environ['PATH']}", "FAKE_BW_VAULT": str(tmp / "vault.json"),
+               "EDITOR": editor, "BW_SESSION": session, "VISUAL": ""}
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        out, code = io.StringIO(), None
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                bti.main(bti.Args(sources=(tmp / "links.txt",), dry_run=dry_run))
+        except SystemExit as e:
+            code = e.code
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
+        return json.loads((tmp / "vault.json").read_text()), code, out.getvalue()
+
+
+def totps(vault: dict) -> dict:
+    return {i["id"]: urlparse(i["login"]["totp"]).query if i["login"].get("totp") else None
+            for i in vault["items"] if i["type"] == 1}
+
+
+def secret_in_argv(vault: dict) -> bool:
+    return any(s in " ".join(a) for a in vault["argv"] for s in SECRETS)
+
+
+vault, code, _ = run("true")
+check("the plan as proposed: each code lands in the login it names, a login with a code keeps it",
+      {"gh": None, "gh-work": "secret=WORKSECRET&issuer=GitHub", "proton": "secret=PROTONSECRET&issuer=Proton",
+       "amazon": "secret=OLD"},
+      totps(vault))
+check("the run ends cleanly", None, code)
+check("no secret appears in bw's arguments", False, secret_in_argv(vault))
+
+vault, _, plan = run("true", dry_run=True)
+check("a dry run writes nothing", [i["login"].get("totp") for i in VAULT if i["type"] == 1],
+      [i["login"].get("totp") for i in vault["items"] if i["type"] == 1])
+check("a dry run shows the unmatched code as unmatched", True,
+      bool(re.search(r"^4 +Obscure Forum \(max\) +-> -  # no login matched$", plan, re.M)))
+check("the HOTP code is not in the plan", False, "Bank" in plan)
+
+editor = "sed -i -e 's/^#3 /3  /' -e '/Obscure/s/-> -/-> new/'"
+vault, _, _ = run(editor)
+created = [i for i in vault["items"] if i["id"].startswith("new-")]
+check("an uncommented line replaces the login's code", "secret=AMAZONSECRET&issuer=Amazon", totps(vault)["amazon"])
+check("new makes a login holding the code, under the issuer's name, with no password",
+      [("Obscure Forum", "max", None, "secret=FORUMSECRET&issuer=Obscure%20Forum")],
+      [(i["name"], i["login"]["username"], i["login"]["password"], urlparse(i["login"]["totp"]).query)
+       for i in created])
+
+vault, code, _ = run("sed -i '/Proton/s/-> proton/-> nobody/'")
+check("a plan naming an unknown login stops the run", True, isinstance(code, str) and "nobody" in code)
+check("and writes nothing", [i["login"].get("totp") for i in VAULT if i["type"] == 1],
+      [i["login"].get("totp") for i in vault["items"] if i["type"] == 1])
+
+vault, code, _ = run("true", session="")
+check("a locked vault is unlocked, then written", (True, None, "secret=WORKSECRET&issuer=GitHub"),
+      (vault.get("unlocked", False), code, totps(vault)["gh-work"]))
+
+finish()

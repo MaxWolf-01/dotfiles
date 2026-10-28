@@ -43,6 +43,7 @@ in
   };
 
   home.packages = with pkgs; [
+    bitwarden-cli # bw
     dconf2nix
     loupe
     obsidian
