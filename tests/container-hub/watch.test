@@ -35,6 +35,7 @@ EXITING = "bbbbbbbb-0000-4000-8000-000000000002"  # its process one of its own, 
 PANED = "cccccccc-0000-4000-8000-000000000003"  # idle in a tmux pane, in a project with an agent repo
 HOMELESS = "dddddddd-0000-4000-8000-000000000004"  # idle in a tmux pane, in a directory no agent repo holds yet
 ENDED = "eeeeeeee-0000-4000-8000-000000000005"  # ended, with a session page of its own
+RACED = "ffffffff-0000-4000-8000-000000000006"  # ended, its session page written to as its directory is first watched
 
 hub_said = (fakes.RUN / "module.log").open("w")
 sys.stderr = hub_said  # what the hub prints on the way, as its log would hold it; check() prints to stdout
@@ -75,11 +76,10 @@ class Watched:
         self.tab = queue.Queue()
         self.hub.seen_by[self.tab] = self.hub.view_digest()
         self.hub.join(self.tab)
-        self.rounds = self.hub.Rounds()
 
     def step(self, times: int = 1) -> bool:
         """The watch loop's next `times` waits; True where one found the hub's code changed."""
-        return any([self.hub.watch_step(self.rounds, longest=0.05) for _ in range(times)])
+        return any([self.hub.watch_step(longest=0.05) for _ in range(times)])
 
     def settled(self) -> None:
         """Steps until two in a row find nothing waiting to be read, the kernel's notices taken first: the reads that
@@ -89,7 +89,7 @@ class Watched:
             self.step()
             with self.hub.reading:
                 self.hub.WATCH.drain()
-            quiet = quiet + 1 if self.hub.WATCH.due(self.rounds.last) is None else 0
+            quiet = quiet + 1 if self.hub.WATCH.due() is None else 0
             if quiet == 2:
                 self.heard()
                 return
@@ -182,12 +182,12 @@ try:
           (True, True, {READER}), (len(read.heard) <= elapsed / w.hub.PACE + 1, len(read.heard) >= 1, set(read)))
 
     watched.settled()
-    real_read = w.hub.WATCH.disk.read
-    w.hub.WATCH.disk.read = lambda: [(-1, w.hub.IN_Q_OVERFLOW, ""), *real_read()]  # what the kernel says once its queue is full
+    real_read = w.hub.WATCH.notices.read
+    w.hub.WATCH.notices.read = lambda: [(-1, w.hub.IN_Q_OVERFLOW, ""), *real_read()]  # what the kernel says once its queue is full
     with fakes.Reads(w.hub) as read:
         page(pages[1], "<!doctype html><p>written while notices were lost</p>")
         watched.step(5)
-        w.hub.WATCH.disk.read = real_read
+        w.hub.WATCH.notices.read = real_read
     check("notices the kernel lost make the next read read every unit", [None], read.heard[:1])
 
     # --- a watched directory goes, and another comes in its place
@@ -223,21 +223,27 @@ try:
         print("skip a session's turn records moved away: no mx plugin reader here")
 
     watched.settled()
-    kept = records.parent
-    os.rename(kept, kept.with_name(f"{w.hub.PAGES}.old"))  # the directory above it, which tells the one watched nothing
-    page(records / "session.md", f"---\nsession: {ENDED}\n---\n\n# Under a new directory above it\n")
-    page(records / "index.html")
-    watched.settled()
-    (records / "session.md").write_text(f"---\nsession: {ENDED}\n---\n\n# Changed under the new one\n")
-    watched.settled()
-    check("a page directory whose parent was moved away and made anew is listened to where it is now",
-          "Changed under the new one", w.view(ENDED)["title"])
-
-    watched.settled()
     watches = len(w.hub.WATCH.wds)
     w.hub.state_file(ENDED).unlink()
     watched.settled()
     check("a unit that goes takes the watches its directories alone needed with it", True, len(w.hub.WATCH.wds) < watches)
+
+    w.opened(page(alpha / "agent/show/map-columns/raced.html"), RACED)
+    watched.settled()
+    raced = w.home / ".claude/session-pages" / RACED
+    add, title = w.hub.WATCH.notices.add, lambda text: f"---\nsession: {RACED}\n---\n\n# {text}\n"
+
+    def written_first(directory: str) -> int:  # the write between the read's look at the page and its watch
+        if directory == str(raced) and "Read" in (raced / "session.md").read_text():
+            (raced / "session.md").write_text(title("Written as it was first watched"))
+        return add(directory)
+
+    w.hub.WATCH.notices.add = written_first
+    page(raced / "session.md", title("Read"))
+    watched.settled()
+    w.hub.WATCH.notices.add = add
+    check("a page written between the read's look at it and its directory's first watch is read again",
+          "Written as it was first watched", w.view(RACED)["title"])
 
     # --- a session's process exits, leaving its registry file behind
 
@@ -256,20 +262,31 @@ try:
           ([{"type": "disk", "units": []}], written), (watched.until_told(), registry_file.stat().st_mtime_ns))
     check("...which shows its session ended", "ended", w.view(EXITING)["state"])
 
-    # --- what was read off the clock is read again once it goes stale: whether a pane holds an idle session
+    # --- whether a pane holds an idle session: asked of tmux once for its process, or again, later each time
 
     asked = lambda: w.tmux_calls.read_text().count("display-message") if w.tmux_calls.exists() else 0
     w.opened(page(alpha / "agent/show/map-columns/paned.html"), PANED)
     (alpha / "agent/handoffs").mkdir()
-    w.registered(PANED, tmux="paned:@0.%7", cwd=alpha)
+    w.registered(PANED, tmux="paned:@0.%7", cwd=alpha)  # a pane of no tmux server, which holds nothing
     watched.settled()
-    calls, before = asked(), watched.reads
+    calls = asked()
     watched.step(10)
-    check("an idle session in a pane, its pane asked of tmux, is not asked again within the minute", (calls, before),
-          (asked(), watched.reads))
-    w.clock.tick(61)
-    watched.settled()
-    check("...and once the minute is up, tmux is asked again, in one read", (calls + 1, before + 1), (asked(), watched.reads))
+    check("an idle session whose pane does not hold it has its pane asked again only once its wait is up", calls, asked())
+    tries = []
+    for _ in range(4):
+        w.clock.tick(w.hub.PACE)
+        watched.settled()
+        tries.append(asked() - calls)
+    check("...the wait twice as long each time", [1, 1, 2, 2], tries)
+
+    held = {"tmux": "held:@0.%3", "pid": 1, "procStart": "1"}
+    pane_in, said_tmux = w.hub.pane_in, []
+    w.hub.pane_in = lambda entry: (said_tmux.append(entry) or "%3", "")
+    first = w.hub.pane_held(held)
+    w.clock.tick(10 ** 6)
+    check("a pane found holding its session's process is asked of tmux once for that process's life", (True, True, 1),
+          (first, w.hub.pane_held(held), len(said_tmux)))
+    w.hub.pane_in = pane_in
 
     # --- ...and where a session's directory has no agent repo, whether it has one since
 
@@ -281,17 +298,12 @@ try:
     watched = Watched(w)
     watched.settled()
     calls = asked()
+    check("a session in a directory with no agent repo offers no handoff, and has its pane asked of no one", calls, asked())
     w.git(plain, "init", "-q")
     (plain / "agent/tickets").mkdir(parents=True)
-    w.clock.tick(299)
     watched.settled()
-    check("a session in a directory with no agent repo has its pane asked of no one, the hub looking again only after five minutes",
-          calls, asked())
-    before = watched.reads
-    w.clock.tick(2)
-    watched.settled()
-    check("...and once they are up, finds the agent repo made since, and asks tmux for its pane", (calls + 1, True),
-          (asked(), watched.reads > before))
+    check("...and once an agent repo is made there, the hub finds it, with no clock, and asks tmux for its pane",
+          calls + 1, asked())
 
     # --- the watch loop as the hub runs it: waits with no end of their own, a tab joining while it waits
 
@@ -304,9 +316,8 @@ try:
     assert w.hub.WATCH.start()
 
     def as_the_hub_runs_it(hub=w.hub) -> None:  # watch_disk's loop, with no servers to stop
-        rounds = hub.Rounds()
         while True:
-            hub.watch_step(rounds)
+            hub.watch_step()
 
     threading.Thread(target=as_the_hub_runs_it, daemon=True).start()
     time.sleep(0.3)  # the loop waits with no tab listening, as long as it takes
@@ -383,7 +394,7 @@ try:
     w.opened(opened, READER)
     w.registered(READER)
     code_dirs = {str(p.parent) for p in w.hub.CODE}
-    added, allowed = [], [3]
+    added = []
 
     class FewWatches(w.hub.Inotify):
         """The kernel's watches nearly all taken by other programs: those of the hub's code fit, those of the disk
@@ -391,13 +402,12 @@ try:
 
         def add(self, directory: str) -> int:
             if directory not in code_dirs:
-                if len(added) >= allowed[0]:
+                if len(added) >= 3:
                     raise OSError(errno.ENOSPC, "No space left on device")
                 added.append(directory)
             return super().add(directory)
 
     w.hub.Inotify = FewWatches
-    w.hub.RETRY = 0.0
     before_lines = len(said())
     watched = Watched(w)
     check("a hub that runs out of watches stops asking for them", False, w.hub.WATCH.on)
@@ -406,15 +416,9 @@ try:
                                             for line in said()[before_lines:] if line.startswith("watching the disk")])
     opened.unlink()
     check("...hears a change by reading the disk", [{"type": "disk", "units": [READER]}], watched.until_told())
-    added.clear()
     watched.step(6)
-    check("...asks again after a while, its code's watches fitting and the disk's not, and says nothing more",
-          [f"watching the disk by reading it every 0.05 s: {w.hub.WATCH.why}"],
-          [line for line in said()[before_lines:] if line.startswith("watching the disk")])
-    allowed[0] = 10_000
-    watched.step(6)
-    check("...and once there are watches again, hears the disk again, saying so once", (True, 1),
-          (w.hub.WATCH.on, said()[before_lines:].count("watching the disk by its changes again")))
+    check("...and reads it so for the rest of its life, having said so once", (False, 1),
+          (w.hub.WATCH.on, sum(line.startswith("watching the disk") for line in said()[before_lines:])))
 finally:
     for process in sleepers:
         process.kill()
