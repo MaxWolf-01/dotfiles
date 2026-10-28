@@ -432,6 +432,7 @@ import time
 import urllib.parse
 import uuid
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 from datetime import UTC, datetime
@@ -2064,6 +2065,7 @@ def read_hub() -> tuple[dict, dict[str, str]]:
         names = sorted(n for n in os.listdir(STATE / "units") if n.endswith(".json") and not n.startswith("."))
     except FileNotFoundError:
         names = []
+    read_ahead([urllib.parse.unquote(n.removesuffix(".json")) for n in names], live, memo)
     for name in names:
         key, path = urllib.parse.unquote(name.removesuffix(".json")), STATE / "units" / name
         listed.add(key)
@@ -2085,6 +2087,38 @@ def read_hub() -> tuple[dict, dict[str, str]]:
     rest = sorted((u for u in units if u["number"] is None),
                   key=lambda u: (2 if u["state"] == "ended" else 0 if u["dismissed"] else 1, -u["last"]))
     return {"units": [*numbered, *rest], "usage": usage(inputs)}, {u["unit"]: details[u["unit"]] for u in units}
+
+
+def read_ahead(keys: list[str], live: dict[str, dict], memo: dict) -> None:
+    """Run at once the commands a read runs for each agent repo it has not yet read (`tracker data`, git's refs and
+    log) and for each running session's directory (the handoff hooks' look for its agent repo): each takes a few
+    tenths of a second, so a hub's first read would otherwise wait on them all in turn. They fill the caches the read
+    then finds them in; one that fails is run again by the read, which says why."""
+    agents = {}
+    for key in keys:
+        try:
+            plan = unit_plan(key)[2]
+        except OSError:  # the read lists it, and says why
+            continue
+        for root, agent, _ in plan[1] if plan else ():
+            if agent not in ROOTS and agent not in REFUSED and os.path.isdir(root):
+                agents.setdefault(agent, plan[0])
+    hooks = handoff_hooks(memo)
+    cwds = {str(e["cwd"]) for e in live.values() if e.get("cwd")} if hooks else set()
+    cwds = {c for c in cwds if (hooks.__file__, c) not in HANDOFFS}
+    if not agents and not cwds:
+        return
+
+    def ahead(look) -> None:
+        try:
+            look()
+        except Exception:
+            pass
+
+    looks = [*(lambda a=a: tracker_at(a) for a in agents), *(lambda a=a, s=s: s and session_tickets(a, s) for a, s in agents.items()),
+             *(lambda c=c: handoffs_dir(hooks, c) for c in cwds)]
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(ahead, looks))
 
 
 def unit_read(key: str) -> dict | None:
@@ -2135,11 +2169,7 @@ def unit_inputs(key: str, live: dict[str, dict], memo: dict) -> tuple:
     """Everything unit_view reads a unit from, as cheaply as a change shows: a stamp for each file, and the value of
     what the units share (the registry, the trackers, the agent repos' refs). It may hold more than unit_view reads,
     which costs a build too many, but never less, which would keep a view gone stale."""
-    at = stamp(state_file(key))
-    if not ((hit := STATES.get(key)) and hit[0] == at):
-        data = load(key)
-        hit = STATES[key] = at, data, data and planned(data)
-    _, data, plan = hit
+    at, data, plan = unit_plan(key)
     if data is None:
         return (at,)
     session, roots, files, dirs = plan
@@ -2152,6 +2182,15 @@ def unit_inputs(key: str, live: dict[str, dict], memo: dict) -> tuple:
             live.get(session) if session else None,
             session and transcript_inputs(session, memo),
             reader and reader.__file__)
+
+
+def unit_plan(key: str) -> tuple:
+    """A unit's state file as STATES holds it: its stamp, what it holds, and the paths it names (`planned`)."""
+    at = stamp(state_file(key))
+    if not ((hit := STATES.get(key)) and hit[0] == at):
+        data = load(key)
+        hit = STATES[key] = at, data, data and planned(data)
+    return hit
 
 
 def planned(data: dict) -> tuple:
