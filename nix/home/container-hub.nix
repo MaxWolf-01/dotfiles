@@ -31,9 +31,9 @@
 # a clean one included, leaves every agent's pages opening as plain tabs.
 #
 # A peer is another host's hub this one relays (the hub's --peer): every other
-# host of ./session-hosts.nix trusted as much as this one or less (that file
-# says why). It is reached over ssh as max: ssh forwards the peer's socket to
-# one here that only max can open, since ssh makes it 0600
+# host that runs max's sessions (./machines.nix) trusted as much as this one
+# or less (that file says why). It is reached over ssh as max: ssh forwards
+# the peer's socket to one here that only max can open, since ssh makes it 0600
 # (StreamLocalBindMask) in a directory of his. Not over the peer's tailnet
 # port: the tailnet policy cannot tell max's processes on pc from the dispatch
 # workers beside them, so a grant from pc to that port would let a worker
@@ -58,7 +58,7 @@ let
   peers = cfg.peers;
 in
 {
-  imports = [ ./session-copies.nix ];
+  imports = [ ./machines.nix ./session-copies.nix ];
 
   options.containerHub = {
     loopback = lib.mkEnableOption ''
@@ -87,23 +87,17 @@ in
         options = {
           ssh = lib.mkOption {
             type = lib.types.str;
-            description = "The ssh destination that reaches the host as max. Its hub listens where this host's does, under the same home.";
+            description = "Its `ssh` in ./machines.nix. Its hub listens where this host's does, under the same home.";
           };
           trust = lib.mkOption {
             type = lib.types.int;
-            description = "How far the host is trusted, higher being further.";
+            description = "Its `trust` in ./machines.nix.";
           };
         };
       });
-      default =
-        let
-          listed = import ./session-hosts.nix;
-          names = map (h: h.name) listed;
-        in
-        # listToAttrs would keep the first of two entries of one name, and drop the other unsaid
-        assert lib.assertMsg (lib.allUnique names) "session-hosts.nix names a host more than once: ${lib.concatStringsSep ", " names}";
-        lib.listToAttrs (map (h: { inherit (h) name; value = removeAttrs h [ "name" ]; }) listed);
-      description = "The hosts that run max's sessions, by name; ./session-hosts.nix says what they are for.";
+      default = lib.listToAttrs (map (m: { inherit (m) name; value = { inherit (m) ssh trust; }; })
+        (lib.filter (m: m.sessions) config.machines));
+      description = "The hosts that run max's sessions, by name: the machines of ./machines.nix that run them.";
     };
     peers = lib.mkOption {
       type = lib.types.attrs;

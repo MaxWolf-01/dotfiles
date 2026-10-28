@@ -6,13 +6,14 @@
 
   home.sessionVariables.SOPS_AGE_KEY_FILE = "${config.home.homeDirectory}/.local/secrets/age-key.txt";
 
-  # This machine's capability record, read by a worker running locally and by
-  # `worker-hosts` (bin/). No @TOOLCHAIN@ token: what is installed here is
-  # spread across common.nix and its imports rather than one list, so the
-  # record points at the config instead of enumerating it.
   claudeToken.mode = "switch";
 
-  home.file."HOST.md".source = ./zephyrus/HOST.md;
+  # This machine's capability record, read by a worker running locally and by
+  # `worker-hosts` (bin/): its entry in ../machines.nix, and the hand-written
+  # rest. No @TOOLCHAIN@ token: what is installed here is spread across
+  # common.nix and its imports rather than one list, so the record points at
+  # the config instead of enumerating it.
+  home.file."HOST.md".text = config.machineRecords."max@zephylux" + builtins.readFile ./zephylux-max/HOST.md;
 
   # The slots dispatch's workers here take (`host-slots --help`). Every worker
   # here runs as max, so the slots are his own, in his runtime directory, which

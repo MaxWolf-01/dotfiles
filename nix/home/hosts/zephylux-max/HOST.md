@@ -1,11 +1,3 @@
----
-host: zephylux
-user: max
-isolated: false
-placement: last
-withholds: gpu
----
-
 # Worker host: max@zephylux
 
 The daily driver, and the machine max is most likely sitting in front of. Work

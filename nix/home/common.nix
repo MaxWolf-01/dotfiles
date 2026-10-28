@@ -1,6 +1,7 @@
 { config, pkgs, lib, rime, system, ... }:
 {
   imports = [
+    ./machines.nix
     ./terminal-colors.nix
     ./tmux.nix
   ];

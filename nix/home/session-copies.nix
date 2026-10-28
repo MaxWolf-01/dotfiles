@@ -1,5 +1,5 @@
 # session-copies: every 2 minutes, pull max's sessions from each host this
-# one's hub relays (containerHub.peers, by the rule ./session-hosts.nix
+# one's hub relays (containerHub.peers, by the rule ./machines.nix
 # states), into ~/.local/share/session-copies/<host>/<user>/. What a pull
 # copies: bin/session-copies --help.
 #
@@ -19,8 +19,8 @@ let
   cfg = config.sessionCopies;
   peers = config.containerHub.peers;
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
-  # bin/session-copies is a uv script driving rsync over ssh; sed for
-  # worker-hosts --targets; jq for bin/run-log.
+  # bin/session-copies is a uv script driving rsync over ssh; sed and jq for
+  # worker-hosts --targets; jq for bin/run-log too.
   path = lib.makeBinPath (with pkgs; [ bash coreutils gnused uv rsync openssh jq ]);
   sources = lib.attrNames peers ++ lib.optional cfg.workerHosts "the worker hosts";
 in

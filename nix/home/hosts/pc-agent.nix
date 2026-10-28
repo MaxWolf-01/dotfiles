@@ -1,4 +1,4 @@
-# agent@pc: dispatch workers on the personal Claude account. Record in ./pc-agent/.
+# agent@pc: dispatch workers on the personal Claude account. Record in ./pc-agent/, entry in ../machines.nix.
 import ../worker.nix {
   name = "agent";
   # Attributable in `git log` as the bot account, not as max.
@@ -6,6 +6,4 @@ import ../worker.nix {
     name = "MaxWolf-01-clanker";
     email = "MaxWolf-01-clanker@users.noreply.github.com";
   };
-  record = ./pc-agent/HOST.md;
-  body = ./pc-worker-body.md;
 }
