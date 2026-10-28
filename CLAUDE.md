@@ -131,10 +131,10 @@ See `docs/nixos-new-machine.md` (disko + nixos-facter + nixos-anywhere).
 
 ## Hosts
 
-`hosts` is every machine's worker users with their live state (`--watch`,
-`--json`), and the acts on them; `hosts --help` lists them. `hosts unlock
-<host>`, run on zephylux, unlocks what a rebooted xmg19 or pc keeps locked:
-run it whenever either was rebooted. What each one's unlock opens is its
+`hosts` shows every worker user with its machine's live state, and its
+subcommands act on the machines (`hosts --help`). `hosts unlock <host>`, run on
+zephylux, unlocks what a rebooted xmg19 or pc keeps locked: run it whenever
+either was rebooted. What each one's unlock opens is its
 `unlock` in `nix/home/machines.nix`.
 
 ## SFTPGo File Drop
@@ -155,11 +155,11 @@ which holds the share root. What it refuses goes to the SFTPGo drop.
 
 Tailnet-wide: every device resolves through Mullvad's filtering resolver, pushed
 with `tailnet dns push` (`bin/tailnet`) from `secrets/tailscale/dns.json`.
-Servers (pc, jarvis, yapit-prod) are opted out. Never add `Domains=~.` to a resolved config — it ties
-with tailscaled's own catch-all and silently defeats filtering. `dns-blocked`
-answers "is this domain blocked, and by which list"; `dns-filter off` turns
-filtering off on zephylux for a few minutes. Chain, gotchas, and the
-captive-portal escape (`portal`): `docs/dns.md`.
+Servers (pc, jarvis, yapit-prod) are opted out. Never add `Domains=~.` to a
+resolved config — it ties with tailscaled's own catch-all and silently defeats
+filtering. `dns-blocked` answers "is this domain blocked, and by which list";
+`dns-filter off` turns filtering off on zephylux for a few minutes. Chain,
+gotchas, and the captive-portal escape (`portal`): `docs/dns.md`.
 
 Mullvad exit node: `vpn` (`bin/vpn`). Its watcher service (`vpn watch`) is the
 one process that changes the exit node, and the `vpn` commands are its clients.
