@@ -18,7 +18,7 @@
 #                    whichever worker user runs them
 #   dispatcherKeys   the public key of each machine that dispatches to the
 #                    workers. Without its key a machine gets "Permission denied
-#                    (publickey)" from these users, and `worker-hosts` shows
+#                    (publickey)" from these users, and `hosts` shows
 #                    that message in place of the host's state.
 { memoryMax, sessionsReserve, slots, dispatcherKeys }:
 { pkgs, lib, ... }:

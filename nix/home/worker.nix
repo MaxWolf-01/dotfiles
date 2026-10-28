@@ -126,7 +126,7 @@ in
 
   imports = [ ./machines.nix ];
 
-  # What dispatch reads before planning a wave, and what `worker-hosts` (bin/)
+  # What dispatch reads before planning a wave, and what `hosts` (bin/)
   # shows for this user. Its frontmatter is the user's entry in ./machines.nix;
   # the rest is hand-written: the user's own lead paragraph, in
   # ./hosts/<host>-<user>/HOST.md, kept in the checkout so that a host which is

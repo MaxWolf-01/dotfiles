@@ -29,5 +29,5 @@ or a script written for another host's PATH has to be given here.
 
 pc comes back with max's age key, SSH key and encrypted datasets locked, and
 its backups skip until they are unlocked; work here runs regardless. When
-`worker-hosts` shows pc up for less than a day, the orchestrator runs
-`host-unlock pc` on zephylux once.
+`hosts` shows pc up for less than a day, the orchestrator runs
+`hosts unlock pc` on zephylux once.

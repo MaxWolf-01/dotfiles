@@ -9,7 +9,7 @@
   claudeToken.mode = "switch";
 
   # This machine's capability record, read by a worker running locally and by
-  # `worker-hosts` (bin/): its entry in ../machines.nix, and the hand-written
+  # `hosts` (bin/): its entry in ../machines.nix, and the hand-written
   # rest. No @TOOLCHAIN@ token: what is installed here is spread across
   # common.nix and its imports rather than one list, so the record points at
   # the config instead of enumerating it.

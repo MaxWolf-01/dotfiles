@@ -312,7 +312,7 @@ in
   # --- Catch-up handle ---
   # "The backups can run now." secrets/zshrc starts it on login, when the age key
   # is decrypted or the ssh key enters the agent, zfs-unlock starts it when a
-  # dataset appears, and `host-unlock pc` once everything is unlocked. It
+  # dataset appears, and `hosts unlock pc` once everything is unlocked. It
   # carries no Install section, so systemd itself never starts it: the timers
   # cover the scheduled runs, this covers what skipped for want of a
   # precondition.
