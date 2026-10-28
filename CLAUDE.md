@@ -152,7 +152,7 @@ which holds the share root. What it refuses goes to the SFTPGo drop.
 ## DNS
 
 Tailnet-wide: every device resolves through Mullvad's filtering resolver, pushed
-with `bin/tailscale-dns` from `secrets/tailscale/dns.json`. Servers (pc, jarvis,
+with `tailnet dns push` (`bin/tailnet`) from `secrets/tailscale/dns.json`. Servers (pc, jarvis,
 yapit-prod) are opted out. Never add `Domains=~.` to a resolved config — it ties
 with tailscaled's own catch-all and silently defeats filtering. `dns-blocked`
 answers "is this domain blocked, and by which list"; `dns-filter off` turns

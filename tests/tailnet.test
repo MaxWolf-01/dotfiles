@@ -1,0 +1,121 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""Check that bin/tailnet sends no push without its validation. Run it directly; no framework.
+
+tailnet runs as a subprocess against a stand-in for the Tailscale API on a local port, with HOME at a
+temporary directory holding the policy and DNS files of each case. The oracle is the requests the stand-in
+received: an ACL push goes out only after the API called the policy valid, and a DNS push only for a file
+holding "proxied": true, which keeps MagicDNS on.
+
+Example:
+
+    tests/tailnet.test
+"""
+
+import http.server
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import check, finish, needs  # noqa: E402
+
+TAILNET = Path(__file__).resolve().parents[1] / "bin/tailnet"
+POLICY = '{"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["*:*"]}]}'
+# What the API answers /acl/validate with for a policy it refuses.
+INVALID = {"message": "line 1: unknown field \"acl\"", "data": []}
+
+
+class FakeApi(http.server.BaseHTTPRequestHandler):
+    """Records every request; answers /acl/validate with the verdict of the case, every other path with {}."""
+
+    requests: list[tuple[str, str, bytes]] = []
+    validate_status = 200
+    validate_body: dict = {}
+
+    def answer(self) -> None:
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        FakeApi.requests.append((self.command, self.path, body))
+        status, reply = (200, {})
+        if self.path.endswith("/acl/validate"):
+            status, reply = FakeApi.validate_status, FakeApi.validate_body
+        data = json.dumps(reply).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = do_POST = answer
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def tailnet(home: Path, api: str, *args: str) -> subprocess.CompletedProcess:
+    env = os.environ | {"HOME": str(home), "TAILNET_API": api, "TS_API_TOKEN": "tskey-api-test"}
+    return subprocess.run([str(TAILNET), *args], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+def case(home: Path, api: str, args: tuple[str, ...], validate=(200, {})) -> tuple[int, list[tuple[str, str]], bytes]:
+    """Runs tailnet once: its exit code, the requests the API received, and the body of the last one."""
+    FakeApi.requests = []
+    FakeApi.validate_status, FakeApi.validate_body = validate
+    r = tailnet(home, api, *args)
+    sent = [(method, path) for method, path, _ in FakeApi.requests]
+    return r.returncode, sent, FakeApi.requests[-1][2] if FakeApi.requests else b""
+
+
+def main() -> None:
+    needs("curl", "jq")
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeApi)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    api = f"http://127.0.0.1:{port}/api/v2"
+    validate = ("POST", "/api/v2/tailnet/-/acl/validate")
+    acl_push = ("POST", "/api/v2/tailnet/-/acl")
+    dns_push = ("POST", "/api/v2/tailnet/-/dns/config")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        files = home / ".dotfiles/secrets/tailscale"
+        files.mkdir(parents=True)
+        (files / "policy.hujson").write_text(POLICY)
+
+        rc, sent, body = case(home, api, ("acl", "push"))
+        check("acl push: a policy the API calls valid is validated, then pushed", (0, [validate, acl_push]), (rc, sent))
+        check("acl push: what goes out is the local policy file", POLICY, body.decode())
+
+        rc, sent, _ = case(home, api, ("acl", "push"), validate=(200, INVALID))
+        check("acl push: a policy the API calls invalid is not pushed", (1, [validate]), (rc, sent))
+
+        rc, sent, _ = case(home, api, ("acl", "push"), validate=(500, {"message": "internal error"}))
+        check("acl push: a validation the API could not answer pushes nothing", (True, [validate]), (rc != 0, sent))
+
+        dns = {"nameservers": [{"address": "194.242.2.4", "useWithExitNode": True}], "proxied": True}
+        for name, config in [
+            ('a config holding "proxied": true is pushed', dns),
+            ('a config without "proxied" sends nothing', {k: v for k, v in dns.items() if k != "proxied"}),
+            ('a config holding "proxied": false sends nothing', dns | {"proxied": False}),
+            ('a config holding "proxied": "true", a string, sends nothing', dns | {"proxied": "true"}),
+        ]:
+            (files / "dns.json").write_text(json.dumps(config))
+            rc, sent, body = case(home, api, ("dns", "push"))
+            expected = (0, [dns_push]) if config.get("proxied") is True else (1, [])
+            check(f"dns push: {name}", expected, (rc, sent))
+            if config.get("proxied") is True:
+                check("dns push: what goes out is the local DNS file", config, json.loads(body))
+
+    server.shutdown()
+    finish()
+
+
+if __name__ == "__main__":
+    main()

@@ -14,7 +14,7 @@ mechanisms deliver it:
 
 Mullvad publishes several list flavours, one IP each:
 <https://mullvad.net/en/help/dns-over-https-and-dns-over-tls>. The tailnet
-config lives in `secrets/tailscale/dns.json`, pushed with `bin/tailscale-dns`;
+config lives in `secrets/tailscale/dns.json`, pushed with `tailnet dns push` (`bin/tailnet`);
 the failover chain names the same resolver in `bin/dns-failover-install`.
 
 ## zephylux: the failover chain
@@ -153,5 +153,5 @@ dig @127.0.0.1 -p 5300 doubleclick.net # zephylux: what the front alone says
 dig @127.0.0.1 -p 5301 github.com      # zephylux: the bypass path alone
 resolvectl query pc                    # MagicDNS
 tailscale dns status                   # resolvers the control plane handed this device
-tailscale-dns diff                     # live tailnet config vs the versioned file
+tailnet dns diff                       # live tailnet config vs the versioned file
 ```
