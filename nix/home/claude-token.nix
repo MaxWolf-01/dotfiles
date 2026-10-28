@@ -12,7 +12,7 @@
     default = "profile";
     description = ''
       profile: every profile runs on its account's token. switch: every profile
-      runs on its own /login unless `claude-account` switched the host.
+      runs on its own /login unless `clawd use` switched the personal one.
     '';
   };
 
@@ -27,8 +27,11 @@
 
     home.packages = [
       (pkgs.writeShellScriptBin "claude" ''
-        exec ${pkgs.bash}/bin/bash ${./claude-token.sh} ${pkgs.sops}/bin/sops "$0" ${config.claudeToken.mode} "$@"
+        exec ${pkgs.bash}/bin/bash ${./claude-token.sh} ${pkgs.sops}/bin/sops ${./claude-accounts.sh} "$0" ${config.claudeToken.mode} "$@"
       '')
     ];
+
+    # bin/clawd reads it to say what each profile's next session runs on.
+    xdg.configFile."clawd/wrapper-mode".text = config.claudeToken.mode;
   };
 }

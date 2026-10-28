@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# max's Claude accounts: which one each profile's next session runs on, switching
+# the personal profile to another, their quota, and their tokens on the worker users.
+#
+# A profile is a Claude Code config dir: ~/.claude is the personal account's,
+# ~/.claude-<account> that account's. An account's setup-token is
+# CLAUDE_CODE_OAUTH_TOKEN in secrets/creds/env/claude-<account>.env, which `claude`
+# (the wrapper, nix/home/claude-token.sh) hands to the sessions it starts; how each
+# host decides: that wrapper's header.
+#
+# Usage:
+#   clawd                         one line per profile: the account its next session
+#                                 gets, and whether through its own login or a switch
+#   clawd use <account>           put the personal profile's new sessions on that
+#                                 account's token (zephylux)
+#   clawd use personal            back to the personal profile's own /login
+#   clawd quota [--json]          every plan's quota and Console org's spend
+#   clawd push [<user@host>...]   give the worker users their accounts' tokens
+#   clawd ping                    anchor the 5-hour usage window
+#
+# use: only the personal profile is ever switched; ~/.claude-helferline always runs on
+# its own login. Sessions already running keep the login they started on, and the
+# scheduled units that run claude (clawd ping, the retros) are never switched. pc's
+# wrapper ignores the switch: there every profile always runs on its account's token.
+#
+# quota: for every profile that holds a login, how much of its plan's quota is used and
+# when it resets, read from Anthropic's OAuth usage endpoint with the profile's current
+# access token, never refreshed: a refresh rotates the token Claude Code holds. An
+# expired one is reported, and opening claude in that profile renews it.
+# Then each Console org that receives a Max plan's monthly API credits: what it has spent
+# since the day of the month the grant arrives, CC_QUOTA_GRANT_DAY (default 10). No public
+# API reads a grant or the balance left, so quota shows the spend and leaves the balance
+# to the Console's Billing page. The spend comes from the Admin API's cost report, which
+# counts whole days, so it runs through yesterday. An org is a with-secrets entry defining
+# an organization-scoped API key, under a name holding ORGANIZATION and ending in API_KEY
+# (ORGANIZATION_API_KEY, HELFERLINE_DEV_ORGANIZATION__ANTHROPIC_API_KEY), and optionally
+# its CC_QUOTA_GRANT_DAY. CC_QUOTA_ORG_KEY, when set, stands in for every entry (with
+# CC_QUOTA_GRANT_DAY from the environment); set empty, it leaves the orgs out.
+# --json prints the same report as one line of JSON, for a history to append it to: at
+# (UTC), profiles (name, plan, buckets of name, used %, resets_at, dollars_left,
+# dollars_limit; or name and error), and consoles (entry, org, since, spent in dollars,
+# counted through yesterday; or entry and error).
+#
+# push: every worker user whose entry in the machines list (nix/home/machines.nix, written
+# out as ~/.config/machines.json, or MACHINES_FILE) names an account gets that account's
+# token. On each host:
+#   1. `claude -p` has to answer on the new token before it replaces the one the user
+#      held, in ~/.config/claude-token (mode 600), with the account's name beside it in
+#      ~/.config/claude-token-account; its shell exports both
+#      (nix/home/worker-claude-token.zsh). A token claude refuses is left out, and the
+#      run fails;
+#   2. a fresh shell there has to export that token and account; otherwise the browser
+#      login stays, and the run fails;
+#   3. `claude auth logout` drops the browser login, unless a claude session that started
+#      before the token is still running on it: that login stays until the session ends,
+#      and the run fails, naming the host to push again.
+# Run it on zephylux after minting an account's token, which the yearly renewal does, and
+# after a worker's home is rebuilt. An account whose token is not minted yet is skipped,
+# its workers left on their login. A host that is down is reported and the rest still
+# pushed. The token is never printed.
+#
+# ping: one cheap message that opens the 5-hour usage window. The window starts with the
+# first message sent, not at a fixed clock time, so a ping at a fixed hour pins the reset
+# grid: one at 08:30 means resets at 13:30, 18:30, 23:30. A ping inside an open window
+# does nothing, except that one opening a window shortly before an anchor time puts that
+# anchor inside it. The schedule is in nix/home/timers.nix.
+set -uo pipefail
+
+repo="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
+claude_accounts_who=clawd
+. "$repo/nix/home/claude-accounts.sh"
+
+main() {
+    case ${1:-} in
+        -h|--help) usage ;;
+        "") cmd_status ;;
+        use|quota|push|ping)
+            local command=$1
+            shift
+            case ${1:-} in -h|--help) usage; exit 0 ;; esac
+            "cmd_$command" "$@" ;;
+        *) die "no command $1; clawd --help says what it takes" ;;
+    esac
+}
+
+usage() { awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"; }
+die() { echo "clawd: $1" >&2; exit 2; }
+
+# What `claude` on this host does with the switch: switch where `clawd use` applies,
+# profile where every profile runs on its account's token, nothing where no wrapper is
+# installed.
+wrapper_mode() { cat "$HOME/.config/clawd/wrapper-mode" 2>/dev/null; }
+
+cmd_status() {
+    local mode switched dir account
+    mode=$(wrapper_mode)
+    switched=$(claude_switched_account)
+    while IFS= read -r dir; do
+        account=$(claude_profile_account "$dir")
+        printf '%s: ' "${dir/#"$HOME"/\~}"
+        if [ "$mode" = switch ] && [ "$account" = personal ] && [ -n "$switched" ]; then
+            if [ -f "$(claude_account_file "$switched")" ] && claude_account_minted "$switched"; then
+                echo "$switched, switched (\`clawd use personal\` goes back to its own login)"
+            else
+                echo "switched to $switched, which has no token: claude refuses to start (\`clawd use personal\` goes back)"
+            fi
+        elif [ "$mode" = profile ] && claude_account_minted "$account"; then
+            echo "$account, on its token"
+        else
+            echo "$account, its own login"
+        fi
+    done < <(claude_profiles)
+}
+
+cmd_use() {
+    [ $# -eq 1 ] || die "use takes one account, got: ${*:-none}"
+    local account=$1 file
+    case $(wrapper_mode) in
+        switch) ;;
+        profile) die "this host's claude puts every profile on its own account's token, so there is no switch" ;;
+        *) die "no claude wrapper here ($HOME/.config/clawd/wrapper-mode is missing; nix/home/claude-token.nix installs it)" ;;
+    esac
+    if [ "$account" = personal ]; then
+        rm -f "$claude_switch_file"
+        echo "personal: new sessions on ~/.claude run on its own /login; running sessions keep theirs"
+        return
+    fi
+    file=$(claude_account_file "$account")
+    [ -f "$file" ] || die "no account '$account': $file does not exist (accounts: $(claude_accounts | paste -sd' ' -))"
+    claude_account_minted "$account" \
+        || die "'$account' holds no token yet: mint one with \`claude setup-token\` and write it with \`sops $file\`"
+    mkdir -p "$(dirname "$claude_switch_file")"
+    echo "$account" >"$claude_switch_file"
+    echo "$account: new sessions on ~/.claude run on its token; running sessions keep theirs, and ~/.claude-helferline keeps its own login"
+}
+
+# Bash and jq alone from here to the text report: jarvis-sync's unit runs `clawd quota
+# --json` on a PATH without awk, grep or sed.
+cmd_quota() {
+    set -e
+    local json=false
+    case ${1:-} in
+        --json) json=true ;;
+        '') ;;
+        *) die "quota takes no $1; clawd --help says what it takes" ;;
+    esac
+
+    local api=${CC_QUOTA_API:-https://api.anthropic.com}
+    now=${CC_QUOTA_NOW:-$(date +%s)}
+
+    # Every profile's report, one JSON object each.
+    local profiles=() dir creds name token usage
+    for dir in "$HOME/.claude" "$HOME"/.claude-*/; do
+        dir=${dir%/}
+        creds=$dir/.credentials.json
+        [[ -f $creds ]] || continue
+        name=$(claude_profile_account "$dir")
+        if (($(jq -r '.claudeAiOauth.expiresAt // 0' "$creds") < now * 1000)); then
+            profiles+=("$(failed "$name" "token expired; open claude in this profile to renew it")")
+            continue
+        fi
+        token=$(jq -r .claudeAiOauth.accessToken "$creds")
+        if ! usage=$(curl -sSf "$api/api/oauth/usage" -H "Authorization: Bearer $token" -H 'anthropic-beta: oauth-2025-04-20'); then
+            profiles+=("$(failed "$name" "the usage endpoint refused the request")")
+            continue
+        fi
+        # Every bucket the reply fills in, so one Anthropic adds later shows up under its own name.
+        # Reset times jitter around the minute (04:59:59.85, then 05:00:00.24), so they are rounded to it.
+        profiles+=("$(jq -c --arg n "$name" --arg p "$(jq -r '.claudeAiOauth.subscriptionType // "?"' "$creds")" '{name: $n, plan: $p, buckets: [
+            to_entries[] | select(.value | type == "object" and has("utilization") and .resets_at != null)
+            | {name: .key, used: (.value.utilization | round),
+               resets_at: (.value.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdate + 30 | . - . % 60 | todate),
+               dollars_left: .value.remaining_dollars, dollars_limit: .value.limit_dollars}]}' <<<"$usage")")
+    done
+
+    local consoles=() entry vars key day var value
+    if [[ -v CC_QUOTA_ORG_KEY ]]; then
+        [[ -z $CC_QUOTA_ORG_KEY ]] || consoles+=("$(console key "$CC_QUOTA_ORG_KEY" "${CC_QUOTA_GRANT_DAY:-10}")")
+    else
+        while read -r entry vars; do
+            [[ " $vars " == *ORGANIZATION*API_KEY" "* ]] || continue
+            key= day=
+            while IFS='=' read -r var value; do
+                case $var in
+                    *ORGANIZATION*API_KEY) key=$value ;;
+                    CC_QUOTA_GRANT_DAY) day=$value ;;
+                esac
+            done < <(with-secrets "$entry" env </dev/null 2>/dev/null || true)
+            [[ -n $key ]] || continue
+            consoles+=("$(console "$entry" "$key" "${day:-10}")")
+        done < <(with-secrets --list 2>/dev/null || true)
+    fi
+
+    local report
+    report=$(jq -nc --arg at "$(date -u -d "@$now" +%FT%TZ)" \
+        --argjson profiles "$(printf '%s\n' ${profiles[@]+"${profiles[@]}"} | jq -sc .)" \
+        --argjson consoles "$(printf '%s\n' ${consoles[@]+"${consoles[@]}"} | jq -sc .)" \
+        '{at: $at, profiles: $profiles, consoles: $consoles}')
+    if $json; then
+        echo "$report"
+    else
+        quota_text <<<"$report"
+    fi
+}
+
+failed() { jq -nc --arg n "$1" --arg e "$2" '{name: $n, error: $e}'; }
+
+# One Console org's spend as a JSON object: console <entry> <key> <grant day>.
+console() {
+    local entry=$1 key=$2 day=$3 since admin org cents=0 page report
+    since=$(date -d "@$now" +%Y-%m-)$(printf %02d "$day")
+    (($(date -d "@$now" +%-d) >= day)) || since=$(date -d "$since -1 month" +%F)
+    admin=(-H "x-api-key: $key" -H 'anthropic-version: 2023-06-01')
+    if ! org=$(curl -sSf "$api/v1/organizations/me" "${admin[@]}" | jq -r .name); then
+        jq -nc --arg e "$entry" '{entry: $e, error: "the Admin API refused the organization key"}'
+        return
+    fi
+    # A cycle that starts today has no whole day yet, and the report refuses an empty range.
+    if [[ $since != "$(date -d "@$now" +%F)" ]]; then
+        page=
+        while :; do
+            if ! report=$(curl -sSfG "$api/v1/organizations/cost_report" "${admin[@]}" --data-urlencode "starting_at=${since}T00:00:00Z" -d limit=31 ${page:+--data-urlencode "page=$page"}); then
+                jq -nc --arg e "$entry" --arg o "$org" '{entry: $e, org: $o, error: "the cost report refused the request"}'
+                return
+            fi
+            cents=$(jq -r --arg c "$cents" '[.data[].results[].amount | tonumber] | add + ($c | tonumber)' <<<"$report")
+            page=$(jq -r 'if .has_more then .next_page else empty end' <<<"$report")
+            [[ -n $page ]] || break
+        done
+    fi
+    jq -nc --arg e "$entry" --arg o "$org" --arg s "$since" --argjson c "$cents" \
+        '{entry: $e, org: $o, since: $s, spent: ($c | round / 100)}'
+}
+
+# The report on stdin as text: a heading per profile or Console org, a row per bucket with
+# a bar of how much is used. Colour only on a terminal, and never with NO_COLOR set.
+quota_text() {
+    local bold dim off green yellow red kind a b c d e
+    if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+        bold=$'\e[1m' dim=$'\e[2m' off=$'\e[0m' green=$'\e[32m' yellow=$'\e[33m' red=$'\e[31m'
+    else
+        bold= dim= off= green= yellow= red=
+    fi
+    jq -r '(.profiles[] | if .error then ["error", .name, .error]
+            else ["heading", .name, .plan], (.buckets[] | ["bucket", .name, .used, (.resets_at | fromdate), .dollars_left, .dollars_limit]) end),
+        (.consoles[] | if .error then ["error", "console \(.org // .entry)", .error]
+            else ["heading", "console \(.org)", .entry], ["spend", .spent, .since] end)
+        | map(. // "" | tostring) | @tsv' |
+        while IFS=$'\t' read -r kind a b c d e; do
+            case $kind in
+                heading) printf '%s%s%s %s%s%s\n' "$bold" "$a" "$off" "$dim" "$b" "$off" ;;
+                error) printf '%s%s%s %s%s%s\n' "$bold" "$a" "$off" "$red" "$b" "$off" ;;
+                bucket)
+                    if [[ -n $d ]]; then
+                        row "$(label "$a")" "$b" "\$$(printf %.2f "$d") of \$$(printf %.0f "$e") left${dim}, expires $(when "$c")$off"
+                    else
+                        row "$(label "$a")" "$b" "${dim}resets $(when "$c")$off"
+                    fi
+                    ;;
+                spend) printf '  %-13s $%.2f spent%s since %s, through yesterday%s\n' "API credits" "$a" "$dim" "$(date -d "$b" '+%a %d %b')" "$off" ;;
+            esac
+        done
+}
+
+# A bucket's name as a person says it; one this list lacks keeps the endpoint's name.
+label() {
+    case $1 in
+        five_hour) echo 5-hour ;;
+        seven_day) echo week ;;
+        seven_day_opus) echo "week, opus" ;;
+        seven_day_sonnet) echo "week, sonnet" ;;
+        iguana_necktie) echo "cloud credit" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+repeat() { local s= i; for ((i = 0; i < $2; i++)); do s+=$1; done; printf %s "$s"; }
+
+bar() { # bar <used %>: 20 cells, coloured by how close the bucket is to its limit
+    local used=$1 full colour=$green
+    full=$(((used > 100 ? 100 : used) / 5))
+    ((used < 70)) || colour=$yellow
+    ((used < 90)) || colour=$red
+    printf '%s%s%s%s%s' "$colour" "$(repeat █ "$full")" "$dim" "$(repeat ░ $((20 - full)))" "$off"
+}
+
+# When an instant is: its weekday and time within the week, its date beyond, and how far off it is.
+when() {
+    local at=$1 left=$(($1 - now)) far
+    if ((left < 6 * 86400)); then far=$(date -d "@$at" '+%a %H:%M'); else far=$(date -d "@$at" '+%a %d %b'); fi
+    if ((left < 3600)); then echo "$far, in $((left / 60))m"
+    elif ((left < 86400)); then echo "$far, in $((left / 3600))h $((left % 3600 / 60))m"
+    else echo "$far, in $((left / 86400))d $((left % 86400 / 3600))h"
+    fi
+}
+
+row() { # row <label> <used %> <detail>
+    printf '  %-13s %s %4s  %s\n' "$1" "$(bar "$2")" "$2%" "$3"
+}
+
+cmd_push() {
+    local ssh_opts=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+    local target
+    for target in "$@"; do [[ $target != -* ]] || die "push takes no $target; clawd --help says what it takes"; done
+
+    # Every worker user whose entry names an account: user@host and that account.
+    local machines=${MACHINES_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/machines.json} workers=() account
+    [ -r "$machines" ] || die "no machines list at $machines; Home Manager writes it (nix/home/machines.nix)"
+    mapfile -t workers < <(jq -r '.[] | .name as $host | .workers[] | select(.account) | "\(.user)@\($host) \(.account)"' "$machines")
+    if [ $# -gt 0 ]; then
+        local chosen=() match
+        for target in "$@"; do
+            match=$(printf '%s\n' "${workers[@]}" | awk -v t="$target" '$1 == t' | grep .) ||
+                die "no worker user with an account: $target (have: $(printf '%s\n' "${workers[@]}" | cut -d' ' -f1 | paste -sd' ' -))"
+            chosen+=("$match")
+        done
+        workers=("${chosen[@]}")
+    fi
+
+    local -A token=()
+    local failed=0 worker out
+    for worker in "${workers[@]}"; do
+        read -r target account <<<"$worker"
+        if [ -z "${token[$account]+set}" ]; then
+            token[$account]=$(claude_account_token "$account")
+            case $? in
+                3) die "no $(claude_account_file "$account"), so the $account account has no token to push" ;;
+                1) exit 2 ;;
+            esac
+        fi
+        if [ -z "${token[$account]}" ]; then
+            echo "skipped: $target: the $account token is not minted yet, so it stays on its browser login"
+            continue
+        fi
+
+        out=$(printf '%s\n' "${token[$account]}" | ssh "${ssh_opts[@]}" "$target" "account=$(printf %q "$account"); $install_token" 2>&1)
+        case $? in
+            0) out=$(ssh "${ssh_opts[@]}" "$target" "account=$(printf %q "$account"); $check_and_logout" </dev/null 2>&1) ;;
+            255) out="could not reach it to write the token (host down, or its home locked?)"; false ;;
+            *) out=${out:-could not write the token}; false ;;
+        esac
+        if [ $? -eq 0 ]; then
+            echo "ok: $target ($account): $out"
+        else
+            echo "FAILED: $target ($account): ${out:-no answer}"
+            failed=$((failed + 1))
+        fi
+    done
+
+    [ "$failed" -eq 0 ] || { echo "clawd push: $failed worker user(s) not done; see above" >&2; exit 1; }
+}
+
+# Writes stdin, the token, in place of the old one in one rename, once claude answers on
+# it, and $account beside it. Prints why when it does not.
+read -r -d '' install_token <<'REMOTE'
+umask 077 && mkdir -p ~/.config && cat >~/.config/claude-token.new || exit 1
+if ! out=$(CLAUDE_CODE_OAUTH_TOKEN="$(cat ~/.config/claude-token.new)" timeout 120 claude -p ping --model haiku \
+    --strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-session-persistence --disable-slash-commands 2>&1); then
+  rm -f ~/.config/claude-token.new
+  echo "claude -p fails on the new token, so it keeps the token and login it had: $out"
+  exit 1
+fi
+mv ~/.config/claude-token.new ~/.config/claude-token
+echo "$account" >~/.config/claude-token-account
+REMOTE
+
+# Runs in the worker's own shell, which has read .zshenv: its environment is what every
+# claude there starts with. Prints one line saying how it ended.
+read -r -d '' check_and_logout <<'REMOTE'
+if [ "${CLAUDE_CODE_OAUTH_TOKEN-}" != "$(cat ~/.config/claude-token)" ] || [ "${CLAUDE_ACCOUNT-}" != "$account" ]; then
+  echo "token written, but its shell does not export it and its account, so the browser login stays: is nix/home/worker-claude-token.zsh switched in on this host (nswitch)?"
+  exit 1
+fi
+on_login=0
+for pid in $(pgrep -u "$(id -u)" -x claude); do
+  tr '\0' '\n' </proc/$pid/environ 2>/dev/null | grep -q '^CLAUDE_CODE_OAUTH_TOKEN=' || on_login=$((on_login + 1))
+done
+if [ "$on_login" -gt 0 ]; then
+  echo "on the token, but $on_login claude session(s) still run on the browser login, which stays until they end: push to this host again then"
+  exit 1
+fi
+creds=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json
+if [ -e "$creds" ]; then
+  # Unset, so that logout sees only the browser login and never the account's token.
+  env -u CLAUDE_CODE_OAUTH_TOKEN claude auth logout >/dev/null 2>&1
+  rm -f "$creds"
+  echo "on the token; browser login logged out"
+else
+  echo "on the token"
+fi
+REMOTE
+
+cmd_ping() {
+    [ $# -eq 0 ] || die "ping takes no arguments, got: $*"
+    if ! command -v claude >/dev/null; then
+        echo "clawd ping: claude CLI not on PATH ($PATH)" >&2
+        exit 1
+    fi
+    # haiku so the ping never eats the weekly Opus budget. No MCP servers, no saved
+    # session, no skills: the cheapest round trip that still opens a window.
+    local status
+    timeout 120 claude -p ping \
+        --model haiku \
+        --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+        --no-session-persistence \
+        --disable-slash-commands
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "clawd ping: ping failed (exit $status). Check network, then 'claude auth'. An expired login or token fails silently apart from this." >&2
+        exit "$status"
+    fi
+}
+
+main "$@"
