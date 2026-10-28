@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# tier: full-path (nix)
+# Evaluate the flake's real host configs and check the machines list (nix/home/machines.nix) against them. Run it
+# directly; no framework.
+#
+# What adding a machine relies on: the list is the one place the host tools learn of a worker user, so every worker
+# user the flake sets up is in it and nothing the flake does not set up is; every host writes out the same list;
+# each worker user's HOST.md states what its entry says; and a list naming a machine twice does not build.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$repo/tests/check.sh"
+needs nix jq
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+evaluated=$(nix eval --json --impure --expr "
+let
+  f = builtins.getFlake \"git+file://$repo\";
+  pkgs = f.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem};
+  users = host: f.nixosConfigurations.\${host}.config.home-manager.users;
+  laptop = f.homeConfigurations.zephyrus.config;
+in {
+  configured = pkgs.lib.concatMap (host: map (user: \"\${user}@\${host}\") (builtins.attrNames (users host)))
+    [ \"pc\" \"xmg19\" ];
+  listed = laptop.machines;
+  written = map (c: c.xdg.configFile.\"machines.json\".text)
+    [ laptop (users \"pc\").max (users \"xmg19\").max (users \"pc\").agent ];
+  records = {
+    \"agent-hl@pc\" = (users \"pc\").agent-hl.home.file.\"HOST.md\".text;
+    \"agent@xmg19\" = (users \"xmg19\").agent.home.file.\"HOST.md\".text;
+    \"max@zephylux\" = laptop.home.file.\"HOST.md\".text;
+  };
+}" 2>"$scratch/err") || { fail "the flake's host configs evaluate" "$(tail -20 "$scratch/err")"; finish; }
+
+# max on pc and xmg19 is the machine's owner, not a worker user; on the laptop he is both. Sorted on both sides,
+# since the flake names users in its own order.
+check "the worker users the list holds are the ones the flake sets up, the laptop's max among them" \
+    "$( (jq -r '.configured[] | select(startswith("max@") | not)' <<<"$evaluated"; echo max@zephylux) | sort)" \
+    "$(jq -r '.listed[] | .name as $h | .workers[] | "\(.user)@\($h)"' <<<"$evaluated" | sort)"
+check "every host, worker users' homes included, writes out the same list" 1 \
+    "$(jq '.written | unique | length' <<<"$evaluated")"
+
+frontmatter() { jq -r --arg w "$1" '.records[$w]' <<<"$evaluated" | awk 'NR == 1 && /^---$/ {on = 1; next} on && /^---$/ {exit} on'; }
+check "agent-hl@pc's record says it is pc's, on the Helferline account, isolated, its GPU withheld" \
+    "host: pc
+user: agent-hl
+isolated: true
+withholds: gpu
+account: helferline" "$(frontmatter agent-hl@pc)"
+check "agent@xmg19's record says it is on the personal account, and withholds nothing" \
+    "host: xmg19
+user: agent
+isolated: true
+account: personal" "$(frontmatter agent@xmg19)"
+check "the laptop's record says it is placed on last, and names no account" \
+    "host: zephylux
+user: max
+isolated: false
+placement: last
+withholds: gpu" "$(frontmatter max@zephylux)"
+[[ $(jq -r '.records["agent@xmg19"]' <<<"$evaluated") == *"# Worker host: agent@xmg19"* ]] &&
+    passed "...and goes on with its hand-written description" ||
+    fail "...and goes on with its hand-written description" "$(jq -r '.records["agent@xmg19"]' <<<"$evaluated" | head)"
+
+# Home Manager refuses a config whose assertions fail as soon as it is read.
+nix eval --raw --impure --expr "
+let
+  f = builtins.getFlake \"git+file://$repo\";
+  pkgs = f.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem};
+in (f.inputs.home-manager.lib.homeManagerConfiguration {
+  inherit pkgs;
+  modules = [ (f.outPath + \"/nix/home/machines.nix\") {
+    home = { username = \"max\"; homeDirectory = \"/home/max\"; stateVersion = \"26.05\"; };
+    machines = [ { name = \"pc\"; ssh = \"pc\"; trust = 2; } { name = \"pc\"; ssh = \"pc\"; trust = 1; } ];
+  } ];
+}).activationPackage.drvPath" >/dev/null 2>"$scratch/twice"
+[[ $? -ne 0 && $(<"$scratch/twice") == *"machines names a machine more than once: pc, pc"* ]] &&
+    passed "a list naming a machine twice does not build, and says which" ||
+    fail "a list naming a machine twice does not build, and says which" "$(tail -5 "$scratch/twice")"
+
+finish
