@@ -406,13 +406,17 @@ Examples:
     container-hub --socket /tmp/hub.sock --port 18377 --state /tmp/hub-state --copies /tmp/copies
 """
 
+import ctypes
+import errno
 import fcntl
+import fnmatch
 import hashlib
 import html
 import http.client
 import importlib.machinery
 import importlib.util
 import json
+import math
 import mimetypes
 import os
 import pwd
@@ -424,6 +428,7 @@ import secrets
 import shutil
 import socket
 import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
@@ -433,11 +438,13 @@ import urllib.parse
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from stat import S_ISDIR
 
 import tyro
 from markdown_it import MarkdownIt
@@ -508,6 +515,9 @@ class Args:
     pull: str = ""
     """The command, as a shell would split it, that pulls the peers' session copies once, which this hub runs once a
     peer has released sessions to it; with none, they move here at the copies' next pull."""
+    poll: bool = False
+    """Read the disk every 2 s while a hub tab listens, as on a host whose kernel cannot say what changed (a home on
+    NFS), rather than once a change is heard."""
 
 
 # --------------------------------------------------------------------------
@@ -557,27 +567,131 @@ def tracker_command() -> str | None:
 
 def mx_script(script: str) -> Path | None:
     """A script of the newest mx plugin under the plugin cache, by its path under the plugin's `skills/`."""
-    scripts = HOME.glob(f".claude*/plugins/cache/*/mx/*/skills/{script}")
+    scripts = globbed(HOME, f".claude*/plugins/cache/*/mx/*/skills/{script}")
     version = lambda p: tuple(int(x) if x.isdigit() else 0 for x in p.parents[2].name.split("."))
     return max(scripts, key=version, default=None)
 
 
 def signature(root: Path) -> tuple:
+    looked(root, "*.md")
     try:
-        return tuple(sorted((e.name, e.stat().st_mtime_ns, e.stat().st_size) for e in os.scandir(root) if e.name.endswith(".md")))
+        found = tuple(sorted((e.name, e.stat().st_mtime_ns, e.stat().st_size) for e in os.scandir(root) if e.name.endswith(".md")))
     except OSError:
         return ()
+    for name, *_ in found:
+        looked(os.path.join(root, name))
+    return found
 
 
 def stamp(path: Path | str) -> tuple | None:
     """What a file's stat says of its content, None where there is no file. A write of the same size in the same
     tick of the kernel's clock as the stat before it keeps the stamp, and the hub misses it, on kernels before 6.13,
-    which brought finer times for a file whose time was just read (multigrain timestamps)."""
+    which brought finer times for a file whose time was just read (multigrain timestamps). A directory's changes
+    with every name that comes or goes in it."""
+    looked(path)
     try:
         s = os.stat(path)
     except OSError:
         return None
+    if S_ISDIR(s.st_mode):
+        looked(path, "*")
     return s.st_ino, s.st_mtime_ns, s.st_size, s.st_mode
+
+
+# --------------------------------------------------------------------------
+# what a read looked at, which the disk watch listens for changes to (WATCH)
+# --------------------------------------------------------------------------
+
+
+class Looks:
+    """What a read looked at: `seen`, each (path, None) for a path it stat'ed or read, there or not, and each
+    (directory, pattern) for a directory whose names matching the pattern it listed, a pattern ending in `/` matching
+    directories alone; and `until`, the time.time() at which the first thing it read off the clock rather than the
+    disk goes stale."""
+
+    def __init__(self):
+        self.seen: set[tuple[str, str | None]] = set()
+        self.until = math.inf
+
+
+looking = threading.local()
+"""The Looks of the read under way in this thread (`now`), where one is recorded."""
+
+
+def looked(path: Path | str, names: str | None = None) -> None:
+    """Note, for the read under way, that it looked at `path`, or with `names`, listed which of the directory's names
+    match that pattern."""
+    if (now := getattr(looking, "now", None)) is not None:
+        now.seen.add((os.fspath(path), names))
+
+
+def looked_until(at: float) -> None:
+    """Note, for the read under way, that what it read stays true until `at` alone, by time.time()."""
+    if (now := getattr(looking, "now", None)) is not None and at < now.until:
+        now.until = at
+
+
+@contextmanager
+def recording():
+    """What the code in the block looks at, noted also for the read around it, if one is recorded."""
+    outer, looking.now = getattr(looking, "now", None), Looks()
+    looks = looking.now
+    try:
+        yield looks
+    finally:
+        looking.now = outer
+        replay(looks)
+
+
+def replay(looks: Looks) -> None:
+    if (now := getattr(looking, "now", None)) is not None:
+        now.seen |= looks.seen
+        now.until = min(now.until, looks.until)
+
+
+def once(memo: dict, key, read):
+    """read(), once per read of the hub; every unit that asks for it after the first looked at what the first did."""
+    if key not in memo:
+        with recording() as looks:
+            memo[key] = read(), looks
+    value, looks = memo[key]
+    replay(looks)
+    return value
+
+
+MAGIC = re.compile(r"[*?[]")
+
+
+def globbed(base: Path, pattern: str) -> list[Path]:
+    """base.glob(pattern), for a pattern of names with no `**`, noting each directory it lists. A pattern ending in `/`
+    matches directories alone, as a wildcard before the last name does."""
+    paths, parts = [base], pattern.rstrip("/").split("/")
+    for i, part in enumerate(parts):
+        last = i == len(parts) - 1
+        files = last and not pattern.endswith("/")
+        if not MAGIC.search(part):
+            paths = [p / part for p in paths if not last or stamp(p / part) is not None]
+            continue
+        listed = []
+        for d in paths:
+            looked(d, part if files else part + "/")
+            try:
+                with os.scandir(d) as entries:
+                    listed += [Path(e.path) for e in entries if fnmatch.fnmatchcase(e.name, part) and (files or e.is_dir())]
+            except OSError:
+                continue
+        paths = listed
+    return paths
+
+
+def is_dir(path: Path | str) -> bool:
+    looked(path)
+    return os.path.isdir(path)
+
+
+def is_file(path: Path | str) -> bool:
+    looked(path)
+    return os.path.isfile(path)
 
 
 REFUSED: dict[Path, tuple] = {}
@@ -593,6 +707,7 @@ def tracker_at(agent: Path | None) -> Tracker | None:
     if (root := ROOTS.get(agent)) and (hit := TRACKERS.get(root)) and hit.signature == signature(root):
         return hit
     command = tracker_command()
+    looked(agent.parent)
     if not command or not agent.parent.is_dir():
         return None
     tried = (command, signature(agent / "tickets"), root and signature(root))
@@ -615,9 +730,7 @@ def tracker_at(agent: Path | None) -> Tracker | None:
 
 def tracker_of(agent: Path, memo: dict) -> Tracker | None:
     """tracker_at, once per read of the hub."""
-    if (agent, "tracker") not in memo:
-        memo[agent, "tracker"] = tracker_at(agent)
-    return memo[agent, "tracker"]
+    return once(memo, (agent, "tracker"), lambda: tracker_at(agent))
 
 
 SESSION_LOGS: dict[Path, tuple[str, dict[str, list[str]]]] = {}
@@ -625,7 +738,9 @@ TICKET_PATH = re.compile(r"(?:tickets/([^/]+)\.md|(?:show|prototypes)/([^/]+)/.*
 
 
 def git(cwd: Path, *args: str) -> str:
-    run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=False)
+    # GIT_OPTIONAL_LOCKS=0: `git status` leaves the index as it is, which would otherwise wake the disk watch it is read for
+    run = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=False,
+                         env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     return run.stdout if run.returncode == 0 else ""
 
 
@@ -636,46 +751,52 @@ REFS: dict[Path, tuple[tuple | None, str, Path]] = {}
 def refs_of(agent: Path, memo: dict) -> tuple[str, Path]:
     """The refs of an agent repo, as `git for-each-ref` lists them, and its common git dir: once per read of the hub,
     and asked of git only once a file git keeps the refs in has changed."""
-    if (agent, "refs") in memo:
-        return memo[agent, "refs"]
+    return once(memo, (agent, "refs"), lambda: refs_at(agent))
+
+
+def refs_at(agent: Path) -> tuple[str, Path]:
     seen = refs_stamp(agent)
     if seen is not None and (hit := REFS.get(agent)) and hit[0] == seen:
-        memo[agent, "refs"] = hit[1:]
         return hit[1:]
     refs = git(agent, "for-each-ref", "--format=%(objectname)")
     common = Path(git(agent, "rev-parse", "--path-format=absolute", "--git-common-dir").strip() or agent) if refs else agent
     REFS[agent] = seen, refs, common
-    memo[agent, "refs"] = refs, common
     return refs, common
 
 
 def refs_stamp(agent: Path) -> tuple | None:
     """The stamp of every file git keeps an agent repo's refs in: a ref written replaces its file, or packed-refs, or
-    the reftable's list. None where the agent directory is no repo of its own, which git is asked about every time."""
+    the reftable's list. None where the agent directory is in no repo, which git is asked about every time."""
     common = git_dir(agent)
     if common is None:
         return None
     found = [stamp(common / "packed-refs"), stamp(common / "reftable" / "tables.list")]
-    for top, _, names in os.walk(common / "refs"):
+    looked(common / "refs", "*")
+    for top, dirs, names in os.walk(common / "refs"):
+        looked(top, "*")
         found += [(top, name, stamp(os.path.join(top, name))) for name in names]
     return tuple(found)
 
 
 def git_dir(agent: Path) -> Path | None:
-    """The common git dir of the repo an agent directory is: its `.git`, or for a worktree, the one the directory its
-    `.git` file names points to in `commondir`."""
-    dot = agent / ".git"
-    if dot.is_dir():
-        return dot
-    try:
-        named = Path(dot.read_text().removeprefix("gitdir:").strip())
-    except OSError:
-        return None
-    named = named if named.is_absolute() else agent / named
-    try:
-        return (named / (named / "commondir").read_text().strip()).resolve()
-    except OSError:
-        return named
+    """The common git dir of the repo an agent directory is, or sits in: its `.git`, or for a worktree, the one the
+    directory its `.git` file names points to in `commondir`."""
+    for d in (agent, *agent.parents):
+        dot = d / ".git"
+        looked(dot)
+        if dot.is_dir():
+            return dot
+        try:
+            named = Path(dot.read_text().removeprefix("gitdir:").strip())
+        except OSError:
+            continue
+        named = named if named.is_absolute() else d / named
+        looked(named / "commondir")
+        try:
+            return (named / (named / "commondir").read_text().strip()).resolve()
+        except OSError:
+            return named
+    return None
 
 
 def session_tickets(agent: Path, session: str, memo: dict | None = None) -> list[str]:
@@ -732,7 +853,8 @@ def registry() -> dict[str, dict]:
     since, names no session. A session resumed in a second process while the first still runs is read from one
     of them, and lists every one under `processes`."""
     found = {}
-    for path in HOME.glob(".claude*/sessions/*.json"):
+    for path in globbed(HOME, ".claude*/sessions/*.json"):
+        looked(path)
         try:
             entry = json.loads(path.read_text())
             sid, pid = str(entry["sessionId"]), int(entry["pid"])
@@ -761,26 +883,38 @@ transcripts_read: dict[Path, tuple] = {}
 
 def transcript(session: str, memo: dict) -> Path | None:
     """A session's transcript, where Claude Code still keeps one."""
-    global looked_at
-    if session in transcripts and not transcripts[session].exists():  # cleaned away, or moved to another account
+    if session in transcripts and stamp(transcripts[session]) is None:  # cleaned away, or moved to another account
         del transcripts[session]
-    if session not in transcripts and not memo.get("transcripts looked"):
-        memo["transcripts looked"] = True  # one look per read of the hub, however many sessions have no transcript
-        # a session whose transcript Claude Code has cleaned away would otherwise walk every project at every read
-        projects = projects_in(HOME.glob(".claude*/projects"), memo)
-        if projects != looked_at:
-            looked_at = projects
-            transcripts.update({p.stem: p for p in HOME.glob(".claude*/projects/*/*.jsonl")})
+    if session not in transcripts:
+        # one look per read of the hub, however many sessions have no transcript: a session whose transcript Claude
+        # Code has cleaned away would otherwise walk every project at every read
+        once(memo, "transcripts", lambda: look_for_transcripts(memo))
     return transcripts.get(session)
+
+
+def look_for_transcripts(memo: dict) -> None:
+    global looked_at
+    projects = projects_in(globbed(HOME, ".claude*/projects"), memo)
+    if projects != looked_at:
+        looked_at = projects
+        transcripts.update({p.stem: p for p in HOME.glob(".claude*/projects/*/*.jsonl")})
 
 
 def projects_in(roots, memo: dict) -> tuple:
     """Every project directory under these `projects` directories, with when it last changed, which a transcript
     written or deleted changes: once per read of the hub."""
     roots = tuple(sorted(map(str, roots)))
-    if ("projects", roots) not in memo:
-        memo["projects", roots] = tuple((d.path, d.stat().st_mtime_ns) for root in roots for d in os.scandir(root) if d.is_dir())
-    return memo["projects", roots]
+    return once(memo, ("projects", roots), lambda: projects_of(roots))
+
+
+def projects_of(roots: tuple[str, ...]) -> tuple:
+    found = []
+    for root in roots:
+        looked(root, "*/")
+        found += [(d.path, d.stat().st_mtime_ns) for d in os.scandir(root) if d.is_dir()]
+    for path, _ in found:
+        looked(path, "*.jsonl")  # what the readers look for in each, whose names coming and going change its time
+    return tuple(found)
 
 
 def claude_title(session: str, memo: dict) -> str | None:
@@ -835,6 +969,8 @@ def read_of(path: Path | None) -> dict | None:
         st = path.stat() if path else None
     except OSError:
         st = None
+    if path:
+        looked(path)
     if not st:
         return None
     size, mtime, read, found = transcripts_read.get(path, (0, 0, 0, NOTHING_READ))
@@ -1008,7 +1144,7 @@ def statusline_inputs() -> list[dict]:
     `written_at` added. Claude Code keeps these numbers nowhere else."""
     global statusline_read
     found, kept = [], {}
-    for path in STATUSLINE.glob("*.json"):
+    for path in globbed(STATUSLINE, "*.json"):
         at = stamp(path)
         if (hit := statusline_read.get(path)) and hit[0] == at:
             data = hit[1]
@@ -1096,7 +1232,7 @@ layout is the mx plugin's, whose `session-page/session_page.py` is its home: the
 
 def accounts() -> list[Path]:
     """Every account's directory, `~/.claude*`, as it is spelled under HOME, which may be a link."""
-    return sorted(a for a in HOME.glob(".claude*") if a.is_dir())
+    return sorted(globbed(HOME, ".claude*/"))
 
 
 def is_account(path: Path | str) -> bool:
@@ -1754,19 +1890,22 @@ def resume_command(session: str, memo: dict) -> str:
 def resumable_of(session: str, memo: dict) -> list[Path]:
     """A session's transcripts under the config dirs diffview resumes from, as one look per read of the hub finds
     them."""
-    global resumable_at
-    if not memo.get("resumable looked"):
-        memo["resumable looked"] = True
-        roots = [c / "projects" for c in diffview.claude_configs() if (c / "projects").is_dir()]
-        projects = projects_in(roots, memo)
-        if projects != resumable_at:  # a transcript written or deleted changes its project directory
-            resumable_at = projects
-            found: dict[str, list[Path]] = {}
-            for path in (p for root in roots for p in root.glob("*/*.jsonl")):
-                found.setdefault(path.stem, []).append(path)
-            resumable.clear()
-            resumable.update(found)
+    once(memo, "resumable", lambda: look_for_resumable(memo))
     return resumable.get(session, [])
+
+
+def look_for_resumable(memo: dict) -> None:
+    global resumable_at
+    looked(HOME, ".claude*/")  # where diffview.claude_configs looks
+    roots = [c / "projects" for c in diffview.claude_configs() if stamp(c / "projects")]
+    projects = projects_in(roots, memo)
+    if projects != resumable_at:  # a transcript written or deleted changes its project directory
+        resumable_at = projects
+        found: dict[str, list[Path]] = {}
+        for path in (p for root in roots for p in root.glob("*/*.jsonl")):
+            found.setdefault(path.stem, []).append(path)
+        resumable.clear()
+        resumable.update(found)
 
 
 def stays(member: dict) -> bool:
@@ -2044,8 +2183,8 @@ def hub_view() -> dict:
     return hub_read()[0]
 
 
-reading = threading.Lock()
-"""One read of the disk at a time. A read that waits on another finds what that one kept (KEPT, transcripts_read) and
+reading = threading.RLock()
+"""One read of the disk at a time, and the disk watch's tables (WATCH) changed under it alone. A read that waits on another finds what that one kept (KEPT, transcripts_read) and
 reads only what changed since. Reads at once would each read it all, as the tabs that connect after a restart do,
 while nothing is kept yet."""
 
@@ -2056,29 +2195,67 @@ def hub_read() -> tuple[dict, dict[str, str]]:
         return read_hub()
 
 
+SHARED: dict = {}
+"""What the last read found of what the units share: the running sessions (`live`), the statusline inputs (`inputs`)
+and the context use they give (`contexts`), and the names of the units' state files (`names`)."""
+ROWS: dict[str, tuple[dict | None, str | None]] = {}
+"""Each unit as the last read of it showed it, None once gone, with the digest of its details: what a read gives for a
+unit the disk watch heard nothing of since."""
+
+
 def read_hub() -> tuple[dict, dict[str, str]]:
-    live, memo, inputs = registry(), {}, statusline_inputs()
-    adopt_running(live)
-    contexts = context_use(inputs)
-    units, details, listed = [], {}, set()
+    heard = WATCH.heard()
     try:
-        names = sorted(n for n in os.listdir(STATE / "units") if n.endswith(".json") and not n.startswith("."))
-    except FileNotFoundError:
-        names = []
-    read_ahead([urllib.parse.unquote(n.removesuffix(".json")) for n in names], live, memo)
-    for name in names:
-        key, path = urllib.parse.unquote(name.removesuffix(".json")), STATE / "units" / name
-        listed.add(key)
-        try:
-            view, details[key] = kept_view(key, live, memo)
-        except OSError as e:
-            print(f"listing {path}: {e}", file=sys.stderr, flush=True)
-            continue
-        if view:
-            units.append(with_live(view, live, contexts, memo))
-    for key in KEPT.keys() - listed:
+        return read_changed(heard)
+    except BaseException:
+        WATCH.lost()
+        raise
+
+
+def read_changed(heard: set | None) -> tuple[dict, dict[str, str]]:
+    """Every unit, read again where `heard` is None, else where it names the unit, what the units share that the unit
+    reads changed, or the unit is new; the others as ROWS has them."""
+    memo, again = {}, set()
+    if heard is None or REGISTRY in heard or UNITS in heard or "live" not in SHARED:
+        live, before = WATCH.read(REGISTRY, registry), SHARED.get("live", {})
+        WATCH.processes(live)
+        again |= {s for s in live.keys() | before.keys() if live.get(s) != before.get(s)}
+        SHARED["live"] = live
+        adopt_running(live)
+    live = SHARED["live"]
+    if heard is None or STATUSLINES in heard or "inputs" not in SHARED:
+        inputs = WATCH.read(STATUSLINES, statusline_inputs)
+        contexts, before = context_use(inputs), SHARED.get("contexts", {})
+        again |= {s for s in contexts.keys() | before.keys() if contexts.get(s) != before.get(s)}
+        SHARED.update(inputs=inputs, contexts=contexts)
+    contexts = SHARED["contexts"]
+    if heard is None or UNITS in heard or "names" not in SHARED:
+        SHARED["names"] = WATCH.read(UNITS, unit_names)
+    keys = [urllib.parse.unquote(n.removesuffix(".json")) for n in SHARED["names"]]
+    again = set(keys) if heard is None else (again | heard | (set(keys) - ROWS.keys())) & set(keys)
+    read_ahead([k for k in keys if k in again], live, memo)
+    units, details = [], {}
+    for key in keys:
+        if key in again:
+            try:
+                with WATCH.reading(key):
+                    view, digest = kept_view(key, live, memo)
+                    ROWS[key] = view and with_live(view, live, contexts, memo), digest
+            except OSError as e:
+                print(f"listing {state_file(key)}: {e}", file=sys.stderr, flush=True)
+                ROWS.pop(key, None)
+                WATCH.again(key)
+                continue
+        row, digest = ROWS[key]
+        if row:
+            units.append(dict(row))
+            details[key] = digest
+    for key in (KEPT.keys() | ROWS.keys()) - set(keys):
         KEPT.pop(key, None)
         STATES.pop(key, None)
+        ROWS.pop(key, None)
+        WATCH.drop(key)
+    WATCH.settled()
     numbered = sorted((u for u in units if u["session"] and u["state"] != "ended" and not u["dismissed"]),
                       key=lambda u: (rank(u), -u["last"]))
     for n, u in enumerate(numbered, 1):
@@ -2086,7 +2263,16 @@ def read_hub() -> tuple[dict, dict[str, str]]:
     # the dismissed, then the loose pages, then the ended, each the latest first
     rest = sorted((u for u in units if u["number"] is None),
                   key=lambda u: (2 if u["state"] == "ended" else 0 if u["dismissed"] else 1, -u["last"]))
-    return {"units": [*numbered, *rest], "usage": usage(inputs)}, {u["unit"]: details[u["unit"]] for u in units}
+    return {"units": [*numbered, *rest], "usage": usage(SHARED["inputs"])}, details
+
+
+def unit_names() -> list[str]:
+    """The names of the units' state files."""
+    looked(STATE / "units", "*.json")
+    try:
+        return sorted(n for n in os.listdir(STATE / "units") if n.endswith(".json") and not n.startswith("."))
+    except FileNotFoundError:
+        return []
 
 
 def read_ahead(keys: list[str], live: dict[str, dict], memo: dict) -> None:
@@ -2104,7 +2290,7 @@ def read_ahead(keys: list[str], live: dict[str, dict], memo: dict) -> None:
             if agent not in ROOTS and agent not in REFUSED and os.path.isdir(root):
                 agents.setdefault(agent, plan[0])
     hooks = handoff_hooks(memo)
-    cwds = {str(e["cwd"]) for e in live.values() if e.get("cwd")} if hooks else set()
+    cwds = {str(live[k]["cwd"]) for k in keys if live.get(k, {}).get("cwd")} if hooks else set()
     cwds = {c for c in cwds if (hooks.__file__, c) not in HANDOFFS}
     if not agents and not cwds:
         return
@@ -2175,8 +2361,8 @@ def unit_inputs(key: str, live: dict[str, dict], memo: dict) -> tuple:
     session, roots, files, dirs = plan
     reader = page_reader(memo)
     return (at,
-            tuple((root, os.path.isdir(root), getattr(tracker_of(agent, memo), "signature", None),
-                   session and refs_of(agent, memo)[0], os.path.isfile(board)) for root, agent, board in roots),
+            tuple((root, is_dir(root), getattr(tracker_of(agent, memo), "signature", None),
+                   session and refs_of(agent, memo)[0], is_file(board)) for root, agent, board in roots),
             tuple((stamp_once(f, memo), watched(record)) for f, record in files),
             tuple(page_dir_inputs(*d, memo) for d in dirs),
             live.get(session) if session else None,
@@ -2209,6 +2395,7 @@ def planned(data: dict) -> tuple:
 
 def page_dir_inputs(page: str, md: str, turns: str, memo: dict) -> tuple:
     at = stamp(page)
+    looked(turns, "*.md")
     try:
         # in the order the directory lists them, which moves only once an entry is added or removed
         records = tuple((e.name, stamp(e.path)) for e in os.scandir(turns) if e.name.endswith(".md"))
@@ -2236,6 +2423,7 @@ def links_in(page: str, at: tuple | None, memo: dict) -> tuple:
 def stamp_once(path: str, memo: dict) -> tuple | None:
     """stamp, once per read of the hub: a session page mostly links its unit's members, and other units' pages."""
     stamps = memo.setdefault("stamps", {})
+    looked(path)
     if path not in stamps:
         stamps[path] = stamp(path)
     return stamps[path]
@@ -2260,7 +2448,7 @@ def transcript_inputs(session: str, memo: dict) -> tuple:
                 hit = CWDS[p] = p_at, diffview.transcript_cwd(p)
             except OSError:  # deleted since the look found it: the next read looks again
                 hit = p_at, ""
-        written.append((str(p), p_at, hit[1], bool(hit[1]) and os.path.isdir(hit[1])))
+        written.append((str(p), p_at, hit[1], bool(hit[1]) and is_dir(hit[1])))
     return path and str(path), at, tuple(written)
 
 
@@ -2275,7 +2463,7 @@ def watched(record: str | None) -> tuple | None:
         return None
     if not ((hit := WATCHED.get(record)) and hit[0] == at):
         WATCHED[record] = hit = at, diffview.watched_repos_in(Path(record))
-    return at, tuple(os.path.exists(r) for r in hit[1])
+    return at, tuple(stamp(r) is not None for r in hit[1])
 
 
 DETAIL = ("members", "pages", "tickets", "session_page")
@@ -2925,8 +3113,9 @@ when it looked. A working directory's agent repo does not move; one in none is l
 COMMITS: dict[Path, tuple[tuple, float | None]] = {}
 """When a handoff was last committed, None where it is not committed or is edited since, by its path, with the stat of
 it and of its repo's index then."""
-PANES_HELD: dict[tuple, float] = {}
-"""When a session's registry entry was last found to run in the tmux pane it names, by that entry's pane and process."""
+PANES_HELD: dict[tuple, tuple[float, bool]] = {}
+"""When a session's registry entry was last asked whether it runs in the tmux pane it names, and the answer, by that
+entry's pane and process."""
 
 
 def handoff_offer(entry: dict | None, memo: dict) -> dict | None:
@@ -2957,7 +3146,7 @@ def handoff_state(entry: dict, memo: dict) -> dict | None:
     if not handoffs and not read["handoffs"]:
         return None
     try:
-        found = {p.resolve() for p in [*(handoffs.glob("*.md") if handoffs else ()), *map(Path, read["handoffs"])] if p.is_file()}
+        found = {p.resolve() for p in [*(globbed(handoffs, "*.md") if handoffs else ()), *map(Path, read["handoffs"])] if is_file(p)}
         written = [p for p in found if hooks.continuation_of(p, session)]
         newest = max(written, key=lambda p: p.stat().st_mtime, default=None)
     except OSError:  # one picked up between the look and the read: looked at again at the next read
@@ -2974,14 +3163,15 @@ def handoff_state(entry: dict, memo: dict) -> dict | None:
 def handoffs_dir(hooks, cwd: str) -> Path | None:
     key = (hooks.__file__, cwd)
     hit = HANDOFFS.get(key)
-    if hit and (hit[0] or time.time() - hit[1] < 300):
-        return hit[0]
-    try:
-        found = hooks.handoffs_of(Path(cwd))
-    except OSError:  # the working directory is gone
-        found = None
-    HANDOFFS[key] = found, time.time()
-    return found
+    if not (hit and (hit[0] or time.time() - hit[1] < 300)):
+        try:
+            found = hooks.handoffs_of(Path(cwd))
+        except OSError:  # the working directory is gone
+            found = None
+        hit = HANDOFFS[key] = found, time.time()
+    if not hit[0]:
+        looked_until(hit[1] + 300)
+    return hit[0]
 
 
 def committed_at(handoff: Path) -> float | None:
@@ -2989,6 +3179,8 @@ def committed_at(handoff: Path) -> float | None:
     `pickup.py` refuses. Asked of git again only once the file or the repo's index has changed, so a handoff left
     standing costs the rail's reads no git."""
     agent = handoff.parent.parent
+    looked(handoff)
+    looked(agent / ".git" / "index")
     try:
         key = tuple((s.st_mtime_ns, s.st_size) for s in (handoff.stat(), (agent / ".git" / "index").stat()))
     except OSError:  # no index of its own to watch (a worktree's agent repo): asked every time
@@ -3007,12 +3199,10 @@ def pane_held(entry: dict) -> bool:
     """The session runs in the pane its registry entry names, as `pane_in` checks it, which a click checks again: the
     rail's reads ask tmux once a minute per session."""
     key = (entry.get("tmux"), entry.get("pid"), entry.get("procStart"))
-    if time.time() - PANES_HELD.get(key, 0) < 60:
-        return True
-    if not pane_in(entry)[0]:
-        return False
-    PANES_HELD[key] = time.time()
-    return True
+    if not ((hit := PANES_HELD.get(key)) and time.time() - hit[0] < 60):
+        hit = PANES_HELD[key] = time.time(), bool(pane_in(entry)[0])
+    looked_until(hit[0] + 60)
+    return hit[1]
 
 
 def hand_off(body: dict) -> tuple[int, dict]:
@@ -3424,8 +3614,10 @@ def copy_of(host: str) -> Copy | None:
     """The copy of the host's sessions run by this hub's own user, the one whose sessions the host's hub shows, once a
     pull has finished one: as the pull recorded it beside the copy. The host's workers' copies are not the hub's."""
     root = COPIES / host / USER
+    looked(pulled := root.with_name(f"{USER}.pulled.json"))
+    looked(root)
     try:
-        said = json.loads(root.with_name(f"{USER}.pulled.json").read_text())
+        said = json.loads(pulled.read_text())
         found = Copy(root, str(said["home"]), float(said["at"]))
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -3441,7 +3633,7 @@ def copied(host: str, session: str, memo: dict) -> dict | None:
     its account's directory and `at` when the copy was pulled. None where the copy holds no transcript of it."""
     if not (c := copy_of(host)):
         return None
-    projects = projects_in(c.root.glob(".claude*/projects"), memo)
+    projects = projects_in(globbed(c.root, ".claude*/projects"), memo)
     if copied_transcripts.get(c.root, ((),))[0] != projects:
         copied_transcripts[c.root] = projects, {p.stem: p for p in c.root.glob(".claude*/projects/*/*.jsonl")}
     if not (path := copied_transcripts[c.root][1].get(session)):
@@ -3453,17 +3645,20 @@ def copied(host: str, session: str, memo: dict) -> dict | None:
 def copied_registry(c: Copy, memo: dict) -> dict[str, dict]:
     """Each session the copy's registry names, by its id: {"state", `idle` where its registry status is and `working`
     for any other, "person", whether a person types into it, as adopt_running tells}. Once per read of the hub."""
-    if ("registry", c.root) not in memo:
-        states = {}
-        for entry in c.root.glob(".claude*/sessions/*.json"):
-            try:
-                said = json.loads(entry.read_text())
-                states[str(said["sessionId"])] = {"state": "idle" if said.get("status") == "idle" else "working",
-                                                  "person": said.get("kind", "interactive") == "interactive"}
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
-        memo["registry", c.root] = states
-    return memo["registry", c.root]
+    return once(memo, ("registry", c.root), lambda: copied_states(c))
+
+
+def copied_states(c: Copy) -> dict[str, dict]:
+    states = {}
+    for entry in globbed(c.root, ".claude*/sessions/*.json"):
+        looked(entry)
+        try:
+            said = json.loads(entry.read_text())
+            states[str(said["sessionId"])] = {"state": "idle" if said.get("status") == "idle" else "working",
+                                              "person": said.get("kind", "interactive") == "interactive"}
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return states
 
 
 def copy_of_path(host: str, path: str) -> Path | None:
@@ -3546,15 +3741,15 @@ def forks(memo: dict | None = None) -> dict[tuple[str, str], dict]:
     """Every fork record this host holds, its own forks' and those the session copies carry, by the host and session
     each forks, the latest fork of a session only. A look stands while no page directory comes or goes: a record is
     written once, in a directory that appears with it, as a fork makes it and a pull copies it."""
+    return once({} if memo is None else memo, "forks", look_for_forks)
+
+
+def look_for_forks() -> dict[tuple[str, str], dict]:
     global fork_look
-    if memo is not None and "forks" in memo:
-        return memo["forks"]
-    places = [*HOME.glob(f".claude*/{PAGES}"), *COPIES.glob(f"*/{USER}/.claude*/{PAGES}")]
+    places = [*globbed(HOME, f".claude*/{PAGES}/"), *globbed(COPIES, f"*/{USER}/.claude*/{PAGES}/")]
     seen = tuple(sorted((str(p), stamp(p)) for p in places))
     if seen != fork_look[0]:
         fork_look = seen, fork_records(places)
-    if memo is not None:
-        memo["forks"] = fork_look[1]
     return fork_look[1]
 
 
@@ -3591,6 +3786,7 @@ written_after: dict[tuple[Path, int], tuple[int, int]] = {}
 def wrote_after(transcript: Path, point: int) -> dict | None:
     """What the transcript holds past `point`: its bytes, and the turns of its main thread that ended there. It only
     grows, so a count is read on from where it stopped."""
+    looked(transcript)
     try:
         size = transcript.stat().st_size
         read, turns = written_after.get((transcript, point), (0, 0))
@@ -3788,8 +3984,9 @@ def release_beside(transcript: Path | None) -> dict | None:
     """The release written beside a transcript, this host's own or a copy's: {"to", "at", "from", "unit"}."""
     if not transcript:
         return None
+    looked(beside := transcript.with_name(transcript.stem + RELEASE))
     try:
-        said = json.loads(transcript.with_name(transcript.stem + RELEASE).read_text())
+        said = json.loads(beside.read_text())
         return {"to": str(said["to"]), "at": float(said["at"]), "from": str(said["from"]),
                 "unit": said["unit"] if isinstance(said.get("unit"), dict) else None}
     except (OSError, ValueError, KeyError, TypeError):
@@ -4021,7 +4218,7 @@ def released_here(session: str) -> tuple[dict, dict] | None:
     """The latest release of the session to this host that a session copy holds: the copy (as `copied` finds it) and the
     release."""
     best = None
-    for root in sorted(p for p in COPIES.glob("*") if p.is_dir()):
+    for root in sorted(globbed(COPIES, "*/")):
         found = copied(root.name, session, {})
         said = found and release_beside(found["transcript"])
         if said and said["to"] == HOST and (not best or said["at"] > best[1]["at"]):
@@ -4164,13 +4361,14 @@ def handoff_hooks(memo: dict):
 
 
 def plugin_module(memo: dict, script: str, uses: tuple[str, ...], without: str):
-    if script not in memo:
+    def newest():
         path = mx_script(script)
         with loading:  # two reads of the hub at once load it once
             if path and path not in READERS:
                 READERS[path] = load_plugin_module(path, uses, without)
-        memo[script] = READERS.get(path)
-    return memo[script]
+        return READERS.get(path)
+
+    return once(memo, script, newest)
 
 
 def load_plugin_module(path: Path, uses: tuple[str, ...], without: str):
@@ -4616,6 +4814,7 @@ class Handler(BaseHTTPRequestHandler):
             print(f"listening: {e}", file=sys.stderr, flush=True)
         with lock:
             listeners.append(q)
+        WATCH.wake()
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -4903,16 +5102,50 @@ def restart_command() -> str:
 
 def watch_disk(servers: list[socketserver.BaseServer]) -> None:
     """A hub tab that is showing hears when the disk under it changes: a ticket's status, a page deleted, a new
-    artefact, a session finishing a turn. Read only while a tab listens. A round that finds the hub's own code
-    changed stops the servers, for main() to run the new code."""
-    failing = frozenset()
-    while True:
-        time.sleep(2)
+    artefact, a session finishing a turn. Read only while a tab listens, and only once the disk watch hears a change.
+    A step that finds the hub's own code changed stops the servers, for main() to run the new code."""
+    rounds = Rounds()
+    while not watch_step(rounds):
+        pass
+    for server in servers:
+        server.shutdown()
+
+
+@dataclass
+class Rounds:
+    failing: frozenset[str] = frozenset()
+    """The errors since a round last succeeded: each is printed once, and their end once."""
+    last: float = -math.inf
+    """When the last round read the hub, by time.monotonic()."""
+
+
+def watch_step(rounds: Rounds, longest: float | None = None) -> bool:
+    """One wait of the disk watch, at most `longest` seconds, and the round it makes due. True once the hub's code
+    has changed on disk. Without the kernel's notices (WATCH.on), a round every PACE seconds, as code_changed() is
+    asked."""
+    if not WATCH.on:
+        time.sleep(PACE if longest is None else min(PACE, longest))
         if code_changed():
-            for server in servers:
-                server.shutdown()
-            return
-        failing = watch_round(failing)
+            return True
+        rounds.failing = watch_round(rounds.failing)
+        with reading:
+            WATCH.retry()
+        return False
+    with lock:
+        listening = bool(listeners)
+    due = None
+    if listening:
+        with reading:
+            WATCH.drain()
+        if (due := WATCH.due(rounds.last)) is not None and time.monotonic() >= due:
+            rounds.last = time.monotonic()
+            rounds.failing = watch_round(rounds.failing)
+            return False
+    # while a round is due the disk's notices wait in the kernel's queue, which merges a file's repeated writes
+    wait = (due - time.monotonic()) if due is not None else WATCH.next_deadline() if listening else None
+    if longest is not None:
+        wait = longest if wait is None else min(wait, longest)
+    return WATCH.wait(listening and due is None, wait) and code_changed()
 
 
 def watch_round(failing: frozenset[str]) -> frozenset[str]:
@@ -4923,7 +5156,8 @@ def watch_round(failing: frozenset[str]) -> frozenset[str]:
     if not watching:
         return failing
     try:
-        digest = view_digest()
+        with reading:
+            digest, read = view_digest(), WATCH.reads
     except Exception as e:  # a ticket or page changing under the read: the next round reads it again
         if (why := f"{type(e).__name__}: {e}") not in failing:
             print(f"watching: {why}", file=sys.stderr, flush=True)
@@ -4934,7 +5168,371 @@ def watch_round(failing: frozenset[str]) -> frozenset[str]:
         if event := disk_event(seen_by.get(q), digest):
             q.put(event)
         seen_by[q] = digest
+    WATCH.told = read
     return frozenset()
+
+
+# --------------------------------------------------------------------------
+# the disk watch: the kernel says which files changed (inotify), and a read reads again only the units they are of
+# --------------------------------------------------------------------------
+
+PACE = 2.0
+"""Seconds from one round of the disk watch to the next, at least: as often as a hub that cannot hear the disk reads it."""
+SETTLE = 0.2
+"""Seconds a round waits after the first change it hears, for the writes that come with it."""
+RETRY = 600.0
+"""Seconds a hub that ran out of watches reads the disk every PACE before it asks the kernel again."""
+
+REGISTRY, STATUSLINES, UNITS = ("registry",), ("statusline",), ("units",)
+"""What the units share, each read again on its own once its files change: the session registry, the statusline
+inputs, and the names of the units' state files. Every other reader the watch knows of is a unit, by its key."""
+
+IN_MODIFY, IN_ATTRIB, IN_MOVED_FROM, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x2, 0x4, 0x40, 0x80, 0x100, 0x200
+IN_DELETE_SELF, IN_MOVE_SELF, IN_UNMOUNT, IN_Q_OVERFLOW, IN_IGNORED = 0x400, 0x800, 0x2000, 0x4000, 0x8000
+IN_ONLYDIR, IN_ISDIR = 0x1000000, 0x40000000
+NAMED = IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO
+"""A name came or went."""
+GONE = IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT | IN_IGNORED
+"""The watched directory itself went."""
+RUN_OUT = (errno.ENOSPC, errno.ENOMEM, errno.EMFILE, errno.ENFILE)
+"""What the kernel answers a watch or a pidfd asked for once this user has too many."""
+
+
+class Inotify:
+    """The kernel's notices of the changes in some directories (inotify(7)), through libc's calls."""
+
+    def __init__(self):
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.fd = self.call(self.libc.inotify_init1, os.O_NONBLOCK | os.O_CLOEXEC)
+
+    def call(self, function, *args) -> int:
+        if (answer := function(*args)) < 0:
+            raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+        return answer
+
+    def add(self, directory: str) -> int:
+        """The watch on the directory, the one it already has where it has one under any name."""
+        return self.call(self.libc.inotify_add_watch, self.fd, os.fsencode(directory),
+                         NAMED | IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR)
+
+    def remove(self, wd: int) -> None:
+        self.libc.inotify_rm_watch(self.fd, wd)  # one the kernel has dropped already answers EINVAL
+
+    def read(self) -> list[tuple[int, int, str]]:
+        """The notices waiting, each (watch, what happened, the name in its directory it happened to)."""
+        notices = []
+        while True:
+            try:
+                data = os.read(self.fd, 1 << 16)
+            except BlockingIOError:
+                return notices
+            at = 0
+            while at < len(data):
+                wd, mask, _, size = struct.unpack_from("iIII", data, at)
+                notices.append((wd, mask, os.fsdecode(data[at + 16:at + 16 + size].rstrip(b"\0"))))
+                at += 16 + size
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+
+class Watch:
+    """The disk watch. Every read of a unit, and of what the units share, notes what it looked at (Looks); the kernel
+    is asked about the directories those files sit in, or the nearest that is there, and a unit is read again only
+    once a notice names one of its files, a session's process exits (pidfd), or a time-based input it read goes stale.
+    Its tables change under `reading` alone."""
+
+    def __init__(self):
+        self.on = False
+        self.why = ""
+        """Why the hub reads the disk every PACE instead, as its log last said."""
+        self.off_at = -math.inf
+        self.disk: Inotify | None = None
+        self.code: Inotify | None = None
+        """The hub's own code (CODE) apart, asked about while no tab listens too."""
+        self.wds: dict[str, int] = {}
+        self.dirs: dict[int, set[str]] = {}
+        """Each watch's directories: one directory under two names has one watch."""
+        self.names: dict[str, dict[str, set]] = {}
+        """Who reads each name in each watched directory: what changes under the name changes what they read."""
+        self.patterns: dict[str, dict[str, set]] = {}
+        """Who lists each watched directory's names by each pattern: a name that comes or goes changes what they read."""
+        self.held: dict[object, frozenset[tuple[str, str, bool]]] = {}
+        """What each reader is listening for: (directory, name or pattern, whether a pattern)."""
+        self.until: dict[object, float] = {}
+        """When what each reader read off the clock goes stale, by time.time()."""
+        self.pids: dict[int, int] = {}
+        """A pidfd for each running session's process, which the kernel marks readable once the process exits."""
+        self.dirty: set = set()
+        """The readers to read again."""
+        self.whole = True
+        """Every reader is to be read again: nothing is known yet, a notice was lost, or a read failed."""
+        self.since: float | None = None
+        """When the readers to read again were first heard of, by time.monotonic()."""
+        self.fresh: set[str] = set()
+        """The directories watched since the read under way started: changed before the watch, as far as it knows."""
+        self.reads, self.told = 0, 0
+        """The reads that read anything again, and how many of them the listeners have been told of."""
+        self.wake_r = self.wake_w = None
+
+    def start(self) -> bool:
+        """Ask the kernel about the disk; where it cannot be, say why once, and read it every PACE."""
+        try:
+            self.disk, self.code = Inotify(), Inotify()
+            for d in {str(p.parent) for p in CODE}:
+                self.code.add(d)
+        except OSError as e:
+            self.off(f"inotify: {e}")
+            return False
+        if self.wake_r is None:
+            self.wake_r, self.wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.on, self.whole = True, True
+        if self.why:
+            print("watching the disk by its changes again", file=sys.stderr, flush=True)
+            self.why = ""
+        self.wake()
+        return True
+
+    def off(self, why: str) -> None:
+        """Stop asking the kernel, and read the disk every PACE instead, saying why where the log has not said it."""
+        for notices in (self.disk, self.code):
+            if notices:
+                notices.close()
+        for fd in self.pids.values():
+            os.close(fd)
+        self.disk = self.code = None
+        self.on, self.whole, self.off_at = False, True, time.monotonic()
+        for table in (self.wds, self.dirs, self.names, self.patterns, self.held, self.until, self.pids):
+            table.clear()
+        self.dirty.clear()
+        if why != self.why:
+            print(f"watching the disk by reading it every {PACE:g} s: {why}", file=sys.stderr, flush=True)
+        self.why = why
+
+    def retry(self) -> None:
+        """Ask the kernel again, once a while after its watches or pidfds ran out."""
+        if self.why.startswith("ran out") and time.monotonic() - self.off_at >= RETRY:
+            self.start()
+
+    # --- what a read reads again
+
+    def heard(self) -> set | None:
+        """The readers to read again, as the notices since the last read say: None for every one."""
+        if not self.on:
+            return None
+        self.drain()
+        self.fresh.clear()
+        whole, dirty = self.whole, self.dirty
+        self.whole, self.dirty, self.since = False, set(), None
+        if whole or dirty:
+            self.reads += 1
+        return None if whole else dirty
+
+    def lost(self) -> None:
+        """A read failed on the way: what it took is read again, with everything else."""
+        self.whole = True
+
+    def again(self, reader) -> None:
+        self.dirty.add(reader)
+
+    def read(self, reader, read):
+        """read(), listening for changes to what it looked at, as `reader`'s."""
+        if not self.on:
+            return read()
+        with recording() as looks:
+            value = read()
+        self.keep(reader, looks)
+        return value
+
+    @contextmanager
+    def reading(self, reader):
+        """The block, listening for changes to what it looked at, as `reader`'s."""
+        if not self.on:
+            yield
+            return
+        with recording() as looks:
+            yield
+        self.keep(reader, looks)
+
+    def settled(self) -> None:
+        """The read is done: every reader of a directory first watched while it ran is read again, which a change
+        between its look and the watch would otherwise leave stale."""
+        for d in self.fresh:
+            self.dirty |= self.readers_of(d)
+        if self.fresh and self.since is None:
+            self.since = time.monotonic()
+        self.fresh.clear()
+
+    # --- what is listened for
+
+    def keep(self, reader, looks: Looks) -> None:
+        """Listen for changes to what `reader` was just read from, and for it alone."""
+        if not self.on:
+            return
+        new, until = set(), looks.until
+        try:
+            for path, names in looks.seen:
+                if (heard := self.listen(path, names)) is None:  # a directory the kernel will not watch: read on the clock
+                    until = min(until, time.time() + PACE)
+                else:
+                    new.add(heard)
+        except OSError as e:
+            self.off(f"ran out of watches ({e}); asking again in {RETRY:g} s")
+            return
+        old = self.held.get(reader, frozenset())
+        for d, name, pattern in old - new:
+            self.unlisten(reader, d, name, pattern)
+        for d, name, pattern in new - old:
+            (self.patterns if pattern else self.names).setdefault(d, {}).setdefault(name, set()).add(reader)
+        self.held[reader] = frozenset(new)
+        if until < math.inf:
+            self.until[reader] = until
+        else:
+            self.until.pop(reader, None)
+
+    def drop(self, reader) -> None:
+        """Listen for nothing of `reader`'s, which is gone."""
+        self.keep(reader, Looks())
+        self.held.pop(reader, None)
+        self.dirty.discard(reader)
+
+    def listen(self, path: str, names: str | None) -> tuple[str, str, bool] | None:
+        """Watch what a look was of: the directory a name sits in or a listing lists, or, where it is not there, the
+        nearest directory above it for the name that is missing. None where the kernel will not watch it."""
+        d, name, pattern = (path, names, True) if names is not None else (*os.path.split(path), False)
+        while d not in self.wds:
+            try:
+                wd = self.disk.add(d)
+            except OSError as e:
+                if e.errno in RUN_OUT:
+                    raise
+                if e.errno not in (errno.ENOENT, errno.ENOTDIR) or d == "/":
+                    return None
+                d, name, pattern = *os.path.split(d), False
+                continue
+            self.wds[d] = wd
+            self.dirs.setdefault(wd, set()).add(d)
+            self.fresh.add(d)
+        return d, name, pattern
+
+    def unlisten(self, reader, d: str, name: str, pattern: bool) -> None:
+        table = self.patterns if pattern else self.names
+        readers = table[d][name]
+        readers.discard(reader)
+        if not readers:
+            del table[d][name]
+            if not table[d]:
+                del table[d]
+        if d not in self.names and d not in self.patterns and (wd := self.wds.pop(d, None)) is not None:
+            self.dirs[wd].discard(d)
+            if not self.dirs[wd]:
+                del self.dirs[wd]
+                self.disk.remove(wd)
+
+    def readers_of(self, d: str) -> set:
+        return {r for table in (self.names, self.patterns) for readers in table.get(d, {}).values() for r in readers}
+
+    def processes(self, live: dict[str, dict]) -> None:
+        """Hear each running session's process exit, which leaves its registry file behind."""
+        if not self.on:
+            return
+        pids = {int(p["pid"]) for e in live.values() for p in e["processes"]}
+        for pid in self.pids.keys() - pids:
+            os.close(self.pids.pop(pid))
+        for pid in pids - self.pids.keys():
+            try:
+                self.pids[pid] = os.pidfd_open(pid)
+            except ProcessLookupError:  # exited since the registry was read
+                self.dirty.add(REGISTRY)
+            except OSError as e:
+                self.off(f"ran out of pidfds ({e}); asking again in {RETRY:g} s" if e.errno in RUN_OUT else f"pidfd: {e}")
+                return
+
+    # --- hearing it
+
+    def drain(self) -> None:
+        """Take the kernel's notices, and what has gone stale by the clock: who read what they name is read again."""
+        if not self.on:
+            return
+        for wd, mask, name in self.disk.read():
+            if mask & IN_Q_OVERFLOW:
+                self.whole = True
+            for d in self.dirs.get(wd, ()):
+                if mask & GONE:
+                    self.dirty |= self.readers_of(d)
+                    continue
+                self.dirty |= self.names.get(d, {}).get(name, set())
+                if mask & NAMED:
+                    for pattern, readers in self.patterns.get(d, {}).items():
+                        if self.matches(d, name, mask, pattern):
+                            self.dirty |= readers
+            if mask & IN_IGNORED:
+                for d in self.dirs.pop(wd, ()):
+                    self.wds.pop(d, None)
+        if self.pids:
+            exits = select.poll()
+            for fd in self.pids.values():
+                exits.register(fd, select.POLLIN)
+            if exits.poll(0):
+                self.dirty.add(REGISTRY)
+        now = time.time()
+        for reader in [r for r, at in self.until.items() if at <= now + PACE]:  # with those about to, in one round
+            self.dirty.add(reader)
+            del self.until[reader]
+        if (self.dirty or self.whole) and self.since is None:
+            self.since = time.monotonic()
+
+    @staticmethod
+    def matches(d: str, name: str, mask: int, pattern: str) -> bool:
+        """A name that came or went is one a listing by `pattern` lists. A pattern of directories alone takes a link
+        to one as one, as the listing does; a link deleted it cannot tell from a file's."""
+        if pattern.endswith("/"):
+            if not (mask & IN_ISDIR or mask & (IN_CREATE | IN_MOVED_TO) and os.path.isdir(os.path.join(d, name))):
+                return False
+            pattern = pattern[:-1]
+        return fnmatch.fnmatchcase(name, pattern)
+
+    def due(self, last: float) -> float | None:
+        """When the next round is to read the hub, by time.monotonic(): SETTLE after the first change it has not read,
+        and PACE after the round before at the soonest. None where nothing waits."""
+        if not (self.dirty or self.whole or self.reads > self.told):
+            return None
+        return max((self.since or time.monotonic()) + SETTLE, last + PACE)
+
+    def next_deadline(self) -> float | None:
+        """Seconds until the first time-based input a reader read goes stale."""
+        return max(0.0, min(self.until.values()) - time.time()) if self.until else None
+
+    def wait(self, disk: bool, timeout: float | None) -> bool:
+        """Wait at most `timeout` seconds for a notice of the hub's code, or of a wake; with `disk`, of the disk and
+        the sessions' processes too. True where the code may have changed."""
+        waiting = select.poll()
+        try:
+            for fd in (self.wake_r, self.code.fd, *((self.disk.fd, *self.pids.values()) if disk else ())):
+                waiting.register(fd, select.POLLIN)
+            waiting.poll(None if timeout is None else math.ceil(timeout * 1000))
+            while os.read(self.wake_r, 512):
+                pass
+        except BlockingIOError:
+            pass
+        except (OSError, AttributeError):  # a read turned the watch off meanwhile, closing what was waited on
+            return False
+        names = {p.name for p in CODE}
+        try:
+            return any(name in names or mask & (GONE | IN_Q_OVERFLOW) for _, mask, name in self.code.read())
+        except (OSError, AttributeError):
+            return False
+
+    def wake(self) -> None:
+        """End the wait under way: a tab listens now, or a read left readers to read again."""
+        try:
+            if self.wake_w is not None:
+                os.write(self.wake_w, b"!")
+        except BlockingIOError:
+            pass
+
+
+WATCH = Watch()
 
 
 # --------------------------------------------------------------------------
@@ -5115,6 +5713,8 @@ def main(args: Args) -> None:
         RELOADS_UNREAD = True
         print(f"typing no /reload-plugins: {reloads_file()} could not be read ({e})", file=sys.stderr, flush=True)
     servers, held = listen(args)
+    with reading:
+        WATCH.off("--poll") if args.poll else WATCH.start()
     threading.Thread(target=watch_disk, args=(servers,), daemon=True).start()
     threading.Thread(target=keep_plugins_current, daemon=True).start()
     for server in servers[1:]:
