@@ -97,6 +97,21 @@ it holds them:
 - `dgpu`'s probe of the dGPU's outputs, on a change of its card and after a
   wake, where gnome-shell's own probe follows and would wake it anyway.
 
+The NVIDIA kernel driver also wakes it by itself, for about 20 s, on two
+platform events, locked or not:
+
+- A power-profile switch (the fan key cycles quiet, balanced, performance,
+  one wake per step). The firmware notifies `\_SB.NPCF`, and the driver's
+  NVPCF handler takes a runtime-PM reference to pass the event on.
+- A charger plug or unplug, through the driver's power-source handler.
+
+No module parameter guards either handler (580.178.04 and 615.71.09 alike),
+and `nvidia-powerd` plays no part: with it stopped, a profile switch still
+woke the card in 0.6 s (2026-10-28). A drop in battery percentage does not
+wake it on this model. NVIDIA's fix for the NVPCF wake is PR #1299 on
+open-gpu-kernel-modules (issue #1300), open as of 2026-10-28; it leaves the
+charger wake alone.
+
 Who holds it right now:
 
     r=$(readlink -f /dev/dri/by-path/pci-0000:01:00.0-render)
@@ -149,8 +164,14 @@ History: the host recorder's `dgpu_port` column (D3cold or D0 every 5 s).
 - **A wake that kills the card.** On 2026-09-29 a monitor unplug made the
   driver wake the card, its firmware never came back (Xid 119, then 154), and
   the next hibernate hung in `nvidia-sleep.sh` with the lid shut until the
-  power cut out. `dgpu-wedge-watch` (`nix/home/timers.nix`) tells max to
-  reboot when the kernel logs it; only a reboot recovers the card.
+  power cut out. On 2026-10-28 a profile switch woke it, the GSP firmware
+  crashed (Xid 120) and failed to boot again (Xid 154), and three minutes
+  later the laptop powered off hard, the journal stopping mid-line; likely
+  the dGPU's 98 °C cutoff, unmeasured. Reported on open-gpu-kernel-modules
+  issue #1284. `dgpu-wedge-watch` (`nix/home/timers.nix`) tells max to
+  reboot when the kernel logs it; only a reboot recovers the card. The closed
+  kernel module without GSP firmware would avoid the crash, but the open
+  module is where NVIDIA is heading, so it is not used.
 - **The dock's monitors black after a resume.** On 2026-10-06 the
   thunderbolt driver tore down both DisplayPort tunnels right after a resume
   (`(DP): not active, tearing down` in `journalctl -k`), and the dock's
