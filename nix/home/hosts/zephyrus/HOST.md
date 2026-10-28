@@ -2,7 +2,6 @@
 host: zephylux
 user: max
 isolated: false
-account: personal
 placement: last
 ---
 
