@@ -1,4 +1,4 @@
-{ config, ... }:
+{ config, pkgs, lib, ... }:
 {
   home.username = "max";
   home.homeDirectory = "/home/max";
@@ -13,6 +13,21 @@
   claudeToken.mode = "switch";
 
   home.file."HOST.md".source = ./zephyrus/HOST.md;
+
+  # The slots dispatch's workers here take (`host-slots --help`). Every worker
+  # here runs as max, so the slots are his own, in his runtime directory, which
+  # these tmpfiles rules make at login and at each switch.
+  home.packages = [
+    (import ../../host-slots {
+      inherit pkgs lib;
+      slots = 4;
+      dir = "\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/host-slots";
+    })
+  ];
+  systemd.user.tmpfiles.rules = [
+    "d %t/host-slots 0700 - - -"
+    "f %t/host-slots/lock 0600 - - -"
+  ];
 
   # Every process here is max's, so the hub keeps its loopback port beside the
   # socket, and the laptop's browser and tools reach it with no network at all.
