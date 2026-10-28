@@ -516,8 +516,8 @@ class Args:
     """The command, as a shell would split it, that pulls the peers' session copies once, which this hub runs once a
     peer has released sessions to it; with none, they move here at the copies' next pull."""
     poll: bool = False
-    """Read the disk every 2 s while a hub tab listens, as on a host whose kernel cannot say what changed (a home on
-    NFS), rather than once a change is heard."""
+    """Read the disk at every round of the watch while a hub tab listens, rather than once the kernel says a file
+    changed."""
 
 
 # --------------------------------------------------------------------------
@@ -586,8 +586,8 @@ def signature(root: Path) -> tuple:
 def stamp(path: Path | str) -> tuple | None:
     """What a file's stat says of its content, None where there is no file. A write of the same size in the same
     tick of the kernel's clock as the stat before it keeps the stamp, and the hub misses it, on kernels before 6.13,
-    which brought finer times for a file whose time was just read (multigrain timestamps). A directory's changes
-    with every name that comes or goes in it."""
+    which brought finer times for a file whose time was just read (multigrain timestamps). A directory's stamp
+    changes whenever a name in it comes or goes."""
     looked(path)
     try:
         s = os.stat(path)
@@ -604,54 +604,57 @@ def stamp(path: Path | str) -> tuple | None:
 
 
 class Looks:
-    """What a read looked at: `seen`, each (path, None) for a path it stat'ed or read, there or not, and each
-    (directory, pattern) for a directory whose names matching the pattern it listed, a pattern ending in `/` matching
-    directories alone; and `until`, the time.time() at which the first thing it read off the clock rather than the
-    disk goes stale."""
+    """What a read looked at."""
 
     def __init__(self):
         self.seen: set[tuple[str, str | None]] = set()
+        """(path, None) for a path it stat'ed or read, there or not; (directory, pattern) for a directory it listed the
+        names matching the pattern of. A pattern ending in `/` matches directories alone."""
         self.until = math.inf
+        """The time.time() at which the first thing it read off the clock, not the disk, goes stale."""
 
 
 looking = threading.local()
-"""The Looks of the read under way in this thread (`now`), where one is recorded."""
+"""The Looks of the read under way in this thread (`current`), where one is recorded."""
 
 
 def looked(path: Path | str, names: str | None = None) -> None:
     """Note, for the read under way, that it looked at `path`, or with `names`, listed which of the directory's names
     match that pattern."""
-    if (now := getattr(looking, "now", None)) is not None:
-        now.seen.add((os.fspath(path), names))
+    if WATCH.on and (current := getattr(looking, "current", None)) is not None:  # the first test, as often as a read stats
+        current.seen.add((os.fspath(path), names))
 
 
 def looked_until(at: float) -> None:
     """Note, for the read under way, that what it read stays true until `at` alone, by time.time()."""
-    if (now := getattr(looking, "now", None)) is not None and at < now.until:
-        now.until = at
+    if WATCH.on and (current := getattr(looking, "current", None)) is not None and at < current.until:
+        current.until = at
 
 
 @contextmanager
 def recording():
     """What the code in the block looks at, noted also for the read around it, if one is recorded."""
-    outer, looking.now = getattr(looking, "now", None), Looks()
-    looks = looking.now
+    outer, looking.current = getattr(looking, "current", None), Looks()
+    looks = looking.current
     try:
         yield looks
     finally:
-        looking.now = outer
+        looking.current = outer
         replay(looks)
 
 
 def replay(looks: Looks) -> None:
-    if (now := getattr(looking, "now", None)) is not None:
-        now.seen |= looks.seen
-        now.until = min(now.until, looks.until)
+    if (current := getattr(looking, "current", None)) is not None:
+        current.seen |= looks.seen
+        current.until = min(current.until, looks.until)
 
 
 def once(memo: dict, key, read):
-    """read(), once per read of the hub; every unit that asks for it after the first looked at what the first did."""
-    if key not in memo:
+    """read(), once per read of the hub. A later caller is noted as looking at what the first call looked at, so the
+    disk watch reads it again once that changes."""
+    if key not in memo and not WATCH.on:  # nothing is listened for: nothing to note
+        memo[key] = read(), Looks()
+    elif key not in memo:
         with recording() as looks:
             memo[key] = read(), looks
     value, looks = memo[key]
@@ -659,7 +662,7 @@ def once(memo: dict, key, read):
     return value
 
 
-MAGIC = re.compile(r"[*?[]")
+WILDCARD = re.compile(r"[*?[]")
 
 
 def globbed(base: Path, pattern: str) -> list[Path]:
@@ -669,7 +672,7 @@ def globbed(base: Path, pattern: str) -> list[Path]:
     for i, part in enumerate(parts):
         last = i == len(parts) - 1
         files = last and not pattern.endswith("/")
-        if not MAGIC.search(part):
+        if not WILDCARD.search(part):
             paths = [p / part for p in paths if not last or stamp(p / part) is not None]
             continue
         listed = []
@@ -772,7 +775,7 @@ def refs_stamp(agent: Path) -> tuple | None:
         return None
     found = [stamp(common / "packed-refs"), stamp(common / "reftable" / "tables.list")]
     looked(common / "refs", "*")
-    for top, dirs, names in os.walk(common / "refs"):
+    for top, _, names in os.walk(common / "refs"):
         looked(top, "*")
         found += [(top, name, stamp(os.path.join(top, name))) for name in names]
     return tuple(found)
@@ -1641,6 +1644,16 @@ def new_unit(key: str) -> dict:
     return {"key": key, "session": None if key == LOOSE else key, "roots": {}, "members": [], "visited": 0, "dismissed": 0}
 
 
+def join(q: queue.Queue) -> None:
+    """The listener hears from now on: the disk watch makes a round due, which tells it what a round under way while it
+    read its digest told the others."""
+    with lock:
+        listeners.append(q)
+    with reading:
+        WATCH.untold()
+    WATCH.wake()
+
+
 def broadcast(event: dict) -> None:
     """Every listener is told."""
     with lock:
@@ -2184,9 +2197,9 @@ def hub_view() -> dict:
 
 
 reading = threading.RLock()
-"""One read of the disk at a time, and the disk watch's tables (WATCH) changed under it alone. A read that waits on another finds what that one kept (KEPT, transcripts_read) and
-reads only what changed since. Reads at once would each read it all, as the tabs that connect after a restart do,
-while nothing is kept yet."""
+"""One read of the disk at a time, and the disk watch's tables (WATCH) changed under it alone. A read that waits on
+another finds what that one kept (KEPT, transcripts_read) and reads only what changed since. Reads at once would each
+read it all, as the tabs that connect after a restart do, while nothing is kept yet."""
 
 
 def hub_read() -> tuple[dict, dict[str, str]]:
@@ -2278,9 +2291,8 @@ def unit_names() -> list[str]:
 def read_ahead(keys: list[str], live: dict[str, dict], memo: dict) -> None:
     """Run at once the commands a read of these units runs for each agent repo it has not yet read (`tracker data`,
     git's refs and log) and for the directory of each of their sessions that runs (the handoff hooks' look for its
-    agent repo): each takes a few
-    tenths of a second, so a hub's first read would otherwise wait on them all in turn. They fill the caches the read
-    then finds them in; one that fails is run again by the read, which says why."""
+    agent repo): each takes a few tenths of a second, so a hub's first read would otherwise wait on them all in turn.
+    They fill the caches the read then finds them in; one that fails is run again by the read, which says why."""
     agents = {}
     for key in keys:
         try:
@@ -3147,7 +3159,8 @@ def handoff_state(entry: dict, memo: dict) -> dict | None:
     if not handoffs and not read["handoffs"]:
         return None
     try:
-        found = {p.resolve() for p in [*(globbed(handoffs, "*.md") if handoffs else ()), *map(Path, read["handoffs"])] if is_file(p)}
+        named = [Path(h) for h in read["handoffs"] if os.path.isabs(h)]  # a tool call refused for a relative one is recorded too
+        found = {p.resolve() for p in [*(globbed(handoffs, "*.md") if handoffs else ()), *named] if is_file(p)}
         written = [p for p in found if hooks.continuation_of(p, session)]
         newest = max(written, key=lambda p: p.stat().st_mtime, default=None)
     except OSError:  # one picked up between the look and the read: looked at again at the next read
@@ -3180,11 +3193,12 @@ def committed_at(handoff: Path) -> float | None:
     `pickup.py` refuses. Asked of git again only once the file or the repo's index has changed, so a handoff left
     standing costs the rail's reads no git."""
     agent = handoff.parent.parent
+    index = git_index(agent)
     looked(handoff)
-    looked(agent / ".git" / "index")
+    looked(index)
     try:
-        key = tuple((s.st_mtime_ns, s.st_size) for s in (handoff.stat(), (agent / ".git" / "index").stat()))
-    except OSError:  # no index of its own to watch (a worktree's agent repo): asked every time
+        key = tuple((s.st_mtime_ns, s.st_size) for s in (handoff.stat(), index.stat()))
+    except OSError:  # no index to watch: asked every time
         key = None
     if key and (hit := COMMITS.get(handoff)) and hit[0] == key:
         return hit[1]
@@ -3194,6 +3208,18 @@ def committed_at(handoff: Path) -> float | None:
     if key:
         COMMITS[handoff] = key, at
     return at
+
+
+def git_index(repo: Path) -> Path:
+    """The index of a repo's own checkout, which a commit there writes: its `.git/index`, or for a worktree, the one in
+    the directory its `.git` file names."""
+    dot = repo / ".git"
+    looked(dot)
+    try:
+        named = Path(dot.read_text().removeprefix("gitdir:").strip())
+    except OSError:
+        return dot / "index"
+    return (named if named.is_absolute() else repo / named) / "index"
 
 
 def pane_held(entry: dict) -> bool:
@@ -4813,9 +4839,7 @@ class Handler(BaseHTTPRequestHandler):
             seen_by[q] = view_digest()
         except Exception as e:  # without a digest, the disk watch's first round tells this listener to read again
             print(f"listening: {e}", file=sys.stderr, flush=True)
-        with lock:
-            listeners.append(q)
-        WATCH.wake()
+        join(q)
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -5143,7 +5167,7 @@ def watch_step(rounds: Rounds, longest: float | None = None) -> bool:
             rounds.failing = watch_round(rounds.failing)
             return False
     # while a round is due the disk's notices wait in the kernel's queue, which merges a file's repeated writes
-    wait = (due - time.monotonic()) if due is not None else WATCH.next_deadline() if listening else None
+    wait = max(0.0, due - time.monotonic()) if due is not None else WATCH.next_deadline() if listening else None
     if longest is not None:
         wait = longest if wait is None else min(wait, longest)
     return WATCH.wait(listening and due is None, wait) and code_changed()
@@ -5247,14 +5271,19 @@ class Watch:
     def __init__(self):
         self.on = False
         self.why = ""
-        """Why the hub reads the disk every PACE instead, as its log last said."""
-        self.off_at = -math.inf
+        """Why the hub reads the disk every PACE instead, as its log last said; "" once it has said it hears it again."""
+        self.retry_at: float | None = None
+        """When to ask the kernel again, after its watches or pidfds ran out, by time.monotonic()."""
         self.disk: Inotify | None = None
         self.code: Inotify | None = None
         """The hub's own code (CODE) apart, asked about while no tab listens too."""
+        self.code_watched = False
+        """Every directory of the hub's code is watched: one replaced is watched again."""
         self.wds: dict[str, int] = {}
         self.dirs: dict[int, set[str]] = {}
         """Each watch's directories: one directory under two names has one watch."""
+        self.checked: set[str] = set()
+        """The watched directories the read under way found still at their paths."""
         self.names: dict[str, dict[str, set]] = {}
         """Who reads each name in each watched directory: what changes under the name changes what they read."""
         self.patterns: dict[str, dict[str, set]] = {}
@@ -5281,29 +5310,32 @@ class Watch:
         """Ask the kernel about the disk; where it cannot be, say why once, and read it every PACE."""
         try:
             self.disk, self.code = Inotify(), Inotify()
-            for d in {str(p.parent) for p in CODE}:
-                self.code.add(d)
+            self.watch_code()
         except OSError as e:
-            self.off(self.ran_out(e, "watches") if e.errno in RUN_OUT else f"inotify: {e}")
+            self.off(self.ran_out(e, "watches") if e.errno in RUN_OUT else f"inotify: {e}", e.errno in RUN_OUT)
             return False
         if self.wake_r is None:
             self.wake_r, self.wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
-        self.on, self.whole = True, True
-        if self.why:
-            print("watching the disk by its changes again", file=sys.stderr, flush=True)
-            self.why = ""
+        self.on, self.whole, self.retry_at = True, True, None
         self.wake()
         return True
 
-    def off(self, why: str) -> None:
-        """Stop asking the kernel, and read the disk every PACE instead, saying why where the log has not said it."""
+    def watch_code(self) -> None:
+        for d in {str(p.parent) for p in CODE}:
+            self.code.add(d)
+        self.code_watched = True
+
+    def off(self, why: str, again: bool = False) -> None:
+        """Stop asking the kernel, and read the disk every PACE instead, saying why where the log has not said it;
+        with `again`, ask the kernel again after RETRY."""
         for notices in (self.disk, self.code):
             if notices:
                 notices.close()
         for fd in self.pids.values():
             os.close(fd)
         self.disk = self.code = None
-        self.on, self.whole, self.off_at = False, True, time.monotonic()
+        self.on, self.whole = False, True
+        self.retry_at = time.monotonic() + RETRY if again else None
         for table in (self.wds, self.dirs, self.names, self.patterns, self.held, self.until, self.pids):
             table.clear()
         self.dirty.clear()
@@ -5317,7 +5349,7 @@ class Watch:
 
     def retry(self) -> None:
         """Ask the kernel again, once a while after its watches or pidfds ran out."""
-        if self.why.startswith("ran out") and time.monotonic() - self.off_at >= RETRY:
+        if self.retry_at is not None and time.monotonic() >= self.retry_at:
             self.start()
 
     # --- what a read reads again
@@ -5328,6 +5360,7 @@ class Watch:
             return None
         self.drain()
         self.fresh.clear()
+        self.checked.clear()
         whole, dirty = self.whole, self.dirty
         self.whole, self.dirty = False, set()
         if whole or dirty:
@@ -5341,6 +5374,11 @@ class Watch:
     def again(self, reader) -> None:
         self.dirty.add(reader)
 
+    def untold(self) -> None:
+        """A tab began to listen while a round may have been under way, with what it saw from before the round: a
+        round is due, which tells it what the round told the others."""
+        self.told = min(self.told, self.reads - 1)
+
     def told_of(self, reads: int) -> None:
         """The listeners have been told of the hub as the first `reads` reads left it."""
         self.told = reads
@@ -5349,17 +5387,13 @@ class Watch:
 
     def read(self, reader, read):
         """read(), listening for changes to what it looked at, as `reader`'s."""
-        if not self.on:
+        with self.reading(reader):
             return read()
-        with recording() as looks:
-            value = read()
-        self.keep(reader, looks)
-        return value
 
     @contextmanager
     def reading(self, reader):
         """The block, listening for changes to what it looked at, as `reader`'s."""
-        if not self.on:
+        if not self.on:  # nothing is listened for: nothing to note
             yield
             return
         with recording() as looks:
@@ -5368,10 +5402,14 @@ class Watch:
 
     def settled(self) -> None:
         """The read is done: every reader of a directory first watched while it ran is read again, which a change
-        between its look and the watch would otherwise leave stale."""
+        between its look and the watch would otherwise leave stale. A first read whole since the kernel's watches ran
+        out says they are back."""
         for d in self.fresh:
             self.dirty |= self.readers_of(d)
         self.fresh.clear()
+        if self.on and self.why:
+            print("watching the disk by its changes again", file=sys.stderr, flush=True)
+            self.why = ""
 
     # --- what is listened for
 
@@ -5382,12 +5420,14 @@ class Watch:
         new, until = set(), looks.until
         try:
             for path, names in looks.seen:
+                if not os.path.isabs(path):  # a path relative to the hub's own directory names no file a unit is read from
+                    continue
                 if (heard := self.listen(path, names)) is None:  # a directory the kernel will not watch: read on the clock
                     until = min(until, time.time() + PACE)
                 else:
                     new.add(heard)
         except OSError as e:
-            self.off(self.ran_out(e, "watches"))
+            self.off(self.ran_out(e, "watches"), again=True)
             return
         old = self.held.get(reader, frozenset())
         for d, name, pattern in old - new:
@@ -5408,22 +5448,39 @@ class Watch:
 
     def listen(self, path: str, names: str | None) -> tuple[str, str, bool] | None:
         """Watch what a look was of: the directory a name sits in or a listing lists, or, where it is not there, the
-        nearest directory above it for the name that is missing. None where the kernel will not watch it."""
+        nearest directory above it for the name that is missing. None where the kernel will not watch it. A directory
+        watched already is asked for again once per read: a directory above it renamed takes the watch with it, and
+        the kernel then answers another watch for whatever is at the path now."""
         d, name, pattern = (path, names, True) if names is not None else (*os.path.split(path), False)
-        while d not in self.wds:
+        while d not in self.checked:
             try:
                 wd = self.disk.add(d)
             except OSError as e:
                 if e.errno in RUN_OUT:
                     raise
-                if e.errno not in (errno.ENOENT, errno.ENOTDIR) or d == "/":
+                if e.errno not in (errno.ENOENT, errno.ENOTDIR) or os.path.dirname(d) == d:
                     return None
-                d, name, pattern = *os.path.split(d), False
+                self.forget(self.wds.get(d), d)
+                d, name, pattern = os.path.dirname(d), os.path.basename(d), False
                 continue
-            self.wds[d] = wd
-            self.dirs.setdefault(wd, set()).add(d)
-            self.fresh.add(d)
+            if self.wds.get(d) != wd:
+                self.forget(self.wds.get(d), d)
+                self.wds[d] = wd
+                self.dirs.setdefault(wd, set()).add(d)
+                self.fresh.add(d)
+            self.checked.add(d)
         return d, name, pattern
+
+    def forget(self, wd: int | None, d: str, remove: bool = True) -> None:
+        """The directory is no longer the one the watch is on."""
+        if wd is None or d not in self.dirs.get(wd, ()):
+            return
+        self.wds.pop(d, None)
+        self.dirs[wd].discard(d)
+        if not self.dirs[wd]:
+            del self.dirs[wd]
+            if remove:
+                self.disk.remove(wd)
 
     def unlisten(self, reader, d: str, name: str, pattern: bool) -> None:
         table = self.patterns if pattern else self.names
@@ -5433,11 +5490,8 @@ class Watch:
             del table[d][name]
             if not table[d]:
                 del table[d]
-        if d not in self.names and d not in self.patterns and (wd := self.wds.pop(d, None)) is not None:
-            self.dirs[wd].discard(d)
-            if not self.dirs[wd]:
-                del self.dirs[wd]
-                self.disk.remove(wd)
+        if d not in self.names and d not in self.patterns:
+            self.forget(self.wds.get(d), d)
 
     def readers_of(self, d: str) -> set:
         return {r for table in (self.names, self.patterns) for readers in table.get(d, {}).values() for r in readers}
@@ -5455,7 +5509,7 @@ class Watch:
             except ProcessLookupError:  # exited since the registry was read
                 self.dirty.add(REGISTRY)
             except OSError as e:
-                self.off(self.ran_out(e, "pidfds") if e.errno in RUN_OUT else f"pidfd: {e}")
+                self.off(self.ran_out(e, "pidfds") if e.errno in RUN_OUT else f"pidfd: {e}", e.errno in RUN_OUT)
                 return
 
     # --- hearing it
@@ -5467,18 +5521,16 @@ class Watch:
         for wd, mask, name in self.disk.read():
             if mask & IN_Q_OVERFLOW:
                 self.whole = True
-            for d in self.dirs.get(wd, ()):
-                if mask & GONE:
+            for d in list(self.dirs.get(wd, ())):
+                if mask & GONE:  # deleted, or renamed with its watch: what is at the path later is watched anew
                     self.dirty |= self.readers_of(d)
+                    self.forget(wd, d, remove=not mask & IN_IGNORED)
                     continue
                 self.dirty |= self.names.get(d, {}).get(name, set())
                 if mask & NAMED:
                     for pattern, readers in self.patterns.get(d, {}).items():
                         if self.matches(d, name, mask, pattern):
                             self.dirty |= readers
-            if mask & IN_IGNORED:
-                for d in self.dirs.pop(wd, ()):
-                    self.wds.pop(d, None)
         if self.pids:
             exits = select.poll()
             for fd in self.pids.values():
@@ -5517,23 +5569,35 @@ class Watch:
 
     def wait(self, disk: bool, timeout: float | None) -> bool:
         """Wait at most `timeout` seconds for a notice of the hub's code, or of a wake; with `disk`, of the disk and
-        the sessions' processes too. True where the code may have changed."""
+        the sessions' processes too. True where the code may have changed. A directory of the code that went is
+        watched again as soon as it is back, looked for every PACE meanwhile."""
+        code, notices = self.code, self.disk
+        if code is None or notices is None:  # a read turned the watch off before the wait began
+            return False
+        if not self.code_watched:
+            timeout = PACE if timeout is None else min(timeout, PACE)
         waiting = select.poll()
         try:
-            for fd in (self.wake_r, self.code.fd, *((self.disk.fd, *self.pids.values()) if disk else ())):
+            for fd in (self.wake_r, code.fd, *((notices.fd, *self.pids.values()) if disk else ())):
                 waiting.register(fd, select.POLLIN)
-            waiting.poll(None if timeout is None else math.ceil(timeout * 1000))
+            waiting.poll(None if timeout is None else max(0, math.ceil(timeout * 1000)))
             while os.read(self.wake_r, 512):
                 pass
         except BlockingIOError:
             pass
-        except (OSError, AttributeError):  # a read turned the watch off meanwhile, closing what was waited on
+        except OSError:  # a read turned the watch off meanwhile, closing what was waited on
             return False
         names = {p.name for p in CODE}
         try:
-            return any(name in names or mask & (GONE | IN_Q_OVERFLOW) for _, mask, name in self.code.read())
-        except (OSError, AttributeError):
-            return False
+            heard = code.read()
+            if any(mask & GONE for _, mask, _ in heard):
+                self.code_watched = False
+            if not self.code_watched:
+                self.watch_code()
+                return True
+        except OSError:
+            return not self.code_watched
+        return any(name in names or mask & IN_Q_OVERFLOW for _, mask, name in heard)
 
     def wake(self) -> None:
         """End the wait under way: a tab listens now, or a read left readers to read again."""
@@ -5542,7 +5606,6 @@ class Watch:
                 os.write(self.wake_w, b"!")
         except BlockingIOError:
             pass
-
 
 WATCH = Watch()
 

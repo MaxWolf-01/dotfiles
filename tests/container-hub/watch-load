@@ -4,20 +4,24 @@
 # dependencies = ["tyro"]
 # ///
 """What a container hub with a tab listening costs a host: its CPU while nothing changes, and while sessions work,
-hearing the disk's changes against reading it every 2 s (--poll), and the inotify watches it holds.
+hearing the disk's changes (events), reading it at every round of its watch (poll, the hub's --poll), and as a hub
+from before the disk watch reads it (before, the script --before names), and the inotify watches it holds.
 
-Each mode starts a hub of its own on a scratch socket and state, with one listener on its event stream, waits for its
+Each run starts a hub of its own on a scratch socket and state, with one listener on its event stream, waits for its
 first reads to finish, then measures the CPU of its processes (the hub's and the commands it ran) over --seconds
 while nothing writes, and again while --busy sessions write their transcripts and statusline files. The hub's tmux
-socket is one no server listens on, so it types into no session.
+server is the synthetic sessions' own, or with --real, one that is not there, so it types into none of the user's. A run whose tab was told nothing while sessions
+worked measured a hub that heard nothing: it is marked invalid, and the tool exits 1.
 
-The world it reads is a synthetic one (load.py: --units units, --running of whose sessions run) under a scratch HOME,
-or with --real, this user's own HOME and a copy of the hub's state, the sessions' own work being the load.
+The world it reads is a synthetic one (synthetic.py: --units units, --running of whose sessions run, each idle in a
+pane of a tmux server of its own) under a scratch HOME, or with --real, this user's own HOME and a copy of the hub's state, the sessions' own
+work being the load.
 
 Examples:
 
     tests/container-hub/watch-load
     tests/container-hub/watch-load --units 300 --running 32 --busy 8 --seconds 60 --out result.json
+    git show hub/cold-read:bin/container-hub > /tmp/before-hub && tests/container-hub/watch-load --before /tmp/before-hub --modes events before
     tests/container-hub/watch-load --real --seconds 120
 """
 
@@ -38,10 +42,11 @@ from typing import Literal
 import tyro
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-import load  # noqa: E402
+sys.path[:0] = [str(HERE), str(HERE.parent)]
+import fakes  # noqa: E402
+import synthetic  # noqa: E402
 
-HUB = HERE.parents[1] / "bin" / "container-hub"
+BIN = HERE.parents[1] / "bin"
 TICK = os.sysconf("SC_CLK_TCK")
 
 
@@ -60,8 +65,10 @@ class Args:
     """Seconds each measurement lasts."""
     warmup: float = 30.0
     """Seconds a hub is given to make its first reads before it is measured."""
-    modes: tuple[Literal["events", "poll"], ...] = ("events", "poll")
-    """The hubs measured, one after the other: hearing the disk, and reading it every 2 s."""
+    modes: tuple[Literal["events", "poll", "before"], ...] = ("events", "poll")
+    """The hubs measured, one after the other in each run."""
+    before: Path | None = None
+    """The hub script measured as `before`, run beside this checkout's diffview."""
     runs: int = 1
     """Times the modes are measured, in turn."""
     real: bool = False
@@ -73,78 +80,76 @@ class Args:
 
 
 def main(args: Args) -> None:
+    if "before" in args.modes and not args.before:
+        sys.exit("watch-load: the `before` mode measures the hub --before names; give it one")
     scratch = Path(tempfile.mkdtemp(prefix="watch-load.", dir="/tmp"))  # a short path: a unix socket's is bounded
-    procs: list[subprocess.Popen] = []
+    tmux = scratch / "tmux.sock"
     try:
         home, state, sessions = Path.home(), None, []
         if not args.real:
             home, state = scratch / "home", scratch / "state"
             home.mkdir()
-            reader = max(Path.home().glob(".claude*/plugins/cache/*/mx/*/skills/session-page/session_page.py"),
-                         key=lambda p: tuple(int(x) if x.isdigit() else 0 for x in p.parents[2].name.split(".")), default=None)
-            if reader:  # the newest mx plugin, where the hub finds its session page reader and its tracker
-                (home / ".claude/plugins/cache/market/mx").mkdir(parents=True)
-                (home / ".claude/plugins/cache/market/mx" / reader.parents[2].name).symlink_to(reader.parents[2])
-            sessions = load.build(home, state, args.units, args.running)
-            procs = load.run(home, sessions)
-        results = {"host": socket.gethostname(), "units": None if args.real else args.units,
-                   "running": None if args.real else args.running, "busy": None if args.real else args.busy,
-                   "write": args.write, "seconds": args.seconds, "runs": []}
+            fakes.with_reader(home)  # where the hub finds the mx plugin's session page reader and its tracker
+            sessions = synthetic.build(home, state, args.units)
+            synthetic.run(home, sessions[:args.running], tmux)
+        hubs = {"events": BIN / "container-hub", "poll": BIN / "container-hub"}
+        if args.before:
+            (scratch / "before").mkdir()
+            shutil.copy(args.before, hubs.setdefault("before", scratch / "before" / "container-hub"))
+            hubs["before"].chmod(0o755)
+            (scratch / "before" / "diffview").symlink_to(BIN / "diffview")
+        results = {"host": socket.gethostname(), **({} if args.real else {"units": args.units, "running": args.running,
+                   "busy": args.busy, "write": args.write}), "seconds": args.seconds, "runs": []}
         for run in range(args.runs):
             for mode in args.modes:
                 mode_state = scratch / f"state-{mode}-{run}"
                 shutil.copytree(state or args.state.expanduser(), mode_state, symlinks=True)
-                results["runs"].append({"mode": mode, **measure(args, f"{mode}-{run}", home, mode_state, scratch, sessions)})
+                measured = measure(args, hubs[mode], mode, f"{mode}-{run}", home, mode_state, scratch, sessions[:args.busy])
+                results["runs"].append({"mode": mode, **measured})
                 print(json.dumps(results["runs"][-1]), flush=True)
         if args.out:
             args.out.write_text(json.dumps(results, indent=1) + "\n")
         print(json.dumps(results, indent=1))
+        if invalid := [r["mode"] for r in results["runs"] if not r["valid"]]:
+            sys.exit(f"watch-load: {len(invalid)} runs measured a hub whose tab was told nothing while sessions worked: {invalid}")
     finally:
-        for p in procs:
-            p.kill()
-            p.wait()
+        synthetic.stop(tmux)
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def measure(args: Args, mode: str, home: Path, state: Path, scratch: Path, sessions: list[str]) -> dict:
-    sock = scratch / f"{mode}.sock"
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "DISPATCH_", "CONTAINER_HUB", "TMUX"))}
-    env.update(HOME=str(home), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", **uv_dirs())
-    argv = [str(HUB), "--socket", str(sock), "--state", str(state), "--host", "watch-load", "--url", "http://watch-load.invalid",
-            "--tmux-socket", str(scratch / "no-tmux.sock"), *(["--poll"] if mode.startswith("poll") else [])]
-    log = (scratch / f"{mode}.log").open("w")
-    hub = subprocess.Popen(argv, env=env, stdout=log, stderr=log, start_new_session=True)
+def measure(args: Args, hub_script: Path, mode: str, name: str, home: Path, state: Path, scratch: Path, busy: list[str]) -> dict:
+    sock = scratch / f"{name}.sock"
+    env = {k: v for k, v in fakes.scrubbed(home).items() if not k.startswith("DISPATCH_")}
+    argv = [str(hub_script), "--socket", str(sock), "--state", str(state), "--host", "watch-load", "--url", "http://watch-load.invalid",
+            "--tmux-socket", str(scratch / ("no-tmux.sock" if args.real else "tmux.sock")), *(["--poll"] if mode == "poll" else [])]
+    log = scratch / f"{name}.log"
+    hub = subprocess.Popen(argv, env=env, stdout=log.open("w"), stderr=subprocess.STDOUT, start_new_session=True)
     try:
         try:
-            listener = listen(sock)
+            listener = Listener(sock)
         except OSError:
-            sys.exit(f"the {mode} hub never listened on {sock}:\n" + (scratch / f"{mode}.log").read_text())
+            sys.exit(f"the {mode} hub never listened on {sock}:\n" + log.read_text())
         time.sleep(args.warmup)
         heard = listener.heard
         idle = cpu_over(hub.pid, args.seconds)
         heard_idle, heard = listener.heard - heard, listener.heard
         stop = threading.Event()
-        writer = threading.Thread(target=work, args=(home, sessions[:args.busy], args.write, stop), daemon=True)
+        writer = threading.Thread(target=work, args=(home, busy, args.write, stop), daemon=True)
         if not args.real:
             writer.start()
-        busy = None if args.real else cpu_over(hub.pid, args.seconds)
+        working = None if args.real else cpu_over(hub.pid, args.seconds)
         stop.set()
-        said = (scratch / f"{mode}.log").read_text().splitlines()
-        return {"idle_cpu_percent": idle, "busy_cpu_percent": busy, "watches": watches(hub.pid),
-                "told_idle": heard_idle, "told_busy": listener.heard - heard,
+        told_busy = listener.heard - heard
+        said = log.read_text().splitlines()
+        return {"idle_cpu_percent": idle, "busy_cpu_percent": working, "watches": watches(hub.pid),
+                "told_idle": heard_idle, "told_busy": told_busy, "valid": args.real or told_busy > 0,
                 "errors": [line for line in said if line.startswith(("watching:", "listing ", "Traceback"))], "log": said[-8:]}
     finally:
         os.killpg(hub.pid, 9)
         hub.wait()
 
 
-def uv_dirs() -> dict[str, str]:
-    """uv's own directories, which would otherwise move into a scratch HOME, where `tracker` installs anew."""
-    return {k: subprocess.run(["uv", *a], capture_output=True, text=True, check=True).stdout.strip()
-            for k, a in (("UV_CACHE_DIR", ("cache", "dir")), ("UV_PYTHON_INSTALL_DIR", ("python", "dir")))}
-
-
-class listen(threading.Thread):
+class Listener(threading.Thread):
     """A hub tab's event stream, read and counted."""
 
     def __init__(self, sock: Path):
@@ -168,9 +173,8 @@ class listen(threading.Thread):
             self.heard += chunk.count(b"data: ")
 
 
-def group_ticks(sid: int) -> int:
-    """CPU ticks of every process of the session, with the children each has waited for."""
-    total = 0
+def session_of(sid: int):
+    """The /proc directory of each process of the session, with its stat's fields after the command's name."""
     for d in Path("/proc").iterdir():
         if d.name.isdigit():
             try:
@@ -178,25 +182,24 @@ def group_ticks(sid: int) -> int:
             except OSError:
                 continue
             if int(fields[3]) == sid:  # the session id, the 6th field
-                total += sum(int(fields[i]) for i in (11, 12, 13, 14))  # utime stime cutime cstime
-    return total
+                yield d, fields
 
 
 def cpu_over(sid: int, seconds: float) -> float:
-    """Percent of one core the hub's processes used over `seconds`."""
-    before, start = group_ticks(sid), time.monotonic()
+    """Percent of one core the hub's processes, with the children each has waited for, used over `seconds`."""
+    ticks = lambda: sum(int(f[i]) for _, f in session_of(sid) for i in (11, 12, 13, 14))  # utime stime cutime cstime
+    before, start = ticks(), time.monotonic()
     time.sleep(seconds)
-    return round(100 * (group_ticks(sid) - before) / TICK / (time.monotonic() - start), 3)
+    return round(100 * (ticks() - before) / TICK / (time.monotonic() - start), 3)
 
 
 def watches(sid: int) -> int:
     """The inotify watches the hub's processes hold."""
     count = 0
-    for d in Path("/proc").iterdir():
+    for d, _ in session_of(sid):
         try:
-            if d.name.isdigit() and int((d / "stat").read_text().rsplit(")", 1)[1].split()[3]) == sid:
-                for info in (d / "fdinfo").iterdir():
-                    count += sum(line.startswith("inotify wd:") for line in info.read_text().splitlines())
+            for info in (d / "fdinfo").iterdir():
+                count += sum(line.startswith("inotify wd:") for line in info.read_text().splitlines())
         except OSError:
             continue
     return count
@@ -214,7 +217,7 @@ def work(home: Path, busy: list[str], every: float, stop: threading.Event) -> No
         if time.monotonic() - last >= 1:
             last = time.monotonic()
             for s in busy:
-                load.statusline(home, s, n)
+                synthetic.statusline(home, s, n)
             n += 1
         stop.wait(every)
 
