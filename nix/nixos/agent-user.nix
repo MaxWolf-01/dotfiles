@@ -34,12 +34,7 @@ let
   # max's uid, pinned so the slice sessionsReserve protects keeps its name.
   maxUid = 1000;
 
-  host-slots = pkgs.runCommand "host-slots" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
-    install -Dm755 ${../../bin/host-slots} $out/bin/host-slots
-    patchShebangs $out/bin/host-slots
-    wrapProgram $out/bin/host-slots --set HOST_SLOTS ${toString slots} \
-      --prefix PATH : ${lib.makeBinPath (with pkgs; [ coreutils gnugrep util-linux ])}
-  '';
+  host-slots = import ../host-slots { inherit pkgs lib slots; };
 
   # Tailscale ACLs are per-node and cannot separate unix users, so the tailnet
   # boundary is drawn by uid instead. The firewall's reload script re-runs

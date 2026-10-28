@@ -2,6 +2,7 @@
 host: zephylux
 user: max
 isolated: false
+placement: last
 ---
 
 # Worker host: max@zephylux
@@ -29,7 +30,8 @@ make.
 
 ## Weigh before a long run here
 
-Finishing is not the question — `nosleep` holds a job through a closed lid and
+Placement puts a worker here only when every other host on its account is
+full or down. Finishing is not the question — `nosleep` holds a job through a closed lid and
 an idle timeout. Conditions are: whether the machine is on mains, whether it can
 shed heat where it happens to be sitting, and what hours at full load cost the
 parts. Where another host is up and the work needs nothing only this machine
