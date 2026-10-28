@@ -1,9 +1,10 @@
 # The machines: every host max runs, and the dispatch worker users on each, in
 # the one list below. Home Manager writes it out as ~/.config/machines.json,
-# which the host tools read (host-unlock, backup-hosts, worker-hosts,
-# claude-token-push, container-hub-address); MACHINES_FILE points them at
-# another copy. A new machine is an entry in the list and nothing else, but for
-# the hand-written description of each worker user on it,
+# which the host tools in bin/ read; MACHINES_FILE points them at another copy.
+# A machine the host tools learn of is an entry here. What a host needs beyond
+# that stays where it was: its ssh alias in ./common.nix, and for a NixOS host
+# its config in the flake, with a Home Manager config per worker user
+# (./hosts/<host>-<user>.nix) and the hand-written half of that user's record,
 # ./hosts/<host>-<user>/HOST.md, whose frontmatter this module writes.
 #
 # The hosts that run max's sessions (`sessions`) each run a container hub, and
@@ -53,6 +54,27 @@ let
     };
   };
 
+  # One step of an unlock: a command run on the machine over ssh, handed a
+  # secret on stdin, or the age key, or nothing.
+  step = types.submodule {
+    options = {
+      run = mkOption {
+        type = types.listOf types.str;
+        description = "The command, run on the machine as max.";
+      };
+      secret = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "The secret it reads on stdin, by its name in secrets/creds/raw/.";
+      };
+      ageKey = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Whether it reads the age key on stdin, from SOPS_AGE_KEY_FILE.";
+      };
+    };
+  };
+
   machine = types.submodule {
     options = {
       name = mkOption {
@@ -73,9 +95,12 @@ let
         description = "Whether it runs max's sessions, and so a container hub.";
       };
       unlock = mkOption {
-        type = types.bool;
-        default = false;
-        description = "Whether it comes back from a boot with something locked that `host-unlock <name>` opens.";
+        type = types.listOf step;
+        default = [ ];
+        description = ''
+          What it keeps locked after a boot, as the steps `host-unlock <name>`
+          runs in order to open it; none where nothing is locked. Each host's
+          receiving end is its host-unlock-receive.'';
       };
       timers = mkOption {
         type = types.nullOr types.str;
@@ -90,7 +115,9 @@ let
     };
   };
 
-  # A worker user's HOST.md frontmatter, every field it sets.
+  # A worker user's HOST.md frontmatter, every field it sets. It goes into the
+  # written-out list as well, so a tool printing the record of a host it cannot
+  # reach prints the frontmatter the host's own copy holds.
   frontmatter = host: w:
     lib.concatLines ([ "---" "host: ${host}" "user: ${w.user}" "isolated: ${lib.boolToString w.isolated}" ]
       ++ lib.optional (w.placement != null) "placement: ${w.placement}"
@@ -100,6 +127,10 @@ let
       ++ [ "---" "" ]);
 
   names = map (m: m.name) config.machines;
+
+  # Each worker user's entry, its frontmatter beside it.
+  written = map (m: m // { workers = map (w: w // { frontmatter = frontmatter m.name w; }) m.workers; })
+    config.machines;
 in
 {
   options.machines = mkOption {
@@ -111,7 +142,16 @@ in
         ssh = "pc";
         trust = 2;
         sessions = true;
-        unlock = true;
+        # The age key, the SSH key in the agent, the ZFS datasets, then copyparty
+        # and the backups' catch-up (../nixos/pc/host-unlock.nix).
+        unlock = [
+          { run = [ "host-unlock-receive" "age-key" ]; ageKey = true; }
+          { run = [ "host-unlock-receive" "ssh-key" ]; secret = "ssh-passphrase-pc"; }
+          { run = [ "host-unlock-receive" "zfs" "phone" ]; secret = "zfs-phone-general"; }
+          { run = [ "host-unlock-receive" "zfs" "general" ]; secret = "zfs-phone-general"; }
+          { run = [ "host-unlock-receive" "zfs" "encrypted" ]; secret = "zfs-encrypted"; }
+          { run = [ "host-unlock-receive" "finish" ]; }
+        ];
         timers = "nix/home/pc-timers.nix";
         workers = [
           { user = "agent"; account = "personal"; isolated = true; withholds = [ "gpu" ]; }
@@ -131,7 +171,8 @@ in
         name = "xmg19";
         ssh = "xmg";
         trust = 1;
-        unlock = true;
+        # Its /home (../nixos/xmg19/home-unlock.nix).
+        unlock = [ { run = [ "sudo" "host-unlock-receive" ]; secret = "xmg19-home-luks"; } ];
         workers = [
           { user = "agent"; account = "personal"; isolated = true; }
           { user = "agent-hl"; account = "helferline"; isolated = true; }
@@ -144,8 +185,8 @@ in
     type = types.attrsOf types.str;
     readOnly = true;
     default = lib.listToAttrs (lib.concatMap
-      (m: map (w: { name = "${w.user}@${m.name}"; value = frontmatter m.name w; }) m.workers)
-      config.machines);
+      (m: map (w: { name = "${w.user}@${m.name}"; value = w.frontmatter; }) m.workers)
+      written);
     description = "Each worker user's HOST.md frontmatter, by user@host.";
   };
 
@@ -160,6 +201,6 @@ in
       message = "machines: ${m.name} lists a worker user more than once";
     }) config.machines;
 
-    xdg.configFile."machines.json".text = builtins.toJSON config.machines;
+    xdg.configFile."machines.json".text = builtins.toJSON written;
   };
 }

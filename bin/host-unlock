@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Unlock what a host keeps locked after a boot, from the machine that holds the
 # secrets. Run it on zephylux, by hand or from an agent, after the host was
-# rebooted; each host's receiving end is its host-unlock-receive.
+# rebooted (pc, xmg19).
 #
 # Usage:
-#   host-unlock xmg19   open and mount xmg19's /home (nix/nixos/xmg19/home-unlock.nix)
-#   host-unlock pc      on pc: the age key, the SSH key in the agent, the ZFS
-#                       datasets phone, general and encrypted, then copyparty and
-#                       the backups' catch-up (nix/nixos/pc/host-unlock.nix)
+#   host-unlock <host>
+#
+# The hosts with an unlock, and the steps each runs, are their entries'
+# `unlock` in nix/home/machines.nix, read from the copy Home Manager writes
+# out, ~/.config/machines.json (MACHINES_FILE points elsewhere). Each step runs
+# a command on the host over ssh, handed a secret from secrets/creds/raw/ or
+# the age key on stdin.
 #
 # Safe to run again: whatever is already unlocked is left as it is.
 set -euo pipefail
@@ -15,34 +18,28 @@ case ${1:-} in -h|--help|'') awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print
 
 SECRETS="$HOME/.dotfiles/secrets"
 AGE_KEY="${SOPS_AGE_KEY_FILE:?is not set; the Home Manager config of this host, in nix/home/hosts/, sets it}"
-# Written by nix/home/machines.nix, which says which machines have an unlock and
-# the ssh destination of each.
 MACHINES="${MACHINES_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/machines.json}"
 
-secret() { sops -d "$SECRETS/creds/raw/$1"; }
-
-unlock_xmg19() {
-  secret xmg19-home-luks | ssh "$1" sudo host-unlock-receive
-}
-
-unlock_pc() {
-  [ -r "$AGE_KEY" ] || { echo "host-unlock: no age key at $AGE_KEY" >&2; exit 1; }
-  ssh "$1" host-unlock-receive age-key < "$AGE_KEY"
-  secret ssh-passphrase-pc | ssh "$1" host-unlock-receive ssh-key
-  secret zfs-phone-general | ssh "$1" host-unlock-receive zfs phone
-  secret zfs-phone-general | ssh "$1" host-unlock-receive zfs general
-  secret zfs-encrypted | ssh "$1" host-unlock-receive zfs encrypted
-  ssh "$1" host-unlock-receive finish
-}
-
 [ -r "$MACHINES" ] || { echo "host-unlock: no machines list at $MACHINES; Home Manager writes it (nix/home/machines.nix)" >&2; exit 1; }
-dest=$(jq -r --arg name "$1" '.[] | select(.name == $name and .unlock) | .ssh' "$MACHINES")
-if [ -z "$dest" ]; then
-  echo "host-unlock: no unlock known for '$1' ($(jq -r '[.[] | select(.unlock) | .name] | join(", ")' "$MACHINES"))" >&2
+machine=$(jq -c --arg name "$1" '.[] | select(.name == $name and .unlock != [])' "$MACHINES")
+if [ -z "$machine" ]; then
+  echo "host-unlock: no unlock known for '$1' ($(jq -r '[.[] | select(.unlock != []) | .name] | join(", ")' "$MACHINES"))" >&2
   exit 1
 fi
-if [ "$(type -t "unlock_$1")" != function ]; then
-  echo "host-unlock: $MACHINES says $1 has an unlock, but this script has no steps for it" >&2
+if jq -e 'any(.unlock[]; .ageKey)' <<<"$machine" >/dev/null && [ ! -r "$AGE_KEY" ]; then
+  echo "host-unlock: no age key at $AGE_KEY" >&2
   exit 1
 fi
-"unlock_$1" "$dest"
+
+dest=$(jq -r .ssh <<<"$machine")
+# ssh joins its command's words with spaces, so the step's command goes as one.
+# The secret comes last: read drops an empty field anywhere before the last.
+while IFS=$'\t' read -r age_key run secret; do
+  if [ -n "$secret" ]; then
+    sops -d "$SECRETS/creds/raw/$secret" | ssh "$dest" "$run"
+  elif [ "$age_key" = true ]; then
+    ssh "$dest" "$run" < "$AGE_KEY"
+  else
+    ssh "$dest" "$run" < /dev/null
+  fi
+done < <(jq -r '.unlock[] | [.ageKey, (.run | join(" ")), .secret // ""] | @tsv' <<<"$machine")

@@ -32,8 +32,8 @@
 #
 # A peer is another host's hub this one relays (the hub's --peer): every other
 # host that runs max's sessions (./machines.nix) trusted as much as this one
-# or less (that file says why). It is reached over ssh as max: ssh forwards the peer's socket to
-# one here that only max can open, since ssh makes it 0600
+# or less (that file says why). It is reached over ssh as max: ssh forwards
+# the peer's socket to one here that only max can open, since ssh makes it 0600
 # (StreamLocalBindMask) in a directory of his. Not over the peer's tailnet
 # port: the tailnet policy cannot tell max's processes on pc from the dispatch
 # workers beside them, so a grant from pc to that port would let a worker
@@ -87,11 +87,11 @@ in
         options = {
           ssh = lib.mkOption {
             type = lib.types.str;
-            description = "The ssh destination that reaches the host as max. Its hub listens where this host's does, under the same home.";
+            description = "Its `ssh` in ./machines.nix. Its hub listens where this host's does, under the same home.";
           };
           trust = lib.mkOption {
             type = lib.types.int;
-            description = "How far the host is trusted, higher being further.";
+            description = "Its `trust` in ./machines.nix.";
           };
         };
       });
