@@ -14,8 +14,8 @@ mechanisms deliver it:
 
 Mullvad publishes several list flavours, one IP each:
 <https://mullvad.net/en/help/dns-over-https-and-dns-over-tls>. The tailnet
-config lives in `secrets/tailscale/dns.json`, pushed with `tailnet dns push` (`bin/tailnet`);
-the failover chain names the same resolver in `bin/dns-failover-install`.
+config lives in `secrets/tailscale/dns.json`, pushed with `tailnet dns push`
+(`bin/tailnet`); the failover chain names the same resolver in `bin/dns-failover-install`.
 
 ## zephylux: the failover chain
 
