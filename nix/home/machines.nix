@@ -2,7 +2,7 @@
 # the one list below. Home Manager writes it out as ~/.config/machines.json,
 # which the host tools in bin/ read; MACHINES_FILE points them at another copy.
 # A machine the host tools learn of is an entry here. What a host needs beyond
-# that stays where it was: its ssh alias in ./common.nix, and for a NixOS host
+# that lives elsewhere: its ssh alias in ./common.nix, and for a NixOS host
 # its config in the flake, with a Home Manager config per worker user
 # (./hosts/<host>-<user>.nix) and the hand-written half of that user's record,
 # ./hosts/<host>-<user>/HOST.md, whose frontmatter this module writes.
@@ -199,7 +199,11 @@ in
     ] ++ map (m: {
       assertion = lib.allUnique (map (w: w.user) m.workers);
       message = "machines: ${m.name} lists a worker user more than once";
-    }) config.machines;
+    }) config.machines
+    ++ lib.concatMap (m: map (st: {
+      assertion = st.secret == null || !st.ageKey;
+      message = "machines: a step of ${m.name}'s unlock takes both a secret and the age key on stdin; it can read one";
+    }) m.unlock) config.machines;
 
     xdg.configFile."machines.json".text = builtins.toJSON written;
   };
