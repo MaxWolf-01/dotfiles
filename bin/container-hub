@@ -637,8 +637,9 @@ def recording():
 
 
 def once(memo: dict, key, read):
-    """read(), once per read of the hub, and what every unit shares: the disk watch reads it as a reader of its own, a
-    change to which reads every unit again."""
+    """read(), once per read of the hub, of what units share: the disk watch reads it as a reader of its own, a change
+    to which reads again every reader that asked for it (WATCH.users)."""
+    WATCH.used(("shared", key))
     if key not in memo:
         memo[key] = WATCH.read(("shared", key), read)
     return memo[key]
@@ -659,7 +660,7 @@ def globbed(base: Path, pattern: str) -> list[Path]:
             continue
         listed = []
         for d in paths:
-            looked(d, part if files else part + "/")
+            looked(d, part if files else f"{part}/{parts[i + 1] if not last else ''}")
             try:
                 with os.scandir(d) as entries:
                     listed += [Path(e.path) for e in entries if fnmatch.fnmatchcase(e.name, part) and (files or e.is_dir())]
@@ -1213,7 +1214,8 @@ layout is the mx plugin's, whose `session-page/session_page.py` is its home: the
 
 def accounts() -> list[Path]:
     """Every account's directory, `~/.claude*`, as it is spelled under HOME, which may be a link."""
-    return sorted(globbed(HOME, ".claude*/"))
+    looked(HOME, ".claude*/projects")  # heard once it holds one: a lock directory beside ~/.claude.json is none
+    return sorted(a for a in HOME.glob(".claude*") if a.is_dir())
 
 
 def is_account(path: Path | str) -> bool:
@@ -1886,7 +1888,7 @@ def resumable_of(session: str, memo: dict) -> list[Path]:
 
 def look_for_resumable(memo: dict) -> None:
     global resumable_at
-    looked(HOME, ".claude*/")  # where diffview.claude_configs looks
+    looked(HOME, ".claude*/projects")  # where diffview.claude_configs looks
     roots = [c / "projects" for c in diffview.claude_configs() if stamp(c / "projects")]
     projects = projects_in(roots, memo)
     if projects != resumable_at:  # a transcript written or deleted changes its project directory
@@ -2222,6 +2224,9 @@ def read_changed(heard: set | None) -> tuple[dict, dict[str, str]]:
     if heard is None or UNITS in heard or "names" not in COMMON:
         COMMON["names"] = WATCH.read(UNITS, unit_names)
     keys = [urllib.parse.unquote(n.removesuffix(".json")) for n in COMMON["names"]]
+    rows, WATCH.checking = (dict(ROWS) if heard is None and WATCH.checking else None), False
+    if rows is not None:
+        WATCH.checked = time.monotonic()
     again = set(keys) if heard is None else (again | heard | (set(keys) - ROWS.keys())) & set(keys)
     read_ahead([k for k in keys if k in again], live, memo)
     units, details = [], {}
@@ -2237,11 +2242,13 @@ def read_changed(heard: set | None) -> tuple[dict, dict[str, str]]:
                 WATCH.dirty.add(key)
                 continue
         row, digest = ROWS[key]
+        if rows is not None and key in rows and rows[key] != ROWS[key]:
+            print(f"the disk watch heard nothing of a change to unit {key}: a look it does not listen for", file=sys.stderr, flush=True)
         if row:
             units.append(dict(row))
             details[key] = digest
     gone = (KEPT.keys() | ROWS.keys()) - set(keys)
-    if heard is None:  # and what all units shared that none reads any more
+    if heard is None:  # and what units shared that none reads any more
         gone |= {r for r in WATCH.held if type(r) is tuple and r[0] == "shared" and r[1] not in memo}
     for key in gone:
         KEPT.pop(key, None)
@@ -5118,6 +5125,8 @@ def watch_step(longest: float | None = None) -> bool:
     with lock:
         listening = bool(listeners)
     due = WATCH.due() if listening else None
+    if listening and due is None and time.monotonic() >= WATCH.checked + BACKSTOP:
+        WATCH.whole = WATCH.checking = True
     if WATCH.wait(longest if due is None else min(longest, max(0.0, due - time.monotonic()))):
         time.sleep(SETTLE)  # the writes that come with the one heard wait in the kernel's queue: one wake for them all
     with reading:
@@ -5170,6 +5179,9 @@ PACE = 2.0
 processes and the clock: as often as a hub that cannot hear the disk reads it."""
 SETTLE = 0.2
 """Seconds the watch waits after a notice, for the writes that come with it."""
+BACKSTOP = 600.0
+"""Seconds between two reads of every unit the watch heard nothing of, which log a unit found changed: a change no
+notice named, a look the read path makes without noting it."""
 
 REGISTRY, STATUSLINES, UNITS, OWN_CODE = ("registry",), ("statusline",), ("units",), ("code",)
 """The readers that are no unit: the session registry, the statusline inputs and the names of the units' state files,
@@ -5232,6 +5244,7 @@ class Watch:
         self.names: dict[str, dict[str, set]] = {}  # directory -> name -> its readers
         self.patterns: dict[str, dict[str, set]] = {}  # directory -> pattern -> readers of the names matching it
         self.held: dict[object, frozenset[tuple[str, str, bool]]] = {}  # reader -> (directory, name, a pattern)
+        self.users: dict[object, set] = {}  # a reader of what units share (once) -> the readers that asked for it
         self.seen: dict[object, tuple] = {}  # reader -> its Looks.seen as watched, and `named` then where one climbed
         self.named = 0  # the names that came or went that a look watched from a directory above it waits on
         self.until: dict[object, float] = {}  # reader -> when what it read off the clock goes stale (time.time())
@@ -5240,6 +5253,7 @@ class Watch:
         self.fresh: set[str] = set()  # watched since the read began, and so its readers are read once more
         self.since, self.last, self.failing = None, -math.inf, frozenset()  # first change untold, last round
         self.reads = self.told = 0  # the reads that read anything again; how many the listeners were told of
+        self.checked, self.checking = time.monotonic(), False  # the last backstop read (BACKSTOP); one under way
 
     def start(self) -> bool:
         """Ask the kernel about the disk and the hub's own code; where it cannot be, say why (off)."""
@@ -5259,16 +5273,22 @@ class Watch:
         print(f"watching the disk by reading it every {PACE:g} s: {why}", file=sys.stderr, flush=True)
 
     def heard(self) -> set | None:
-        """The readers to read again, as the notices since the last read say: None for every one, as where what all
-        units share (once) changed."""
+        """The readers to read again, as the notices since the last read say, with the users of what they share: None
+        for every one."""
         if not self.on:
             return None
         self.drain()
         self.fresh.clear()
-        whole = self.whole or any(type(r) is tuple and r[0] == "shared" for r in self.dirty)
-        dirty, self.whole, self.dirty = self.dirty, False, set()
+        while grown := {u for r in self.dirty for u in self.users.get(r, ())} - self.dirty:
+            self.dirty |= grown
+        whole, dirty, self.whole, self.dirty = self.whole, self.dirty, False, set()
         self.reads += bool(whole or dirty)
         return None if whole else dirty
+
+    def used(self, shared) -> None:
+        """The reader under way asked for what units share: read again once it changes."""
+        if (reader := getattr(looking, "reader", None)) is not None and self.on:
+            self.users.setdefault(shared, set()).add(reader)
 
     def read(self, reader, read):
         """read(), listening for changes to what it looked at, as `reader`'s."""
@@ -5281,8 +5301,12 @@ class Watch:
         if not self.on:
             yield
             return
-        with recording() as looks:
-            yield
+        outer, looking.reader = getattr(looking, "reader", None), reader
+        try:
+            with recording() as looks:
+                yield
+        finally:
+            looking.reader = outer
         self.keep(reader, looks)
 
     def settled(self) -> None:
@@ -5327,6 +5351,9 @@ class Watch:
         self.keep(reader, Looks())
         self.held.pop(reader, None)
         self.seen.pop(reader, None)
+        self.users.pop(reader, None)
+        for users in self.users.values():
+            users.discard(reader)
         self.dirty.discard(reader)
 
     def listen(self, path: str, names: str | None) -> tuple[str, str, bool] | None:
@@ -5404,13 +5431,17 @@ class Watch:
 
     @staticmethod
     def matches(d: str, name: str, mask: int, pattern: str) -> bool:
-        """A name that came or went is one a listing by `pattern` lists. A pattern of directories alone takes a link
-        to one as one, as the listing does; a link deleted it cannot tell from a file's."""
-        if pattern.endswith("/"):
-            if not (mask & IN_ISDIR or mask & (IN_CREATE | IN_MOVED_TO) and os.path.isdir(os.path.join(d, name))):
+        """A name that came or went is one a listing by `pattern` lists. A pattern `<names>/<next>` lists the
+        directories alone, as the listing goes on into them for `next`: one made that holds no `next` (a lock
+        directory beside ~/.claude.json) is none, and one that goes takes its own watches' notices with it. A link to a
+        directory is one, as the listing takes it."""
+        names, slash, after = pattern.partition("/")
+        if slash:
+            if not mask & (IN_CREATE | IN_MOVED_TO) or not os.path.isdir(made := os.path.join(d, name)):
                 return False
-            pattern = pattern[:-1]
-        return fnmatch.fnmatchcase(name, pattern)
+            if after and not WILDCARD.search(after) and not os.path.exists(os.path.join(made, after)):
+                return False
+        return fnmatch.fnmatchcase(name, names)
 
     def due(self) -> float | None:
         """When the next round is to read the hub, by time.monotonic(): SETTLE after the first change the listeners
