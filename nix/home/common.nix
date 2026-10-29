@@ -262,20 +262,21 @@
         imageExt = "jpe?g|png|gif|webp|svg|avif|bmp|tiff?|heic";
         videoExt = "mp4|mkv|webm|mov|avi|m4v";
         audioExt = "mp3|flac|ogg|opus|wav|m4a|aac";
-        # filter_do skips the interactive input `filter` always opens; <Esc> clears
-        extFilter = exts: ''filter_do "\.(${exts})$" --insensitive --done'';
+        # An fd search lists every matching file below the cwd as one directory; <Esc> leaves it.
+        # Files only, so symlinks and directories stay out. fd shows hidden files because
+        # yazi passes show_hidden on to it, and skips gitignored ones.
+        fdSearch = pattern: ''search_do --via=fd --args="--type file --ignore-case" "${pattern}"'';
+        extSearch = exts: fdSearch "\\.(${exts})$";
       in [
         { on = [ "<Enter>" ]; run = "plugin smart-enter"; desc = "Enter directory / open file"; }
         { on = [ "<C-n>" ]; run = "plugin dragon-drop"; desc = "Drag and drop selected files"; }
         { on = [ "N" ]; run = "shell 'nautilus . &' --confirm"; desc = "Open nautilus here"; }
         { on = [ "T" ]; run = "shell 'ghostty &' --confirm"; desc = "Open terminal here"; }
-        { on = [ "F" "i" ]; run = extFilter imageExt; desc = "Filter images"; }
-        { on = [ "F" "v" ]; run = extFilter videoExt; desc = "Filter video"; }
-        { on = [ "F" "a" ]; run = extFilter audioExt; desc = "Filter audio"; }
-        { on = [ "F" "m" ]; run = extFilter "${imageExt}|${videoExt}|${audioExt}"; desc = "Filter all media"; }
-        # An empty fd search lists every file below the cwd as one directory; the filters above narrow it.
-        # Files only, so symlinks and directories stay out; fd skips hidden and gitignored files.
-        { on = [ "F" "f" ]; run = ''search_do --via=fd --args="--type file"''; desc = "Flat view of every file below"; }
+        { on = [ "F" "i" ]; run = extSearch imageExt; desc = "Images below"; }
+        { on = [ "F" "v" ]; run = extSearch videoExt; desc = "Video below"; }
+        { on = [ "F" "a" ]; run = extSearch audioExt; desc = "Audio below"; }
+        { on = [ "F" "m" ]; run = extSearch "${imageExt}|${videoExt}|${audioExt}"; desc = "All media below"; }
+        { on = [ "F" "f" ]; run = fdSearch ""; desc = "Every file below"; }
       ];
     };
     settings = {
