@@ -55,6 +55,8 @@ in
     chromium
     zathura
     texliveFull
+    yubikey-manager # ykman
+    yubioath-flutter # Yubico Authenticator: the keys' FIDO2 PIN and passkeys
   ];
 
   xdg.configFile."xdg-terminals.list".text = "com.mitchellh.ghostty.desktop\n";
