@@ -11,7 +11,7 @@
     path = [ pkgs.bash ]; # coreutils and findutils are on every unit's PATH
     serviceConfig = {
       # The flake's copy, not ~/.dotfiles/bin: xmg19's /home stays locked
-      # after a boot until host-unlock (xmg19/home-unlock.nix), and the
+      # after a boot until `hosts unlock` (xmg19/home-unlock.nix), and the
       # recorder runs from boot. A change to it lands at the next switch,
       # which restarts the unit.
       ExecStart = "${../../bin/host-recorder}";

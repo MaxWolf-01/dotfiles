@@ -75,7 +75,7 @@ streak that never ends becomes visible through the watchdog bound below.
 
 Not to be confused with the model run log, `~/logs/agent/runs.jsonl`: one line
 per model run the agent workflow starts, and what it cost, written by the mx
-plugin's own `run-log`.
+plugin's `model-runs`.
 
 ## "unit X hasn't run in N days — is that a problem?"
 

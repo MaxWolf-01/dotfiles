@@ -1,21 +1,21 @@
 # Home Manager for a dispatch worker user on pc or xmg19.
 # nix/nixos/agent-user.nix creates the users; this is a function of what
-# differs between them: the user's name, the identity its commits carry, the
-# HOST.md record it publishes, and the body that record shares with the host's
-# other worker user. It does not import common.nix, which is max's environment
-# (his git identity, ssh hosts, symlinks into ~/.dotfiles); a worker user gets
-# only what a worker needs.
+# differs between them: the user's name and the identity its commits carry.
+# Its entry in ./machines.nix says the rest. It does not import common.nix,
+# which is max's environment (his git identity, ssh hosts, symlinks into
+# ~/.dotfiles); a worker user gets only what a worker needs.
 #
 # Done by hand once per user, over `ssh <user>@<host>`: install claude (`curl
 # -fsSL https://claude.ai/install.sh | bash`) and the plugin (`claude plugin
 # marketplace add MaxWolf-01/agents`, `claude plugin install mx@MaxWolf-01`).
 # Dispatch updates the plugin at the start of every run. Claude signs in with
-# no browser: `claude-token-push` on zephylux gives the user its account's
+# no browser: `clawd push` on zephylux gives the user its account's
 # token.
-{ name, identity, record, body }:
+{ name, identity }:
 { config, osConfig, pkgs, lib, ... }:
 
 let
+  host = osConfig.networking.hostName;
   # Installed as packages, and listed in HOST.md by mainProgram (`make`, `rg`),
   # so the record names the commands a worker types and cannot list a tool that
   # is not installed. A package without mainProgram fails evaluation.
@@ -124,18 +124,24 @@ in
     '';
   };
 
-  # What dispatch reads before planning a wave, and what `worker-hosts` (bin/)
-  # shows for this user. The record file holds the user's own lead paragraph
-  # and is kept beside the host config so that a host which is down still
-  # describes itself from the orchestrator's checkout. @BODY@ is the machine's
-  # tools and limits, one file shared by every worker user on it; @TOOLCHAIN@
-  # inside that is the package list above. Two sources, no copies.
+  imports = [ ./machines.nix ];
+
+  # What dispatch reads before planning a wave, and what `hosts` (bin/)
+  # shows for this user. Its frontmatter is the user's entry in ./machines.nix;
+  # the rest is hand-written: the user's own lead paragraph, in
+  # ./hosts/<host>-<user>/HOST.md, kept in the checkout so that a host which is
+  # down still describes itself to the orchestrator. @BODY@ there is the
+  # machine's tools and limits, ./hosts/<host>-worker-body.md, one file shared
+  # by every worker user on it; @TOOLCHAIN@ inside that is the package list
+  # above.
   home.file."HOST.md".text =
     let
       tools = lib.concatStringsSep " " (
         map (c: "`${c}`") (lib.sort lib.lessThan (map (p: p.meta.mainProgram) toolchain))
       );
+      record = builtins.readFile (./hosts + "/${host}-${name}/HOST.md");
+      body = builtins.readFile (./hosts + "/${host}-worker-body.md");
     in
-    builtins.replaceStrings [ "@TOOLCHAIN@" ] [ tools ]
-      (builtins.replaceStrings [ "@BODY@\n" ] [ (builtins.readFile body) ] (builtins.readFile record));
+    config.machineRecords."${name}@${host}"
+    + builtins.replaceStrings [ "@TOOLCHAIN@" ] [ tools ] (builtins.replaceStrings [ "@BODY@\n" ] [ body ] record);
 }

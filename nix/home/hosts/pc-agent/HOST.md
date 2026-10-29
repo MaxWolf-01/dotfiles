@@ -1,11 +1,3 @@
----
-host: pc
-user: agent
-isolated: true
-withholds: gpu
-account: personal
----
-
 # Worker host: agent@pc
 
 The almost-always-on machine: a headless NixOS box that also holds the personal

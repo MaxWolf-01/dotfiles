@@ -1,11 +1,3 @@
----
-host: pc
-user: agent-hl
-isolated: true
-withholds: gpu
-account: helferline
----
-
 # Worker host: agent-hl@pc
 
 pc's worker user for Helferline work: `claude` here is logged into the

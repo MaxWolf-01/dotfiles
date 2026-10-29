@@ -1,7 +1,7 @@
 # /home lives on its own LUKS volume (disk-config.nix) that no boot opens: the
 # TPM unlocks the system disk for anyone holding the laptop, so the worktrees,
 # Claude logins and dotdirs sit behind a key that only zephylux holds, in
-# secrets/creds/raw/xmg19-home-luks. `host-unlock xmg19` (bin/) pipes it into
+# secrets/creds/raw/xmg19-home-luks. `hosts unlock xmg19` (bin/hosts) pipes it into
 # host-unlock-receive below. Until then xmg19 runs without a /home: sshd,
 # tailscale and the backups landing in /srv work, and a login lands in a home
 # that is not there.
