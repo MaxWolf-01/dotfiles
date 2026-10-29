@@ -421,6 +421,9 @@
 
   home.packages = with pkgs; [
     age
+    # sops encrypts every secret to the YubiKeys' age recipients too, which needs
+    # the plugin wherever a secret is written; decrypting with a key needs pcscd.
+    age-plugin-yubikey
     ast-grep
     cargo
     csvlens

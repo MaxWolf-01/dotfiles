@@ -43,7 +43,6 @@ in
   };
 
   home.packages = with pkgs; [
-    age-plugin-yubikey # a YubiKey's PIV slot as an age (sops) recipient; needs apt's pcscd
     bitwarden-cli # bw
     dconf2nix
     loupe
