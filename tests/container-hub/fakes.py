@@ -393,3 +393,21 @@ exit 1
 
     def member_of(self, opened: dict) -> dict:
         return next(m for m in self.view(opened["unit"])["members"] if m["id"] == opened["id"])
+
+
+class Reads(list):
+    """The keys of the units the hub reads while this is entered, and what the disk watch had heard (`heard`) at each
+    read of the hub: None where it read every unit."""
+
+    def __init__(self, module):
+        super().__init__()
+        self.module, self.heard = module, []
+
+    def __enter__(self) -> "Reads":
+        self.kept_view, self.read_changed = self.module.kept_view, self.module.read_changed
+        self.module.kept_view = lambda key, *rest: (self.append(key), self.kept_view(key, *rest))[1]
+        self.module.read_changed = lambda heard: (self.heard.append(heard), self.read_changed(heard))[1]
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.module.kept_view, self.module.read_changed = self.kept_view, self.read_changed
