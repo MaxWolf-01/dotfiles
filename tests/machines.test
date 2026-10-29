@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# tier: full-path (nix)
+# Evaluate the flake's real host configs and check the machines list (nix/home/machines.nix) against them. Run it
+# directly; no framework.
+#
+# What adding a machine relies on: the list is the one place the host tools learn of a worker user, so every worker
+# user the flake sets up is in it and nothing the flake does not set up is; every host writes out the same list,
+# and it is the list the host tools read; each worker user's HOST.md states what its entry says; and a list naming
+# a machine twice, or an unlock step reading two things on stdin, does not build.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$repo/tests/check.sh"
+needs nix jq
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+evaluated=$(nix eval --json --impure --expr "
+let
+  f = builtins.getFlake \"git+file://$repo\";
+  pkgs = f.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem};
+  users = host: f.nixosConfigurations.\${host}.config.home-manager.users;
+  laptop = f.homeConfigurations.zephyrus.config;
+in {
+  configured = pkgs.lib.concatMap (host: map (user: \"\${user}@\${host}\") (builtins.attrNames (users host)))
+    [ \"pc\" \"xmg19\" ];
+  listed = laptop.machines;
+  written = map (c: c.xdg.configFile.\"machines.json\".text)
+    [ laptop (users \"pc\").max (users \"xmg19\").max (users \"pc\").agent ];
+  records = {
+    \"agent-hl@pc\" = (users \"pc\").agent-hl.home.file.\"HOST.md\".text;
+    \"agent@xmg19\" = (users \"xmg19\").agent.home.file.\"HOST.md\".text;
+    \"max@zephylux\" = laptop.home.file.\"HOST.md\".text;
+  };
+}" 2>"$scratch/err") || { fail "the flake's host configs evaluate" "$(tail -20 "$scratch/err")"; finish; }
+
+# max on pc and xmg19 is the machine's owner, not a worker user; on the laptop he is both. Sorted on both sides,
+# since the flake names users in its own order.
+check "the worker users the list holds are the ones the flake sets up, the laptop's max among them" \
+    "$( (jq -r '.configured[] | select(startswith("max@") | not)' <<<"$evaluated"; echo max@zephylux) | sort)" \
+    "$(jq -r '.listed[] | .name as $h | .workers[] | "\(.user)@\($h)"' <<<"$evaluated" | sort)"
+check "every host, worker users' homes included, writes out the same list" 1 \
+    "$(jq '.written | unique | length' <<<"$evaluated")"
+
+# The host tools' own tests each write a list by hand; these run the tools on the one the module writes.
+jq -r '.written[0]' <<<"$evaluated" >"$scratch/machines.json"
+check "hosts targets --json, read off the written list, names each worker user and its account" \
+    "agent@pc personal|agent-hl@pc helferline|max@zephylux null|agent@xmg19 personal|agent-hl@xmg19 helferline" \
+    "$(MACHINES_FILE="$scratch/machines.json" "$repo/bin/hosts" targets --json | jq -r '.[] | "\(.target) \(.account)"' | paste -sd'|' -)"
+check "hosts backups, read off the written list, finds backups run by pc and by the laptop" "0 pc zephylux" \
+    "$(out=$(MACHINES_FILE="$scratch/machines.json" "$repo/bin/hosts" backups); echo "$? $(cut -f2 <<<"$out" | sort -u | paste -sd' ' -)")"
+check "the written list carries each worker user's frontmatter, as its HOST.md opens with it" \
+    "$(jq -r '.records["agent-hl@pc"]' <<<"$evaluated" | awk '{print} NR > 1 && /^---$/ {exit}')" \
+    "$(jq -r '.[] | select(.name == "pc") | .workers[] | select(.user == "agent-hl") | .frontmatter' "$scratch/machines.json" | sed '/^$/d')"
+
+# Sorted, since a record's readers read it by key.
+frontmatter() {
+    jq -r --arg w "$1" '.records[$w]' <<<"$evaluated" | awk 'NR == 1 && /^---$/ {on = 1; next} on && /^---$/ {exit} on' | sort
+}
+check "agent-hl@pc's record says it is pc's, on the Helferline account, isolated, its GPU withheld" \
+    "$(printf '%s\n' 'host: pc' 'user: agent-hl' 'isolated: true' 'withholds: gpu' 'account: helferline' | sort)" \
+    "$(frontmatter agent-hl@pc)"
+check "agent@xmg19's record says it is on the personal account, and withholds nothing" \
+    "$(printf '%s\n' 'host: xmg19' 'user: agent' 'isolated: true' 'account: personal' | sort)" \
+    "$(frontmatter agent@xmg19)"
+check "the laptop's record says it is placed on last, and names no account" \
+    "$(printf '%s\n' 'host: zephylux' 'user: max' 'isolated: false' 'placement: last' 'withholds: gpu' | sort)" \
+    "$(frontmatter max@zephylux)"
+[[ $(jq -r '.records["agent@xmg19"]' <<<"$evaluated") == *"# Worker host: agent@xmg19"* ]] &&
+    passed "...and goes on with its hand-written description" ||
+    fail "...and goes on with its hand-written description" "$(jq -r '.records["agent@xmg19"]' <<<"$evaluated" | head)"
+
+# Builds a config of machines.nix alone, given the list as Nix; Home Manager refuses one whose assertions fail as soon
+# as it is read. What it said goes to $scratch/refused.
+builds() { # <machines>
+    nix eval --raw --impure --expr "
+let
+  f = builtins.getFlake \"git+file://$repo\";
+  pkgs = f.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem};
+in (f.inputs.home-manager.lib.homeManagerConfiguration {
+  inherit pkgs;
+  modules = [ (f.outPath + \"/nix/home/machines.nix\") {
+    home = { username = \"max\"; homeDirectory = \"/home/max\"; stateVersion = \"26.05\"; };
+    machines = $1;
+  } ];
+}).activationPackage.drvPath" >/dev/null 2>"$scratch/refused"
+}
+
+! builds '[ { name = "pc"; ssh = "pc"; trust = 2; } { name = "pc"; ssh = "pc"; trust = 1; } ]' &&
+    [[ $(<"$scratch/refused") == *"machines names a machine more than once: pc, pc"* ]] &&
+    passed "a list naming a machine twice does not build, and says which" ||
+    fail "a list naming a machine twice does not build, and says which" "$(tail -5 "$scratch/refused")"
+! builds '[ { name = "pc"; ssh = "pc"; trust = 2;
+             workers = [ { user = "agent"; isolated = true; } { user = "agent"; isolated = false; } ]; } ]' &&
+    [[ $(<"$scratch/refused") == *"machines: pc lists a worker user more than once"* ]] &&
+    passed "a machine listing a worker user twice does not build, and says which machine" ||
+    fail "a machine listing a worker user twice does not build, and says which machine" "$(tail -5 "$scratch/refused")"
+! builds '[ { name = "pc"; ssh = "pc"; trust = 2;
+             unlock = [ { run = [ "host-unlock-receive" ]; secret = "s"; ageKey = true; } ]; } ]' &&
+    [[ $(<"$scratch/refused") == *"a step of pc's unlock takes both a secret and the age key"* ]] &&
+    passed "an unlock step handed both a secret and the age key does not build, and says whose" ||
+    fail "an unlock step handed both a secret and the age key does not build, and says whose" "$(tail -5 "$scratch/refused")"
+
+finish

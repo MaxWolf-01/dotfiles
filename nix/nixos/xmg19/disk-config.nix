@@ -2,7 +2,7 @@
 # Samsung 1TB, LUKS + LVM unlocked by the TPM: EFI (1G) + boot (2G) + root (200G)
 #   + swap (32G) + /srv (rest).
 # Patriot 256GB, LUKS with a key of its own: /home, locked after every boot until
-#   `host-unlock xmg19` on zephylux sends the key (home-unlock.nix).
+#   `hosts unlock xmg19` on zephylux sends the key (home-unlock.nix).
 {
   disko.devices.disk.main = {
     device = "/dev/disk/by-id/nvme-Samsung_SSD_970_EVO_Plus_1TB_S4W6NF0M500455Y";

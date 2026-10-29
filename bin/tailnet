@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Administer the tailnet through the Tailscale API: its ACL policy, its DNS, its
+# devices and their tags. The tailscale CLI has no ACL support and only reads DNS.
+#
+# Sources of truth, both versioned in secrets/:
+#   ~/.dotfiles/secrets/tailscale/policy.hujson   the ACL policy
+#   ~/.dotfiles/secrets/tailscale/dns.json        the tailnet-wide DNS config
+#
+# Token: passed in TS_API_TOKEN, never stored. A tailnet API token is full
+# access. It can mint auth keys, which admit nodes with no interactive login.
+# Mint one for the occasion at https://login.tailscale.com/admin/settings/keys
+# and revoke it after:
+#   TS_API_TOKEN=tskey-api-... tailnet acl push
+#
+# Usage:
+#   tailnet acl get                      # the live policy (hujson)
+#   tailnet acl validate                 # validate the local policy through the API
+#   tailnet acl push                     # validate, then upload the local policy
+#   tailnet dns get                      # the live DNS config
+#   tailnet dns diff                     # live DNS config vs the local file
+#   tailnet dns push                     # upload the local DNS file (full replace)
+#   tailnet devices                      # every device: id, hostname, tags
+#   tailnet tag <device-id> <tag...>     # replace a device's tags (e.g. tag:server)
+#
+# DNS goes through /dns/config, not /dns/nameservers: only the structured
+# dnstype.Resolver shape can say useWithExitNode, which keeps our resolvers in
+# effect while a Mullvad exit node is up. The endpoint is undocumented, and the
+# only way to set that field outside the admin console (docs/dns.md).
+#
+# GOTCHA: a DNS push replaces the whole document, and one without
+# "proxied": true turns MagicDNS off tailnet-wide. `dns push` refuses such a
+# file; always push the full file, never a partial object.
+set -euo pipefail
+help() { awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; }
+for arg; do case $arg in -h|--help) help; exit 0 ;; esac; done
+
+# TAILNET_API points it at a stand-in for the API (tests/tailnet.test).
+API=${TAILNET_API:-https://api.tailscale.com/api/v2}
+POLICY="$HOME/.dotfiles/secrets/tailscale/policy.hujson"
+DNS_CONFIG="$HOME/.dotfiles/secrets/tailscale/dns.json"
+
+# A command it does not take exits 2; one that failed, or refused to push, exits 1.
+usage() { echo "tailnet: $1; tailnet --help says what it takes" >&2; exit 2; }
+die() { echo "tailnet: $*" >&2; exit 1; }
+
+api() {
+  local token="${TS_API_TOKEN:?mint one at https://login.tailscale.com/admin/settings/keys, pass as TS_API_TOKEN, revoke after}"
+  curl -sS --fail-with-body -H "Authorization: Bearer $token" "$@"
+}
+
+acl_validate() {
+  [ -f "$POLICY" ] || die "policy file not found: $POLICY"
+  local result
+  # The endpoint answers 200 with a JSON error body on an invalid policy, non-2xx only on request errors.
+  result=$(api -X POST --data-binary "@$POLICY" "$API/tailnet/-/acl/validate")
+  if [ -n "$result" ] && jq -e '.message' <<<"$result" >/dev/null 2>&1; then
+    echo "tailnet: policy invalid:" >&2
+    echo "$result" >&2
+    exit 1
+  fi
+  echo "policy valid"
+}
+
+dns_live() { api "$API/tailnet/-/dns/config" | jq -S .; }
+
+dns_require_config() {
+  [ -f "$DNS_CONFIG" ] || die "DNS config not found: $DNS_CONFIG"
+  jq -e '.proxied == true' "$DNS_CONFIG" >/dev/null \
+    || die "refusing to push, \"proxied\": true missing from $DNS_CONFIG (would turn MagicDNS off)"
+}
+
+case "${1:-} ${2:-}" in
+  "acl get")
+    api -H "Accept: application/hujson" "$API/tailnet/-/acl"
+    ;;
+  "acl validate")
+    acl_validate
+    ;;
+  "acl push")
+    acl_validate
+    api -X POST -H "Content-Type: application/hujson" --data-binary "@$POLICY" "$API/tailnet/-/acl" >/dev/null
+    echo "policy pushed"
+    ;;
+  "dns get")
+    dns_live
+    ;;
+  "dns diff")
+    dns_require_config
+    # Live echoes back keys we don't set (routes, domains, nameservers); compare
+    # only the keys the file declares, so unset keys don't show as spurious drift.
+    diff -u <(dns_live | jq -S --slurpfile want "$DNS_CONFIG" '. as $g | $want[0] | keys | map({(.): $g[.]}) | add') \
+            <(jq -S . "$DNS_CONFIG") \
+      && echo "tailnet DNS matches $DNS_CONFIG"
+    ;;
+  "dns push")
+    dns_require_config
+    api -X POST -H "Content-Type: application/json" --data-binary "@$DNS_CONFIG" "$API/tailnet/-/dns/config" >/dev/null
+    echo "tailnet DNS pushed"
+    ;;
+  "devices "*)
+    api "$API/tailnet/-/devices" | jq -r '.devices[] | [.id, .hostname, (.tags // [] | join(","))] | @tsv'
+    ;;
+  "tag "*)
+    [ $# -ge 3 ] || usage "tag takes a device id and at least one tag (e.g. tag:server)"
+    device_id=$2
+    shift 2
+    tags=$(printf '%s\n' "$@" | jq -R . | jq -cs '{tags: .}')
+    api -X POST -H "Content-Type: application/json" --data "$tags" "$API/device/$device_id/tags"
+    echo "tagged $device_id: $*"
+    ;;
+  *)
+    usage "no command ${*:-given}"
+    ;;
+esac

@@ -1,10 +1,3 @@
----
-host: xmg19
-user: agent
-isolated: true
-account: personal
----
-
 # Worker host: agent@xmg19
 
 A laptop in max's flat run as a server: NixOS, an i7-9750H (6 cores, 12

@@ -3,7 +3,7 @@
 # nix/home/claude-token.sh or read a token's expiry. Sourced after HOME is set; needs sops
 # and age.
 
-claude_token_sh="$(cd "$(dirname "${BASH_SOURCE[0]}")/../nix/home" && pwd)/claude-token.sh"
+claude_nix_home="$(cd "$(dirname "${BASH_SOURCE[0]}")/../nix/home" && pwd)"
 
 # A throwaway age key, as SOPS_AGE_KEY_FILE.
 accounts_key() {
@@ -22,10 +22,13 @@ account_token() {
     sops encrypt --in-place --age "$(age-keygen -y "$SOPS_AGE_KEY_FILE")" "$file"
 }
 
-# install_claude_wrapper <dir> [profile|switch]: the wrapper as the `claude` in <dir>, as
-# nix/home/claude-token.nix installs it, in pc's mode unless named.
+# install_claude_wrapper <dir> [profile|switch]: the wrapper as the `claude` in <dir>, and
+# the mode bin/clawd reads, as nix/home/claude-token.nix installs them, in pc's mode unless
+# named.
 install_claude_wrapper() {
-    mkdir -p "$1"
-    printf '#!/usr/bin/env bash\nexec bash %q %q "$0" %q "$@"\n' "$claude_token_sh" "$(command -v sops)" "${2:-profile}" >"$1/claude"
+    mkdir -p "$1" "$HOME/.config/clawd"
+    printf '#!/usr/bin/env bash\nexec bash %q %q %q "$0" %q "$@"\n' "$claude_nix_home/claude-token.sh" "$(command -v sops)" \
+        "$claude_nix_home/claude-accounts.sh" "${2:-profile}" >"$1/claude"
     chmod +x "$1/claude"
+    echo "${2:-profile}" >"$HOME/.config/clawd/wrapper-mode"
 }
