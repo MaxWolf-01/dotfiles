@@ -53,9 +53,6 @@
   hardware.graphics.enable = true;
 
   boot = {
-    # systemd in stage 1 is what reads the TPM: cryptroot unlocks unattended
-    # (disk-config.nix), so a reboot or an rtcwake wake-up comes all the way up.
-    initrd.systemd.enable = true;
     initrd.kernelModules = [ "nvidia" "nvidia_modeset" "nvidia_uvm" "nvidia_drm" ];
     kernelParams = [
       "nvidia_drm.fbdev=1"

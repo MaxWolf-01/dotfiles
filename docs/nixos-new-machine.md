@@ -28,8 +28,8 @@ Same as above, but step 1-2 replaced with: boot any Linux, set up root SSH manua
 ### Disk unlocked by the TPM
 
 A host whose crypttab entry carries `tpm2-device=auto` (xmg19's
-`disk-config.nix`) needs `boot.initrd.systemd.enable` and one enrolment after
-its first `nswitch`, which asks for the passphrase:
+`disk-config.nix`) needs one enrolment after its first `nswitch`, which asks
+for the passphrase:
 
 ```bash
 sudo systemd-cryptenroll --tpm2-device=auto /dev/disk/by-partlabel/disk-main-luks
