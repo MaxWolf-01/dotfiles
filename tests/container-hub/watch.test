@@ -1,0 +1,466 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro", "pyyaml", "markdown-it-py[linkify]"]  # the hub's own, whose module this loads
+# ///
+"""Check the hub's disk watch: what the watch loop reads, and when, while a hub tab listens. Run it directly; no
+framework.
+
+The hub's module is loaded in this process, as decisions.test loads it (fakes.World), and its watch loop is stepped
+here one wait at a time (watch_step), on waits a few hundredths of a second long in place of its own (PACE, SETTLE),
+but for one world where the loop runs as the hub runs it, in a thread of its own. A listener is a queue, as a hub
+tab's event stream holds one, and joins as the stream joins it. That every kind of change a unit is read from reaches
+the read is work-containers.test's (view_of_disk), which runs its worlds with the watch on.
+"""
+
+import errno
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fakes  # noqa: E402  (the hub's module in this process, its clock, and the world it reads)
+from check import BIN, check, finish  # noqa: E402
+from fakes import page  # noqa: E402
+
+READER = "aaaaaaaa-0000-4000-8000-000000000001"  # an orchestrator with pages open, its process this one
+EXITING = "bbbbbbbb-0000-4000-8000-000000000002"  # its process one of its own, which exits
+PANED = "cccccccc-0000-4000-8000-000000000003"  # idle in a tmux pane, in a project with an agent repo
+HOMELESS = "dddddddd-0000-4000-8000-000000000004"  # idle in a tmux pane, in a directory no agent repo holds yet
+ENDED = "eeeeeeee-0000-4000-8000-000000000005"  # ended, with a session page of its own
+OTHER = "abababab-0000-4000-8000-000000000007"  # an orchestrator in another repo
+RACED = "ffffffff-0000-4000-8000-000000000006"  # ended, its session page written to as its directory is first watched
+
+hub_said = (fakes.RUN / "module.log").open("w")
+sys.stderr = hub_said  # what the hub prints on the way, as its log would hold it; check() prints to stdout
+sleepers: list[subprocess.Popen] = []
+
+
+def said() -> list[str]:
+    hub_said.flush()
+    return (fakes.RUN / "module.log").read_text().splitlines()
+
+
+def sleeper() -> subprocess.Popen:
+    """A process a session runs as: not this one, which a worker may be, and a hub leaves a worker's session off its
+    rail."""
+    process = subprocess.Popen(["sleep", "600"], env={k: v for k, v in os.environ.items() if not k.startswith("DISPATCH_")},
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sleepers.append(process)
+    return process
+
+
+class Watched:
+    """A world whose hub watches the disk, with a tab listening, and the reads of the hub (hub_read) its watch loop
+    makes."""
+
+    def __init__(self, world: fakes.World, start: bool = True):
+        self.w, self.hub = world, world.hub
+        self.hub.PACE, self.hub.SETTLE = 0.05, 0.01
+        self.reads = 0
+        read_hub = self.hub.read_hub
+
+        def counted():
+            self.reads += 1
+            return read_hub()
+
+        self.hub.read_hub = counted
+        if start:
+            assert self.hub.WATCH.start()
+        self.tab = queue.Queue()
+        self.hub.seen_by[self.tab] = self.hub.view_digest()
+        self.hub.join(self.tab)
+
+    def step(self, times: int = 1) -> bool:
+        """The watch loop's next `times` waits; True where one found the hub's code changed."""
+        return any([self.hub.watch_step(longest=0.05) for _ in range(times)])
+
+    def settled(self) -> None:
+        """Steps until two in a row find nothing waiting to be read, the kernel's notices taken first: the reads that
+        follow its first watches, and the hub's own writes."""
+        quiet = 0
+        for _ in range(200):
+            self.step()
+            with self.hub.reading:
+                self.hub.WATCH.drain()
+            quiet = quiet + 1 if self.hub.WATCH.due() is None else 0
+            if quiet == 2:
+                self.heard()
+                return
+        raise RuntimeError("the watch never settled")
+
+    def heard(self) -> list[dict]:
+        """What the tab was told since this was last asked."""
+        told = []
+        while not self.tab.empty():
+            told.append(self.tab.get())
+        return told
+
+    def until_told(self, steps: int = 60) -> list[dict]:
+        for _ in range(steps):
+            self.step()
+            if told := self.heard():
+                return told
+        return []
+
+
+def idle(watched: Watched, steps: int = 20) -> tuple[int, list[dict]]:
+    """The reads the watch loop makes over `steps` waits, and what the tab hears."""
+    before = watched.reads
+    watched.step(steps)
+    return watched.reads - before, watched.heard()
+
+
+try:
+    # --- an idle hub reads nothing; a change is heard, and only its unit read again
+
+    w = fakes.World()
+    alpha = w.repo("alpha", [("map-columns", None, READER)])
+    pages = [page(alpha / f"agent/show/map-columns/p{i}.html") for i in range(3)]
+    for p in pages:
+        w.opened(p, READER)
+    w.registered(READER)
+    beta = w.repo("beta", [("csv-import", None, OTHER)])
+    w.opened(page(beta / "agent/show/csv-import/b.html"), OTHER)
+    transcript = w.home / ".claude/projects/-alpha" / f"{READER}.jsonl"
+    page(transcript, fakes.transcript(READER, alpha))
+    watched = Watched(w)
+    watched.settled()
+    check("a hub with a tab listening, whose files have not changed and whose sessions' processes run, reads nothing",
+          (0, []), idle(watched))
+
+    page(w.home / ".claude/projects/-alpha/notes.txt", "a file no unit is read from, beside the transcripts")
+    page(alpha / "agent/show/map-columns/p0.html.bak", "a name beside a page's, which no unit reads")
+    check("...nor once a file no unit reads is written in a directory the units are read from", (0, []), idle(watched))
+
+    (w.home / ".claude.json.lock").mkdir()  # what Claude Code makes beside ~/.claude.json while it writes that file
+    (w.home / ".claude.json").write_text("{}")
+    made = idle(watched, 5)
+    (w.home / ".claude.json.lock").rmdir()
+    check("...nor once a lock directory is made beside ~/.claude.json, matching the accounts' ~/.claude*", ((0, []), (0, [])),
+          (made, idle(watched)))
+
+    with fakes.Reads(w.hub) as read:
+        before = watched.reads
+        w.committed(alpha / "agent", "map-columns", READER, "claimed")  # a ref's lock written, then renamed into place
+        watched.settled()
+    check("a ticket committed in one agent repo is heard in one read, of that repo's units alone", (1, {READER}),
+          (watched.reads - before, set(read)))
+
+    with fakes.Reads(w.hub) as read:
+        pages[0].unlink()
+        told = watched.until_told()
+    check("a page deleted is heard: the tab is told of the unit it was in", [{"type": "disk", "units": [READER]}], told)
+    check("...from one read of the hub, which read that unit alone", ([READER], 1), (list(read), len(read.heard)))
+
+    watched.settled()
+    w.opened(page(alpha / "agent/show/map-columns/later.html"), READER)  # its unit's state written, and nothing after
+    w.hub.hub_view()  # the tab's own request, which reads the hub before the watch loop's round does
+    watched.step(20)
+    check("a change a request read first still reaches the listening tab", True,
+          {"type": "disk", "units": [READER]} in watched.heard())
+
+    watched.settled()
+    late = queue.Queue()
+    w.hub.seen_by[late] = w.hub.view_digest()  # what a tab read while a round told the others what changed next
+    pages[1].unlink()
+    watched.settled()
+    w.hub.join(late)
+    watched.step(20)
+    check("a tab that joins with what it read before a round is told what that round told the others", True,
+          {"type": "disk", "units": [READER]} in [late.get() for _ in range(late.qsize())])
+
+    watched.settled()
+    with fakes.Reads(w.hub) as read:
+        stop, lines = threading.Event(), [fakes.transcript(READER, alpha).splitlines()[0] + "\n"]
+
+        def at_work() -> None:  # a session at work, its transcript written many times a second
+            while not stop.is_set():
+                with transcript.open("a") as f:
+                    f.write(lines[0])
+                time.sleep(0.003)
+
+        writer = threading.Thread(target=at_work)
+        start = time.monotonic()
+        writer.start()
+        while time.monotonic() - start < 20 * w.hub.PACE:
+            watched.step()
+        stop.set()
+        writer.join()
+        elapsed = time.monotonic() - start
+    check("a transcript written every few milliseconds for 20 rounds' time is read once a round at most, and is read",
+          (True, True, {READER}), (len(read.heard) <= elapsed / w.hub.PACE + 1, len(read.heard) >= 1, set(read)))
+
+    watched.settled()
+    real_read = w.hub.WATCH.notices.read
+    w.hub.WATCH.notices.read = lambda: [(-1, w.hub.IN_Q_OVERFLOW, ""), *real_read()]  # what the kernel says once its queue is full
+    with fakes.Reads(w.hub) as read:
+        page(pages[1], "<!doctype html><p>written while notices were lost</p>")
+        watched.step(5)
+        w.hub.WATCH.notices.read = real_read
+    check("notices the kernel lost make the next read read every unit", [None], read.heard[:1])
+
+    # --- a watched directory goes, and another comes in its place
+
+    watched.settled()
+    records = w.home / ".claude/session-pages" / ENDED
+    page(records / "session.md", f"---\nsession: {ENDED}\n---\n\n# First of its name\n")
+    page(records / "index.html")
+    w.clicked(records / "index.html", ENDED)
+    w.opened(page(alpha / "agent/show/map-columns/ended.html"), ENDED)  # which keeps its unit while its session page is away
+    watched.settled()
+    check("a session titled by its session page shows that title", "First of its name", w.view(ENDED)["title"])
+    watched.settled()
+    os.rename(records, records.with_name(f"{ENDED}.old"))
+    check("its page directory moved away is heard", True, bool(watched.until_told()))
+    page(records / "session.md", f"---\nsession: {ENDED}\n---\n\n# Back in its place\n")
+    page(records / "index.html")
+    watched.settled()
+    check("...and another made in its place is read", "Back in its place", w.view(ENDED)["title"])
+    watched.settled()
+    (records / "session.md").write_text(f"---\nsession: {ENDED}\n---\n\n# Written in the new one\n")
+    check("...and listened to: a change in it is heard", True, bool(watched.until_told()))
+    check("...and shown", "Written in the new one", w.view(ENDED)["title"])
+    if fakes.READER:  # the turns' headlines are the mx plugin's reader's to read
+        w.turn_record(records, 1, "The one turn")
+        watched.settled()
+        check("a turn record's headline is its session's status line", "The one turn", w.view(ENDED)["status_line"])
+        watched.settled()
+        os.rename(records / "turns", records / "turns.old")  # only the directory itself hears it go
+        check("...and its turn records moved away are heard", True, bool(watched.until_told()))
+        check("...and shown gone", "", w.view(ENDED)["status_line"])
+    else:
+        print("skip a session's turn records moved away: no mx plugin reader here")
+
+    watched.settled()
+    watches = len(w.hub.WATCH.wds)
+    w.hub.state_file(ENDED).unlink()
+    watched.settled()
+    check("a unit that goes takes the watches its directories alone needed with it", True, len(w.hub.WATCH.wds) < watches)
+
+    w.opened(page(alpha / "agent/show/map-columns/raced.html"), RACED)
+    watched.settled()
+    raced = w.home / ".claude/session-pages" / RACED
+    add, title = w.hub.WATCH.notices.add, lambda text: f"---\nsession: {RACED}\n---\n\n# {text}\n"
+
+    def written_first(directory: str) -> int:  # the write between the read's look at the page and its watch
+        if directory == str(raced) and "Read" in (raced / "session.md").read_text():
+            (raced / "session.md").write_text(title("Written as it was first watched"))
+        return add(directory)
+
+    w.hub.WATCH.notices.add = written_first
+    page(raced / "session.md", title("Read"))
+    watched.settled()
+    w.hub.WATCH.notices.add = add
+    check("a page written between the read's look at it and its directory's first watch is read again",
+          "Written as it was first watched", w.view(RACED)["title"])
+
+    # --- what no notice names is found by the read of every unit every BACKSTOP, and logged
+
+    watched.settled()
+    w.hub.BACKSTOP = 0.3
+    w.hub.WATCH.checked = time.monotonic()
+    unheard, listen = str(alpha / "agent/show/map-columns"), w.hub.WATCH.listen
+    w.hub.WATCH.listen = lambda path, names: None if unheard in (path, os.path.dirname(path)) else listen(path, names)
+    with transcript.open("a") as f:  # its unit read again, listening for its pages no more: a look the read misses
+        f.write(fakes.transcript(READER, alpha).splitlines()[0] + "\n")
+    watched.settled()
+    pages[2].unlink()
+    watched.step(3)
+    check("a change no notice names is not heard at once", [], watched.heard())
+    time.sleep(0.3)
+    told = watched.until_told()
+    check("...but by the backstop's read of every unit, which tells the tab", [{"type": "disk", "units": [READER]}], told)
+    check("...and logs the unit, so the look the watch missed shows", True,
+          any(f"heard nothing of a change to unit {READER}" in line for line in said()))
+    w.hub.BACKSTOP, w.hub.WATCH.listen = 600.0, listen
+
+    # --- a session's process exits, leaving its registry file behind
+
+    process = sleeper()
+    w.opened(page(alpha / "agent/show/map-columns/exiting.html"), EXITING)
+    w.registered(EXITING, pid=process.pid, started=fakes.started(process.pid))
+    watched.settled()
+    check("a session whose process runs shows idle", "idle", w.view(EXITING)["state"])
+    watched.settled()
+    check("...and the hub, its files unchanged, reads nothing", (0, []), idle(watched))
+    registry_file = w.home / ".claude/sessions" / f"{EXITING[:8]}.json"
+    written = registry_file.stat().st_mtime_ns
+    process.kill()
+    process.wait()
+    check("its process exiting is heard though no file changed: the tab is told the rail changed",
+          ([{"type": "disk", "units": []}], written), (watched.until_told(), registry_file.stat().st_mtime_ns))
+    check("...which shows its session ended", "ended", w.view(EXITING)["state"])
+
+    # --- whether a pane holds an idle session: asked of tmux once for its process, or again, later each time
+
+    asked = lambda: w.tmux_calls.read_text().count("display-message") if w.tmux_calls.exists() else 0
+    w.opened(page(alpha / "agent/show/map-columns/paned.html"), PANED)
+    (alpha / "agent/handoffs").mkdir()
+    w.registered(PANED, tmux="paned:@0.%7", cwd=alpha)  # a pane of no tmux server, which holds nothing
+    watched.settled()
+    calls = asked()
+    watched.step(10)
+    check("an idle session whose pane does not hold it has its pane asked again only once its wait is up", calls, asked())
+    tries = []
+    for _ in range(4):
+        w.clock.tick(w.hub.PACE)
+        watched.settled()
+        tries.append(asked() - calls)
+    check("...the wait twice as long each time", [1, 1, 2, 2], tries)
+
+    held = {"tmux": "held:@0.%3", "pid": 1, "procStart": "1"}
+    pane_in, said_tmux = w.hub.pane_in, []
+    w.hub.pane_in = lambda entry: (said_tmux.append(entry) or "%3", "")
+    first = w.hub.pane_held(held)
+    w.clock.tick(10 ** 6)
+    check("a pane found holding its session's process is asked of tmux once for that process's life", (True, True, 1),
+          (first, w.hub.pane_held(held), len(said_tmux)))
+    w.hub.pane_in = pane_in
+
+    # --- ...and where a session's directory has no agent repo, whether it has one since
+
+    w = fakes.World()
+    plain = w.home / "plain"
+    plain.mkdir()
+    w.opened(page(plain / "a page.html"), HOMELESS)
+    w.registered(HOMELESS, tmux="plain:@0.%9", cwd=plain)
+    watched = Watched(w)
+    watched.settled()
+    calls = asked()
+    check("a session in a directory with no agent repo offers no handoff, and has its pane asked of no one", calls, asked())
+    w.git(plain, "init", "-q")
+    (plain / "agent/tickets").mkdir(parents=True)
+    watched.settled()
+    check("...and once an agent repo is made there, the hub finds it, with no clock, and asks tmux for its pane",
+          calls + 1, asked())
+
+    # --- the watch loop as the hub runs it: waits with no end of their own, a tab joining while it waits
+
+    w = fakes.World()
+    gamma = w.repo("gamma", [("map-columns", None, READER)])
+    opened = page(gamma / "agent/show/map-columns/p.html")
+    w.opened(opened, READER)
+    w.registered(READER)
+    w.hub.PACE, w.hub.SETTLE = 0.05, 0.01
+    assert w.hub.WATCH.start()
+
+    def as_the_hub_runs_it(hub=w.hub) -> None:  # watch_disk's loop, with no servers to stop
+        while True:
+            hub.watch_step()
+
+    threading.Thread(target=as_the_hub_runs_it, daemon=True).start()
+    time.sleep(0.3)  # the loop waits with no tab listening, as long as it takes
+    tab = queue.Queue()
+    w.hub.seen_by[tab] = w.hub.view_digest()
+    w.hub.join(tab)
+    time.sleep(0.3)  # and with the tab, until a change
+    while not tab.empty():
+        tab.get()
+    opened.unlink()
+    start = time.monotonic()
+    try:
+        told, at = tab.get(timeout=5), time.monotonic() - start
+    except queue.Empty:
+        told, at = None, None
+    check("a tab that joins the loop's wait is told of the next change", {"type": "disk", "units": [READER]}, told)
+    check("...within PACE and SETTLE of it, and a little time to read", True, at is not None and at < w.hub.PACE + w.hub.SETTLE + 0.5)
+
+    # --- the hub's own code changed on disk (P3)
+
+    w = fakes.World()
+    code = w.scratch / "code"
+    code.mkdir()
+    for name in ("container-hub", "diffview"):
+        shutil.copy(BIN / name, code / name)
+    w.hub.CODE = (code / "container-hub", code / "diffview")
+    w.hub.LOADED = tuple(map(w.hub.stamp, w.hub.CODE))
+    watched = Watched(w)
+    w.hub.listeners.clear()  # code changing is heard with no tab listening
+    check("code that has not changed runs on", False, watched.step(5))
+    (code / "container-hub").write_text((BIN / "container-hub").read_text() + "\ndef broken(:\n")
+    check("the hub's code changed on disk but not compiling is not run", False, watched.step(3))
+    check("...and the log says why", True, any("container-hub does not compile" in line for line in said()))
+    (code / "container-hub").write_text((BIN / "container-hub").read_text() + "\n# changed\n")
+    check("the hub's code changed on disk and compiling is run, as soon as the change is heard", True, watched.step(3))
+    w.hub.LOADED = tuple(map(w.hub.stamp, w.hub.CODE))
+    os.rename(code, code.with_name("code.old"))
+    watched.step(3)
+    code.mkdir()
+    for name in ("container-hub", "diffview"):
+        shutil.copy(BIN / name, code / name)
+    w.hub.LOADED = tuple(map(w.hub.stamp, w.hub.CODE))
+    watched.step(int(3 * w.hub.PACE / 0.05) + 3)
+    (code / "container-hub").write_text((BIN / "container-hub").read_text() + "\n# changed in the new directory\n")
+    check("...and so is code changed in a directory made in place of the one it was in", True, watched.step(3))
+
+    # --- without the kernel's notices, the hub reads the disk every PACE, as it did (P4)
+
+    w = fakes.World()
+    beta = w.repo("beta", [("map-columns", None, READER)])
+    opened = page(beta / "agent/show/map-columns/p.html")
+    w.opened(opened, READER)
+    w.registered(READER)
+
+    class NoInotify:
+        def __init__(self):
+            raise OSError(errno.ENOSYS, "Function not implemented")
+
+    w.hub.Inotify = NoInotify
+    check("a host with no inotify starts no watch", False, w.hub.WATCH.start())
+    polled = Watched(w, start=False)
+    before = polled.reads
+    polled.step(3)
+    check("...and reads the disk at every round instead", 3, polled.reads - before)
+    opened.unlink()
+    check("...so a change is heard", [{"type": "disk", "units": [READER]}], polled.until_told())
+    lines = [line for line in said() if line.startswith("watching the disk")]
+    check("...and the log says why, once", ["watching the disk by reading it every 2 s: inotify: [Errno 38] Function not implemented"],
+          lines)
+
+    w = fakes.World()
+    gamma = w.repo("gamma", [("map-columns", None, READER)])
+    opened = page(gamma / "agent/show/map-columns/p.html")
+    w.opened(opened, READER)
+    w.registered(READER)
+    code_dirs = {str(p.parent) for p in w.hub.CODE}
+    added = []
+
+    class FewWatches(w.hub.Inotify):
+        """The kernel's watches nearly all taken by other programs: those of the hub's code fit, those of the disk
+        do not."""
+
+        def add(self, directory: str) -> int:
+            if directory not in code_dirs:
+                if len(added) >= 3:
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                added.append(directory)
+            return super().add(directory)
+
+    w.hub.Inotify = FewWatches
+    before_lines = len(said())
+    watched = Watched(w)
+    check("a hub that runs out of watches stops asking for them", False, w.hub.WATCH.on)
+    watched.step()
+    check("...says so in its log", [True], [line.startswith("watching the disk by reading it every 0.05 s: ran out of watches")
+                                            for line in said()[before_lines:] if line.startswith("watching the disk")])
+    opened.unlink()
+    check("...hears a change by reading the disk", [{"type": "disk", "units": [READER]}], watched.until_told())
+    watched.step(6)
+    check("...and reads it so for the rest of its life, having said so once", (False, 1),
+          (w.hub.WATCH.on, sum(line.startswith("watching the disk") for line in said()[before_lines:])))
+finally:
+    for process in sleepers:
+        process.kill()
+        process.wait()
+    sys.stderr = sys.__stderr__
+    hub_said.close()
+
+finish()
