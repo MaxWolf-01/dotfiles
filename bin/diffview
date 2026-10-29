@@ -71,7 +71,7 @@ class Args:
     summary: str = ""
     """One plain-English paragraph on what this change is about (shown at the top; inline markdown ok)."""
     auto_summary: bool = True
-    """Generate the summary with `change-summary` after the page opens; it fills in when ready. Ignored when --summary is given; with --no-auto-summary, a watched page offers to write one on request."""
+    """Generate the summary with `change-summary` after the page opens; it fills in when ready. A summary that fails can be tried again with the ↻ beside its reason on the served page, under the PATH and Claude config dir this ran with, as long as the sources still give the diff the page shows. Ignored when --summary is given; with --no-auto-summary, a watched page offers to write one on request."""
     summary_model: str = ""
     """Model for the auto-summary, passed to `change-summary --model`; empty keeps its default."""
     title: str = ""
@@ -242,22 +242,36 @@ def transcript_cwd(transcript: Path) -> str:
 def write_page(out: Path, data: dict, hljs: str) -> None:
     """Render the page and move it into place atomically, so no request sees it half written."""
     template = (Path(__file__).resolve().parent / "diffview.html").read_text()
-    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
     page = (
         template.replace("__TITLE__", data["title"].replace("<", "&lt;"))
         .replace("__HLJS__", hljs)
-        .replace('"__DATA__"', payload)
+        .replace('"__DATA__"', embedded(data))
     )
-    tmp = out.with_name(f"{out.name}.{os.getpid()}.tmp")  # per-writer, so a background summary and a rebuild never share one
+    replace_page(out, page)
+
+
+def replace_page(out: Path, page: str) -> None:
+    tmp = out.with_name(f"{out.name}.{os.getpid()}.{threading.get_ident()}.tmp")  # per-writer, so a background summary and a rebuild never share one
     tmp.write_text(page)
     os.replace(tmp, out)
+
+
+def embedded(data: dict) -> str:
+    """The page data as JSON a <script> holds: no "</" to close it, no "<!--" to change how it parses."""
+    return json.dumps(data, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
+
+
+def page_data(text: str) -> tuple[dict, int, int]:
+    """The data a rendered page's text carries, and where in that text it starts and ends."""
+    start = text.index("const DATA = ") + len("const DATA = ")
+    data, end = json.JSONDecoder().raw_decode(text, start)
+    return data, start, end
 
 
 def page_sources(page: Path) -> list[str]:
     """The spec of each source a rendered page shows, read from the data it carries."""
     try:
-        text = page.read_text()
-        data, _ = json.JSONDecoder().raw_decode(text, text.index("const DATA = ") + len("const DATA = "))
+        data, _, _ = page_data(page.read_text())
         specs = [s["spec"] for s in data["sources"]]
     except (OSError, ValueError, KeyError, TypeError) as e:
         sys.exit(f"diffview: {page} is no diffview page that names its sources ({type(e).__name__}: {e})")
@@ -291,14 +305,14 @@ def load_summary(out: Path) -> str:
     return load_sidecar(out).get("summary", "")
 
 
-def write_summary(out: Path, summary: str, error: str, written_for: dict) -> None:
+def write_summary(out: Path, summary: str, error: str, written_for: dict, retry: dict | None = None) -> None:
     """The summary sidecar. written_for is the diff size the paragraph describes, which is what lets a
     served page say how far the diff has moved since; the time of writing joins it, unless it is an
-    earlier record going back as it was."""
+    earlier record going back as it was. retry is how a failed summary is tried again (summary_run)."""
     sidecar = summary_path(out)
-    tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp")
+    tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     record = {"at": datetime.now().astimezone().isoformat(timespec="seconds"), **written_for}
-    tmp.write_text(json.dumps({"summary": summary, "error": error, "for": record}))
+    tmp.write_text(json.dumps({"summary": summary, "error": error, "for": record, **({"retry": retry} if retry else {})}))
     os.replace(tmp, sidecar)
 
 
@@ -900,6 +914,60 @@ def take_request(out: Path) -> dict | None:
     return superseded if isinstance(superseded, dict) and superseded else load_sidecar(out)
 
 
+RETRYING: set[Path] = set()   # the pages whose failed summary this process is writing again
+
+
+def retry_summary(out: Path) -> bool:
+    """Write a page's failed summary again where no watcher runs to, in a thread of the caller (the container
+    hub that serves the page), so the request that asked returns at once. It is written for the sources the
+    page pins, under what the failed attempt ran with (summary_run). False for a page with no failed summary
+    that says how it ran.
+
+    The failed sidecar moves into the request file as request_summary's does, so the page waits for the new
+    one; one a hub did not live to finish goes back before anything else here reads it."""
+    with SUMMARY_REQUEST:
+        if out in RETRYING:
+            return True   # a retry under way is the same retry
+        restore_request(out)
+        failed = load_sidecar(out)
+        if failed.get("summary") or not failed.get("retry"):
+            return False
+        os.replace(summary_path(out), request_path(out))
+        RETRYING.add(out)
+    threading.Thread(target=write_retry, args=(out, failed), daemon=True).start()
+    return True
+
+
+def write_retry(out: Path, failed: dict) -> None:
+    """retry_summary's model call, landed as finish_summary lands one: in the sidecar, and in the page file
+    unless a render replaced it meanwhile. It fails, without asking the model, where the sources no longer
+    give the diff the page shows: a page of a working tree that has moved on is rendered again instead."""
+    run, size, summary = failed["retry"], failed.get("for", {}), ""
+    try:
+        rendered = page_id(out)
+        text = out.read_text()
+        data, start, end = page_data(text)
+        size = data["size"]
+        sources = [collect_source(s["spec"], data["context"]) for s in data["sources"]]
+        if diff_size(sources) != size:
+            error = "the sources no longer give the diff this page shows; render it again for a summary"
+        else:
+            summary, error = generate_summary(summary_body(sources), run.get("model", ""), {**os.environ, **run.get("env", {})})
+    except (SystemExit, OSError, ValueError, KeyError) as e:
+        error = str(e)
+    try:
+        write_summary(out, summary, error, size, None if summary else run)
+        if summary and page_id(out) == rendered:
+            data.update(summary=summary, summaryPending=False, saved=load_saved_state(state_path(out)))
+            replace_page(out, text[:start] + embedded(data) + text[end:])
+    except OSError:
+        pass
+    finally:
+        request_path(out).unlink(missing_ok=True)
+        with SUMMARY_REQUEST:
+            RETRYING.discard(out)
+
+
 def restore_request(out: Path) -> None:
     """A request an exited watcher never took: the page that made it is no longer waiting, so the summary it
     moved aside goes back."""
@@ -926,7 +994,7 @@ def rewrite_summary(args: Args, out: Path, previous: dict) -> tuple[str, dict | 
             return text, page
     except (SystemExit, OSError) as e:
         error = str(e)
-    write_summary(out, previous.get("summary", ""), error, previous.get("for", {}))
+    write_summary(out, previous.get("summary", ""), error, previous.get("for", {}), previous.get("retry"))
     print(f"diffview: summary not rewritten: {error}", flush=True)
     return "", None
 
@@ -1419,10 +1487,20 @@ def summary_body(sources: list[dict]) -> str:
     return "\n\n".join(f"### {s['label']} ({s['detail']})\n{s['_patch'][:budget]}" for s in sources)
 
 
-def generate_summary(body: str, model: str) -> tuple[str, str]:
+SUMMARY_ENV = ("PATH", "CLAUDE_CONFIG_DIR", "CHANGE_SUMMARY_MODEL", "CHANGE_SUMMARY_EFFORT")
+
+
+def summary_run(model: str) -> dict:
+    """What a failed summary is tried again with by the container hub, whose own environment finds neither
+    change-summary nor the Claude account the render used: the model, and the variables that pick those."""
+    return {"model": model, "env": {k: os.environ[k] for k in SUMMARY_ENV if k in os.environ}}
+
+
+def generate_summary(body: str, model: str, env: dict | None = None) -> tuple[str, str]:
     """change-summary's paragraph for this diff, or ("", reason) when it has none."""
     try:
-        proc = subprocess.run(["change-summary", *(["--model", model] if model else [])], input=body, capture_output=True, text=True, timeout=900)
+        proc = subprocess.run(["change-summary", *(["--model", model] if model else [])], input=body, capture_output=True, text=True,
+                              timeout=900, env=env)
     except (OSError, subprocess.TimeoutExpired) as e:
         return "", str(e)
     if proc.returncode != 0:
@@ -1451,7 +1529,7 @@ def finish_summary(out: Path, body: str, model: str, data: dict, hljs: str, rend
         os.dup2(devnull, fd)
     try:
         summary, error = generate_summary(body, model)
-        write_summary(out, summary, error, data["size"])
+        write_summary(out, summary, error, data["size"], None if summary else summary_run(model))
         # rendering to this path again while the model ran makes the page on disk somebody
         # else's; the sidecar still stands, so a page open on it is not left waiting
         if summary and page_id(out) == rendered:
