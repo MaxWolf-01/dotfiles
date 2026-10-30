@@ -44,7 +44,7 @@ pkgs.runCommand "sudo-touch-rig" { } ''
   ln -s ${skDummy}/lib/sk-dummy.so $out/lib/sk-dummy.so
   ln -s ${pamWrapper}/lib/libpam_wrapper.so $out/lib/libpam_wrapper.so
   ln -s ${pkgs.pam_rssh}/lib/libpam_rssh.so $out/lib/libpam_rssh.so
-  ln -s ${pkgs.linux-pam}/lib/security/pam_deny.so $out/lib/pam_deny.so
+  ln -s ${pkgs.linux-pam}/lib/security/pam_deny.so ${pkgs.linux-pam}/lib/security/pam_permit.so $out/lib/
   ln -s ${pkgs.pamtester}/bin/pamtester $out/bin/pamtester
   ln -s ${pkgs.openssh}/bin/ssh-agent ${pkgs.openssh}/bin/ssh-add ${pkgs.openssh}/bin/ssh-keygen $out/bin/
 ''

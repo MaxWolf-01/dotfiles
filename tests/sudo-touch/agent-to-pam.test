@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# tier: full-path (nix, ssh-agent, PAM through pam_wrapper)
+# Drive sudo by a YubiKey touch from the laptop's agent to pc's PAM line, with OpenSSH's software security key in
+# place of a YubiKey and pam_wrapper in place of root (rig.nix). Run it directly; no framework.
+#
+# The agent runs as the laptop's unit runs it, with its askpass and environment; pam_rssh runs with the arguments
+# pc's sudo gives it, reading a scratch copy of the keys file. What max relies on: a sudo the agent can answer
+# waits for the touch, shows as a waiting prompt meanwhile, and goes through once touched; a key the file does not
+# list is no way in; and with no agent or no key in it, the stack goes on to the password.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+. "$repo/tests/check.sh"
+needs nix jq
+scratch=$(mktemp -d)
+agent_pid=
+trap '[ -z "$agent_pid" ] || kill "$agent_pid" 2>/dev/null; rm -rf "$scratch"' EXIT
+
+nix eval --json --impure --expr "
+let
+  f = builtins.getFlake \"git+file://$repo\";
+  unit = f.homeConfigurations.zephyrus.config.systemd.user.services.ssh-sk-agent.Service;
+in {
+  execStart = unit.ExecStart;
+  environment = unit.Environment;
+  sudo = f.nixosConfigurations.pc.config.security.pam.services.sudo.text;
+  # What the unit's strings name, so the build below makes them.
+  drvs = builtins.attrNames (builtins.getContext (toString unit.ExecStart + toString unit.Environment));
+}" >"$scratch/eval.json" 2>"$scratch/err" || { fail "the flake's host configs evaluate" "$(tail -20 "$scratch/err")"; finish; }
+rig=$(nix build --no-link --print-out-paths --impure --expr "
+  import $repo/tests/sudo-touch/rig.nix { pkgs = (builtins.getFlake \"git+file://$repo\").inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}; }" \
+    2>"$scratch/err") || { fail "the rig builds" "$(tail -20 "$scratch/err")"; finish; }
+jq -r '.drvs[] | . + "^out"' "$scratch/eval.json" | xargs nix build --no-link 2>"$scratch/err" ||
+    { fail "the agent unit's programs build" "$(tail -20 "$scratch/err")"; finish; }
+
+# The unit, with %t made this scratch directory, and the rig's provider allowed in.
+run="$scratch/run"
+mkdir -p "$run"
+export XDG_RUNTIME_DIR="$run"
+while read -r assignment; do
+    export "${assignment//%t/$run}"
+done < <(jq -r '.environment[]' "$scratch/eval.json")
+export SK_DUMMY_TOUCH="$scratch/touched"
+read -ra exec_start <<<"$(jq -r '.execStart[]' "$scratch/eval.json")"
+# The allowlist is matched against the provider's resolved path.
+"${exec_start[@]//%t/$run}" -P "$(realpath "$rig/lib/sk-dummy.so")" >"$scratch/agent.log" 2>&1 &
+agent_pid=$!
+timeout 5 bash -c "until [ -S '$SSH_AUTH_SOCK' ]; do sleep 0.05; done" || { fail "the agent listens" "$(cat "$scratch/agent.log")"; finish; }
+
+"$rig/bin/ssh-keygen" -q -t ed25519-sk -w "$rig/lib/sk-dummy.so" -N '' -C keychain -f "$scratch/keychain" </dev/null
+"$rig/bin/ssh-keygen" -q -t ed25519-sk -w "$rig/lib/sk-dummy.so" -N '' -C elsewhere -f "$scratch/elsewhere" </dev/null
+"$rig/bin/ssh-add" -q -S "$rig/lib/sk-dummy.so" "$scratch/keychain" 2>/dev/null
+
+# pc's pam_rssh line, reading the keys from here, then a stand-in for what follows it in the stack.
+rssh=$(jq -r .sudo "$scratch/eval.json" | grep '^auth .*libpam_rssh\.so' | sed "s|/etc/ssh/sudo-touch/|$scratch/keys/|; s| #.*||")
+mkdir -p "$scratch/keys" "$scratch/pam.d"
+stack() {
+    printf '%s\nauth required %s\n' "$rssh" "$rig/lib/$1" >"$scratch/pam.d/sudo"
+}
+pamtester() {
+    LD_PRELOAD="$rig/lib/libpam_wrapper.so" PAM_WRAPPER=1 PAM_WRAPPER_SERVICE_DIR="$scratch/pam.d" \
+        "$rig/bin/pamtester" -I "ruser=$USER" sudo "$USER" authenticate </dev/null >/dev/null 2>&1
+}
+prompts() {
+    compgen -G "$run/prompt-waits/*.json"
+}
+
+# What follows the touch denies, so a success is the touch's alone.
+stack pam_deny.so
+cp "$scratch/keychain.pub" "$scratch/keys/$USER"
+pamtester &
+sudo_pid=$!
+if timeout 10 bash -c "until compgen -G '$run/prompt-waits/*.json' >/dev/null; do sleep 0.05; done"; then
+    check "while the key waits for a touch, a waiting prompt of kind touch shows" touch "$(jq -r .kind $(prompts))"
+    check "sudo is still waiting" yes "$(kill -0 "$sudo_pid" 2>/dev/null && echo yes)"
+else
+    fail "a waiting prompt shows while the key waits for a touch" "$(cat "$scratch/agent.log")"
+fi
+touch "$SK_DUMMY_TOUCH"
+wait "$sudo_pid"
+check "once touched, sudo goes through on the touch alone" 0 "$?"
+timeout 5 bash -c "while compgen -G '$run/prompt-waits/*' >/dev/null; do sleep 0.05; done"
+check "and the waiting prompt is gone" "" "$(ls -A "$run/prompt-waits" 2>/dev/null)"
+
+cp "$scratch/elsewhere.pub" "$scratch/keys/$USER"
+pamtester
+check "a key the file does not list is no way in" 1 "$([ $? -ne 0 ] && echo 1)"
+
+# What follows the touch lets anyone in, standing in for the password: reaching it is falling through.
+stack pam_permit.so
+pamtester
+check "with the agent holding no listed key, sudo goes on to the password" 0 "$?"
+SSH_AUTH_SOCK= pamtester
+check "with no agent at all, sudo goes on to the password" 0 "$?"
+
+finish
