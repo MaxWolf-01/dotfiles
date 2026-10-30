@@ -11,8 +11,8 @@ plugged in, no registered key, no forwarded agent, or no touch, sudo asks for
 the password as it always did; a key plugged in but left untouched makes sudo
 wait until the key gives up first.
 
-The keys are the two YubiKey 5C NFC: the keychain one (serial 40771133) and the
-backup (40771121). Register both at every step that registers a key.
+The keys are the two YubiKeys, the keychain one and the backup. Register both at
+every step that registers a key.
 
 ## Setting it up
 

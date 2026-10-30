@@ -14,7 +14,8 @@
 { config, pkgs, lib, ... }:
 let
   keys = ../yubikey;
-  # The machines whose sudo takes a touch, by the ssh block that reaches each.
+  # The machines whose sudo takes a touch, by the ssh block that reaches each:
+  # the hosts whose configuration.nix imports nix/nixos/sudo-touch.nix.
   forwarded = {
     pc = "pc";
     xmg19 = "xmg xmg19";
@@ -47,7 +48,8 @@ let
         echo "no key handle at $handle yet; docs/sudo-touch.md makes it"
       fi
     done
-    if ssh-add -L | grep -v '^sk-ssh-ed25519@openssh.com ' | grep -q .; then
+    # ssh-add -L exits 1, saying so on stdout, when the agent holds nothing.
+    if held=$(ssh-add -L) && grep -v '^sk-ssh-ed25519@openssh.com ' <<<"$held" | grep -q .; then
       ssh-add -D
       echo "the YubiKey agent held a key that is not an ed25519-sk key; emptied it" >&2
       exit 1

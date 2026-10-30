@@ -12,7 +12,7 @@ set -uo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 . "$repo/tests/check.sh"
-needs nix jq
+needs nix jq ssh
 scratch=$(mktemp -d)
 agent_pid=
 trap '[ -z "$agent_pid" ] || kill "$agent_pid" 2>/dev/null; rm -rf "$scratch"' EXIT
@@ -23,10 +23,12 @@ let
   unit = f.homeConfigurations.zephyrus.config.systemd.user.services.ssh-sk-agent.Service;
 in {
   execStart = unit.ExecStart;
+  execStartPost = unit.ExecStartPost;
+  sshConfig = f.homeConfigurations.zephyrus.config.home.file.\".ssh/config\".source;
   environment = unit.Environment;
   sudo = f.nixosConfigurations.pc.config.security.pam.services.sudo.text;
   # What the unit's strings name, so the build below makes them.
-  drvs = builtins.attrNames (builtins.getContext (toString unit.ExecStart + toString unit.Environment));
+  drvs = builtins.attrNames (builtins.getContext (toString unit.ExecStart + toString unit.ExecStartPost + toString unit.Environment));
 }" >"$scratch/eval.json" 2>"$scratch/err" || { fail "the flake's host configs evaluate" "$(tail -20 "$scratch/err")"; finish; }
 rig=$(nix build --no-link --print-out-paths --impure --expr "
   import $repo/tests/sudo-touch/rig.nix { pkgs = (builtins.getFlake \"git+file://$repo\").inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}; }" \
@@ -46,7 +48,22 @@ read -ra exec_start <<<"$(jq -r '.execStart[]' "$scratch/eval.json")"
 # The allowlist is matched against the provider's resolved path.
 "${exec_start[@]//%t/$run}" -P "$(realpath "$rig/lib/sk-dummy.so")" >"$scratch/agent.log" 2>&1 &
 agent_pid=$!
-timeout 5 bash -c "until [ -S '$SSH_AUTH_SOCK' ]; do sleep 0.05; done" || { fail "the agent listens" "$(cat "$scratch/agent.log")"; finish; }
+# Where the laptop's ssh forwards from, /run/user/<uid> being the unit's %t.
+forwarded=$(ssh -G -F "$(jq -r .sshConfig "$scratch/eval.json")" pc 2>/dev/null | awk '$1 == "forwardagent" { print $2 }')
+forwarded="$run${forwarded#/run/user/$(id -u)}"
+timeout 5 bash -c "until [ -S '$forwarded' ]; do sleep 0.05; done" ||
+    { fail "the agent listens where the laptop's ssh forwards from ($forwarded)" "$(cat "$scratch/agent.log")"; finish; }
+
+# The unit's loader, on an agent holding nothing (no key is registered yet): the unit stays up.
+load=$(jq -r '.execStartPost | if type == "array" then .[0] else . end' "$scratch/eval.json")
+"$load" >"$scratch/load.log" 2>&1
+check "the loader leaves an agent holding nothing running" 0 "$?"
+# ...and on one someone added an everyday key to: it empties the agent and fails the unit.
+"$rig/bin/ssh-keygen" -q -t ed25519 -N '' -C everyday -f "$scratch/everyday" </dev/null
+"$rig/bin/ssh-add" -q "$scratch/everyday" 2>/dev/null
+"$load" >"$scratch/load.log" 2>&1
+check "the loader refuses an agent holding a key that is not an sk key" 1 "$?"
+check "and empties it" "" "$("$rig/bin/ssh-add" -L 2>/dev/null | grep -v '^The agent has no identities')"
 
 "$rig/bin/ssh-keygen" -q -t ed25519-sk -w "$rig/lib/sk-dummy.so" -N '' -C keychain -f "$scratch/keychain" </dev/null
 "$rig/bin/ssh-keygen" -q -t ed25519-sk -w "$rig/lib/sk-dummy.so" -N '' -C elsewhere -f "$scratch/elsewhere" </dev/null

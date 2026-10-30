@@ -57,7 +57,7 @@ jq -n --arg id "$id" --arg prompt "$message" --arg host "$hosts" --arg since "$(
     id: $id,
     kind: "touch",
     prompt: "Touch a YubiKey for \($host): \($prompt)",
-    command: "\($host), through the forwarded YubiKey agent",
+    command: "ssh \($host)",
     pane: null,
     since: $since
 }' >"$dir/.$id.tmp" && mv "$dir/.$id.tmp" "$file"
