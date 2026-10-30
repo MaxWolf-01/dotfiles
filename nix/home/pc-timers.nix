@@ -21,8 +21,9 @@ let
   ]);
 
   # systemd for journalctl: the watchdog asks it when units without a run log
-  # last finished cleanly, here and (over ssh) on the laptop.
-  watchdogPath = "${backupPath}:${lib.makeBinPath [ pkgs.systemd ]}";
+  # last finished cleanly, here and (over ssh) on the laptop; uv runs
+  # bin/hosts, which says which host runs each backup.
+  watchdogPath = "${backupPath}:${lib.makeBinPath [ pkgs.systemd pkgs.uv ]}";
 
   # ssh-agent socket (managed by services.ssh-agent in common.nix)
   sshAuthSock = "/run/user/1000/ssh-agent";
