@@ -19,6 +19,9 @@ in
     description = "Copy ${disk.source} onto the cold disk ${name}";
     path = [ config.boot.zfs.package ] ++ (with pkgs; [
       bash coreutils util-linux getent gnused gnugrep gawk jq sops curl git age
+      # .sops.yaml lists the YubiKeys as recipients, and age encrypts to one only
+      # through its plugin.
+      age-plugin-yubikey
     ]);
     # alert-send needs the age key, decrypted on max's first login after a
     # boot; until then the mail is undelivered and the run log keeps the record.
