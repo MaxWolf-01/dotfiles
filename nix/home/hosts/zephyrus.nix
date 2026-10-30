@@ -51,6 +51,7 @@
     ../dotnet.nix
     ../gnome.nix
     ../greyline.nix
+    ../prompt-waits.nix
     ../proton-mail.nix
     ../timers.nix
     ../vibe-typer.nix
