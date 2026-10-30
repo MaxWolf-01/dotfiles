@@ -91,6 +91,12 @@ let
     bash coreutils uv sops jq
   ]);
 
+  # bin/whatsapp-chat is a uv script; ssh and rsync reach the phone, sops opens the
+  # backup key; jq for bin/run-log.
+  whatsappPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv openssh rsync sops jq
+  ]);
+
   # sops for the Bridge password, uv for lifelog's header index, jq for bin/run-log.
   mailPath = lib.makeBinPath (with pkgs; [
     bash coreutils isync notmuch sops uv jq
@@ -748,6 +754,42 @@ in
     Unit.Description = "Proton mail mirror (every 15 min)";
     Timer = {
       OnCalendar = "*:07/15";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- WhatsApp backup → ~/data/whatsapp ---
+  # The phone's newest full backup, decrypted on the laptop, for whatsapp-chat and
+  # lifelog's whatsapp view; jarvis-sync ships it. What a run does: `whatsapp-chat --help`.
+  # Hourly, ahead of jarvis-sync's :05: WhatsApp backs up once a day, and a run with
+  # nothing new copies and writes nothing.
+
+  systemd.user.services.whatsapp-mirror = {
+    Unit = {
+      Description = "Mirror the phone's WhatsApp backup, decrypted, into ~/data/whatsapp";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${whatsappPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/bin/whatsapp-chat mirror --record";
+      # Copying 100 MB from the phone over a slow link can take minutes; a hung
+      # oneshot would make every later firing a silent no-op.
+      TimeoutStartSec = "30m";
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.whatsapp-mirror = {
+    Unit.Description = "WhatsApp backup mirror (hourly)";
+    Timer = {
+      OnCalendar = "*:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
