@@ -142,11 +142,16 @@ History: the host recorder's `dgpu_port` column (D3cold or D0 every 5 s).
   `dgpu-resume`. It cannot stop a `dgpu lock` typed by hand under a monitor,
   nor an installed copy that differs from `bin/dgpu` (`dgpu status` says so;
   `dgpu install` replaces it).
-- **HDMI hot-plug.** Plugging HDMI into a running session crashes gnome-shell,
-  locked or not, and gdm restarts the session with the monitor working; a
-  session that starts with the cable in works from the start. Save your work
-  before plugging in or out. The bug:
-  `agent/tickets/hdmi-hotplug-crashes-gnome-shell.md`.
+- **Hot-plugging a monitor on a dGPU port.** Plugging a monitor into HDMI or
+  the USB-C 3.2 port of a running session crashed gnome-shell, locked or not
+  (2026-09-23, 09-30, 10-30): the screen freezes, about 30 s later
+  gnome-shell aborts, and you are back at the login screen with everything
+  unsaved gone. A session that starts with the monitor in works from the
+  start, and so does a monitor on the Thunderbolt port. The journal shows
+  `fb1: nvidia-drmdrmfb` at the plug, then `intel: the execbuf ioctl keeps
+  returning ENOMEM`. `MUTTER_DEBUG_MULTI_GPU_FORCE_COPY_MODE` in
+  `nix/home/hosts/zephyrus.nix` is meant to prevent it; not yet tested with a
+  hotplug. The bug: `agent/tickets/hdmi-hotplug-crashes-gnome-shell.md`.
 - **A kernel upgrade without its NVIDIA modules.** Ubuntu phases updates, and
   `apt upgrade` can install `linux-image-X` while holding back
   `linux-modules-nvidia-580-open-X`. Booting that kernel leaves the card on
