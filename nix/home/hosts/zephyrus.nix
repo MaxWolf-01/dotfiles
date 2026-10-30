@@ -62,6 +62,7 @@
     ../greyline.nix
     ../prompt-waits.nix
     ../proton-mail.nix
+    ../sudo-touch.nix
     ../timers.nix
     ../vibe-typer.nix
     ../wayland.nix

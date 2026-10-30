@@ -137,6 +137,13 @@ zephylux, unlocks what a rebooted xmg19 or pc keeps locked: run it whenever
 either was rebooted. What each one's unlock opens is its
 `unlock` in `nix/home/machines.nix`.
 
+## sudo by a YubiKey touch
+
+sudo takes a YubiKey touch before the password: pam_u2f on zephylux, and on pc
+and xmg19 pam_rssh through a second ssh agent, forwarded only there, that holds
+only the YubiKeys' sk keys. Setup, the checks and how to back out:
+`docs/sudo-touch.md`.
+
 ## SFTPGo File Drop
 
 The only service on pc with a public (non-tailnet) surface. Manage accounts with
