@@ -8,19 +8,24 @@
 
 The promises here: a person is called by their address-book name whichever way the number
 was saved, else by the name they set in WhatsApp, else by their full number, and never by
-the masked number WhatsApp shows for strangers when the full one is known; a chat is found
+the masked number WhatsApp shows for strangers when the full one is known, and names.json, which
+lifelog's view reads in place of this script, calls everyone that too; a chat is found
 by id or by name, an exact name winning over a partial one, and a name matching several
 chats exits 2; a chat prints oldest first, cut to the newest messages or to a start time,
 without system notices, with replies and media named.
 
 The database is a fixture built here with only the columns the script reads, in the
-shape of a 2.26 backup. Copying from the phone and decrypting are not covered.
+shape of a 2.26 backup. Copying from the phone and decrypting are not covered: the mirror's
+checks stand a copy of the fixture in for what decrypting gives, and an answer for the phone.
 """
 
 import io
 import json
+import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +36,7 @@ from check import bin_module, check, finish  # noqa: E402
 wc = bin_module("whatsapp-chat")
 
 SCHEMA = """
-create table jid (_id integer primary key, user text, server text);
+create table jid (_id integer primary key, user text, server text, raw_string text);
 create table jid_map (lid_row_id integer primary key, jid_row_id integer);
 create table lid_display_name (lid_row_id integer primary key, display_name text);
 create table chat (_id integer primary key, jid_row_id integer, subject text);
@@ -51,16 +56,16 @@ def fixture() -> sqlite3.Connection:
     db = sqlite3.connect(":memory:")
     db.executescript(SCHEMA)
     db.executemany(
-        "insert into jid values (?, ?, ?)",
+        "insert into jid values (?, ?, ?, ?)",
         [
-            (1, "436601111111", "s.whatsapp.net"),  # Anna: in the address book
-            (2, "436602222222", "s.whatsapp.net"),  # Ben: a WhatsApp name only, reached through his lid
-            (3, "436603333333", "s.whatsapp.net"),  # Cleo: masked name, number known
-            (11, "900000000000002", "lid"),
-            (12, "900000000000003", "lid"),
-            (13, "900000000000004", "lid"),  # Dan: lid only, masked name
-            (20, "120363000000000001", "g.us"),
-            (21, "120363000000000002", "g.us"),
+            (1, "436601111111", "s.whatsapp.net", "436601111111@s.whatsapp.net"),  # Anna: in the address book
+            (2, "436602222222", "s.whatsapp.net", "436602222222@s.whatsapp.net"),  # Ben: a WhatsApp name only, reached through his lid
+            (3, "436603333333", "s.whatsapp.net", "436603333333@s.whatsapp.net"),  # Cleo: masked name, number known
+            (11, "900000000000002", "lid", "900000000000002@lid"),
+            (12, "900000000000003", "lid", "900000000000003@lid"),
+            (13, "900000000000004", "lid", "900000000000004@lid"),  # Dan: lid only, masked name
+            (20, "120363000000000001", "g.us", "120363000000000001@g.us"),
+            (21, "120363000000000002", "g.us", "120363000000000002@g.us"),
         ],
     )
     db.executemany("insert into jid_map values (?, ?)", [(11, 2), (12, 3)])
@@ -120,6 +125,20 @@ check("a masked WhatsApp name loses to the full number", "+436603333333", names(
 check("a lid with no number keeps its masked name", "+49∙∙∙∙∙∙∙∙44", names(13))
 check("a group is its subject", "Hikers", names(20))
 
+# --- names.json, the names lifelog reads
+side = json.loads(wc.names_file(db, names))
+check("names.json calls every jid what whatsapp-chat calls it",
+      {"436601111111@s.whatsapp.net": "Anna", "436602222222@s.whatsapp.net": "Ben B",
+       "436603333333@s.whatsapp.net": "+436603333333",
+       "900000000000002@lid": "Ben B", "900000000000003@lid": "+436603333333", "900000000000004@lid": "+49∙∙∙∙∙∙∙∙44",
+       "120363000000000001@g.us": "Hikers", "120363000000000002@g.us": "Hikers Vienna"},
+      {n["jid"]: n["name"] for n in side["names"]})
+check("and names the message types, the system notices' type and the kinds of chat",
+      ("text", "image", "audio", 7, "group"),
+      (*({k["type"]: k["kind"] for k in side["kinds"]}[t] for t in (0, 1, 2)), side["system"],
+       {c["server"]: c["kind"] for c in side["chat_kinds"]}["g.us"]))
+check("the same database and address book give the same names.json", wc.names_file(db, names), wc.names_file(db, names))
+
 # --- the address book, as termux-contact-list answers
 entries = [{"name": "Anna", "number": "+43 660 1111111"}]
 check("a list of contacts is the address book", entries, wc.address_book(json.dumps(entries)))
@@ -178,5 +197,73 @@ check("an age counts back from now", True, abs((datetime.now() - wc.since("2h"))
 check("a date is its midnight", datetime(2026, 10, 1), wc.since("2026-10-01"))
 _, err, code = run(wc.since, "yesterday")
 check("anything else is refused", 1, code)
+
+# --- the mirror
+# A copy of the fixture stands in for a decrypted backup, and the phone's answer is set per run.
+scratch = Path(tempfile.mkdtemp())
+wc.CACHE, wc.MIRROR = scratch / "cache", scratch / "data/whatsapp"
+wc.CACHE.mkdir()
+(wc.CACHE / "contacts.json").write_text(json.dumps([{"name": "Anna", "number": "+43 660 1111111"}]))
+calls = scratch / "run-log.calls"
+wc.RUN_LOG = scratch / "run-log"
+wc.RUN_LOG.write_text(f'#!/usr/bin/env bash\necho "$*" >> {calls}\n')
+wc.RUN_LOG.chmod(0o755)
+decrypted = []
+
+
+def decrypt(backup: Path, plain: Path, stamp: int) -> None:
+    decrypted.append(backup)
+    db.commit()  # the backup API waits forever on the fixture's own open transaction
+    out = sqlite3.connect(scratch / "plain.db")
+    db.backup(out)
+    out.close()
+    wc.replace(plain, (scratch / "plain.db").read_bytes(), stamp)
+
+
+def mirror_run(phone: str | None) -> tuple[str, int | None]:
+    """One `mirror --record` run, the phone answering where phone is None, else away for that reason: what it logged."""
+    wc.decrypt, wc.pull = decrypt, lambda: phone
+    calls.unlink(missing_ok=True)
+    _, _, code = run(wc.mirror, True)
+    return calls.read_text().strip() if calls.exists() else "", code
+
+
+logged, _ = mirror_run("ssh: connect to host phone port 8022: Connection timed out")
+check("a phone that does not answer, with no backup cached, is a skip saying why, and mirrors nothing",
+      ("whatsapp-mirror skip --reason phone not reached, no backup cached: ssh: connect to host phone port 8022: "
+       "Connection timed out", False), (logged, wc.MIRROR.exists()))
+
+backup = wc.CACHE / wc.BACKUP
+backup.write_bytes(b"encrypted")
+os.utime(backup, ns=(1_790_000_000_123_456_789,) * 2)
+logged, _ = mirror_run(None)
+stats = json.loads(logged.split("--stats ", 1)[1])
+plain, named = wc.MIRROR / "msgstore.db", wc.MIRROR / "names.json"
+check("a backup the mirror lacks is decrypted, and names.json written beside it: ok",
+      ("whatsapp-mirror ok", True, True, 1), (logged.split(" --")[0], stats["decrypted"], stats["names_written"], len(decrypted)))
+check("the mirror's database carries the backup's mtime, to the nanosecond", backup.stat().st_mtime_ns, plain.stat().st_mtime_ns)
+check("names.json is what whatsapp-chat names the fixture by", wc.names_file(db, names), named.read_text())
+before = [(f.stat().st_ino, f.stat().st_mtime_ns) for f in (plain, named)]
+logged, _ = mirror_run(None)
+stats = json.loads(logged.split("--stats ", 1)[1])
+check("a run with no newer backup decrypts nothing and rewrites nothing",
+      (False, False, 1, before), (stats["decrypted"], stats["names_written"], len(decrypted),
+                                  [(f.stat().st_ino, f.stat().st_mtime_ns) for f in (plain, named)]))
+logged, _ = mirror_run("ssh: connect to host phone port 8022: No route to host")
+check("a phone that does not answer, with a backup cached, is a skip", "whatsapp-mirror skip --reason phone not reached: "
+      "ssh: connect to host phone port 8022: No route to host", logged)
+os.utime(backup, ns=(1_790_000_100_000_000_000,) * 2)
+logged, _ = mirror_run(None)
+check("a newer backup is decrypted again", (True, 2, 1_790_000_100_000_000_000),
+      (json.loads(logged.split("--stats ", 1)[1])["decrypted"], len(decrypted), plain.stat().st_mtime_ns))
+wc.decrypt = lambda *_: sys.exit("whatsapp-chat: could not decrypt the backup key: no identity matched")
+os.utime(backup, ns=(1_790_000_200_000_000_000,) * 2)
+calls.unlink(missing_ok=True)
+wc.pull = lambda: None
+_, _, code = run(wc.mirror, True)
+check("a backup that cannot be decrypted is a fail saying why, and exits non-zero",
+      ("whatsapp-mirror fail --reason whatsapp-chat: could not decrypt the backup key: no identity matched", 1),
+      (calls.read_text().strip(), code))
+shutil.rmtree(scratch)
 
 finish()

@@ -188,6 +188,14 @@ ships. Read the local copy; never talk to Bridge's
 IMAP or SMTP directly, and never send mail. Setup and limits:
 `nix/home/proton-mail.nix`.
 
+## WhatsApp
+
+The phone's newest WhatsApp backup is mirrored, decrypted, to `~/data/whatsapp`
+(zephylux only, hourly, `whatsapp-chat mirror`); `whatsapp-chat` prints a chat
+from it, and `lifelog whatsapp` reads it as one row per message, which Jarvis
+reads from the copy `jarvis-sync` ships. The backup key stays on the laptop.
+`whatsapp-chat --help` says how.
+
 ## Knowledge Base Publishing
 
 The Obsidian knowledge vault (`~/repos/obsidian/knowledge-base/`, separate repo with its own CLAUDE.md) publishes selectively to a Quartz site via:

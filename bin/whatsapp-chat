@@ -3,14 +3,18 @@
 # requires-python = ">=3.11"
 # dependencies = ["tyro", "wa-crypt-tools"]
 # ///
-"""Print a WhatsApp chat as plain text, read from the phone's own encrypted backup.
+"""Print a WhatsApp chat as plain text, read from the laptop's mirror of the phone's own encrypted backup.
 
-Each run copies the newest full backup (msgstore.db.crypt15) from the phone over
-the ssh alias phone, decrypts it with the 64-digit key in
-secrets/creds/raw/whatsapp-backup-key, and reads the chat from it. The encrypted
-copy stays in ~/.cache/whatsapp-chat; the decrypted database lives only in
-XDG_RUNTIME_DIR, which is RAM, and is rebuilt when a newer backup arrives. When
-the phone does not answer, the cached backup is read.
+The mirror is ~/data/whatsapp: msgstore.db, the newest full backup decrypted, and
+names.json, what each person, group, message type and kind of chat is called, which
+lifelog's whatsapp view reads beside it on the laptop and in Jarvis's container. Each
+run first brings the mirror up to date: it copies the newest full backup
+(msgstore.db.crypt15) from the phone over the ssh alias phone into
+~/.cache/whatsapp-chat, decrypts it with the 64-digit key in
+secrets/creds/raw/whatsapp-backup-key when it is newer than the mirror's copy, and
+rewrites names.json only when what it holds changed. When the phone does not answer,
+the cached backup is read. `mirror` does that alone, for the timer that keeps the
+mirror current. The key never leaves the laptop.
 
 Messages are as recent as the phone's last full backup, whose time goes to stderr
 on every run. Newer daily increments on the phone are not read; stderr says when
@@ -27,6 +31,7 @@ Examples:
     whatsapp-chat show anna --last 50
     whatsapp-chat show 175 --since 7d
     whatsapp-chat show "Adventure Hikers" --since 2026-10-01 --offline
+    whatsapp-chat mirror --record
 """
 
 import json
@@ -48,7 +53,9 @@ PHONE_DIR = "storage/shared/Android/media/com.whatsapp/WhatsApp/Databases"
 BACKUP = "msgstore.db.crypt15"
 KEY = Path.home() / ".dotfiles/secrets/creds/raw/whatsapp-backup-key"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "whatsapp-chat"
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "whatsapp-chat"
+MIRROR = Path.home() / "data/whatsapp"
+UNIT = "whatsapp-mirror"
+RUN_LOG = Path(__file__).resolve().parent / "run-log"
 SSH = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
 
 # An address-book number written without a country code ("0660 …") is read as one
@@ -74,6 +81,9 @@ KINDS = {
     90: "call",
 }
 SYSTEM = 7
+
+# chat's jid server, for the chats that are not one person's.
+CHAT_KINDS = {"g.us": "group", "newsletter": "channel", "broadcast": "broadcast"}
 
 # How many of the chats an ambiguous name matches `show` lists, most recent first.
 AMBIGUOUS_SHOWN = 15
@@ -107,15 +117,31 @@ class Show:
     """Read the cached backup without asking the phone for a newer one."""
 
 
-Cmd = Annotated[List, tyro.conf.subcommand(name="list")] | Annotated[Show, tyro.conf.subcommand(name="show")]
+@dataclass
+class Mirror:
+    """Bring the mirror up to date and print nothing: the first step of list and show, alone."""
+
+    record: bool = False
+    """Append the run's outcome to ~/logs/runs/whatsapp-mirror.jsonl (bin/run-log): skip where the phone did not answer, fail where the mirror could not be brought up to date, ok with the backup's time and size and what was rewritten otherwise."""
+
+
+Cmd = (
+    Annotated[List, tyro.conf.subcommand(name="list")]
+    | Annotated[Show, tyro.conf.subcommand(name="show")]
+    | Annotated[Mirror, tyro.conf.subcommand(name="mirror")]
+)
 
 
 def main() -> None:
     cmd = tyro.cli(Cmd, description=__doc__)
     os.umask(0o077)
-    if not cmd.offline:
-        pull()
-    db = sqlite3.connect(f"file:{decrypted()}?mode=ro", uri=True)
+    if isinstance(cmd, Mirror):
+        mirror(cmd.record)
+        return
+    if not cmd.offline and (away := pull()):
+        note(f"the phone did not answer, so this reads the cached backup ({away})")
+    update()
+    db = sqlite3.connect(f"file:{MIRROR / 'msgstore.db'}?mode=ro", uri=True)
     names = Names(db, contacts())
     if isinstance(cmd, List):
         print_chats(db, names, cmd.query, cmd.limit)
@@ -126,8 +152,9 @@ def main() -> None:
 # --- getting the database --------------------------------------------------------
 
 
-def pull() -> None:
-    """The newest backup and address book into CACHE, or a note on stderr of why not."""
+def pull() -> str | None:
+    """The newest backup and address book into CACHE: None where the phone answered, else ssh's or rsync's last word
+    on why not."""
     CACHE.mkdir(parents=True, exist_ok=True)
     rsync = subprocess.run(
         ["rsync", "-t", "-e", " ".join(SSH), f"{PHONE}:{PHONE_DIR}/{BACKUP}", str(CACHE / BACKUP)],
@@ -135,10 +162,8 @@ def pull() -> None:
         text=True,
     )
     if rsync.returncode != 0:
-        if not (CACHE / BACKUP).exists():
-            sys.exit(f"whatsapp-chat: could not copy the backup from the phone, and none is cached:\n{rsync.stderr.strip()}")
-        note(f"the phone did not answer, so this reads the cached backup ({rsync.stderr.strip().splitlines()[-1]})")
-        return
+        # ssh says why first; rsync's own last line only says that ssh failed.
+        return (rsync.stderr.strip().splitlines() or [f"rsync exited {rsync.returncode}"])[0]
 
     newer = subprocess.run(
         SSH + [PHONE, f"find {PHONE_DIR} -maxdepth 1 -name 'msgstore-increment-*.db.crypt15' -newer {PHONE_DIR}/{BACKUP}"],
@@ -150,7 +175,8 @@ def pull() -> None:
 
     book = subprocess.run(SSH + [PHONE, "termux-contact-list"], capture_output=True, text=True)
     if (entries := address_book(book.stdout)) is not None:
-        (CACHE / "contacts.json").write_text(json.dumps(entries))
+        write_changed(CACHE / "contacts.json", json.dumps(entries))
+    return None
 
 
 def address_book(answer: str) -> list[dict] | None:
@@ -166,17 +192,39 @@ def address_book(answer: str) -> list[dict] | None:
     return entries if isinstance(entries, list) else None
 
 
-def decrypted() -> Path:
-    """The plain database for the cached backup, decrypting it only when the backup is newer."""
+@dataclass
+class Updated:
+    backup: int
+    """When the phone took the backup the mirror holds, in nanoseconds since the epoch."""
+    decrypted: bool
+    named: bool
+    """Whether names.json was rewritten."""
+
+
+def update() -> Updated:
+    """Bring the mirror up to the cached backup, decrypting it only when it is newer than the mirror's copy, and
+    writing names.json only when what it holds changed."""
+    backup = CACHE / BACKUP
+    if not backup.exists():
+        sys.exit("whatsapp-chat: no backup is cached, so there is nothing to read; the next run that reaches the phone copies one")
+    plain = MIRROR / "msgstore.db"
+    stamp = backup.stat().st_mtime_ns
+    note(f"backup of {datetime.fromtimestamp(stamp / 1e9):%Y-%m-%d %H:%M}, {age(datetime.now().timestamp() - stamp / 1e9)} old")
+    # The mirror's copy carries the backup's mtime, which is how it is known to be current.
+    fresh = not (plain.exists() and plain.stat().st_mtime_ns == stamp)
+    if fresh:
+        decrypt(backup, plain, stamp)
+    db = sqlite3.connect(f"file:{plain}?mode=ro", uri=True)
+    try:
+        named = write_changed(MIRROR / "names.json", names_file(db, Names(db, contacts())))
+    finally:
+        db.close()
+    return Updated(stamp, fresh, named)
+
+
+def decrypt(backup: Path, plain: Path, stamp: int) -> None:
     from wa_crypt_tools.lib.db.dbfactory import DatabaseFactory
     from wa_crypt_tools.lib.key.keyfactory import KeyFactory
-
-    backup = CACHE / BACKUP
-    plain = RUNTIME / "msgstore.db"
-    stamp = backup.stat().st_mtime
-    note(f"backup of {datetime.fromtimestamp(stamp):%Y-%m-%d %H:%M}, {age(datetime.now().timestamp() - stamp)} old")
-    if plain.exists() and plain.stat().st_mtime == stamp:
-        return plain
 
     sops = subprocess.run(["sops", "-d", str(KEY)], capture_output=True, text=True)
     if sops.returncode != 0:
@@ -184,12 +232,54 @@ def decrypted() -> Path:
     with backup.open("rb") as f:
         db = DatabaseFactory.from_file(f)
         data = zlib.decompress(db.decrypt(KeyFactory.from_hex(sops.stdout.strip()), f.read()))
-    RUNTIME.mkdir(parents=True, exist_ok=True)
-    partial = plain.with_suffix(".partial")
+    replace(plain, data, stamp)
+
+
+def write_changed(path: Path, text: str) -> bool:
+    """Write text to path unless it holds that already, so an unchanged file keeps its mtime and no copy ships it
+    again; whether it was written."""
+    if path.exists() and path.read_text() == text:
+        return False
+    replace(path, text.encode())
+    return True
+
+
+def replace(path: Path, data: bytes, mtime_ns: int | None = None) -> None:
+    """Put data at path whole or not at all, so a reader never opens half of it."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.{os.getpid()}.partial")
     partial.write_bytes(data)
-    os.utime(partial, (stamp, stamp))
-    partial.replace(plain)
-    return plain
+    if mtime_ns is not None:
+        os.utime(partial, ns=(mtime_ns, mtime_ns))
+    partial.replace(path)
+
+
+def mirror(record: bool) -> None:
+    def log(outcome: str, *more: str) -> None:
+        if record and subprocess.run([str(RUN_LOG), UNIT, outcome, *more]).returncode != 0:
+            note("run-log failed")
+
+    away = pull()
+    if away and not (CACHE / BACKUP).exists():
+        note(f"the phone did not answer, and no backup is cached: {away}")
+        log("skip", "--reason", f"phone not reached, no backup cached: {away}")
+        return
+    try:
+        done = update()
+    except SystemExit as e:
+        log("fail", "--reason", str(e.code).splitlines()[0])
+        raise
+    if away:
+        note(f"the phone did not answer, so the mirror holds the cached backup ({away})")
+        log("skip", "--reason", f"phone not reached: {away}")
+        return
+    stats = {
+        "backup": datetime.fromtimestamp(done.backup / 1e9).astimezone().isoformat(timespec="seconds"),
+        "bytes": (MIRROR / "msgstore.db").stat().st_size,
+        "decrypted": done.decrypted,
+        "names_written": done.named,
+    }
+    log("ok", "--stats", json.dumps(stats))
 
 
 def contacts() -> dict[str, str]:
@@ -249,6 +339,23 @@ class Names:
         return chosen or f"{user}@{server}"
 
 
+def names_file(db: sqlite3.Connection, names: Names) -> str:
+    """names.json: what every row of the jid table is called, by its raw_string (user@server, with the device where it
+    names one), and what each message type and each
+    kind of chat is, for a reader of the mirror without this script. The same database and address book give the
+    same text."""
+    return json.dumps(
+        {
+            "names": [{"jid": raw, "name": names(i)} for i, raw in
+                      db.execute("select _id, raw_string from jid where raw_string is not null order by raw_string")],
+            "kinds": [{"type": t, "kind": k} for t, k in {0: "text", **KINDS}.items()],
+            "system": SYSTEM,
+            "chat_kinds": [{"server": server, "kind": k} for server, k in CHAT_KINDS.items()],
+        },
+        ensure_ascii=False,
+    )
+
+
 # --- chats -----------------------------------------------------------------------
 
 
@@ -263,7 +370,6 @@ class Chat:
 
 
 def chats(db: sqlite3.Connection, names: Names) -> list[Chat]:
-    kinds = {"g.us": "group", "newsletter": "channel", "broadcast": "broadcast"}
     rows = db.execute(
         """select c._id, c.jid_row_id, j.server, count(m._id), max(m.timestamp)
            from chat c join jid j on j._id = c.jid_row_id
@@ -271,7 +377,7 @@ def chats(db: sqlite3.Connection, names: Names) -> list[Chat]:
            group by c._id order by max(m.timestamp) desc""",
         (SYSTEM,),
     )
-    return [Chat(i, jid, kinds.get(server, "dm"), names(jid), n, last) for i, jid, server, n, last in rows if n]
+    return [Chat(i, jid, CHAT_KINDS.get(server, "dm"), names(jid), n, last) for i, jid, server, n, last in rows if n]
 
 
 def print_chats(db: sqlite3.Connection, names: Names, query: str, limit: int) -> None:
