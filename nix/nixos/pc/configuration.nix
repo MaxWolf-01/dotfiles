@@ -26,6 +26,7 @@
     ../journald.nix
     ../uv-python.nix
     ../gpu-queue.nix
+    ../sudo-touch.nix
   ];
 
   # Boot

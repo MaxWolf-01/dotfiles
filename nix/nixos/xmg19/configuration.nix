@@ -20,6 +20,7 @@
     ../host-recorder.nix
     ../journald.nix
     ../uv-python.nix
+    ../sudo-touch.nix
   ];
 
   hardware.facter.reportPath = ./facter.json;
