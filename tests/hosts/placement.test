@@ -1,0 +1,128 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Check the readings bin/hosts makes of a probe's answer, and where its placer puts a spawn given readings. Run it
+directly; no framework.
+
+What an orchestrator relies on: a spawn is placed on the hosts that can take it now, best first, told apart from
+one that has to wait and one no host could ever take; the memory a host offers is what its workers may really use;
+and --json names each field of a reading. The whole command, driven through a stand-in ssh, is
+tests/hosts/readings.test.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from check import bin_module, check, finish  # noqa: E402
+
+hosts = bin_module("hosts")
+Reading, Answer = hosts.Reading, hosts.Answer
+
+
+def answer(*lines: str):
+    return hosts.Answer(hosts.parse("\n".join(lines)))
+
+
+# --- a reading, from a probe's answer
+
+check("free memory for workers is what user.slice's ceiling leaves, when that is less", (4000000, 10000000),
+      hosts.memory(answer("memtotal_kb=16000000", "memavail_kb=9000000", "arc_kb=500000", "users_max_kb=10000000",
+                          "users_used_kb=6000000")))
+check("free memory counts the ZFS ARC as free, and workers use at most the ceiling", (2500000, 10000000),
+      hosts.memory(answer("memtotal_kb=16000000", "memavail_kb=2000000", "arc_kb=500000", "users_max_kb=10000000",
+                          "users_used_kb=1000000")))
+check("the most workers may use leaves out what max's sessions are protected up to", 8388608,
+      hosts.memory(answer("memtotal_kb=16000000", "memavail_kb=9000000", "users_max_kb=10485760",
+                          "users_used_kb=1000000", "users_reserved_kb=2097152"))[1])
+
+# A worker user's entry, as hosts reads it: its machine's name as `host`.
+entry = {"host": "box", "user": "agent", "isolated": None, "has": ["docker"], "withholds": []}
+check("a host offers what was probed, an asleep GPU among it, and its entry's has", ["docker", "gpu", "x86_64"],
+      hosts.capabilities(entry, answer("arch=x86_64", "gpu=asleep")))
+entry = {"host": "box", "user": "agent", "isolated": None, "has": ["docker"], "withholds": ["gpu"]}
+check("a host offers what was probed and its entry's has, less its withholds", ["docker", "x86_64"],
+      hosts.capabilities(entry, answer("arch=x86_64", "gpu=GeForce|0|460|4096")))
+check("a locked host's reading counts nothing, and carries what its entry says",
+      Reading("agent@box", "box", None, None, "locked", None, None, ["docker"], None, None, None, ["gpu"], None),
+      hosts.reading(entry, answer("locked=1")))
+
+# Every field told apart from the others by its value, so a field read from the wrong column shows.
+check("--json names each field of a reading",
+      '{"target":"agent@box","host":"box","account":"personal","isolated":true,"state":"up","slots_held":1,"slots":6,"offers":["gpu","x86_64"],"free_kb":9000000,"most_kb":16000000,"cpu_pressure":2.5,"withholds":["docker"],"placement":"last","description":"A box."}',
+      json.dumps(hosts.row(Reading("agent@box", "box", "personal", True, "up", 1, 6, ["gpu", "x86_64"], 9000000,
+                                   16000000, 2.5, ["docker"], "last"), "A box."), separators=(",", ":")))
+
+# --- placing a spawn
+
+
+def r(target: str, *, account="personal", isolated=True, state="up", held=0, slots=6, offers=("x86_64",),
+      free=8388608, most=10485760, pressure=1.0, withholds=(), placement=None):
+    return Reading(target, target.split("@")[1], account, isolated, state, held, slots, list(offers), free, most,
+                   pressure, list(withholds), placement)
+
+
+def places(what: str, expected: str, account: str, needs: tuple[str, ...], *readings) -> None:
+    """Checks that a spawn on account needing every capability is placed on expected: the user@hosts best first,
+    or `exit <n>`."""
+    chosen, code = hosts.place(list(readings), account, needs)
+    check(what, expected, " ".join(t for t, _ in chosen) if code == 0 else f"exit {code}")
+
+
+places("the machine whose tasks waited least for a CPU first", "agent@pc agent@xmg19", "personal", (),
+       r("agent@xmg19", pressure=12.5), r("agent@pc", pressure=3.0))
+places("a machine with every slot held is passed over", "agent@xmg19", "personal", (),
+       r("agent@pc", held=6, pressure=0), r("agent@xmg19", slots=8, held=7, pressure=9))
+places("an unreachable or locked machine is passed over", "agent@laptop", "personal", (),
+       r("agent@pc", state="unreachable"), r("agent@xmg19", state="locked"), r("agent@laptop", pressure=40))
+places("a machine whose pressure is unknown is passed over", "agent@xmg19", "personal", (),
+       r("agent@pc", pressure=None), r("agent@xmg19", pressure=30))
+places("only the spawn's account", "agent-hl@pc", "helferline", (),
+       r("agent@pc", pressure=0), r("agent-hl@pc", account="helferline", pressure=5))
+places("only a machine offering every capability the spawn needs", "agent@xmg19", "personal", ("gpu", "docker"),
+       r("agent@pc", offers=["docker"], pressure=0), r("agent@xmg19", offers=["gpu", "docker", "x86_64"], pressure=5),
+       r("agent@laptop", offers=["gpu"]))
+places("a machine with no slot count is never placed on", "agent@pc", "personal", (),
+       r("max@zephylux", slots=None, held=None, pressure=0), r("agent@pc", pressure=50))
+places("at one pressure, the machine holding fewer slots first", "agent@xmg19 agent@pc", "personal", (),
+       r("agent@pc", slots=12, held=10, pressure=2), r("agent@xmg19", slots=12, held=9, pressure=2))
+places("a last-placed machine comes after every other that can take the spawn, however idle",
+       "agent@xmg19 agent@pc max@zephylux", "personal", (),
+       r("max@zephylux", placement="last", pressure=0, held=0), r("agent@pc", pressure=40, held=5),
+       r("agent@xmg19", pressure=30))
+places("and takes the spawn when no other can", "max@zephylux", "personal", (),
+       r("max@zephylux", placement="last", pressure=50), r("agent@pc", held=6), r("agent@xmg19", state="unreachable"))
+places("a machine without the memory for another worker is passed over", "agent@xmg19", "personal", (),
+       r("agent@pc", free=1048576, pressure=0), r("agent@xmg19", pressure=20))
+places("memory the spawn needs is the most the workers may use", "agent@xmg19", "personal", ("mem=16G",),
+       r("agent@pc", most=10485760, pressure=0), r("agent@xmg19", most=25165824, pressure=20))
+places("every machine full waits", "exit 3", "personal", (), r("agent@pc", held=6), r("agent@xmg19", slots=2, held=2))
+places("a machine whose memory is taken waits", "exit 3", "personal", (), r("agent@pc", free=0))
+places("a host down may take it once back, so the spawn waits", "exit 3", "personal", ("gpu",),
+       r("agent@pc", state="unreachable"))
+places("a host down whose record withholds what the spawn needs never takes it", "exit 1", "personal", ("gpu",),
+       r("agent@pc", state="unreachable", withholds=["gpu"]))
+places("a capability no host up offers, and none down, is never placed", "exit 1", "personal", ("gpu",),
+       r("agent@pc", offers=["docker"]), r("max@zephylux", slots=None, held=None, offers=["gpu"]))
+here = hosts.here()
+places("a record naming no account takes a spawn on any account from a dispatcher on its machine", here,
+       "helferline", (), r(here, account=None))
+places("...and none from elsewhere", "exit 1", "helferline", (), r("max@elsewhere", account=None))
+places("an account no record names is never placed", "exit 1", "personal", (), r("agent-hl@pc", account="helferline"))
+check("each host comes with whether it is isolated", ([("agent@pc", True), ("max@zephylux", False)], 0),
+      hosts.place([r("agent@pc"), r("max@zephylux", isolated=False, pressure=9)], "personal", ()))
+
+# A reading as `reading` makes it from an up host's answer, placed: the placer reads the fields `reading` writes.
+entry = {"host": "box", "user": "agent", "isolated": True, "account": "personal", "has": [], "withholds": []}
+up = hosts.reading(entry, answer("held=1", "slots=6", "arch=x86_64", "memtotal_kb=16000000", "memavail_kb=9000000",
+                                 "pressure=2.50", "gpu=GeForce|0|460|4096"))
+check("an up host's reading names its slots, capabilities, memory and pressure",
+      Reading("agent@box", "box", "personal", True, "up", 1, 6, ["gpu", "x86_64"], 9000000, 16000000, 2.5, [], None),
+      up)
+check("and the placer places on it", ([("agent@box", True)], 0), hosts.place([up], "personal", ("gpu",)))
+
+finish()
