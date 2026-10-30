@@ -58,9 +58,9 @@ class View:
     """Every worker user, with its machine's live state; or, named, one worker user's whole record.
 
     Probes run in parallel with a connect timeout, so an unreachable host costs that timeout and delays none of the
-    others. Its description still prints, which is why the record's hand-written half lives in the checkout,
-    nix/home/hosts/<host>-<user>/HOST.md, and not only on the host: you read a description when a machine is down
-    and you need to know whether it was the one you wanted.
+    others. An unreachable host's description still prints, which is why the record's hand-written half lives in
+    the checkout, nix/home/hosts/<host>-<user>/HOST.md, and not only on the host: you read a description when a
+    machine is down and you need to know whether it was the one you wanted.
 
     JSON (--json): a list of the readings placement decides from, null where a host did not answer, each with
     target, host, account, isolated, state (up, locked or unreachable), slots_held, slots, offers (a list),
@@ -93,7 +93,8 @@ class Place:
     """The user@hosts a spawn on ACCOUNT with every capability it needs may start on now, best first.
 
     Each line is user@host, a tab, and `isolated` or `not isolated`. The readings it chose from go to stderr.
-    Exit 3: none now, but one may once a slot frees or a host is back; 1: none ever could.
+    Exits 3 when no host can take it now but one may once a slot frees or a host is back, and 1 when none ever
+    could.
 
     A spawn asks for capabilities by name, and a machine's are read off it where they are facts: its
     architecture (`x86_64`), `gpu`, and `mem=<N>G`, met where the workers may use N GiB; the entry's `has` adds to
@@ -277,7 +278,7 @@ if grep -qx '[0-9]*' "$users/memory.max" 2>/dev/null; then
     awk '/^[0-9]+$/ {s += $1} END {print "users_reserved_kb=" int(s / 1024)}'
 fi
 # The ZFS ARC is evictable but counts as used, so MemAvailable understates a
-# host with a pool by the size of it -- gigabytes, on this one.
+# host with a pool by the size of it: gigabytes, on this one.
 if [ -r /proc/spl/kstat/zfs/arcstats ]; then
   awk '$1 == "size" {print "arc_kb=" int($3 / 1024)}' /proc/spl/kstat/zfs/arcstats
 fi
@@ -327,7 +328,7 @@ def parse(out: str) -> dict[str, list[str]]:
 
 def probe(entry: dict) -> Answer:
     # stderr is kept, not discarded: an unauthorized key and a machine that is off both produce no output, and only
-    # the error tells you which one you are looking at -- one of them you can fix in a minute.
+    # the error tells you which one you are looking at. One of them you can fix in a minute.
     done = subprocess.run(["ssh", *SSH_OPTS, target(entry), "bash", "-s"], input=REMOTE_PROBE,
                           capture_output=True, text=True, check=False)
     return Answer(parse(done.stdout), done.stderr)
@@ -501,7 +502,9 @@ def paint(text: str, *codes: str) -> str:
     return f"\033[{';'.join(codes)}m{text}\033[0m"
 
 
-def gib(kb: int) -> str:
+def gib(kb: int | None) -> str:
+    if kb is None:
+        return "-"
     g = kb / 1048576
     return f"{g:.1f}G" if g < 10 else f"{g:.0f}G"
 
@@ -529,13 +532,14 @@ def render(r: Reading, entry: dict, answer: Answer) -> str:
     p = r.cpu_pressure
     waiting = paint(f"{pressure(p)}%", *(() if p is None else (GREEN,) if p < 5 else (YELLOW,) if p < 25 else (RED,)))
     line = (f"  {label('cpu')} {waiting} waiting, {answer.get('cores') or '-'} threads ({cpu_model(answer) or '-'})"
-            f"   {label('mem')} {gib(r.free_kb or 0)} free for workers of {gib(r.most_kb or 0)}")
+            f"   {label('mem')} {gib(r.free_kb)} free for workers of {gib(r.most_kb)}")
     gpu = answer.get("gpu")
     if gpu == "asleep":
         line += f"   {label('gpu')} asleep"
     elif gpu:
         gname, gutil, gused, gtotal = gpu.split("|")
-        line += f"   {label('gpu')} {gname.removeprefix('NVIDIA ')} {gutil}%, {gib((int(gtotal) - int(gused)) * 1024)} free"
+        free = gib((int(gtotal) - int(gused)) * 1024)
+        line += f"   {label('gpu')} {gname.removeprefix('NVIDIA ')} {gutil}%, {free} free"
     out += line + "\n"
 
     disks = "".join(f"   {mount} {avail} free of {size}"
@@ -584,10 +588,16 @@ def record(entry: dict) -> str:
     remote = subprocess.run(["ssh", *SSH_OPTS, t, "cat", "HOST.md"], capture_output=True, text=True, check=False)
     if remote.returncode == 0:
         return remote.stdout
-    print(f"hosts: {t} is unreachable — the checked-in record follows", file=sys.stderr)
-    body = (HOSTS_DIR / f"{entry['host']}-worker-body.md").read_text()
-    text = "".join(body if line == "@BODY@\n" else line
-                   for line in record_file(entry).read_text().splitlines(keepends=True))
+    print(f"hosts: {t} is unreachable; the checked-in record follows", file=sys.stderr)
+    # A machine with no shared body (zephylux) has none to splice in.
+    body_file = HOSTS_DIR / f"{entry['host']}-worker-body.md"
+    body = body_file.read_text() if body_file.is_file() else ""
+    try:
+        own = record_file(entry).read_text()
+    except OSError as e:
+        print(f"hosts: {e}", file=sys.stderr)
+        own = ""
+    text = "".join(body if line == "@BODY@\n" else line for line in own.splitlines(keepends=True))
     frontmatter = (entry.get("frontmatter") or "").rstrip("\n")
     return f"{frontmatter}\n\n{text}".replace("@TOOLCHAIN@", "(unknown: the tool list is spliced in on the host)")
 
@@ -634,7 +644,7 @@ def backups() -> None:
     pairs: set[tuple[str, str]] = set()
     for host, file in timer_files.items():
         if not file.is_file():
-            die(f"no timer definitions at {file} — nothing says which backups {host} runs")
+            die(f"no timer definitions at {file}, so nothing says which backups {host} runs")
         for conf in re.findall(r"backup/restic/[a-z0-9_-]+/[a-z0-9_-]+\.conf", file.read_text()):
             named = subprocess.run([str(REPO / "bin/restic-config-name"), conf], stdout=subprocess.PIPE, text=True,
                                    check=False)
@@ -644,7 +654,7 @@ def backups() -> None:
     # An empty answer would tell every reader that no host runs any backup: the watchdog would date each away
     # repository against the wrong host's log. A path spelled differently in a timer file is enough to get here.
     if not pairs:
-        die(f"no restic backup found in {' '.join(map(str, timer_files.values()))} — either no timer runs one, "
+        die(f"no restic backup found in {' '.join(map(str, timer_files.values()))}: either no timer runs one, "
             "or the paths there changed shape")
     # Two hosts backing up into one repository is a race nobody wrote down, and it would make the run log this
     # answer points at ambiguous.
