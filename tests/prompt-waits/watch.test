@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# tier: full-path (tmux)
+# Drive `prompt-waits watch` against a throwaway tmux server. Run it directly;
+# no framework.
+#
+# The promises: a pane whose foreground program waits on a sudo prompt gets one
+# file in the directory and one notification naming the command and the pane,
+# within two seconds, and never a second one while it waits; both go once the
+# prompt is answered, though the program runs on, and once the program ends; a
+# sudo run by a script is seen as well as one typed at the shell; the button
+# puts the attached tmux client on the pane; a file another program writes is
+# notified and withdrawn the same way, and one in another shape does not stop
+# the rest; a stopped watcher leaves nothing behind; one killed without its
+# cleanup, started again, puts a prompt still waiting in its notification's
+# place instead of notifying it twice.
+#
+# The stand-in sudo prints sudo's prompt and reads a line. notify-send is a
+# recorder that prints an id and, when the test "clicks" it, the button's
+# action; gdbus records the notifications withdrawn. The server runs on its own
+# socket under a scratch TMUX_TMPDIR, with TMUX unset, so the live server is
+# never reached.
+
+set -uo pipefail
+
+. "$(dirname "${BASH_SOURCE[0]}")/../check.sh"
+prompt_waits="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../bin" && pwd)/prompt-waits"
+
+needs tmux uv jq
+
+work=$(mktemp -d)
+export WORK="$work" TMUX_TMPDIR="$work/run" SHELL=/bin/sh
+unset TMUX
+mkdir -p "$TMUX_TMPDIR" "$work/bin" "$work/clicks"
+real_tmux=$(command -v tmux)
+
+cat >"$work/bin/tmux" <<EOF
+#!/usr/bin/env bash
+exec $real_tmux -f /dev/null -L prompt-waits "\$@"
+EOF
+cat >"$work/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '[sudo] password for max: '
+read -rs answer
+echo
+echo "running $*"
+sleep 60
+EOF
+cat >"$work/bin/nswitch" <<'EOF'
+#!/usr/bin/env bash
+sudo nixos-rebuild switch
+EOF
+cat >"$work/bin/notify-send" <<'EOF'
+#!/usr/bin/env bash
+n=$(( $(cat "$WORK/notified" 2>/dev/null | wc -l) + 1 ))
+args="$*"
+printf '%s\n' "$n ${args//$'\n'/ | }" >>"$WORK/notified"
+for arg; do case "$arg" in --replace-id=*) n=${arg#*=} ;; esac; done
+echo "$n"
+trap 'exit 0' TERM
+while :; do
+    if [ -e "$WORK/clicks/$n" ]; then rm "$WORK/clicks/$n"; echo go; fi
+    sleep 0.1
+done
+EOF
+cat >"$work/bin/gdbus" <<'EOF'
+#!/usr/bin/env bash
+echo "${@: -1}" >>"$WORK/closed"
+EOF
+chmod +x "$work/bin"/*
+export PATH="$work/bin:$PATH"
+T="$work/bin/tmux"
+
+dir="$work/prompt-waits"
+watcher=""
+cleanup() {
+    [ -z "$watcher" ] || kill "$watcher" 2>/dev/null
+    "$T" kill-server 2>/dev/null
+    pkill -f "$work/bin/notify-send" 2>/dev/null
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+# settles WHAT EXPECTED SECONDS COMMAND...: check() on COMMAND's output once it
+# prints EXPECTED, or at the deadline.
+settles() {
+    local what="$1" expected="$2" deadline=$(( $(date +%s%N) + $3 * 1000000000 )) actual
+    shift 3
+    while actual=$("$@" 2>/dev/null); [ "$actual" != "$expected" ] && [ "$(date +%s%N)" -lt "$deadline" ]; do
+        sleep 0.05
+    done
+    check "$what" "$expected" "$actual"
+}
+files() { (cd "$dir" && ls ./*.json 2>/dev/null | sed 's|^\./||' | sort | tr '\n' ' '); }
+count() { cat "$1" 2>/dev/null | wc -l | tr -d ' '; }
+field() { jq -r "$2" "$dir/$1"; }
+
+# --- a server: an idle session with a client on it, and the sessions that will prompt
+"$T" new-session -d -s idle -x 120 -y 30 'bash --norc -i'
+"$T" new-session -d -s work -x 120 -y 30 'bash --norc -i'
+"$T" new-window -t work:1 'bash --norc -i'
+"$T" new-session -d -s script -x 120 -y 30 'bash --norc -i'
+# The client is a real one, in a pane of a second server of its own.
+"$real_tmux" -f /dev/null -L prompt-waits-outer new-session -d -x 120 -y 30 "env -u TMUX $T attach -t idle"
+trap '"$real_tmux" -L prompt-waits-outer kill-server 2>/dev/null; cleanup' EXIT
+settles "the client is attached to the idle session" "idle" 10 "$T" list-clients -F '#{session_name}'
+
+"$prompt_waits" watch --dir "$dir" --interval 0.25 --terminal "false" >"$work/watcher.log" 2>&1 &
+watcher=$!
+settles "the watcher makes its directory" "yes" 60 bash -c "[ -d '$dir' ] && echo yes"
+sleep 1  # the watcher is through its startup
+
+# --- a sudo prompt typed at the shell
+"$T" send-keys -t work:1.0 'sudo true' Enter
+settles "a sudo prompt gets its file within two seconds" "1" 2 bash -c "ls '$dir'/*.json 2>/dev/null | wc -l"
+settles "and one notification within two seconds" "1" 2 count "$work/notified"
+id=$(files | tr -d ' ')
+pane=$("$T" display -p -t work:1.0 '#{pane_id}')
+check "the file is the pane's" "tmux-${pane#%}-" "$(sed 's/[0-9]*\.json$//' <<<"$id")"
+check "it waits for a password" "password" "$(field "$id" .kind)"
+check "it holds the prompt's line" "[sudo] password for max:" "$(field "$id" .prompt)"
+check "it holds the command" "bash $work/bin/sudo true" "$(field "$id" .command)"
+check "it holds the pane" "$pane work:1.0" "$(field "$id" '"\(.pane.id) \(.pane.target)"')"
+check "it holds when it appeared" "yes" "$(field "$id" .since | grep -qE '^[0-9]{4}-..-..T' && echo yes)"
+check "the notification names the program and the kind" "yes" \
+    "$(grep -q 'sudo waits for a password' "$work/notified" && echo yes)"
+check "it names the command and the pane" "yes" \
+    "$(grep -q "bash $work/bin/sudo true" "$work/notified" && grep -q 'in work:1.0' "$work/notified" && echo yes)"
+check "it is critical and has a button" "yes" \
+    "$(grep -q -- '--urgency=critical' "$work/notified" && grep -q -- '--action=go=' "$work/notified" && echo yes)"
+check "nothing else of the pane reaches the file" \
+    '["command","id","kind","pane","prompt","since"]' "$(jq -c 'keys' "$dir/$id")"
+
+sleep 1.5
+check "a prompt still waiting is notified once" "1" "$(count "$work/notified")"
+
+# --- the button
+touch "$work/clicks/1"
+settles "the button puts the client on the prompt's session" "work" 3 "$T" list-clients -F '#{session_name}'
+check "and on its pane" "$pane" "$("$T" list-clients -F '#{pane_id}')"
+
+# --- answered while the program runs on
+"$T" send-keys -t work:1.0 'hunter2' Enter
+settles "an answered prompt's file goes" "" 2 files
+settles "and its notification is withdrawn" "1" 2 cat "$work/closed"
+settles "the program runs on" "yes" 3 bash -c "$T capture-pane -p -t work:1.0 | grep -q 'running true' && echo yes"
+check "nothing is notified for the answered prompt" "1" "$(count "$work/notified")"
+
+# --- a sudo inside a script, and the command ending before an answer
+"$T" send-keys -t script:0.0 'nswitch' Enter
+settles "a script's sudo gets its file" "1" 2 bash -c "ls '$dir'/*.json 2>/dev/null | wc -l"
+check "its command is the sudo's" "bash $work/bin/sudo nixos-rebuild switch" "$(field "$(files | tr -d ' ')" .command)"
+"$T" send-keys -t script:0.0 C-c
+settles "a prompt whose command ended loses its file" "" 2 files
+settles "and its notification" "2" 2 count "$work/closed"
+
+# --- a file another program writes
+printf '%s\n' '{"id": "agent-1", "kind": "touch", "prompt": "Touch the YubiKey", "command": "ssh pc", "since": "2026-10-30T12:00:00+00:00"}' \
+    >"$dir/.agent-1.part" && mv "$dir/.agent-1.part" "$dir/agent-1.json"
+settles "another program's file is notified" "3" 2 count "$work/notified"
+check "as what it waits for" "yes" "$(tail -1 "$work/notified" | grep -q 'ssh waits for a touch' && echo yes)"
+check "with no button, having no pane" "no" "$(tail -1 "$work/notified" | grep -q -- '--action' && echo yes || echo no)"
+rm "$dir/agent-1.json"
+settles "and withdrawn when it goes" "3" 2 count "$work/closed"
+
+# --- files in another shape
+printf '%s\n' '{"id": "odd", "kind": "pin", "command": "echo it'"'"'s"}' >"$dir/odd.json"
+printf '%s\n' '{"id": "bad", "kind": "pin", "pane": "work:0.0"}' >"$dir/bad.json"
+printf '%s\n' '["not", "a", "prompt"]' >"$dir/worse.json"
+settles "a command that is no shell words is still notified" "4" 2 count "$work/notified"
+check "under its first word" "yes" "$(tail -1 "$work/notified" | grep -q 'echo waits for a PIN' && echo yes)"
+sleep 1
+check "a file in another shape is not notified, nor does it stop the watcher" "4 yes" \
+    "$(count "$work/notified") $(kill -0 "$watcher" && echo yes)"
+rm "$dir/odd.json" "$dir/bad.json" "$dir/worse.json"
+settles "the odd one is withdrawn when it goes" "4" 2 count "$work/closed"
+
+# --- the watcher stopping
+"$T" send-keys -t work:0.0 'sudo -v' Enter
+settles "one more prompt waits" "1" 2 bash -c "ls '$dir'/*.json 2>/dev/null | wc -l"
+settles "and is notified" "5" 2 count "$work/notified"
+kill "$watcher"; wait "$watcher" 2>/dev/null; watcher=""
+check "a stopped watcher leaves no file of its own" "" "$(files)"
+check "and withdraws its notifications" "5" "$(count "$work/closed")"
+
+# --- a watcher killed without its cleanup, as a crash or systemd's SIGKILL leaves it
+start_watcher() {
+    "$prompt_waits" watch --dir "$dir" --interval 0.25 --terminal "false" >>"$work/watcher.log" 2>&1 &
+    watcher=$!
+}
+start_watcher
+settles "a started watcher notifies the prompt still waiting" "6" 60 count "$work/notified"
+settles "and keeps its notification's id" '["6"]' 2 jq -c '[.[]]' "$dir/.notified"
+disown "$watcher"; pkill -KILL -f "prompt-waits watch --dir $dir"; pkill -KILL -f "$work/bin/notify-send"
+while kill -0 "$watcher" 2>/dev/null; do sleep 0.05; done; watcher=""
+check "the killed watcher's file stays" "1" "$(ls "$dir"/*.json 2>/dev/null | wc -l)"
+start_watcher
+settles "started again, it shows the prompt again" "7" 60 count "$work/notified"
+check "in the place of the notification it left" "yes" "$(tail -1 "$work/notified" | grep -q -- '--replace-id=6' && echo yes)"
+check "and withdraws nothing while it waits" "5" "$(count "$work/closed")"
+"$T" send-keys -t work:0.0 'hunter2' Enter
+settles "answered, that notification is withdrawn" "6" 2 count "$work/closed"
+check "under the id it kept" "6" "$(tail -1 "$work/closed")"
+
+if [ "$failures" -gt 0 ]; then echo "--- the watcher's log"; cat "$work/watcher.log"; fi
+finish
