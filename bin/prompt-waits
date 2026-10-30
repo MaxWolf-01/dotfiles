@@ -10,8 +10,8 @@ the prompt waits. Any program may write one there, named by an id of its own and
 
     {"id", "kind": "password|pin|touch|passphrase", "prompt", "command", "pane": {"id", "target"}, "since"}
 
-where "pane" is optional, and "since" is an ISO 8601 time. A file goes in whole: write it beside its name and rename
-it into place.
+where "pane" is optional, and "since" is an ISO 8601 time. A file goes in whole: write it under a name that starts
+with a dot, which is never read, and rename it into place. A file in another shape is left out.
 
 The watcher (`prompt-waits watch`, the prompt-waits unit) writes and removes the files for the panes of the default
 tmux server, under ids that start with "tmux-". A pane waits when a program of its foreground process group is a
@@ -25,8 +25,8 @@ to it when no client is.
 
 Examples:
 
-    prompt-waits list
     prompt-waits watch
+    cat $XDG_RUNTIME_DIR/prompt-waits/*.json
 """
 
 import json
@@ -136,10 +136,10 @@ class Pane:
     cursor_y: int
 
 
-def panes(tmux: str) -> list[Pane]:
+def panes() -> list[Pane]:
     """Every pane of the default tmux server, by one list-panes call; none when the server does not run."""
     fmt = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_pid}\t#{cursor_y}"
-    done = subprocess.run([tmux, "list-panes", "-a", "-F", fmt], capture_output=True, text=True)
+    done = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt], capture_output=True, text=True)
     if done.returncode != 0:
         return []
     found = []
@@ -195,25 +195,25 @@ def foreground(shell: int) -> list[int]:
     return found
 
 
-def cursor_lines(tmux: str, pane: Pane) -> list[str]:
+def cursor_lines(pane: Pane) -> list[str]:
     """The pane's cursor line and the one above it, and nothing else of it."""
     done = subprocess.run(
-        [tmux, "capture-pane", "-p", "-t", pane.id, "-S", str(max(0, pane.cursor_y - 1)), "-E", str(pane.cursor_y)],
+        ["tmux", "capture-pane", "-p", "-t", pane.id, "-S", str(max(0, pane.cursor_y - 1)), "-E", str(pane.cursor_y)],
         capture_output=True,
         text=True,
     )
     return done.stdout.split("\n")[:-1] if done.returncode == 0 else []
 
 
-def waiting(tmux: str) -> dict[str, dict]:
+def waiting() -> dict[str, dict]:
     """The prompts the panes wait on now, by id, each as its file holds it, without "since"."""
     found = {}
-    for pane in panes(tmux):
+    for pane in panes():
         prompters = [(pid, argv) for pid in foreground(pane.pid) if is_prompter(program_name(argv := cmdline(pid)))]
         if not prompters:
             continue
         pid, argv = prompters[-1]
-        prompt = prompt_in(program_name(argv), cursor_lines(tmux, pane))
+        prompt = prompt_in(program_name(argv), cursor_lines(pane))
         if prompt:
             id = f"tmux-{pane.id.lstrip('%')}-{pid}"
             found[id] = {
@@ -237,53 +237,78 @@ def write(dir: Path, record: dict) -> None:
 
 
 def read_all(dir: Path) -> dict[str, dict]:
-    """Every waiting prompt in the directory, by file name; a file that is not a JSON object is left out."""
+    """Every waiting prompt in the directory, by file name. A file in another shape is left out, so one producer's
+    mistake cannot keep the others' prompts from being notified."""
     found = {}
-    for path in sorted(dir.glob("*.json")):
+    for path in sorted(dir.glob("[!.]*.json")):
         try:
             record = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        if isinstance(record, dict):
+        if well_formed(record):
             found[path.stem] = record
     return found
+
+
+def well_formed(record) -> bool:
+    if not isinstance(record, dict) or record.get("kind") not in WAITS_FOR:
+        return False
+    if not all(isinstance(record.get(key, ""), str) for key in ("prompt", "command")):
+        return False
+    pane = record.get("pane")
+    return pane is None or (isinstance(pane, dict) and isinstance(pane.get("id"), str))
 
 
 # --- the notifications
 
 
 def summary(record: dict) -> str:
-    argv = shlex.split(record.get("command") or "") if record.get("command") else []
-    who = program_name(argv) if argv else "A program"
-    return f"{who} waits for {WAITS_FOR.get(record.get('kind', ''), 'you')}"
+    command = record.get("command", "")
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = command.split()
+    return f"{program_name(argv) if argv else 'A program'} waits for {WAITS_FOR[record['kind']]}"
 
 
 def body(record: dict) -> str:
     lines = [record.get("prompt", ""), record.get("command", "")]
     if pane := record.get("pane"):
-        lines.append(f"in {pane.get('target') or pane.get('id')}")
+        lines.append(f"in {pane.get('target') or pane['id']}")
     return "\n".join(line for line in lines if line)
 
 
-def go(tmux: str, terminal: list[str], pane_id: str) -> None:
+def go(terminal: list[str], pane_id: str) -> None:
     """Put the most recently active tmux client on the pane, or a new terminal attached to it."""
-    done = subprocess.run([tmux, "list-clients", "-F", "#{client_activity}\t#{client_name}"], capture_output=True, text=True)
+    done = subprocess.run(["tmux", "list-clients", "-F", "#{client_activity}\t#{client_name}"], capture_output=True, text=True)
     clients = sorted(
         (int(a), name) for a, _, name in (row.partition("\t") for row in done.stdout.splitlines()) if a.isdigit()
     )
     if clients:
-        subprocess.run([tmux, "switch-client", "-c", clients[-1][1], "-t", pane_id])
+        subprocess.run(["tmux", "switch-client", "-c", clients[-1][1], "-t", pane_id])
     else:
-        subprocess.run([tmux, "select-window", "-t", pane_id])
-        subprocess.run([tmux, "select-pane", "-t", pane_id])
-        subprocess.Popen([*terminal, tmux, "attach-session", "-t", pane_id], start_new_session=True)
+        subprocess.run(["tmux", "select-window", "-t", pane_id])
+        subprocess.run(["tmux", "select-pane", "-t", pane_id])
+        subprocess.Popen([*terminal, "tmux", "attach-session", "-t", pane_id], start_new_session=True)
+
+
+def close(notification_id: str) -> None:
+    subprocess.run(
+        ["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+         "--object-path", "/org/freedesktop/Notifications",
+         "--method", "org.freedesktop.Notifications.CloseNotification", notification_id],
+        capture_output=True,
+    )  # fmt: skip
 
 
 class Notification:
-    """One desktop notification, held open by its notify-send until it is clicked, dismissed or withdrawn."""
+    """One desktop notification, held open by its notify-send until it is clicked, dismissed or withdrawn. One that
+    replaces another takes its place on screen instead of showing a second."""
 
-    def __init__(self, record: dict, on_go):
+    def __init__(self, record: dict, on_go, replaces: str | None = None):
         args = ["notify-send", "--app-name=prompt-waits", "--urgency=critical", "--print-id", "--wait"]
+        if replaces:
+            args.append(f"--replace-id={replaces}")
         pane_id = (record.get("pane") or {}).get("id")
         if pane_id:
             args.append("--action=go=Go to pane")
@@ -314,29 +339,11 @@ class Notification:
                 self.close()
 
     def close(self) -> None:
-        subprocess.run(
-            ["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
-             "--object-path", "/org/freedesktop/Notifications",
-             "--method", "org.freedesktop.Notifications.CloseNotification", self.id],
-            capture_output=True,
-        )  # fmt: skip
+        close(self.id)
         self.proc.terminate()
 
 
-# --- the commands
-
-
-@dataclass
-class ListArgs:
-    dir: Path = default_dir()
-    """The directory of waiting prompts."""
-
-
-@app.command(name="list")
-def list_(args: ListArgs) -> None:
-    """Print every waiting prompt, one JSON object a line."""
-    for record in read_all(args.dir).values() if args.dir.is_dir() else ():
-        print(json.dumps(record))
+# --- the command
 
 
 @dataclass
@@ -345,8 +352,6 @@ class WatchArgs:
     """The directory of waiting prompts, made when missing."""
     interval: float = 0.5
     """Seconds between two looks at the panes and the directory."""
-    tmux: str = "tmux"
-    """The tmux binary, which reaches the default server."""
     terminal: str = "ghostty -e"
     """The terminal a button opens, with what makes it run a command, when no tmux client is attached."""
 
@@ -357,21 +362,28 @@ def watch(args: WatchArgs) -> None:
 
     Each look costs one `tmux list-panes -a`, and one `tmux capture-pane` per pane whose foreground holds a
     prompter. A file is written once, when its prompt appears, and removed when the prompt goes. On exit the
-    watcher removes its files and withdraws its notifications."""
+    watcher removes its files and withdraws its notifications. The notifications on screen are kept in the
+    directory's .notified, so a watcher that died without withdrawing them withdraws them when it starts again,
+    and puts each prompt still waiting in its old notification's place rather than notifying it a second time."""
     args.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     terminal = shlex.split(args.terminal)
-    ours: set[str] = set()
+    state = args.dir / ".notified"
+    ours = {path.stem for path in args.dir.glob("tmux-*.json")}
     shown: dict[str, Notification] = {}
+    try:
+        left = json.loads(state.read_text())
+    except (OSError, ValueError):
+        left = {}
+    left = {id: n for id, n in left.items() if isinstance(n, str)} if isinstance(left, dict) else {}
+    kept: dict[str, str] = {}
 
     def on_go(pane_id: str) -> None:
-        go(args.tmux, terminal, pane_id)
+        go(terminal, pane_id)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    for stale in args.dir.glob("tmux-*.json"):
-        stale.unlink(missing_ok=True)
     try:
         while True:
-            now = waiting(args.tmux)
+            now = waiting()
             for id in ours - now.keys():
                 (args.dir / f"{id}.json").unlink(missing_ok=True)
                 print(f"answered: {id}")
@@ -383,14 +395,21 @@ def watch(args: WatchArgs) -> None:
             files = read_all(args.dir)
             for id in shown.keys() - files.keys():
                 shown.pop(id).withdraw()
+            for id in left.keys() - files.keys():
+                close(left[id])
             for id in files.keys() - shown.keys():
-                shown[id] = Notification(files[id], on_go)
+                shown[id] = Notification(files[id], on_go, replaces=left.get(id))
+            left = {}
+            if (ids := {id: n.id for id, n in shown.items() if n.id}) != kept:
+                state.write_text(json.dumps(ids))
+                kept = ids
             time.sleep(args.interval)
     finally:
         for id in ours:
             (args.dir / f"{id}.json").unlink(missing_ok=True)
         for notification in shown.values():
             notification.withdraw()
+        state.unlink(missing_ok=True)
 
 
 def table() -> str:
