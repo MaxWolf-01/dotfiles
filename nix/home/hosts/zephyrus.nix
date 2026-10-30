@@ -6,6 +6,15 @@
 
   home.sessionVariables.SOPS_AGE_KEY_FILE = "${config.home.homeDirectory}/.local/secrets/age-key.txt";
 
+  # A monitor on a dGPU port gets its frames copied from the iGPU. mutter's
+  # default copy has the iGPU write into a buffer in NVIDIA's video memory,
+  # which the open driver cannot share, and gnome-shell aborts on the first
+  # frame after a hotplug. This makes mutter read each frame back on the CPU
+  # instead; it leaves the iGPU's own monitors alone. Read at gnome-shell's
+  # start, so it takes effect at the next login.
+  # ../../../agent/tickets/hdmi-hotplug-crashes-gnome-shell.md
+  home.sessionVariables.MUTTER_DEBUG_MULTI_GPU_FORCE_COPY_MODE = "primary-gpu-cpu";
+
   claudeToken.mode = "switch";
 
   # This machine's capability record, read by a worker running locally and by
