@@ -26,6 +26,9 @@ in
     # alert-send needs the age key, decrypted on max's first login after a
     # boot; until then the mail is undelivered and the run log keeps the record.
     environment.SOPS_AGE_KEY_FILE = "/run/user/1000/age-key.txt";
+    # A switch would otherwise kill a run in progress and wait out a fresh one,
+    # hours. A changed unit takes effect at the next plug-in.
+    restartIfChanged = false;
     serviceConfig = {
       Type = "oneshot";
       # The pool's partitions appear a moment after the disk itself.
