@@ -138,8 +138,8 @@ def main() -> None:
     if isinstance(cmd, Mirror):
         mirror(cmd.record)
         return
-    if not cmd.offline and (away := pull()):
-        note(f"the phone did not answer, so this reads the cached backup ({away})")
+    if not cmd.offline and (missed := pull()):
+        note(f"no backup was copied from the phone, so this reads the cached backup ({missed.reason})")
     update()
     db = sqlite3.connect(f"file:{MIRROR / 'msgstore.db'}?mode=ro", uri=True)
     names = Names(db, contacts())
@@ -152,9 +152,18 @@ def main() -> None:
 # --- getting the database --------------------------------------------------------
 
 
-def pull() -> str | None:
-    """The newest backup and address book into CACHE: None where the phone answered, else ssh's or rsync's last word
-    on why not."""
+@dataclass
+class Missed:
+    """Why a pull copied nothing."""
+
+    reason: str
+    """ssh's or rsync's first word on it."""
+    away: bool
+    """Whether ssh could not reach the phone at all, rather than the phone answering without the backup."""
+
+
+def pull() -> Missed | None:
+    """The newest backup and address book into CACHE: None where they were copied, else why not."""
     CACHE.mkdir(parents=True, exist_ok=True)
     rsync = subprocess.run(
         ["rsync", "-t", "-e", " ".join(SSH), f"{PHONE}:{PHONE_DIR}/{BACKUP}", str(CACHE / BACKUP)],
@@ -162,8 +171,9 @@ def pull() -> str | None:
         text=True,
     )
     if rsync.returncode != 0:
-        # ssh says why first; rsync's own last line only says that ssh failed.
-        return (rsync.stderr.strip().splitlines() or [f"rsync exited {rsync.returncode}"])[0]
+        # ssh says why first; rsync's own last line only says that ssh failed. rsync exits 255 when ssh did.
+        reason = (rsync.stderr.strip().splitlines() or [f"rsync exited {rsync.returncode}"])[0]
+        return Missed(reason, away=rsync.returncode == 255)
 
     newer = subprocess.run(
         SSH + [PHONE, f"find {PHONE_DIR} -maxdepth 1 -name 'msgstore-increment-*.db.crypt15' -newer {PHONE_DIR}/{BACKUP}"],
@@ -259,20 +269,27 @@ def mirror(record: bool) -> None:
         if record and subprocess.run([str(RUN_LOG), UNIT, outcome, *more]).returncode != 0:
             note("run-log failed")
 
-    away = pull()
-    if away and not (CACHE / BACKUP).exists():
-        note(f"the phone did not answer, and no backup is cached: {away}")
-        log("skip", "--reason", f"phone not reached, no backup cached: {away}")
+    missed = pull()
+    if missed and missed.away and not (CACHE / BACKUP).exists():
+        note(f"the phone did not answer, and no backup is cached: {missed.reason}")
+        log("skip", "--reason", f"phone not reached, no backup cached: {missed.reason}")
         return
     try:
         done = update()
     except SystemExit as e:
-        log("fail", "--reason", str(e.code).splitlines()[0])
+        log("fail", "--reason", " ".join(str(e.code).split()))
         raise
-    if away:
-        note(f"the phone did not answer, so the mirror holds the cached backup ({away})")
-        log("skip", "--reason", f"phone not reached: {away}")
+    except Exception as e:
+        log("fail", "--reason", " ".join(f"{type(e).__name__}: {e}".split()))
+        raise
+    if missed and missed.away:
+        note(f"the phone did not answer, so the mirror holds the cached backup ({missed.reason})")
+        log("skip", "--reason", f"phone not reached: {missed.reason}")
         return
+    if missed:
+        # The phone answered, so the cause is on it: backups switched off, a moved folder, a lost permission.
+        log("fail", "--reason", f"the phone answered, but its backup could not be copied: {missed.reason}")
+        sys.exit(f"whatsapp-chat: the phone answered, but its backup could not be copied: {missed.reason}")
     stats = {
         "backup": datetime.fromtimestamp(done.backup / 1e9).astimezone().isoformat(timespec="seconds"),
         "bytes": (MIRROR / "msgstore.db").stat().st_size,
@@ -341,13 +358,14 @@ class Names:
 
 def names_file(db: sqlite3.Connection, names: Names) -> str:
     """names.json: what every row of the jid table is called, by its raw_string (user@server, with the device where it
-    names one), and what each message type and each
+    names one) or, where it has none, user@server, and what each message type and each
     kind of chat is, for a reader of the mirror without this script. The same database and address book give the
     same text."""
     return json.dumps(
         {
-            "names": [{"jid": raw, "name": names(i)} for i, raw in
-                      db.execute("select _id, raw_string from jid where raw_string is not null order by raw_string")],
+            "names": [{"jid": jid, "name": name} for jid, name in sorted({
+                jid: names(i) for i, jid in db.execute("select _id, coalesce(raw_string, user || '@' || server) from jid")
+            }.items())],
             "kinds": [{"type": t, "kind": k} for t, k in {0: "text", **KINDS}.items()],
             "system": SYSTEM,
             "chat_kinds": [{"server": server, "kind": k} for server, k in CHAT_KINDS.items()],
