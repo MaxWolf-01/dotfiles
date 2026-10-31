@@ -5312,7 +5312,7 @@ class Watch:
             os.close(fd)
         self.pids.clear()
         self.on, self.notices, self.whole = False, None, True
-        RELOAD_HEARD.set()  # its loop goes on its clock
+        RELOAD_HEARD.set()  # keep_plugins_current wakes, and from then on looks every RELOAD_EVERY
         print(f"watching the disk by reading it every {PACE:g} s: {why}", file=sys.stderr, flush=True)
 
     def heard(self) -> set | None:
@@ -5521,8 +5521,8 @@ TOLD = (".state.json", ".watch.json")
 watch record its diffview watcher writes at each build. The watcher holds its record open for writing for as long as it
 runs, so its exit, a kill included, closes the file, which the kernel tells of (IN_CLOSE_WRITE)."""
 ALIVE_AGAIN = 1.0
-"""Seconds after which a watch record that read as held is read once more: the kernel tells of a watcher's exit just
-before it lets go of the record's lock."""
+"""Seconds after which a watch record closed while it read as held is read once more: the kernel tells of a watcher's
+exit just before it lets go of the record's lock."""
 
 
 class Pages:
@@ -5561,41 +5561,50 @@ class Pages:
             due = min(again.values(), default=None)
             if waiting.poll(None if due is None else max(0, math.ceil((due - time.monotonic()) * 1000))):
                 time.sleep(SETTLE)
-            changed = set(self.heard(notices.read()))
+            try:
+                changed = set(self.heard(notices.read()))
+            except OSError as e:
+                print(f"telling the pages: {e}", file=sys.stderr, flush=True)
+                continue
             for page in [p for p, at in again.items() if at <= time.monotonic()]:
-                changed.add((page, ".watch.json"))
+                changed.add((page, ".watch.json", False))
                 del again[page]
-            for page, kept in changed:
-                event = {"type": "page", "url": "/f" + urllib.parse.quote(str(page))}
-                if kept == ".state.json":
-                    event["saved"] = True
-                elif (record := diffview.watch_record(page)) is None:
-                    continue  # dropped, by a render without --watch: the page has nothing to follow
-                else:
-                    event["watch"] = record
-                    if record["alive"]:
-                        again[page] = time.monotonic() + ALIVE_AGAIN
+            for page, kept, closed in changed:
+                try:
+                    event = {"type": "page", "url": "/f" + urllib.parse.quote(str(page))}
+                    if kept == ".state.json":
+                        event["saved"] = True
+                    elif (record := diffview.watch_record(page)) is None:
+                        continue  # dropped, by a render without --watch: the page has nothing to follow
+                    else:
+                        event["watch"] = record
+                        if record["alive"] and closed:
+                            again[page] = time.monotonic() + ALIVE_AGAIN
+                except Exception as e:  # one page's record (another user's, malformed) stops the telling of none other
+                    print(f"telling {page}: {e}", file=sys.stderr, flush=True)
+                    continue
                 with lock:
                     qs = listeners + page_listeners
                 for q in qs:
                     q.put(event)
 
-    def heard(self, notices: list[tuple[int, int, str]]) -> list[tuple[Path, str]]:
-        """The pages the notices name a change beside, each with what changed; a page deleted is followed no more."""
+    def heard(self, notices: list[tuple[int, int, str]]) -> list[tuple[Path, str, bool]]:
+        """The pages the notices name a change beside, each with what changed and whether the change was a close; a
+        page deleted is followed no more."""
         found = []
         with self.lock:
             for wd, mask, name in notices:
                 if mask & IN_Q_OVERFLOW:  # some notices lost: every page is told, as if all had changed
-                    found += [(Path(d) / page, kept) for d, pages in self.followed.items() for page in pages for kept in TOLD]
+                    found += [(Path(d) / page, kept, True) for d, pages in self.followed.items() for page in pages for kept in TOLD]
                 for d in list(self.dirs.get(wd, ())):
                     pages = self.followed.get(d, set())
-                    if mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED):
+                    if mask & GONE:
                         self.followed.pop(d, None)
                         self.dirs[wd].discard(d)
                     elif mask & IN_DELETE and name in pages:
                         pages.discard(name)
                     elif (page := diffview.page_beside(Path(name), TOLD)) and page.name in pages:
-                        found.append((Path(d) / page.name, name.removeprefix(page.name)))
+                        found.append((Path(d) / page.name, name.removeprefix(page.name), bool(mask & IN_CLOSE_WRITE)))
                 if not self.dirs.get(wd, True):
                     del self.dirs[wd]
                     if not mask & IN_IGNORED:
