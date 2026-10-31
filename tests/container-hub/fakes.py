@@ -202,19 +202,25 @@ class Unix(http.client.HTTPConnection):
         self.sock.connect(str(self.path_))
 
 
-def request(to: int | Path, method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60):
-    """(status, headers, body as JSON where it parses) of a request to a hub: at its port on 127.0.0.1, as a browser
-    reaches it, or at its socket, as a local tool does. A body of bytes goes as it is, any other as JSON."""
+def request(to: int | Path, method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
+            raw: bool = False):
+    """(status, headers, body as JSON where it parses, or as it came over the wire where `raw`) of a request to a hub:
+    at its port on 127.0.0.1, as a browser reaches it, or at its socket, as a local tool does. A body of bytes goes as
+    it is, any other as JSON."""
     conn = Unix(to) if isinstance(to, Path) else http.client.HTTPConnection("127.0.0.1", to, timeout=timeout)
     data = body if isinstance(body, bytes) or body is None else json.dumps(body).encode()
     conn.request(method, path, body=data, headers={"Content-Type": "application/json", **(headers or {})})
     r = conn.getresponse()
-    raw = r.read()
+    got = r.read()
     conn.close()
     try:
-        return r.status, r.headers, json.loads(raw)
+        return r.status, r.headers, got if raw else json.loads(got)
     except ValueError:
-        return r.status, r.headers, raw
+        return r.status, r.headers, got
+
+
+GZIP = {"Accept-Encoding": "gzip, deflate, br"}
+"""What a browser says it takes."""
 
 
 def token(port: int) -> str:
