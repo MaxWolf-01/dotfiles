@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# tier: fast
+# Drive bin/github-mirror over a scratch tree: bare repos stand in for GitHub (git
+# rewrites its URLs to them) and a stub stands in for gh. Run it directly; no framework.
+#
+# The two modes differ on purpose. The working tree of an org has to match GitHub, so it
+# prunes and fetches only origin. The backup mirror has to outlive what GitHub deletes.
+
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mirror="$here/../bin/github-mirror"
+. "$here/check.sh"
+needs git jq
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+remote="$scratch/remote"
+tree="$scratch/tree"
+mkdir -p "$remote" "$tree" "$scratch/stub"
+
+export HOME="$scratch/home" RUN_LOG_DIR="$scratch/runs" GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$scratch/gitconfig" REMOTE_ROOT="$remote"
+mkdir -p "$HOME"
+git config --global user.name test
+git config --global user.email test@example.invalid
+git config --global init.defaultBranch main
+git config --global advice.detachedHead false
+git config --global url."file://$remote/".insteadOf "https://github.com/"
+
+# gh: the repos an owner has are the bare repos under remote/<owner>, and one holding
+# a file named ARCHIVED is archived.
+cat >"$scratch/stub/gh" <<'EOF'
+#!/usr/bin/env bash
+[ -z "${GITHUB_DOWN:-}" ] || exit 1
+case "$1 $2" in
+    "repo list")
+        archived=yes
+        for arg; do [ "$arg" = --no-archived ] && archived=no; done
+        for repo in "$REMOTE_ROOT/$3"/*.git "$REMOTE_ROOT/$3"/.*.git; do
+            [ -d "$repo" ] || continue
+            [ "$archived" = no ] && [ -e "$repo/ARCHIVED" ] && continue
+            basename "$repo" .git
+        done
+        ;;
+    "repo clone") git clone --quiet "https://github.com/$3" "$4" ;;
+    *) exit 1 ;;
+esac
+EOF
+chmod +x "$scratch/stub/gh"
+export PATH="$scratch/stub:$PATH"
+
+# A repo on "GitHub" with one commit on main and development, and a branch to delete.
+make_remote() {
+    local owner=$1 repo=$2 work="$scratch/seed/$1-$2"
+    git init -q --bare "$remote/$owner/$repo.git"
+    git init -q "$work"
+    git -C "$work" commit -q --allow-empty -m first
+    git -C "$work" remote add origin "https://github.com/$owner/$repo"
+    git -C "$work" branch development
+    git -C "$work" branch to-delete
+    git -C "$work" push -q origin main development to-delete
+}
+
+# A new commit on a branch of a "GitHub" repo; prints nothing.
+push_commit() {
+    local work="$scratch/seed/$1-$2"
+    git -C "$work" checkout -q "$3"
+    git -C "$work" commit -q --allow-empty -m "next on $3"
+    git -C "$work" push -q origin "$3"
+}
+
+tip_of() { git -C "$scratch/seed/$1-$2" rev-parse "$3"; }
+last_run() { tail -n 1 "$RUN_LOG_DIR/$1.jsonl"; }
+
+# --- A working tree of an org
+
+make_remote ACME app
+make_remote ACME dirty
+make_remote ACME local-work
+make_remote ACME .github
+make_remote ACME archived
+touch "$remote/ACME/archived.git/ARCHIVED"
+make_remote OTHER foreign
+make_remote ACME not-cloned-yet
+
+for repo in app dirty local-work .github; do
+    git clone -q "https://github.com/ACME/$repo" "$tree/$repo"
+done
+git -C "$tree/app" checkout -q development
+git -C "$tree/app" remote add unreachable "$scratch/does-not-exist.git"
+git clone -q "https://github.com/OTHER/foreign" "$tree/foreign"
+git -C "$tree/local-work" checkout -q -b my-feature
+git -C "$tree/local-work" commit -q --allow-empty -m "not pushed"
+mkdir -p "$tree/plain-dir"
+
+push_commit ACME app development
+push_commit ACME dirty main
+push_commit ACME .github main
+push_commit OTHER foreign main
+git -C "$remote/ACME/app.git" branch -q -D to-delete
+foreign_before=$(git -C "$tree/foreign" rev-parse origin/main)
+echo changed >"$tree/dirty/tracked"
+git -C "$tree/dirty" add tracked
+my_feature=$(git -C "$tree/local-work" rev-parse HEAD)
+
+"$mirror" ACME "$tree" >/dev/null
+check "a working-tree run exits 0" 0 $?
+
+check "the checked-out integration branch is fast-forwarded" \
+    "$(tip_of ACME app development)" "$(git -C "$tree/app" rev-parse HEAD)"
+check "a branch deleted on GitHub is pruned" \
+    "" "$(git -C "$tree/app" for-each-ref refs/remotes/origin/to-delete)"
+check "a clone with uncommitted work keeps it" \
+    "A  tracked" "$(git -C "$tree/dirty" status --porcelain)"
+check "a clone with uncommitted work still learns the remote's state" \
+    "$(tip_of ACME dirty main)" "$(git -C "$tree/dirty" rev-parse origin/main)"
+check "a checkout is never moved to another branch" \
+    "my-feature $my_feature" \
+    "$(git -C "$tree/local-work" branch --show-current) $(git -C "$tree/local-work" rev-parse HEAD)"
+check "the org's .github repo is kept current" \
+    "$(tip_of ACME .github main)" "$(git -C "$tree/.github" rev-parse HEAD)"
+check "another owner's clone is left alone" \
+    "$foreign_before" "$(git -C "$tree/foreign" rev-parse origin/main)"
+check "a repo the org has and the tree lacks is cloned" \
+    "$(tip_of ACME not-cloned-yet main)" "$(git -C "$tree/not-cloned-yet" rev-parse HEAD 2>&1)"
+check "an archived repo is not cloned" no "$([ -e "$tree/archived" ] && echo yes || echo no)"
+
+line=$(last_run acme-mirror)
+check "the run is logged under the owner's name" ok "$(jq -r .outcome <<<"$line")"
+check "an unreachable second remote is not a failure" 0 "$(jq -r .stats.failed <<<"$line")"
+
+# --- GitHub out of reach
+
+for repo in "$remote"/ACME/*.git "$remote"/ACME/.*.git; do [ -d "$repo" ] && mv "$repo" "$repo.away"; done
+
+GITHUB_DOWN=1 "$mirror" ACME "$tree" >/dev/null 2>&1
+check "a run that could fetch nothing still exits 0" 0 $?
+check "a run that could fetch nothing is logged as failed" fail "$(jq -r .outcome <<<"$(last_run acme-mirror)")"
+
+for repo in "$remote"/ACME/*.away "$remote"/ACME/.*.away; do [ -d "$repo" ] && mv "$repo" "${repo%.away}"; done
+
+# --- The backup mirror
+
+make_remote MaxWolf-01 mine
+make_remote yapit-tts theirs
+make_remote someone hand-cloned
+backup="$HOME/repos/github"
+mkdir -p "$backup/MaxWolf-01" "$backup/someone"
+git clone -q "https://github.com/MaxWolf-01/mine" "$backup/MaxWolf-01/mine"
+git clone -q "https://github.com/someone/hand-cloned" "$backup/someone/hand-cloned"
+
+make_remote someone second-home
+git -C "$backup/someone/hand-cloned" remote add second "https://github.com/someone/second-home"
+push_commit someone hand-cloned main
+push_commit someone second-home main
+git -C "$remote/MaxWolf-01/mine.git" branch -q -D to-delete
+
+"$mirror" >/dev/null
+check "a backup run exits 0" 0 $?
+
+check "a branch deleted on GitHub survives in the backup" \
+    "1" "$(git -C "$backup/MaxWolf-01/mine" for-each-ref refs/remotes/origin/to-delete | wc -l | tr -d ' ')"
+check "a hand-cloned repo from any owner is fetched" \
+    "$(tip_of someone hand-cloned main)" "$(git -C "$backup/someone/hand-cloned" rev-parse HEAD)"
+check "every remote of a clone is fetched" \
+    "$(tip_of someone second-home main)" "$(git -C "$backup/someone/hand-cloned" rev-parse second/main)"
+check "a listed account's missing repo is cloned into its own directory" \
+    "$(tip_of yapit-tts theirs main)" "$(git -C "$backup/yapit-tts/theirs" rev-parse HEAD 2>&1)"
+check "the backup run keeps its own log" ok "$(jq -r .outcome <<<"$(last_run github-mirror)")"
+
+# --- Bad calls
+
+"$mirror" only-one-argument >/dev/null 2>&1
+check "one argument is refused" 2 $?
+
+finish

@@ -480,6 +480,36 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- HELFERLINE org → ~/work/helferline ---
+  # The clones max and his agents read as the team's current state and branch work
+  # from. Hourly because a day-old view of them misleads, and a run with nothing new
+  # takes seconds; origin is HTTPS, so it needs no ssh agent.
+
+  systemd.user.services.helferline-mirror = {
+    Unit = {
+      Description = "Keep the HELFERLINE clones matching GitHub";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [ "PATH=${mirrorPath}" ];
+      ExecStart = "${dotfiles}/bin/github-mirror HELFERLINE ${home}/work/helferline";
+      # oneshot has no start timeout of its own; a hung run would make every later
+      # firing a silent no-op.
+      TimeoutStartSec = "1h";
+    };
+  };
+
+  systemd.user.timers.helferline-mirror = {
+    Unit.Description = "HELFERLINE clones (hourly)";
+    Timer = {
+      OnCalendar = "*:15:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Browsing archive: append new Firefox visits ---
 
   systemd.user.services.browsing-archive = {
