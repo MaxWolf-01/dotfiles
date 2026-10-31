@@ -21,6 +21,7 @@ page saves by, claude-browser and diffview handing it pages, a hub with no port 
 
 import contextlib
 import fcntl
+import gzip
 import http.client
 import http.server
 import json
@@ -1040,13 +1041,77 @@ while data := os.read(0, 4096):
     trellis_cache = HOME / ".cache/container-hub" / ("trellis-" + re.search(r'TRELLIS_VERSION = "(.+)"', (BIN / "container-hub").read_text())[1])
     trellis_cache.mkdir(parents=True, exist_ok=True)
     (trellis_cache / "style.css").write_text("body { background: url(https://attacker.example/x) }")
-    status_code, body = request("GET", "/static/trellis/style.css")
+    trellis_path = "/static/trellis/" + trellis_cache.name.removeprefix("trellis-")
+    status_code, body = request("GET", trellis_path + "/style.css")
     check("a cached trellis file that differs from its pin is refused", 502, status_code)
     check("...naming the file", True, b"style.css does not match its pinned sha256" in body)
     check("...on the hub's stderr too", True, "style.css does not match its pinned sha256" in (SCRATCH / "hub.log").read_text())
     check("...and left in place rather than fetched over", "body { background: url(https://attacker.example/x) }",
           (trellis_cache / "style.css").read_text())
     (trellis_cache / "style.css").unlink()
+
+    # --- compressed, and cached until it changes: what the phone fetches over its slow link
+
+    def fetched(path: str, headers: dict | None = None) -> tuple[int, http.client.HTTPMessage, bytes]:
+        """(status, headers, body as it came over the wire) of a GET to the hub's port."""
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
+        try:
+            conn.request("GET", path, headers=headers or {})
+            answer = conn.getresponse()
+            return answer.status, answer.headers, answer.read()
+        finally:
+            conn.close()
+
+    GZIP = {"Accept-Encoding": "gzip, deflate, br"}  # as a browser asks
+    fast = alpha / "agent/show/fast-phone"
+    kinds = {  # the kind of text, and a body big enough that gzip shrinks it
+        "a session page": served(page(fast / "index.html", "<!doctype html><h1>turns</h1>" + "<p>a turn of the session</p>\n" * 400)),
+        "its script": served(page(fast / "tool-calls.js", "const calls = [" + '{"tool": "Bash", "ok": true},\n' * 400 + "];\n")),
+        "a stylesheet": served(page(fast / "page.css", "p { margin: 0 }\n" * 400)),
+        "markdown": served(page(fast / "report.md", "## Comments\n\n" + "- a line of the report\n" * 400)),
+        "an SVG": served(page(fast / "figure.svg", '<svg xmlns="http://www.w3.org/2000/svg">' + '<rect width="1" height="1"/>' * 400 + "</svg>")),
+        "JSON on disk": served(page(fast / "numbers.json", json.dumps([{"n": n} for n in range(400)]))),
+        "the hub tab": "/",
+        "the rail's index": "/api/hub",
+    }
+    answers = {kind: (fetched(url), fetched(url, GZIP)) for kind, url in kinds.items()}
+    check("each kind of text goes gzipped to a client that takes gzip, and as it is to one that does not",
+          {kind: (200, None, "gzip") for kind in kinds},
+          {kind: (zipped[0], plain[1]["Content-Encoding"], zipped[1]["Content-Encoding"]) for kind, (plain, zipped) in answers.items()})
+    check("...and decoded, it is what the client that does not take gzip was sent", {kind: True for kind in kinds},
+          {kind: gzip.decompress(zipped[2]) == plain[2] for kind, (plain, zipped) in answers.items()})
+    check("...less than half its size", {kind: True for kind in kinds},
+          {kind: len(zipped[2]) < len(plain[2]) / 2 for kind, (plain, zipped) in answers.items()})
+    check("...and each says the encoding it is sent in depends on the client's Accept-Encoding", {kind: "Accept-Encoding" for kind in kinds},
+          {kind: zipped[1]["Vary"] for kind, (_, zipped) in answers.items()})
+    png = fast / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(4000))
+    check("an image that is no SVG goes as it is, gzip or not", None, fetched(served(png), GZIP)[1]["Content-Encoding"])
+
+    session_page = kinds["a session page"]
+    status_code, got, _ = fetched(session_page, GZIP)
+    tag = got["ETag"]
+    check("a file is the browser's to keep, asking again on every use whether it changed", (200, "no-cache", True),
+          (status_code, got["Cache-Control"], bool(tag)))
+    status_code, again, body = fetched(session_page, {**GZIP, "If-None-Match": tag})
+    check("...and asked again unchanged, it costs no body: a 304", (304, b"", tag), (status_code, body, again["ETag"]))
+    check("...as does the page's script, the hub tab and the rail's index", {k: 304 for k in ("its script", "the hub tab", "the rail's index")},
+          {k: fetched(kinds[k], {"If-None-Match": answers[k][0][1]["ETag"]})[0] for k in ("its script", "the hub tab", "the rail's index")})
+    (fast / "index.html").write_text("<!doctype html><h1>turns</h1><p>a turn written since</p>")
+    status_code, _, body = fetched(session_page, {"If-None-Match": tag})
+    check("...while asked after it changed, it is the new page", (200, True), (status_code, b"a turn written since" in body))
+    check("an answer that is no page goes uncached: a missing file", "no-store", fetched(served(fast / "gone.html"))[1]["Cache-Control"])
+
+    tab = fetched("/")[2].decode()
+    check("the hub tab loads trellis from the address of the version the hub pins", [trellis_path + "/style.css", trellis_path + "/index.js"],
+          re.findall(r'"(/static/trellis/[^"]+)"', tab))
+    status_code, got, body = fetched(trellis_path + "/index.js", GZIP)
+    if status_code == 502 and b"curl" in body:
+        skipped("a trellis file kept for good", "trellis could not be fetched from its CDN")
+    else:
+        check("...where each file is the browser's to keep for good, a new version being a new address", (200, "public, max-age=31536000, immutable", "gzip"),
+              (status_code, got["Cache-Control"], got["Content-Encoding"]))
+    check("...and no other version is served", 404, fetched("/static/trellis/0.0.1/index.js")[0])
 
     # --- the state-write protocol a diffview page saves its comments by: a page writes its state whole, so a second
     # page on the same review would erase the first; the hub takes writes from the page that owns the file, and
@@ -1132,7 +1197,9 @@ while data := os.read(0, 4096):
 
     # --- the event stream: what a listening hub tab hears
 
-    events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
+    events = urllib.request.urlopen(urllib.request.Request(f"{ORIGIN}/events", headers=GZIP), timeout=10)
+    check("the event stream goes uncompressed and uncached to a client that takes gzip, so an event reaches it at once",
+          (None, "no-store"), (events.headers["Content-Encoding"], events.headers["Cache-Control"]))
     while not events.readline().startswith(b"data:"):  # the event it opens with, naming the pages' code
         pass
     again = open_page(alpha / "agent/show/csv-import/index.html", WORKER)
