@@ -1186,10 +1186,14 @@ def an_agent_opening_a_page_again(w: World) -> None:
     asked = lambda: w.frame_of("map-columns").evaluate("window.asked")
     w.frame_of("map-columns").evaluate("window.__mark = 1; window.asked = 0; window.reloadWouldLose = () => (asked++, true)")
     w.opened(w.pages[2])
-    until(lambda: asked() >= 2, "the tab to ask the page twice whether a reload would lose anything")
-    check("a page that would lose what is typed in it is not reloaded under it", False, reloaded())
-    w.frame_of("map-columns").evaluate("window.reloadWouldLose = () => false")
-    settles("...and is reloaded once it would lose nothing", True, reloaded)
+    until(lambda: asked() >= 1, "the tab to ask the page whether a reload would lose anything")
+    w.view.wait_for_timeout(500)
+    first = asked()
+    w.view.wait_for_timeout(2500)
+    check("a page that would lose what is typed in it is not reloaded under it, nor asked again on a clock", (False, first),
+          (reloaded(), asked()))
+    w.frame_of("map-columns").evaluate("window.reloadWouldLose = () => false; parent.pageFree(window)")
+    settles("...and is reloaded once it says it would lose nothing", True, reloaded)
     w.frame_of("map-columns").evaluate("window.__mark = 1")
     w.opened(w.pages[2])
     settles("a page that says nothing is reloaded at once", True, reloaded, within=5)
@@ -1247,6 +1251,81 @@ def diffview_told(w: World) -> None:
     asked.clear()
     w.view.wait_for_timeout(5000)
     check("...and asks nothing after, its watcher gone", [], asked)
+
+
+@scenario
+def pages_on_new_code(w: World) -> None:
+    """hub-pages-reload-on-new-code: once the hub runs new code, every page whose code changed runs it, a diffview page
+    in a panel and one in a tab of its own, and the hub tab with its frames, each once that loses nothing being typed;
+    a page whose code did not change is not reloaded."""
+    own_bin = w.scratch / "bin"  # the hub's code, as the scenario changes it
+    own_bin.mkdir()
+    for name in ("container-hub", "container-hub.html", "diffview", "diffview.html"):
+        shutil.copy2(BIN / name, own_bin / name)
+    w.kill_hub()
+    w.hub_args[0] = str(own_bin / "container-hub")
+    w.start_hub()
+    w.view.reload()
+    w.view.wait_for_function("window.wc && ws.views().length === 2", timeout=30000)
+    w.enter()
+    w.open_diff()
+    panel = lambda: w.frame_at("/diffviews/map-columns.html")
+    own = w.context.new_page()
+    own.on("pageerror", lambda e: w.errors.append(str(e)))
+    own.goto(w.origin + w.session_url(w.agent / "diffviews/map-columns.html"))
+    own.wait_for_function("navigator.locks.query().then(l => l.held.length > 0)")  # its stream of its own is open
+
+    def read(page, script: str):
+        try:
+            return page().evaluate(script) if callable(page) else page.evaluate(script)
+        except PlaywrightError:  # read mid-reload
+            return None
+    code = "document.querySelector('meta[name=diffview-code]').content"
+    was = read(own, code)
+    for page in (own, panel, w.view):
+        read(page, "window.__mark = 1")
+    panel().locator('td.no[data-side="new"][data-no="1"]').first.click()
+    box = panel().locator(".cbox[data-editing] textarea")
+    box.fill("typed in the panel")
+    template = (own_bin / "diffview.html").read_text()
+    (own_bin / "diffview.html").write_text(template.replace("<head>", "<head>\n<!-- new code -->", 1))
+    settles("a diffview page in a tab of its own runs diffview's new code once the hub does", True,
+            lambda: read(own, code) not in (None, was) and "new code" in read(own, "document.head.innerHTML"), within=15)
+    now = read(own, code)
+    w.view.wait_for_timeout(1500)
+    check("a diffview page in a panel with a comment being typed waits", (was, 1), (read(panel, code), read(panel, "window.__mark")))
+    check("...and the hub tab, whose code did not change, is not reloaded", 1, read(w.view, "window.__mark"))
+    box.press("Control+Enter")
+    settles("...and runs the new code once the comment is saved", now, lambda: read(panel, code), within=5)
+    settles("...the comment saved", True, lambda: "typed in the panel" in (read(panel, "[...document.querySelectorAll('.cbox .ctext')].map(e => e.innerText)") or []))
+
+    read(own, "window.__mark = 1")
+    w.view.locator("#search").fill("map")
+    panel().locator('td.no[data-side="new"][data-no="1"]').first.click()
+    panel().locator(".cbox[data-editing] textarea").fill("typed again")
+    log = w.scratch / "hub.log"
+    restarts = log.read_text().count("running again")
+    (own_bin / "container-hub.html").write_text((own_bin / "container-hub.html").read_text() + "<!-- new code -->\n")
+    w.view.wait_for_timeout(2500)
+    check("a hub tab whose code changed waits while a search is held and a comment typed in a frame", 1, read(w.view, "window.__mark"))
+    w.view.locator("#search").fill("")
+    w.view.wait_for_timeout(1000)
+    check("...the comment still being typed once the search is emptied", 1, read(w.view, "window.__mark"))
+    panel().locator(".cbox[data-editing] textarea").press("Control+Enter")
+    settles("...and runs the new code once the comment is saved", True,
+            lambda: read(w.view, "window.__mark") is None and "<!-- new code -->" in (read(w.view, "document.documentElement.outerHTML") or ""),
+            within=5)
+    check("...told by the hub, which ran no new code of its own for it", restarts, log.read_text().count("running again"))
+    w.view.wait_for_function("window.wc && ws.views().length > 0", timeout=30000)
+    w.frame_at("/diffviews/map-columns.html")
+    check("...its frames with it", now, read(panel, code))
+    check("a diffview page in a tab of its own, whose code did not change, is not reloaded", 1, read(own, "window.__mark"))
+    w.view.wait_for_timeout(2000)  # what the reloaded pages read as they load
+    asked = []
+    w.context.on("request", lambda r: asked.append(r.url))
+    w.view.wait_for_timeout(5000)
+    check("...and no page asks the hub anything after, while nothing changes", [], asked)
+    own.close()
 
 
 @scenario
