@@ -292,7 +292,16 @@ map("n", "<leader>gtd", ":Gitsigns toggle_deleted<CR>", { desc = "Toggle deleted
 map("n", "<leader>gd", ":Gitsigns diffthis<CR>", { desc = "Diff this", silent = true })
 map("n", "<leader>gD", ":Gitsigns diffthis HEAD<CR>", { desc = "Diff with HEAD", silent = true })
 
--- TODO fugitive.vim for blaming entire buffer, ...
+-- in the panel: <CR> menu, r reblame at commit, R at its parent, d diff, s/S show commit, q close
+map("n", "<leader>gbb", function()
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "gitsigns-blame" then
+      return vim.api.nvim_win_close(win, true)
+    end
+  end
+  vim.cmd "Gitsigns blame"
+end, { desc = "Toggle blame panel" })
+map("n", "<leader>gbl", function() require("gitsigns").blame_line { full = true } end, { desc = "Blame line: commit and its hunk" })
 
 -- ====================================================================
 -- Sessions
