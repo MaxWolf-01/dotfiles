@@ -481,9 +481,8 @@ in
   };
 
   # --- HELFERLINE org → ~/work/helferline ---
-  # The clones max and his agents read as the team's current state and branch work
-  # from. Hourly because a day-old view of them misleads, and a run with nothing new
-  # takes seconds; origin is HTTPS, so it needs no ssh agent.
+  # Hourly because a day-old view of them misleads, and a run with nothing new takes
+  # seconds. The ssh agent is for a clone whose origin is ssh.
 
   systemd.user.services.helferline-mirror = {
     Unit = {
@@ -493,7 +492,10 @@ in
     };
     Service = {
       Type = "oneshot";
-      Environment = [ "PATH=${mirrorPath}" ];
+      Environment = [
+        "PATH=${mirrorPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
       ExecStart = "${dotfiles}/bin/github-mirror HELFERLINE ${home}/work/helferline";
       # oneshot has no start timeout of its own; a hung run would make every later
       # firing a silent no-op.
