@@ -126,7 +126,7 @@ class World:
     and both tickets' show pages, open in ORCHESTRATOR's unit. The tab opens in the overview, every page loaded."""
 
     def __init__(self, browser, run: Path, name: str):
-        self.hub = self.context = self.tmux_socket = None
+        self.hub = self.context = self.tmux_socket = self.watcher = None
         self.news = 0  # the pages hears() has opened
         self.errors = []
         try:
@@ -319,6 +319,8 @@ exit 1
     def close(self) -> None:
         """Everything the world started stops, whichever step of it fails."""
         try:
+            if self.watcher and self.watcher.poll() is None:
+                os.killpg(self.watcher.pid, signal.SIGKILL)
             if self.context:
                 check("no script errors", [], self.errors)
                 self.context.close()
@@ -503,8 +505,9 @@ exit 1
         page.wait_for_function(ready, timeout=30000)
         return page
 
-    def open_diff(self) -> tuple[str, str]:
-        """A diffview page of the tree's last commit opened in ORCHESTRATOR's unit, by its view's id and its panel."""
+    def open_diff(self, watch: bool = False) -> tuple[str, str]:
+        """A diffview page of the tree's last commit opened in ORCHESTRATOR's unit, by its view's id and its panel; with
+        `watch`, of the working tree since, which a `diffview --watch` follows until the world ends (self.watcher)."""
         hljs = self.home / ".cache/diffview" / f"hljs-{HLJS_VERSION}"
         hljs.mkdir(parents=True)
         (hljs / "highlight.min.js").write_text("")  # fails its pin, so diffview neither fetches nor highlights
@@ -513,8 +516,14 @@ exit 1
         self.git(self.code, "commit", "-q", "-m", "notes")
         diff = self.agent / "diffviews" / "map-columns.html"
         diff.parent.mkdir()
-        subprocess.run([BIN / "diffview", f"{self.code}@HEAD~1..HEAD", "-o", str(diff), "--no-auto-summary"], env=self.env,
-                       check=True, capture_output=True)
+        render = [BIN / "diffview", f"{self.code}@HEAD~1.." + ("" if watch else "HEAD"), "-o", str(diff), "--no-auto-summary"]
+        if watch:
+            # it names the page's address on the hub, which it asks the world's, never a hub of its own on 8377
+            self.watcher = subprocess.Popen([*render, "--watch"], env={**self.env, "CONTAINER_HUB_SOCKET": str(self.scratch / "hub.sock")},
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            until(lambda: Path(f"{diff}.watch.json").exists(), "the watcher's first build")
+        else:
+            subprocess.run(render, env=self.env, check=True, capture_output=True)
         diff_id = self.opened(diff)
         self.view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(diff_id)} && v.placement === 'docked')", timeout=10000)
         self.frame_at("/diffviews/map-columns.html")
@@ -1191,6 +1200,113 @@ def an_agent_opening_a_page_again(w: World) -> None:
     w.minimize(w.ids["csv-import"])
     w.opened(w.pages[1])
     settles("a minimized page an agent opens again comes back into the layout", True, lambda: w.ids["csv-import"] in w.docked())
+
+
+@scenario
+def diffview_told(w: World) -> None:
+    """hub-pages-told-not-polled: a diffview page in a panel hears from the hub tab's own stream, asking nothing on a
+    clock: it reloads into its watcher's newer build, takes in what a tab of its own saved, and says when its watcher
+    stopped."""
+    w.enter()
+    w.open_diff(watch=True)
+    w.frame_at("/diffviews/map-columns.html").wait_for_function("typeof hubTold === 'function'")  # its look at load asked
+    asked = []
+    w.context.on("request", lambda r: asked.append(r.url.rsplit(".html", 1)[-1]) if ".html." in r.url else None)
+    w.view.wait_for_timeout(5000)
+    check("the page asks the hub nothing while nothing changes", [], asked)
+    frame = lambda: w.frame_at("/diffviews/map-columns.html")
+    built = frame().evaluate("DATA.generated")
+
+    def build():
+        try:
+            return frame().evaluate("DATA.generated")
+        except PlaywrightError:  # read mid-reload
+            return built
+    frame().locator('td.no[data-side="new"][data-no="1"]').first.click()
+    box = frame().locator(".cbox[data-editing] textarea")
+    box.fill("typed in the panel")
+    (w.code / "notes.txt").write_text("one\ntwo\n")
+    until(lambda: json.loads(Path(f"{w.agent}/diffviews/map-columns.html.watch.json").read_text())["g"] != built,
+          "the watcher's newer build")
+    w.view.wait_for_timeout(1000)
+    check("a newer build waits while a comment is being typed", built, build())
+    box.press("Control+Enter")
+    settles("...and is loaded once it is saved", True, lambda: build() != built, within=5)
+    own = w.context.new_page()
+    own.goto(w.origin + w.session_url(w.agent / "diffviews/map-columns.html"))
+    own.locator('td.no[data-side="new"][data-no="2"]').first.click()
+    own.keyboard.type("typed in a tab of its own")
+    own.keyboard.press("Control+Enter")
+    settles("a comment saved in a tab of its own reaches the page in the panel", True,
+            lambda: "typed in a tab of its own" in frame().locator(".cbox .ctext").all_inner_texts(), within=5)
+    own.close()
+    stopped = time.monotonic()
+    os.killpg(w.watcher.pid, signal.SIGKILL)
+    settles("the page says its watcher stopped", 1, lambda: frame().locator(".watchgone").count(), within=5)
+    check("...within 2 seconds", True, time.monotonic() - stopped < 2)
+    asked.clear()
+    w.view.wait_for_timeout(5000)
+    check("...and asks nothing after, its watcher gone", [], asked)
+
+
+@scenario
+def a_late_answer_keeps_the_keyboard(w: World) -> None:
+    """Going into an ended unit reads its pages first; the answer, however late, moves no keyboard that a key moved
+    since: ctrl+alt+f pressed before it lands keeps the search box."""
+    v = w.view
+    ended = "e0e0e0e0-0000-4000-8000-000000000020"
+    transcript = w.home / ".claude/projects/-home-repos-alpha" / f"{ended}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(json.dumps({"type": "ai-title", "aiTitle": "Long done", "sessionId": ended}) + "\n")
+    w.opened(w.page("notes/long-done.html", "an ended session's page"), ended)
+    settles("the ended unit is on the rail", True, lambda: v.evaluate(f"wc.state.units.some(u => u.unit === {json.dumps(ended)})"))
+    held = []
+    hold = lambda route: held.append(route)  # its details, answered only once released below
+    v.route(f"**/api/u/{ended}", hold)
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type(ended[:8])
+    v.keyboard.press("Enter")
+    until(lambda: held or v.evaluate("false"), "the tab to ask for the unit's pages")
+    settles("the unit is entered", ended, w.current)
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type("zz")
+    for route in held:
+        route.continue_()
+    v.unroute(f"**/api/u/{ended}", hold)
+    w.frame_at("/notes/long-done.html")
+    v.wait_for_timeout(500)
+    check("the search box keeps the keyboard and what was typed into it", ["search", "zz"],
+          v.evaluate("[document.activeElement.id, document.getElementById('search').value]"))
+
+
+@scenario
+def a_key_while_a_page_loads(w: World) -> None:
+    """Going into a unit puts the keyboard into its page, which may still be loading: a hub key pressed then is the
+    hub's all the same."""
+    v = w.view
+    ended = "e0e0e0e0-0000-4000-8000-000000000020"
+    transcript = w.home / ".claude/projects/-home-repos-alpha" / f"{ended}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(json.dumps({"type": "ai-title", "aiTitle": "Long done", "sessionId": ended}) + "\n")
+    w.opened(w.page("notes/long-done.html", "an ended session's page"), ended)
+    settles("the ended unit is on the rail", True, lambda: v.evaluate(f"wc.state.units.some(u => u.unit === {json.dumps(ended)})"))
+    held = []
+    hold = lambda route: held.append(route)  # the page, served only once released below
+    v.route("**/notes/long-done.html", hold)
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type(ended[:8])
+    v.keyboard.press("Enter")
+    v.wait_for_function(f"{HOLDS_KEYBOARD} && document.activeElement.contentDocument?.readyState === 'complete'", timeout=10000)
+    check("the unit's page has the keyboard before it has loaded", "about:blank",
+          v.evaluate("document.activeElement.contentWindow.location.href"))
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type("zz")
+    for route in held:
+        route.continue_()
+    v.unroute("**/notes/long-done.html", hold)
+    w.frame_at("/notes/long-done.html")
+    check("ctrl+alt+f pressed then opens the search, which takes what is typed", ["search", "zz"],
+          v.evaluate("[document.activeElement.id, document.getElementById('search').value]"))
 
 
 @scenario

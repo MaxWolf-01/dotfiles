@@ -391,9 +391,14 @@ over the tab.
     POST /f/<page>.state.json a diffview page saving its comments
     GET  /f/<page>.watch.json the watch record of a page `diffview --watch` keeps current, with "alive": whether
                               its diffview watcher still runs. A watched page follows its rebuilds by it, and leaves its
-                              unit once a repo it watched is gone.
+                              unit once a repo it watched is gone. A page whose state file or watch record was asked
+                              for is told of each change to either (/events/pages), until the page is deleted.
     POST /f/<page>.summary.json  a page asking for its summary again: of its diffview watcher, or, with none
                               running, of the hub itself where the first attempt failed; 409 where neither can
+    GET  /events/pages        an event stream of the "page" events alone, for a diffview page in no hub tab:
+                              {"type": "page", "url", "saved": true} once the page's state file is written, and
+                              {"type": "page", "url", "watch"} with its watch record as GET answers it, once its watcher
+                              writes the record or exits
     GET  /.health             {"saves": true, "url"}: diffview pages served here can save; the hub's --url. Readable
                               from hub.mwolf.dev too, which tells by it a hub that answers from a tailscale serve
                               answering for one that is down
@@ -1405,6 +1410,8 @@ def ticket_of(page: Page, session: str | None, cwd: str | None) -> tuple[str | N
 STATE = Path()
 lock = threading.RLock()
 listeners: list[queue.Queue] = []
+page_listeners: list[queue.Queue] = []
+"""The streams of the pages' events alone (/events/pages), which every hub tab's stream carries too."""
 # The digests of the hub each listener last saw, taken when it starts listening and moved on by every round of the
 # disk watch: a listener hears of every change made since it started, and of nothing else. What changed before is
 # the listener's to read once its stream is open.
@@ -2978,7 +2985,12 @@ def drop(key: str, name: str, data: bytes) -> tuple[int, dict]:
 
 MX = "mx@MaxWolf-01"
 RELOAD = "/reload-plugins"
-RELOAD_EVERY = 15  # seconds between two looks at every session
+RELOAD_EVERY = 15  # seconds between two looks at every session, where the hub cannot hear the disk
+RELOADS = ("reloads",)
+"""The disk watch's reader of what makes a session due a reload: the registry, each account's installed mx, and the mx
+each session runs."""
+RELOAD_HEARD = threading.Event()
+"""Set by the disk watch once a file RELOADS was read from changed."""
 RELOADED: dict[str, str] = {}
 """The mx version the hub last typed RELOAD into a running session for, by the session's id, kept in `reloaded.json`:
 an idle session records the move only at its next prompt, and one on an mx from before that never does."""
@@ -2999,7 +3011,8 @@ def installed_mx(account: str) -> str | None:
     """The mx version Claude Code has installed for an account, as its `plugins/installed_plugins.json` records it."""
     try:
         # Claude Code's file, read as `registry` reads its others: one that does not parse now is read at the next look
-        return str(json.loads((Path(account) / "plugins" / "installed_plugins.json").read_text())["plugins"][MX][0]["version"])
+        looked(path := Path(account) / "plugins" / "installed_plugins.json")
+        return str(json.loads(path.read_text())["plugins"][MX][0]["version"])
     except (OSError, ValueError, KeyError, IndexError, TypeError):
         return None
 
@@ -3009,7 +3022,8 @@ def loaded_mx(account: str, session: str) -> str | None:
     the plugin's data directory: Claude Code names it after the plugin's id, every character but a letter, digit, `_`
     or `-` a `-`."""
     try:
-        return (Path(account) / "plugins" / "data" / re.sub(r"[^A-Za-z0-9_-]", "-", MX) / "sessions" / session).read_text().strip() or None
+        looked(path := Path(account) / "plugins" / "data" / re.sub(r"[^A-Za-z0-9_-]", "-", MX) / "sessions" / session)
+        return path.read_text().strip() or None
     except (OSError, ValueError):
         return None
 
@@ -3026,13 +3040,16 @@ def reload_due(session: str, entry: dict) -> str | None:
     """The mx version to reload a running session to: the one installed for its account, where the session runs an
     older one or none it recorded, is idle, interactive, no dispatched worker and not forked elsewhere, and the hub has
     not typed the reload for that version yet. None otherwise."""
-    if entry.get("status") not in ("idle", "shell") or entry.get("kind", "interactive") != "interactive" or elsewhere_refusal(session):
+    if entry.get("status") not in ("idle", "shell") or entry.get("kind", "interactive") != "interactive":
         return None
     if not (installed := installed_mx(entry["account"])):
         return None
     have = [v for v in (loaded_mx(entry["account"], session), RELOADED.get(session)) if v]
     if any(version_of(v) >= version_of(installed) for v in have) or dispatched(int(entry["pid"])):
         return None
+    with recording():  # unwatched: its transcript, written at every turn, would make every turn a look at every session
+        if elsewhere_refusal(session):
+            return None
     return installed
 
 
@@ -3062,27 +3079,37 @@ def reload_into(session: str, entry: dict, version: str) -> str:
 
 
 def keep_plugins_current() -> None:
-    """From the hub's start, every RELOAD_EVERY seconds, reload each session due a newer mx (`reload_due`) whose pane
-    the hub can type into."""
+    """From the hub's start, reload each session due a newer mx (`reload_due`) whose pane the hub can type into: once
+    at the start, then each time the disk watch hears a file RELOADS read change. A session whose box held a draft, or
+    whose paste failed, is tried again at its registry's next change, which a turn's start and end make; every
+    RELOAD_EVERY seconds where the hub cannot hear the disk."""
     while True:
+        RELOAD_HEARD.clear()  # before the look: a change heard during it is looked at again
         reload_round()
-        time.sleep(RELOAD_EVERY)
+        RELOAD_HEARD.wait(None if WATCH.on else RELOAD_EVERY)
 
 
 def reload_round() -> None:
     if RELOADS_UNREAD:
         return
     try:
-        live = registry()
-    except Exception as e:  # a file changing under the read: the next look reads it again
+        with reading:
+            # read again in the same look while it watched a directory for the first time, which a file written there
+            # before the watch took would otherwise wait out until the next change; the units read none of those
+            for _ in range(3):
+                due = WATCH.read(RELOADS, lambda: {s: (e, reload_due(s, e)) for s, e in registry().items()})
+                if not WATCH.fresh:
+                    break
+                WATCH.fresh.clear()
+    except Exception as e:  # a file changing under the read: the next change reads it again
         print(f"keeping sessions on the newest mx: {e}", file=sys.stderr, flush=True)
         return
     with typing:  # an ended session needs no mark: a resumed one records the version it starts on
-        for ended in RELOADED.keys() - live.keys():
+        for ended in RELOADED.keys() - due.keys():
             del RELOADED[ended]
-    for session, entry in live.items():
+    for session, (entry, version) in due.items():
         try:
-            if (version := reload_due(session, entry)) and (said := reload_into(session, entry, version)):
+            if version and (said := reload_into(session, entry, version)):
                 print(said, file=sys.stderr, flush=True)
         except Exception as e:  # one session failing it (tmux, an entry of another shape) stops none of the others
             print(f"reloading mx in {session[:8]}: {e}", file=sys.stderr, flush=True)
@@ -4788,6 +4815,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(view) if view else self.send_json({"error": "no such unit"}, 404)
         if path == "/events":
             return self.stream()
+        if path == "/events/pages":
+            return self.stream(pages=True)
         if key := stand_in_key(path):
             view = unit_read(key)
             return self.send_page(stand_in_page(view)) if view else self.send(404, b"no such unit", "text/plain")
@@ -4801,6 +4830,8 @@ class Handler(BaseHTTPRequestHandler):
             target = Path(urllib.parse.unquote(path.removeprefix("/f"))).resolve()
             if not servable(target):
                 return self.send(403, b"not a page the hub serves", "text/plain")
+            if diffview and (page := diffview.page_beside(target, TOLD)) and page.is_file():
+                TOLD_PAGES.follow(page)
             if diffview and (page := diffview.page_beside(target, (".watch.json",))) and page.is_file():
                 return self.send_json(diffview.watch_record(page))  # with whether its watcher still runs
             if not target.exists() and diffview and diffview.is_beside_page(target):
@@ -4810,14 +4841,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file(target)
         self.send(404, b"not found", "text/plain")
 
-    def stream(self) -> None:
-        """A listener goes the moment its tab closes rather than at the next write that fails."""
+    def stream(self, pages: bool = False) -> None:
+        """A listener goes the moment its tab closes rather than at the next write that fails. One to the pages' events
+        alone is no listener of the disk watch's, which reads the disk only while a hub tab listens."""
         q: queue.Queue = queue.Queue()
-        try:
-            seen_by[q] = view_digest()
-        except Exception as e:  # without a digest, the disk watch's first round tells this listener to read again
-            print(f"listening: {e}", file=sys.stderr, flush=True)
-        join(q)
+        if pages:
+            with lock:
+                page_listeners.append(q)
+        else:
+            try:
+                seen_by[q] = view_digest()
+            except Exception as e:  # without a digest, the disk watch's first round tells this listener to read again
+                print(f"listening: {e}", file=sys.stderr, flush=True)
+            join(q)
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -4839,7 +4875,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             with lock:
-                listeners.remove(q)
+                (page_listeners if pages else listeners).remove(q)
 
     def relay(self, method: str) -> None:
         """A request under /h/<host>/, carried to that host's hub as the same request to its own path. This hub's
@@ -4869,8 +4905,8 @@ class Handler(BaseHTTPRequestHandler):
         tab = urllib.parse.urlsplit(self.origins()[0])
         headers = {"X-Forwarded-Host": tab.netloc, "X-Forwarded-Proto": tab.scheme,
                    **{k: v for k in ("Origin", "Content-Type", "Accept", "Sec-Fetch-Dest") if (v := self.headers.get(k))}}
-        if asked == "/events":
-            return self.relay_stream(host, headers)
+        if asked in ("/events", "/events/pages"):
+            return self.relay_stream(host, asked, headers)
         target = path + (f"?{parts.query}" if parts.query else "")
         tokened = method == "POST" and asked in TOKENED
         try:
@@ -4928,7 +4964,7 @@ class Handler(BaseHTTPRequestHandler):
         at = c.at if (c := copy_of(host)) else None
         self.send_page(after_body(body, copy_banner(host, at)))
 
-    def relay_stream(self, host: str, headers: dict[str, str]) -> None:
+    def relay_stream(self, host: str, path: str, headers: dict[str, str]) -> None:
         """The peer's event stream, after an event of the relay's own: {"type": "reached"} once the peer answers, or
         {"type": "unreachable"} where it does not, and the stream ends there, to be opened again in 5 seconds. The
         stream ends with the peer's, and a hub tab's EventSource opens it again as it would its own hub's. Spoken by
@@ -4943,7 +4979,7 @@ class Handler(BaseHTTPRequestHandler):
             peer.settimeout(READ_WAIT)
             try:
                 peer.connect(str(PEERS[host]))
-                peer.sendall(b"GET /events HTTP/1.0\r\nHost: hub\r\n" + b"".join(f"{k}: {v}\r\n".encode() for k, v in headers.items())
+                peer.sendall(f"GET {path} HTTP/1.0\r\nHost: hub\r\n".encode() + b"".join(f"{k}: {v}\r\n".encode() for k, v in headers.items())
                              + b"\r\n")
                 head = b""
                 while b"\r\n\r\n" not in head:
@@ -5188,7 +5224,7 @@ REGISTRY, STATUSLINES, UNITS, OWN_CODE = ("registry",), ("statusline",), ("units
 """The readers that are no unit: the session registry, the statusline inputs and the names of the units' state files,
 which the units share, and the hub's own code. Every other reader is a unit, by its key."""
 
-IN_MODIFY, IN_ATTRIB, IN_MOVED_FROM, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x2, 0x4, 0x40, 0x80, 0x100, 0x200
+IN_MODIFY, IN_ATTRIB, IN_CLOSE_WRITE, IN_MOVED_FROM, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x2, 0x4, 0x8, 0x40, 0x80, 0x100, 0x200
 IN_DELETE_SELF, IN_MOVE_SELF, IN_UNMOUNT, IN_Q_OVERFLOW, IN_IGNORED, IN_ONLYDIR, IN_ISDIR = (
     0x400, 0x800, 0x2000, 0x4000, 0x8000, 0x1000000, 0x40000000)
 NAMED = IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO
@@ -5209,10 +5245,9 @@ class Inotify:
             raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
         return answer
 
-    def add(self, directory: str) -> int:
+    def add(self, directory: str, mask: int = NAMED | IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF) -> int:
         """The watch on the directory, the one it already has where it has one under any name."""
-        return self.call(self.libc.inotify_add_watch, self.fd, os.fsencode(directory),
-                         NAMED | IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR)
+        return self.call(self.libc.inotify_add_watch, self.fd, os.fsencode(directory), mask | IN_ONLYDIR)
 
     def remove(self, wd: int) -> None:
         self.libc.inotify_rm_watch(self.fd, wd)  # one the kernel has dropped already answers EINVAL
@@ -5271,6 +5306,7 @@ class Watch:
             os.close(fd)
         self.pids.clear()
         self.on, self.notices, self.whole = False, None, True
+        RELOAD_HEARD.set()  # keep_plugins_current wakes, and from then on looks every RELOAD_EVERY
         print(f"watching the disk by reading it every {PACE:g} s: {why}", file=sys.stderr, flush=True)
 
     def heard(self) -> set | None:
@@ -5407,6 +5443,8 @@ class Watch:
         name is read again, and every reader once a notice was lost (IN_Q_OVERFLOW)."""
         for wd, mask, name in self.notices.read() if self.on else ():
             self.whole |= bool(mask & IN_Q_OVERFLOW)
+            if mask & IN_Q_OVERFLOW:
+                RELOAD_HEARD.set()
             for d in list(self.dirs.get(wd, ())):
                 if mask & GONE:  # deleted, or moved with its watch: what is at the path later is watched anew
                     self.dirty |= (readers := self.readers_of(d))
@@ -5427,6 +5465,9 @@ class Watch:
         for reader in [r for r, at in self.until.items() if at <= time.time()]:
             self.dirty.add(reader)
             del self.until[reader]
+        if RELOADS in self.dirty:  # read by keep_plugins_current, in a thread of its own, rather than by a round
+            self.dirty.discard(RELOADS)
+            RELOAD_HEARD.set()
         if (self.dirty or self.whole) and self.since is None:
             self.since = time.monotonic()
 
@@ -5463,6 +5504,99 @@ class Watch:
         return bool(waiting.poll(math.ceil(timeout * 1000)))
 
 WATCH = Watch()
+
+
+# --------------------------------------------------------------------------
+# the pages told: a diffview page hears from the hub when what is kept beside it changes, rather than asking on a clock
+# --------------------------------------------------------------------------
+
+TOLD = (".state.json", ".watch.json")
+"""What diffview keeps beside a page that the page follows: its state file, which another page saving writes, and the
+watch record its diffview watcher writes at each build. The watcher holds its record open for writing for as long as it
+runs, so its exit, a kill included, closes the file, which the kernel tells of (IN_CLOSE_WRITE) just before it lets go of
+the record's lock: SETTLE later, the record reads as no longer held."""
+
+
+class Pages:
+    """The diffview pages the hub tells of what is kept beside them: every page a state file or watch record was asked
+    for of, until the page is deleted. Each change is told to every listener, a hub tab's stream and a page's own
+    (/events/pages), which pick their own page's out by its url."""
+
+    MASK = IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.notices: Inotify | None = None
+        self.dirs: dict[int, str] = {}  # a watch -> its directory, as the /f/ route resolves it
+        self.followed: dict[str, set[str]] = {}  # directory -> the names of the pages followed in it
+
+    def follow(self, page: Path) -> None:
+        d, name = str(page.parent), page.name
+        with self.lock:
+            if name in self.followed.get(d, ()):
+                return
+            try:
+                if self.notices is None:
+                    self.notices = Inotify()
+                    threading.Thread(target=self.tell, args=(self.notices,), daemon=True).start()
+                self.dirs[self.notices.add(d, self.MASK)] = d
+            except OSError as e:  # the page is told nothing, and follows its file only when it comes to the front
+                return print(f"telling {page} of its changes: {e}", file=sys.stderr, flush=True)
+            self.followed.setdefault(d, set()).add(name)
+
+    def tell(self, notices: Inotify) -> None:
+        """Tell of each change the kernel's notices name, SETTLE after the first, so the writes of one save or one
+        build are told once."""
+        waiting = select.poll()
+        waiting.register(notices.fd, select.POLLIN)
+        while True:
+            waiting.poll()
+            time.sleep(SETTLE)
+            try:
+                changed = set(self.heard(notices.read()))
+            except OSError as e:
+                print(f"telling the pages: {e}", file=sys.stderr, flush=True)
+                continue
+            for page, kept in changed:
+                try:
+                    event = {"type": "page", "url": "/f" + urllib.parse.quote(str(page))}
+                    if kept == ".state.json":
+                        event["saved"] = True
+                    elif (record := diffview.watch_record(page)) is None:
+                        continue  # dropped, by a render without --watch: the page has nothing to follow
+                    else:
+                        event["watch"] = record
+                except Exception as e:  # one page's record (another user's, malformed) stops the telling of none other
+                    print(f"telling {page}: {e}", file=sys.stderr, flush=True)
+                    continue
+                with lock:
+                    qs = listeners + page_listeners
+                for q in qs:
+                    q.put(event)
+
+    def heard(self, notices: list[tuple[int, int, str]]) -> list[tuple[Path, str]]:
+        """The pages the notices name a change beside, each with what changed; a page deleted is followed no more."""
+        found = []
+        with self.lock:
+            for wd, mask, name in notices:
+                if mask & IN_Q_OVERFLOW:  # some notices lost: every page is told, as if all had changed
+                    found += [(Path(d) / page, kept) for d, pages in self.followed.items() for page in pages for kept in TOLD]
+                if (d := self.dirs.get(wd)) is None:
+                    continue
+                pages = self.followed.get(d, set())
+                if mask & GONE:
+                    self.followed.pop(d, None)
+                    del self.dirs[wd]
+                    if not mask & IN_IGNORED:
+                        self.notices.remove(wd)
+                elif mask & IN_DELETE and name in pages:
+                    pages.discard(name)
+                elif (page := diffview.page_beside(Path(name), TOLD)) and page.name in pages:
+                    found.append((Path(d) / page.name, name.removeprefix(page.name)))
+        return found
+
+
+TOLD_PAGES = Pages()
 
 
 # --------------------------------------------------------------------------

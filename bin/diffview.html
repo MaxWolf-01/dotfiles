@@ -665,6 +665,7 @@ function saveWorks() {
   clearInterval(RETRY);
   RETRY = null;
   document.querySelector(".savefail")?.remove();   // saving again is the whole message; a stale warning is a lie
+  reloadWhenFree();
 }
 function saveBroke() {
   if (!RETRY) RETRY = setInterval(persist, 3000);  // the server coming back lands everything typed while it was gone
@@ -684,27 +685,31 @@ function copyButton(cmd) {
   return copy;
 }
 /* the file moved between this page's last sync and this write: take the file, keep what this page
-   changed since, send again. Nobody is asked; the merge loses nothing it does not say. A fetch the
-   poll started just before may be the one taken: then its file predates the move, and the resend is
+   changed since, send again. Nobody is asked; the merge loses nothing it does not say. A fetch
+   follow started just before may be the one taken: then its file predates the move, and the resend is
    refused once more, which comes back here with a fresh fetch */
 function refused() {
   return takeFile().then(persist);
 }
 /* the file as it is now, merged in when it is a version this page has not seen. One at a time, since
-   the poll, a refused save and a focus can all ask */
+   the hub's word of a save, a refused save and a focus can all ask; one asked during another reads once more
+   after it, since the save it is for may have landed after that one's read */
+let SYNC_AGAIN = false;
 function takeFile() {
-  if (!SYNC) SYNC = fetchBeside(".state.json")
+  if (SYNC) SYNC_AGAIN = true;
+  else SYNC = fetchBeside(".state.json")
     .then(file => { if (file && file.savedAt !== SINCE) mergeFile(file); })
-    .finally(() => { SYNC = null; });
+    .finally(() => { SYNC = null; if (SYNC_AGAIN) { SYNC_AGAIN = false; takeFile(); } });
   return SYNC;
 }
 /* the page follows its file: what another page saved is merged in. Nothing is merged over a write of this page's own that is still
-   in the air, or waiting on a server that stopped answering: the answer to that write decides, and the
-   poll returns after; so a file the poll finds newer is always another page's */
+   in the air, or waiting on a server that stopped answering: the answer to that write decides, since a write that missed
+   another page's save is refused and merges it then, and one that landed first has the other page write again, which
+   the hub tells of; so a file found newer here is always another page's */
 function follow() {
   if (!S) return;   // the state file is still being read
   syncReading();
-  if (INFLIGHT || RETRY || SYNC) return;
+  if (INFLIGHT || RETRY) return;
   takeFile();
 }
 
@@ -3247,24 +3252,62 @@ if (savedScroll != null) {
   sessionStorage.removeItem(SCROLL_KEY);
   requestAnimationFrame(() => scrollTo(0, +savedScroll));
 }
+/* the hub tells a served page of each save to its state file and, for a page --watch rebuilds, of each change to
+   the record its watcher keeps beside it, naming the build it wrote last and whether it still runs (hearHub). The
+   page also looks at once when it comes to the front */
 READY.then(() => {
   if (!SERVED) return;
-  // every 2 seconds in the foreground (a background tab is throttled to about one a minute), and at once
-  // when the tab comes to the front
-  setInterval(follow, 2000);
   addEventListener("focus", follow);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") follow(); });
-  /* only --watch rebuilds a page under you. Its watcher keeps a record beside the page naming the build it
-     wrote last, and the hub says with it whether the watcher still runs */
-  if (!FROM_WATCH) return;
-  setInterval(async () => {
-    const watch = await fetchBeside(".watch.json");
-    if (!watch) return;                        // the hub not answering is the save warning's to say
-    watcherStopped(!watch.alive, watch);
-    if (!watch.alive || !watch.g || watch.g === DATA.generated) return;   // against THIS page's build, no baseline races
-    if (!reloadWouldLose()) location.reload();
-  }, 2000);
+  addEventListener("storage", e => { if (e.key === READING_KEY) syncReading(); });   // another tab of this browser changed the reading marks
+  if (FROM_WATCH) lookAtWatch();   // a build written between this page's load and its first event
+  hearHub(ev => {
+    const missed = ev.type === "again" || ev.type === "reached";   // the stream was down
+    if (!missed && (ev.type !== "page" || decodeURIComponent(ev.url) !== decodeURIComponent(location.pathname))) return;
+    if (missed || ev.saved) follow();
+    if (FROM_WATCH && missed) lookAtWatch();
+    if (FROM_WATCH && ev.watch) onWatch(ev.watch);
+  });
 });
+/* what the hub tells this page: through the hub tab it is shown in, which calls hubTold, else through one stream of
+   the hub's (/events/pages) that every page of this browser on the hub shares, held by whichever of them holds the
+   lock and passed to the rest on a channel. A browser keeps only six connections to one origin open, and the hub tab
+   holds some of them already */
+function hearHub(told) {
+  let hubTab = false;
+  try { hubTab = parent !== window && parent.HUB_TELLS_PAGES === true; } catch (e) {}   // a parent on another origin
+  if (hubTab) { window.hubTold = told; return; }
+  const base = location.pathname.match(/^\/h\/[^/]+/)?.[0] ?? "";   // a page of a host this hub relays: its stream, relayed
+  const listen = (tell) => {
+    const stream = new EventSource(base + "/events/pages");
+    stream.onopen = () => tell({ type: "again" });
+    stream.onmessage = (e) => {   // a relayed host's hub names its pages as its own, under no /h/<host>
+      const ev = JSON.parse(e.data);
+      tell(ev.url ? { ...ev, url: base + ev.url } : ev);
+    };
+  };
+  if (!navigator.locks || !window.BroadcastChannel) return listen(told);   // no lock outside a secure context
+  const name = "diffview-told" + base, channel = new BroadcastChannel(name);
+  channel.onmessage = (e) => told(e.data);
+  navigator.locks.request(name, () => new Promise(() => listen(ev => { channel.postMessage(ev); told(ev); })));   // held while the page lives
+}
+async function lookAtWatch() {
+  const watch = await fetchBeside(".watch.json");
+  if (watch) onWatch(watch);                   // the hub not answering is the save warning's to say
+}
+let BUILD_WAITS = false;   // a newer build is not loaded, since that would lose what is being typed
+function onWatch(watch) {
+  watcherStopped(!watch.alive, watch);
+  if (!watch.alive || !watch.g || watch.g === DATA.generated) return;   // against THIS page's build, no baseline races
+  BUILD_WAITS = true;
+  reloadWhenFree();
+}
+/* what ends the typing a reload waits on is a key or a click, or a save landing after the hub was down (saveWorks) */
+function reloadWhenFree() {
+  if (BUILD_WAITS && !reloadWouldLose()) location.reload();
+}
+addEventListener("keyup", reloadWhenFree);
+addEventListener("click", reloadWhenFree);
 /* never yank a review mid-comment, nor over comments that never reached disk (a restarted --watch rebuilds
    on sight); a container view asks this too before it reloads the page */
 function reloadWouldLose() {
