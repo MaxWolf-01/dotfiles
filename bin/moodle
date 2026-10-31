@@ -114,6 +114,11 @@ from tyro.extras import SubcommandApp
 
 MOODLE = "https://moodle.jku.at"
 IDP_HOST = "shibboleth.im.jku.at"
+NIDP = "https://access.jku.at/nidp/"  # JKU's Access Manager, where Shibboleth sends the browser for the password
+# The password fields: Shibboleth's own login form, and the Access Manager's.
+CREDENTIAL_FIELDS = (("j_username", "j_password"), ("Ecom_User_ID", "Ecom_Password"))
+# How the Access Manager moves on without a form: a script that sets window.location.
+SCRIPT_REDIRECT = re.compile(r"window\.location\.href\s*=\s*'([^']+)'")
 SECRETS = "jku"
 STATE = Path.home() / ".local/state/moodle"
 ROOT = Path.home() / "repos/github/MaxWolf-01/jku"
@@ -160,32 +165,51 @@ class Moodle:
         self.sesskey = ""
 
     def sign_in(self, username: str, password: str) -> None:
-        """Walk Shibboleth's forms: local-storage probe, username/password, then the SAML response back to Moodle."""
+        """Walk JKU's login as the browser does: Shibboleth hands it to the Access Manager, which asks for the password
+        and hands back a SAML response, which Shibboleth passes on to Moodle.
+
+        Each form is posted with the values it carries and the Referer, which the Access Manager answers an empty page
+        without; its device-recognition form goes with the fingerprint field empty. The walk stops at the password
+        form's second showing: the credentials were refused, and a second try would count against the account's lockout.
+        """
         r = self.s.get(f"{MOODLE}/login/index.php", timeout=60)
-        password_page = None
-        for _ in range(6):
+        password_sent = False
+        for _ in range(12):
             if r.url.startswith(MOODLE + "/") and "SAMLResponse" not in r.text:
                 break
             form = BeautifulSoup(r.text, "lxml").find("form")
+            if form is None and r.url.startswith(NIDP) and (script := SCRIPT_REDIRECT.search(r.text)):
+                target = urljoin(r.url, script.group(1))
+                if not target.startswith(NIDP):
+                    sys.exit(f"moodle: sign-in hit an unexpected redirect to {target}; not following it")
+                r = self.s.get(target, headers={"Referer": r.url}, timeout=60)
+                continue
             if not form:
                 break
             target = urljoin(r.url, form.get("action", ""))
             host = urlparse(target)
-            if host.hostname != IDP_HOST and not (target.startswith(MOODLE + "/Shibboleth.sso/")):
+            if host.hostname != IDP_HOST and not target.startswith((NIDP, MOODLE + "/Shibboleth.sso/")):
                 sys.exit(f"moodle: sign-in hit an unexpected form posting to {host.hostname}{host.path}; not following it")
             data = {i["name"]: i.get("value", "") for i in form.find_all("input") if i.get("name")}
-            if "j_username" in data:
-                if r.url == password_page:
-                    break  # the IdP showed the password form again: the credentials were refused
-                password_page = r.url
-                data |= {"j_username": username, "j_password": password}
-            data["_eventId_proceed"] = ""
-            r = self.s.post(target, data=data, timeout=60)
+            refused = False
+            for user_field, password_field in CREDENTIAL_FIELDS:
+                if user_field in data:
+                    refused = password_sent
+                    password_sent = True
+                    data |= {user_field: username, password_field: password}
+            if refused:
+                break
+            if urlparse(r.url).hostname == IDP_HOST:
+                data["_eventId_proceed"] = ""
+            r = self.s.post(target, data=data, headers={"Referer": r.url}, timeout=60)
         page = self.s.get(f"{MOODLE}/my/courses.php", timeout=60)
         key = re.search(r'"sesskey":"(\w+)"', page.text)
         if not key or 'data-userid="' not in page.text:
             idp_error = BeautifulSoup(r.text, "lxml").select_one(".output--failure, .form-error, .alert-danger")
-            why = clean(idp_error.get_text(" ")) if idp_error else "Moodle still shows the guest page after the sign-in"
+            refused = r.url.startswith(NIDP) and BeautifulSoup(r.text, "lxml").find("input", attrs={"name": "Ecom_Password"})
+            why = (clean(idp_error.get_text(" ")) if idp_error
+                   else "JKU's login showed the password form again: it refused the password, or the account is locked" if refused
+                   else "Moodle still shows the guest page after the sign-in")
             sys.exit(f"moodle: sign-in to {MOODLE} failed: {why}\n"
                      f"Check the username and password in the sops file `{SECRETS}` (sops-editor), and that JKU's login works in a browser.")
         self.sesskey = key.group(1)
