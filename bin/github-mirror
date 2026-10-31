@@ -1,26 +1,60 @@
 #!/usr/bin/env bash
-# Mirror GitHub repos to ~/repos/github/<owner>/<repo>: clone what the listed
-# accounts have and this machine lacks, then fetch every clone under that tree,
-# hand-cloned ones from any owner included, and fast-forward a checkout that
-# has nothing local at stake. Safe for working copies: a branch with
-# uncommitted or unpushed work is left where it is, and a repo that vanished
-# upstream is left as it was.
+# Clone what a GitHub account has and this machine lacks, then fetch the clones
+# and fast-forward a checkout that has nothing local at stake: a branch with
+# uncommitted or unpushed work is left where it is, no checkout changes branch,
+# and a repo that vanished upstream is left as it was.
 #
 # Usage: github-mirror
+#          Clones the accounts this script lists into ~/repos/github/<owner>/<repo>.
+#          Fetches every clone in that tree, whatever its owner, from all its
+#          remotes, without pruning. Logs as github-mirror.
+#
+#        github-mirror OWNER DIR
+#          Clones OWNER's unarchived repos into DIR/<repo>. Fetches only the
+#          clones in DIR whose origin is OWNER's, from origin alone, with --prune.
+#          Logs as <owner, lowercased>-mirror.
 set -euo pipefail
 case ${1:-} in -h|--help) awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;; esac
 
-BASE_DIR="$HOME/repos/github"
-ACCOUNTS=("MaxWolf-01" "yapit-tts")
+case $# in
+    0)
+        unit=github-mirror
+        base_dir="$HOME/repos/github"
+        accounts=("MaxWolf-01" "yapit-tts")
+        list_flags=()
+        fetch_args=(--all)
+        clone_dir() { echo "$base_dir/$1"; }
+        walked_dirs() { printf '%s\n' "$base_dir"/*/*/; }
+        in_scope() { true; }
+        ;;
+    2)
+        unit="${1,,}-mirror"
+        base_dir="${2%/}"
+        accounts=("$1")
+        list_flags=(--no-archived)
+        fetch_args=(origin --prune)
+        clone_dir() { echo "$base_dir"; }
+        # The dotted pattern is for an org's .github repo.
+        walked_dirs() { printf '%s\n' "$base_dir"/*/ "$base_dir"/.[!.]*/; }
+        # The raw setting, as `git remote get-url` would apply any insteadOf.
+        in_scope() { [[ $(git -C "$1" config --get remote.origin.url) == *github.com[:/]"${accounts[0]}"/* ]]; }
+        ;;
+    *)
+        echo "github-mirror: takes no arguments, or OWNER DIR; see --help" >&2
+        exit 2
+        ;;
+esac
 
-# Every run leaves one line in ~/logs/runs/github-mirror.jsonl (bin/run-log):
-# ok with the counters once the walk completes, failed repos included, and fail
-# only when the script dies before its summary. Recording the run must never
-# decide whether the mirror succeeded: run-log explains itself on stderr and
-# the mirror carries on. Reached by path: the timer's PATH has no ~/bin.
+# Every run leaves one line in ~/logs/runs/<unit>.jsonl (bin/run-log): ok with
+# the counters once the walk completes, failed repos included; skip when no clone
+# could be fetched because GitHub is out of reach; fail when none could be fetched
+# with GitHub there, so a mirror that does nothing cannot pass for one that works,
+# and when the script dies before its summary. Recording the run must never decide
+# whether the mirror succeeded: run-log explains itself on stderr and the mirror
+# carries on. Reached by path: the timer's PATH has no ~/bin.
 run_log_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-log"
 log_run() {
-    "$run_log_bin" github-mirror "$@" || true
+    "$run_log_bin" "$unit" "$@" || true
 }
 logged=0
 trap '[ "$logged" = 1 ] || log_run fail --reason "aborted with exit $?"' EXIT
@@ -60,13 +94,13 @@ fast_forward() {
 }
 
 # Pass 1: clone what the listed accounts have and this tree lacks.
-for owner in "${ACCOUNTS[@]}"; do
-    dir="$BASE_DIR/$owner"
+for owner in "${accounts[@]}"; do
+    dir=$(clone_dir "$owner")
     mkdir -p "$dir"
 
     echo "=== $owner ==="
     LIMIT=10000
-    if ! repos=$(gh repo list "$owner" --limit "$LIMIT" --json name --jq '.[].name'); then
+    if ! repos=$(gh repo list "$owner" --limit "$LIMIT" "${list_flags[@]}" --json name --jq '.[].name'); then
         echo "  gh repo list failed; no clones for $owner this run" >&2
         ((failed++)) || true
         continue
@@ -92,19 +126,19 @@ for owner in "${ACCOUNTS[@]}"; do
     echo
 done
 
-# Pass 2: every clone in the tree, whichever owner. A worktree (.git is a file,
-# not a directory) carries a branch of its own and is skipped. A fetch that
-# fails on one remote still brings the others in, so the fast-forward is
-# attempted either way; it finds nothing new when the failing remote was the
-# upstream. git fetch itself waits forever on a remote that accepts the
-# connection and never answers, so each fetch is cut off after five minutes
-# and counted as failed.
+# Pass 2: the clones in the tree. A worktree (.git is a file, not a directory)
+# carries a branch of its own and is skipped. A fetch that fails on one remote
+# still brings the others in, so the fast-forward is attempted either way; it
+# finds nothing new when the failing remote was the upstream. git fetch itself
+# waits forever on a remote that accepts the connection and never answers, so
+# each fetch is cut off after five minutes and counted as failed.
 echo "=== fetch ==="
-for repo_dir in "$BASE_DIR"/*/*/; do
+while IFS= read -r repo_dir; do
     [ -d "$repo_dir/.git" ] || continue
-    name="${repo_dir#"$BASE_DIR"/}"
+    in_scope "$repo_dir" || continue
+    name="${repo_dir#"$base_dir"/}"
     printf "  fetch  %s ... " "${name%/}"
-    if timeout 300 git -C "$repo_dir" fetch --all --quiet 2>/dev/null; then
+    if timeout 300 git -C "$repo_dir" fetch "${fetch_args[@]}" --quiet 2>/dev/null; then
         ((fetched++)) || true
         printf "ok, "
     else
@@ -118,12 +152,21 @@ for repo_dir in "$BASE_DIR"/*/*/; do
         2) ((current++)) || true ;;
         *) ((left++)) || true ;;
     esac
-done
+done < <(walked_dirs)
 echo
 
 echo "Done: $cloned cloned, $fetched fetched ($forwarded fast-forwarded, $current current, $left left as they were), $failed failed"
 
 stats=$(printf '{"cloned":%d,"fetched":%d,"fast_forwarded":%d,"current":%d,"left":%d,"failed":%d}' \
     "$cloned" "$fetched" "$forwarded" "$current" "$left" "$failed")
-log_run ok --stats "$stats"
+if [ "$fetched" -eq 0 ] && [ "$failed" -gt 0 ]; then
+    # A public repo, so the answer says nothing about this machine's credentials.
+    if timeout 30 git ls-remote --quiet https://github.com/git/git HEAD >/dev/null 2>&1; then
+        log_run fail --reason "no clone could be fetched, though GitHub answers" --stats "$stats"
+    else
+        log_run skip --reason "GitHub not reachable" --stats "$stats"
+    fi
+else
+    log_run ok --stats "$stats"
+fi
 logged=1
