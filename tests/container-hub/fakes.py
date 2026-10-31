@@ -354,14 +354,15 @@ exit 1
         page(self.home / ".cache/claude-statusline" / f"{session}.json", json.dumps(data))
 
     def turn_record(self, session_dir: Path, number: int, headline: str, questions: tuple[str, ...] = (),
-                    at: float | None = None, **front: dict[str, str]) -> None:
+                    at: float | None = None, todos: tuple[str, ...] = (), **front: dict[str, str]) -> None:
         """A turn record in the shape the mx plugin's RULES.md gives it, written at `at`, else at the hub's clock: its
-        frontmatter's `answered` and `superseded` each a mapping of question tags."""
+        frontmatter's `answered` and `superseded` each a mapping of question and to-do tags."""
         path = session_dir / "turns" / f"{number:02d}.md"
         tables = "".join(f"{name}:\n" + "".join(f"  {tag}: {value}\n" for tag, value in table.items()) for name, table in front.items())
         asked = "\n## Questions\n\n" + "".join(f"- [{q}] **Which way, {q}?** A call only the user can make.\n  - (a) this way *my pick*\n  - (b) that way\n"
                                                     for q in questions) if questions else ""
-        page(path, f"---\ndate: 2026-10-07\n{tables}---\n\n# {headline}\n{asked}")
+        listed = "\n## To do\n\n" + "".join(f"- [{a}] **Do {a}** outside the session.\n" for a in todos) if todos else ""
+        page(path, f"---\ndate: 2026-10-07\n{tables}---\n\n# {headline}\n{asked}{listed}")
         os.utime(path, (at or self.clock.now,) * 2)
 
     @staticmethod
