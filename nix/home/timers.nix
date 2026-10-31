@@ -453,6 +453,7 @@ in
   };
 
   # --- GitHub repo mirror (clone missing, fetch existing) ---
+  # A local backup, so it does not prune: a branch deleted on GitHub survives here.
 
   systemd.user.services.github-mirror = {
     Unit = {
@@ -481,6 +482,8 @@ in
   };
 
   # --- HELFERLINE org → ~/work/helferline ---
+  # These clones are read as what is on GitHub, so they are pruned, and fetched from
+  # origin alone, where an unreachable ssh remote cannot use up a fetch's time limit.
   # Hourly because a day-old view of them misleads, and a run with nothing new takes
   # seconds. The ssh agent is for a clone whose origin is ssh.
 
