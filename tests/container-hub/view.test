@@ -136,9 +136,11 @@ class World:
             raise
 
     def build(self, browser, run: Path, name: str) -> None:
-        # A scenario named twice runs twice. The name is cut short because tmux's socket and the hub's live in here, and
-        # a unix socket's path fits in 108 bytes, under a TMPDIR as long as the devShell's too.
-        self.scratch = Path(tempfile.mkdtemp(dir=run, prefix=f"{name[:24]}."))
+        # A scenario named twice runs twice. The name is cut short because the hubs' and tmux's sockets live in here, and
+        # a unix socket's path fits in 107 bytes, under a TMPDIR as long as the devShell's (~/.tmp/nix-shell.XXXXXX) too.
+        self.scratch = Path(tempfile.mkdtemp(dir=run, prefix=f"{name[:8]}."))
+        if len(bytes(self.scratch)) > 107 - len("/no-laptop.sock"):  # the longest socket name a scenario gives
+            raise RuntimeError(f"TMPDIR is too long for the worlds' sockets: {self.scratch} leaves no room for one under it")
         self.home = self.scratch / "home"
         self.code = self.home / "repos" / "alpha"
         self.agent = self.code / "agent"
@@ -973,6 +975,16 @@ def the_rail_says_when_each_turn_ended(w: World) -> None:
     settles("SECOND's: three hours ago", "3h ago", lambda: row(SECOND).inner_text())
     check("...the time itself on hover, in 24 hours", True,
           bool(re.fullmatch(r"last turn ended .*\b\d\d:\d\d", row(SECOND).get_attribute("title"))))
+    ticking = w.context.new_page()  # a tab whose clock the test moves on, which nothing the hub tells moves
+    ticking.clock.install()
+    ticking.goto(w.origin + "/")
+    ticking.wait_for_function("window.wc && ws.views().length > 0", timeout=30000)
+    label = lambda: ticking.locator(f'#units button[title="session {ORCHESTRATOR}"] .ago').inner_text()
+    before = label()
+    ticking.clock.fast_forward("05:00")
+    since = ticking.evaluate("Date.now() / 1000") - (w.t0 - 100)  # as long ago as the tab's clock now says the turn ended
+    check("...and moves on as time passes, with nothing else changed", ("1m ago", f"{int(since // 60)}m ago"), (before, label()))
+    ticking.close()
 
 
 @scenario
@@ -2915,6 +2927,91 @@ def a_peers_sessions(w: World) -> None:
         stop(laptop)
 
 
+TOLD = session_id(0x26)  # a session on the laptop, running, an agent's page new in its unit
+
+
+@scenario
+def numbers_told(w: World) -> None:
+    """hub-numbers-event-carries-numbers: the world's hub is pc's, relaying a laptop's hub. A statusline's numbers
+    changed on either host, and a unit visited on either, reach the tab in the event that tells it, which then asks
+    neither hub anything, and shows what a tab that reads it all shows."""
+    home = w.scratch / "lap"
+    env = {**w.env, "HOME": str(home)}
+    fakes.page(home / ".claude/sessions/told.json", json.dumps({"pid": os.getpid(), "procStart": SELF_STARTED, "sessionId": TOLD,
+                                                                 "status": "idle", "statusUpdatedAt": int(w.t0 * 1000) - 600_000}))
+    lap = subprocess.Popen([str(BIN / "container-hub"), "--socket", str(w.scratch / "lap.sock"), "--url", "http://laptop.invalid",
+                            "--state", str(w.scratch / "lap-state"), "--host", "laptop"],
+                           env=env, stdout=subprocess.DEVNULL, stderr=(w.scratch / "lap.log").open("a"), start_new_session=True)
+    on_laptop = lambda path, body: json.loads(subprocess.run(
+        ["curl", "-sf", "--unix-socket", str(w.scratch / "lap.sock"), "-H", "Content-Type: application/json", "-d", json.dumps(body),
+         f"http://hub{path}"], check=True, capture_output=True).stdout)
+    try:
+        until(lambda: (w.scratch / "lap.sock").exists() or lap.poll() is not None, "the laptop's hub to listen")
+        on_laptop("/api/open", {"target": str(fakes.page(home / "notes/new.html", "<!doctype html><h1>new</h1>")), "session": TOLD})
+        w.kill_hub()
+        w.hub_args += ["--host", "pc", "--peer", f"laptop={w.scratch / 'lap.sock'}"]
+        w.start_hub()
+        w.view.reload()
+        key = f"laptop/{TOLD}"
+        w.view.wait_for_function(f"window.wc && wc.state.units.some(u => u.unit === {json.dumps(key)})", timeout=30000)
+        w.settle()
+        rail = lambda page=w.view: page.evaluate("""[...document.querySelectorAll('#usage > *, #units .nav, #aside-units .nav')]
+            .map(e => [e.title, e.textContent, e.dataset.tone ?? ''])""")
+        ctx = lambda session: w.view.evaluate(f"document.querySelector('#units button[title=\"session {session}\"] .ctx')?.textContent ?? null")
+        new = lambda session: w.view.evaluate(f"!!document.querySelector('#units button[title=\"session {session}\"] .new')")
+        check("the laptop's session has an agent's page new in its unit, the tab elsewhere", (True, True), (new(TOLD), w.current() != key))
+        asked = []
+        w.context.on("request", lambda r: asked.append(urllib.parse.urlsplit(r.url).path) if "/api/" in r.url else None)
+        while True:  # the reads the tab makes as its streams open, the relay's "reached" among them, done with first
+            before = len(asked)
+            w.view.wait_for_timeout(2000)
+            if len(asked) == before:
+                break
+        asked.clear()
+
+        t = time.time()
+        w.statusline(ORCHESTRATOR, w.home / ".claude", context_window={"used_percentage": 42.5, "total_input_tokens": 85000},
+                     rate_limits={"five_hour": {"used_percentage": 31, "resets_at": t + 3700}})
+        settles("pc's statusline changed shows its numbers on the rail", "42%", lambda: ctx(ORCHESTRATOR))
+        fakes.page(home / ".cache/claude-statusline" / f"{TOLD}.json", json.dumps({
+            "session_id": TOLD, "config_dir": str(home / ".claude-lap"), "written_at": t, "model": {"display_name": "Opus"},
+            "context_window": {"used_percentage": 64, "total_input_tokens": 128000},
+            "rate_limits": {"five_hour": {"used_percentage": 12, "resets_at": t + 3700}}}))
+        settles("...and the laptop's, through the relay, its usage too", ("64%", True),
+                lambda: (ctx(TOLD), w.view.locator('#usage button.account:text-is("lap")').count() == 1))
+        on_laptop("/api/visit", {"unit": TOLD})
+        settles("a visit on the laptop takes the new page off its row", False, lambda: new(TOLD))
+        w.api("/api/visit", {"unit": ORCHESTRATOR})
+        w.view.wait_for_timeout(3000)  # the rounds that follow each change, and any read they would make
+        check("...and for none of it, nor what the hubs' rounds tell after, does the tab ask either hub anything", [], asked)
+        check("...while its rail is what a tab that reads it all shows", rail(w.fresh_tab("window.wc && wc.state.units.length > 0")), rail())
+        if not READER:
+            skipped("a turn record after the tab's own visit", "no mx plugin here, whose session page reader the rail reads a page by")
+        else:  # a record whose headline is the last one's changes the numbers alone: its unit's row, now unseen
+            w.view.locator(f'#units button[title="session {ORCHESTRATOR}"] .name').click()
+            until(lambda: w.current() == ORCHESTRATOR, "ORCHESTRATOR's unit")
+            w.view.keyboard.press("Control+Alt+0")
+            until(lambda: w.current() is None, "the overview")
+            w.written()
+            record = lambda n: fakes.page(w.agent / f"sessions/{ORCHESTRATOR}/turns/{n:02d}.md", "---\ndate: 2026-10-07\n---\n\n# Same headline\n")
+            record(1)
+            unseen = lambda: w.view.evaluate(f"document.querySelector('#units button[title=\"session {ORCHESTRATOR}\"]')"
+                                             ".closest('.unit').querySelector('.mark').title.includes('a turn record you have not seen')")
+            settles("a turn record written after the tab's own visit shows unseen on its row", True, unseen)
+            w.view.locator(f'#units button[title="session {ORCHESTRATOR}"] .name').click()
+            until(lambda: w.current() == ORCHESTRATOR, "ORCHESTRATOR's unit")
+            w.view.keyboard.press("Control+Alt+0")
+            until(lambda: w.current() is None, "the overview")
+            w.written()
+            settles("...seen once visited", False, unseen)
+            w.view.wait_for_timeout(1500)  # the visit's round, whose numbers event the tab holds the visit through
+            record(2)
+            settles("...and the next one, which changes the numbers alone, shows unseen again", True, unseen)
+    finally:
+        os.killpg(lap.pid, signal.SIGKILL)
+        lap.wait()
+
+
 COPIED = session_id(0x22)  # a session on the laptop, idle at the last pull of it, the laptop down since
 GONE = session_id(0x25)  # a session on the laptop, ended before the last pull, and no unit
 
@@ -3067,7 +3164,7 @@ def main(args: Args) -> None:
     names = list(args.scenarios or SCENARIOS)
     if args.shuffle:
         random.Random(args.shuffle).shuffle(names)
-    scratch = Path(tempfile.mkdtemp(prefix="container-hub-view-test."))  # every world's, and what they share
+    scratch = Path(tempfile.mkdtemp(prefix="hub-view."))  # every world's, and what they share; short, as World.build says
     # trellis, which a hub fetches on first use into its HOME's cache: fetched once, by the first world's hub
     (scratch / "trellis").mkdir()
     try:

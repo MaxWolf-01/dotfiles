@@ -617,6 +617,7 @@ const notAnswering = (host, { at }) => `${host} does not answer${at ? `; as read
 
 let ws = null;
 let read = { units: [], usage: [] }; // the hub's last index (/api/hub), every account's units in it
+let ownRead = null; // this hub's own part of it, as /api/hub answered it, the numbers told since laid over it
 const details = new Map(); // /api/u/<key> of each unit the tab lays out: its pages and members, which the index leaves out
 let state = { units: [], members: [] }; // those answers as the tab shows them: the shown accounts', with the user's changes
 // The unit you are in, by its session, so a reorder of the rail never moves you; null in the overview. An address
@@ -681,7 +682,7 @@ function send(p) {
 // The index, then the details of the units laid out: read again for those `changed` names, and for those a change
 // made here waits on.
 async function refresh(changed = []) {
-  const started = performance.now();
+  const started = performance.now(), since = tellings;
   let r;
   try {
     r = await fetch("/api/hub");
@@ -689,8 +690,8 @@ async function refresh(changed = []) {
   } catch {
     return; // the hub is down: the status line says so, and the tab reads again once it is back
   }
-  const own = await r.json();
-  read = merged(own, await Promise.all(peersOf(own).map(peerIndex)));
+  ownRead = withTold(null, await r.json(), since);
+  read = merged(ownRead, await Promise.all(peersOf(ownRead).map(peerIndex)));
   const answered = [...pending].filter((p) => p.answered !== null && p.answered < started);
   derive();
   await hold([...changed, ...answered.map((p) => p.body.unit)]);
@@ -716,16 +717,45 @@ function peersOf(own) {
 // peer's reach changed.
 const PEER_WAIT = 1500;
 async function peerIndex(host) {
-  const held = () => [host, peerReads.get(host) ?? { units: [], usage: [], unreachable: { at: null, why: "not read yet" } }];
+  const held = () => [host, heldOf(host)], since = tellings;
   const asking = fetch(`${base(host)}/api/hub`).then(async (r) => {
     const got = await r.json(), was = peerReads.get(host);
-    peerReads.set(host, r.ok ? got : { units: [], usage: [], unreachable: got.unreachable ?? { at: null, why: got.error } });
+    peerReads.set(host, r.ok ? withTold(host, got, since) : { units: [], usage: [], unreachable: got.unreachable ?? { at: null, why: got.error } });
     return !was || !was.unreachable !== !peerReads.get(host).unreachable;
   }, () => false); // this hub is down: the status line says so
   const late = await Promise.race([asking.then(() => false), new Promise((done) => setTimeout(() => done(true), PEER_WAIT))]);
   if (late) asking.then((changed) => changed && refresh().then(() => apply()));
   return held();
 }
+const heldOf = (host) => peerReads.get(host) ?? { units: [], usage: [], unreachable: { at: null, why: "not read yet" } };
+
+// What a numbers event or a visit changed, told by the hub's stream (null) or a peer's, laid over the index the tab
+// holds of that host, with no read: a numbers event carries the usage and each unit's row of them whole, a visit the
+// time the unit was visited at, whose row the tab works out as the hub does. The numbers a stream told last are kept,
+// for a read of its host that started before they were told and answered after, which holds the ones they replaced.
+const told = new Map();
+let tellings = 0;
+const withTold = (stream, index, since) => (told.get(stream)?.at > since && !index.unreachable ? withNumbers(index, told.get(stream).ev) : index);
+const withNumbers = (index, { usage, rows }) => ({ ...index, usage, units: index.units.map((u) => ({ ...u, ...rows[u.unit] })) });
+function layOver(stream, ev) {
+  if (ev.type === "numbers") told.set(stream, { ev, at: ++tellings });
+  // the hub holds this tab's own visits of the unit now: laid over every derive, an old one would hide what came since
+  else for (const p of pending) if (p.what === "visit" && p.body.unit === ev.unit) pending.delete(p);
+  const index = stream === null ? ownRead : peerReads.get(stream);
+  if (!ownRead || !index || index.unreachable) return; // a read under way holds it, the numbers laid over what it reads
+  const key = keyOf(ev.unit);
+  const changed = ev.type === "numbers" ? withNumbers(index, ev)
+    : { ...index, units: index.units.map((u) => (u.unit === key ? { ...u, ...visitedAt(u, ev.visited) } : u)) };
+  if (stream === null) ownRead = changed;
+  else peerReads.set(stream, changed);
+  read = merged(ownRead, peers.map((host) => [host, heldOf(host)]));
+  derive();
+  render();
+}
+// A unit's row once visited at `at`, by the hub's rule (needs_you and rail_index in bin/container-hub).
+const visitedAt = (u, at) => ({ visited: at, agent_opened_at: u.agent_opened_at.filter((t) => t > at),
+  needs_you: u.needs_you?.questions ? { ...u.needs_you, unseen: false } : null });
+
 // Every host's units in one index, a peer's keyed and addressed as this tab has them, each marked unreachable where its
 // host does not answer. An account's usage is this host's where it has it, a peer's otherwise: it is the account's, not
 // the host's.
@@ -1077,9 +1107,9 @@ function stepUnit(step) {
 
 // Entering or leaving a unit is what clears its "new": you saw what was there.
 // You looked at a unit: what was new there is not.
-const visit = (key) => unit(key)?.unreachable || unit(key)?.found || local((s) => {
+const visit = (key, at = now()) => unit(key)?.unreachable || unit(key)?.found || local((s) => {
   const u = s.units.find((x) => x.unit === key);
-  if (u) { u.visited = now(); if (u.needs_you) u.needs_you = { ...u.needs_you, unseen: false }; }
+  if (u) Object.assign(u, visitedAt(u, at));
 }, "visit", { unit: key });
 
 function enter(U) {
@@ -3759,6 +3789,7 @@ function listenTo(host) {
   stream.onmessage = (e) => {
     const ev = JSON.parse(e.data);
     if (ev.type === "code") return newCode(ev, host);
+    if (ev.type === "numbers") return layOver(host, ev); // its rows keyed as the peer keys its units
     if (ev.type === "unreachable" && peerReads.get(host)?.unreachable) return; // as the tab shows it already
     if (ev.type === "reached" || ev.type === "unreachable") {
       note(ev.type === "reached" ? `${host} answers` : `${host} does not answer`);
@@ -3775,8 +3806,9 @@ function listenTo(host) {
 async function heard(ev) {
   if (ev.type === "code") return newCode(ev);
   if (ev.type === "page") return tellPages(ev); // nothing of the hub's index changed
+  if (ev.type === "numbers") return layOver(null, ev);
+  if (ev.type === "visit") return layOver(ev.unit.includes("/") ? hostOf(ev.unit) : null, ev);
   await refresh(ev.units ?? (["added", "reopened", "listed", "close"].includes(ev.type) ? [ev.unit] : []));
-  if (ev.type === "visit" || ev.type === "numbers") return render();
   // a click answered already; a hidden account's agent puts nothing over the tab
   const hidden = (U) => hiddenAccounts.has(read.units.find((u) => u.unit === U)?.account);
   if (ev.type === "board") return ev.by === "user" || hidden(ev.unit) ? render() : openBoard(ev.url, ev.unit, false);
