@@ -75,14 +75,18 @@ in
   # prefs are merged into each profile's Preferences instead -- while Brave is
   # down, because a running Brave rewrites that file from memory on exit.
   home.activation.braveProfilePrefs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-    if ${pkgs.procps}/bin/pgrep -x -u "$USER" 'brave|\.brave-wrapped' > /dev/null; then
-      echo "brave: running, profile prefs untouched -- quit it and switch again"
+    bravePending=()
+    for prefs in "$HOME/.config/BraveSoftware/Brave-Browser"/*/Preferences; do
+      [[ -e $prefs ]] || continue
+      # Chromium's own: the profile picker's and the guest session's, which it resets.
+      [[ $prefs == */"System Profile"/* || $prefs == */"Guest Profile"/* ]] && continue
+      ${pkgs.jq}/bin/jq -e --argjson patch '${builtins.toJSON profilePrefs}' '. * $patch == .' "$prefs" > /dev/null \
+        || bravePending+=("$prefs")
+    done
+    if (( ''${#bravePending[@]} )) && ${pkgs.procps}/bin/pgrep -x -u "$USER" 'brave|\.brave-wrapped' > /dev/null; then
+      echo "brave: running, prefs left unapplied in ''${#bravePending[@]} profile(s) -- quit it and switch again"
     else
-      for prefs in "$HOME/.config/BraveSoftware/Brave-Browser"/*/Preferences; do
-        [[ -e $prefs ]] || continue
-        if ${pkgs.jq}/bin/jq -e --argjson patch '${builtins.toJSON profilePrefs}' '. * $patch == .' "$prefs" > /dev/null; then
-          continue
-        fi
+      for prefs in "''${bravePending[@]}"; do
         if [[ -v DRY_RUN ]]; then
           echo "would update brave prefs in $prefs"
         else
@@ -93,5 +97,6 @@ in
         fi
       done
     fi
+    unset bravePending
   '';
 }
