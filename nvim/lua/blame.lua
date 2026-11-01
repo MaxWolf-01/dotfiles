@@ -254,7 +254,7 @@ local function winbar()
   local where = #state.stack > 1 and ("%#Comment#before " .. top().from:sub(1, 7) .. "  ") or ""
   return where
     .. key("K", "diff")
-    .. key("s", "commit")
+    .. key("s/S", "commit")
     .. key("r", "older")
     .. (#state.stack > 1 and key("⌫", "newer") or "")
     .. key("q", "close")
