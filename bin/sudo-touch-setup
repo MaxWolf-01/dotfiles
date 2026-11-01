@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+#
+# sudo-touch-setup: a wizard that turns on sudo by a YubiKey touch, on zephylux,
+# pc and xmg19. It registers both keys (one plugged in at a time), commits the
+# registrations, switches each host, and checks that sudo takes a touch there
+# and still takes the password without a key. docs/sudo-touch.md says how the
+# setup works, what to do when it does not, and how to back out.
+#
+#   sudo-touch-setup          run it on zephylux, in a terminal, keys at hand
+#
+# Safe to stop with Ctrl-C and run again: a key already registered is skipped,
+# and each host's switch and check simply run again.
+#
+# Everything above the "STAGES" marker is the wizard library from the mx wizard
+# skill: do not hand-edit it. The stages are below the marker.
+
+set -euo pipefail
+
+# ──────────────────────────────────────────────────────────────────────────
+# Wizard library: delightful, consistent UX. Identical across every wizard.
+# ──────────────────────────────────────────────────────────────────────────
+
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+  BOLD=$(tput bold); DIM=$(tput dim); RESET=$(tput sgr0)
+  BLUE=$(tput setaf 4); GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3); RED=$(tput setaf 1)
+else
+  BOLD=""; DIM=""; RESET=""; BLUE=""; GREEN=""; YELLOW=""; RED=""
+fi
+
+# Author sets this at the top of the stages section.
+TOTAL_STAGES=0
+
+_STAGE_INDEX=0
+ENV_FILE="${ENV_FILE:-.env}"
+WRITTEN_ENV=()    # KEYs written to ENV_FILE this run
+WRITTEN_SECRET=() # secret NAMEs set this run
+SKIPPED=()        # things we couldn't do (e.g. gh missing)
+
+# _clear: wipe the terminal so only the current step is on screen. No-op when
+# output isn't a terminal, so piped logs stay readable.
+_clear() {
+  [[ -t 1 ]] || return 0
+  if command -v tput >/dev/null 2>&1; then tput clear; else printf '\033[2J\033[3J\033[H'; fi
+}
+
+# banner "Title": opening frame, what this wizard does.
+banner() {
+  _clear
+  printf '\n%s%s  %s%s\n' "$BOLD" "$BLUE" "$1" "$RESET"
+  printf '%s  %s stages%s\n\n' "$DIM" "$TOTAL_STAGES" "$RESET"
+  printf '%s  You drive the browser; this wizard tells you exactly what to do and\n' "$DIM"
+  printf '  captures the values you copy back. Stop any time with Ctrl-C and re-run\n'
+  printf '  later; it remembers values already saved.%s\n' "$RESET"
+  pause "Ready to start?"
+}
+
+# stage "Name": clear the screen, then announce a stage and show progress.
+# Clearing keeps only the current step on screen.
+stage() {
+  _clear
+  _STAGE_INDEX=$((_STAGE_INDEX + 1))
+  printf '\n%s%s▸ Stage %s/%s · %s%s\n' \
+    "$BOLD" "$BLUE" "$_STAGE_INDEX" "$TOTAL_STAGES" "$1" "$RESET"
+}
+
+# say "...": a plain instruction line.
+say()  { printf '  %s\n' "$1"; }
+# step "...": a numbered-feeling action the human takes in the browser.
+step() { printf '  %s•%s %s\n' "$BLUE" "$RESET" "$1"; }
+note() { printf '  %s%s%s\n' "$DIM" "$1" "$RESET"; }
+warn() { printf '  %s⚠ %s%s\n' "$YELLOW" "$1" "$RESET"; }
+
+# open_url URL: open in the human's browser, cross-platform incl. WSL.
+open_url() {
+  local url="$1"
+  printf '  %s↗ opening%s %s\n' "$GREEN" "$RESET" "$url"
+  { if   command -v wslview     >/dev/null 2>&1; then wslview "$url"
+    elif command -v explorer.exe >/dev/null 2>&1; then explorer.exe "$url"
+    elif command -v xdg-open    >/dev/null 2>&1; then xdg-open "$url"
+    elif command -v open        >/dev/null 2>&1; then open "$url"
+    else warn "couldn't open a browser; visit it manually: $url"; fi
+  } >/dev/null 2>&1 || warn "couldn't open a browser; visit it manually: $url"
+}
+
+# pause "msg": wait for the human to confirm they've done the manual part.
+pause() {
+  printf '  %s%s%s ' "$DIM" "${1:-Press Enter to continue}" "$RESET"
+  read -r _ || true
+}
+
+# confirm "question": y/N gate; returns success on yes.
+confirm() {
+  local reply=""
+  printf '  %s? %s [y/N] ' "$YELLOW" "$1"
+  read -r reply || true
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+# _existing KEY: current value of KEY in ENV_FILE, if any.
+_existing() {
+  [[ -f "$ENV_FILE" ]] || return 1
+  local line; line=$(grep -E "^${1}=" "$ENV_FILE" | tail -n1) || return 1
+  printf '%s' "${line#*=}"
+}
+
+# ask KEY "Prompt": read a value into $KEY. Offers the existing .env value as
+# a default on re-runs (Enter keeps it). Visible input (non-secret).
+ask() {
+  local key="$1" prompt="$2" current input
+  current=$(_existing "$key" || true)
+  if [[ -n "$current" ]]; then
+    printf '  %s%s%s %s[Enter keeps current]%s ' "$BOLD" "$prompt" "$RESET" "$DIM" "$RESET"
+  else
+    printf '  %s%s%s ' "$BOLD" "$prompt" "$RESET"
+  fi
+  read -r input || true
+  [[ -z "$input" && -n "$current" ]] && input="$current"
+  printf -v "$key" '%s' "$input"
+}
+
+# ask_secret KEY "Prompt": like ask, but input is hidden.
+ask_secret() {
+  local key="$1" prompt="$2" current input
+  current=$(_existing "$key" || true)
+  if [[ -n "$current" ]]; then
+    printf '  %s%s%s %s[Enter keeps current]%s ' "$BOLD" "$prompt" "$RESET" "$DIM" "$RESET"
+  else
+    printf '  %s%s%s ' "$BOLD" "$prompt" "$RESET"
+  fi
+  read -rs input || true
+  printf '\n'
+  [[ -z "$input" && -n "$current" ]] && input="$current"
+  printf -v "$key" '%s' "$input"
+}
+
+# write_env KEY VALUE: upsert KEY=VALUE into ENV_FILE (creates it; replaces
+# any existing line). Idempotent.
+write_env() {
+  local key="$1" value="$2" tmp
+  touch "$ENV_FILE"
+  tmp=$(mktemp)
+  grep -vE "^${key}=" "$ENV_FILE" > "$tmp" || true
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  mv "$tmp" "$ENV_FILE"
+  WRITTEN_ENV+=("$key")
+  printf '  %s✓ wrote%s %s → %s\n' "$GREEN" "$RESET" "$key" "$ENV_FILE"
+}
+
+# set_secret NAME VALUE: set a GitHub Actions repo secret via gh. Falls back
+# to a warning (and records it) if gh is unavailable or unauthenticated.
+set_secret() {
+  local name="$1" value="$2"
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    if printf '%s' "$value" | gh secret set "$name" >/dev/null 2>&1; then
+      WRITTEN_SECRET+=("$name")
+      printf '  %s✓ set%s GitHub secret %s\n' "$GREEN" "$RESET" "$name"
+      return
+    fi
+  fi
+  SKIPPED+=("GitHub secret $name (set it manually: gh secret set $name)")
+  warn "skipped GitHub secret $name: gh not ready; set it later"
+}
+
+# set_var NAME VALUE: set a GitHub Actions repo variable (non-secret).
+set_var() {
+  local name="$1" value="$2"
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    if gh variable set "$name" --body "$value" >/dev/null 2>&1; then
+      printf '  %s✓ set%s GitHub variable %s\n' "$GREEN" "$RESET" "$name"
+      return
+    fi
+  fi
+  SKIPPED+=("GitHub variable $name")
+  warn "skipped GitHub variable $name: gh not ready; set it later"
+}
+
+# finish: clear, then a closing summary of everything configured.
+finish() {
+  _clear
+  printf '\n%s%s  ✓ Setup complete%s\n' "$BOLD" "$GREEN" "$RESET"
+  (( ${#WRITTEN_ENV[@]} ))    && note "wrote ${#WRITTEN_ENV[@]} value(s) to $ENV_FILE: ${WRITTEN_ENV[*]}"
+  (( ${#WRITTEN_SECRET[@]} )) && note "set ${#WRITTEN_SECRET[@]} GitHub secret(s): ${WRITTEN_SECRET[*]}"
+  if (( ${#SKIPPED[@]} )); then
+    printf '\n'; warn "still to do by hand:"
+    for s in "${SKIPPED[@]}"; do note "  - $s"; done
+  fi
+  printf '\n'
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# STAGES: author this section. One stage() per step the human takes.
+# Replace the example below. Set TOTAL_STAGES to match the stages you write.
+# ──────────────────────────────────────────────────────────────────────────
+
+TOTAL_STAGES=7
+
+case "${1:-}" in
+  -h|--help) sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") ;;
+  *) echo "sudo-touch-setup: takes no arguments (--help says what it does)" >&2; exit 2 ;;
+esac
+
+dotfiles=$HOME/.dotfiles
+secrets=$dotfiles/secrets
+state=${XDG_STATE_HOME:-$HOME/.local/state}/sudo-touch-setup
+# The two YubiKeys by serial (`ykman list --serials`). A replacement key takes
+# its serial here; see "A YubiKey lost" in secrets/DISASTER.md.
+keychain_serial=40771133
+backup_serial=40771121
+# The ssh host and the flake's nixosConfiguration have the same name on both.
+remote_hosts=(pc xmg19)
+
+ok()  { printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$1"; }
+die() { printf '\n  %s✗ %s%s\n\n' "$RED" "$1" "$RESET"; exit 1; }
+
+# wait_for_key SERIAL LABEL: returns once that YubiKey, and no other, is plugged
+# in, so each touch below lands on the key it registers.
+wait_for_key() {
+  local serial=$1 label=$2 plugged
+  while :; do
+    plugged=$(ykman list --serials 2>/dev/null | paste -sd' ' -)
+    if [[ $plugged == "$serial" ]]; then
+      ok "the $label key ($serial) is plugged in, alone"
+      return
+    fi
+    step "Plug in the $label key ($serial), and only that one.${plugged:+ Plugged in now: $plugged.}"
+    pause "Press Enter once it is in"
+  done
+}
+
+# fido_device: the plugged-in YubiKey's FIDO device. libfido2 also reaches the
+# key through its smart-card interface, and with two candidates ssh-keygen first
+# asks for a touch to choose one, giving up after 15 seconds with "device not
+# found". Naming the device skips that. With Yubico OTP off, the key has one HID
+# device, the FIDO one.
+fido_device() {
+  local d found=()
+  for d in /sys/class/hidraw/hidraw*; do
+    grep -qi '^HID_ID=0003:00001050:' "$d/device/uevent" 2>/dev/null && found+=("/dev/${d##*/}")
+  done
+  [[ ${#found[@]} == 1 ]] || return 1
+  echo "${found[0]}"
+}
+
+# touch_test: sudo with nothing to type, so it succeeds only on a touch. -k
+# ignores sudo's remembered grant for this one command without dropping it,
+# which keeps the grant there to undo a broken change with.
+touch_test() {
+  SUDO_ASKPASS=$(command -v false) sudo -k -A true
+}
+
+register_key() {  # LABEL SERIAL
+  local label=$1 serial=$2 line
+  local u2f=$state/u2f-$label handle=$HOME/.ssh/id_ed25519_sk_$label
+  stage "The $label key ($serial)"
+  say "The key blinks each time it wants a touch."
+  wait_for_key "$serial" "$label"
+
+  local fido; fido=$(ykman --device "$serial" fido info)
+  if grep -q '^PIN: *Not set' <<<"$fido"; then
+    say "It has no FIDO2 PIN yet. sudo does not use one; passkeys on websites do."
+    if confirm "Set its FIDO2 PIN now (use the same PIN on both keys)?"; then
+      ykman --device "$serial" fido access change-pin
+    fi
+  fi
+
+  # Yubico OTP types a code when the key is brushed, and the code is phishable.
+  local info; info=$(ykman --device "$serial" info)
+  if grep -qE '^Yubico OTP.*Enabled' <<<"$info"; then
+    ykman --device "$serial" config nfc --disable OTP -f >/dev/null
+    ykman --device "$serial" config usb --disable OTP -f >/dev/null 2>&1 || true
+    # The USB change reboots the key, and nothing announces it is back.
+    for _ in $(seq 20); do ykman --device "$serial" info >/dev/null 2>&1 && break; sleep 0.5; done
+    ok "Yubico OTP is off, over USB and NFC"
+  fi
+
+  if [[ -s $u2f ]]; then
+    ok "already registered for sudo on this laptop"
+  else
+    step "Touch the key: this registers it for sudo on this laptop."
+    line=$(pamu2fcfg -u "$USER") || die "pamu2fcfg failed; run the wizard again"
+    mkdir -p "$state"
+    printf '%s\n' "${line#"$USER":}" >"$u2f"
+    ok "registered for sudo on this laptop"
+  fi
+
+  if [[ -f $handle ]]; then
+    ok "already has its ssh key for sudo on pc and xmg19 ($handle)"
+  else
+    local device
+    device=$(fido_device) || die "found no single YubiKey FIDO device under /sys/class/hidraw"
+    step "Touch the key again when it blinks: this makes the ssh key sudo on pc and xmg19 asks for."
+    note "If it asks for a PIN, that is the FIDO2 PIN."
+    until ssh-keygen -q -t ed25519-sk -O device="$device" -N "" -C "sudo-touch $label" -f "$handle"; do
+      note "\"invalid format\" means the key is still waiting on the last try: give it half a minute."
+      confirm "ssh-keygen did not make the key. Try again?" || die "no ssh key made; run the wizard again"
+    done
+    ok "made $handle"
+  fi
+  pause
+}
+
+# The script each remote host runs, in an ssh session from here, which forwards
+# the YubiKey agent. Its sudo grant, from the one password it asks for, is what
+# undoes the switch if sudo there no longer works.
+remote_script=$(cat <<'REMOTE'
+set -u
+host=$1
+say()  { printf '  %s\n' "$1"; }
+fail() { printf '  ✗ %s\n' "$1"; exit 1; }
+ask_yes() { local reply; read -rp "  ? $1 [y/N] " reply; [[ $reply =~ ^[Yy] ]]; }
+
+git -C ~/.dotfiles pull -q --ff-only || fail "git pull failed on $host; sort out ~/.dotfiles there, then run the wizard again"
+say "building $host's system first, which needs no sudo"
+build=$(mktemp -d)
+(cd "$build" && nixos-rebuild build --flake ~/.dotfiles#"$host") || fail "the build failed; nothing changed on $host"
+rm -rf "$build"
+say "your sudo password on $host:"
+sudo -v || fail "sudo did not take the password"
+sudo nixos-rebuild switch --flake ~/.dotfiles#"$host" || fail "the switch failed"
+
+keys=$(ssh-add -L 2>/dev/null)
+grep -q '^sk-ssh-ed25519@openssh.com ' <<<"$keys" \
+  || fail "no YubiKey ssh key reached $host, so sudo there still asks only for the password; see 'When it does not work' in docs/sudo-touch.md"
+if grep -v '^sk-ssh-ed25519@openssh.com ' <<<"$keys" | grep -q .; then
+  say "⚠ the agent forwarded to $host holds a key that is not a YubiKey's"
+fi
+
+say "touch the key when it blinks"
+if SUDO_ASKPASS=$(command -v false) sudo -k -A true; then
+  say "✓ sudo on $host took the touch"
+else
+  say "✗ sudo on $host did not take the touch"
+  if ask_yes "Undo the switch, so sudo on $host takes only the password again?"; then
+    sudo nixos-rebuild switch --rollback
+  fi
+  exit 1
+fi
+if ask_yes "Check that the password still works without a key? Unplug the key first."; then
+  sudo -k true && say "✓ the password works without a key"
+  say "plug the key back in"
+fi
+REMOTE
+)
+
+remote_switch() {  # HOST
+  local host=$1 encoded
+  stage "sudo on $host"
+  say "The wizard logs in to $host, pulls the commit, builds and switches, then"
+  say "has sudo there ask for a touch. Keep a key plugged in."
+  pause
+  # base64 gets the script through the remote login shell's quoting untouched.
+  encoded=$(base64 -w0 <<<"$remote_script")
+  ssh -t "$host" "bash -c \"\$(echo $encoded | base64 -d)\" _ $host" \
+    || die "$host is not done; what failed is above. Run the wizard again once it is fixed."
+  pause
+}
+
+# ── Stages ────────────────────────────────────────────────────────────────
+
+banner "sudo by a YubiKey touch"
+
+stage "This laptop"
+[[ $(hostname) == zephylux ]] || die "this runs on zephylux, the laptop the keys plug into"
+[[ $(git -C "$dotfiles" branch --show-current) == master ]] \
+  || die "$dotfiles is not on master, where the registrations are committed"
+say "pamu2fcfg is what registers a key for sudo here. Your sudo password:"
+sudo -v || die "sudo did not take the password"
+sudo apt-get install -y -qq pamu2fcfg >/dev/null || die "apt-get install pamu2fcfg failed"
+ok "pamu2fcfg is installed"
+pause
+
+register_key keychain "$keychain_serial"
+register_key backup "$backup_serial"
+
+stage "Commit the registrations, then switch this laptop"
+say "What is written is public: a credential id and a public key per key."
+printf '%s:%s:%s\n' "$USER" "$(cat "$state/u2f-keychain")" "$(cat "$state/u2f-backup")" \
+  >"$dotfiles/nix/yubikey/u2f_keys"
+pubs=$dotfiles/nix/yubikey/sudo-sk-keys.pub
+{ grep '^#' "$pubs"; cat "$HOME"/.ssh/id_ed25519_sk_{keychain,backup}.pub; } >"$pubs.new"
+mv "$pubs.new" "$pubs"
+files=(nix/yubikey/u2f_keys nix/yubikey/sudo-sk-keys.pub)
+git -C "$dotfiles" add -- "${files[@]}"
+if ! git -C "$dotfiles" diff --cached --quiet -- "${files[@]}"; then
+  git -C "$dotfiles" commit -q -m "feat(sudo-touch): register both YubiKeys" \
+    -m "Written by bin/sudo-touch-setup." -- "${files[@]}"
+  ok "committed ${files[*]}"
+fi
+git -C "$dotfiles" push -q origin master || die "git push failed; push $dotfiles by hand, then run the wizard again"
+ok "pushed"
+
+# The handles go into secrets, so a reinstall that restores them needs no new
+# registration on pc and xmg19.
+for label in keychain backup; do
+  dest=creds/raw/id_ed25519_sk_$label
+  [[ -f $secrets/$dest ]] && continue
+  (cd "$secrets" && sops encrypt --input-type binary --output-type binary \
+    --filename-override "$dest" "$HOME/.ssh/id_ed25519_sk_$label" >"$dest.new" && mv "$dest.new" "$dest") \
+    || die "sops could not encrypt $dest"
+  git -C "$secrets" add -- "$dest"
+  git -C "$secrets" commit -q -m "sudo-touch: the $label YubiKey's ssh key handle" -- "$dest"
+  ok "saved the $label key's ssh handle in secrets/$dest"
+done
+git -C "$secrets" push -q || die "git push failed in $secrets; push it by hand, then run the wizard again"
+
+say "Switching this laptop (hmswitch)..."
+hmswitch >/dev/null || die "hmswitch failed; run it by hand to see why"
+systemctl --user restart ssh-sk-agent
+[[ -e $HOME/.config/Yubico/u2f_keys ]] || die "hmswitch did not link ~/.config/Yubico/u2f_keys"
+held=$(SSH_AUTH_SOCK=/run/user/$(id -u)/ssh-sk-agent ssh-add -L 2>/dev/null | grep -c '^sk-ssh-ed25519@openssh.com ' || true)
+[[ $held == 2 ]] || die "the YubiKey agent holds $held sk keys, not 2: systemctl --user status ssh-sk-agent"
+ok "the YubiKey agent holds both keys' ssh keys, for pc and xmg19"
+pause
+
+stage "sudo on this laptop"
+say "sudo will ask for a touch first, and for the password when no key answers."
+note "Your sudo password, if asked: sudo keeps the grant while this stage runs,"
+note "so a broken change can be undone without it."
+sudo -v || die "sudo did not take the password"
+cp /etc/pam.d/sudo "$state/pam.d-sudo.before"
+(cd "$dotfiles" && ./setup sudo_touch) || die "./setup sudo_touch failed; /etc/pam.d/sudo is as it was"
+step "Touch the key when it blinks."
+if touch_test; then
+  ok "sudo took the touch"
+else
+  warn "sudo did not take the touch"
+  if confirm "Put /etc/pam.d/sudo back as it was?"; then
+    sudo cp "$state/pam.d-sudo.before" /etc/pam.d/sudo && ok "put back"
+  fi
+  die "see 'When it does not work' in docs/sudo-touch.md"
+fi
+if confirm "Check that the password still works without a key? Unplug the key first."; then
+  sudo -k true && ok "the password works without a key"
+  step "Plug a key back in: pc and xmg19 need it next."
+fi
+pause
+
+for host in "${remote_hosts[@]}"; do
+  remote_switch "$host"
+done
+
+finish
+ok "sudo takes a touch on zephylux, pc and xmg19"
+printf '\n'

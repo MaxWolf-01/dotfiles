@@ -1,5 +1,5 @@
-# sudo by a YubiKey touch, the laptop's half; docs/sudo-touch.md registers the
-# keys and says how to back out.
+# sudo by a YubiKey touch, the laptop's half; sudo-touch-setup registers the
+# keys, and docs/sudo-touch.md says how to back out.
 #
 # Here sudo asks pam_u2f, which `./setup ubuntu` puts in /etc/pam.d/sudo, and
 # pam_u2f reads which keys count from ~/.config/Yubico/u2f_keys, linked below.
@@ -45,7 +45,7 @@ let
       if [ -f "$handle" ]; then
         ssh-add "$handle"
       else
-        echo "no key handle at $handle yet; docs/sudo-touch.md makes it"
+        echo "no key handle at $handle yet; sudo-touch-setup makes it"
       fi
     done
     # ssh-add -L exits 1, saying so on stdout, when the agent holds nothing.
