@@ -427,6 +427,7 @@ import ctypes
 import errno
 import fcntl
 import fnmatch
+import gzip
 import hashlib
 import html
 import http.client
@@ -478,6 +479,9 @@ TRELLIS = {  # fetched, not committed: its licence asks a sponsorship for commer
 }
 TRELLIS_VERSION = "0.3.0"
 TRELLIS_URL = f"https://cdn.jsdelivr.net/npm/@danfessler/trellis@{TRELLIS_VERSION}/dist/"
+TRELLIS_PATH = f"/static/trellis/{TRELLIS_VERSION}"
+"""Where the hub serves trellis: a new version is a new URL, so a browser keeps each file for good (IMMUTABLE)."""
+IMMUTABLE = "public, max-age=31536000, immutable"
 
 URL = ""
 """The hub tab's address on this host (--url), with no trailing slash."""
@@ -1495,6 +1499,19 @@ def content_type(path: Path, body: bytes) -> str:
     except UnicodeDecodeError:
         return guessed or "application/octet-stream"
     return "text/plain; charset=utf-8"
+
+
+TEXT = re.compile(r"text/|application/(json|javascript|xml)|application/[\w.+-]+\+(json|xml)|image/svg\+xml")
+"""The types a response is gzipped in."""
+
+
+def takes_gzip(accepted: str | None) -> bool:
+    """Whether an Accept-Encoding takes gzip: named, or as *, and not at q=0."""
+    for coding in (accepted or "").split(","):
+        name, _, params = coding.partition(";")
+        if name.strip().lower() in ("gzip", "*"):
+            return not re.fullmatch(r"\s*q\s*=\s*0(\.0*)?\s*", params)
+    return False
 
 
 MARKDOWN_SUFFIXES = (".md", ".markdown")
@@ -4723,8 +4740,16 @@ def relayed_location(host: str, location: str) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # Chromium revalidates by an ETag only on an HTTP/1.1 response
+
     def log_message(self, *_):
         pass
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        """One request to a connection: an event stream sends no length that would end it, so each answer closes its
+        connection."""
+        super().send_response(code, message)
+        self.send_header("Connection", "close")
 
     def handle_one_request(self):
         global answering
@@ -4738,11 +4763,24 @@ class Handler(BaseHTTPRequestHandler):
                 answered.notify_all()
 
     def send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
+        """A GET answered 200 carries its body's hash as its ETag, and the browser keeps it but asks again on every use:
+        a body unchanged since it last had it is a 304, any change a new body. Text goes gzipped to a client that
+        takes it. The event streams answer by hand, neither cached nor compressed."""
+        kept = code == 200 and self.command == "GET"
+        headers = {"Cache-Control": "no-cache" if kept else "no-store", **(headers or {})}
+        if kept:
+            headers["ETag"] = f'W/"{hashlib.sha256(body).hexdigest()[:32]}"'
+            if headers["ETag"] in re.split(r"\s*,\s*", self.headers.get("If-None-Match") or ""):
+                code, body = 304, b""
+        if TEXT.match(ctype):
+            headers["Vary"] = "Accept-Encoding"
+            if body and takes_gzip(self.headers.get("Accept-Encoding")):
+                body, headers["Content-Encoding"] = gzip.compress(body, 6, mtime=0), "gzip"
         self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (headers or {}).items():
+        if code != 304:
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+        for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
@@ -4828,11 +4866,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/" or path.startswith("/u/"):
             raw = TAB.read_bytes()
             tab = raw.decode().replace('"__RESTART__"', json.dumps(restart_command())).replace('"__CODE__"', json.dumps(tab_version(raw)))
-            tab = tab.replace("__TOKEN__", TOKEN if top_level(self.headers) else "")
+            tab = tab.replace("__TOKEN__", TOKEN if top_level(self.headers) else "").replace("__TRELLIS__", TRELLIS_PATH)
             return self.send(200, tab.encode(), "text/html; charset=utf-8")
-        if path.startswith("/static/trellis/") and (name := path.rsplit("/", 1)[-1]) in TRELLIS:
+        if path.startswith(TRELLIS_PATH + "/") and (name := path.removeprefix(TRELLIS_PATH + "/")) in TRELLIS:
             try:
-                return self.send_file(trellis(name))
+                body = (file := trellis(name)).read_bytes()
+                return self.send(200, body, content_type(file, body), {"Cache-Control": IMMUTABLE})
             except OSError as e:
                 print(f"trellis {name}: {e}", file=sys.stderr, flush=True)
                 return self.send(502, f"trellis could not be served: {e}".encode(), "text/plain")
@@ -4947,6 +4986,7 @@ class Handler(BaseHTTPRequestHandler):
                    **{k: v for k in ("Origin", "Content-Type", "Accept", "Sec-Fetch-Dest") if (v := self.headers.get(k))}}
         if asked in ("/events", "/events/pages"):
             return self.relay_stream(host, asked, headers)
+        headers["Accept-Encoding"] = "gzip"  # compressed from the peer too, held here decompressed, for send() to compress again
         target = path + (f"?{parts.query}" if parts.query else "")
         tokened = method == "POST" and asked in TOKENED
         try:
@@ -4957,7 +4997,9 @@ class Handler(BaseHTTPRequestHandler):
                                                    READ_WAIT if kept_read(asked) or asked == "/api/sessions" else LONG_WAIT)
                 if not (tokened and status == 403):  # a token the peer made anew since it was asked
                     break
-        except (OSError, http.client.HTTPException, ValueError, KeyError) as e:
+            if got.get("Content-Encoding") == "gzip":
+                answer = gzip.decompress(answer)
+        except (OSError, http.client.HTTPException, ValueError, KeyError, EOFError) as e:
             return self.unreachable(host, asked, method, str(e) or type(e).__name__)
         if method == "GET" and status == 200 and kept_read(asked):
             remember(host, asked, answer)
