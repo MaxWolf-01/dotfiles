@@ -364,12 +364,15 @@ local function entry_at(win, loud)
   return b.entries[api.nvim_win_get_cursor(win)[1]], b
 end
 
-local function winbar()
-  local function key(k, label)
-    return "%#Title#" .. k .. "%#Comment# " .. label .. "  "
-  end
-  return key("K", "change") .. key("f", follow and "follow (on)" or "follow") .. key("h", "history")
-    .. key("s/S", "commit") .. key("q", "close")
+
+
+local function keyhint(k, label)
+  return "%#Title#" .. k .. "%#Comment# " .. label .. "  "
+end
+
+local function panel_winbar()
+  return keyhint("K", "change") .. keyhint("f", follow and "follow (on)" or "follow") .. keyhint("h", "history")
+    .. keyhint("s/S", "commit") .. keyhint("q", "close")
 end
 
 local function render()
@@ -389,7 +392,7 @@ local function render()
   for _, m in ipairs(marks) do
     api.nvim_buf_set_extmark(buf, ns, m[1] - 1, m[2], { end_col = m[3], hl_group = m[4] })
   end
-  vim.wo[state.panel_win].winbar = winbar()
+  vim.wo[state.panel_win].winbar = panel_winbar()
   return true
 end
 
@@ -403,12 +406,12 @@ local function committed_entry()
   return e, b
 end
 
---- Opens `lines` in a scratch buffer beside the code: `open` is "vsplit" or "tabnew".
-local function open_beside(name, lines, open)
+--- Opens `lines` in a scratch buffer beside the code (`open` is "vsplit" or "tabnew"); returns it.
+local function open_beside(name, lines, open, ft)
   local buf = api.nvim_create_buf(false, true)
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   pcall(api.nvim_buf_set_name, buf, name) -- the same view opened twice keeps the first's name
-  vim.bo[buf].modifiable, vim.bo[buf].filetype, vim.bo[buf].bufhidden = false, "git", "wipe"
+  vim.bo[buf].modifiable, vim.bo[buf].filetype, vim.bo[buf].bufhidden = false, ft or "git", "wipe"
   vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, nowait = true, desc = "Close" })
   if state and api.nvim_get_current_win() == state.panel_win then
     api.nvim_set_current_win(state.code_win)
@@ -416,28 +419,123 @@ local function open_beside(name, lines, open)
   vim.cmd(open)
   vim.wo.scrollbind, vim.wo.cursorbind = false, false -- a split inherits the code window's binding
   api.nvim_win_set_buf(0, buf)
+  return buf
+end
+
+local function open_commit(root, sha, open)
+  local out = git(root, { "show", "--stat", "--patch", "--format=fuller", sha }) or ""
+  open_beside("blame://commit/" .. sha:sub(1, 7), vim.split(out, "\n", { plain = true }), open)
 end
 
 function M.show_commit(open)
   local e, b = committed_entry()
   if e then
-    local out = git(b.root, { "show", "--stat", "--patch", "--format=fuller", e.commit.sha }) or ""
-    open_beside("blame://commit/" .. e.commit.sha:sub(1, 7), vim.split(out, "\n", { plain = true }), open)
+    open_commit(b.root, e.commit.sha, open)
   end
 end
 
---- Every commit that changed the line under the cursor, newest first, each with its change.
+local HISTORY_LINES = 6 -- changed lines shown per commit; a bigger change ends on a count
+
+--- The commits of `git log -L` output, newest first, each with the lines its change removed (-)
+--- and added (+) in the range.
+local function parse_line_log(out)
+  local commits, cur, in_hunk = {}, nil, false
+  for _, l in ipairs(vim.split(out, "\n", { plain = true })) do
+    if l:sub(1, 1) == "\1" then
+      local f = vim.split(l:sub(2), "\0", { plain = true })
+      cur = { sha = f[1], author = f[2], time = tonumber(f[3]), summary = f[4], changes = {} }
+      commits[#commits + 1] = cur
+      in_hunk = false
+    elseif l:match "^diff %-%-git " then
+      in_hunk = false
+    elseif l:match "^@@ " then
+      in_hunk = true
+    elseif cur and in_hunk and l:match "^[+-]" then
+      cur.changes[#cur.changes + 1] = l
+    end
+  end
+  -- A change that removes nothing wrote the line; git goes on tracing the range into the lines
+  -- that stood near it before, which are another line's history.
+  for i, c in ipairs(commits) do
+    if #vim.tbl_filter(function(l) return l:sub(1, 1) == "-" end, c.changes) == 0 then
+      c.born = true
+      return vim.list_slice(commits, 1, i)
+    end
+  end
+  return commits
+end
+
+--- The timeline's lines, highlights, and the commit each row belongs to.
+local function history_layout(commits, title)
+  local lines, marks, shas = { title, "" }, { { 1, 0, #title, "Title" } }, {}
+  local age = age_hls(commits)
+  local function add(text, sha)
+    lines[#lines + 1] = text
+    shas[#lines] = sha
+    return #lines
+  end
+  for _, c in ipairs(commits) do
+    local date = os.date("%Y-%m-%d", c.time)
+    local born = c.born
+    local head = date .. "  " .. c.author .. "  " .. c.summary
+    local row = add(head .. (born and "  (first written here)" or ""), c.sha)
+    marks[#marks + 1] = { row, 0, #date, age[c.sha] }
+    marks[#marks + 1] = { row, #date + 2, #date + 2 + #c.author, author_hl(c.author) }
+    if born then
+      marks[#marks + 1] = { row, #head, #lines[row], "Comment" }
+    end
+    local shown = #c.changes > HISTORY_LINES + 1 and HISTORY_LINES or #c.changes
+    for k = 1, shown do
+      local ch = c.changes[k]
+      row = add("    " .. ch, c.sha)
+      marks[#marks + 1] = { row, 4, #lines[row], ch:sub(1, 1) == "+" and "Added" or "Removed" }
+    end
+    if shown < #c.changes then
+      row = add(("    … %d more changed lines"):format(#c.changes - shown), c.sha)
+      marks[#marks + 1] = { row, 4, #lines[row], "Comment" }
+    end
+    add("", nil)
+  end
+  return lines, marks, shas
+end
+
+--- How the line under the cursor came to be: every commit that changed it, newest first, each
+--- with the line's text before (-) and after (+).
 function M.history()
   local e, b = committed_entry()
-  if e then
-    local c = e.commit
-    local range = ("-L%d,%d:%s"):format(e.orig, e.orig, c.path)
-    local out, err = git(b.root, { "log", "--date=short", range, c.sha })
-    if not out then
-      return notify(err, vim.log.levels.ERROR)
-    end
-    open_beside(("blame://history/%s:%d"):format(c.path, e.orig), vim.split(out, "\n", { plain = true }), "vsplit")
+  if not e then
+    return
   end
+  local win = api.nvim_get_current_win()
+  local code_buf = (state and win == state.panel_win) and state.base_buf or api.nvim_get_current_buf()
+  local lnum = api.nvim_win_get_cursor(win)[1]
+  local text = api.nvim_buf_get_lines(code_buf, lnum - 1, lnum, false)[1] or ""
+  local c = e.commit
+  local range = ("-L%d,%d:%s"):format(e.orig, e.orig, c.path)
+  local out, err = git(b.root, { "log", "--format=%x01%H%x00%an%x00%at%x00%s", range, c.sha })
+  if not out then
+    return notify(err, vim.log.levels.ERROR)
+  end
+  local commits = parse_line_log(out)
+  local lines, marks, shas = history_layout(commits, "History of line " .. lnum .. ":  " .. vim.trim(text))
+  local buf = open_beside(("blame://history/%s:%d"):format(c.path, lnum), lines, "vsplit", "blame-history")
+  for _, m in ipairs(marks) do
+    api.nvim_buf_set_extmark(buf, ns, m[1] - 1, m[2], { end_col = m[3], hl_group = m[4] })
+  end
+  vim.wo.winbar = keyhint("s/S", "commit") .. keyhint("q", "close")
+  vim.wo.wrap, vim.wo.number, vim.wo.relativenumber = false, false, false
+  api.nvim_win_set_cursor(0, { math.min(3, #lines), 0 })
+  local function commit_at_cursor(open)
+    return function()
+      local sha = shas[api.nvim_win_get_cursor(0)[1]]
+      if sha then
+        open_commit(b.root, sha, open)
+      end
+    end
+  end
+  vim.keymap.set("n", "s", commit_at_cursor "vsplit", { buffer = buf, desc = "Show commit in a split" })
+  vim.keymap.set("n", "<CR>", commit_at_cursor "vsplit", { buffer = buf, desc = "Show commit in a split" })
+  vim.keymap.set("n", "S", commit_at_cursor "tabnew", { buffer = buf, desc = "Show commit in a tab" })
 end
 
 local function change_popup()
@@ -540,7 +638,7 @@ function M.follow()
     follow_update()
   end
   if state then
-    vim.wo[state.panel_win].winbar = winbar()
+    vim.wo[state.panel_win].winbar = panel_winbar()
   end
 end
 
