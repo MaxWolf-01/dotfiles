@@ -408,6 +408,7 @@ local function open_beside(name, lines, open)
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   pcall(api.nvim_buf_set_name, buf, name) -- the same view opened twice keeps the first's name
   vim.bo[buf].modifiable, vim.bo[buf].filetype, vim.bo[buf].bufhidden = false, "git", "wipe"
+  vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, nowait = true, desc = "Close" })
   if state and api.nvim_get_current_win() == state.panel_win then
     api.nvim_set_current_win(state.code_win)
   end
