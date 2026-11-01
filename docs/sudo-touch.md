@@ -39,10 +39,13 @@ ones; without them, delete the handles' lines from `sudo-sk-keys.pub` first.
 
 The password still works, so sudo is not locked; the touch is just not taken.
 
-- **No blink at all on pc or xmg19.** `echo $SSH_AUTH_SOCK` and `ssh-add -L` in
-  that session: an empty answer means no agent was forwarded. The session was
-  opened before the switch that set up forwarding, or inside a tmux started by
-  an older session, whose `SSH_AUTH_SOCK` points at a connection that is gone. Open a new `ssh pc`.
+- **No blink at all on pc or xmg19.** sudo there reads the forwarded agent
+  from `~/.ssh/sk-agent.sock`, which each login from the laptop links
+  (`nix/nixos/sudo-touch-login.zsh`), while `SSH_AUTH_SOCK` stays on the
+  host's own agent for git. `SSH_AUTH_SOCK=~/.ssh/sk-agent.sock ssh-add -L` on
+  the host: an error or no sk keys means the link points at a connection that
+  is gone, or no login has linked it since the switch. Open a new `ssh pc`; a
+  tmux started earlier finds the new link too.
 - **A blink, a touch, and still the password prompt.** pam_rssh refused the
   signature. `journalctl -b _COMM=sudo` on that host says why; for more, set
   `security.pam.rssh.settings.loglevel = "debug";` in `nix/nixos/sudo-touch.nix`
