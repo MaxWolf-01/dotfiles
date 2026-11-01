@@ -21,7 +21,12 @@ fake_notifications_start() { # <scratch dir>
     timeout 30 bash -c "until [ -s '$dir/ready' ]; do sleep 0.05; done" || { fail "the fake notification service starts"; finish; }
 }
 
+# Also ends every notify holder still up under $XDG_RUNTIME_DIR, by the pid its key's file names.
 fake_notifications_stop() {
+    local held
+    for held in "${XDG_RUNTIME_DIR:-/nonexistent}"/notify/*; do
+        [ -f "$held" ] && kill "$(cut -d' ' -f1 "$held")" 2>/dev/null
+    done
     [ ${#fake_notifications_pids[@]} -eq 0 ] || kill "${fake_notifications_pids[@]}" 2>/dev/null
 }
 
