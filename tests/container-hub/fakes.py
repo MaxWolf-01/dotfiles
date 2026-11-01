@@ -131,8 +131,9 @@ def page(path: Path, body: str = "<!doctype html><p>a page</p>") -> Path:
 
 
 def job(home: Path, name: str, session: str | None, tty: bool = True, pid: int | None = None,
-        started: str = "2026-11-01T09:00:00Z", command: str = "sudo apt-get install -y pcscd", ended: bool = False) -> Path:
-    """A job as `job run` leaves it in the job state directory under `home`: the meta its runner writes on entry, naming
+        started: str = "2026-11-01T09:00:00+00:00", command: str = "sudo apt-get install -y pcscd", ended: bool = False) -> Path:
+    """A job as `job run` leaves it in the job state directory under `home`: the meta its runner writes on entry (`cmd_exec`
+    in bin/job, whose shape this copies), naming
     the session that started it (none where `session` is None) and whether it runs `--tty`, and the status line it
     writes on exit where the job has `ended`. Its runner is this test's own process unless `pid` names another."""
     d = home / ".local/state/jobs" / name
