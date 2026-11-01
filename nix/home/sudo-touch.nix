@@ -9,7 +9,7 @@
 # YubiKeys' ed25519-sk keys, and only those two hosts get it: the everyday agent,
 # with id_ed25519 in it, is forwarded nowhere. Every signature it makes waits for
 # a touch, so a host it is forwarded to can ask for one but never take one
-# silently, and while it waits a prompt-waits file names the host that asked
+# silently, and while it waits a notification names the host that asked
 # (ssh-sk-askpass.sh).
 { config, pkgs, lib, ... }:
 let
@@ -24,9 +24,18 @@ let
   # without the key it was made on.
   handles = map (key: "${config.home.homeDirectory}/.ssh/id_ed25519_sk_${key}") [ "keychain" "backup" ];
 
+  # bin/notify, built into the store: the unit's PATH holds only what the
+  # askpass names. It reaches the desktop through the session bus the user
+  # manager gives every unit.
+  notify = pkgs.writeShellApplication {
+    name = "notify";
+    runtimeInputs = with pkgs; [ coreutils util-linux libnotify glib gnused ];
+    bashOptions = [ "nounset" "pipefail" ];
+    text = builtins.readFile ../../bin/notify;
+  };
   askpass = pkgs.writeShellApplication {
     name = "ssh-sk-askpass";
-    runtimeInputs = with pkgs; [ coreutils gawk gnused iproute2 jq ];
+    runtimeInputs = (with pkgs; [ coreutils gawk gnused iproute2 util-linux ]) ++ [ notify ];
     # No errexit: a host it fails to place is still a prompt to show.
     bashOptions = [ "nounset" "pipefail" ];
     text = builtins.readFile ./ssh-sk-askpass.sh;

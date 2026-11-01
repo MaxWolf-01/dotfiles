@@ -462,6 +462,10 @@
     tree
     uv
     vim
+    # util-linux's waitpid alone, for bin/notify: Ubuntu's util-linux leaves it
+    # out, and the whole package would put a mount without setuid ahead of the
+    # system's.
+    (runCommand "waitpid" { } "mkdir -p $out/bin && ln -s ${util-linux}/bin/waitpid $out/bin/")
     wakatime-cli
     yt-dlp
 
