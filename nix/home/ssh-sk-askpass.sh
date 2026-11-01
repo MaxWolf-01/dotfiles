@@ -2,8 +2,8 @@
 # ssh-sk-askpass: the SSH_ASKPASS of the YubiKey agent (sudo-touch.nix). While a
 # key waits for a touch, ssh-agent runs it with its message as the only argument
 # and SSH_ASKPASS_PROMPT=none, and sends it SIGTERM once the key has answered.
-# For that long it keeps a waiting prompt in $XDG_RUNTIME_DIR/prompt-waits/,
-# naming the host that asked, so a touch request max did not cause shows as such.
+# For that long it keeps a notification up (`notify`) naming the host that
+# asked, so a touch request max did not cause shows as such.
 #
 # Which host asked: the agent's only clients are the ssh processes forwarding it,
 # so the client on the other end of each connection to the agent's socket is
@@ -14,9 +14,7 @@ set -uo pipefail
 
 message="${1:-Confirm user presence}"
 sock="${SSH_SK_AGENT_SOCK:?the agent socket}"
-dir="${XDG_RUNTIME_DIR:?}/prompt-waits"
-id="ssh-sk-agent-$$"
-file="$dir/$id.json"
+key="ssh-sk-agent-$$"
 
 # The pids of the ssh processes connected to the agent: the agent's end of each
 # connection names the client's end by inode, and only the client's end carries
@@ -45,25 +43,17 @@ hosts_asking() {
 hosts=$(hosts_asking | sort -u | paste -sd, - | sed 's/,/ or /g')
 hosts="${hosts:-an unknown host}"
 
-mkdir -p "$dir"
 cleanup() {
-    rm -f "$file" "$dir/.$id.tmp"
+    notify withdraw "$key"
     [ -z "${waiter:-}" ] || kill "$waiter" 2>/dev/null
     exit 0
 }
 trap cleanup TERM INT HUP
 
-jq -n --arg id "$id" --arg prompt "$message" --arg host "$hosts" --arg since "$(date -u +%FT%TZ)" '{
-    id: $id,
-    kind: "touch",
-    prompt: "Touch a YubiKey for \($host): \($prompt)",
-    command: "ssh \($host)",
-    pane: null,
-    since: $since
-}' >"$dir/.$id.tmp" && mv "$dir/.$id.tmp" "$file"
+notify raise "$key" "Touch a YubiKey for $hosts" "$message"
 
 # Until ssh-agent's SIGTERM, or ssh-agent itself going, whichever comes first.
-tail --pid="$PPID" -f /dev/null &
+waitpid "$PPID" 2>/dev/null &
 waiter=$!
 wait "$waiter"
 cleanup

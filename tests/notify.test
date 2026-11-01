@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# tier: fast
+# Drive bin/notify against a stand-in for the desktop's notification service on a private session bus
+# (fake-notifications.sh). Run it directly; no framework.
+#
+# What max relies on: a notification raised for something blocked on him stays on screen exactly as long as it
+# blocks, going when it is withdrawn, when whatever raised it ends, or when he dismisses it; and its button puts his
+# tmux client where the wait is.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$repo/tests/check.sh"
+. "$repo/tests/fake-notifications.sh"
+needs jq setsid
+notify="$repo/bin/notify"
+scratch=$(mktemp -d)
+trap 'fake_notifications_stop; rm -rf "$scratch"' EXIT
+export XDG_RUNTIME_DIR="$scratch/run"
+mkdir -p "$XDG_RUNTIME_DIR"
+fake_notifications_start "$scratch"
+
+# A tmux that records what the button asks of it, with two clients attached, the second touched last.
+mkdir "$scratch/bin"
+cat >"$scratch/bin/tmux" <<EOF
+#!/usr/bin/env bash
+case \$1 in
+    list-clients) printf '200 /dev/pts/7\n100 /dev/pts/3\n' ;;
+    *) echo "\$*" >>"$scratch/tmux.calls" ;;
+esac
+EOF
+chmod +x "$scratch/bin/tmux"
+export PATH="$scratch/bin:$PATH"
+
+# The pid of the holder keeping a key's notification up, and whether it has ended within 5 s.
+holder() { cut -d' ' -f1 "$XDG_RUNTIME_DIR/notify/$1"; }
+ended() { waitpid --exited --timeout 5 "$1" 2>/dev/null && echo yes; }
+
+# --- raise and withdraw
+
+"$notify" raise nt-touch "Touch a YubiKey for pc" "Confirm user presence"
+check "raise exits 0 once the notification is up" 0 $?
+check "one notification is on screen" 1 "$(shown | grep -c .)"
+check "with the summary and body given" "Touch a YubiKey for pc|Confirm user presence" "$(shown | jq -r '.summary + "|" + .body')"
+check "and critical urgency, which keeps it on screen" 2 "$(shown | jq -r .urgency)"
+"$notify" withdraw nt-touch
+await_shown 0 5 && passed "withdraw takes it down" || fail "withdraw takes it down"
+check "and the notification was closed by notify, not by the user" caller \
+    "$(jq -r 'select(.event == "close") | .by' "$fake_notifications_log" | tail -1)"
+"$notify" withdraw nt-touch
+check "withdrawing a key not up is no error" 0 $?
+
+# --- a key raised twice shows once
+
+"$notify" raise nt-twice "first"
+"$notify" raise nt-twice "second"
+check "raising a key that is up replaces its notification" "second" "$(shown | jq -r .summary)"
+"$notify" withdraw nt-twice
+await_shown 0 5 || fail "the replaced key's notification goes on withdraw"
+
+# --- the notification goes when what raised it goes
+
+bash -c '"$1" raise nt-caller "job waits"; sleep 0.5' _ "$notify"
+await_shown 0 5 && passed "the notification goes when the process that raised it ends" ||
+    fail "the notification goes when the process that raised it ends"
+sleep 300 &
+held=$!
+"$notify" raise nt-while --while "$held" "blocked on max"
+check "with --while, the notification outlives the process that raised it" 1 "$(shown | grep -c .)"
+kill "$held"
+await_shown 0 5 && passed "and goes when the process it names ends" || fail "and goes when the process it names ends"
+
+# --- the button, and max dismissing it
+
+"$notify" raise nt-go --tmux job-build "job build waits for you" "sudo nixos-rebuild switch"
+check "--tmux puts a button on the notification" '{"go":"Go to job-build"}' "$(shown | jq -c .actions)"
+held=$(holder nt-go)
+click "$(shown | jq -r .id)" go
+await_shown 0 5 || fail "a clicked notification goes"
+timeout 5 bash -c "until [ -s '$scratch/tmux.calls' ]; do sleep 0.05; done"
+check "the button switches the tmux client touched last to the target" "switch-client -c /dev/pts/7 -t job-build" \
+    "$(cat "$scratch/tmux.calls" 2>/dev/null)"
+check "and nothing of it is left running" yes "$(ended "$held")"
+
+"$notify" raise nt-dismiss "blocked on max"
+held=$(holder nt-dismiss)
+dismiss "$(shown | jq -r .id)"
+timeout 5 bash -c "while [ -e '$XDG_RUNTIME_DIR/notify/nt-dismiss' ]; do sleep 0.05; done"
+check "a notification max dismissed is forgotten" "" "$(ls -A "$XDG_RUNTIME_DIR/notify")"
+check "and nothing of it is left running" yes "$(ended "$held")"
+
+# --- no service to show it on
+
+DBUS_SESSION_BUS_ADDRESS="unix:path=$scratch/no-bus" "$notify" raise nt-nobus "nobody sees this" 2>"$scratch/err"
+check "with no notification service answering, raise exits 69" 69 $?
+check "saying so" yes "$(grep -q 'did not show it' "$scratch/err" && echo yes)"
+check "and leaves no key behind" "" "$(ls -A "$XDG_RUNTIME_DIR/notify")"
+
+"$notify" raise "../escape" "x" 2>/dev/null
+check "a key that is not a file name is refused" 64 $?
+
+finish
