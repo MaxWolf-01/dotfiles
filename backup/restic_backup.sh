@@ -23,7 +23,7 @@ set -uo pipefail
 # show_progress - (optional) "true" or "false" to show backup progress (default: false)
 # require_mount - (optional) Path that must be a mountpoint: missing before the run is a skip,
 #                 gone after it is a failure. Read from the environment as well as the config,
-#                 so a caller that owns the mount can pass it (backup/jarvis_backup.sh)
+#                 so a caller that owns the mount can pass it (backup/sshfs_backup.sh)
 # backup_opts - (optional) Extra flags for `restic backup`, word-split (e.g. "--ignore-inode")
 
 # Reached relative to this script, not through PATH: the systemd units pin
