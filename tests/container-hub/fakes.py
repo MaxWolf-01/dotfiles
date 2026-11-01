@@ -101,7 +101,7 @@ def uv_dirs() -> dict[str, str]:
 def scrubbed(home: Path, **extra: str) -> dict[str, str]:
     """This environment with HOME moved, no session of its own, no tmux server, and no git or XDG configuration of
     the user's: a global commit hook would stamp the fixture's commits with this run's session."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB", "TMUX"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB", "TMUX", "JOB_"))}
     return {**env, **{k: v for k, v in uv_dirs().items() if v}, "HOME": str(home), "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1", **extra}
 
@@ -357,6 +357,18 @@ exit 1
                                        "context_window_size": 200000}} if context else {}),
                 "rate_limits": {"seven_day": {"used_percentage": seven_day[0], "resets_at": seven_day[1]}} if seven_day else {}}
         page(self.home / ".cache/claude-statusline" / f"{session}.json", json.dumps(data))
+
+    def job(self, name: str, session: str | None, tty: bool = True, pid: int | None = None,
+            started: str = "2026-11-01T09:00:00Z", command: str = "sudo apt-get install -y pcscd", ended: bool = False) -> Path:
+        """A job as `job run` leaves it in its state directory: the meta its runner writes on entry, naming the session
+        that started it (none where `session` is None) and whether it runs `--tty`, and the status line it writes on
+        exit where the job has `ended`. Its runner is this test's own process unless `pid` names another."""
+        d = self.home / ".local/state/jobs" / name
+        page(d / "meta", f"pid={pid or os.getpid()}\nstarted={started}\ncwd={self.home}\nawake=0\ntty={int(tty)}\n"
+                         f"session={session or ''}\ncmd={command}\n")
+        if ended:
+            page(d / "status", "exit=0 ended=2026-11-01T09:01:00Z secs=60\n")
+        return d
 
     def turn_record(self, session_dir: Path, number: int, headline: str, questions: tuple[str, ...] = (),
                     at: float | None = None, todos: tuple[str, ...] = (), **front: dict[str, str]) -> None:

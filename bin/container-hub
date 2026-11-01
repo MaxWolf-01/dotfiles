@@ -20,7 +20,7 @@ session id, the whole id on hover. A click on the tree, the short id or the sess
 and "copied" rises over it, as it does over anything a click in the hub tab copies.
 
 The hub tab (`/`) shows every unit, switched between on its rail. The rail numbers the units whose sessions run: first
-those blocked in their terminal, then the idle sessions that need you (below), then the other idle ones, then the busy,
+those blocked in their terminal, then the sessions that need you (below), then the other idle ones, then the busy,
 each group the latest turn's end first. 1 is the blocked session that most recently finished a turn, or, where none is
 blocked, the first of the next group that has one. A turn's end is when the session's page was last rendered, or when
 the registry (`~/.claude*/sessions/<pid>.json`) last marked the session idle. A unit whose session's process has exited
@@ -30,9 +30,12 @@ its session does, until you send it a prompt or bring it back. The loose pages, 
 
 A unit's mark on the rail is its session's state: a turning three-quarter ring while it works (still where motion is
 reduced), red while it is blocked in its terminal, and while it is idle, a filled dot where it needs you, a filled
-sand one where it waits on a run and does not need you, and a hollow one otherwise. A session whose turn ended with a
-command left running in the background is idle, waiting on it. So is one whose turn ended with an agent it started in
-the background still at work, which the registry marks busy as it does a turn under way; the session's transcript
+sand one where it waits on a run and does not need you, and a hollow one otherwise. Whatever its state, a session with a
+`job run --tty` job of its own running needs you, for the job waits on what you type into it (a password, a PIN, a
+touch): its mark is a purple dot, and the job's command stands where its status line goes, until the job ends. `job`
+records the session that started a job, and the hub reads the jobs from the job state directory of the user it runs
+as ($JOB_STATE_DIR, else `~/.local/state/jobs`). A session whose turn ended with a command left running in the
+background is idle, waiting on it. So is one whose turn ended with an agent it started in the background still at work, which the registry marks busy as it does a turn under way; the session's transcript
 tells the two apart. A command that ends on its own (a wait on a worker, a test suite) is a run, and so is an agent. A
 command that runs until stopped is a watcher; the hub knows it by `--watch` in its command (`diffview --watch`). Only
 a run fills the dot. The session page shows each run at the top of its turns, with its description, age and command,
@@ -382,7 +385,9 @@ over the tab.
                               "context" (its running session's context use, and the model and effort it runs on, as the
                               statusline last had them),
                               "last", "number", "status_line", "needs_you" ({"questions", "todos", "unseen"},
-                              where it needs you), "board", "worked_on" (the tickets the board marks),
+                              where it needs you), "prompt" (the --tty job it started that waits on you, the one
+                              waiting longest: {"job", "command", "at"}), "board", "worked_on" (the tickets the board
+                              marks),
                               "dismissed", "handoff" (what its box offers: {"offer", "path"?, "url"?, "at"?, its last commit,
                               "behind"?, a prompt sent since that commit}, as above),
                               "background" (what its session started in the background that still runs, oldest first:
@@ -472,6 +477,7 @@ HERE = Path(__file__).resolve().parent
 HOME = Path.home().resolve()
 TEMP = Path(tempfile.gettempdir()).resolve()
 STATUSLINE = HOME / ".cache" / "claude-statusline"
+JOB_STATE = Path(os.environ.get("JOB_STATE_DIR") or HOME / ".local" / "state" / "jobs")
 
 TRELLIS = {  # fetched, not committed: its licence asks a sponsorship for commercial use
     "index.js": "239bc6506cdc4b4391a34a091d87fe4dc7ab46a2152f24781bd261621a652220",
@@ -846,8 +852,11 @@ def turn_ended(entry: dict, memo: dict) -> float | None:
 
 
 def rank(unit: dict) -> int:
-    """A numbered unit's group on the rail: blocked, needs you, the other idle ones, busy."""
-    return 0 if unit["state"] == "waiting" else 1 if unit["needs_you"] else 3 if unit["state"] == "busy" else 2
+    """A numbered unit's group on the rail: blocked, needs you (a `--tty` job waiting on you included), the other idle
+    ones, busy."""
+    if unit["state"] == "waiting":
+        return 0
+    return 1 if unit["needs_you"] or unit["prompt"] else 3 if unit["state"] == "busy" else 2
 
 
 def registry() -> dict[str, dict]:
@@ -1160,6 +1169,29 @@ def statusline_inputs() -> list[dict]:
         if isinstance(data, dict):
             found.append(data)
     statusline_read = kept
+    return found
+
+
+def tty_jobs() -> dict[str, dict]:
+    """The `job run --tty` jobs that wait on the user, by the session that started them: {"job", "command", "at"}, the
+    one that has waited longest where a session started several. A job waits while its meta says `tty=1` and it has
+    no status file, as long as its runner's process lives. `job` writes `meta` on the runner's entry and `status` as
+    its last act; a meta from before `job` recorded `tty` and `session` names neither, and waits on no session."""
+    found, pids = {}, set()
+    for meta in globbed(JOB_STATE, "*/meta"):
+        try:
+            said = dict(line.split("=", 1) for line in meta.read_text().splitlines() if "=" in line)
+            pid = int(said["pid"])
+        except (OSError, ValueError, KeyError):
+            continue
+        session = said.get("session")
+        if said.get("tty") != "1" or not session or is_file(meta.parent / "status") or not running(pid, None):
+            continue
+        pids.add(pid)
+        job = {"job": meta.parent.name, "command": said.get("cmd", ""), "at": said.get("started", "")}
+        if session not in found or job["at"] < found[session]["at"]:
+            found[session] = job
+    WATCH.processes(JOBS, pids)
     return found
 
 
@@ -2249,7 +2281,7 @@ def read_changed(heard: set | None) -> tuple[dict, dict[str, str]]:
     memo, again = {}, set()
     if heard is None or REGISTRY in heard or UNITS in heard or "live" not in COMMON:
         live, before = WATCH.read(REGISTRY, registry), COMMON.get("live", {})
-        WATCH.processes(live)
+        WATCH.processes(REGISTRY, {int(p["pid"]) for e in live.values() for p in e["processes"]})
         again |= {s for s in live.keys() | before.keys() if live.get(s) != before.get(s)}
         COMMON["live"] = live
         adopt_running(live)
@@ -2260,6 +2292,11 @@ def read_changed(heard: set | None) -> tuple[dict, dict[str, str]]:
         again |= {s for s in contexts.keys() | before.keys() if contexts.get(s) != before.get(s)}
         COMMON.update(inputs=inputs, contexts=contexts)
     contexts = COMMON["contexts"]
+    if heard is None or JOBS in heard or "jobs" not in COMMON:
+        jobs, before = WATCH.read(JOBS, tty_jobs), COMMON.get("jobs", {})
+        again |= {s for s in jobs.keys() | before.keys() if jobs.get(s) != before.get(s)}
+        COMMON["jobs"] = jobs
+    jobs = COMMON["jobs"]
     if heard is None or UNITS in heard or "names" not in COMMON:
         COMMON["names"] = WATCH.read(UNITS, unit_names)
     keys = [urllib.parse.unquote(n.removesuffix(".json")) for n in COMMON["names"]]
@@ -2274,7 +2311,7 @@ def read_changed(heard: set | None) -> tuple[dict, dict[str, str]]:
             try:
                 with WATCH.reading(key):
                     view, digest = kept_view(key, live, memo)
-                    ROWS[key] = view and with_live(view, live, contexts, memo), digest
+                    ROWS[key] = view and with_live(view, live, contexts, jobs, memo), digest
             except OSError as e:
                 print(f"listing {state_file(key)}: {e}", file=sys.stderr, flush=True)
                 ROWS.pop(key, None)
@@ -2354,14 +2391,15 @@ def unit_read(key: str) -> dict | None:
         adopt_running(live)
         view, _ = kept_view(key, live, memo)
         view = view or found_view(key, live, memo)
-        return view and with_live(view, live, context_use(statusline_inputs()), memo)
+        return view and with_live(view, live, context_use(statusline_inputs()), tty_jobs(), memo)
 
 
-def with_live(view: dict, live: dict[str, dict], contexts: dict[str, dict], memo: dict) -> dict:
+def with_live(view: dict, live: dict[str, dict], contexts: dict[str, dict], jobs: dict[str, dict], memo: dict) -> dict:
     """A unit's kept view with what every read adds to it: the handoff its box offers rests on a tmux pane as much as
     on disk, so it is never kept."""
     s = view["session"]
-    return {**view, "context": contexts.get(s) if s in live else None, "handoff": handoff_offer(live.get(s), memo),
+    return {**view, "context": contexts.get(s) if s in live else None, "prompt": jobs.get(s) if s in live else None,
+            "handoff": handoff_offer(live.get(s), memo),
             "forked": forked_mark(HOST, s, transcript(s, memo) if s else None, memo),
             "released": released_mark(s, memo)}
 
@@ -3800,8 +3838,8 @@ def copy_unit(session: str, found: dict) -> dict:
             "state": {"idle": "idle", "working": "busy"}.get(found["state"], "ended"),
             "waiting_for": None, "pane": None, "panes": [], "last": found["transcript"].stat().st_mtime, "number": None,
             "dismissed": False, "first": 0, "visited": 0, "status_line": "", "needs_you": None, "background": [], "resume": "",
-            "tickets": [], "pages": [], "members": [], "board": None, "worked_on": [], "context": None, "handoff": None,
-            "forked": None, "session_page": {"url": page, "id": member_id(page)}}
+            "tickets": [], "pages": [], "members": [], "board": None, "worked_on": [], "context": None, "prompt": None,
+            "handoff": None, "forked": None, "session_page": {"url": page, "id": member_id(page)}}
 
 
 def copy_page_session(path: Path) -> tuple[str, str] | None:
@@ -5314,9 +5352,9 @@ BACKSTOP = 600.0
 """Seconds between two reads of every unit the watch heard nothing of, which log a unit found changed: a change no
 notice named, a look the read path makes without noting it."""
 
-REGISTRY, STATUSLINES, UNITS, OWN_CODE = ("registry",), ("statusline",), ("units",), ("code",)
-"""The readers that are no unit: the session registry, the statusline inputs and the names of the units' state files,
-which the units share, and the hub's own code. Every other reader is a unit, by its key."""
+REGISTRY, STATUSLINES, JOBS, UNITS, OWN_CODE = ("registry",), ("statusline",), ("jobs",), ("units",), ("code",)
+"""The readers that are no unit: the session registry, the statusline inputs, the jobs and the names of the units'
+state files, which the units share, and the hub's own code. Every other reader is a unit, by its key."""
 
 IN_MODIFY, IN_ATTRIB, IN_CLOSE_WRITE, IN_MOVED_FROM, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x2, 0x4, 0x8, 0x40, 0x80, 0x100, 0x200
 IN_DELETE_SELF, IN_MOVE_SELF, IN_UNMOUNT, IN_Q_OVERFLOW, IN_IGNORED, IN_ONLYDIR, IN_ISDIR = (
@@ -5378,7 +5416,7 @@ class Watch:
         self.seen: dict[object, tuple] = {}  # reader -> its Looks.seen as watched, and `named` then where one climbed
         self.named = 0  # the names that came or went that a look watched from a directory above it waits on
         self.until: dict[object, float] = {}  # reader -> when what it read off the clock goes stale (time.time())
-        self.pids: dict[int, int] = {}  # a pidfd for each running session's process, readable once it exits
+        self.pids: dict[object, dict[int, int]] = {}  # reader -> a pidfd for each process it read running, readable at exit
         self.dirty, self.whole = set(), True  # the readers to read again; all of them
         self.fresh: set[str] = set()  # watched since the read began, and so its readers are read once more
         self.since, self.last, self.failing = None, -math.inf, frozenset()  # first change untold, last round
@@ -5396,7 +5434,8 @@ class Watch:
 
     def off(self, why: str) -> None:
         """Read the disk every PACE for the rest of the hub's life, saying why."""
-        for fd in [*self.pids.values(), *([self.notices.fd] if self.notices else [])]:
+        pidfds = [fd for fds in self.pids.values() for fd in fds.values()]
+        for fd in [*pidfds, *([self.notices.fd] if self.notices else [])]:
             os.close(fd)
         self.pids.clear()
         self.on, self.notices, self.whole = False, None, True
@@ -5519,16 +5558,18 @@ class Watch:
                 if remove:
                     self.notices.remove(wd)
 
-    def processes(self, live: dict[str, dict]) -> None:
-        """Hear each running session's process exit, which leaves its registry file behind."""
-        pids = {int(p["pid"]) for e in live.values() for p in e["processes"]} if self.on else set()
-        for pid in self.pids.keys() - pids:
-            os.close(self.pids.pop(pid))
-        for pid in pids - self.pids.keys():
+    def processes(self, reader, pids: set[int]) -> None:
+        """Hear each of these processes exit, and read `reader` again then: a session's, which leaves its registry file
+        behind, and a job's runner killed before it wrote its status file."""
+        held = self.pids.setdefault(reader, {})
+        pids = pids if self.on else set()
+        for pid in held.keys() - pids:
+            os.close(held.pop(pid))
+        for pid in pids - held.keys():
             try:
-                self.pids[pid] = os.pidfd_open(pid)
-            except ProcessLookupError:  # exited since the registry was read
-                self.dirty.add(REGISTRY)
+                held[pid] = os.pidfd_open(pid)
+            except ProcessLookupError:  # exited since it was read
+                self.dirty.add(reader)
             except (OSError, AttributeError) as e:  # AttributeError: a Python built without it (uv's 3.14.3)
                 return self.off(f"pidfd: {e}")
 
@@ -5551,11 +5592,12 @@ class Watch:
                 for pattern, readers in self.patterns.get(d, {}).items() if mask & NAMED else ():
                     if self.matches(d, name, mask, pattern):
                         self.dirty |= readers
-        exits = select.poll()
-        for fd in self.pids.values():
-            exits.register(fd, select.POLLIN)
-        if self.pids and exits.poll(0):
-            self.dirty.add(REGISTRY)
+        for reader, held in self.pids.items():
+            exits = select.poll()
+            for fd in held.values():
+                exits.register(fd, select.POLLIN)
+            if held and exits.poll(0):
+                self.dirty.add(reader)
         for reader in [r for r, at in self.until.items() if at <= time.time()]:
             self.dirty.add(reader)
             del self.until[reader]
