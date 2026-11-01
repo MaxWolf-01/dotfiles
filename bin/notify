@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Put a desktop notification up while something is blocked on max, and take it
+# down when it no longer is.
+#
+# Usage: notify raise <key> [--tmux TARGET] [--while PID] <summary> [<body>]
+#        notify withdraw <key>
+#   raise     shows a critical notification, which the desktop keeps on
+#             screen until it goes, and returns once it is up. It goes when
+#             `notify withdraw <key>` is run, when the process that ran
+#             `raise` ends, or PID with --while (checked once a second), or
+#             when max dismisses it.
+#             Raising a key already up replaces that notification.
+#             --tmux TARGET adds a button that switches the most recently
+#             active tmux client to TARGET (a session, window or pane), on
+#             the tmux server $TMUX names, else the default one; with no
+#             client attached the button does nothing.
+#   withdraw  takes the key's notification down; a key not up is no error.
+#
+# Keys are names of your choosing, per user ($XDG_RUNTIME_DIR/notify/<key>).
+#
+# For a blocking ask only: a command waiting on max's touch, password or
+# answer. Never for news; a notification nobody needs to act on soon trains
+# max to ignore the ones that do.
+#
+# An agent raises from its Bash tool, whose shell ends at once, so it names its
+# session's process, the shell's parent: `notify raise <key> --while $PPID ...`,
+# and withdraws the key once max has answered.
+#
+# Exit codes: 0 done, 64 usage, 69 no notification service to show it on
+# (no notify-send or gdbus on PATH, or no session bus answering).
+set -uo pipefail
+
+self=$(realpath "${BASH_SOURCE[0]}")
+dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/notify
+
+die() { echo "notify: $1" >&2; exit "${2:-64}"; }
+
+valid_key() {
+    case $1 in
+        ""|.*|*[!A-Za-z0-9._-]*) die "bad key '$1': letters, digits, dot, dash and underscore, not starting with a dot" ;;
+    esac
+}
+
+cmd_raise() {
+    [ $# -ge 1 ] || die "raise needs a key"
+    local key=$1 tmux= caller=$PPID
+    shift
+    valid_key "$key"
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --tmux)  [ $# -ge 2 ] || die "--tmux needs a target"; tmux=$2; shift 2 ;;
+            --while) [[ ${2:-} =~ ^[0-9]+$ ]] || die "--while needs a pid"; caller=$2; shift 2 ;;
+            --)      shift; break ;;
+            -*)      die "raise: unknown flag '$1'" ;;
+            *)       break ;;
+        esac
+    done
+    [ $# -ge 1 ] && [ $# -le 2 ] || die "raise needs a summary and at most a body"
+    for tool in notify-send gdbus setsid; do
+        command -v "$tool" >/dev/null || die "no $tool on PATH" 69
+    done
+    mkdir -p "$dir" || die "cannot create $dir" 69
+    cmd_withdraw "$key"
+    # The holder keeps the notification while it is up. It runs in a session of
+    # its own, so a Ctrl-C meant for the caller's command does not take it down,
+    # and with no stdio of the caller's, so a caller reading this command's
+    # output is not held open by it.
+    setsid -f "$self" __hold "$key" "$caller" "$tmux" "$@" </dev/null >/dev/null 2>"$dir/.$key.err"
+    # notify-send says why it failed on stderr; a warning it prints on success
+    # is why the file is checked once more after the error shows.
+    for _ in $(seq 50); do
+        [ -s "$dir/$key" ] || [ -s "$dir/.$key.err" ] && break
+        sleep 0.1
+    done
+    [ -s "$dir/$key" ] || sleep 0.5
+    [ -s "$dir/$key" ] && { rm -f "$dir/.$key.err"; return 0; }
+    local why
+    why=$(head -3 "$dir/.$key.err" 2>/dev/null)
+    rm -f "$dir/.$key.err"
+    die "the notification service did not show it${why:+: $why}" 69
+}
+
+# The holder: shows the notification, and takes it down when it is withdrawn
+# (TERM), when the caller ends, or after max clicked or dismissed it.
+cmd_hold() {
+    local key=$1 caller=$2 tmux=$3 summary=$4 body=${5:-}
+    local file=$dir/$key id= sender reader= watcher=
+    local args=(--app-name=notify --urgency=critical --print-id --wait)
+    [ -z "$tmux" ] || args+=("--action=go=Go to $tmux")
+    exec {out}< <(exec notify-send "${args[@]}" -- "$summary" "$body")
+    sender=$!
+    # notify-send that cannot reach the service prints id 0 and waits forever.
+    read -r -u "$out" id
+    [[ $id =~ ^[1-9][0-9]*$ ]] || { kill "$sender" 2>/dev/null; exit 1; }
+    take_down() {
+        trap '' TERM INT HUP
+        gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+            --method org.freedesktop.Notifications.CloseNotification "$id" >/dev/null 2>&1
+        kill "$sender" "$reader" "$watcher" 2>/dev/null
+        # A raise that replaced this one owns the file now.
+        [ "$(cut -d' ' -f1 "$file" 2>/dev/null)" != "$$" ] || rm -f "$file"
+        exit 0
+    }
+    trap take_down TERM INT HUP
+    printf '%s %s\n' "$$" "$id" >"$file.new" && mv "$file.new" "$file"
+    while read -r line; do
+        [ "$line" = go ] && [ -n "$tmux" ] && go_to "$tmux"
+    done <&"$out" &
+    reader=$!
+    tail --pid="$caller" -f /dev/null &
+    watcher=$!
+    wait -n "$reader" "$watcher"
+    take_down
+}
+
+# The client max touched last is the one in front of him.
+go_to() {
+    local client
+    client=$(tmux list-clients -F '#{client_activity} #{client_name}' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+    [ -n "$client" ] && tmux switch-client -c "$client" -t "$1"
+}
+
+cmd_withdraw() {
+    [ $# -eq 1 ] || die "withdraw needs a key"
+    valid_key "$1"
+    local file=$dir/$1 pid id
+    [ -f "$file" ] || return 0
+    read -r pid id <"$file"
+    kill "$pid" 2>/dev/null
+    # A holder killed outright left its notification up; this takes it down.
+    gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+        --method org.freedesktop.Notifications.CloseNotification "$id" >/dev/null 2>&1
+    rm -f "$file"
+}
+
+case ${1:-} in
+    raise)    shift; cmd_raise "$@" ;;
+    withdraw) shift; cmd_withdraw "$@" ;;
+    __hold)   shift; cmd_hold "$@" ;;
+    -h|--help|"") sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d' ;;
+    *) die "unknown command: $1" ;;
+esac
