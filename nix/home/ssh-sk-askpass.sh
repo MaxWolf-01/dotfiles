@@ -3,7 +3,8 @@
 # key waits for a touch, ssh-agent runs it with its message as the only argument
 # and SSH_ASKPASS_PROMPT=none, and sends it SIGTERM once the key has answered.
 # For that long it keeps a notification up (`notify`) naming the host that
-# asked, so a touch request max did not cause shows as such.
+# asked, so a touch request max did not cause shows as such, with a button to
+# the tmux pane the asking ssh runs in.
 #
 # Which host asked: the agent's only clients are the ssh processes forwarding it,
 # so the client on the other end of each connection to the agent's socket is
@@ -40,8 +41,26 @@ hosts_asking() {
     done
 }
 
+# The tmux pane an asking ssh client runs in: the pane whose process is the
+# client or one of its ancestors. The tmux on PATH is the one serving max's
+# panes; a client outside tmux has none.
+pane_of() { # <pid>
+    local pid=$1 panes pane
+    panes=$(tmux list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null) || return 0
+    while [ "${pid:-0}" -gt 1 ]; do
+        pane=$(awk -v p="$pid" '$1 == p { print $2; exit }' <<<"$panes")
+        [ -n "$pane" ] && { echo "$pane"; return 0; }
+        pid=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null)
+    done
+}
+
 hosts=$(hosts_asking | sort -u | paste -sd, - | sed 's/,/ or /g')
 hosts="${hosts:-an unknown host}"
+pane=''
+for pid in $(clients | sort -u); do
+    pane=$(pane_of "$pid")
+    [ -z "$pane" ] || break
+done
 
 cleanup() {
     notify withdraw "$key"
@@ -50,7 +69,7 @@ cleanup() {
 }
 trap cleanup TERM INT HUP
 
-notify raise "$key" "Touch a YubiKey for $hosts" "$message"
+notify raise "$key" ${pane:+--tmux "$pane"} "Touch a YubiKey for $hosts" "$message"
 
 # Until ssh-agent's SIGTERM, or ssh-agent itself going, whichever comes first.
 waitpid "$PPID" 2>/dev/null &
