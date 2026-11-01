@@ -56,6 +56,22 @@ The password still works, so sudo is not locked; the touch is just not taken.
   (missing: the wizard has not committed the registration, or `hmswitch` has
   not run since), then add `debug` to the line in `/etc/pam.d/sudo`.
 
+## Two sudos at once
+
+One agent on zephylux answers both pc and xmg19, and ssh-agent handles one
+request at a time. While one sudo waits for a touch, a sudo on the other
+host waits behind it and shows nothing, not even its touch prompt; touch
+once for each, in the order they asked. Ending the first sudo's ssh session
+does not free the agent, which keeps waiting on the key; neither does
+Ctrl-C, which a touch wait ignores. What frees it at once:
+
+```bash
+systemctl --user restart ssh-sk-agent   # on zephylux; every waiting sudo goes on to its password
+```
+
+Seen 2026-11-01 during the rollout: pc's `nswitch` waited with a blank
+screen behind xmg19's pending sudo until the agent was restarted.
+
 ## Backing out
 
 - **zephylux.** `/etc/pam.d/sudo` as it was before the wizard changed it is in

@@ -125,6 +125,7 @@
       custom-keybindings = [
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/"
+        "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2/"
       ];
     };
 
@@ -140,6 +141,13 @@
       name = "Toggle nightlight";
       command = "toggle_nightlight";
       binding = "<Primary><Super>n";
+    };
+
+    # Custom: what a waiting notification's button does (bin/notify)
+    "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom2" = {
+      name = "Go to what waits on me";
+      command = "notify go";
+      binding = "<Super>g";
     };
 
     # ibus lives under /desktop/ibus/, not /org/freedesktop/ibus/.
