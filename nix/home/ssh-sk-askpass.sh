@@ -53,7 +53,7 @@ trap cleanup TERM INT HUP
 notify raise "$key" "Touch a YubiKey for $hosts" "$message"
 
 # Until ssh-agent's SIGTERM, or ssh-agent itself going, whichever comes first.
-tail --pid="$PPID" -f /dev/null &
+waitpid "$PPID" 2>/dev/null &
 waiter=$!
 wait "$waiter"
 cleanup

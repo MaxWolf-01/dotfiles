@@ -8,7 +8,7 @@
 #             screen until it goes, and returns once it is up. It goes when
 #             `notify withdraw <key>` runs, when max dismisses it, or when
 #             the process that ran `raise` ends (with --while PID, when PID
-#             ends instead; checked once a second).
+#             ends instead).
 #             Raising a key already up replaces that notification.
 #             --tmux TARGET adds a button that switches the most recently
 #             active tmux client to TARGET (a session, window or pane), on
@@ -27,7 +27,8 @@
 # and withdraws the key once max has answered.
 #
 # Exit codes: 0 done, 64 usage, 69 no notification service to show it on
-# (no notify-send or gdbus on PATH, or no session bus answering).
+# (no notify-send, gdbus, setsid or waitpid on PATH, or no session bus
+# answering).
 set -uo pipefail
 
 self=$(realpath "${BASH_SOURCE[0]}")
@@ -56,42 +57,43 @@ cmd_raise() {
         esac
     done
     [ $# -ge 1 ] && [ $# -le 2 ] || die "raise needs a summary and at most a body"
-    for tool in notify-send gdbus setsid; do
+    for tool in notify-send gdbus setsid waitpid; do
         command -v "$tool" >/dev/null || die "no $tool on PATH" 69
     done
     mkdir -p "$dir" || die "cannot create $dir" 69
     cmd_withdraw "$key"
     # The holder keeps the notification while it is up. It runs in a session of
     # its own, so a Ctrl-C meant for the caller's command does not take it down,
-    # and with no stdio of the caller's, so a caller reading this command's
-    # output is not held open by it.
-    setsid -f "$self" __hold "$key" "$caller" "$tmux" "$@" </dev/null >/dev/null 2>"$dir/.$key.err"
-    # notify-send says why it failed on stderr; a warning it prints on success
-    # is why the file is checked once more after the error shows.
-    for _ in $(seq 50); do
-        [ -s "$dir/$key" ] || [ -s "$dir/.$key.err" ] && break
-        sleep 0.1
-    done
-    [ -s "$dir/$key" ] || sleep 0.5
-    [ -s "$dir/$key" ] && { rm -f "$dir/.$key.err"; return 0; }
-    local why
-    why=$(head -3 "$dir/.$key.err" 2>/dev/null)
-    rm -f "$dir/.$key.err"
-    die "the notification service did not show it${why:+: $why}" 69
+    # and with none of the caller's stdio, so a caller reading this command's
+    # output is not held open by it. Its stdout is a pipe back to here, on
+    # which it says `up` or why not, and which it then closes.
+    local answer
+    # The deadline is only the backstop for a holder that never answers, as on a
+    # session bus that accepts the call and hangs; it is no clock to check on.
+    read -r -t 10 answer < <(setsid -f "$self" __hold "$key" "$caller" "$tmux" "$@" </dev/null 2>/dev/null)
+    [ $? -le 128 ] || die "the notification service did not answer within 10 s" 69
+    [ "$answer" = up ] || die "the notification service did not show it${answer:+: $answer}" 69
 }
 
 # The holder: shows the notification, and takes it down when it is withdrawn
 # (TERM), when the caller ends, or after max clicked or dismissed it.
 cmd_hold() {
     local key=$1 caller=$2 tmux=$3 summary=$4 body=${5:-}
-    local file=$dir/$key id='' sender reader='' watcher=''
+    local file=$dir/$key err=$dir/.$key.err id='' sender reader='' watcher=''
     local args=(--app-name=notify --urgency=critical --print-id --wait)
     [ -z "$tmux" ] || args+=("--action=go=Go to $tmux")
-    exec {out}< <(exec notify-send "${args[@]}" -- "$summary" "$body")
+    exec {out}< <(exec notify-send "${args[@]}" -- "$summary" "$body" 2>"$err")
     sender=$!
-    # notify-send that cannot reach the service prints id 0 and waits forever.
+    # notify-send that cannot reach the service prints id 0 and waits forever,
+    # having said why on stderr.
     read -r -u "$out" id
-    [[ $id =~ ^[1-9][0-9]*$ ]] || { kill "$sender" 2>/dev/null; exit 1; }
+    if ! [[ $id =~ ^[1-9][0-9]*$ ]]; then
+        kill "$sender" 2>/dev/null
+        head -1 "$err"
+        rm -f "$err"
+        exit 1
+    fi
+    rm -f "$err"
     take_down() {
         trap '' TERM INT HUP
         gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
@@ -103,11 +105,16 @@ cmd_hold() {
     }
     trap take_down TERM INT HUP
     printf '%s %s\n' "$$" "$id" >"$file.new" && mv "$file.new" "$file"
+    # The file is in place, so a withdraw right after raise finds it.
+    echo up
+    exec >/dev/null
     while read -r line; do
         [ "$line" = go ] && [ -n "$tmux" ] && go_to "$tmux"
     done <&"$out" &
     reader=$!
-    tail --pid="$caller" -f /dev/null &
+    # On the process itself (a pidfd), not on a clock; a caller already gone
+    # makes it return at once.
+    waitpid "$caller" 2>/dev/null &
     watcher=$!
     wait -n "$reader" "$watcher"
     take_down
