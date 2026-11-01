@@ -10,9 +10,10 @@
 -- has, where a scale in time would crowd most of them into one end. Every colour is read from
 -- the colorscheme's groups and follows it.
 --
--- `r` re-blames the file as it was just before the commit under the cursor, in place: the code
--- window shows that older version and the panel blames it, so a line rewritten by a reformat
--- can be followed back to whoever wrote it first. `<BS>` steps forward again.
+-- Follow mode puts a card at the side of the window that shows the commit of the line under the
+-- cursor, its message and the hunk of it that touched the line, and keeps it current as the
+-- cursor moves, in the panel and in any file. Line history lists every commit that changed the
+-- line under the cursor (`git log -L`), newest first, each with its change.
 
 local api = vim.api
 local M = {}
@@ -111,6 +112,11 @@ local function parse_porcelain(out)
   return entries, commits
 end
 
+--- A commit trailer (Co-Authored-By:, Signed-off-by:, …): bookkeeping, not part of the message.
+local function is_trailer(line)
+  return line:match "^%a+%-[%w-]+: " ~= nil
+end
+
 local bodies = {} -- sha -> commit message body; commits never change, so this only grows
 
 local function fetch_bodies(root, commits)
@@ -169,7 +175,7 @@ end
 local function paragraphs(c)
   local paras = { { text = c.summary or "", hl = nil } }
   for _, line in ipairs(vim.split(bodies[c.sha] or "", "\n", { plain = true })) do
-    if vim.trim(line) ~= "" then
+    if vim.trim(line) ~= "" and not is_trailer(line) then
       paras[#paras + 1] = { text = line, hl = "Comment" }
     end
   end
@@ -239,45 +245,141 @@ local function layout(entries, commits, width)
   return lines, marks
 end
 
+-- Blame of a buffer ---------------------------------------------------------------------------
+
+local function notify(msg, level)
+  vim.notify("blame: " .. msg, level or vim.log.levels.INFO)
+end
+
+--- The repository root and the buffer's path in it, or nil for a buffer that is no file in git.
+local function locate(buf)
+  local file = vim.bo[buf].buftype == "" and vim.fn.resolve(api.nvim_buf_get_name(buf)) or ""
+  local root = file ~= "" and git(vim.fn.fnamemodify(file, ":h"), { "rev-parse", "--show-toplevel" })
+  if not root then
+    return nil
+  end
+  root = vim.fn.resolve(vim.trim(root))
+  return root, file:sub(#root + 2)
+end
+
+local blames = {} -- buf -> the blame of its text at changedtick `tick`, or its error
+
+--- The blame of the buffer's current text (unsaved edits are "not committed yet"), or nil.
+local function blame_buffer(buf, loud)
+  local tick = api.nvim_buf_get_changedtick(buf)
+  local b = blames[buf]
+  if not (b and b.tick == tick) then
+    b = { tick = tick }
+    blames[buf] = b
+    local root, path = locate(buf)
+    if not root then
+      b.err = "not a file in a git repository"
+    else
+      local text = table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), "\n") .. "\n"
+      local out, err = git(root, { "blame", "--porcelain", "--contents", "-", "--", path }, text)
+      if out then
+        b.entries, b.commits = parse_porcelain(out)
+        b.root, b.path = root, path
+      else
+        b.err = err
+      end
+    end
+  end
+  if b.err then
+    if loud then
+      notify(b.err, vim.log.levels.WARN)
+    end
+    return nil
+  end
+  return b
+end
+
+api.nvim_create_autocmd("BufWipeout", {
+  group = api.nvim_create_augroup("blame-cache", { clear = true }),
+  callback = function(ev) blames[ev.buf] = nil end,
+})
+
+-- The line's commit and change ----------------------------------------------------------------
+
+local cards = {} -- "sha:path" -> { head = header and message lines, hunks = this file's hunks }
+
+local function commit_card(root, c)
+  local key = c.sha .. ":" .. c.path
+  if not cards[key] then
+    local out = git(root, { "show", "--date=short", "--format=%h  %an  %ad%n%n%B", "-U3", c.sha, "--", c.path }) or ""
+    local card, hunk, in_diff = { head = {}, hunks = {} }, nil, false
+    for _, l in ipairs(vim.split(out, "\n", { plain = true })) do
+      local start, count = l:match "^@@ %-%S+ %+(%d+),?(%d*) @@"
+      if start then
+        hunk = { start = tonumber(start), count = count == "" and 1 or tonumber(count), lines = { l } }
+        card.hunks[#card.hunks + 1] = hunk
+      elseif hunk then
+        hunk.lines[#hunk.lines + 1] = l
+      elseif l:match "^diff %-%-git " then
+        in_diff = true
+      elseif not in_diff and not is_trailer(l) then
+        card.head[#card.head + 1] = l
+      end
+    end
+    for _, lines in ipairs(vim.list_extend({ card.head }, vim.tbl_map(function(h) return h.lines end, card.hunks))) do
+      while lines[#lines] == "" do
+        table.remove(lines)
+      end
+    end
+    cards[key] = card
+  end
+  return cards[key]
+end
+
+--- The card for one blame entry: commit, message, and the hunk that touched the line. The
+--- second value names what the card shows, so a caller can tell when it changes.
+local function line_card(root, e)
+  local c = e.commit
+  if c.sha == UNCOMMITTED then
+    return { "not committed yet" }, "uncommitted"
+  end
+  local card = commit_card(root, c)
+  local lines = vim.list_extend({}, card.head)
+  for i, h in ipairs(card.hunks) do
+    if e.orig >= h.start and e.orig < h.start + math.max(h.count, 1) then
+      lines[#lines + 1] = ""
+      return vim.list_extend(lines, h.lines), c.sha .. ":" .. i
+    end
+  end
+  return lines, c.sha
+end
+
 -- The panel ----------------------------------------------------------------------------------
 
-local state -- the open panel: code_win, panel_win, panel_buf, root, base_buf, saved, stack, entries
+local state -- the open panel: code_win, panel_win, panel_buf, base_buf, saved, blame
+local follow -- while follow mode is on: buf, and win and key while its card shows
 
-local function top()
-  return state.stack[#state.stack]
+--- The blame entry under the cursor of `win`, and the blame it is from.
+local function entry_at(win, loud)
+  local b = (state and win == state.panel_win) and state.blame or blame_buffer(api.nvim_win_get_buf(win), loud)
+  if not b then
+    return nil
+  end
+  return b.entries[api.nvim_win_get_cursor(win)[1]], b
 end
 
 local function winbar()
   local function key(k, label)
     return "%#Title#" .. k .. "%#Comment# " .. label .. "  "
   end
-  local where = #state.stack > 1 and ("%#Comment#before " .. top().from:sub(1, 7) .. "  ") or ""
-  return where
-    .. key("K", "diff")
-    .. key("s/S", "commit")
-    .. key("r", "older")
-    .. (#state.stack > 1 and key("⌫", "newer") or "")
-    .. key("q", "close")
+  return key("K", "change") .. key("f", follow and "follow (on)" or "follow") .. key("h", "history")
+    .. key("s/S", "commit") .. key("q", "close")
 end
 
 local function render()
-  local frame = top()
-  local out, err
-  if frame.rev then
-    out, err = git(state.root, { "blame", "--porcelain", frame.rev, "--", frame.path })
-  else
-    local text = table.concat(api.nvim_buf_get_lines(state.base_buf, 0, -1, false), "\n") .. "\n"
-    out, err = git(state.root, { "blame", "--porcelain", "--contents", "-", "--", frame.path }, text)
-  end
-  if not out then
-    vim.notify("blame: " .. err, vim.log.levels.ERROR)
+  local b = blame_buffer(state.base_buf, true)
+  if not b then
     return false
   end
-  local entries, commits = parse_porcelain(out)
-  fetch_bodies(state.root, commits)
-  state.entries = entries
+  fetch_bodies(b.root, b.commits)
+  state.blame = b
 
-  local lines, marks = layout(entries, commits, api.nvim_win_get_width(state.panel_win))
+  local lines, marks = layout(b.entries, b.commits, api.nvim_win_get_width(state.panel_win))
   local buf = state.panel_buf
   vim.bo[buf].modifiable = true
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -290,92 +392,138 @@ local function render()
   return true
 end
 
-local function current_commit()
-  local e = state.entries[api.nvim_win_get_cursor(state.panel_win)[1]]
-  if not e or e.commit.sha == UNCOMMITTED then
-    vim.notify("blame: this line is not committed yet", vim.log.levels.INFO)
+--- The committed entry under the cursor of the current window, or nil, said why.
+local function committed_entry()
+  local e, b = entry_at(api.nvim_get_current_win(), true)
+  if e and e.commit.sha == UNCOMMITTED then
+    notify "this line is not committed yet"
     return nil
   end
-  return e.commit, e
+  return e, b
 end
 
-local function scratch(name, lines, ft)
+--- Opens `lines` in a scratch buffer beside the code: `open` is "vsplit" or "tabnew".
+local function open_beside(name, lines, open)
   local buf = api.nvim_create_buf(false, true)
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  api.nvim_buf_set_name(buf, name)
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].filetype = ft
-  return buf
-end
-
---- Shows the stack's top in the code window, blames it, and puts both cursors on `lnum`.
-local function show_top(lnum)
-  state.shown = top().buf
-  api.nvim_win_set_buf(state.code_win, top().buf)
-  render()
-  lnum = math.max(1, math.min(lnum, api.nvim_buf_line_count(top().buf)))
-  api.nvim_win_set_cursor(state.code_win, { lnum, 0 })
-  api.nvim_win_set_cursor(state.panel_win, { lnum, 0 })
-end
-
-local function older()
-  local c, e = current_commit()
-  if not c then
-    return
+  pcall(api.nvim_buf_set_name, buf, name) -- the same view opened twice keeps the first's name
+  vim.bo[buf].modifiable, vim.bo[buf].filetype, vim.bo[buf].bufhidden = false, "git", "wipe"
+  if state and api.nvim_get_current_win() == state.panel_win then
+    api.nvim_set_current_win(state.code_win)
   end
-  if not c.prev_sha then
-    vim.notify("blame: " .. c.sha:sub(1, 7) .. " added this line; there is nothing older", vim.log.levels.INFO)
-    return
-  end
-  local out, err = git(state.root, { "show", c.prev_sha .. ":" .. c.prev_path })
-  if not out then
-    vim.notify("blame: " .. err, vim.log.levels.ERROR)
-    return
-  end
-  local lines = vim.split(out:gsub("\n$", ""), "\n", { plain = true })
-  local ft = vim.filetype.match { filename = c.prev_path } or ""
-  local buf = scratch(("blame://%s/%s"):format(c.prev_sha:sub(1, 7), c.prev_path), lines, ft)
-  top().lnum = api.nvim_win_get_cursor(state.panel_win)[1]
-  table.insert(state.stack, { rev = c.prev_sha, path = c.prev_path, buf = buf, from = c.sha })
-  show_top(e.orig)
-end
-
-local function newer()
-  if #state.stack == 1 then
-    return
-  end
-  local left = table.remove(state.stack)
-  show_top(top().lnum)
-  api.nvim_buf_delete(left.buf, { force = true })
-end
-
-local function show_commit(open)
-  local c = current_commit()
-  if not c then
-    return
-  end
-  local out = git(state.root, { "show", "--stat", "--patch", "--format=fuller", c.sha }) or ""
-  local buf = scratch("blame://commit/" .. c.sha:sub(1, 7), vim.split(out, "\n", { plain = true }), "git")
-  vim.bo[buf].bufhidden = "wipe"
-  api.nvim_set_current_win(state.code_win)
   vim.cmd(open)
   vim.wo.scrollbind, vim.wo.cursorbind = false, false -- a split inherits the code window's binding
   api.nvim_win_set_buf(0, buf)
 end
 
-local function diff_popup()
-  local c = current_commit()
-  if not c then
+function M.show_commit(open)
+  local e, b = committed_entry()
+  if e then
+    local out = git(b.root, { "show", "--stat", "--patch", "--format=fuller", e.commit.sha }) or ""
+    open_beside("blame://commit/" .. e.commit.sha:sub(1, 7), vim.split(out, "\n", { plain = true }), open)
+  end
+end
+
+--- Every commit that changed the line under the cursor, newest first, each with its change.
+function M.history()
+  local e, b = committed_entry()
+  if e then
+    local c = e.commit
+    local range = ("-L%d,%d:%s"):format(e.orig, e.orig, c.path)
+    local out, err = git(b.root, { "log", "--date=short", range, c.sha })
+    if not out then
+      return notify(err, vim.log.levels.ERROR)
+    end
+    open_beside(("blame://history/%s:%d"):format(c.path, e.orig), vim.split(out, "\n", { plain = true }), "vsplit")
+  end
+end
+
+local function change_popup()
+  local e, b = entry_at(api.nvim_get_current_win(), true)
+  if e then
+    vim.lsp.util.open_floating_preview((line_card(b.root, e)), "git", {
+      border = "rounded",
+      focus_id = "blame-change",
+      max_width = math.floor(vim.o.columns * 0.6),
+      max_height = math.floor(vim.o.lines * 0.7),
+    })
+  end
+end
+
+-- Follow mode --------------------------------------------------------------------------------
+
+local function follow_hide()
+  if follow.win and api.nvim_win_is_valid(follow.win) then
+    api.nvim_win_close(follow.win, true)
+  end
+  follow.win = nil
+end
+
+--- Shows the card of the line under the cursor at the side of the window, away from the cursor.
+local function follow_update()
+  local win = api.nvim_get_current_win()
+  if not follow or api.nvim_win_get_config(win).relative ~= "" then
     return
   end
-  local out = git(state.root, { "show", "--date=short", "--format=%h  %an  %ad%n%n%B", c.sha, "--", c.path }) or ""
-  vim.lsp.util.open_floating_preview(vim.split(vim.trim(out), "\n", { plain = true }), "git", {
-    border = "rounded",
-    focus_id = "blame-diff",
-    max_width = math.floor(vim.o.columns * 0.6),
-    max_height = math.floor(vim.o.lines * 0.7),
-  })
+  local e, b = entry_at(win)
+  if not e then
+    return follow_hide()
+  end
+  local lines, key = line_card(b.root, e)
+  if key ~= follow.key then
+    vim.bo[follow.buf].modifiable = true
+    api.nvim_buf_set_lines(follow.buf, 0, -1, false, lines)
+    vim.bo[follow.buf].modifiable = false
+  end
+
+  local anchor = (state and win == state.panel_win) and state.code_win or win
+  local ww, wh = api.nvim_win_get_width(anchor), api.nvim_win_get_height(anchor)
+  local widest = 0
+  for _, l in ipairs(lines) do
+    widest = math.max(widest, vim.fn.strdisplaywidth(l))
+  end
+  local low = vim.fn.winline() > wh / 2 -- the cursor is in the lower half, so the card goes up top
+  local cfg = {
+    relative = "win", win = anchor, anchor = low and "NE" or "SE", row = low and 0 or wh, col = ww,
+    width = math.max(1, math.min(widest, math.floor(ww * 0.5))),
+    height = math.max(1, math.min(#lines, math.floor(wh * 0.5))),
+  }
+  if follow.win and api.nvim_win_is_valid(follow.win) then
+    api.nvim_win_set_config(follow.win, cfg)
+  else
+    cfg.border, cfg.style, cfg.focusable, cfg.zindex = "rounded", "minimal", false, 40
+    follow.win = api.nvim_open_win(follow.buf, false, cfg)
+    vim.wo[follow.win].wrap = true
+  end
+  if key ~= follow.key then
+    api.nvim_win_set_cursor(follow.win, { 1, 0 })
+    follow.key = key
+  end
 end
+
+function M.follow()
+  if follow then
+    follow_hide()
+    api.nvim_del_augroup_by_name "blame-follow"
+    api.nvim_buf_delete(follow.buf, { force = true })
+    follow = nil
+  else
+    follow = { buf = api.nvim_create_buf(false, true) }
+    vim.bo[follow.buf].filetype = "git"
+    local group = api.nvim_create_augroup("blame-follow", { clear = true })
+    api.nvim_create_autocmd({ "CursorMoved", "WinEnter", "BufEnter", "InsertLeave", "WinResized" }, {
+      group = group,
+      callback = function() vim.schedule(follow_update) end,
+    })
+    api.nvim_create_autocmd("InsertEnter", { group = group, callback = follow_hide })
+    follow_update()
+  end
+  if state then
+    vim.wo[state.panel_win].winbar = winbar()
+  end
+end
+
+-- Opening and closing the panel --------------------------------------------------------------
 
 function M.close()
   if not state then
@@ -384,16 +532,8 @@ function M.close()
   local s = state
   state = nil
   if api.nvim_win_is_valid(s.code_win) then
-    if api.nvim_win_get_buf(s.code_win) ~= s.base_buf and api.nvim_buf_is_valid(s.base_buf) then
-      api.nvim_win_set_buf(s.code_win, s.base_buf)
-    end
     for opt, val in pairs(s.saved) do
       vim.wo[s.code_win][opt] = val
-    end
-  end
-  for k = 2, #s.stack do
-    if api.nvim_buf_is_valid(s.stack[k].buf) then
-      api.nvim_buf_delete(s.stack[k].buf, { force = true })
     end
   end
   pcall(api.nvim_del_augroup_by_name, "blame-panel")
@@ -404,13 +544,9 @@ end
 
 function M.open()
   local code_win, base_buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
-  local file = vim.fn.resolve(api.nvim_buf_get_name(base_buf))
-  local root = file ~= "" and git(vim.fn.fnamemodify(file, ":h"), { "rev-parse", "--show-toplevel" })
-  if not root then
-    vim.notify("blame: not a file in a git repository", vim.log.levels.WARN)
+  if not blame_buffer(base_buf, true) then
     return
   end
-  root = vim.trim(root)
 
   local saved = {}
   for _, opt in ipairs { "scrollbind", "cursorbind", "foldenable", "wrap" } do
@@ -420,18 +556,14 @@ function M.open()
   vim.cmd(("aboveleft %dvsplit"):format(width))
   local panel_win, panel_buf = api.nvim_get_current_win(), api.nvim_create_buf(false, true)
   api.nvim_win_set_buf(panel_win, panel_buf)
-  api.nvim_buf_set_name(panel_buf, "blame://" .. vim.fn.fnamemodify(file, ":t"))
+  pcall(api.nvim_buf_set_name, panel_buf, "blame://" .. vim.fn.fnamemodify(api.nvim_buf_get_name(base_buf), ":t"))
   vim.bo[panel_buf].filetype = "blame"
   vim.bo[panel_buf].bufhidden = "wipe"
   local wo = vim.wo[panel_win][0]
   wo.number, wo.relativenumber, wo.signcolumn, wo.foldcolumn = false, false, "no", "0"
   wo.wrap, wo.list, wo.spell, wo.winfixwidth, wo.cursorline = false, false, false, true, true
 
-  state = {
-    code_win = code_win, panel_win = panel_win, panel_buf = panel_buf, root = root,
-    base_buf = base_buf, shown = base_buf, saved = saved,
-    stack = { { path = file:sub(#vim.fn.resolve(root) + 2), buf = base_buf } },
-  }
+  state = { code_win = code_win, panel_win = panel_win, panel_buf = panel_buf, base_buf = base_buf, saved = saved }
   if not render() then
     return M.close()
   end
@@ -448,11 +580,11 @@ function M.open()
     vim.keymap.set("n", lhs, fn, { buffer = panel_buf, nowait = true, desc = desc })
   end
   map("q", M.close, "Close blame")
-  map("K", diff_popup, "This commit's message and its change to this file")
-  map("s", function() show_commit "vsplit" end, "Show commit in a split")
-  map("S", function() show_commit "tabnew" end, "Show commit in a tab")
-  map("r", older, "Blame the file as it was before this commit")
-  map("<BS>", newer, "Back to the newer blame")
+  map("K", change_popup, "The line's commit and the change that touched it")
+  map("f", M.follow, "Toggle follow mode")
+  map("h", M.history, "Every commit that changed this line")
+  map("s", function() M.show_commit "vsplit" end, "Show commit in a split")
+  map("S", function() M.show_commit "tabnew" end, "Show commit in a tab")
 
   local group = api.nvim_create_augroup("blame-panel", { clear = true })
   api.nvim_create_autocmd("WinClosed", {
@@ -463,7 +595,7 @@ function M.open()
   api.nvim_create_autocmd("BufWinEnter", { -- another buffer in the code window ends the blame
     group = group,
     callback = function()
-      if state and api.nvim_win_is_valid(state.code_win) and api.nvim_win_get_buf(state.code_win) ~= state.shown then
+      if state and api.nvim_win_is_valid(state.code_win) and api.nvim_win_get_buf(state.code_win) ~= state.base_buf then
         vim.schedule(M.close)
       end
     end,
@@ -472,7 +604,7 @@ function M.open()
     group = group,
     buffer = base_buf,
     callback = function()
-      if state and #state.stack == 1 then
+      if state then
         render()
       end
     end,
