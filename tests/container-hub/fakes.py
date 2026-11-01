@@ -348,15 +348,14 @@ exit 1
         self.registered(session, pid=gone.pid, started=None, **extra)
 
     def statusline(self, session: str, at: float, config_dir: Path | str | None = None, context: tuple | None = None,
-                   five_hour: tuple | None = None, seven_day: tuple | None = None) -> None:
+                   seven_day: tuple | None = None) -> None:
         """What the statusline keeps of a render: Claude Code's statusline input as received, with the account it ran
-        under and when it ran added. A window is (used percentage, resets at); a pro account's input carries none."""
+        under and when it ran added. The week's window is (used percentage, resets at); a pro account's input carries none."""
         data = {"session_id": session, "model": {"id": "claude-opus-5-5", "display_name": "Opus"},
                 "workspace": {"current_dir": str(self.home)}, "config_dir": str(config_dir or self.home / ".claude"), "written_at": at,
                 **({"context_window": {"used_percentage": context[0], "total_input_tokens": context[1],
                                        "context_window_size": 200000}} if context else {}),
-                "rate_limits": {name: {"used_percentage": w[0], "resets_at": w[1]}
-                                for name, w in (("five_hour", five_hour), ("seven_day", seven_day)) if w}}
+                "rate_limits": {"seven_day": {"used_percentage": seven_day[0], "resets_at": seven_day[1]}} if seven_day else {}}
         page(self.home / ".cache/claude-statusline" / f"{session}.json", json.dumps(data))
 
     def turn_record(self, session_dir: Path, number: int, headline: str, questions: tuple[str, ...] = (),
