@@ -12,8 +12,9 @@
 --
 -- Follow mode puts a card at the side of the window that shows the commit of the line under the
 -- cursor, its message and the hunk of it that touched the line, and keeps it current as the
--- cursor moves, in the panel and in any file. Line history lists every commit that changed the
--- line under the cursor (`git log -L`), newest first, each with its change.
+-- cursor moves, in the panel and in any file; <C-j> and <C-k> scroll it. Line history lists
+-- every commit that changed the line under the cursor (`git log -L`), newest first, each with
+-- its change.
 
 local api = vim.api
 local M = {}
@@ -483,16 +484,22 @@ local function follow_update()
   for _, l in ipairs(lines) do
     widest = math.max(widest, vim.fn.strdisplaywidth(l))
   end
+  local width = math.max(1, math.min(widest, math.floor(ww * 0.5)))
+  local rows = 0 -- the card wraps, so a line wider than it takes several rows
+  for _, l in ipairs(lines) do
+    rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / width))
+  end
+  local height = math.max(1, math.min(rows, math.floor(wh * 0.5)))
   local low = vim.fn.winline() > wh / 2 -- the cursor is in the lower half, so the card goes up top
   local cfg = {
     relative = "win", win = anchor, anchor = low and "NE" or "SE", row = low and 0 or wh, col = ww,
-    width = math.max(1, math.min(widest, math.floor(ww * 0.5))),
-    height = math.max(1, math.min(#lines, math.floor(wh * 0.5))),
+    width = width, height = height, border = "rounded",
+    footer = rows > height and { { " ^j ^k scroll ", "Comment" } } or "", footer_pos = "right",
   }
   if follow.win and api.nvim_win_is_valid(follow.win) then
     api.nvim_win_set_config(follow.win, cfg)
   else
-    cfg.border, cfg.style, cfg.focusable, cfg.zindex = "rounded", "minimal", false, 40
+    cfg.style, cfg.focusable, cfg.zindex = "minimal", false, 40
     follow.win = api.nvim_open_win(follow.buf, false, cfg)
     vim.wo[follow.win].wrap = true
   end
@@ -502,8 +509,19 @@ local function follow_update()
   end
 end
 
+--- Scrolls the card by `keys` (half a page down or up), from whichever window has the cursor.
+local function card_scroll(keys)
+  return function()
+    if follow and follow.win and api.nvim_win_is_valid(follow.win) then
+      api.nvim_win_call(follow.win, function() vim.cmd("normal! " .. vim.keycode(keys)) end)
+    end
+  end
+end
+
 function M.follow()
   if follow then
+    pcall(vim.keymap.del, "n", "<C-j>")
+    pcall(vim.keymap.del, "n", "<C-k>")
     follow_hide()
     api.nvim_del_augroup_by_name "blame-follow"
     api.nvim_buf_delete(follow.buf, { force = true })
@@ -517,6 +535,8 @@ function M.follow()
       callback = function() vim.schedule(follow_update) end,
     })
     api.nvim_create_autocmd("InsertEnter", { group = group, callback = follow_hide })
+    vim.keymap.set("n", "<C-j>", card_scroll "<C-d>", { desc = "Scroll the blame card down" })
+    vim.keymap.set("n", "<C-k>", card_scroll "<C-u>", { desc = "Scroll the blame card up" })
     follow_update()
   end
   if state then
