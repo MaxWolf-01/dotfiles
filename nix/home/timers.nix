@@ -395,8 +395,7 @@ in
   # mx's weekly retros, run from the agents repo's checkout: on Monday the workflow retro, of the
   # agents repo and every Claude Code session; on Tuesday the repo retro of each repo on
   # ./repo-retros, one after another. bin/workflow-retro says what each records. Each kind gets a
-  # night of its own to end inside the window claude-ping opens at 23:30 (why: the claude-ping
-  # comment below), though a long night of repo retros can still run past it. Persistent: a laptop
+  # night of its own. Persistent: a laptop
   # asleep at 02:00 runs them on waking. When both catch up on the same waking, the repo retros
   # wait for the workflow retro to end.
   # Both are oneshots, which have no start timeout by default, so a wedged run would leave the unit
@@ -1131,41 +1130,6 @@ in
       OnCalendar = "09,21:20:00";
       Persistent = true;
       RandomizedDelaySec = "10m";
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
-
-  # --- Claude usage-window anchor ---
-  # The 5-hour window starts with your first message, so these pings pin it to a
-  # fixed grid: 08:30 → 13:30 → 18:30 → 23:30. Deliberately no 04:30 ping: it
-  # would open a window running to 09:30 that swallows the 08:30 anchor, and
-  # that anchor is the one that matters — it leaves ~2.5h of window in hand when
-  # the workday starts around 11:00, then a fresh 5h block at 13:30.
-  # 04:30–08:30 is the only gap, and it sits inside sleep.
-
-  systemd.user.services.claude-ping = {
-    Unit = {
-      Description = "Anchor the Claude 5-hour usage window";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      WorkingDirectory = "/tmp";
-      # ~/.nix-profile/bin ahead of ~/.local/bin: its `claude` is the wrapper
-      # (claude-token.nix), and the ping has to open the profile's own window.
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
-      ExecStart = "${dotfiles}/bin/clawd ping";
-    };
-  };
-
-  systemd.user.timers.claude-ping = {
-    Unit.Description = "Claude window anchor (08:30, then every 5h to 23:30)";
-    Timer = {
-      OnCalendar = "*-*-* 08,13,18,23:30:00";
-      # Laptop: a missed anchor replays once on resume, which is no worse than
-      # the window you would have opened with your first message anyway.
-      Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
   };
