@@ -123,9 +123,13 @@ try:
 
     # The session's program, standing in for Claude Code: it asks its terminal for bracketed paste as Claude Code
     # does, and records every byte that reaches it, so what arrives is what typing in the pane would have sent. It
-    # shows what it gets, as Claude Code's prompt does, which is what the hub waits on between the pieces of a paste.
+    # shows what it gets in an input box drawn as Claude Code draws its own, which is what the hub waits on between the
+    # pieces of a paste and reads to see an Enter taken. A taken Enter empties the box, ctrl+u too. A second argument
+    # is a draft the box holds from the start.
     # A path to slow.png it reads as Claude Code reads a large screenshot, its footer showing hub.PASTING meanwhile,
-    # and it records a "!" before any input that reaches it then.
+    # and it records a "!" before any input that reaches it then. An Enter it loses, as Claude Code does one arriving
+    # while it reads an image or still starts, lands in the box as a newline: one arriving during that read, the first
+    # after a text holding "loses one Enter", and every one after "loses every Enter".
     received = SCRATCH / "received"
     recorder = SCRATCH / "recorder.py"
     recorder.write_text(f"""\
@@ -133,19 +137,37 @@ import os, select, sys, time, tty
 tty.setraw(0)
 os.write(1, b'\\x1b[?2004h')
 out = open(sys.argv[1], 'ab', buffering=0)
-reading = 0.0
+line, pasting, reading, lost = (sys.argv[2] if len(sys.argv) > 2 else '').encode(), False, 0.0, 0
+def draw():
+    rule = '\\u2500' * 40
+    box = ('\\u276f ' + line.decode(errors='replace')).replace('\\r', '\\r\\n  ')
+    os.write(1, ('\\x1b[2J\\x1b[H' + rule + '\\r\\n' + box + '\\r\\n' + rule + ('\\r\\n' + {hub.PASTING!r} if reading else '')).encode())
+draw()
 while True:
     if reading and not select.select([0], [], [], max(0.0, reading - time.monotonic()))[0]:
-        os.write(1, b'\\r\\x1b[2K')
         reading = 0.0
+        draw()
         continue
     if not (data := os.read(0, 4096)):
         break
     out.write(b'!' * bool(reading) + data)
-    os.write(1, data.replace(b'\\x1b', b''))
     if b'slow.png' in data:
-        os.write(1, b'\\r\\n' + {hub.PASTING.encode()!r})
         reading = time.monotonic() + 3 * {hub.SETTLED}
+    while data:
+        mark = next((m for m in (b'\\x1b[200~', b'\\x1b[201~') if data.startswith(m)), None)
+        if mark:
+            pasting, data = mark == b'\\x1b[200~', data[len(mark):]
+            continue
+        key, data = data[:1], data[1:]
+        if key == b'\\x15':
+            line, lost = b'', 0
+        elif key != b'\\r' or pasting:
+            line += key
+        elif reading or b'loses every Enter' in line or b'loses one Enter' in line and not lost:
+            line, lost = line + b'\\r', lost + 1
+        else:
+            line, lost = b'', 0
+    draw()
 """)
     tmux = lambda *args: subprocess.run([TMUX, "-S", TMUX_SOCKET, *args], env=ENV, capture_output=True, text=True, check=True).stdout.strip()
     # no config: the user's own would load plugins whose tmux calls name no socket
@@ -191,6 +213,26 @@ while True:
               "its Enter once it is read", (200, b"\x1b[200~/drops/slow.png\x1b[201~\r"),
               (typed("/drops/slow.png")[0], arrives(b"\x1b[200~/drops/slow.png\x1b[201~\r")))
         received.write_bytes(b"")
+        check("an Enter the session loses, its text still in its box, is pressed once more, and the text sent",
+              (200, b"\x1b[200~this loses one Enter\x1b[201~\r\r"),
+              (typed("this loses one Enter")[0], arrives(b"\x1b[200~this loses one Enter\x1b[201~\r\r")))
+        received.write_bytes(b"")
+        status_code, answer = typed("this loses every Enter")
+        check("a text the session still holds after the second Enter is said not to be sent, and no third Enter goes",
+              (502, True, b"\x1b[200~this loses every Enter\x1b[201~\r\r"),
+              (status_code, "pressed 2 time(s)" in answer.get("error", ""), arrives(b"\x1b[200~this loses every Enter\x1b[201~\r\r")))
+        tmux("send-keys", "-t", pane, "C-u")
+        arrives(b"\x1b[200~this loses every Enter\x1b[201~\r\r\x15")
+        received.write_bytes(b"")
+        in_pane("busy", tmux=f"answering:@0.{pane}")  # a turn runs, which may have opened a permission prompt since
+        status_code, answer = typed("this loses every Enter")
+        check("a session no longer idle gets no second Enter, whatever its box holds",
+              (502, True, b"\x1b[200~this loses every Enter\x1b[201~\r"),
+              (status_code, "pressed 1 time(s)" in answer.get("error", ""), arrives(b"\x1b[200~this loses every Enter\x1b[201~\r")))
+        in_pane(tmux=f"answering:@0.{pane}")
+        tmux("send-keys", "-t", pane, "C-u")
+        arrives(b"\x1b[200~this loses every Enter\x1b[201~\r\x15")
+        received.write_bytes(b"")
         check("nothing but whitespace is not sent", 400, typed(" \n ")[0])
         tmux("copy-mode", "-t", pane)  # scrolled up in, where copy mode would take the Enter
         check("a pane in copy mode leaves it, and the session gets the paste and the Enter", (200, b"\x1b[200~go on\x1b[201~\r", "0"),
@@ -215,15 +257,13 @@ while True:
         check("a pane that does not hold the session's process is sent nothing", (409, True, b""),
               (status_code, "no longer holds" in answer.get("error", ""), arrives(b"")))
         # --- hub-reloads-mx: /reload-plugins typed into a session whose input box is empty, and only there. Each pane
-        # draws Claude Code's input box, between its two rules, then runs the recorder.
+        # runs the recorder, its input box holding the draft given.
         page(HOME / ".claude" / "plugins" / "installed_plugins.json", json.dumps({"plugins": {"mx@MaxWolf-01": [{"version": "1.0.55"}]}}))
-        rule = "─" * 30
         reloads = {}
-        for session, line in ((ORCHESTRATOR, "❯ "), (WORKER, "❯ half a thought")):
+        for session, draft in ((ORCHESTRATOR, ""), (WORKER, "half a thought")):
             got = SCRATCH / f"received-{session[:8]}"
-            drawn = f'printf "%s\\n%s\\n%s\\n" {shlex.quote(rule)} {shlex.quote(line)} {shlex.quote(rule)}'
             tmux("new-session", "-d", "-s", session[:8], "-x", "100", "-y", "20",
-                 f"sh -c {shlex.quote(drawn + '; exec ' + shlex.join([sys.executable, str(recorder), str(got)]))}")
+                 shlex.join(["exec", sys.executable, str(recorder), str(got), draft]))
             box_pane, box_pid = tmux("display-message", "-p", "-t", f"{session[:8]}:", "#{pane_id} #{pane_pid}").split()
             deadline = time.monotonic() + 10
             while not (got.exists() and "❯" in tmux("capture-pane", "-p", "-t", box_pane)) and time.monotonic() < deadline:
@@ -560,13 +600,14 @@ while data := os.read(0, 4096):
     # window of the tmux session `hub`, Claude Code typed into its shell
 
     # Claude Code's stand-in, on the PATH of the panes' shells: it registers under the id it is given, as Claude Code
-    # does, idle in its pane unless `registers` says otherwise, that it does not register, or that it exits at once; records its
-    # arguments, account and directory, and every byte typed into it once it runs. A person's session, as the hub
+    # does, idle in its pane unless `registers` says otherwise, that it does not register, that it exits at once, or that it
+    # spends `starting` seconds registered with no status; records its arguments, account and directory, and every byte
+    # typed into it once it runs, after a "!" where some were typed before. A person's session, as the hub
     # sees one started under max's own login: run inside a dispatched worker, it sheds the worker's DISPATCH_WORKLOG.
     fake_bin, launched, typed_after, registers = SCRATCH / "fake-bin", SCRATCH / "launched", SCRATCH / "typed-after", SCRATCH / "registers"
     fake_bin.mkdir()
     (fake_bin / "claude").write_text(f"""#!{sys.executable}
-import json, os, sys, tty
+import json, os, select, sys, time, tty
 if "DISPATCH_WORKLOG" in os.environ:
     os.execve(sys.argv[0], sys.argv, {{k: v for k, v in os.environ.items() if k != "DISPATCH_WORKLOG"}})
 args = sys.argv[1:]
@@ -576,16 +617,22 @@ with open({str(launched)!r}, "a") as f:
 change = json.load(open({str(registers)!r})) if os.path.exists({str(registers)!r}) else {{}}
 if change == "exit":  # Claude Code failing at its start, before it registers
     sys.exit(1)
+tty.setraw(0)
 if change is not None:
     started = open(f"/proc/{{os.getpid()}}/stat").read().rsplit(")", 1)[1].split()[19]
+    starting = change.pop("starting", 0)
     entry = {{"pid": os.getpid(), "procStart": started, "kind": "interactive", "cwd": os.getcwd(), "status": "idle",
              "sessionId": args[args.index("--session-id" if "--session-id" in args else "--resume") + 1],
              "tmux": "hub:@0." + os.environ["TMUX_PANE"], **change}}
     os.makedirs(account + "/sessions", exist_ok=True)
+    if starting:  # registered with no status, its prompt not yet taking input, as Claude Code starts
+        open(f"{{account}}/sessions/{{os.getpid()}}.json", "w").write(json.dumps({{k: v for k, v in entry.items() if k != "status"}}))
+        time.sleep(starting)
     open(f"{{account}}/sessions/{{os.getpid()}}.json", "w").write(json.dumps(entry))
-tty.setraw(0)
 os.write(1, b"\\x1b[?2004h")
 out = open({str(typed_after)!r}, "ab", buffering=0)
+if select.select([0], [], [], 0)[0]:  # typed before its prompt took input
+    out.write(b"!")
 while data := os.read(0, 4096):
     out.write(data)
     os.write(1, data.replace(b"\\x1b", b""))
@@ -732,6 +779,11 @@ while data := os.read(0, 4096):
         check("a session that starts blocked in its terminal is a unit, but takes no first prompt, the box saying why",
               (409, "waiting", True, b""), (status_code, (view(answer.get("unit") or "") or {}).get("state"),
                                             "dialog open" in answer.get("error", ""), reached(b"")))
+        registers.write_text(json.dumps({"starting": 1.0}))
+        typed_after.unlink(missing_ok=True)
+        status_code, answer = hub.start({"project": str(alpha), "prompt": "go"})
+        check("a session registered with no status yet, still starting, takes its first prompt only once it is idle",
+              (200, b"\x1b[200~go\x1b[201~\r"), (status_code, reached(b"\x1b[200~go\x1b[201~\r")))
         registers.unlink()
     finally:
         stop_tmux()

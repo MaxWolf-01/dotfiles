@@ -2992,6 +2992,7 @@ as an image's does."""
 SETTLED = 0.2  # seconds a pane's screen stays the same once a paste has changed it
 SETTLE_LIMIT = 3.0
 PASTING = "Pasting\u2026"  # Claude Code's footer while it reads a pasted image
+TAKEN_WAIT = 2.0  # seconds Claude Code has to show it took a message once its Enter is pressed
 
 
 def paste(pane: str, text: str) -> str:
@@ -3004,7 +3005,14 @@ def paste(pane: str, text: str) -> str:
     pane to settle. Claude Code attaches an image whose path is pasted, but it finds a path's start only after a space
     or a line feed, and tmux pastes a line break as a carriage return: the line before a path goes in with it as one
     path that cannot be read, and is lost. It also drops an Enter that arrives while it still reads an image, which it
-    shows as PASTING in its footer: a large screenshot holds that still on screen for longer than SETTLED."""
+    shows as PASTING in its footer: a large screenshot holds that still on screen for longer than SETTLED.
+
+    The Enter is checked: Claude Code took the message once the first line of its input box is no longer the one the
+    paste left there (the box empties, holds a placeholder for a queued message, or gives way to a dialog). An Enter it
+    lost, during a state of its own no wait above foresaw, leaves that line, and sometimes a newline under it. Enter
+    goes once more where the line is still there and the session still idle, right before, so it cannot land on a
+    permission prompt, which only a running turn opens; a second that is lost too is said, not reported as sent. A
+    pane showing no input box (an unknown layout, a program other than Claude Code) is typed into unchecked."""
     with typing:
         return pasted(pane, text)
 
@@ -3016,6 +3024,7 @@ def pasted(pane: str, text: str) -> str:
     if tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}").stdout.strip() == "1":
         if (run := tmux("send-keys", "-t", pane, "-X", "cancel")).returncode != 0:
             return f"tmux send-keys into {pane}: {run.stderr.strip()}"
+    before = prompt_box(screen(pane))
     for piece in pieces:
         buffer = f"container-hub-{secrets.token_hex(4)}"
         shown = screen(pane) if images else ""
@@ -3025,9 +3034,35 @@ def pasted(pane: str, text: str) -> str:
                 return f"tmux {args[0]} into {pane}: {run.stderr.strip()}"
         if images:
             settle(pane, shown)
-    if (run := tmux("send-keys", "-t", pane, "Enter")).returncode != 0:
-        return f"tmux send-keys into {pane}: {run.stderr.strip()}"
-    return ""
+    shows = box_until(pane, lambda box: box not in (None, before, ["❯"]))  # a box drawn only once its prompt starts too
+    typed = (prompt_box(screen(pane)) or [None])[0] if shows else None
+    taken = lambda box: box is None or box[0] != typed
+    for pressed in (1, 2):
+        if (run := tmux("send-keys", "-t", pane, "Enter")).returncode != 0:
+            return f"tmux send-keys into {pane}: {run.stderr.strip()}"
+        if typed is None or box_until(pane, taken) or taken(prompt_box(screen(pane))):
+            return ""
+        if not idle_in(pane):
+            break
+    return (f"typed into {pane}, but Claude Code did not take it after Enter was pressed {pressed} time(s); "
+            "press Enter in that pane")
+
+
+def box_until(pane: str, done) -> bool:
+    """Whether `done` came to hold for the pane's input box (None where it shows none) within TAKEN_WAIT seconds. A
+    tmux pane says nothing when its screen changes, so the screen is read again every 50 ms."""
+    deadline = time.monotonic() + TAKEN_WAIT
+    while not done(prompt_box(screen(pane))):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def idle_in(pane: str) -> bool:
+    """A session the registry places in the pane is idle: no turn of its runs, so no permission prompt is open."""
+    return any(pane_id(p) == pane and p.get("status") in ("idle", "shell")
+               for entry in registry().values() for p in entry["processes"])
 
 
 def screen(pane: str) -> str:
@@ -3158,12 +3193,20 @@ def reload_due(session: str, entry: dict) -> str | None:
 
 
 def prompt_empty(shown: str) -> bool:
-    """Claude Code's input box on a pane's screen holds nothing: its line `❯` alone, between the two rules that frame
-    it. Any other screen counts as not empty: a draft, a dialog, a placeholder, a layout this does not know."""
-    lines = shown.rstrip("\n").split("\n")
-    framed = [i for i in range(1, len(lines) - 1)
-              if lines[i].startswith("❯") and lines[i - 1].startswith("─") and lines[i + 1].startswith("─")]
-    return bool(framed) and lines[framed[-1]].strip() == "❯"
+    """Claude Code's input box on a pane's screen holds nothing: its line `❯` alone. Any other screen counts as not
+    empty: a draft, a dialog, a placeholder, a layout this does not know."""
+    return prompt_box(shown) == ["❯"]
+
+
+def prompt_box(shown: str) -> list[str] | None:
+    """Claude Code's input box on a pane's screen, the last one drawn: its lines from the one opening on `❯` down to
+    the rule under them, a rule above them too; None where the screen shows no such box."""
+    lines = [line.rstrip() for line in shown.rstrip("\n").split("\n")]
+    for i in range(len(lines) - 2, 0, -1):
+        if lines[i].startswith("❯") and lines[i - 1].startswith("─"):
+            end = next((j for j in range(i + 1, len(lines)) if lines[j].startswith("─")), None)
+            return lines[i:end] if end else None
+    return None
 
 
 def reload_into(session: str, entry: dict, version: str) -> str:
@@ -3714,13 +3757,16 @@ def launch(session: str, cwd: Path, account: str, args: list[str], prompt: str) 
 
 def registered(session: str) -> tuple[dict | None, str]:
     """The registry entry of a session the hub started, once it names it neither at work nor starting up; else None
-    and why, after START_WAIT seconds at most. One blocked in its terminal is returned as it is."""
+    and why, after START_WAIT seconds at most. One blocked in its terminal is returned as it is.
+
+    Claude Code writes the entry with no status while it starts, before its prompt takes input: a prompt pasted then
+    lands in the prompt, but its Enter is lost (Claude Code 2.1.316)."""
     deadline, seen = time.monotonic() + START_WAIT, None
     while True:
-        if (seen := registry().get(session)) and seen.get("status") not in RUNNING:
+        if (seen := registry().get(session)) and seen.get("status") and seen["status"] not in RUNNING:
             return seen, ""
         if time.monotonic() > deadline:
-            return None, (f"the session was still at work after {START_WAIT:g} s" if seen
+            return None, (f"the session was still {'at work' if seen.get('status') else 'starting'} after {START_WAIT:g} s" if seen
                           else f"Claude Code had not registered the session after {START_WAIT:g} s: a prompt of the shell's or a "
                                "dialog of Claude Code's own may be waiting in that pane")
         time.sleep(0.2)
