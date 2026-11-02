@@ -60,6 +60,7 @@
     ../dotnet.nix
     ../gnome.nix
     ../greyline.nix
+    ../proc-load.nix
     ../proton-mail.nix
     ../sudo-touch.nix
     ../timers.nix

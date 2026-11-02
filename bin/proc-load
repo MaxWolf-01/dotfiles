@@ -1,0 +1,360 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro>=1.0.14"]
+# ///
+"""Record every process's CPU and memory minute by minute, and show which ones were busy.
+
+`record` reads /proc every 10 seconds and appends one line per minute to
+<dir>/procs/<date>.jsonl: the CPU seconds each process used in that minute and
+its resident memory. A minute lists every process that used any CPU in it,
+plus the 30 largest by memory. A process's command line is written the first
+time it appears in a day's file. A process that starts and exits between two
+readings is not seen, and the last 10 seconds of one that exits are lost.
+
+Firefox's startup script (desktop/firefox-tab-map.js) appends to
+<dir>/firefox/<date>.jsonl which site and tabs each Firefox process serves,
+whenever that changes. `top` puts those tabs next to the Firefox processes.
+Brave keeps that mapping to itself, so its processes show only their type
+(renderer, gpu-process, ...).
+
+Days older than --keep-days are deleted by `record`.
+
+Examples:
+
+    proc-load top                     the last 30 minutes, busiest first
+    proc-load top --since 2h --limit 50
+    proc-load top --until 10:45 --since 15m
+    proc-load top --by name           summed per program name
+    proc-load record                  what the user service runs
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Literal
+
+import tyro
+
+DEFAULT_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "proc-load"
+TICK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+TOP_BY_MEMORY = 30
+STORE_HASH = re.compile(r"/nix/store/[a-z0-9]{32}-")
+
+
+@dataclass(frozen=True)
+class Proc:
+    pid: int
+    start: int
+    """Start time in clock ticks since boot: with the pid, it tells a reused pid from the process before it."""
+    comm: str
+    ticks: int
+    """CPU time used so far, user plus system, in clock ticks."""
+    rss: int
+    """Resident memory in bytes."""
+
+
+def read_procs(root: Path = Path("/proc")) -> list[Proc]:
+    procs = []
+    for entry in root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:  # exited since the listing
+            continue
+        # comm sits in parentheses and may itself hold spaces and parentheses.
+        open_, close = stat.index("("), stat.rindex(")")
+        rest = stat[close + 2 :].split()  # rest[0] is field 3 of proc(5), so field n is rest[n - 3]
+        procs.append(
+            Proc(
+                pid=int(entry.name),
+                start=int(rest[19]),
+                comm=stat[open_ + 1 : close],
+                ticks=int(rest[11]) + int(rest[12]),
+                rss=int(rest[21]) * PAGE,
+            )
+        )
+    return procs
+
+
+def command_line(root: Path, pid: int) -> str:
+    try:
+        raw = (root / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return ""
+    return STORE_HASH.sub("/nix/store/…-", raw.replace(b"\0", b" ").decode(errors="replace").strip())[:200]
+
+
+@dataclass
+class Recorder:
+    """Turns readings of /proc into one line a minute."""
+
+    dir: Path
+    root: Path = Path("/proc")
+    seen: dict[tuple[int, int], int] = field(default_factory=dict)
+    """CPU ticks of each process at the last reading."""
+    used: dict[tuple[int, int], int] = field(default_factory=lambda: defaultdict(int))
+    """CPU ticks each process used in the current minute."""
+    rss: dict[tuple[int, int], int] = field(default_factory=dict)
+    comm: dict[tuple[int, int], str] = field(default_factory=dict)
+    minute: int = 0
+    written: set[tuple[int, int]] = field(default_factory=set)
+    """Processes whose command line the current day's file already holds."""
+    day: str = ""
+    last_uptime: float | None = None
+
+    def reading(self, now: float, uptime: float) -> None:
+        """Takes one reading at wall time `now`, `uptime` seconds after boot; writes the previous minute's line
+        first when `now` is in a new minute."""
+        minute = int(now // 60 * 60)
+        if self.minute and minute != self.minute:
+            self.flush()
+        self.minute = minute
+        alive = {}
+        for proc in read_procs(self.root):
+            key = (proc.pid, proc.start)
+            alive[key] = proc.ticks
+            before = self.seen.get(key)
+            if before is not None:
+                self.used[key] += proc.ticks - before
+            elif self.last_uptime is not None and proc.start / TICK > self.last_uptime:
+                self.used[key] += proc.ticks  # born since the last reading: all its CPU time is new
+            self.rss[key] = proc.rss
+            self.comm[key] = proc.comm
+        self.seen = alive
+        self.last_uptime = uptime
+
+    def flush(self) -> None:
+        busy = {key for key, ticks in self.used.items() if ticks > 0}
+        alive = [key for key in self.rss if key in self.seen]
+        busy |= set(sorted(alive, key=self.rss.__getitem__, reverse=True)[:TOP_BY_MEMORY])
+        day = datetime.fromtimestamp(self.minute).date().isoformat()
+        if day != self.day:
+            self.day, self.written = day, set()
+        new = {
+            str(pid): [self.comm[(pid, start)], command_line(self.root, pid)]
+            for pid, start in sorted(busy - self.written)
+        }
+        line = {
+            "t": self.minute,
+            "new": new,
+            "p": {
+                str(pid): [round(self.used[(pid, start)] / TICK, 2), round(self.rss.get((pid, start), 0) / 2**20)]
+                for pid, start in sorted(busy)
+            },
+        }
+        path = self.dir / "procs" / f"{day}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as out:
+            out.write(json.dumps(line, separators=(",", ":"), ensure_ascii=False) + "\n")
+        self.written |= busy
+        # A process that exited is forgotten once its last minute is written.
+        self.used = defaultdict(int)
+        self.rss = {key: value for key, value in self.rss.items() if key in self.seen}
+        self.comm = {key: value for key, value in self.comm.items() if key in self.seen}
+
+
+def prune(dir: Path, keep_days: int, today: date) -> None:
+    oldest = today - timedelta(days=keep_days - 1)
+    for path in dir.glob("*/*.jsonl"):
+        try:
+            if date.fromisoformat(path.stem) < oldest:
+                path.unlink()
+        except ValueError:
+            continue
+
+
+def record(dir: Path = DEFAULT_DIR, interval: float = 10, keep_days: int = 14) -> None:
+    """Read /proc every `interval` seconds and append one line a minute, until stopped.
+
+    Args:
+        dir: Where the procs/ and firefox/ files live.
+        interval: Seconds between readings. CPU use has no event to wait on, so a clock drives it.
+        keep_days: Days of files to keep, today included.
+    """
+    (dir / "firefox").mkdir(parents=True, exist_ok=True)
+    recorder = Recorder(dir)
+    pruned = None
+    while True:
+        started = time.monotonic()
+        now = time.time()
+        if (today := date.today()) != pruned:
+            prune(dir, keep_days, today)
+            pruned = today
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        recorder.reading(now, uptime)
+        time.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+
+# --- reading the files back
+
+
+def parse_duration(text: str) -> timedelta:
+    match = re.fullmatch(r"(\d+)([smhd])", text)
+    if not match:
+        sys.exit(f"proc-load: {text!r} is not a duration such as 90s, 30m, 2h or 1d")
+    amount, unit = int(match[1]), match[2]
+    return timedelta(seconds=amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit])
+
+
+def parse_time(text: str, now: datetime) -> datetime:
+    for fmt in ("%H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return datetime.combine(now.date(), parsed.time()) if fmt == "%H:%M" else parsed
+    sys.exit(f"proc-load: {text!r} is not a time such as 10:45 or '2026-11-02 10:45'")
+
+
+def lines(dir: Path, kind: str, first: date, last: date):
+    day = first
+    while day <= last:
+        path = dir / kind / f"{day.isoformat()}.jsonl"
+        if path.exists():
+            for raw in path.read_text().splitlines():
+                try:
+                    yield json.loads(raw)
+                except json.JSONDecodeError:  # a line cut short by a crash
+                    continue
+        day += timedelta(days=1)
+
+
+@dataclass
+class Row:
+    pid: int
+    what: str
+    name: str
+    """The program: the file name of the command's executable, or the process's comm where it has none."""
+    cpu: float = 0.0
+    """CPU seconds in the window."""
+    peak: float = 0.0
+    """The most CPU seconds in any one minute."""
+    rss: int = 0
+    """The largest resident memory seen, in MiB."""
+
+
+def program(comm: str, cmd: str) -> str:
+    return cmd.split(" ", 1)[0].rsplit("/", 1)[-1].removeprefix(".").removesuffix("-wrapped") or comm
+
+
+def label(comm: str, cmd: str) -> str:
+    if match := re.search(r"--type=([a-z-]+)", cmd):
+        kind = match[1]
+        if sub := re.search(r"--utility-sub-type=([\w.]+)", cmd):
+            kind += " " + sub[1].rsplit(".", 1)[-1]
+        return f"{comm} {kind}"
+    return cmd or comm
+
+
+def tab_text(proc: dict) -> str:
+    titles = [title or url for title, url in proc.get("tabs", [])]
+    seen = list(dict.fromkeys(t for t in titles if t))
+    head = proc.get("origin") or proc.get("type", "")
+    return f"firefox {proc.get('type', '')} {head}: " + " | ".join(seen) if seen else f"firefox {proc.get('type', '')} {head}"
+
+
+def window_rows(dir: Path, since: datetime, until: datetime) -> tuple[list[Row], int, float | None, float | None]:
+    """Rows for every process that shows up between since and until, how many minutes the window holds lines for,
+    and the times of the newest procs line and the newest Firefox line read."""
+    start, end = since.timestamp(), until.timestamp()
+    commands: dict[str, list[str]] = {}
+    rows: dict[tuple[str, str], Row] = {}
+    newest = None
+    minutes = 0
+    # Command lines are written once a day, so the day's file is read from its start.
+    for line in lines(dir, "procs", since.date(), until.date()):
+        commands.update(line.get("new", {}))
+        if not start <= line["t"] < end:
+            continue
+        newest = line["t"]
+        minutes += 1
+        for pid, (cpu, rss) in line["p"].items():
+            comm, cmd = commands.get(pid, ["?", ""])
+            key = (pid, comm + cmd)
+            row = rows.setdefault(key, Row(int(pid), label(comm, cmd), program(comm, cmd)))
+            row.cpu += cpu
+            row.peak = max(row.peak, cpu)
+            row.rss = max(row.rss, rss)
+
+    # The tab map is written when it changes, so the last one before the window also counts.
+    tabs: dict[int, dict] = {}
+    firefox_newest = None
+    for line in lines(dir, "firefox", since.date() - timedelta(days=1), until.date()):
+        if line["t"] >= end:
+            break
+        firefox_newest = line["t"]
+        for proc in line.get("procs", []):
+            if line["t"] < start:
+                tabs[proc["pid"]] = proc
+            else:
+                known = tabs.setdefault(proc["pid"], {**proc, "tabs": []})
+                known["tabs"] = list(dict.fromkeys(map(tuple, known["tabs"] + proc.get("tabs", []))))
+    for row in rows.values():
+        if row.pid in tabs and row.name == "firefox":
+            row.what = tab_text(tabs[row.pid])
+    return list(rows.values()), minutes, newest, firefox_newest
+
+
+def ago(t: float | None, now: float) -> str:
+    if t is None:
+        return "none"
+    seconds = int(now - t)
+    return f"{seconds}s ago" if seconds < 120 else f"{seconds // 60}m ago"
+
+
+def top(
+    since: str = "30m",
+    until: str = "",
+    limit: int = 25,
+    by: Literal["process", "name"] = "process",
+    dir: Path = DEFAULT_DIR,
+) -> None:
+    """Print the processes that used the most CPU in a window, busiest first.
+
+    CPU is in percent of one core: avg over the minutes of the window that were recorded (not those the laptop
+    slept through), peak in its busiest minute.
+    RSS is the most resident memory seen in the window. A Firefox process shows its site and tab titles.
+
+    Args:
+        since: How far the window reaches back from its end: 90s, 30m, 2h, 1d.
+        until: Where the window ends: 10:45 (today) or '2026-11-02 10:45'. Empty means now.
+        limit: Rows to print.
+        by: process lists each process; name sums them per program name, so Firefox's content processes are one row.
+        dir: Where `record` writes.
+    """
+    now = datetime.now()
+    end = parse_time(until, now) if until else now
+    begin = end - parse_duration(since)
+    rows, minutes, newest, firefox_newest = window_rows(dir, begin, end)
+    seconds = max(minutes, 1) * 60
+
+    if by == "name":
+        merged: dict[str, Row] = {}
+        for row in rows:
+            total = merged.setdefault(row.name, Row(0, row.name, row.name))
+            total.cpu += row.cpu
+            total.peak += row.peak  # an upper bound: the processes' busiest minutes need not coincide
+            total.rss += row.rss
+        rows = list(merged.values())
+
+    print(
+        f"{begin:%H:%M}–{end:%H:%M}, {minutes} minutes recorded, newest {ago(newest, now.timestamp())}, "
+        f"newest Firefox tab map {ago(firefox_newest, now.timestamp())}"
+    )
+    print(f"{'avg':>6} {'peak':>6} {'RSS':>7} {'PID':>7}  what")
+    for row in sorted(rows, key=lambda r: r.cpu, reverse=True)[:limit]:
+        pid = str(row.pid) if by == "process" else ""
+        print(f"{row.cpu / seconds * 100:5.1f}% {row.peak / 60 * 100:5.0f}% {row.rss:6d}M {pid:>7}  {row.what[:140]}")
+
+
+if __name__ == "__main__":
+    tyro.extras.subcommand_cli_from_dict({"record": record, "top": top}, description=__doc__)

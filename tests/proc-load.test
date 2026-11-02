@@ -1,0 +1,90 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro>=1.0.14"]
+# ///
+# tier: fast
+"""proc-load against a made-up /proc and its own files: what a minute's line holds, and what `top` makes of the
+lines and of Firefox's tab map."""
+
+import contextlib
+import io
+import json
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from check import bin_module, check, finish
+
+pl = bin_module("proc-load")
+TICK = pl.TICK
+
+
+def write_proc(root: Path, pid: int, comm: str, ticks: int, rss_pages: int, start: int = 100, cmd: str = "") -> None:
+    d = root / str(pid)
+    d.mkdir(parents=True, exist_ok=True)
+    # Fields 3.. of proc(5): state, then 10 fields up to utime (14), stime (15), ..., starttime (22), vsize, rss (24).
+    rest = ["S"] + ["0"] * 10 + [str(ticks), "0"] + ["0"] * 6 + [str(start), "0", str(rss_pages)] + ["0"] * 20
+    (d / "stat").write_text(f"{pid} ({comm}) " + " ".join(rest) + "\n")
+    (d / "cmdline").write_bytes(cmd.replace(" ", "\0").encode() + b"\0")
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    root, out = tmp / "proc", tmp / "state"
+    (root / "self").mkdir(parents=True)  # not a pid: skipped
+    minute = int(datetime(2026, 11, 2, 10, 40).timestamp())
+
+    write_proc(root, 10, "Isolated Web Co", ticks=0, rss_pages=1000,
+               cmd="/nix/store/" + "a" * 32 + "-firefox-158/lib/firefox/firefox -contentproc")
+    write_proc(root, 20, "brave", ticks=50, rss_pages=500, cmd="/opt/brave.com/brave/brave --type=renderer --lang=en")
+    write_proc(root, 30, "sleepy (x) y", ticks=7, rss_pages=10)
+    rec = pl.Recorder(out, root)
+    rec.reading(minute + 5, uptime=1000)
+
+    write_proc(root, 10, "Isolated Web Co", ticks=3 * TICK, rss_pages=2000,
+               cmd="/nix/store/" + "a" * 32 + "-firefox-158/lib/firefox/firefox -contentproc")
+    write_proc(root, 20, "brave", ticks=50 + TICK, rss_pages=500, cmd="/opt/brave.com/brave/brave --type=renderer --lang=en")
+    write_proc(root, 40, "wakatime-cli", ticks=TICK // 2, rss_pages=5, start=int(1005 * TICK))  # born after the first reading
+    rec.reading(minute + 15, uptime=1010)
+    rec.reading(minute + 65, uptime=1060)  # the next minute: the first one is written
+
+    lines = (out / "procs" / "2026-11-02.jsonl").read_text().splitlines()
+    first = json.loads(lines[0])
+    check("one line for the finished minute", 1, len(lines))
+    check("CPU seconds of a process seen at both readings", 3.0, first["p"]["10"][0])
+    check("memory in MiB at the last reading", round(2000 * pl.PAGE / 2**20), first["p"]["10"][1])
+    check("a process born between readings counts all its CPU time", 0.5, first["p"]["40"][0])
+    check("an idle process is listed for its memory (among the 30 largest)", 0.0, first["p"]["30"][0])
+    check("a comm with spaces and parentheses is read whole", "sleepy (x) y", first["new"]["30"][0])
+    check("store hashes are shortened in command lines", "/nix/store/…-firefox-158/lib/firefox/firefox -contentproc",
+          first["new"]["10"][1])
+
+    rec.reading(minute + 125, uptime=1120)
+    second = json.loads((out / "procs" / "2026-11-02.jsonl").read_text().splitlines()[1])
+    check("a command line is written once a day", {}, second["new"])
+
+    (out / "firefox").mkdir(parents=True)
+    (out / "firefox" / "2026-11-02.jsonl").write_text(
+        json.dumps({"t": minute - 600, "parent": 1, "procs": [
+            {"pid": 10, "type": "webIsolated", "origin": "https://youtube.com", "tabs": [["YouTube Music", "https://music.youtube.com/"]]},
+        ]}) + "\n"
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pl.top(since="5m", until="2026-11-02 10:45", dir=out)
+    rows = buf.getvalue().splitlines()
+    check("busiest first", True, rows[2].split()[3] == "10")
+    check("a Firefox process shows its site and tabs from the map written before the window",
+          "firefox webIsolated https://youtube.com: YouTube Music", rows[2].split(maxsplit=4)[4])
+    check("a Brave process shows its type", "brave renderer", rows[3].split(maxsplit=4)[4])
+    check("avg is percent of one core over the recorded minutes (two of the five)", "2.5%", rows[2].split()[0])
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pl.top(since="5m", until="2026-11-02 10:45", by="name", dir=out)
+    check("--by name sums per program", "firefox", buf.getvalue().splitlines()[2].split()[-1])
+
+finish()
