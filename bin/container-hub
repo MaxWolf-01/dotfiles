@@ -127,7 +127,8 @@ question, a dialog), to one that runs in no tmux pane, or to a pane that no long
 the box sent shows at the top of the session page's turns, as the turn under way, until a render of the page shows
 it or the session ends, since the page shows a message only once its turn ends. A file pasted or dropped into the
 box is saved under the cache's `container-hub/drops/` and its path typed in its place; the session attaches an
-image's as the image.
+image's as the image. A message Claude Code did not take, though the hub pressed Enter twice, stays in its input box,
+and the box says so; its next send of the same words presses Enter there instead of typing them a second time.
 
 Beside the box, jump (ctrl+alt+g) takes you to the session's tmux pane: it moves the tmux client you typed in last to
 that pane, its tmux session and window with it, and leaves raising the terminal's window to you. Close (ctrl+alt+x, or
@@ -314,7 +315,11 @@ over the tab.
                               prompt.
     POST /api/recall          {"unit"}: bring a unit set aside back into the numbers.
     POST /api/type            {"unit", "text"}, from the hub tab with its X-Hub-Token: type the text into the unit's
-                              session and press Enter. 409 {"error": why} where nothing may be typed.
+                              session and press Enter. 409 {"error": why} where nothing may be typed; 502 {"error",
+                              "pane", "stuck": true} where it was typed, but Claude Code did not take it.
+    POST /api/enter           {"unit"}, from the hub tab with its X-Hub-Token: press Enter in the unit's session, for a
+                              text /api/type left stuck there; only where the session is idle and its input box holds
+                              something. Answers as /api/type does.
     POST /api/hand-off        {"unit", "offer", "path"?, "at"?, "behind"?}, from the hub tab with its X-Hub-Token: what the
                               unit's box offered, as /api/u/<key> gave its "handoff", "offer" the one clicked: "update" is
                               also taken where it offered to hand off. "hand-off" answers {"unit", "view", "pane", "handoff"},
@@ -2813,7 +2818,7 @@ TOKEN = ""
 open across a restart of the hub still sends."""
 PANE = re.compile(r"%\d+$")  # the registry names a pane as session:@window.%pane; the pane's id alone survives a move
 DROP_LIMIT = 200 * 2**20
-TOKENED = ("/api/type", "/api/drop", "/api/staged", "/api/hand-off", "/api/jump", "/api/close-panes", "/api/start", "/api/resume", "/api/fork",
+TOKENED = ("/api/type", "/api/enter", "/api/drop", "/api/staged", "/api/hand-off", "/api/jump", "/api/close-panes", "/api/start", "/api/resume", "/api/fork",
            "/api/release", "/api/receive")
 """The routes that want the token: each acts in a session's terminal, or saves what it is given."""
 
@@ -2980,8 +2985,30 @@ def type_into(body: dict) -> tuple[int, dict]:
         if not pane:
             return 409, {"error": why}
         if failed := paste(pane, text):
-            return 502, {"error": failed}
+            return 502, {"error": failed, "pane": pane, "stuck": isinstance(failed, NotTaken)}
     except (OSError, subprocess.TimeoutExpired) as e:  # no tmux on PATH, or a server that does not answer
+        return 502, {"error": f"tmux: {e}"}
+    return 200, {"ok": True, "pane": pane}
+
+
+def enter_into(body: dict) -> tuple[int, dict]:
+    """Press Enter in the unit's pane, for a message the hub typed there that Claude Code did not take: only where the
+    session is idle and its input box holds something, so the Enter sends that and lands on no prompt of its own."""
+    if why := elsewhere_refusal(str(body["unit"])):
+        return 409, {"error": why}
+    try:
+        pane, why = pane_of(body["unit"])
+        if not pane:
+            return 409, {"error": why}
+        with typing:
+            box = prompt_box(screen(pane))
+            if not box or box == ["❯"]:
+                return 409, {"error": f"the session's input box in tmux pane {pane} holds nothing to send", "pane": pane}
+            if not idle_in(pane):
+                return 409, {"error": "the session is no longer idle; look at its pane", "pane": pane, "stuck": True}
+            if failed := entered(pane, box[0], 1):
+                return 502, {"error": failed, "pane": pane, "stuck": isinstance(failed, NotTaken)}
+    except (OSError, subprocess.TimeoutExpired) as e:
         return 502, {"error": f"tmux: {e}"}
     return 200, {"ok": True, "pane": pane}
 
@@ -3035,17 +3062,27 @@ def pasted(pane: str, text: str) -> str:
         if images:
             settle(pane, shown)
     shows = box_until(pane, lambda box: box not in (None, before, ["❯"]))  # a box drawn only once its prompt starts too
-    typed = (prompt_box(screen(pane)) or [None])[0] if shows else None
+    return entered(pane, (prompt_box(screen(pane)) or [None])[0] if shows else None, 2)
+
+
+class NotTaken(str):
+    """Why a message the hub typed into a pane is still in Claude Code's input box: it was typed, but not sent."""
+
+
+def entered(pane: str, typed: str | None, presses: int) -> str:
+    """Press Enter in the pane until Claude Code takes the message whose box's first line is `typed`, `presses` times
+    at most, a second only while the session is still idle; why it did not, else nothing. With no `typed` to look
+    for, Enter goes once, unchecked."""
     taken = lambda box: box is None or box[0] != typed
-    for pressed in (1, 2):
+    for pressed in range(1, presses + 1):
         if (run := tmux("send-keys", "-t", pane, "Enter")).returncode != 0:
             return f"tmux send-keys into {pane}: {run.stderr.strip()}"
         if typed is None or box_until(pane, taken) or taken(prompt_box(screen(pane))):
             return ""
         if not idle_in(pane):
             break
-    return (f"typed into {pane}, but Claude Code did not take it after Enter was pressed {pressed} time(s); "
-            "press Enter in that pane")
+    return NotTaken(f"typed into tmux pane {pane}, but Claude Code did not take it after Enter was pressed {pressed} "
+                    "time(s); it waits in the session's input box")
 
 
 def box_until(pane: str, done) -> bool:
@@ -5078,7 +5115,7 @@ class Handler(BaseHTTPRequestHandler):
             if size > DROP_LIMIT:  # the relay holds a body whole, so every one it carries has the drop's limit
                 return self.send_json({"error": f"over {DROP_LIMIT // 2**20} MB; give the session its path instead"}, 413)
             body = self.rfile.read(size)
-            if asked in ("/api/type", "/api/hand-off", "/api/resume") and (why := relayed_refusal(host, body)):
+            if asked in ("/api/type", "/api/enter", "/api/hand-off", "/api/resume") and (why := relayed_refusal(host, body)):
                 return self.send_json({"error": why}, 409)
         tab = urllib.parse.urlsplit(self.origins()[0])
         headers = {"X-Forwarded-Host": tab.netloc, "X-Forwarded-Proto": tab.scheme,
@@ -5262,6 +5299,8 @@ class Handler(BaseHTTPRequestHandler):
                 code, answer = (403, {"error": "only a local tool may share"}) if self.headers.get("Origin") else share(body)
             elif path == "/api/type":
                 code, answer = type_into(body)
+            elif path == "/api/enter":
+                code, answer = enter_into(body)
             elif path == "/api/staged":
                 code, answer = staged(body)
             elif path == "/api/hand-off":
