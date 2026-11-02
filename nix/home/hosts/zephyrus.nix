@@ -58,9 +58,9 @@
     ../desktop.nix
     ../display-layout.nix
     ../dotnet.nix
-    ../helferline-mirror.nix
     ../gnome.nix
     ../greyline.nix
+    ../helferline-mirror.nix
     ../proc-load.nix
     ../proton-mail.nix
     ../sudo-touch.nix

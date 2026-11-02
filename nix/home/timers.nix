@@ -57,6 +57,10 @@ let
     bash coreutils uv jq slackdump
   ]);
 
+  slackPushPath = lib.makeBinPath (with pkgs; [
+    bash coreutils rsync openssh
+  ]);
+
   dashboardPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv openssh jq
   ]);
@@ -835,6 +839,7 @@ in
       Description = "Add new Slack messages to the local archive";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
+      OnSuccess = [ "slack-archive-push.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -854,6 +859,40 @@ in
       RandomizedDelaySec = "10m";
     };
     Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Slack archive → PC ---
+  # pc reads a copy rather than syncing its own: slackdump takes any cgroup-v2
+  # host for a container and then keys its stored login on the hostname, so a
+  # login copied from here never opens on pc. Started by each successful sync,
+  # when nothing writes the archive, so the database and its WAL travel as one.
+
+  systemd.user.services.slack-archive-push = {
+    Unit = {
+      Description = "Copy the Slack archive to pc";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${slackPushPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = pkgs.writeShellScript "slack-archive-push" ''
+        set -euo pipefail
+        src=${home}/work/helferline/slack
+        # --delete against a missing or empty archive would empty pc's copy.
+        if [ ! -s "$src/slackdump.sqlite" ]; then
+          echo "slack-archive-push: no archive at $src" >&2
+          exit 1
+        fi
+        rsync -a --delete "$src/" pc:work/helferline/slack/
+      '';
+      # oneshot has no start timeout of its own; a push hung on a dead link
+      # would hold every later one back.
+      TimeoutStartSec = "1h";
+    };
   };
 
   # --- Documents → jarvis (read-only mirror for the agent) ---
