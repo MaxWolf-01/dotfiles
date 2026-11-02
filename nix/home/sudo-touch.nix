@@ -89,9 +89,17 @@ in
     Install.WantedBy = [ "default.target" ];
   };
 
-  # %i is the uid, so the path is the unit's %t/ssh-sk-agent in any process,
-  # including one without XDG_RUNTIME_DIR.
+  # Forwarded only where SSH_SK_FORWARD names the agent, which tmux sets for
+  # every pane: max and his agents work in tmux, timers and scripts never do, so
+  # every touch request comes from a pane. Outside tmux, ssh warns that it
+  # cannot forward "$SSH_SK_FORWARD" and connects without it. A `Match exec`
+  # would say the same thing quietly, but it runs $SHELL, and an agent's shell
+  # can carry a bare `SHELL=bash`, which makes ssh refuse to connect at all.
   programs.ssh.settings = lib.mapAttrs' (_: block: lib.nameValuePair block {
-    ForwardAgent = "/run/user/%i/ssh-sk-agent";
+    ForwardAgent = "$SSH_SK_FORWARD";
   }) forwarded;
+  # tmux expands the variable when it reads its config: the unit's %t.
+  programs.tmux.extraConfig = ''
+    set-environment -g SSH_SK_FORWARD "$XDG_RUNTIME_DIR/ssh-sk-agent"
+  '';
 }
