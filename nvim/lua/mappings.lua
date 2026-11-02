@@ -294,7 +294,7 @@ map("n", "<leader>gD", ":Gitsigns diffthis HEAD<CR>", { desc = "Diff with HEAD",
 
 map("n", "<leader>gbb", function() require("blame").toggle() end, { desc = "Toggle blame panel" })
 map("n", "<leader>gbf", function() require("blame").follow() end, { desc = "Toggle blame follow: the line's commit beside the code" })
-map("n", "<leader>gbh", function() require("blame").history() end, { desc = "Line history: every commit that changed this line" })
+map("n", "<leader>gbh", function() require("blame").history() end, { desc = "Blame view on the line's history" })
 map("n", "<leader>gbl", function() require("gitsigns").blame_line { full = true } end, { desc = "Blame line: commit and its hunk" })
 
 -- ====================================================================
