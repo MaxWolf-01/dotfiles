@@ -8,6 +8,7 @@
     ../claude-token.nix
     ../common.nix
     ../container-hub.nix
+    ../helferline-mirror.nix
     ../pc-timers.nix
   ];
 

@@ -58,6 +58,7 @@
     ../desktop.nix
     ../display-layout.nix
     ../dotnet.nix
+    ../helferline-mirror.nix
     ../gnome.nix
     ../greyline.nix
     ../proton-mail.nix
