@@ -11,9 +11,9 @@
 -- has, where a scale in time would crowd most of them into one end. Every colour is read from
 -- the colorscheme's groups and follows it.
 --
--- The pane shows the line's change (its commit, message, and the hunk that touched the line) or
--- its history (every commit that changed it, `git log -L`, newest first, each with the line
--- before and after, ending where it was first written).
+-- The pane shows the change that made the line under the cursor: its commit, message, and the
+-- hunk that touched the line. `h` and `l` walk back and forth through the line's earlier
+-- changes (`git log -L`), back to the commit that first wrote it.
 --
 -- Follow mode is that pane without the view, for any file: a card beside the code that shows
 -- the line's change and follows the cursor.
@@ -185,13 +185,20 @@ local function paragraphs(c)
   return paras
 end
 
+--- Two letters for an author, from their name's words or its capitals: Maximilian Wolf → MW,
+--- MaxWolf-01 → MW, felix → FE. Their colour tells authors apart; the pane has the full name.
+local function initials(author)
+  local words = vim.split(vim.trim(author), "%s+")
+  if #words > 1 then
+    return (words[1]:sub(1, 1) .. words[#words]:sub(1, 1)):upper()
+  end
+  local caps = author:gsub("[^%u]", "")
+  return #caps >= 2 and caps:sub(1, 2) or author:sub(1, 2):upper()
+end
+
 --- Lines and highlights for the panel, one row per entry.
 local function layout(entries, commits, width)
-  local author_w, age = 0, age_hls(commits)
-  for _, e in ipairs(entries) do
-    author_w = math.max(author_w, width_of(e.commit.author or ""))
-  end
-  author_w = math.min(author_w, 16)
+  local author_w, age = 2, age_hls(commits)
   local col = 1 + DATE_W + 1 -- where the text column starts, after the bar and the date
   local text_w = width - col
 
@@ -219,7 +226,7 @@ local function layout(entries, commits, width)
     else
       local bar = author_hl(c.author)
       local date = os.date("%Y-%m-%d", c.time)
-      local author = fit(c.author, author_w)
+      local author = initials(c.author)
       author = author .. string.rep(" ", author_w - width_of(author))
       local rows = flow(paragraphs(c), text_w - author_w - 1, text_w)
       if #rows > n then -- the block's last row takes as much of what is left as fits
@@ -352,32 +359,41 @@ local function line_card(root, e)
   return lines, c.sha
 end
 
--- Line history --------------------------------------------------------------------------------
+-- Walking the line's changes --------------------------------------------------------------------
 
-local HISTORY_LINES = 3 -- removed and added lines shown per commit; the rest are counted
-
---- The commits of `git log -L` output, newest first, each with the lines its change removed (-)
---- and added (+) in the range.
+--- The commits of `git log -L` output, newest first, each with its message and the hunk of its
+--- change to the line. It ends at the commit that first wrote the line, marked `born`.
 local function parse_line_log(out)
-  local commits, cur, in_hunk = {}, nil, false
+  local commits, cur, in_msg, in_hunk = {}, nil, false, false
   for _, l in ipairs(vim.split(out, "\n", { plain = true })) do
     if l:sub(1, 1) == "\1" then
       local f = vim.split(l:sub(2), "\0", { plain = true })
-      cur = { sha = f[1], author = f[2], time = tonumber(f[3]), summary = f[4], changes = {} }
+      cur = { sha = f[1], author = f[2], time = tonumber(f[3]), message = {}, hunk = {} }
       commits[#commits + 1] = cur
-      in_hunk = false
+      in_msg, in_hunk = true, false
+    elseif cur and in_msg then
+      local text, ended = l:gsub("\2", "")
+      in_msg = ended == 0
+      if not is_trailer(text) then
+        cur.message[#cur.message + 1] = text
+      end
     elseif l:match "^diff %-%-git " then
       in_hunk = false
-    elseif l:match "^@@ " then
+    elseif cur and (in_hunk or l:match "^@@ ") then
       in_hunk = true
-    elseif cur and in_hunk and l:match "^[+-]" then
-      cur.changes[#cur.changes + 1] = l
+      cur.hunk[#cur.hunk + 1] = l
     end
   end
-  -- A change that removes nothing wrote the line; git goes on tracing the range into the lines
-  -- that stood near it before, which are another line's history.
   for i, c in ipairs(commits) do
-    if #vim.tbl_filter(function(l) return l:sub(1, 1) == "-" end, c.changes) == 0 then
+    for _, lines in ipairs { c.message, c.hunk } do
+      while lines[#lines] and vim.trim(lines[#lines]) == "" do
+        table.remove(lines)
+      end
+    end
+    -- A change that removes nothing wrote the line; past it, git traces the lines that stood
+    -- near it before, which are another line's history.
+    local removes = vim.iter(c.hunk):any(function(l) return l:sub(1, 1) == "-" end)
+    if not removes then
       c.born = true
       return vim.list_slice(commits, 1, i)
     end
@@ -385,49 +401,17 @@ local function parse_line_log(out)
   return commits
 end
 
---- The timeline's lines, highlights, and the commit each row belongs to.
-local function history_layout(commits)
-  local lines, marks, shas = {}, {}, {}
-  local age = age_hls(commits)
-  local function add(text, sha)
-    lines[#lines + 1] = text
-    shas[#lines] = sha
-    return #lines
-  end
-  for _, c in ipairs(commits) do
-    local date = os.date("%Y-%m-%d", c.time)
-    local head = date .. "  " .. c.author .. "  " .. c.summary
-    local row = add(head .. (c.born and "  (first written here)" or ""), c.sha)
-    marks[#marks + 1] = { row, 0, #date, age[c.sha] }
-    marks[#marks + 1] = { row, #date + 2, #date + 2 + #c.author, author_hl(c.author) }
-    if c.born then
-      marks[#marks + 1] = { row, #head, #lines[row], "Comment" }
-    end
-    for _, sign in ipairs { "-", "+" } do
-      local side = vim.tbl_filter(function(l) return l:sub(1, 1) == sign end, c.changes)
-      local shown = #side > HISTORY_LINES + 1 and HISTORY_LINES or #side
-      for k = 1, shown do
-        row = add("    " .. side[k], c.sha)
-        marks[#marks + 1] = { row, 4, #lines[row], sign == "+" and "Added" or "Removed" }
-      end
-      if shown < #side then
-        row = add(("    %s … %d more %s"):format(sign, #side - shown, sign == "+" and "added" or "removed"), c.sha)
-        marks[#marks + 1] = { row, 4, #lines[row], "Comment" }
-      end
-    end
-    add("", nil)
-  end
-  return lines, marks, shas
-end
-
 local histories = {} -- "sha:path:line" -> the line's commits, or { err = … }; history never changes
 local fetching -- the one `git log -L` in flight: key and process
 
---- The history of the entry's line if it is known; otherwise starts reading it, calls `done`
---- once it is in, and returns nil. A newer request stops the one before.
+local function history_key(e)
+  return table.concat({ e.commit.sha, e.commit.path, e.orig }, ":")
+end
+
+--- The changes to the entry's line, newest first, if they are known; otherwise starts reading
+--- them, calls `done` once they are in, and returns nil. A newer request stops the one before.
 local function line_history(root, e, done)
-  local c = e.commit
-  local key = table.concat({ c.sha, c.path, e.orig }, ":")
+  local key = history_key(e)
   if histories[key] then
     return histories[key]
   end
@@ -437,8 +421,8 @@ local function line_history(root, e, done)
   if fetching then
     fetching.proc:kill "sigterm"
   end
-  local range = ("-L%d,%d:%s"):format(e.orig, e.orig, c.path)
-  local cmd = { "git", "-C", root, "log", "--format=%x01%H%x00%an%x00%at%x00%s", range, c.sha }
+  local range = ("-L%d,%d:%s"):format(e.orig, e.orig, e.commit.path)
+  local cmd = { "git", "-C", root, "log", "--format=%x01%H%x00%an%x00%at%n%B%x02", range, e.commit.sha }
   local this = { key = key }
   this.proc = vim.system(cmd, { text = true }, function(r)
     vim.schedule(function()
@@ -456,13 +440,21 @@ local function line_history(root, e, done)
   return nil
 end
 
+--- A step back in the line's history as the pane shows it: commit, message, the change.
+local function step_card(c)
+  local lines = { ("%s  %s  %s"):format(c.sha:sub(1, 7), c.author, os.date("%Y-%m-%d", c.time)), "" }
+  vim.list_extend(lines, c.message)
+  lines[#lines + 1] = ""
+  return vim.list_extend(lines, c.hunk)
+end
+
 -- The blame view ------------------------------------------------------------------------------
 --
 -- Three windows: the panel left of the code, scroll- and cursor-bound to it, and the detail
 -- pane across the bottom of both. Every key works from the panel, so browsing never needs
 -- another window; the code window gets <C-j>/<C-k> too.
 
-local state -- the open view: windows, buffers, the blame, `view` (change|history), what the pane shows
+local state -- the open view: windows, buffers, the blame, the walk, what the pane shows
 local follow -- while follow mode is on: buf, and win and key while its card shows
 
 --- The blame entry under the cursor of `win`, and the blame it is from.
@@ -478,9 +470,12 @@ local function keyhint(k, label)
   return "%#Title#" .. k .. "%#Comment# " .. label .. "  "
 end
 
-local function panel_winbar()
-  return keyhint("h", state.view == "history" and "change" or "history") .. keyhint("s", "commit")
-    .. keyhint("S", "in tab") .. keyhint("^j ^k", "scroll") .. keyhint("q", "close")
+local function pane_hints()
+  if state.pinned then
+    return keyhint("⌫", "back") .. keyhint("S", "in tab") .. keyhint("^j ^k", "scroll") .. keyhint("q", "close")
+  end
+  return keyhint("h", "older") .. keyhint("l", "newer") .. keyhint("s", "whole commit") .. keyhint("S", "in tab")
+    .. keyhint("^j ^k", "scroll") .. keyhint("q", "close")
 end
 
 local function render_panel()
@@ -500,7 +495,8 @@ local function render_panel()
   for _, m in ipairs(marks) do
     api.nvim_buf_set_extmark(buf, ns, m[1] - 1, m[2], { end_col = m[3], hl_group = m[4] })
   end
-  vim.wo[state.panel_win].winbar = panel_winbar()
+  local name = vim.fn.fnamemodify(api.nvim_buf_get_name(state.base_buf), ":t")
+  vim.wo[state.panel_win].winbar = "%#Title#blame%#Comment#  " .. name:gsub("%%", "%%%%")
   return true
 end
 
@@ -511,7 +507,7 @@ local function cursor_line()
 end
 
 --- Puts a view into the detail pane, unless it already shows the one named `key`.
-local function pane_set(key, title, lines, marks, ft)
+local function pane_set(key, title, lines)
   if state.shown == key then
     return
   end
@@ -520,17 +516,12 @@ local function pane_set(key, title, lines, marks, ft)
   vim.bo[buf].modifiable = true
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  vim.bo[buf].filetype = ft
-  api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-  for _, m in ipairs(marks) do
-    api.nvim_buf_set_extmark(buf, ns, m[1] - 1, m[2], { end_col = m[3], hl_group = m[4] })
-  end
-  vim.wo[state.detail_win].winbar = "%#Title#" .. title:gsub("%%", "%%%%")
+  vim.wo[state.detail_win].winbar = "%#Title#" .. title:gsub("%%", "%%%%") .. "%=" .. pane_hints()
   api.nvim_win_set_cursor(state.detail_win, { 1, 0 })
 end
 
---- Shows the line under the cursor in the detail pane: its change or its history, or the
---- commit pinned there while the cursor stays on that commit's lines.
+--- Shows the line under the cursor in the detail pane: the change that made it, or one of its
+--- earlier changes while walking, or the commit pinned there while the cursor stays on it.
 local function pane_update()
   if not state then
     return
@@ -547,44 +538,75 @@ local function pane_update()
     end
     state.pinned = nil
   end
+  if not state.walk or state.walk.line ~= lnum or state.walk.key ~= history_key(e) then
+    state.walk = { line = lnum, key = history_key(e), step = 0 }
+  end
   if c.sha == UNCOMMITTED then
-    return pane_set("uncommitted", "line " .. lnum, { "not committed yet" }, {}, "git")
+    return pane_set("uncommitted", ("line %d"):format(lnum), { "not committed yet" })
   end
-  if state.view == "change" then
+  local step, history = state.walk.step, histories[state.walk.key]
+  local born = history and history[step + 1] and history[step + 1].born -- known once walked
+  local title = step == 0 and ("line %d: the change that made it"):format(lnum)
+    or ("line %d: %d %s back"):format(lnum, step, step == 1 and "change" or "changes")
+  if born then
+    title = title .. ", where it was first written"
+  end
+  if step == 0 then
     local lines, key = line_card(state.blame.root, e)
-    return pane_set("change:" .. key, "the change to line " .. lnum, lines, {}, "git")
+    return pane_set(("change:%s:%d:%s"):format(key, lnum, tostring(born)), title, lines)
   end
-  local key = table.concat({ "history", c.sha, e.orig }, ":")
-  local text = vim.trim(api.nvim_buf_get_lines(state.base_buf, lnum - 1, lnum, false)[1] or "")
-  local title = "history of line " .. lnum .. ":  " .. text
-  local commits = line_history(state.blame.root, e, pane_update)
-  if not commits then
-    return pane_set(key .. ":reading", title, { "reading the history…" }, {}, "blame-history")
-  elseif commits.err then
-    return pane_set(key, title, { commits.err }, {}, "blame-history")
+  pane_set(("step:%s:%d:%d"):format(state.walk.key, lnum, step), title, step_card(history[step + 1]))
+end
+
+--- Steps the pane `delta` changes back (1) or forward (-1) in the history of the line.
+local function walk(delta)
+  local lnum = cursor_line()
+  local e = state.blame.entries[lnum]
+  if not e or e.commit.sha == UNCOMMITTED or state.walk.line ~= lnum then
+    return
   end
-  local lines, marks, shas = history_layout(commits)
-  state.history_shas = shas
-  pane_set(key, title, lines, marks, "blame-history")
+  state.pinned, state.shown = nil, nil
+  local step = state.walk.step + delta
+  if step < 0 then
+    return pane_update()
+  end
+  if delta > 0 then
+    local history = line_history(state.blame.root, e, function()
+      if state and state.walk and state.walk.line == lnum and cursor_line() == lnum then
+        walk(delta)
+      end
+    end)
+    if not history then
+      vim.wo[state.detail_win].winbar = "%#Comment#reading the line's history…"
+      return
+    elseif history.err then
+      return notify(history.err, vim.log.levels.ERROR)
+    elseif step >= #history then
+      return pane_update() -- the oldest change already; the title now says so
+    end
+  end
+  state.walk.step = step
+  pane_update()
 end
 
 --- Pins commit `sha`, all of it, in the detail pane until the cursor leaves its lines.
 local function pin(sha)
   local out = git(state.blame.root, { "show", "--stat", "--patch", "--format=fuller", sha }) or ""
   state.pinned = { sha = sha, lnum = cursor_line() }
-  pane_set("commit:" .. sha, "commit " .. sha:sub(1, 7) .. "   ⌫ back", vim.split(out, "\n", { plain = true }), {}, "git")
+  pane_set("commit:" .. sha, "commit " .. sha:sub(1, 7), vim.split(out, "\n", { plain = true }))
 end
 
---- The commit to pin: in the history, the entry under the pane's cursor; else the line's.
+--- The commit the pane shows: the line's, or the one the walk stands on.
 local function commit_to_show()
-  if api.nvim_get_current_win() == state.detail_win and state.view == "history" and not state.pinned then
-    return state.history_shas and state.history_shas[api.nvim_win_get_cursor(state.detail_win)[1]]
-  end
   local e = state.blame.entries[cursor_line()]
   if not e or e.commit.sha == UNCOMMITTED then
     return notify "this line is not committed yet"
   end
-  return e.commit.sha
+  if state.pinned then
+    return state.pinned.sha
+  end
+  local history = histories[state.walk.key]
+  return state.walk.step > 0 and history[state.walk.step + 1].sha or e.commit.sha
 end
 
 local function show_commit()
@@ -612,12 +634,6 @@ end
 local function back()
   state.pinned, state.shown = nil, nil
   pane_update()
-end
-
-local function switch_view()
-  state.view = state.view == "change" and "history" or "change"
-  back()
-  vim.wo[state.panel_win].winbar = panel_winbar()
 end
 
 local function pane_scroll(keys)
@@ -745,8 +761,8 @@ function M.close()
   end
 end
 
---- Opens the blame view on the current window's file, its pane on `view` (default "change").
-function M.open(view)
+--- Opens the blame view on the current window's file.
+function M.open()
   local code_win, base_buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
   if not blame_buffer(base_buf, true) then
     return
@@ -761,7 +777,7 @@ function M.open(view)
   -- height and their rows stay level.
   local detail_buf = api.nvim_create_buf(false, true)
   pcall(api.nvim_buf_set_name, detail_buf, "blame://line")
-  vim.bo[detail_buf].bufhidden = "wipe"
+  vim.bo[detail_buf].bufhidden, vim.bo[detail_buf].filetype = "wipe", "git"
   local detail_win = api.nvim_open_win(detail_buf, false, {
     split = "below", win = -1, height = math.max(8, math.floor(vim.o.lines * 0.35)),
   })
@@ -781,7 +797,7 @@ function M.open(view)
 
   state = {
     code_win = code_win, panel_win = panel_win, detail_win = detail_win, base_buf = base_buf,
-    panel_buf = panel_buf, detail_buf = detail_buf, saved = saved, view = view or "change",
+    panel_buf = panel_buf, detail_buf = detail_buf, saved = saved,
   }
   if not render_panel() then
     return M.close()
@@ -798,7 +814,8 @@ function M.open(view)
       vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, desc = desc })
     end
     map("q", M.close, "Close blame")
-    map("h", switch_view, "Switch the pane between the line's change and its history")
+    map("h", function() walk(1) end, "The line's change before this one")
+    map("l", function() walk(-1) end, "The line's change after this one")
     map("s", show_commit, "Show the whole commit in the pane")
     map("<CR>", show_commit, "Show the whole commit in the pane")
     map("S", show_commit_in_tab, "Show the whole commit in a tab")
@@ -843,16 +860,6 @@ function M.toggle()
     M.close()
   else
     M.open()
-  end
-end
-
---- The line's history: the blame view with its pane on the history, opened if it is not.
-function M.history()
-  if not state then
-    return M.open "history"
-  end
-  if state.view ~= "history" then
-    switch_view()
   end
 end
 
