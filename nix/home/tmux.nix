@@ -22,6 +22,11 @@ let
     exec ${tmux} new-session -A -s "$1"
   '';
 
+  # What every Ghostty window runs (ghostty.nix). Tested by tests/tmux-window.test.
+  tmuxWindow = pkgs.writeShellScriptBin "tmux-window" ''
+    exec ${pkgs.bash}/bin/bash ${./tmux-window.sh} ${tmux} ${tmuxRestore}
+  '';
+
   # `tmux` on PATH is the guard in tmux-guard.sh, with the real binary behind
   # it; the script's header says what it refuses. Tested by tests/tmux-guard.test.
   tmuxGuard = lib.hiPrio (pkgs.writeShellScriptBin "tmux" ''
@@ -148,7 +153,7 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  config.home.packages = [ tms tmuxGuard ];
+  config.home.packages = [ tms tmuxGuard tmuxWindow ];
 
   # tmux puts every pane in its own tmux-spawn-<uuid>.scope, and systemd-oomd
   # relieves memory pressure by SIGKILLing one whole scope. Panes hold the
