@@ -171,6 +171,11 @@ in
         "widget.use-xdg-desktop-portal.open-uri" = 1;
         "media.eme.enabled" = true;
         "media.webspeech.synth.enabled" = false;
+        # With GNOME's toolkit-accessibility flag on, Firefox's accessibility
+        # engine kept its main process at about half a core. VibeTyper may
+        # turn that flag on, so Firefox opts out itself. VibeTyper's own logs
+        # show it never resolved the focused app this way.
+        "accessibility.force_disabled" = 1;
       };
     };
   };
