@@ -347,7 +347,7 @@ in
 
   systemd.user.services.yapit-health-report = {
     Unit = {
-      Description = "Yapit daily health report";
+      Description = "Yapit weekly health report";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
@@ -362,34 +362,9 @@ in
   };
 
   systemd.user.timers.yapit-health-report = {
-    Unit.Description = "Yapit health report (10pm daily)";
+    Unit.Description = "Yapit health report (Monday 10pm, weekly)";
     Timer = {
-      OnCalendar = "*-*-* 22:00:00";
-      Persistent = true;
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
-
-  systemd.user.services.yapit-dep-scout = {
-    Unit = {
-      Description = "Yapit dependency scout";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
-      # ${home}/bin for run-log and alert-send: the script records each run and
-      # mails what needs a person with them
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
-      ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/dep-scout.sh";
-    };
-  };
-
-  systemd.user.timers.yapit-dep-scout = {
-    Unit.Description = "Yapit dependency scout (biweekly)";
-    Timer = {
-      OnCalendar = "Mon *-*-1..7,15..21 20:00:00";
+      OnCalendar = "Mon *-*-* 22:00:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
