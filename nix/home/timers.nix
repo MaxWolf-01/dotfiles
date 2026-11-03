@@ -221,7 +221,7 @@ in
         "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${dotfiles}/backup/jarvis_backup.sh ${secrets}/backup/restic/jarvis/rsyncnet.conf";
+      ExecStart = "${dotfiles}/backup/sshfs_backup.sh ${secrets}/backup/restic/jarvis/rsyncnet.conf";
     };
   };
 
@@ -254,7 +254,7 @@ in
         "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${dotfiles}/backup/jarvis_backup.sh ${secrets}/backup/restic/jarvis/pc.conf";
+      ExecStart = "${dotfiles}/backup/sshfs_backup.sh ${secrets}/backup/restic/jarvis/pc.conf";
     };
   };
 
@@ -264,6 +264,36 @@ in
       OnCalendar = "daily";
       Persistent = true;
       RandomizedDelaySec = "40m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- yapit prod → rsync.net (dumps staged on the VPS, then via SSHFS) ---
+
+  systemd.user.services.yapit-rsyncnet = {
+    Unit = {
+      Description = "Restic backup to rsync.net (yapit prod via SSHFS)";
+      X-SwitchMethod = "keep-old";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      TimeoutStartSec = "2h";
+      Environment = [
+        "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/backup/sshfs_backup.sh ${secrets}/backup/restic/yapit/rsyncnet.conf";
+    };
+  };
+
+  systemd.user.timers.yapit-rsyncnet = {
+    Unit.Description = "Daily backup to rsync.net (yapit prod)";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
@@ -293,6 +323,7 @@ in
         "working-xmg19.service"
         "jarvis-rsyncnet.service"
         "jarvis-pc.service"
+        "yapit-rsyncnet.service"
       ];
     };
   };
