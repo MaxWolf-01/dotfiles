@@ -92,7 +92,7 @@ tailscaled from pointing the OS at it; it keeps listening on `100.100.100.100`
 and keeps answering:
 
 ```
-ssh pc host yapit-prod.tail710178.ts.net 100.100.100.100  # -> 100.124.59.34
+ssh pc host yapit-prod.tail710178.ts.net 100.100.100.100  # -> 100.64.187.19
 ssh pc host github.com 100.100.100.100                    # -> SERVFAIL
 ```
 
