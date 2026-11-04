@@ -355,8 +355,9 @@ in
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
       # ${home}/bin for run-log and alert-send: the script records each run and
-      # mails what needs a person with them
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
+      # mails what needs a person with them. mx/bin for model-runs, which the
+      # analysis agent runs under.
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/repos/github/MaxWolf-01/agents/mx/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/report.sh";
     };
   };
