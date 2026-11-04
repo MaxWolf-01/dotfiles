@@ -1,0 +1,130 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Drive bin/ratings against a scratch folder. Run it directly; no framework.
+
+The promises here: files with the same bytes are one item, whichever folders
+hold them; each file is previewed by its kind; for each item and scale the
+last line in the log is its rating and a null one clears it, and the scales
+keep apart; the server appends what the page posts and refuses what it should
+not take, including a request that names some other host; `list` prints the rated items, best first.
+"""
+
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import threading
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import bin_module, check, finish  # noqa: E402
+
+ratings = bin_module("ratings")
+
+root = Path(tempfile.mkdtemp())
+for d in ("a", "b", ".hidden"):
+    (root / d).mkdir()
+(root / "a" / "cat.png").write_bytes(b"cat")
+(root / "b" / "cat.png").write_bytes(b"cat")
+(root / "b" / "dog.gif").write_bytes(b"dog")
+(root / "b" / "clip.webm").write_bytes(b"clip")
+(root / "b" / "notes.jsonl").write_text('{"a": "größe"}\n')
+(root / "b" / "blob").write_bytes(b"\x00\x01\xff binary")
+(root / ".hidden" / "x.png").write_bytes(b"hidden")
+log = root / "ratings.jsonl"
+log.write_text("")
+
+items = ratings.scan(root, log, [])
+by_name = {it["name"]: it for it in items}
+check("one item per distinct content, hidden folders and the log left out",
+      ["blob", "cat.png", "clip.webm", "dog.gif", "notes.jsonl"], [it["name"] for it in items])
+check("an item lists every copy", ["a/cat.png", "b/cat.png"], by_name["cat.png"]["paths"])
+check("each file is previewed by its kind",
+      {"blob": "other", "cat.png": "image", "clip.webm": "video", "dog.gif": "image", "notes.jsonl": "text"},
+      {it["name"]: it["kind"] for it in items})
+check("--ext keeps only the extensions named", ["cat.png", "dog.gif"],
+      [it["name"] for it in ratings.scan(root, log, ["png", ".GIF"])])
+
+cat, dog = by_name["cat.png"]["sha"], by_name["dog.gif"]["sha"]
+ratings.append(log, cat, "digits", 3, "a/cat.png")
+ratings.append(log, cat, "digits", 8, "a/cat.png")
+ratings.append(log, dog, "digits", 5, "b/dog.gif")
+ratings.append(log, dog, "digits", None, "b/dog.gif")
+ratings.append(log, dog, "swipe", 1, "b/dog.gif")
+check("the last line holds, and a null one clears", {cat: 8}, ratings.load(log, "digits"))
+check("each scale keeps its own ratings", {dog: 1}, ratings.load(log, "swipe"))
+
+
+def serve(scale: str, hosts: set[str] = set(ratings.LOOPBACK)):
+    server = ratings.make_server(root, items, log, scale, "127.0.0.1", 0, hosts)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def status(base: str, path: str, body: dict | None = None, headers: dict | None = None) -> int:
+    data = None if body is None else json.dumps(body).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(base + path, data=data, headers=headers or {})) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+server, base = serve("digits")
+check("a posted rating is saved", 204, status(base, "/rate", {"sha": dog, "rating": 0}))
+check("and lands in the log, on its scale", {cat: 8, dog: 0}, ratings.load(log, "digits"))
+check("a rating outside 0-9 is refused", 400, status(base, "/rate", {"sha": dog, "rating": 10}))
+check("a sha the folder does not hold is refused", 400, status(base, "/rate", {"sha": "f" * 16, "rating": 1}))
+check("another site's page cannot post", 403,
+      status(base, "/rate", {"sha": dog, "rating": 9}, {"Origin": "https://example.com"}))
+check("the refused ones left the log alone", {cat: 8, dog: 0}, ratings.load(log, "digits"))
+with urllib.request.urlopen(f"{base}/file/{cat}") as r:
+    check("a file is served by its sha", b"cat", r.read())
+with urllib.request.urlopen(f"{base}/text/{by_name['notes.jsonl']['sha']}") as r:
+    check("a text file's preview is its text", '{"a": "größe"}\n', r.read().decode())
+check("an unknown sha serves nothing", 404, status(base, "/file/" + "0" * 16))
+with urllib.request.urlopen(base + "/") as r:
+    page = r.read().decode()
+check("the page carries the items and the scale", True, '"name":"clip.webm"' in page and '"scale":"digits"' in page)
+check("a request naming some other host is refused", 403, status(base, "/", headers={"Host": "rebound.example"}))
+server.shutdown()
+
+check("on loopback only loopback names pass", set(ratings.LOOPBACK), ratings.allowed_hosts("127.0.0.1"))
+server, base = serve("digits", set(ratings.LOOPBACK) | {"myhost"})
+port = server.server_address[1]
+check("a request by this machine's own name is served", 200, status(base, "/", headers={"Host": f"myhost:{port}"}))
+check("and its page may post a rating", 204, status(base, "/rate", {"sha": dog, "rating": 0},
+      {"Host": f"myhost:{port}", "Origin": f"http://myhost:{port}"}))
+check("but a page on another origin may not", 403, status(base, "/rate", {"sha": dog, "rating": 0},
+      {"Host": f"myhost:{port}", "Origin": f"http://127.0.0.1:{port}"}))
+server.shutdown()
+
+server, base = serve("swipe")
+check("swipe takes favorite, 3", 204, status(base, "/rate", {"sha": cat, "rating": 3}))
+check("and refuses 4, which it does not have", 400, status(base, "/rate", {"sha": cat, "rating": 4}))
+check("swipe ratings leave the digits alone", ({cat: 8, dog: 0}, {cat: 3, dog: 1}),
+      (ratings.load(log, "digits"), ratings.load(log, "swipe")))
+server.shutdown()
+
+
+def listed(**kw) -> str:
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        ratings.list_cmd(ratings.ListArgs(root=str(root), **kw))
+    return out.getvalue()
+
+
+check("list prints the rated ones best first", [f"8\t{root}/a/cat.png", f"0\t{root}/b/dog.gif"],
+      listed().splitlines())
+check("--min leaves out the lower ones", [cat], [r["sha"] for r in json.loads(listed(min=1, json=True))])
+check("a swipe list names its labels", [f"Favorite\t{root}/a/cat.png", f"Weak accept\t{root}/b/dog.gif"],
+      listed(scale="swipe").splitlines())
+
+finish()

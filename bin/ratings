@@ -1,0 +1,363 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro"]
+# ///
+"""Rate the files in a folder, one at a time, from the keyboard or by swiping on a phone.
+
+`serve` shows the files on a page in the browser, one after another, each
+previewed by its kind: images, video, audio, PDFs and text, and for anything
+else its name and size. A key, a tap or a swipe rates the file on screen and
+moves on. Files with the same content are one item, rated once, wherever their
+copies sit. `list` prints what was rated, best first.
+
+Two scales, chosen with --scale:
+- digits: 0 to 9, on the digit keys
+- swipe: reject (left or A), weak accept (down or S), accept (right or D), favorite (up or W); stored as 0 to 3
+
+Each scale keeps its own ratings, so a folder can be rated on both.
+
+Every rating is a line appended to a JSONL log, by default ratings.jsonl in
+the folder, so the log is the whole record:
+
+    {"sha": "<first 16 hex of the sha256>", "scale": "digits|swipe", "rating": <int> or null, "path": "<relative path>", "at": "<UTC time>"}
+
+For each sha and scale the last line holds; a null rating clears it.
+
+Examples:
+
+    ratings serve ~/Pictures/emoji --ext png gif --open
+    ratings serve ~/data/samples --scale swipe --host 0.0.0.0     # reachable from a phone on the tailnet
+    ratings list ~/Pictures/emoji --min 8
+    ratings list ~/data/samples --scale swipe --min 2 --json | jq -r '.[].paths[0]'
+"""
+
+import codecs
+import hashlib
+import json
+import mimetypes
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Annotated, Literal
+
+import tyro
+from tyro.extras import SubcommandApp
+
+app = SubcommandApp()
+
+TEMPLATE = Path(__file__).resolve().parent / "ratings.html"
+LOG_NAME = "ratings.jsonl"
+TEXT_PREVIEW_BYTES = 200_000
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+# A scale is data: what each value is called, the keys that give it, and for a
+# swipe the way the card flies off. The page draws itself from this.
+SCALES = {
+    "digits": [{"value": d, "label": str(d), "keys": [str(d)],
+                "hint": {0: "Trash", 1: "The worst still worth keeping", 9: "Must have"}.get(d, "")}
+               for d in range(10)],
+    "swipe": [
+        {"value": 0, "label": "Reject", "keys": ["ArrowLeft", "a"], "fly": "left"},
+        {"value": 1, "label": "Weak accept", "keys": ["ArrowDown", "s"], "fly": "down"},
+        {"value": 2, "label": "Accept", "keys": ["ArrowRight", "d"], "fly": "right"},
+        {"value": 3, "label": "Favorite", "keys": ["ArrowUp", "w"], "fly": "up"},
+    ],
+}
+Scale = Literal["digits", "swipe"]
+
+
+# ---------------------------------------------------------------- the data
+
+def kind(path: Path) -> str:
+    """How the page previews a file: image, video, audio, pdf, text or other.
+
+    The name decides where it can; a file whose name says nothing is text when
+    its first 4 KB decode as UTF-8 and hold no NUL byte.
+    """
+    mime = mimetypes.guess_type(path.name)[0] or ""
+    top = mime.split("/")[0]
+    if top in ("image", "video", "audio"):
+        return top
+    if mime == "application/pdf":
+        return "pdf"
+    if top == "text" or mime in ("application/json", "application/xml", "application/javascript"):
+        return "text"
+    with path.open("rb") as f:
+        head = f.read(4096)
+    try:
+        # final=False: a multi-byte character cut off at 4 KB is not an error
+        codecs.getincrementaldecoder("utf-8")().decode(head, final=False)
+    except UnicodeDecodeError:
+        return "other"
+    return "other" if b"\0" in head else "text"
+
+
+def scan(root: Path, log: Path, exts: list[str]) -> list[dict]:
+    """Every file under root, one item per distinct content, in name order.
+
+    Hidden directories and the log itself are left out, and so is any file
+    whose extension is not in exts when exts names some. An item lists every
+    path its content sits at, relative to root, so a file copied into five
+    folders is rated once.
+    """
+    wanted = {e.lower().lstrip(".") for e in exts}
+    files = sorted(
+        (p for p in root.rglob("*")
+         if p.is_file() and p != log
+         and not any(part.startswith(".") for part in p.relative_to(root).parts)
+         and (not wanted or p.suffix.lower().lstrip(".") in wanted)),
+        key=lambda p: (p.name.lower(), str(p)),
+    )
+    by_sha: dict[str, dict] = {}
+    for p in files:
+        with p.open("rb") as f:
+            sha = hashlib.file_digest(f, "sha256").hexdigest()[:16]
+        item = by_sha.setdefault(sha, {"sha": sha, "name": p.name, "kind": kind(p),
+                                       "bytes": p.stat().st_size, "paths": []})
+        item["paths"].append(str(p.relative_to(root)))
+    return list(by_sha.values())
+
+
+def load(log: Path, scale: str) -> dict[str, int]:
+    """The rating each sha holds on a scale now: its last line there, gone when that line clears it."""
+    ratings: dict[str, int] = {}
+    if not log.exists():
+        return ratings
+    for n, line in enumerate(log.read_text().splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+            sha, rating, on = entry["sha"], entry["rating"], entry["scale"]
+        except (ValueError, KeyError, TypeError):
+            sys.exit(f"ratings: {log}:{n} is not a rating line: {line[:80]}")
+        if on != scale:
+            continue
+        if rating is None:
+            ratings.pop(sha, None)
+        else:
+            ratings[sha] = rating
+    return ratings
+
+
+def valid(rating, scale: str) -> bool:
+    return rating is None or (type(rating) is int and rating in {v["value"] for v in SCALES[scale]})
+
+
+def append(log: Path, sha: str, scale: str, rating: int | None, path: str) -> None:
+    """One line, written in one call, so a crash leaves at most a line short rather than a line torn."""
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with log.open("a") as f:
+        f.write(json.dumps({"sha": sha, "scale": scale, "rating": rating, "path": path, "at": at}) + "\n")
+
+
+def log_path(root: Path, log: str) -> Path:
+    return Path(log).expanduser().resolve() if log else root / LOG_NAME
+
+
+# ---------------------------------------------------------------- serve
+
+@dataclass
+class ServeArgs:
+    root: Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="FOLDER")]
+    """The folder to rate. Every file under it is included, hidden directories aside."""
+    scale: Scale = "digits"
+    """digits: 0 to 9 on the digit keys. swipe: reject (left or A), weak accept (down or S), accept (right or D), favorite (up or W)."""
+    ext: list[str] = field(default_factory=list)
+    """Only files with these extensions, e.g. --ext png gif. All files when none are named."""
+    log: str = ""
+    """The JSONL file the ratings are appended to. Defaults to ratings.jsonl in the folder."""
+    host: str = "127.0.0.1"
+    """Address to listen on. 0.0.0.0 or this machine's tailnet address lets a phone on the tailnet reach the page, by this machine's name or address."""
+    port: int = 8790
+    """Port to listen on. 0 takes any free one."""
+    open: bool = False
+    """Open the page in the browser (xdg-open)."""
+
+
+@app.command(name="serve")
+def serve_cmd(args: ServeArgs) -> None:
+    """Serve the rating page until Ctrl-C.
+
+    Keys on the page besides the scale's own: [ and ] step back and forward
+    (and so do left and right on the digits scale), n jumps to the next
+    unrated item, backspace clears a rating, and ? shows the keys.
+    """
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
+        sys.exit(f"ratings: {root} is not a directory")
+    if not TEMPLATE.exists():
+        sys.exit(f"ratings: the page template is missing at {TEMPLATE}")
+    log = log_path(root, args.log)
+    print(f"ratings: reading {root}", file=sys.stderr)
+    items = scan(root, log, args.ext)
+    if not items:
+        sys.exit(f"ratings: no files under {root}" + (f" ending in {', '.join(args.ext)}" if args.ext else ""))
+    hosts = allowed_hosts(args.host)
+    server = make_server(root, items, log, args.scale, args.host, args.port, hosts)
+    port = server.server_address[1]
+    names = sorted(h for h in hosts if h not in LOOPBACK) or ["127.0.0.1"]
+    print(f"ratings: {len(items)} items on the {args.scale} scale at "
+          + "  ".join(f"http://{h}:{port}/" for h in names) + "  (Ctrl-C stops)", file=sys.stderr)
+    if args.open:
+        subprocess.Popen(["xdg-open", f"http://127.0.0.1:{port}/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def allowed_hosts(bind: str) -> set[str]:
+    """The names a request may address this server by.
+
+    Listening beyond loopback adds this machine's own names: its hostname, its
+    tailnet name and addresses, and the address it listens on. Nothing else
+    passes, which is what stops a web page that points a name of its own at
+    this machine (DNS rebinding) from reading the files or writing ratings.
+    """
+    hosts = set(LOOPBACK)
+    if bind in LOOPBACK:
+        return hosts
+    hosts |= {socket.gethostname().lower()}
+    if bind != "0.0.0.0":
+        hosts.add(bind)
+    try:
+        status = json.loads(subprocess.run(["tailscale", "status", "--json"], capture_output=True,
+                                           text=True, timeout=5).stdout)
+        me = status["Self"]
+        hosts |= {me["DNSName"].rstrip(".").lower(), *me.get("TailscaleIPs", [])}
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass   # no tailscale here: the hostname and the bind address still work
+    return hosts
+
+
+def make_server(root: Path, items: list[dict], log: Path, scale: str, host: str, port: int,
+                hosts: set[str] = set(LOOPBACK)) -> ThreadingHTTPServer:
+    """The server for one folder on one scale, bound but not yet serving."""
+    by_sha = {item["sha"]: item for item in items}
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def addressed(self) -> str | None:
+            """The Host this request names, when it is one of this machine's own."""
+            name = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+            return self.headers.get("Host") if name in hosts else None
+
+        def do_GET(self):
+            if not self.addressed():
+                return self.reply(403, b"forbidden")
+            path = self.path.split("?")[0]
+            if path == "/":
+                page = TEMPLATE.read_text().replace("/*DATA*/null", inline(
+                    {"items": items, "ratings": load(log, scale), "root": root.name,
+                     "scale": scale, "values": SCALES[scale]}))
+                return self.reply(200, page.encode(), "text/html; charset=utf-8")
+            route, _, sha = path.lstrip("/").partition("/")
+            # Only a sha the scan found resolves, so the folder stays the boundary.
+            item = by_sha.get(sha)
+            if route not in ("file", "text") or item is None:
+                return self.reply(404, b"not found")
+            file = root / item["paths"][0]
+            if route == "text":
+                with file.open("rb") as f:
+                    head = f.read(TEXT_PREVIEW_BYTES)
+                return self.reply(200, head.decode("utf-8", errors="replace").encode(),
+                                  "text/plain; charset=utf-8")
+            self.send_file(file)
+
+        def send_file(self, file: Path) -> None:
+            """Streamed rather than read whole: a file here may be a video of several GB."""
+            self.send_response(200)
+            self.send_header("Content-Type", mimetypes.guess_type(file.name)[0] or "application/octet-stream")
+            self.send_header("Content-Length", str(file.stat().st_size))
+            self.send_header("Cache-Control", "max-age=86400")   # a sha's bytes never change
+            self.end_headers()
+            with file.open("rb") as f:
+                try:
+                    shutil.copyfileobj(f, self.wfile)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass   # the page moved on before the file finished
+
+        def do_POST(self):
+            addressed = self.addressed()
+            if not addressed or self.path != "/rate" or self.headers.get("Origin") not in (None, f"http://{addressed}"):
+                self.close_connection = True   # the unread body is not the next request
+                return self.reply(403, b"forbidden")
+            try:
+                ask = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+                sha, rating = ask["sha"], ask["rating"]
+            except (ValueError, KeyError, TypeError):
+                return self.reply(400, b"a rating is {sha, rating}")
+            if sha not in by_sha or not valid(rating, scale):
+                return self.reply(400, f"unknown sha, or a rating the {scale} scale does not have".encode())
+            with lock:
+                append(log, sha, scale, rating, by_sha[sha]["paths"][0])
+            self.reply(204, b"")
+
+        def reply(self, code: int, body: bytes, ctype: str = "text/plain") -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def inline(data) -> str:
+    """JSON safe inside a script element: a file name may contain `</script>`."""
+    return json.dumps(data, separators=(",", ":")).replace("</", "<\\/").replace("<!--", "<\\u0021--")
+
+
+# ---------------------------------------------------------------- list
+
+@dataclass
+class ListArgs:
+    root: Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="FOLDER")]
+    """The folder that was rated."""
+    scale: Scale = "digits"
+    """The scale whose ratings to print."""
+    ext: list[str] = field(default_factory=list)
+    """Only files with these extensions, as for serve."""
+    log: str = ""
+    """The JSONL file of ratings. Defaults to ratings.jsonl in the folder."""
+    min: int = 0
+    """Only items rated at least this (on swipe: 0 reject, 1 weak accept, 2 accept, 3 favorite)."""
+    json: bool = False
+    """Emit JSON to stdout: [{"sha": str, "rating": int, "label": str, "paths": [absolute path, ...]}], best first."""
+
+
+@app.command(name="list")
+def list_cmd(args: ListArgs) -> None:
+    """Print the rated items, best first: the rating's label, a tab, then the item's first path.
+
+    An item whose files are all gone from the folder is left out.
+    """
+    root = Path(args.root).expanduser().resolve()
+    log = log_path(root, args.log)
+    ratings = load(log, args.scale)
+    labels = {v["value"]: v["label"] for v in SCALES[args.scale]}
+    rows = sorted(
+        ({"sha": it["sha"], "rating": ratings[it["sha"]], "label": labels[ratings[it["sha"]]],
+          "paths": [str(root / p) for p in it["paths"]]}
+         for it in scan(root, log, args.ext) if ratings.get(it["sha"], -1) >= args.min),
+        key=lambda r: (-r["rating"], Path(r["paths"][0]).name.lower()))
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        print(f"{r['label']}\t{r['paths'][0]}")
+
+
+if __name__ == "__main__":
+    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))
