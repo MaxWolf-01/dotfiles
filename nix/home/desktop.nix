@@ -45,6 +45,11 @@ in
   home.packages = with pkgs; [
     bitwarden-cli # bw
     dconf2nix
+    # Ubuntu's AppArmor profile for /usr/bin/notify-send lets it call only Notify
+    # and GetServerInformation: it cannot ask whether the server has actions, so
+    # it drops every --action, and `notify`'s button never shows. This one, ahead
+    # of /usr/bin on PATH, runs unconfined.
+    libnotify
     loupe
     obsidian
     qdirstat
