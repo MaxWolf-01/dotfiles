@@ -32,6 +32,9 @@ per post owner, `saved.tsv` (the post list) and `ledger.tsv` (every attempt).
    A run stops on the first refusal. Moving to another Mullvad node after a
    refusal is for max to decide.
 5. **Report the residue.** An `unavailable` post is private or deleted, and a
-   logged-out fetch never gets it. An `error` with a `rsrc.php/null.jpg` URL
-   is a placeholder that fails on every retry. Count both from the ledger
-   (`--help` has the queries).
+   logged-out fetch never gets it. pc's daily `instagram-saves` timer requests
+   those logged in as the account that saved them, a few a day, using the
+   sessions in the archive's `sessions/` (`instagram-saves --help` says how one
+   is made). A new export's unavailable posts join that queue on their own. An
+   `error` with a `rsrc.php/null.jpg` URL is a placeholder that fails on every
+   retry. Count both from the ledger (`--help` has the queries).
