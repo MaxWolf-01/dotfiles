@@ -26,6 +26,8 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import zipfile
+import zlib
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -41,10 +43,12 @@ create table jid_map (lid_row_id integer primary key, jid_row_id integer);
 create table lid_display_name (lid_row_id integer primary key, display_name text);
 create table chat (_id integer primary key, jid_row_id integer, subject text);
 create table message (_id integer primary key, chat_row_id integer, from_me integer, sender_jid_row_id integer,
-                      timestamp integer, message_type integer, text_data text, sort_id integer);
-create table message_media (message_row_id integer primary key, raw_transcription_text text);
+                      timestamp integer, message_type integer, text_data text, sort_id integer, key_id text);
+create table message_media (message_row_id integer primary key, raw_transcription_text text, chat_row_id integer,
+                            file_path text);
 create table message_quoted (message_row_id integer primary key, from_me integer, sender_jid_row_id integer,
-                             message_type integer, text_data text);
+                             message_type integer, text_data text, chat_row_id integer,
+                             parent_message_chat_row_id integer, key_id text);
 """
 
 
@@ -93,9 +97,11 @@ def fixture() -> sqlite3.Connection:
         (15, 101, 0, None, ms("2026-08-01T10:00"), 0, "ben's dm", 15),
         (16, 104, 0, None, ms("2026-07-01T10:00"), 0, "cleo's dm", 16),
     ]
-    db.executemany("insert into message values (?, ?, ?, ?, ?, ?, ?, ?)", messages)
-    db.execute("insert into message_media values (4, 'what was said')")
-    db.execute("insert into message_quoted values (13, 0, 11, 0, 'from ben, quoted')")
+    db.executemany("""insert into message (_id, chat_row_id, from_me, sender_jid_row_id, timestamp, message_type,
+                      text_data, sort_id, key_id) values (?, ?, ?, ?, ?, ?, ?, ?, 'K' || ?1)""", messages)
+    db.execute("insert into message_media (message_row_id, raw_transcription_text) values (4, 'what was said')")
+    db.execute("""insert into message_quoted (message_row_id, from_me, sender_jid_row_id, message_type, text_data, key_id)
+                  values (13, 0, 11, 0, 'from ben, quoted', 'K11')""")
     return db
 
 
@@ -191,6 +197,116 @@ check(
     out.splitlines(),
 )
 
+# --- merging the increments
+# An increment is built here as the phone writes one: a zip of header.json, whole table rows as JSON, and the messages
+# as length-delimited history-sync protobufs, with the field numbers whatsmeow's waproto.proto gives them.
+
+
+def varint(n: int) -> bytes:
+    out = b""
+    while n > 0x7F:
+        out, n = out + bytes([n & 0x7F | 0x80]), n >> 7
+    return out + bytes([n])
+
+
+def pb(*pairs) -> bytes:
+    """A protobuf message of (field number, value) pairs: an int as a varint, a str or bytes length-delimited."""
+    out = b""
+    for number, value in pairs:
+        if isinstance(value, int):
+            out += varint(number << 3) + varint(value)
+        else:
+            value = value.encode() if isinstance(value, str) else value
+            out += varint(number << 3 | 2) + varint(len(value)) + value
+    return out
+
+
+def sent(row: int, key: str, at: str, message: bytes | None = None, from_me: int = 0, sender: str | None = None,
+         stub: int | None = None, path: str | None = None) -> bytes:
+    """A HistorySyncMsg: a WebMessageInfo and the message row it is."""
+    info = [(1, pb((2, from_me), (3, key))), (3, ms(at) // 1000)]
+    info += [(2, message)] if message is not None else []
+    info += [(5, sender)] if sender else []
+    info += [(24, stub)] if stub else []
+    info += [(38, pb((1, path)))] if path else []
+    return pb((1, pb(*info)), (2, row))
+
+
+def increment(chats: dict[str, list[bytes]], rows: dict[str, list[dict]] = {}, deleted: list[int] = []) -> bytes:
+    sync = pb((1, 2), *((2, pb((1, jid), *((2, m) for m in messages))) for jid, messages in chats.items()))
+    files = {"messages.bin": varint(len(sync)) + sync, "deletedMessages_1.json": json.dumps({"deleted_ids": deleted})}
+    entities = []
+    for table, changed in rows.items():
+        files[f"{table}_modified_1.json"] = json.dumps({table: changed})
+        entities.append({"table_name": table, "table_id_field": "_id", "deleted_id_files": [],
+                         "modified_entity_files": [f"{table}_modified_1.json"]})
+    files["header.json"] = json.dumps({
+        "entities": {"some": entities},
+        "added_messages": {"filename": "messages.bin"},
+        "deleted_messages": {"deleted_message_ids_files": ["deletedMessages_1.json"]},
+    })
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+ANNA, GROUP = "436601111111@s.whatsapp.net", "120363000000000001@g.us"
+text = lambda t: pb((1, t))  # noqa: E731
+first_increment = increment(
+    {
+        ANNA: [
+            sent(6, "K6", "2026-10-06T09:00", text("a new one")),
+            # Message 3 again, as content the merge does not know.
+            sent(3, "K3", "2026-10-03T09:00", pb((83, pb((1, 1))))),
+            # An edit of message 1, sent later than it.
+            sent(1, "K1", "2026-10-07T09:00", pb((12, pb((2, 14), (14, text("first line, edited")))))),
+        ],
+        GROUP: [
+            # Dan replies to max's own "agreed", naming max by a jid the database does not hold.
+            sent(17, "K17", "2026-10-08T10:00", pb((6, pb((1, "to you"), (17, pb(
+                (1, "K13"), (2, "436609999999@s.whatsapp.net"), (3, text("agreed"))))))), sender="900000000000004@lid"),
+            sent(18, "K18", "2026-10-08T10:01", pb((3, pb((3, "a photo")))), from_me=1),
+        ],
+    },
+    rows={"chat": [{"_id": 102, "jid_row_id": 20, "subject": "Hikers Tyrol"}], "a_table_newer_than_the_backup": [{"_id": 1}]},
+    deleted=[2],
+)
+second_increment = increment({ANNA: [
+    sent(6, "K6", "2026-10-06T09:00", stub=1),
+    sent(19, "K19", "2026-10-09T09:00", pb((8, pb((6, 1)))), path="Media/WhatsApp Voice Notes/202641/PTT-1.opus"),
+]})
+db.commit()
+merged = sqlite3.connect(":memory:")
+merged.deserialize(wc.merged(db.serialize(), [first_increment, second_increment]))
+merged_names = wc.Names(merged, book)
+out, _, _ = run(wc.print_chat, merged, merged_names, wc.pick_chat(merged, merged_names, "anna"), 0, None)
+check(
+    "increments merged in turn: a message added, an edit at the edited message's time, one deleted, one deleted for "
+    "everyone after an earlier increment added it, a voice note, and one held as content the merge does not know keeps "
+    "what the full backup said it was",
+    [
+        "[2026-10-01 09:00] Anna: first line, edited",
+        "[2026-10-03 09:00] Anna: [image] a caption",
+        "[2026-10-04 09:00] Anna: [audio] what was said",
+        "[2026-10-05 09:00] Anna: [type 99]",
+        "[2026-10-06 09:00] Anna: [deleted]",
+        "[2026-10-09 09:00] Anna: [audio]",
+    ],
+    out.splitlines(),
+)
+check("a voice note's file path is where the mirror holds it", "Media/WhatsApp Voice Notes/202641/PTT-1.opus",
+      merged.execute("select file_path from message_media where message_row_id = 19").fetchone()[0])
+out, _, _ = run(wc.print_chat, merged, merged_names, wc.pick_chat(merged, merged_names, "102"), 2, None)
+check(
+    "a changed chat row renames the group, and a reply to max's own message names him as me",
+    ["Hikers Tyrol",
+     '[2026-10-08 10:00] +49∙∙∙∙∙∙∙∙44 (replying to me: "agreed"): to you',
+     "[2026-10-08 10:01] me: [image] a photo"],
+    [merged_names(20), *out.splitlines()],
+)
+
 # --- --since
 check("an age counts back from now", True, abs((datetime.now() - wc.since("2h")).total_seconds() - 7200) < 5)
 check("a date is its midnight", datetime(2026, 10, 1), wc.since("2026-10-01"))
@@ -201,6 +317,7 @@ check("anything else is refused", 1, code)
 # A copy of the fixture stands in for a decrypted backup, and the phone's answer is set per run.
 scratch = Path(tempfile.mkdtemp())
 wc.CACHE, wc.MIRROR = scratch / "cache", scratch / "data/whatsapp"
+wc.INCREMENTS = wc.CACHE / "increments"
 wc.CACHE.mkdir()
 (wc.CACHE / "contacts.json").write_text(json.dumps([{"name": "Anna", "number": "+43 660 1111111"}]))
 calls = scratch / "run-log.calls"
@@ -209,21 +326,20 @@ wc.RUN_LOG.write_text(f'#!/usr/bin/env bash\necho "$*" >> {calls}\n')
 wc.RUN_LOG.chmod(0o755)
 decrypted = []
 voice_notes_missed = None
+# What each cached file decrypts to.
+plaintext = {wc.BACKUP: db.serialize(), "msgstore-increment-1.db.crypt15": first_increment,
+             "msgstore-increment-2.db.crypt15": second_increment, "msgstore-increment-3.db.crypt15": second_increment}
 
 
-def decrypt(backup: Path, plain: Path, stamp: int) -> None:
-    decrypted.append(backup)
-    db.commit()  # the backup API waits forever on the fixture's own open transaction
-    out = sqlite3.connect(scratch / "plain.db")
-    db.backup(out)
-    out.close()
-    wc.replace(plain, (scratch / "plain.db").read_bytes(), stamp)
+def decrypt(backup: Path, key: str) -> bytes:
+    decrypted.append(backup.name)
+    return zlib.compress(plaintext[backup.name])
 
 
 def mirror_run(phone: str | None, away: bool = True) -> tuple[str, int | None]:
     """One `mirror --record` run, the backup copied where phone is None, else not for that reason, the phone away or
     answering: what it logged, and its exit code."""
-    wc.decrypt, wc.pull = decrypt, lambda: phone and wc.Missed(phone, away)
+    wc.decrypt, wc.backup_key, wc.pull = decrypt, lambda: "key", lambda: phone and wc.Missed(phone, away)
     wc.pull_voice_notes = lambda: voice_notes_missed
     calls.unlink(missing_ok=True)
     _, _, code = run(wc.mirror, True)
@@ -259,6 +375,47 @@ os.utime(backup, ns=(1_790_000_100_000_000_000,) * 2)
 logged, _ = mirror_run(None)
 check("a newer backup is decrypted again", (True, 2, 1_790_000_100_000_000_000),
       (json.loads(logged.split("--stats ", 1)[1])["decrypted"], len(decrypted), plain.stat().st_mtime_ns))
+
+
+def cache_increment(n: int, mtime_ns: int) -> None:
+    step = wc.INCREMENTS / f"msgstore-increment-{n}.db.crypt15"
+    step.write_bytes(b"encrypted")
+    os.utime(step, ns=(mtime_ns,) * 2)
+
+
+def messages_mirrored() -> int:
+    mirrored = sqlite3.connect(f"file:{plain}?mode=ro", uri=True)
+    try:
+        return mirrored.execute("select count(*) from message").fetchone()[0]
+    finally:
+        mirrored.close()
+
+
+wc.INCREMENTS.mkdir()
+decrypted.clear()
+cache_increment(1, 1_790_000_200_000_000_000)
+logged, _ = mirror_run(None)
+stats = json.loads(logged.split("--stats ", 1)[1])
+check("an increment newer than the full backup is merged into the mirror, which carries the increment's mtime",
+      (True, 1, [wc.BACKUP, "msgstore-increment-1.db.crypt15"], 1_790_000_200_000_000_000, 14),
+      (stats["decrypted"], stats["increments"], decrypted, plain.stat().st_mtime_ns, messages_mirrored()))
+before = [(f.stat().st_ino, f.stat().st_mtime_ns) for f in (plain, named)]
+logged, _ = mirror_run(None)
+check("a run with no new increment decrypts nothing and rewrites nothing",
+      (False, 2, before), (json.loads(logged.split("--stats ", 1)[1])["decrypted"], len(decrypted),
+                           [(f.stat().st_ino, f.stat().st_mtime_ns) for f in (plain, named)]))
+cache_increment(3, 1_790_000_400_000_000_000)
+logged, _ = mirror_run(None)
+check("an increment after a missing one is not read", (False, 1),
+      (json.loads(logged.split("--stats ", 1)[1])["decrypted"], json.loads(logged.split("--stats ", 1)[1])["increments"]))
+cache_increment(2, 1_790_000_300_000_000_000)
+logged, _ = mirror_run(None)
+check("once the one missing comes, both are read, in order", (3, 1_790_000_400_000_000_000, 15),
+      (json.loads(logged.split("--stats ", 1)[1])["increments"], plain.stat().st_mtime_ns, messages_mirrored()))
+os.utime(backup, ns=(1_790_000_500_000_000_000,) * 2)
+logged, _ = mirror_run(None)
+check("a full backup newer than the cached increments is read alone", (0, 1_790_000_500_000_000_000, 12),
+      (json.loads(logged.split("--stats ", 1)[1])["increments"], plain.stat().st_mtime_ns, messages_mirrored()))
 voice_notes = wc.MIRROR / wc.VOICE_NOTES / "202645"
 voice_notes.mkdir(parents=True)
 (voice_notes / "PTT-20261103-WA0020.opus").write_bytes(b"opus")
@@ -285,18 +442,30 @@ def broken(*_) -> None:
     raise ValueError("the backup is truncated")
 
 
-for stub, reason, what in (
-        (refused, "whatsapp-chat: could not decrypt the backup key /k: Failed to get the data key no identity matched",
+for name, stub, reason, what in (
+        ("backup_key", refused, "whatsapp-chat: could not decrypt the backup key /k: Failed to get the data key no identity matched",
          "a key sops cannot open is a fail, sops' words on one line"),
-        (broken, "ValueError: the backup is truncated", "a backup that breaks in decryption is a fail naming the error")):
+        ("decrypt", broken, "ValueError: the backup is truncated", "a backup that breaks in decryption is a fail naming the error")):
     os.utime(backup, ns=(backup.stat().st_mtime_ns + 1,) * 2)
     calls.unlink(missing_ok=True)
-    wc.decrypt, wc.pull = stub, lambda: None
+    wc.decrypt, wc.backup_key, wc.pull = decrypt, lambda: "key", lambda: None
+    setattr(wc, name, stub)
     try:
         _, _, code = run(wc.mirror, True)
     except ValueError:
         code = 1
     check(f"{what}, and exits non-zero", (f"whatsapp-mirror fail --reason {reason}", 1), (calls.read_text().strip(), code))
+
+
+def unmergeable():
+    raise ValueError("an increment names a chat the database lacks: 999@g.us")
+
+
+wc.update = unmergeable
+sys.argv = ["whatsapp-chat", "list", "--offline"]
+out, err, code = run(wc.main)
+check("list reads the mirror as it was when it cannot be brought up to date, and says why",
+      (None, True, True), (code, "Anna" in out, "999@g.us" in err))
 shutil.rmtree(scratch)
 
 finish()

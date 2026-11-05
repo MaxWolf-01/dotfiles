@@ -771,8 +771,9 @@ in
   };
 
   # --- WhatsApp backup → ~/data/whatsapp ---
-  # The phone's newest full backup, decrypted on the laptop, for whatsapp-chat and
-  # lifelog's whatsapp view; jarvis-sync ships it. What a run does: `whatsapp-chat --help`.
+  # The phone's newest full backup and the daily increments since, decrypted and
+  # merged on the laptop, for whatsapp-chat and lifelog's whatsapp view; jarvis-sync
+  # ships it. What a run does: `whatsapp-chat --help`.
   # Hourly, ahead of jarvis-sync's :05: WhatsApp backs up once a day, and a run with
   # nothing new copies and writes nothing.
 
