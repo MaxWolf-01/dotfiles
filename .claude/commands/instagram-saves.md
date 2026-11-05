@@ -1,5 +1,6 @@
 ---
 description: Download the saved posts of a new Instagram export into pc's archive. Use when max has a new Instagram "Download your information" export, or asks to fetch his saved Instagram posts.
+disable-model-invocation: true
 ---
 
 `secrets/scripts/instagram-saves` does the work; `instagram-saves --help` and
@@ -9,7 +10,7 @@ per post owner, `saved.tsv` (the post list) and `ledger.tsv` (every attempt).
 
 1. **Collect the export.** It has to be in JSON format, one zip per account.
    Exports live in `~/Documents/lifelog/raw/instagram/` on zephylux, beside the
-   older ones.
+   older ones. A fresh one is most likely still in `~/Downloads`: move it there.
 2. **Rebuild the post list** from every export there, the old ones too:
    `instagram-saves list ~/Documents/lifelog/raw/instagram/*.zip`, copied over
    pc's `saved.tsv`. The ledger already settles every post an older export
