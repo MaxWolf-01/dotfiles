@@ -89,6 +89,12 @@ let
     bash coreutils uv sops jq
   ]);
 
+  # google-health-collect sops-decrypts its OAuth client and refresh token, and is
+  # a uv script; jq for bin/run-log.
+  googleHealthPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv sops jq
+  ]);
+
   # with-secrets runs sops exec-env for the WakaTime app's id and secret, which
   # renew wakatime-sync's token; jq for bin/run-log.
   wakatimePath = lib.makeBinPath (with pkgs; [
@@ -659,6 +665,39 @@ in
     Timer = {
       # Ten to, in hours neither calendar-collect nor jku-collect takes.
       OnCalendar = "08,20:50:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Google Health → google-health.duckdb ---
+  # The watch's data from the Google Health API, every type at native grain. What a
+  # run reads and replaces: secrets/scripts/google-health-collect --help.
+
+  systemd.user.services.google-health-collect = {
+    Unit = {
+      Description = "Read the watch's data from the Google Health API into the lifelog store";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${googleHealthPath}"
+      ];
+      ExecStart = "${secrets}/scripts/google-health-collect fetch";
+      # Three days are about 140 requests, a minute at the API's pace; a fetch after
+      # the laptop was off for weeks reads every day since, some minutes more.
+      TimeoutStartSec = "1h";
+      Nice = 10;
+    };
+  };
+
+  systemd.user.timers.google-health-collect = {
+    Unit.Description = "Google Health collection (hourly)";
+    Timer = {
+      # Done ahead of jarvis-sync's :35, which ships the store.
+      OnCalendar = "*:32:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
