@@ -92,10 +92,13 @@ in
   # Forwarded only where SSH_SK_FORWARD names the agent, which every
   # interactive zsh sets (.zshrc, read by no other shell): a touch request comes
   # from a terminal max or his agents type in, never from a timer or a script
-  # started outside one. Elsewhere ssh warns that it cannot forward
-  # "$SSH_SK_FORWARD" and connects without it. A `Match exec` would say the
-  # same thing quietly, but it runs $SHELL, and an agent's shell can carry a
-  # bare `SHELL=bash`, which makes ssh refuse to connect at all.
+  # started outside one. Where it is unset, ssh connects without forwarding.
+  # ssh warns 'Cannot forward agent socket path "$SSH_SK_FORWARD"' on every
+  # connection, set or not: it checks that the socket exists before it reads the
+  # variable, an OpenSSH bug. The braced ${SSH_SK_FORWARD} passes that check
+  # but makes ssh refuse to connect where the variable is unset. A `Match exec`
+  # would test for the variable, but it runs $SHELL, and an agent's shell can
+  # carry a bare `SHELL=bash`, which makes ssh refuse to connect at all.
   programs.ssh.settings = lib.mapAttrs' (_: block: lib.nameValuePair block {
     ForwardAgent = "$SSH_SK_FORWARD";
   }) forwarded;
