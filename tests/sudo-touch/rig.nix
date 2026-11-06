@@ -1,6 +1,7 @@
 # What tests/sudo-touch/agent-to-pam.test drives in place of a YubiKey and of root:
 # `sk-dummy`, OpenSSH's software security key, as a provider ssh-agent loads,
-# which waits to sign until the file $SK_DUMMY_TOUCH exists (the touch); and
+# which waits to sign until the file $SK_DUMMY_TOUCH exists (the touch) and,
+# like a YubiKey left untouched, gives up after a while (2 s here); and
 # pam_wrapper, which runs a PAM stack from a directory of the caller's own, so
 # pamtester can run pam_rssh unprivileged.
 { pkgs }:
@@ -16,8 +17,10 @@ let
       	{
       		const char *touch = getenv("SK_DUMMY_TOUCH");
       		int i;
-      		for (i = 0; touch != NULL && access(touch, F_OK) != 0 && i < 400; i++)
+      		for (i = 0; touch != NULL && access(touch, F_OK) != 0 && i < 40; i++)
       			usleep(50000);
+      		if (touch != NULL && access(touch, F_OK) != 0)
+      			return SSH_SK_ERR_GENERAL;
       	}'
     '';
     configureFlags = [ "--without-zlib-version-check" ];
