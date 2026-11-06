@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # What every Ghostty window runs (nix/home/ghostty.nix): attaches it to the lowest-numbered
 # tmux session no client is attached to, else to a new session under the lowest free number.
-# Sessions with other names are left to `tms` and prefix f. Restores the last save first when
-# no server runs yet. When tmux hangs, fails to start or dies under the window, the window
+# Sessions with other names are left to `tms` and prefix f. First runs the unlock, which asks for
+# the keys a fresh boot lacks while the window is still outside tmux, then restores the last save
+# when no server runs yet. When tmux hangs, fails to start or dies under the window, the window
 # gets a plain $SHELL instead, outside tmux, with a red line saying what went wrong.
 # `ghostty -e <command>` never runs this.
-# Usage: tmux-window.sh <real-tmux> <tmux-restore>
+# Usage: tmux-window.sh <real-tmux> <tmux-restore> <unlock>
 set -u
-tmux=$1 restore=$2
+tmux=$1 restore=$2 unlock=$3
 # A Ghostty opened from inside a tmux pane inherits TMUX, and tmux refuses to nest.
 unset TMUX
 
@@ -18,6 +19,14 @@ fallback() {
 
 # Exit 1 is "no server running"; 124 is the timeout, a server that holds its socket and never answers.
 sessions() { timeout 3 "$tmux" list-sessions -F '#{session_attached} #{session_name}' 2>/dev/null; }
+
+# Before the restore: a restored pane has its command typed into it, which a prompt in its shell
+# would take as the answer. Ctrl-C at the prompt skips it, and must not close the window with it.
+if [ -x "$unlock" ]; then
+    trap : INT
+    "$unlock"
+    trap - INT
+fi
 
 list=$(sessions)
 case $? in

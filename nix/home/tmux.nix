@@ -24,7 +24,7 @@ let
 
   # What every Ghostty window runs (ghostty.nix). Tested by tests/tmux-window.test.
   tmuxWindow = pkgs.writeShellScriptBin "tmux-window" ''
-    exec ${pkgs.bash}/bin/bash ${./tmux-window.sh} ${tmux} ${tmuxRestore}
+    exec ${pkgs.bash}/bin/bash ${./tmux-window.sh} ${tmux} ${tmuxRestore} "$HOME/.dotfiles/secrets/scripts/creds-unlock"
   '';
 
   # `tmux` on PATH is the guard in tmux-guard.sh, with the real binary behind
