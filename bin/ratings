@@ -8,28 +8,33 @@
 `serve` shows the files on a page in the browser, one after another, each
 previewed by its kind: images, video, audio, PDFs and text, and for anything
 else its name and size. A key, a tap or a swipe rates the file on screen and
-moves on. Files with the same content are one item, rated once, wherever their
-copies sit. `list` prints what was rated, best first.
+moves on. C writes a comment on the file before you rate it. Files with the
+same content are one item, rated once, wherever their copies sit. `list`
+prints what was rated, best first, with its comment.
 
 Two scales, chosen with --scale:
 - digits: 0 to 9, on the digit keys
-- swipe: reject (left or A), weak accept (down or S), accept (right or D), favorite (up or W); stored as 0 to 3
+- swipe: two ways, left (or A) stored as 0 and right (or D) stored as 1;
+  --labels names them, Reject and Accept unless it says otherwise
 
-Each scale keeps its own ratings, so a folder can be rated on both.
+Each scale keeps its own ratings and comments, so a folder can be rated on both.
 
-Every rating is a line appended to a JSONL log, by default ratings.jsonl in
-the folder, so the log is the whole record:
+Every rating and every comment is a line appended to a JSONL log, by default
+ratings.jsonl in the folder, so the log is the whole record:
 
     {"sha": "<first 16 hex of the sha256>", "scale": "digits|swipe", "rating": <int> or null, "path": "<relative path>", "at": "<UTC time>"}
+    {"sha": "...", "scale": "...", "note": "<comment>", "path": "...", "at": "..."}
 
-For each sha and scale the last line holds; a null rating clears it.
+For each sha and scale the last rating line holds, and a null one clears it;
+the last note line holds too, and an empty one clears it.
 
 Examples:
 
     ratings serve ~/Pictures/emoji --ext png gif --open
     ratings serve ~/data/samples --scale swipe --host 0.0.0.0     # reachable from a phone on the tailnet
+    ratings serve ~/drafts --scale swipe --labels Drop Keep
     ratings list ~/Pictures/emoji --min 8
-    ratings list ~/data/samples --scale swipe --min 2 --json | jq -r '.[].paths[0]'
+    ratings list ~/data/samples --scale swipe --min 1 --json | jq -r '.[].paths[0]'
 """
 
 import codecs
@@ -65,12 +70,20 @@ SCALES = {
                for d in range(10)],
     "swipe": [
         {"value": 0, "label": "Reject", "keys": ["ArrowLeft", "a"], "fly": "left"},
-        {"value": 1, "label": "Weak accept", "keys": ["ArrowDown", "s"], "fly": "down"},
-        {"value": 2, "label": "Accept", "keys": ["ArrowRight", "d"], "fly": "right"},
-        {"value": 3, "label": "Favorite", "keys": ["ArrowUp", "w"], "fly": "up"},
+        {"value": 1, "label": "Accept", "keys": ["ArrowRight", "d"], "fly": "right"},
     ],
 }
 Scale = Literal["digits", "swipe"]
+NOTE_CHARS = 2000
+
+
+def scale_values(scale: str, labels: tuple[str, str] | None = None) -> list[dict]:
+    """A scale's values, the swipe scale's two named by labels, left then right, where given."""
+    values = [dict(v) for v in SCALES[scale]]
+    if scale == "swipe" and labels:
+        for v, label in zip(values, labels):
+            v["label"] = label
+    return values
 
 
 # ---------------------------------------------------------------- the data
@@ -135,10 +148,11 @@ def load(log: Path, scale: str) -> dict[str, int]:
             continue
         try:
             entry = json.loads(line)
-            sha, rating, on = entry["sha"], entry["rating"], entry["scale"]
+            sha, on = entry["sha"], entry["scale"]
+            rating = None if "note" in entry else entry["rating"]
         except (ValueError, KeyError, TypeError):
-            sys.exit(f"ratings: {log}:{n} is not a rating line: {line[:80]}")
-        if on != scale:
+            sys.exit(f"ratings: {log}:{n} is neither a rating nor a note line: {line[:80]}")
+        if on != scale or "note" in entry:   # a comment, which load_notes reads
             continue
         if rating is None:
             ratings.pop(sha, None)
@@ -147,15 +161,35 @@ def load(log: Path, scale: str) -> dict[str, int]:
     return ratings
 
 
+def load_notes(log: Path, scale: str) -> dict[str, str]:
+    """The comment each sha holds on a scale now: its last note line there, gone when that line is empty."""
+    notes: dict[str, str] = {}
+    if not log.exists():
+        return notes
+    for line in log.read_text().splitlines():
+        entry = json.loads(line) if line.strip() else {}
+        if entry.get("scale") != scale or "note" not in entry:
+            continue
+        if entry["note"]:
+            notes[entry["sha"]] = entry["note"]
+        else:
+            notes.pop(entry["sha"], None)
+    return notes
+
+
 def valid(rating, scale: str) -> bool:
     return rating is None or (type(rating) is int and rating in {v["value"] for v in SCALES[scale]})
 
 
-def append(log: Path, sha: str, scale: str, rating: int | None, path: str) -> None:
-    """One line, written in one call, so a crash leaves at most a line short rather than a line torn."""
+def append(log: Path, sha: str, scale: str, rating: int | None, path: str, note: str | None = None) -> None:
+    """One line, written in one call, so a crash leaves at most a line short rather than a line torn.
+
+    A line carries a rating, or with note given a comment in its place.
+    """
     at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    what = {"rating": rating} if note is None else {"note": note}
     with log.open("a") as f:
-        f.write(json.dumps({"sha": sha, "scale": scale, "rating": rating, "path": path, "at": at}) + "\n")
+        f.write(json.dumps({"sha": sha, "scale": scale, **what, "path": path, "at": at}) + "\n")
 
 
 def log_path(root: Path, log: str) -> Path:
@@ -169,7 +203,9 @@ class ServeArgs:
     root: Annotated[str, tyro.conf.Positional, tyro.conf.arg(metavar="FOLDER")]
     """The folder to rate. Every file under it is included, hidden directories aside."""
     scale: Scale = "digits"
-    """digits: 0 to 9 on the digit keys. swipe: reject (left or A), weak accept (down or S), accept (right or D), favorite (up or W)."""
+    """digits: 0 to 9 on the digit keys. swipe: left (or A) and right (or D)."""
+    labels: tuple[str, str] = ("Reject", "Accept")
+    """The swipe scale's two names, left then right, e.g. --labels Cold Hot."""
     ext: list[str] = field(default_factory=list)
     """Only files with these extensions, e.g. --ext png gif. All files when none are named."""
     log: str = ""
@@ -187,8 +223,9 @@ def serve_cmd(args: ServeArgs) -> None:
     """Serve the rating page until Ctrl-C.
 
     Keys on the page besides the scale's own: [ and ] step back and forward
-    (and so do left and right on the digits scale), n jumps to the next
-    unrated item, backspace clears a rating, and ? shows the keys.
+    (and so do left and right on the digits scale), c writes a comment on the
+    item (Enter keeps it, Escape drops it), n jumps to the next unrated item,
+    backspace clears a rating, and ? shows the keys.
     """
     root = Path(args.root).expanduser().resolve()
     if not root.is_dir():
@@ -201,7 +238,7 @@ def serve_cmd(args: ServeArgs) -> None:
     if not items:
         sys.exit(f"ratings: no files under {root}" + (f" ending in {', '.join(args.ext)}" if args.ext else ""))
     hosts = allowed_hosts(args.host)
-    server = make_server(root, items, log, args.scale, args.host, args.port, hosts)
+    server = make_server(root, items, log, args.scale, args.host, args.port, hosts, args.labels)
     port = server.server_address[1]
     names = sorted(h for h in hosts if h not in LOOPBACK) or ["127.0.0.1"]
     print(f"ratings: {len(items)} items on the {args.scale} scale at "
@@ -239,7 +276,7 @@ def allowed_hosts(bind: str) -> set[str]:
 
 
 def make_server(root: Path, items: list[dict], log: Path, scale: str, host: str, port: int,
-                hosts: set[str] = set(LOOPBACK)) -> ThreadingHTTPServer:
+                hosts: set[str] = set(LOOPBACK), labels: tuple[str, str] | None = None) -> ThreadingHTTPServer:
     """The server for one folder on one scale, bound but not yet serving."""
     by_sha = {item["sha"]: item for item in items}
     lock = threading.Lock()
@@ -256,8 +293,8 @@ def make_server(root: Path, items: list[dict], log: Path, scale: str, host: str,
             path = self.path.split("?")[0]
             if path == "/":
                 page = TEMPLATE.read_text().replace("/*DATA*/null", inline(
-                    {"items": items, "ratings": load(log, scale), "root": root.name,
-                     "scale": scale, "values": SCALES[scale]}))
+                    {"items": items, "ratings": load(log, scale), "notes": load_notes(log, scale),
+                     "root": root.name, "scale": scale, "values": scale_values(scale, labels)}))
                 return self.reply(200, page.encode(), "text/html; charset=utf-8")
             route, _, sha = path.lstrip("/").partition("/")
             # Only a sha the scan found resolves, so the folder stays the boundary.
@@ -287,18 +324,27 @@ def make_server(root: Path, items: list[dict], log: Path, scale: str, host: str,
 
         def do_POST(self):
             addressed = self.addressed()
-            if not addressed or self.path != "/rate" or self.headers.get("Origin") not in (None, f"http://{addressed}"):
+            if not addressed or self.path not in ("/rate", "/note") or self.headers.get("Origin") not in (None, f"http://{addressed}"):
                 self.close_connection = True   # the unread body is not the next request
                 return self.reply(403, b"forbidden")
+            what = self.path.lstrip("/")
+            field_ = "rating" if what == "rate" else "note"
             try:
                 ask = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-                sha, rating = ask["sha"], ask["rating"]
+                sha, value = ask["sha"], ask[field_]
             except (ValueError, KeyError, TypeError):
-                return self.reply(400, b"a rating is {sha, rating}")
-            if sha not in by_sha or not valid(rating, scale):
-                return self.reply(400, f"unknown sha, or a rating the {scale} scale does not have".encode())
+                return self.reply(400, f"a {field_} is {{sha, {field_}}}".encode())
+            if sha not in by_sha:
+                return self.reply(400, b"unknown sha")
+            if what == "rate" and not valid(value, scale):
+                return self.reply(400, f"a rating the {scale} scale does not have".encode())
+            if what == "note" and not (type(value) is str and len(value) <= NOTE_CHARS):
+                return self.reply(400, f"a note is text of at most {NOTE_CHARS} characters".encode())
             with lock:
-                append(log, sha, scale, rating, by_sha[sha]["paths"][0])
+                if what == "rate":
+                    append(log, sha, scale, value, by_sha[sha]["paths"][0])
+                else:
+                    append(log, sha, scale, None, by_sha[sha]["paths"][0], note=value.strip())
             self.reply(204, b"")
 
         def reply(self, code: int, body: bytes, ctype: str = "text/plain") -> None:
@@ -327,36 +373,39 @@ class ListArgs:
     """The folder that was rated."""
     scale: Scale = "digits"
     """The scale whose ratings to print."""
+    labels: tuple[str, str] = ("Reject", "Accept")
+    """The swipe scale's two names, left then right, as serve was given them."""
     ext: list[str] = field(default_factory=list)
     """Only files with these extensions, as for serve."""
     log: str = ""
     """The JSONL file of ratings. Defaults to ratings.jsonl in the folder."""
     min: int = 0
-    """Only items rated at least this (on swipe: 0 reject, 1 weak accept, 2 accept, 3 favorite)."""
+    """Only items rated at least this (on swipe: 0 left, 1 right)."""
     json: bool = False
-    """Emit JSON to stdout: [{"sha": str, "rating": int, "label": str, "paths": [absolute path, ...]}], best first."""
+    """Emit JSON to stdout: [{"sha": str, "rating": int, "label": str, "note": str or null, "paths": [absolute path, ...]}], best first."""
 
 
 @app.command(name="list")
 def list_cmd(args: ListArgs) -> None:
-    """Print the rated items, best first: the rating's label, a tab, then the item's first path.
+    """Print the rated items, best first: the rating's label, a tab, the item's first path, and a tab and its comment where it has one.
 
     An item whose files are all gone from the folder is left out.
     """
     root = Path(args.root).expanduser().resolve()
     log = log_path(root, args.log)
     ratings = load(log, args.scale)
-    labels = {v["value"]: v["label"] for v in SCALES[args.scale]}
+    notes = load_notes(log, args.scale)
+    labels = {v["value"]: v["label"] for v in scale_values(args.scale, args.labels)}
     rows = sorted(
         ({"sha": it["sha"], "rating": ratings[it["sha"]], "label": labels[ratings[it["sha"]]],
-          "paths": [str(root / p) for p in it["paths"]]}
+          "note": notes.get(it["sha"]), "paths": [str(root / p) for p in it["paths"]]}
          for it in scan(root, log, args.ext) if ratings.get(it["sha"], -1) >= args.min),
         key=lambda r: (-r["rating"], Path(r["paths"][0]).name.lower()))
     if args.json:
         print(json.dumps(rows, indent=2))
         return
     for r in rows:
-        print(f"{r['label']}\t{r['paths'][0]}")
+        print(f"{r['label']}\t{r['paths'][0]}" + (f"\t{r['note']}" if r["note"] else ""))
 
 
 if __name__ == "__main__":
