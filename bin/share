@@ -12,6 +12,11 @@ expires: a share stays up until `share rm` removes it. --password encrypts
 every HTML page in the browser with StatiCrypt; the password is asked for, never
 taken as an argument.
 
+The page a link opens goes up with the Open Graph tags it lacks, which Slack,
+Signal, WhatsApp and Discord read for the link's preview card: its title, its
+description, and with --image a picture of it. Only the copy in the share root
+carries them; the source stays as it is. A share with a password gets none.
+
 The shares live in the share root, $SHARE_ROOT (default ~/Documents/share/):
 public/ holds one folder per share and is the Cloudflare Worker's whole site,
 shares.json beside it records each share. Every change deploys the whole root,
@@ -31,6 +36,9 @@ Examples:
     share ~/Documents/overview.html
     share ~/talks/slides --password
     share report/ --replace 3f9c0e...
+    share notes.html --title "Trip plan" --description "Dates, trains and the hut"
+    share ~/talks/slides --image            # a screenshot of the page on its card
+    share ~/talks/slides --image cover.png
     share ~/talks/slides --replace <existing-share-id> --password   # a new password, asked for
     share ~/talks/slides --replace <existing-share-id>              # the password removed
     share list
@@ -45,7 +53,6 @@ import getpass
 import html
 import json
 import os
-import re
 import secrets
 import shlex
 import shutil
@@ -55,8 +62,9 @@ import tempfile
 import urllib.parse
 from collections.abc import Iterator
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import tyro
 from tyro.extras import SubcommandApp
@@ -115,6 +123,18 @@ def root_dir() -> Path:
 # ---------------------------------------------------------------- commands
 
 
+def one_image(values: list[str]) -> Path | bool:
+    if len(values) > 1:
+        raise ValueError("--image takes one FILE at most")
+    return Path(values[0]).expanduser() if values else True
+
+
+IMAGE = tyro.constructors.PrimitiveConstructorSpec(
+    nargs="*", metavar="[FILE]", instance_from_str=one_image,
+    is_instance=lambda x: isinstance(x, (bool, Path)),
+    str_from_instance=lambda x: [str(x)] if isinstance(x, Path) else [])
+
+
 @dataclass
 class PutArgs:
     path: Annotated[Path, tyro.conf.Positional]
@@ -123,6 +143,12 @@ class PutArgs:
     """Ask for a password and encrypt every HTML page with it; the other files go up as they are."""
     replace: str = ""
     """Put the content behind this existing share's URL instead of a new one."""
+    title: Annotated[str | None, tyro.conf.arg(metavar="TEXT")] = None
+    """What `share list` and the link's preview card call it; by default the page's <title>, else the file or folder's name."""
+    description: Annotated[str | None, tyro.conf.arg(metavar="TEXT")] = None
+    """The line the link's preview card shows under the title; by default the page's <meta name="description">."""
+    image: Annotated[Path | bool, IMAGE, tyro.conf.arg(help_behavior_hint="(default: none)")] = False
+    """Put a picture of the page on its link's preview card: alone, a 1200x630 screenshot by the Chrome, Chromium or Edge on PATH; with a FILE, that file. Not with --password. `--image page.html --title T` reads page.html as the image: put the path first."""
 
 
 @app.command(name="put")
@@ -135,8 +161,16 @@ def put(args: PutArgs) -> None:
         raise Failed(f"{src} has no index.html at its top, the page its link would open. "
                      "A folder of files to download goes to the SFTPGo drop (sftpgo-share).")
     refuse_large(files_of(src), src)
+    opens_page = src.is_dir() or is_html(src)
+    if args.image is not False and args.password:
+        raise Failed("--image goes with no --password: the preview image shows what the password protects.")
+    if args.image is not False and not opens_page:
+        raise Failed(f"{src.name} is no page for a preview image to go with.")
     # the link opens the page; a file that is not one is reached by its name
-    url = f"https://{DOMAIN}/{{}}/" + ("" if src.is_dir() or is_html(src) else urllib.parse.quote(src.name))
+    url = f"https://{DOMAIN}/{{}}/" + ("" if opens_page else urllib.parse.quote(src.name))
+    head = Head(src / "index.html" if src.is_dir() else src) if opens_page else None
+    title = args.title or (head and head.readable(head.title)) or src.name
+    description = args.description or (head and head.readable(head.metas.get("description")))
     with locked_root() as root:
         shares = read_shares(root)
         old = find(shares, args.replace) if args.replace else None
@@ -148,6 +182,8 @@ def put(args: PutArgs) -> None:
         password = ask_password() if args.password else None
         with tempfile.TemporaryDirectory(dir=root, prefix=".incoming-") as tmp:
             built = build(src, Path(tmp), password)
+            if head and password is None:
+                add_preview(built, head, url.format(share_id), title, description, args.image)
             refuse_large(files_of(built), src, after="encrypted")
             target = root / "public" / share_id
             aside = Path(tmp) / "replaced"
@@ -157,7 +193,8 @@ def put(args: PutArgs) -> None:
             entry = {
                 "id": share_id,
                 "source": str(src),
-                "title": title_of(src),
+                "title": title,
+                "description": description,
                 "date": dt.date.today().isoformat(),
                 "password": password is not None,
                 "url": url.format(share_id),
@@ -178,7 +215,8 @@ def put(args: PutArgs) -> None:
 class ListArgs:
     json: bool = False
     """Print the shares as JSON:
-    [{"id": "str", "source": "str", "title": "str", "date": "YYYY-MM-DD", "password": "bool", "url": "str"}]"""
+    [{"id": "str", "source": "str", "title": "str", "description": "str | null", "date": "YYYY-MM-DD", "password": "bool",
+    "url": "str"}]"""
 
 
 @app.command(name="list")
@@ -187,7 +225,8 @@ def list_shares(args: ListArgs) -> None:
     root = existing_root()
     shares = sorted(read_shares(root), key=lambda s: s["date"], reverse=True)
     if args.json:
-        print(json.dumps(shares, ensure_ascii=False, indent=1))
+        # a share put before share kept descriptions has none
+        print(json.dumps([s | {"description": s.get("description")} for s in shares], ensure_ascii=False, indent=1))
         return
     paint = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
@@ -348,14 +387,124 @@ def ask_password() -> str:
     return first
 
 
-def title_of(src: Path) -> str:
-    """The page's own title, else the file's or folder's name."""
-    page = src if src.is_file() else src / "index.html"
-    if is_html(page) and page.exists():
-        m = re.search(r"<title[^>]*>(.*?)</title>", page.read_text(errors="replace"), re.S | re.I)
-        if m and m.group(1).strip():
-            return html.unescape(" ".join(m.group(1).split()))
-    return src.name
+class Head(HTMLParser):
+    """What share reads of a page: its <title>, its meta tags by their property or name, and where the
+    preview tags go: after its <head> tag, else its <html> tag, else its doctype, else at its start,
+    behind a byte order mark."""
+
+    def __init__(self, page: Path) -> None:
+        super().__init__()
+        # surrogateescape keeps a page in any encoding byte for byte where share writes into it
+        self.text = page.read_bytes().decode("utf-8", "surrogateescape")
+        self.title: str | None = None
+        self.metas: dict[str, str] = {}
+        self.anchors: dict[str, int] = {}
+        self._in_title = False
+        # where each line starts, as getpos() counts lines: at "\n" alone
+        self.lines = [0]
+        for line in self.text.split("\n"):
+            self.lines.append(self.lines[-1] + len(line) + 1)
+        self.feed(self.text)
+        self.close()
+        self.at = next((self.anchors[k] for k in ("head", "html", "doctype") if k in self.anchors),
+                       1 if self.text.startswith("\ufeff") else 0)
+
+    @staticmethod
+    def readable(text: str | None) -> str | None:
+        """Text from the page, its whitespace collapsed, a byte not in UTF-8 shown as U+FFFD; None where empty."""
+        text = (text or "").encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+        return " ".join(text.split()) or None
+
+    def _end(self, length: int) -> int:
+        line, column = self.getpos()
+        return self.lines[line - 1] + column + length
+
+    def handle_decl(self, decl: str) -> None:
+        if decl.lower().startswith("doctype"):
+            self.anchors.setdefault("doctype", self._end(len(decl) + 3))
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in ("head", "html"):
+            self.anchors.setdefault(tag, self._end(len(self.get_starttag_text() or "")))
+        elif tag == "title" and self.title is None:
+            self.title, self._in_title = "", True
+        elif tag == "meta":
+            a = dict(attrs)
+            if key := (a.get("property") or a.get("name") or "").strip().lower():
+                self.metas.setdefault(key, a.get("content") or "")
+
+    handle_startendtag = handle_starttag
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title = (self.title or "") + data
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self._in_title = False
+
+
+def add_preview(share: Path, head: Head, url: str, title: str, description: str | None, image: Path | bool) -> None:
+    """Write into the share's index.html the Open Graph tags a link preview reads that the page lacks, and
+    put the image `image` asks for beside it; a tag the page carries stays."""
+    picture = add_image(share, head, image) if image is not False else None
+    tags = {"og:title": title, "og:description": description, "og:url": url,
+            "og:image": url + picture if picture else None, "og:type": "website", "og:site_name": DOMAIN,
+            # the page's own og:image is the picture --image asked for
+            "twitter:card": "summary_large_image" if picture or (image is not False and "og:image" in head.metas) else "summary"}
+    block = "".join(f'\n<meta {"name" if key.startswith("twitter:") else "property"}="{key}" content="{attribute(value)}">'
+                    for key, value in tags.items() if value is not None and key not in head.metas)
+    (share / "index.html").write_bytes((head.text[:head.at] + block + head.text[head.at:]).encode("utf-8", "surrogateescape"))
+
+
+def attribute(value: str) -> str:
+    """A value as a quoted attribute holds it, in ASCII alone, so it reads the same whatever the page's encoding."""
+    return html.escape(value).encode("ascii", "xmlcharrefreplace").decode()
+
+
+PREVIEW = "share-preview"
+"""The preview image's name in the share's folder, before its suffix."""
+BROWSERS = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "microsoft-edge-stable")
+
+
+def add_image(share: Path, head: Head, image: Path | Literal[True]) -> str | None:
+    """The image --image asks for, put into the share's folder: a screenshot for True, else the file named.
+    Its name, or None where the page names its own og:image or no screenshot was taken."""
+    if "og:image" in head.metas:
+        print("share: the page names its own og:image, which its preview shows", file=sys.stderr)
+        return None
+    name = PREVIEW + (".png" if image is True else image.suffix.lower())
+    if (share / name).exists():
+        raise Failed(f"the share already holds a {name}, where share puts the preview image: rename it.")
+    if image is not True:
+        if not image.is_file():
+            raise Failed(f"there is no image file {image}.")
+        shutil.copyfile(image, share / name)
+        return name
+    if why := screenshot(share / "index.html", share / name):
+        print(f"share: {why}, so the share goes up without a preview image; --image <file> names one", file=sys.stderr)
+        return None
+    return name
+
+
+def screenshot(page: Path, into: Path) -> str | None:
+    """A 1200x630 PNG of the page, the size a link preview shows, at `into`; else why there is none."""
+    found = next(filter(None, map(shutil.which, BROWSERS)), None)
+    if found is None:
+        return "no Chrome, Chromium or Edge on PATH to screenshot the page"
+    with tempfile.TemporaryDirectory(prefix="share-browser-") as profile:
+        # a profile of its own, so a browser already open neither takes the job over nor locks it
+        argv = [found, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
+                "--no-default-browser-check", f"--user-data-dir={profile}", "--window-size=1200,630",
+                f"--screenshot={into}", page.resolve().as_uri()]
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return f"{found} took no screenshot: {e}"
+    if not into.is_file():
+        said = (done.stderr.strip().splitlines() or [f"exit status {done.returncode}"])[-1]
+        return f"{found} took no screenshot: {said}"
+    return None
 
 
 # ---------------------------------------------------------------- deploying
