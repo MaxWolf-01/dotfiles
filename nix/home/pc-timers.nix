@@ -14,6 +14,12 @@ let
     bash coreutils util-linux rsync openssh gnugrep jq
   ]);
 
+  # uv runs the script itself (PEP 723 shebang); jq builds bin/run-log's line;
+  # sops and curl are what bin/alert-send needs to mail anything.
+  igSavesPath = lib.makeBinPath (with pkgs; [
+    bash coreutils jq uv sops curl
+  ]);
+
   # systemd for journalctl: the watchdog asks it when units without a run log
   # last finished cleanly, here and (over ssh) on the laptop.
   watchdogPath = "${backupPath}:${lib.makeBinPath [ pkgs.systemd ]}";
@@ -337,6 +343,42 @@ in
         "pcstate-pc.service"
       ];
     };
+  };
+
+  # --- Instagram saved posts that need a login ---
+  # The logged-out download is finished; what is left are the posts it found
+  # unavailable, requested logged in as the account that saved them, from this
+  # host because the sessions were made here. The pace is what keeps the
+  # accounts from being locked: a few minutes per post and a small cap per
+  # account per day. The job is finite and mails once nothing is left; the
+  # accounts are whichever have a session in the archive's sessions/.
+
+  systemd.user.services.instagram-saves = {
+    Unit = {
+      Description = "Download saved Instagram posts that need a login, a few a day";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      # 2 is a refused session and 1 a post that will be retried; the script
+      # mails the refusal itself, and a run that breaks outright exits 3.
+      SuccessExitStatus = "1 2";
+      Environment = [
+        "PATH=${igSavesPath}"
+      ];
+      ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/data/encrypted/instagram-saves/saved.tsv --dest ${home}/data/encrypted/instagram-saves --require-mount ${home}/data/encrypted --record --logged-in --limit 60 --pause 180 360";
+    };
+  };
+
+  systemd.user.timers.instagram-saves = {
+    Unit.Description = "Daily batch of the logged-in saved-post download";
+    Timer = {
+      OnCalendar = "*-*-* 10:00";
+      Persistent = true;
+      RandomizedDelaySec = "2h";
+    };
+    Install.WantedBy = [ "timers.target" ];
   };
 
   # --- Overdue watchdog ---
