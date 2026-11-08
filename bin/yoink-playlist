@@ -5,8 +5,8 @@
 # ///
 """Yoink the new videos of YouTube playlists into the library, one after another, with `yoink-talk`.
 
-A video is skipped when a transcript in the library or under $SCRIBE_DIR names it in its
-frontmatter, or when an earlier run finished it: those are listed in
+A video is skipped when a transcript in the library names it in its frontmatter, or when an
+earlier run finished it: those are listed in
 $XDG_STATE_HOME/yoink-playlist/done.txt, so a talk deleted from the library does not come back
 while its video stays in the playlist. Removing its line from that file lets it through again.
 A video that fails is tried again by the next run; a transcription ElevenLabs delivered is not paid for twice.
@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -57,11 +58,20 @@ class Args:
 
 def main() -> None:
     args = tyro.cli(Args, description=__doc__)
+    signal.signal(signal.SIGTERM, stopped)
     try:
-        wanted, unread = listed(args.playlists)
-    except OSError as exc:
-        finish(args, [], [], [f"reading {args.playlists} failed: {exc}"])
-    have = transcribed(args.library) | finished()
+        yoink_new(args)
+    except Exception as exc:  # whatever ended the run, the run log says so
+        end_run(args, [], [], [f"{type(exc).__name__}: {exc}"])
+
+
+def stopped(*_) -> None:
+    raise RuntimeError("stopped by SIGTERM, such as the unit's time limit")
+
+
+def yoink_new(args: Args) -> None:
+    wanted, unread = listed(args.playlists)
+    have = transcribed(args.library) | done_ids()
     new = [v for v in wanted if v["id"] not in have]
     hours = sum(v.get("duration") or 0 for v in new) / 3600
     say(f"{len(wanted)} videos listed, {len(new)} new, {hours:.1f} h")
@@ -72,18 +82,17 @@ def main() -> None:
     done, failed = [], []
     for v in new:
         say(f"yoinking {v['id']}: {v['title']}")
-        try:
-            ok = subprocess.run(["yoink-talk", f"https://www.youtube.com/watch?v={v['id']}", "--output-dir", str(args.library.expanduser())]).returncode == 0
-        except FileNotFoundError:
-            finish(args, done, failed, ["yoink-talk is not on PATH", *unread])
-        if ok:
-            finished_path().parent.mkdir(parents=True, exist_ok=True)
-            with finished_path().open("a") as f:
-                f.write(v["id"] + "\n")
-            done.append(v["id"])
-        else:
-            failed.append(v["id"])
-    finish(args, done, failed, unread)
+        r = subprocess.run(["yoink-talk", f"https://www.youtube.com/watch?v={v['id']}", "--output-dir", str(args.library.expanduser())],
+                           stderr=subprocess.PIPE, text=True)
+        sys.stderr.write(r.stderr)
+        if r.returncode:
+            failed.append(f"{v['id']}: {r.stderr.strip().splitlines()[-1][:200] if r.stderr.strip() else f'exited {r.returncode}'}")
+            continue
+        done_file().parent.mkdir(parents=True, exist_ok=True)
+        with done_file().open("a") as f:
+            f.write(v["id"] + "\n")
+        done.append(v["id"])
+    end_run(args, done, failed, unread)
 
 
 def listed(playlists: Path) -> tuple[list[dict], list[str]]:
@@ -119,29 +128,28 @@ def entries(url: str) -> list[dict]:
 
 
 def transcribed(library: Path) -> set[str]:
-    """The videos whose finished transcript sits in the library or under $SCRIBE_DIR.
+    """The videos whose finished transcript sits in the library.
     The transcript is written last, so a talk a run left half done is not among them."""
-    scribe = Path(os.environ.get("SCRIBE_DIR") or Path.home() / "Documents" / "scribe")
     ids: set[str] = set()
-    for root in (library.expanduser(), scribe.expanduser()):
-        for md in root.glob("*/*.md"):
+    for md in library.expanduser().glob("*/*.md"):
+        if md.is_file():
             with md.open("rb") as f:
                 ids.update(VIDEO_URL.findall(f.read(HEAD_BYTES).decode(errors="replace")))
     return ids
 
 
-def finished_path() -> Path:
+def done_file() -> Path:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
     return state / "yoink-playlist" / "done.txt"
 
 
-def finished() -> set[str]:
-    return set(finished_path().read_text().split()) if finished_path().exists() else set()
+def done_ids() -> set[str]:
+    return set(done_file().read_text().split()) if done_file().exists() else set()
 
 
-def finish(args: Args, done: list[str], failed: list[str], problems: list[str]):
+def end_run(args: Args, done: list[str], failed: list[str], problems: list[str]):
     """Says how the run ended and exits; a video or a playlist that failed makes it a failed run."""
-    problems = [*problems, *([f"failed to yoink {' '.join(failed)}"] if failed else [])]
+    problems = [*problems, *failed]
     say(f"{len(done)} yoinked, {len(failed)} failed" + ("; " + "; ".join(problems) if problems else ""))
     if args.record:
         stats = json.dumps({"yoinked": len(done), "failed": len(failed)})
