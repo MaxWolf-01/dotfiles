@@ -73,11 +73,12 @@ typeset -gA JOVIAL_SYMBOL=(
     git.dirty '✘✘✘'
     git.clean '✔'
 
-    # the typing pointer: outside a repo, in a clean one, in a dirty one
+    # the typing pointer: outside a repo, in a clean one, in a dirty one;
+    # one cell wide, so commands always start in the same column
     arrow '○'
     arrow.git-clean '●'
     arrow.git-dirty '◐'
-    # after the pointer: commits not pushed, commits not pulled (as of the
+    # after the git status: commits not pushed, commits not pulled (as of the
     # last fetch), and a branch with no upstream
     git.ahead '⇡'
     git.behind '⇣'
@@ -128,7 +129,7 @@ typeset -gA JOVIAL_PALETTE=(
 )
 
 # parts dispaly order from left to right of jovial theme at the first line 
-typeset -ga JOVIAL_PROMPT_ORDER=( host user path dev-env git-info )
+typeset -ga JOVIAL_PROMPT_ORDER=( host user path dev-env git-info venv )
 
 # prompt parts priority from high to low, for `responsive design`.
 # decide whether to still keep dispaly while terminal width is no enough;
@@ -141,6 +142,7 @@ typeset -ga JOVIAL_PROMPT_PRIORITY=(
     user
     host
     dev-env
+    venv
 )
 
 # pin last command execute elapsed, if the threshold is reached
@@ -376,8 +378,6 @@ zle -N @jov.infer-prompt-rerender
 # variables for git prompt
 typeset -g jovial_rev_git_dir=""
 typeset -g jovial_is_git_dirty=false
-# the ahead/behind marks shown after the typing pointer
-typeset -g jovial_git_sync=""
 
 @jov.chpwd-git-dir-hook() {
     # it's the same as  jovial_rev_git_dir=`\git rev-parse --git-dir 2>/dev/null`
@@ -469,7 +469,6 @@ typeset -gA jovial_affix_lengths=()
         else
             jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow.git-dirty]}"
         fi
-        jovial_parts[typing]+="${jovial_git_sync}"
     else
         jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow]}"
     fi
@@ -495,7 +494,9 @@ typeset -gA jovial_affix_lengths=()
 
     if [[ -z ${venv_name} ]]; then
         jovial_parts[venv]=''
+        jovial_part_lengths[venv]=0
     else
+        jovial_part_lengths[venv]=$(( ${#venv_name} + ${jovial_affix_lengths[venv]} ))
         jovial_parts[venv]="${JOVIAL_AFFIXES[venv.prefix]}${JOVIAL_PALETTE[venv]}${venv_name}${JOVIAL_AFFIXES[venv.suffix]}"
     fi
 }
@@ -938,14 +939,14 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
     local is_dirty ahead behind
     read -r is_dirty ahead behind <<< "${git_state_line}"
 
-    local previous_git_sync="${jovial_git_sync}"
-    jovial_git_sync=''
+    local git_sync=''
     if [[ ${ahead} == '-' ]]; then
-        jovial_git_sync="${JOVIAL_SYMBOL[git.no-upstream]}"
+        git_sync="${JOVIAL_SYMBOL[git.no-upstream]}"
     elif [[ ${ahead} == <-> && ${behind} == <-> ]]; then
-        (( ahead > 0 )) && jovial_git_sync+="${JOVIAL_SYMBOL[git.ahead]}${ahead}"
-        (( behind > 0 )) && jovial_git_sync+="${JOVIAL_SYMBOL[git.behind]}${behind}"
+        (( ahead > 0 )) && git_sync+="${JOVIAL_SYMBOL[git.ahead]}${ahead}"
+        (( behind > 0 )) && git_sync+="${JOVIAL_SYMBOL[git.behind]}${behind}"
     fi
+    [[ -n ${git_sync} ]] && git_sync=" ${git_sync}"
 
     local git_state='' state_color='' git_dirty_status=''
  
@@ -959,19 +960,19 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
 
     git_dirty_status="${JOVIAL_PALETTE[${state_color}]}${JOVIAL_SYMBOL[git.${git_state}]}"
 
-    jovial_parts[git-info]="${JOVIAL_AFFIXES[git-info.prefix]}${JOVIAL_PALETTE[git]}${git_branch}${git_action}${JOVIAL_AFFIXES[git-info.suffix]}${git_dirty_status}"
+    jovial_parts[git-info]="${JOVIAL_AFFIXES[git-info.prefix]}${JOVIAL_PALETTE[git]}${git_branch}${git_action}${JOVIAL_AFFIXES[git-info.suffix]}${git_dirty_status}${JOVIAL_PALETTE[normal]}${git_sync}"
 
     jovial_part_lengths[git-info]=$((
         ${#JOVIAL_SYMBOL[git.${git_state}]}
         + ${jovial_affix_lengths[git-info]}
         + ${#git_branch}
         + ${#git_action}
+        + ${#git_sync}
     ))
 
     local has_changed=false
 
-    if [[ ${jovial_parts[git-info]} != ${jovial_previous_parts[git-info]} \
-        || ${jovial_git_sync} != ${previous_git_sync} ]]; then
+    if [[ ${jovial_parts[git-info]} != ${jovial_previous_parts[git-info]} ]]; then
         has_changed=true
     fi
 
@@ -1112,7 +1113,6 @@ add-zsh-hook precmd @jov.prompt-prepare
 
     prompts[margin-line]="${sgr_reset}${jovial_parts[margin-line]}"
     prompts[typing]="${sgr_reset}${jovial_parts[typing]}"
-    prompts[venv]="${sgr_reset}${jovial_parts[venv]}"
 
     local -a ordered_parts=()
     for key in ${JOVIAL_PROMPT_ORDER[@]}; do
@@ -1123,7 +1123,7 @@ add-zsh-hook precmd @jov.prompt-prepare
     local corner_bottom="${sgr_reset}${JOVIAL_PALETTE[normal]}${JOVIAL_SYMBOL[corner.bottom]}"
 
     echo "${corner_top}${(j..)ordered_parts}${prompts[current-time]}"
-    echo "${corner_bottom}${prompts[typing]}${prompts[venv]} ${sgr_reset}"
+    echo "${corner_bottom}${prompts[typing]}  ${sgr_reset}"
 }
 
 
