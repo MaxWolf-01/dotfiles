@@ -183,3 +183,7 @@ History: the host recorder's `dgpu_port` column (D3cold or D0 every 5 s).
   monitors stayed black until it was replugged. Replug it into the Thunderbolt
   port; that night it went into the USB-C 3.2 port instead (see Ports).
 - **`reboot -h 0`** is not a thing on systemd; `reboot`.
+
+## What can reach it
+
+sshd listens on every interface, which `ss` shows and which looks open; `ufw` (`net_harden` in `setup`) drops whatever does not arrive on `tailscale0`, so read `sudo ufw status` for what is reachable. Inside the tailnet that firewall stops nothing, and ssh is key-only (`ssh_harden` in `setup`).
