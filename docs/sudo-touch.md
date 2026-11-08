@@ -8,8 +8,13 @@ How each half works: `nix/home/sudo-touch.nix` (zephylux) and
 
 The touch is `sufficient`, ahead of the password, never `required`. With no key
 plugged in, no registered key, no forwarded agent, or no touch, sudo asks for
-the password as it always did; a key plugged in but left untouched makes sudo
-wait until the key gives up first.
+the password as it always did. A key plugged in but left untouched gives up
+after its own wait, which nothing here can set, so sudo asks for the touch ten
+times in a row before it gets to the password: the time to reach the key is
+ten of the key's waits. Each ask on pc and xmg19 raises a notification on the
+laptop; on zephylux each prints the cue in the terminal. A machine set up
+before the ten asks keeps one on zephylux until `./setup sudo_touch` runs
+there again; pc and xmg19 take them with their next `nswitch`.
 
 The keys are the two YubiKeys, the keychain one and the backup. Register both at
 every step that registers a key.
@@ -54,7 +59,7 @@ The password still works, so sudo is not locked; the touch is just not taken.
   with the YubiKey.
 - **On zephylux, no "Please touch the device."** `ls -l ~/.config/Yubico/u2f_keys`
   (missing: the wizard has not committed the registration, or `hmswitch` has
-  not run since), then add `debug` to the line in `/etc/pam.d/sudo`.
+  not run since), then add `debug` to the first pam_u2f line in `/etc/pam.d/sudo`.
 
 ## Two sudos at once
 
@@ -63,14 +68,17 @@ request at a time. While one sudo waits for a touch, a sudo on the other
 host waits behind it and shows nothing, not even its touch prompt; touch
 once for each, in the order they asked. Ending the first sudo's ssh session
 does not free the agent, which keeps waiting on the key; neither does
-Ctrl-C, which a touch wait ignores. What frees it at once:
+Ctrl-C, which a touch wait ignores. A restart of the agent frees only the ask
+in flight, since each sudo then asks the restarted agent again. What frees
+them all, each waiting sudo going on to its password:
 
 ```bash
-systemctl --user restart ssh-sk-agent   # on zephylux; every waiting sudo goes on to its password
+systemctl --user stop ssh-sk-agent    # on zephylux; start it again once the sudos have moved on
 ```
 
-Seen 2026-11-01 during the rollout: pc's `nswitch` waited with a blank
-screen behind xmg19's pending sudo until the agent was restarted.
+Seen 2026-11-01 during the rollout, when sudo asked once: pc's `nswitch`
+waited with a blank screen behind xmg19's pending sudo until the agent was
+restarted.
 
 ## Backing out
 
