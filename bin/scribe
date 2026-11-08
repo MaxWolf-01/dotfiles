@@ -24,7 +24,7 @@ recording finds that folder again. The folder holds:
 - analysis.json: Claude's notes, which `regen` writes again
 - audio.opus: the audio the report plays
 - scribe.log: what each run did, with timings, request ids and costs
-- cache/: the transcription response, the speaker names and intermediate files
+- cache/: the transcription response, the speaker labels and intermediate files
 
 ElevenLabs Scribe v2 transcribes and separates the voices in one request, which
 needs ELEVENLABS_API_KEY (`with-secrets elevenlabs scribe run ...`). The
@@ -36,7 +36,7 @@ Examples:
 
     with-secrets elevenlabs scribe run talk.m4a --names Max Levi --me Max
     scribe run talk.m4a --out ~/talks/2026-09-20-meetup
-    scribe rename ~/Documents/scribe/2026-09-20-agent-swarms Parzival=Levi
+    scribe rename ~/Documents/scribe/2026-09-20-agent-swarms Parzival=Levi "Audience member 2=Yann LeCun"
     scribe regen ~/Documents/scribe/2026-09-20-agent-swarms
     scribe share ~/Documents/scribe/2026-09-20-agent-swarms
     scribe share ~/Documents/scribe/2026-09-20-agent-swarms --password
@@ -119,8 +119,8 @@ class RunArgs:
     """Where the recording came from, such as a video's page; shown in the transcript's frontmatter and the report."""
     copy_recording: bool = True
     """Copy the recording into the folder. --no-copy-recording leaves it where it is; the folder keeps audio.opus, made from it."""
-    yes: bool = False
-    """Accept Claude's names without asking. Without a terminal, they are accepted anyway."""
+    context: str = ""
+    """What is known about the recording, such as a video's title, channel and description. Claude reads it to name the speakers and write the notes."""
     model: str = "opus"
     """Claude model for naming the speakers and writing the notes."""
 
@@ -163,7 +163,7 @@ def run(args: RunArgs) -> None:
     if (folder / "cache" / "names.json").exists():
         progress.done("decided before, in cache/names.json")
     else:
-        progress.done(name_speakers(folder, src, args.model, sys.stdin.isatty() and not args.yes, progress))
+        progress.done(name_speakers(folder, src, args.model, progress))
     write_json(folder / "conversation.json", build_conversation(folder))
 
     progress.start("writing notes")
@@ -342,6 +342,7 @@ class Source:
     language: str = "auto"
     me: str = ""
     url: str = ""
+    context: str = ""
     titled: bool = False
     """The folder carries the conversation's title in its name, and keeps it from then on."""
     placed: bool = False
@@ -381,11 +382,11 @@ def settle_folder(recording: Path, args: RunArgs) -> tuple[Path, Source]:
         date = args.date or recording_date(recording)
         folder = folder or free_name(base_dir(), f"{date}-{slug(recording.stem)}")
         src = Source(name=recording.name, sha256=digest, duration=duration_of(recording), date=date,
-                     names=args.names, keyterms=args.keyterms, language=args.language, me=args.me, url=args.url, placed=bool(args.out))
+                     names=args.names, keyterms=args.keyterms, language=args.language, me=args.me, url=args.url, context=args.context, placed=bool(args.out))
     else:
         # options given again replace the ones recorded; the defaults leave them as they were
         src.names, src.keyterms = args.names or src.names, args.keyterms or src.keyterms
-        src.me, src.date, src.url = args.me or src.me, args.date or src.date, args.url or src.url
+        src.me, src.date, src.url, src.context = args.me or src.me, args.date or src.date, args.url or src.url, args.context or src.context
         src.language = src.language if args.language == "auto" else args.language
     folder.mkdir(parents=True, exist_ok=True)
     save_source(folder, src)
@@ -765,11 +766,15 @@ def build_turns(words: list[dict]) -> list[dict]:
     return turns
 
 
+NOT_A_PERSON = "Not a person"
+"""The label of a voice that is no person and has no description of its own; such voices stay apart."""
+
+
 def speakers_of(words: list[dict], names: dict[str, dict]) -> tuple[list[dict], dict[str, str]]:
     """The people and other sources in the recording, and each voice's speaker id.
 
-    A speaker's id is its first voice's label, so it survives renames. Voices given one name
-    become one speaker. Unnamed people are Speaker A, B, ... by their voices' talking time, and a
+    A speaker's id is its first voice's label, so it survives renames. Voices given one label
+    become one speaker. Unlabelled people are Speaker A, B, ... by their voices' talking time, and a
     voice keeps its letter once cache/names.json records it."""
     air = talking_time(stretches(words, by="voice"))
     voices = sorted({w["voice"] for w in words}, key=lambda v: -air.get(v, 0.0))
@@ -778,8 +783,8 @@ def speakers_of(words: list[dict], names: dict[str, dict]) -> tuple[list[dict], 
     voice_to: dict[str, str] = {}
     for v in voices:
         d = names.get(v, {"kind": "person", "name": ""})
-        name = d["name"] if d["kind"] == "person" else "Not a person"
-        if name and name in by_name and d["kind"] == "person":
+        name = d["name"] or ("" if d["kind"] == "person" else NOT_A_PERSON)
+        if name and name != NOT_A_PERSON and name in by_name:
             sp = by_name[name]
         else:
             sp = {"id": v, "name": name, "kind": d["kind"], "voices": []}
@@ -796,18 +801,33 @@ def speakers_of(words: list[dict], names: dict[str, dict]) -> tuple[list[dict], 
     return speakers, voice_to
 
 
+def said_by(words: list[dict], moves: list[dict], voices: dict[str, str]) -> dict[int, str]:
+    """The voice that really said each word of a turn Claude moved, by the word's index. A move names
+    a turn as Claude read it, with the transcription model's voices, so the turns are built from those."""
+    for w in words:
+        w["spk"] = w["voice"]
+    turns = {t["id"]: t for t in build_turns(words)}
+    return {i: m["voice"] for m in moves if m["turn"] in turns and m["voice"] in voices
+            for i in range(turns[m["turn"]]["w0"], turns[m["turn"]]["w1"])}
+
+
 def build_conversation(folder: Path) -> dict:
-    """conversation.json, rebuilt from the cached response and the speaker decisions."""
+    """conversation.json, rebuilt from the cached response, which is never changed, and the speaker decisions."""
     src = load_source(folder)
     response = read_json(folder / "cache" / "scribe.json")
     names_path = folder / "cache" / "names.json"
     names = {d["voice"]: d for d in read_json(names_path)} if names_path.exists() else {}
     words = words_of(response)
     speakers, voice_to = speakers_of(words, names)
-    for w in words:
-        w["spk"] = voice_to[w["voice"]]
+    moves_path = folder / "cache" / "moves.json"
+    said = said_by(words, read_json(moves_path), voice_to) if moves_path.exists() else {}
+    for i, w in enumerate(words):
+        w["spk"] = voice_to[said.get(i, w["voice"])]
+    LOG.write(f"{len(said)} words moved to the voice Claude found said them")
     moved = fix_strays(words)
     LOG.write(f"{moved} words moved off a speaker silent for {STRAY_WINDOW:.0f} s either side")
+    heard = {w["spk"] for w in words}
+    speakers = [sp for sp in speakers if sp["id"] in heard]
     # talking time orders the people again: strays and merged voices changed it
     air = talking_time(stretches(words))
     speakers.sort(key=lambda sp: (sp["kind"] != "person", -air.get(sp["id"], 0.0)))
@@ -916,7 +936,7 @@ NAMES_SCHEMA = {
                 "properties": {
                     "voice": {"type": "string"},
                     "kind": {"type": "string", "enum": ["person", "not-a-person"]},
-                    "name": {"type": "string", "description": "The person's name, or empty when unknown"},
+                    "name": {"type": "string", "description": "The label a reader sees: a name, a role, or what the voice is"},
                     "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
                     "evidence": {
                         "type": "array",
@@ -929,26 +949,55 @@ NAMES_SCHEMA = {
                 },
                 "required": ["voice", "kind", "name", "confidence", "evidence"],
             },
-        }
+        },
+        "moves": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "turn": {"type": "string"},
+                    "voice": {"type": "string", "description": "The voice that really said this turn"},
+                    "why": {"type": "string"},
+                },
+                "required": ["turn", "voice", "why"],
+            },
+        },
     },
-    "required": ["voices"],
+    "required": ["voices", "moves"],
 }
 
-NAMES_SYSTEM = """You name the speakers in an automatic transcript of a recorded conversation.
-The transcription model told the voices apart and labelled each turn with a voice label such as
-speaker_0. For every voice, work out who it is from what is said: self-introductions, being
-addressed by name (the person addressed usually speaks next), others talking about them, what
-they say about themselves. The transcription may misspell names; give the spelling from the list
-of expected people when one of them is meant.
-A voice can also be something other than a person in the room: a video or ad playing aloud, or
-fragments of crosstalk. Mark those kind "not-a-person".
-Cite the turn ids your answer rests on, and say why. Leave the name empty and the confidence low
-rather than guess."""
+NAMES_SYSTEM = """You label the speakers in an automatic transcript of a recording. The
+transcription model told the voices apart and labelled each turn with a voice label such as
+speaker_0. Your labels are used as they are, and can be corrected later.
+
+Work out who each voice is from what is said: self-introductions, being addressed by name (the
+person addressed usually speaks next), others talking about them, what they say about themselves.
+The transcription may misspell names; take the spelling from what is known about the recording or
+from the list of expected people when one of them is meant.
+
+For a person, name is who they are when the recording or what is known about it establishes that;
+otherwise their role, such as "Host", "Moderator" or "Audience member 1", numbering the people of
+one role in the order they first speak. Never invent a name: an unknown person keeps a role, with
+low confidence.
+
+The transcription model sometimes splits one person into two voices, and sometimes makes a voice of
+a few words out of the end of someone's sentence. Give voices that are one person the exact same
+name, and they are shown as one speaker.
+
+Kind "not-a-person" is a voice that is no single person: audience laughter or applause, a video or
+ad playing aloud, fragments of crosstalk. Its name says in a few words what it is, such as "Audience
+laughter", "Video clip" or "Crosstalk", and voices of the same sort get the same name.
+
+Cite the turn ids your answer rests on, and say why.
+
+moves lists single turns the transcription model gave to the wrong voice, while that voice is
+otherwise right: the turn id, and the voice that really said it. List one only when what is said
+makes it plain. Most recordings have none."""
 
 
-def name_speakers(folder: Path, src: Source, model: str, ask: bool, progress: "Progress") -> str:
-    """cache/names.json: per voice, a name or none, whether it is a person, and who decided.
-    The terminal asks about every voice below high confidence, except a brief one that is not a person."""
+def name_speakers(folder: Path, src: Source, model: str, progress: "Progress") -> str:
+    """cache/names.json: per voice, its label, whether it is a person, and how sure Claude is.
+    cache/moves.json: the turns Claude gave to another voice. Nothing asks; `scribe rename` corrects."""
     words = words_of(read_json(folder / "cache" / "scribe.json"))
     for w in words:
         w["spk"] = w["voice"]
@@ -956,11 +1005,11 @@ def name_speakers(folder: Path, src: Source, model: str, ask: bool, progress: "P
     runs = stretches(words, by="voice")
     talk = talking_time(runs)
     counts = {v: sum(len(st["words"]) for st in runs if st["who"] == v) for v in talk}
-    total = sum(talk.values()) or 1.0
     voices = sorted(talk, key=lambda v: -talk[v])
     info = "\n".join(f"- {v}: {talk[v] / 60:.1f} min of speech, {counts[v]} words" for v in voices)
     prompt = (
-        (f"People expected in this conversation (may be incomplete): {', '.join(src.names)}\n\n" if src.names else "")
+        known_about(src)
+        + (f"People expected in this conversation (may be incomplete): {', '.join(src.names)}\n\n" if src.names else "")
         + f"Voices:\n{info}\n\nTranscript:\n{transcript_lines(turns, lambda t: t['spk'])}"
     )
     answer = claude(NAMES_SYSTEM, prompt, NAMES_SCHEMA, model, progress, "naming the voices")
@@ -969,52 +1018,24 @@ def name_speakers(folder: Path, src: Source, model: str, ask: bool, progress: "P
     for v in voices:
         p = proposals.get(v, {"kind": "person", "name": "", "confidence": "low", "evidence": []})
         decisions.append({
-            "voice": v, "name": p["name"] if p["kind"] == "person" else "", "kind": p["kind"], "method": "claude",
+            "voice": v, "name": p["name"], "kind": p["kind"], "method": "claude",
             "confidence": p["confidence"], "evidence": p["evidence"], "sec": round(talk[v], 1), "words": counts[v],
         })
-    brief = {v for v in voices if talk[v] / total < 0.02 or counts[v] < 25}
-    unsure = [d for d in decisions if d["confidence"] != "high" or (d["kind"] == "person" and not d["name"])]
-    unsure = [d for d in unsure if not (d["voice"] in brief and d["kind"] != "person")]
-    if unsure and ask:
-        progress.say("")
-        confirm(unsure, turns)
-    write_json(folder / "cache" / "names.json", decisions)
+    write_json(folder / "cache" / "moves.json", answer["moves"])
+    write_json(folder / "cache" / "names.json", decisions)  # written last: its existence means the naming is done
     voices_of: dict[str, int] = {}
     for d in decisions:
-        label = d["name"] or ("not a person" if d["kind"] != "person" else "no name")
+        label = d["name"] or (NOT_A_PERSON.lower() if d["kind"] != "person" else "no name")
         voices_of[label] = voices_of.get(label, 0) + 1
     named = ", ".join(f"{n} ({k} voices)" if k > 1 else n for n, k in voices_of.items())
-    if unsure and ask:
-        return f"{named}; you confirmed {len(unsure)}"
-    guessed = [d["voice"] for d in unsure]
-    return named + (f"; {len(guessed)} guessed below high confidence, unasked ({', '.join(guessed)}), which `scribe rename` fixes" if guessed else "")
+    unsure = sum(d["confidence"] != "high" for d in decisions)
+    return named + (f"; {len(answer['moves'])} turns moved" if answer["moves"] else "") + (
+        f"; {unsure} below high confidence, which `scribe rename` fixes" if unsure else "")
 
 
-def confirm(unsure: list[dict], turns: list[dict]) -> None:
-    """Ask in the terminal about each voice Claude was not sure of. Everything goes to stderr,
-    so stdout carries only the folder."""
-    say = lambda text="": print(text, file=sys.stderr, flush=True)  # noqa: E731
-    say("Who is this? Enter keeps the proposal, a name replaces it, - marks the voice as not a person.\n")
-    by_id = {t["id"]: t for t in turns}
-    for d in unsure:
-        own = sorted((t for t in turns if t["spk"] == d["voice"]), key=lambda t: -(t["e"] - t["s"]))[:3]
-        guess = d["name"] or ("-" if d["kind"] != "person" else "")
-        shown = guess or "no name"
-        say(f"{d['voice']}: {d['sec'] / 60:.1f} min, {d['words']} words. Claude proposes {shown}, {d['confidence']} confidence.")
-        for ev in d["evidence"][:3]:
-            t = by_id.get(ev["turn"])
-            say(f"    because at {hms(t['s']) if t else ev['turn']}: {ev['why']}")
-        for t in own:
-            say(f"    [{hms(t['s'])}] {t['text'][:160]}")
-        print(f"  name [{shown}]: ", end="", file=sys.stderr, flush=True)
-        answer = input().strip()
-        if answer == "-":
-            d.update(kind="not-a-person", name="", method="you")
-        elif answer:
-            d.update(kind="person", name=answer, method="you")
-        elif guess:
-            d["method"] = "you"
-        say()
+def known_about(src: Source) -> str:
+    """The context the recording came with, as the opening of a prompt to Claude."""
+    return f"What is known about this recording:\n{src.context}\n\n" if src.context else ""
 
 
 # ---------------------------------------------------------------- notes
@@ -1136,7 +1157,8 @@ def write_notes(folder: Path, model: str, progress: "Progress") -> dict:
     me = conv["meta"]["me"]
     reader = f"{me}, one of the speakers," if me else "the person who recorded it"
     names = {sp["id"]: sp["name"] for sp in conv["speakers"]}
-    draft = claude(NOTES_SYSTEM.replace("{reader}", reader), transcript_lines(conv["turns"], lambda t: names[t["spk"]]),
+    draft = claude(NOTES_SYSTEM.replace("{reader}", reader),
+                   known_about(load_source(folder) or Source("", "", 0, "")) + transcript_lines(conv["turns"], lambda t: names[t["spk"]]),
                    ANALYSIS_SCHEMA, model, progress, "drafting the notes")
     write_json(folder / "cache" / "notes-draft.json", draft)
     by_id = {t["id"]: t for t in conv["turns"]}
@@ -1914,7 +1936,7 @@ def read_json(p: Path):
 
 def write_json(p: Path, data) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")  # the index is shared by every scribe running on this machine
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
     tmp.replace(p)
 

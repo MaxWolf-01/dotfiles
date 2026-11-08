@@ -1,0 +1,158 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro>=1.0.14"]
+# ///
+"""Yoink the new videos of YouTube playlists into the library, one after another, with `yoink-talk`.
+
+A video is skipped when a transcript in the library or under $SCRIBE_DIR names it in its
+frontmatter, or when an earlier run finished it: those are listed in
+$XDG_STATE_HOME/yoink-playlist/done.txt, so a talk deleted from the library does not come back
+while its video stays in the playlist. Removing its line from that file lets it through again.
+A video that fails is tried again by the next run; a transcription ElevenLabs delivered is not paid for twice.
+
+A playlist YouTube refuses to list here, as it does some VPN addresses, is listed on pc.
+It has to be public or unlisted: no cookies are sent.
+
+Examples:
+
+    yoink-playlist ~/.dotfiles/secrets/backup/yoink-playlists.txt
+    yoink-playlist playlists.txt --dry-run
+"""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated
+
+import tyro
+
+LIBRARY = Path.home() / "Documents" / "library"
+REMOTE_HOST = "pc"
+RUN_LOG = Path(__file__).resolve().parent / "run-log"
+UNIT = "yoink-playlist"
+UNAVAILABLE = {"[Private video]", "[Deleted video]"}
+"""The titles a listing gives videos that are gone."""
+VIDEO_URL = re.compile(r"^(?:url|source):.*(?:[?&]v=|youtu\.be/|/(?:live|shorts)/)([\w-]{11})(?![\w-])", re.M)
+HEAD_BYTES = 2048
+"""How much of a transcript to read for its frontmatter."""
+
+
+@dataclass
+class Args:
+    playlists: Annotated[Path, tyro.conf.Positional]
+    """A file with one playlist URL per line; lines starting with # are skipped."""
+    library: Path = LIBRARY
+    """Where the talks land, passed to yoink-talk as --output-dir."""
+    dry_run: bool = False
+    """List the videos a run would yoink and their total length, and yoink nothing."""
+    record: bool = False
+    """Write the run's outcome to the job run log."""
+
+
+def main() -> None:
+    args = tyro.cli(Args, description=__doc__)
+    try:
+        wanted, unread = listed(args.playlists)
+    except OSError as exc:
+        finish(args, [], [], [f"reading {args.playlists} failed: {exc}"])
+    have = transcribed(args.library) | finished()
+    new = [v for v in wanted if v["id"] not in have]
+    hours = sum(v.get("duration") or 0 for v in new) / 3600
+    say(f"{len(wanted)} videos listed, {len(new)} new, {hours:.1f} h")
+    if args.dry_run:
+        for v in new:
+            print(v["id"], v["title"])
+        return
+    done, failed = [], []
+    for v in new:
+        say(f"yoinking {v['id']}: {v['title']}")
+        try:
+            ok = subprocess.run(["yoink-talk", f"https://www.youtube.com/watch?v={v['id']}", "--output-dir", str(args.library.expanduser())]).returncode == 0
+        except FileNotFoundError:
+            finish(args, done, failed, ["yoink-talk is not on PATH", *unread])
+        if ok:
+            finished_path().parent.mkdir(parents=True, exist_ok=True)
+            with finished_path().open("a") as f:
+                f.write(v["id"] + "\n")
+            done.append(v["id"])
+        else:
+            failed.append(v["id"])
+    finish(args, done, failed, unread)
+
+
+def listed(playlists: Path) -> tuple[list[dict], list[str]]:
+    """The available videos of every playlist in the file, each once, in playlist order, and what could not be listed."""
+    videos: dict[str, dict] = {}
+    unread = []
+    for url in playlists.expanduser().read_text().splitlines():
+        url = url.strip()
+        if not url or url.startswith("#"):
+            continue
+        try:
+            for e in entries(url):
+                if e and e.get("title") not in UNAVAILABLE:
+                    videos.setdefault(e["id"], e)
+        except RuntimeError as exc:
+            say(str(exc))
+            unread.append(str(exc))
+    return list(videos.values()), unread
+
+
+def entries(url: str) -> list[dict]:
+    cmd = ["yt-dlp", "--flat-playlist", "-J", "--no-warnings", url]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        say(f"YouTube refused to list {url} here; listing it on {REMOTE_HOST}")
+        r = subprocess.run(["ssh", REMOTE_HOST, shlex.join(cmd)], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f"listing {url} failed: {r.stderr.strip()[-300:]}")
+    try:
+        return json.loads(r.stdout)["entries"]
+    except (ValueError, KeyError):
+        raise RuntimeError(f"{url} did not list as a playlist: {r.stdout[:200]}")
+
+
+def transcribed(library: Path) -> set[str]:
+    """The videos whose finished transcript sits in the library or under $SCRIBE_DIR.
+    The transcript is written last, so a talk a run left half done is not among them."""
+    scribe = Path(os.environ.get("SCRIBE_DIR") or Path.home() / "Documents" / "scribe")
+    ids: set[str] = set()
+    for root in (library.expanduser(), scribe.expanduser()):
+        for md in root.glob("*/*.md"):
+            with md.open("rb") as f:
+                ids.update(VIDEO_URL.findall(f.read(HEAD_BYTES).decode(errors="replace")))
+    return ids
+
+
+def finished_path() -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return state / "yoink-playlist" / "done.txt"
+
+
+def finished() -> set[str]:
+    return set(finished_path().read_text().split()) if finished_path().exists() else set()
+
+
+def finish(args: Args, done: list[str], failed: list[str], problems: list[str]):
+    """Says how the run ended and exits; a video or a playlist that failed makes it a failed run."""
+    problems = [*problems, *([f"failed to yoink {' '.join(failed)}"] if failed else [])]
+    say(f"{len(done)} yoinked, {len(failed)} failed" + ("; " + "; ".join(problems) if problems else ""))
+    if args.record:
+        stats = json.dumps({"yoinked": len(done), "failed": len(failed)})
+        outcome = ["fail", "--reason", "; ".join(problems)[:400]] if problems else ["ok"]
+        subprocess.run([str(RUN_LOG), UNIT, *outcome, "--stats", stats])
+    sys.exit(1 if problems else 0)
+
+
+def say(text: str) -> None:
+    print(text, file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()
