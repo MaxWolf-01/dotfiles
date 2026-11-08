@@ -376,6 +376,40 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Talks playlist → library ---
+
+  # bin/yoink-playlist hands each new video to yoink-talk, which needs with-secrets, uv,
+  # ffmpeg and claude; the wrapper in .nix-profile picks claude's login (see ownLogin).
+  # ssh reaches pc, where the download goes when YouTube refuses the VPN's address.
+  systemd.user.services.yoink-playlist = {
+    Unit = {
+      Description = "Yoink new videos of the talks playlist into the library";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Nice = 10; # decoding a long video should not be felt at the keyboard
+      TimeoutStartSec = "12h";
+      Environment = [
+        "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        ownLogin
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/bin/yoink-playlist ${secrets}/backup/yoink-playlists.txt --record";
+    };
+  };
+
+  systemd.user.timers.yoink-playlist = {
+    Unit.Description = "Daily yoink of the talks playlist";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   systemd.user.services.yapit-health-report = {
     Unit = {
       Description = "Yapit weekly health report";
