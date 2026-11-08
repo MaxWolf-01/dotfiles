@@ -2482,11 +2482,56 @@ function toNewestTurn() {
   if (back && !view.element.contains(back)) back.focus({ preventScroll: true });
 }
 
-// One box per unit, kept while the tab lives. Its unsent text is also kept in localStorage as it is typed, so a
-// reload or a browser restart finds it again; its undo history is the tab's alone.
+// One box per unit, kept while the tab lives; its undo history is the tab's alone. Its unsent words are kept by the
+// unit's hub, which tells every tab of each change, so each browser shows the same words. Until the hub has them they
+// are also in localStorage, so a reload or a browser restart with the hub away sends them once it can.
 const boxes = new Map();
+const TAB = Math.random().toString(36).slice(2); // names this tab's own changes, which the hub tells it of too
+const DRAFT_SAVE_MS = 300;
 const draftKey = (U) => `hub:draft:${U}`;
-const keepDraft = (box) => box.area.value ? localStorage.setItem(draftKey(box.unit), box.area.value) : localStorage.removeItem(draftKey(box.unit));
+function keepDraft(box, wait = DRAFT_SAVE_MS) {
+  box.unsaved = true;
+  localStorage.setItem(draftKey(box.unit), box.area.value);
+  clearTimeout(box.saveAfter);
+  box.saveAfter = setTimeout(() => saveDraft(box), wait);
+}
+// One write at a time, so the hub ends on the newest words; a box that changed meanwhile saves again.
+async function saveDraft(box) {
+  if (box.saving) return void (box.saveAgain = true);
+  box.saving = true;
+  const draft = box.area.value;
+  const answer = await post(hostOf(box.unit), "/api/draft", { unit: box.unit, draft, by: TAB });
+  box.saving = false;
+  if (answer.ok && box.area.value === draft) {
+    box.unsaved = false;
+    localStorage.removeItem(draftKey(box.unit));
+  }
+  if (box.saveAgain) {
+    box.saveAgain = false;
+    saveDraft(box);
+  }
+}
+// Words the hub has not got yet stay; they reach it, and every other tab, when their save lands. Of reads that cross,
+// the last one asked is the one shown.
+async function readDraft(box) {
+  const asked = box.reads = (box.reads ?? 0) + 1;
+  const answer = await post(hostOf(box.unit), "/api/draft", { unit: box.unit });
+  const draft = answer.draft ?? "";
+  if (!answer.ok || asked !== box.reads || box.unsaved || box.area.value === draft) return;
+  box.area.value = draft;
+  sessionWin(box.unit)?.waitingWords?.();
+}
+const syncDraft = (box) => (box.unsaved ? saveDraft(box) : readDraft(box));
+// Another tab changed what is under way in a unit: its words, or what is staged on its session page.
+function underWay(U, kind) {
+  if (kind !== "staged" && boxes.has(U)) syncDraft(boxes.get(U));
+  if (kind !== "draft") sessionWin(U)?.waitingChanged?.();
+}
+// The tab heard nothing for a while, its stream dropped: every box and session page of `host`, or of every host, reads
+// again, and sends what never reached the hub.
+const underWayAgain = (host) => {
+  for (const U of new Set([...boxes.keys(), ...sessionPages.keys()])) if (!host || hostOf(U) === host) underWay(U);
+};
 // A unit's states, as the hub shows the registry's statuses; an idle session waits on you only where it needs you
 const STATE_WORDS = { busy: "working", idle: "idle", waiting: "blocked" };
 
@@ -2667,7 +2712,8 @@ function boxOf(U) {
   const how = Object.assign(document.createElement("div"), { className: "how" });
   const area = Object.assign(document.createElement("textarea"), { rows: 2, spellcheck: true });
   const offer = Object.assign(document.createElement("div"), { className: "handoff", hidden: true });
-  area.value = localStorage.getItem(draftKey(U)) ?? "";
+  const unsaved = localStorage.getItem(draftKey(U));
+  area.value = unsaved ?? "";
   const acts = Object.assign(document.createElement("div"), { className: "acts" });
   const act = (className, words, title) => {
     const b = actButton(className, words, title);
@@ -2693,7 +2739,7 @@ function boxOf(U) {
   const composer = Object.assign(document.createElement("div"), { className: "composer" });
   composer.append(line, foot);
   root.append(bar, composer, picker);
-  const box = { unit: U, root, how, offer, area, acts, pick, jump, close, held: 0, sending: false, armed: 0, stuck: null };
+  const box = { unit: U, root, how, offer, area, acts, pick, jump, close, held: 0, sending: false, armed: 0, stuck: null, unsaved: unsaved !== null };
   pick.addEventListener("click", () => picker.click());
   picker.addEventListener("change", () => {
     if (picker.files.length) attach(box, [...picker.files]);
@@ -2716,6 +2762,7 @@ function boxOf(U) {
   area.addEventListener("dragover", (e) => { if (e.dataTransfer?.types.includes("Files")) e.preventDefault(); });
   area.addEventListener("drop", (e) => { if (files(e.dataTransfer).length) { e.preventDefault(); attach(box, files(e.dataTransfer)); } });
   showBox(box, unit(U));
+  syncDraft(box);
   return box;
 }
 
@@ -2768,7 +2815,7 @@ async function sendToPane(box, body, route, { text, typed, then }) {
     area.setSelectionRange(0, typed.length);
     document.execCommand("delete");
   } else if (typed && area.value.startsWith(typed)) area.value = area.value.slice(typed.length);
-  keepDraft(box);
+  keepDraft(box, 0);
   if (phone()) area.blur(); // the phone's keyboard goes down, the session page in sight again
   const doc = sessionDoc(box.unit);
   keepSent(box.unit, [...sentOf(box.unit), { text, at: Date.now(), seen: doc ? shownAs(doc, text) : 0 }]);
@@ -2800,7 +2847,7 @@ window.hubWaiting = {
   load: ofUnit((U) => post(hostOf(U), "/api/staged", { unit: U })),
   save: ofUnit((U, win, doc) => {
     showBox(boxOf(U), unit(U));
-    return post(hostOf(U), "/api/staged", { unit: U, staged: doc });
+    return post(hostOf(U), "/api/staged", { unit: U, staged: doc, by: TAB });
   }),
   words: ofUnit((U) => boxOf(U).area.value),
   send: ofUnit(async (U, win) => {
@@ -3892,6 +3939,7 @@ events.onopen = () => {
   lost = false;
   for (const p of pending) if (p.unsent) send(p);
   tellPages({ type: "again" });
+  underWayAgain();
   refresh([...details.keys()]).then(() => apply()); // events sent while away are gone
   if (saidDown) note("hub back; caught up");
   saidDown = false;
@@ -3942,6 +3990,7 @@ function listenTo(host) {
       if (ev.type === "reached") {
         showAgain(host);
         tellPages({ type: "again" });
+        underWayAgain(host);
       }
       return refresh([...details.keys()].filter((U) => hostOf(U) === host)).then(() => apply());
     }
@@ -3952,6 +4001,7 @@ function listenTo(host) {
 async function heard(ev) {
   if (ev.type === "code") return newCode(ev);
   if (ev.type === "page") return tellPages(ev); // nothing of the hub's index changed
+  if (ev.type === "under-way") return ev.by === TAB ? undefined : underWay(ev.unit, ev.kind);
   if (ev.type === "numbers") return layOver(null, ev);
   if (ev.type === "visit") return layOver(ev.unit.includes("/") ? hostOf(ev.unit) : null, ev);
   await refresh(ev.units ?? (["added", "reopened", "listed", "close"].includes(ev.type) ? [ev.unit] : []));
