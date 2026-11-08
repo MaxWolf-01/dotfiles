@@ -73,12 +73,15 @@ typeset -gA JOVIAL_SYMBOL=(
     git.dirty '✘✘✘'
     git.clean '✔'
 
-    ## preset arrows
-    # arrow '─>'
-    # arrow '─▶'
-    arrow '─➤'
-    arrow.git-clean '(๑˃̵ᴗ˂̵)و'
-    arrow.git-dirty '(ﾉ˚Д˚)ﾉ'
+    # the typing pointer: outside a repo, in a clean one, in a dirty one
+    arrow '○'
+    arrow.git-clean '●'
+    arrow.git-dirty '◐'
+    # after the pointer: commits not pushed, commits not pulled (as of the
+    # last fetch), and a branch with no upstream
+    git.ahead '⇡'
+    git.behind '⇣'
+    git.no-upstream '⇡'
 )
 
 
@@ -373,6 +376,8 @@ zle -N @jov.infer-prompt-rerender
 # variables for git prompt
 typeset -g jovial_rev_git_dir=""
 typeset -g jovial_is_git_dirty=false
+# the ahead/behind marks shown after the typing pointer
+typeset -g jovial_git_sync=""
 
 @jov.chpwd-git-dir-hook() {
     # it's the same as  jovial_rev_git_dir=`\git rev-parse --git-dir 2>/dev/null`
@@ -464,6 +469,7 @@ typeset -gA jovial_affix_lengths=()
         else
             jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow.git-dirty]}"
         fi
+        jovial_parts[typing]+="${jovial_git_sync}"
     else
         jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow]}"
     fi
@@ -819,6 +825,21 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
     fi
 }
 
+# prints "<dirty> <ahead> <behind>": dirty is `true` or `false`; ahead and
+# behind are commit counts against the upstream, `-` when the branch has no
+# upstream, `x` when HEAD is detached
+@jov.judge-git-state() {
+    local ahead_behind
+    if ! \git symbolic-ref -q HEAD > /dev/null 2>&1; then
+        ahead_behind='x x'
+    elif ahead_behind="$(\git rev-list --left-right --count 'HEAD...@{upstream}' 2> /dev/null)"; then
+        ahead_behind="${ahead_behind//$'\t'/ }"
+    else
+        ahead_behind='- -'
+    fi
+    echo "$(@jov.judge-git-dirty) ${ahead_behind}"
+}
+
 @jov.git-action-prompt() {
     # always depend on ${jovial_rev_git_dir} path is existed
 
@@ -888,16 +909,16 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
 
 
 # use `exec` to parallel run commands and capture stdout into file descriptor
-#   @jov.set-git-info [true|false]
-# first param is whether git is dirty or not (`true` or `false`), 
-# if first param is not set, will try to read by exec
+#   @jov.set-git-info ["<dirty> <ahead> <behind>"]
+# the param is the output of `@jov.judge-git-state`;
+# if it is not set, will try to read by exec
 @jov.set-git-info() {
-    local is_dirty="$1"
+    local git_state_line="$1"
 
-    local dirty_fd branch_fd action_fd
+    local state_fd branch_fd action_fd
 
-    if [[ -z ${is_dirty} ]]; then
-        exec {dirty_fd}<> <(@jov.judge-git-dirty)
+    if [[ -z ${git_state_line} ]]; then
+        exec {state_fd}<> <(@jov.judge-git-state)
     fi
 
     exec {branch_fd}<> <(@jov.git-branch)
@@ -909,9 +930,21 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
     exec {branch_fd}>& -
     exec {action_fd}>& -
 
-    if [[ -n ${dirty_fd} ]]; then
-        is_dirty="$(<& ${dirty_fd})"
-        exec {dirty_fd}>& -
+    if [[ -n ${state_fd} ]]; then
+        git_state_line="$(<& ${state_fd})"
+        exec {state_fd}>& -
+    fi
+
+    local is_dirty ahead behind
+    read -r is_dirty ahead behind <<< "${git_state_line}"
+
+    local previous_git_sync="${jovial_git_sync}"
+    jovial_git_sync=''
+    if [[ ${ahead} == '-' ]]; then
+        jovial_git_sync="${JOVIAL_SYMBOL[git.no-upstream]}"
+    elif [[ ${ahead} == <-> && ${behind} == <-> ]]; then
+        (( ahead > 0 )) && jovial_git_sync+="${JOVIAL_SYMBOL[git.ahead]}${ahead}"
+        (( behind > 0 )) && jovial_git_sync+="${JOVIAL_SYMBOL[git.behind]}${behind}"
     fi
 
     local git_state='' state_color='' git_dirty_status=''
@@ -937,7 +970,8 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
 
     local has_changed=false
 
-    if [[ ${jovial_parts[git-info]} != ${jovial_previous_parts[git-info]} ]]; then
+    if [[ ${jovial_parts[git-info]} != ${jovial_previous_parts[git-info]} \
+        || ${jovial_git_sync} != ${previous_git_sync} ]]; then
         has_changed=true
     fi
 
@@ -965,7 +999,7 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
     jovial_parts[git-info]="${jovial_previous_parts[git-info]}"
     jovial_part_lengths[git-info]="${jovial_previous_lengths[git-info]}"
 
-    @jov.async 'git-info' @jov.judge-git-dirty @jov.set-git-info
+    @jov.async 'git-info' @jov.judge-git-state @jov.set-git-info
 }
 
 # `EPOCHSECONDS` is setup in zsh/datetime module
