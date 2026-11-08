@@ -70,15 +70,12 @@ typeset -gA JOVIAL_SYMBOL=(
     corner.top    '╭─'
     corner.bottom '╰─'
 
-    git.dirty '✘✘✘'
-    git.clean '✔'
-
     # the typing pointer: outside a repo, in a clean one, in a dirty one;
     # one cell wide, so commands always start in the same column
     arrow '○'
     arrow.git-clean '●'
     arrow.git-dirty '◐'
-    # after the git status: commits not pushed, commits not pulled (as of the
+    # after the branch: commits not pushed, commits not pulled (as of the
     # last fetch), and a branch with no upstream
     git.ahead '⇡'
     git.behind '⇣'
@@ -122,9 +119,10 @@ typeset -gA JOVIAL_PALETTE=(
     conj. '%F{2}'
     # shell typing area pointer
     typing '%F{13}'
+    typing.git-clean '%F{10}'
+    typing.git-dirty '%F{11}'
     # for other common case text color
     normal '%F{13}'
-    success '%F{10}'
     error '%F{9}'
 )
 
@@ -461,17 +459,15 @@ typeset -gA jovial_affix_lengths=()
 }
 
 @jov.set-typing-pointer() {
-    jovial_parts[typing]="${JOVIAL_PALETTE[typing]}"
-
+    local state=''
     if [[ -n ${jovial_rev_git_dir} ]]; then
         if [[ ${jovial_is_git_dirty} == false ]]; then
-            jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow.git-clean]}"
+            state='.git-clean'
         else
-            jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow.git-dirty]}"
+            state='.git-dirty'
         fi
-    else
-        jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow]}"
     fi
+    jovial_parts[typing]="${JOVIAL_PALETTE[typing${state}]}${JOVIAL_SYMBOL[arrow${state}]}"
 }
 
 @jov.set-venv-info() {
@@ -948,23 +944,10 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
     fi
     [[ -n ${git_sync} ]] && git_sync=" ${git_sync}"
 
-    local git_state='' state_color='' git_dirty_status=''
- 
-    if [[ ${is_dirty} == true ]]; then
-        git_state='dirty'
-        state_color='error'
-    else
-        git_state='clean'
-        state_color='success'
-    fi
-
-    git_dirty_status="${JOVIAL_PALETTE[${state_color}]}${JOVIAL_SYMBOL[git.${git_state}]}"
-
-    jovial_parts[git-info]="${JOVIAL_AFFIXES[git-info.prefix]}${JOVIAL_PALETTE[git]}${git_branch}${git_action}${JOVIAL_AFFIXES[git-info.suffix]}${git_dirty_status}${JOVIAL_PALETTE[normal]}${git_sync}"
+    jovial_parts[git-info]="${JOVIAL_AFFIXES[git-info.prefix]}${JOVIAL_PALETTE[git]}${git_branch}${git_action}${JOVIAL_PALETTE[normal]}${git_sync}${JOVIAL_AFFIXES[git-info.suffix]}"
 
     jovial_part_lengths[git-info]=$((
-        ${#JOVIAL_SYMBOL[git.${git_state}]}
-        + ${jovial_affix_lengths[git-info]}
+        ${jovial_affix_lengths[git-info]}
         + ${#git_branch}
         + ${#git_action}
         + ${#git_sync}
@@ -972,7 +955,9 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
 
     local has_changed=false
 
-    if [[ ${jovial_parts[git-info]} != ${jovial_previous_parts[git-info]} ]]; then
+    # the dirty state shows only in the typing pointer, so it counts as a change too
+    if [[ ${jovial_parts[git-info]} != ${jovial_previous_parts[git-info]} \
+        || ${is_dirty} != ${jovial_is_git_dirty} ]]; then
         has_changed=true
     fi
 
