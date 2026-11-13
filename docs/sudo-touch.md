@@ -9,9 +9,9 @@ How each half works: `nix/home/sudo-touch.nix` (zephylux) and
 The touch is `sufficient`, ahead of the password, never `required`. With no key
 plugged in, no registered key, no forwarded agent, or no touch, sudo asks for
 the password as it always did. A key plugged in but left untouched gives up
-after its own wait, which nothing here can set, so sudo asks for the touch ten
-times in a row before it gets to the password. On pc and xmg19 a missed touch
-costs two of the key's waits, about a minute: ssh-agent takes the key's
+after its own wait, which nothing here can set, so sudo asks for the touch several
+times in a row before it gets to the password: ten times on zephylux, five on
+pc and xmg19, where a missed touch costs two of the key's waits, about a minute: ssh-agent takes the key's
 timeout for a missing PIN and tries once more with an empty one. With no key
 plugged in, every ask fails at once. A sudo on pc and xmg19 raises one
 notification on the laptop for all its asks; on zephylux each ask prints the

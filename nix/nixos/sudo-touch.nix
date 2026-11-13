@@ -8,7 +8,7 @@ let
   # lengthen, so sudo asks this many times in a row: a missed touch is asked for
   # again, and the password comes only after the last ask. Every ask raises its
   # own notification on the laptop.
-  asks = 10;
+  asks = 5;
   rssh = config.security.pam.services.sudo.rules.auth.rssh;
 in
 {
