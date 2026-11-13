@@ -45,7 +45,7 @@
   # layer instead, which outranks the user config anyway.
   home.sessionVariables = {
     NPM_CONFIG_USERCONFIG = "${config.xdg.configHome}/npm/npmrc";
-    NPM_CONFIG_MIN_RELEASE_AGE = "7";
+    NPM_CONFIG_MIN_RELEASE_AGE = "2";
     # Global installs and `npm link` need a writable prefix; the default derives
     # from node's location, which is the read-only nix store.
     NPM_CONFIG_PREFIX = "${config.home.homeDirectory}/.local";
