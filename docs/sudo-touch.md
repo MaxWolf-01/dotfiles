@@ -10,9 +10,12 @@ The touch is `sufficient`, ahead of the password, never `required`. With no key
 plugged in, no registered key, no forwarded agent, or no touch, sudo asks for
 the password as it always did. A key plugged in but left untouched gives up
 after its own wait, which nothing here can set, so sudo asks for the touch ten
-times in a row before it gets to the password: the time to reach the key is
-ten of the key's waits. Each ask on pc and xmg19 raises a notification on the
-laptop; on zephylux each prints the cue in the terminal. A machine set up
+times in a row before it gets to the password. On pc and xmg19 a missed touch
+costs two of the key's waits, about a minute: ssh-agent takes the key's
+timeout for a missing PIN and tries once more with an empty one. With no key
+plugged in, every ask fails at once. A sudo on pc and xmg19 raises one
+notification on the laptop for all its asks; on zephylux each ask prints the
+cue in the terminal. A machine set up
 before the ten asks keeps one on zephylux until `./setup sudo_touch` runs
 there again; pc and xmg19 take them with their next `nswitch`.
 
