@@ -1,0 +1,425 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro", "requests", "beautifulsoup4", "lxml"]
+# ///
+"""Watch a full JKU group or exam sitting for a free seat, and announce it the moment one frees.
+
+group watches a Moodle group choice (a grouptool activity, mod/grouptool) for a seat in the group
+max wants; with --swap it also takes the seat, through grouptool's own "Register" or "Change group"
+button and its confirmation, as max's click would, then reads the page again and announces which
+group the page says he is in. exam watches one sitting of a KUSSS exam (LVA number, date, place)
+and only announces; registering stays max's click.
+
+Both sign in as max with the username and password in the sops file `jku` (JKU__USERNAME,
+JKU__PASSWORD), through the sign-in of bin/moodle and bin/kusss, which this tool loads; started
+without them, it re-runs itself under `with-secrets jku`. Without --swap, every request it sends is
+one those two tools send: a read.
+
+A free seat is announced with notify-send and alert-send, once, then every 30 minutes while it stays
+free. A loop keeps one signed-in session and signs in again when it ends; --once runs one pass, for
+a timer. With --run-log, every pass is recorded with bin/run-log: ok, skip (past --until) or fail (a
+read failed, the page did not look as expected, or an announcement could not be sent).
+
+Where grouptool's queue is on, a full group offers "Change group (queue)" and Moodle moves max in
+by itself when a seat frees; group says so when it sees that button on the wanted group, and never
+queues on its own.
+
+Examples:
+
+    jku-seat-watch group 13924633 --want "Vienna"
+    jku-seat-watch group 13924633 --want "Vienna" --swap --until 2026-12-10
+    jku-seat-watch exam --lva 365.075 --date 2027-02-03 --place Vienna --once --run-log jku-seat-watch-ml
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json as jsonlib
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import date, datetime
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from typing import Annotated, Callable
+
+import requests
+import tyro
+from bs4 import BeautifulSoup
+from tyro.extras import SubcommandApp
+
+BIN = Path(__file__).resolve().parent
+STATE = Path.home() / ".local/state/jku-seat-watch"
+AGAIN = 1800  # seconds before a seat still free is announced again
+
+
+def load(name: str):
+    """bin/<name> as a module, registered in sys.modules, where dataclasses resolve their annotations."""
+    module = name + "_cli"
+    loader = SourceFileLoader(module, str(BIN / name))
+    loaded = sys.modules[module] = importlib.util.module_from_spec(importlib.util.spec_from_loader(module, loader))
+    loader.exec_module(loaded)
+    return loaded
+
+
+moodle = load("moodle")
+kusss = load("kusss")
+app = SubcommandApp()
+
+
+def clean(s: str) -> str:
+    return re.sub(r"\s+", " ", s.replace("\xa0", " ")).strip()
+
+
+# ----------------------------------------------------------------------------- shared by both watchers
+
+@dataclass
+class Watch:
+    once: bool = False
+    """Run one pass and exit (for a systemd timer). Default: loop every --interval seconds."""
+    until: str = ""
+    """ISO date; after it, record a skip and exit 0 without reading anything."""
+    notify: bool = True
+    """Announce with notify-send (the desktop)."""
+    alert: bool = True
+    """Announce with alert-send (the unattended alert mail)."""
+    run_log: str = ""
+    """Unit name for bin/run-log: every pass is recorded there with its seats as stats. Empty records nothing."""
+
+
+class Unexpected(Exception):
+    """A page that does not look the way this tool reads it: the site changed, or showed something else."""
+
+
+def record(w: Watch, outcome: str, reason: str | None, stats: dict) -> None:
+    if not w.run_log:
+        return
+    cmd = ["run-log", w.run_log, outcome, "--stats", jsonlib.dumps(stats, ensure_ascii=False)]
+    subprocess.run(cmd + (["--reason", reason[:500]] if reason else []), check=False)
+
+
+def announce(w: Watch, title: str, body: str) -> list[str]:
+    """Send on every channel turned on; return the ones that failed."""
+    failed = []
+    if w.notify and subprocess.run(["notify-send", "-u", "critical", title, body], check=False).returncode:
+        failed.append("notify-send")
+    if w.alert and subprocess.run(["alert-send", title], input=body.encode(), check=False).returncode:
+        failed.append("alert-send")
+    return failed
+
+
+def tell(w: Watch, throttle: Throttle, key: str, title: str, body: str) -> list[str]:
+    """Announce unless key was announced within the last 30 minutes; return the channels that failed."""
+    if not throttle.due(key):
+        return []
+    failed = announce(w, title, body)
+    if w.notify or w.alert:
+        throttle.mark(key)
+    return failed
+
+
+class Throttle:
+    """When each announcement last went out, kept on disk so a timer's passes share it."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.sent: dict[str, float] = jsonlib.loads(path.read_text()) if path.exists() else {}
+
+    def due(self, key: str) -> bool:
+        return time.time() - self.sent.get(key, 0) > AGAIN
+
+    def mark(self, key: str) -> None:
+        self.sent[key] = time.time()
+        self.save()
+
+    def forget(self, key: str) -> None:
+        if self.sent.pop(key, None) is not None:
+            self.save()
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(jsonlib.dumps(self.sent))
+
+
+def run(w: Watch, interval: int, start: Callable[[], Callable[[], bool]]) -> None:
+    """start signs in and returns one pass, which returns True when nothing is left to watch for (the seat is max's).
+    A sign-in that fails exits, as bin/moodle and bin/kusss do, after the failure is recorded."""
+    if w.until and date.today() > date.fromisoformat(w.until):
+        print(f"past {w.until}, nothing to watch", file=sys.stderr)
+        record(w, "skip", f"past --until {w.until}", {})
+        return
+    try:
+        one_pass = start()
+        while not one_pass() and not w.once:
+            time.sleep(interval)
+    except SystemExit as e:
+        if e.code not in (0, None):
+            record(w, "fail", str(e.code), {})
+        raise
+
+
+# ----------------------------------------------------------------------------- Moodle grouptool
+
+@dataclass
+class Group:
+    """One group of a grouptool page, as the page shows it to max."""
+
+    agrpid: str | None
+    name: str
+    registered: int
+    size: int | None  # None: grouptool sets no size, the group takes everyone
+    mine: bool  # max is registered in it
+    queued: bool  # max is in its queue
+    button: str | None  # name of the button max could press on it: reg[<agrpid>] or unreg[<agrpid>]
+    label: str  # the button's text: Register, Change group, Change group (queue), Queue, ...
+
+    @property
+    def free(self) -> bool:
+        return self.size is None or self.registered < self.size
+
+    def seats(self) -> str:
+        return f"{self.registered}/{self.size if self.size is not None else '∞'}"
+
+
+def groups(soup: BeautifulSoup) -> list[Group]:
+    """Every group panel of a grouptool page (div.group, h2.panel-title, span.fillratio 'Registered: n/size')."""
+    out = []
+    for box in soup.select("div.group"):
+        title, ratio = box.select_one("h2.panel-title"), box.select_one("span.fillratio")
+        m = re.search(r"(\d+)\s*/\s*(\d+|∞)", ratio.get_text() if ratio else "")
+        if not title or not m:
+            raise Unexpected(f"a group panel without a name or a 'Registered: n/size' count: {clean(box.get_text(' '))[:120]!r}")
+        button = box.find("button", attrs={"name": re.compile(r"^(un)?reg\[\d+\]$")})
+        members = box.find("a", href=re.compile(r"agrpid=\d+"))
+        agrpid = re.search(r"\[(\d+)\]", button["name"]) if button else re.search(r"agrpid=(\d+)", members["href"]) if members else None
+        classes = box.get("class", [])
+        out.append(Group(agrpid=agrpid.group(1) if agrpid else None, name=clean(title.get_text(" ")),
+                         registered=int(m.group(1)), size=None if m.group(2) == "∞" else int(m.group(2)),
+                         mine="alert-success" in classes, queued="alert-warning" in classes,
+                         button=button["name"] if button else None, label=clean(button.get_text(" ")) if button else ""))
+    return out
+
+
+def wanted(gs: list[Group], want: str) -> Group:
+    hits = [g for g in gs if want.casefold() in g.name.casefold()]
+    if len(hits) != 1:
+        names = ", ".join(g.name for g in (hits or gs))
+        raise Unexpected(f"--want {want!r} matches {len(hits)} groups, not one; the page has: {names}")
+    return hits[0]
+
+
+class Grouptool:
+    """A signed-in Moodle session on one grouptool activity. Reads through bin/moodle's read-only page();
+    take() is the one place this tool acts on Moodle."""
+
+    def __init__(self, cm: int, connect: Callable[[], object] | None = None):
+        self.cm = cm
+        self.connect = connect or moodle.connect
+        self.m = self.connect()
+
+    def page(self) -> BeautifulSoup:
+        """The grouptool page, signing in again once when Moodle sends the session elsewhere (it ended)."""
+        for attempt in (1, 2):
+            r = self.m.page("/mod/grouptool/view.php", id=self.cm)
+            if "/mod/grouptool/view.php" in r.url:
+                return BeautifulSoup(r.text, "lxml")
+            if attempt == 1:
+                self.m = self.connect()
+        raise Unexpected(f"Moodle answers grouptool {self.cm} with {r.url}: the activity is hidden, gone, or not one max can open")
+
+    def take(self, soup: BeautifulSoup, group: Group) -> str:
+        """Press the group's button, then grouptool's Continue; return grouptool's message. Raises Unexpected when
+        grouptool refuses: its confirmation then offers no Continue that carries confirm=1."""
+        form = soup.find("form", id="registration_form")
+        if not form or not group.button or not group.button.startswith("reg["):
+            raise Unexpected(f"no Register or Change group button on {group.name!r}")
+        data = {i["name"]: i.get("value", "") for i in form.find_all("input", type="hidden") if i.get("name")}
+        r = self.post(form["action"], data | {group.button: group.agrpid})
+        confirm = BeautifulSoup(r.text, "lxml")
+        message = clean(confirm.select_one("#notice .modal-body").get_text(" ")) if confirm.select_one("#notice .modal-body") else ""
+        go = next((f for f in confirm.find_all("form", method=re.compile("post", re.I))
+                   if f.find("input", attrs={"name": "confirm", "value": "1"})), None)
+        if not go:
+            raise Unexpected(f"grouptool refused {group.name!r}: {message or 'its confirmation offers no Continue'}")
+        fields = {i["name"]: i.get("value", "") for i in go.find_all("input") if i.get("name")}
+        if (fields.get("action"), fields.get("group")) != ("reg", group.agrpid):
+            raise Unexpected(f"grouptool's Continue would do {fields.get('action')!r} on group {fields.get('group')!r}, not reg on {group.agrpid}")
+        self.post(go["action"], fields)  # whether it took, the caller reads off the page again
+        return message
+
+    def post(self, url: str, data: dict) -> requests.Response:
+        if not url.startswith(moodle.MOODLE + "/mod/grouptool/view.php"):
+            raise Unexpected(f"refusing to post to {url}: not this grouptool page")
+        r = self.m.s.post(url, data=data, timeout=60)
+        r.raise_for_status()
+        return r
+
+
+@dataclass
+class GroupArgs(Watch):
+    cm: Annotated[int, tyro.conf.Positional] = 0
+    """The grouptool activity's id: the id= in its mod/grouptool/view.php link."""
+    want: str = ""
+    """The wanted group: text its name contains, matching exactly one group (case does not matter)."""
+    swap: bool = False
+    """Take the seat when one frees: Register, or Change group when max is in another group."""
+    interval: int = 60
+    """Seconds between passes when looping."""
+
+
+def group_pass(args: GroupArgs, tool: Grouptool, throttle: Throttle) -> bool:
+    key = f"group/{args.cm}/{args.want}"
+    try:
+        soup = tool.page()
+        gs = groups(soup)
+        if not gs:
+            raise Unexpected("the grouptool page lists no groups")
+        target = wanted(gs, args.want)
+        mine = [g.name for g in gs if g.mine]
+        stats = {"want": target.name, "seats": target.seats(), "mine": mine}
+        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {target.name}: {target.seats()}{'  FREE' if target.free else ''}"
+              f"  (you: {', '.join(mine) or 'no group'})")
+        if target.mine:
+            record(args, "ok", None, stats | {"done": True})
+            print(f"you are in {target.name}; nothing left to watch", file=sys.stderr)
+            return True
+        failed: list[str] = []
+        if "queue" in target.label.casefold():
+            failed += tell(args, throttle, key + "/queue", f"Moodle: {target.name} has a queue",
+                           f"{target.name} is full and offers '{target.label}': join the queue and Moodle moves you in when a seat frees.\n"
+                           f"{moodle.MOODLE}/mod/grouptool/view.php?id={args.cm}")
+        if not target.free:
+            throttle.forget(key)
+            return finish(args, failed, stats)
+        if args.swap and target.button and target.button.startswith("reg["):
+            message = tool.take(soup, target)
+            after = groups(tool.page())
+            now_in = [g.name for g in after if g.mine]
+            ok = target.name in now_in
+            failed += announce(args, f"Moodle: {'moved you into' if ok else 'could not move you into'} {target.name}",
+                               f"grouptool said: {message}\nThe page now shows you in: {', '.join(now_in) or 'no group'}\n"
+                               f"{moodle.MOODLE}/mod/grouptool/view.php?id={args.cm}")
+            if not ok:
+                raise Unexpected(f"after the swap the page shows max in {now_in or 'no group'}, not {target.name}")
+            finish(args, failed, stats | {"mine": now_in, "swapped": True})
+            return True
+        why = "" if target.button else "\nThe page offers no button on it: registration may be closed, or changing groups not allowed."
+        failed += tell(args, throttle, key, f"Moodle seat free: {target.name} {target.seats()}",
+                       f"{target.name}: {target.seats()}{why}\n{moodle.MOODLE}/mod/grouptool/view.php?id={args.cm}")
+        return finish(args, failed, stats)
+    except (Unexpected, requests.RequestException, moodle.MoodleError) as e:
+        print(f"jku-seat-watch: {e}", file=sys.stderr)
+        record(args, "fail", str(e), {})
+        return False
+
+
+def finish(w: Watch, failed: list[str], stats: dict) -> bool:
+    if failed:
+        print(f"jku-seat-watch: announcement failed: {', '.join(failed)}", file=sys.stderr)
+        record(w, "fail", f"announcement failed: {', '.join(failed)}", stats)
+    else:
+        record(w, "ok", None, stats)
+    return False
+
+
+@app.command(name="group")
+def group(args: GroupArgs) -> None:
+    """Watch a Moodle grouptool group for a free seat; with --swap, take it."""
+    if not args.cm or not args.want:
+        sys.exit("jku-seat-watch group: give the activity id and --want")
+    throttle = Throttle(STATE / f"group-{args.cm}.json")
+
+    def start() -> Callable[[], bool]:
+        tool = Grouptool(args.cm)
+        return lambda: group_pass(args, tool, throttle)
+
+    run(args, args.interval, start)
+
+
+# ----------------------------------------------------------------------------- KUSSS exam sitting
+
+@dataclass
+class ExamArgs(Watch):
+    lva: str = ""
+    """The exam's LVA number, as 365.075."""
+    date: str = ""
+    """The sitting's date, ISO: 2027-02-03."""
+    place: str = ""
+    """Text the sitting's place contains (Vienna, HS 1); case does not matter."""
+    interval: int = 300
+    """Seconds between passes when looping."""
+
+
+def sitting(rows: list[dict], args: ExamArgs) -> dict:
+    hits = [e for e in rows if e["lva_nr"] == args.lva and e["date"] == args.date and args.place.casefold() in (e["place"] or "").casefold()]
+    if len(hits) != 1:
+        seen = sorted({f"{e['lva_nr']} {e['date']} {e['place']}" for e in rows if e["lva_nr"] == args.lva})
+        raise Unexpected(f"{args.lva} on {args.date} at {args.place!r} matches {len(hits)} sittings, not one; KUSSS lists: {'; '.join(seen) or 'none'}")
+    return hits[0]
+
+
+class Exams:
+    """A signed-in KUSSS session reading the exam page, through bin/kusss's read-only Session."""
+
+    def __init__(self, connect: Callable[[], object] | None = None):
+        self.connect = connect or (lambda: kusss.connect()[0])
+        self.k = self.connect()
+
+    def rows(self) -> list[dict]:
+        """The exams of max's courses, signing in again once when the page is not the exam list (the session ended)."""
+        for attempt in (1, 2):
+            try:
+                return kusss.exams(self.k.soup(kusss.ME + "szsearchexam.action", search="true", searchType="mylvas"))
+            except kusss.Unreadable:
+                if attempt == 2:
+                    raise
+                self.k = self.connect()
+        return []
+
+
+def exam_pass(args: ExamArgs, source: Exams, throttle: Throttle) -> bool:
+    key = f"exam/{args.lva}/{args.date}/{args.place}"
+    try:
+        e = sitting(source.rows(), args)
+        cap, n = e["capacity"], e["registrations"]
+        free = e["status"] == "open" and (cap is None or (n or 0) < cap)
+        seats = f"{n}/{cap if cap is not None else '∞'}"
+        stats = {"sitting": f"{e['course']} {e['date']} {e['place']}", "seats": seats, "status": e["status"]}
+        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {e['course']} {e['date']} {e['place']}: {seats} {e['status']}")
+        if e["status"] == "registered":
+            record(args, "ok", None, stats | {"done": True})
+            print("you are registered for it; nothing left to watch", file=sys.stderr)
+            return True
+        failed: list[str] = []
+        if not free:
+            throttle.forget(key)
+        else:
+            failed = tell(args, throttle, key, f"KUSSS exam seat free: {e['course']} {e['date']} {e['place']}",
+                          f"{e['lva_nr']} {e['course']}, {e['start'] or e['date']} at {e['place']}: {seats}\n"
+                          f"Registration closes {e['registration_closes']}.\n{kusss.ME}szsearchexam.action?search=true&searchType=mylvas")
+        return finish(args, failed, stats)
+    except (Unexpected, kusss.Unreadable, requests.RequestException) as e:
+        print(f"jku-seat-watch: {e}", file=sys.stderr)
+        record(args, "fail", str(e), {})
+        return False
+
+
+@app.command(name="exam")
+def exam(args: ExamArgs) -> None:
+    """Watch one sitting of a KUSSS exam for a free seat, and announce it; registering stays max's click."""
+    if not (args.lva and args.date and args.place):
+        sys.exit("jku-seat-watch exam: give --lva, --date and --place")
+    throttle = Throttle(STATE / "exams.json")
+
+    def start() -> Callable[[], bool]:
+        source = Exams()
+        return lambda: exam_pass(args, source, throttle)
+
+    run(args, args.interval, start)
+
+
+if __name__ == "__main__":
+    app.cli(description=__doc__, config=(tyro.conf.OmitArgPrefixes,))

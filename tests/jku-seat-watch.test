@@ -1,0 +1,243 @@
+#!/usr/bin/env -S uv run --script --quiet
+# tier: fast
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["tyro", "requests", "beautifulsoup4", "lxml"]
+# ///
+"""Drive bin/jku-seat-watch without Moodle or KUSSS. Run it directly; no framework.
+
+The promises here (agent/tickets/jku-seat-watch.md): without --swap it never posts anything (P1);
+a swap presses the wanted group's own button and then grouptool's Continue, refuses when grouptool
+offers no Continue that confirms, and counts as done only when the page read afterwards shows max in
+the group (P2); a free seat is announced once, again only after 30 minutes, and anew after the group
+filled up in between, and a failed read or announcement is a failed pass in the run log (P3).
+
+The grouptool markup is cut down from moodle.jku.at's grouptool page as it was on 2026-11-13, keeping
+what the parser reads; the buttons and the confirmation are as mod_grouptool's view_controller.php and
+grouptool_utils::confirm render them.
+"""
+
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check import bin_module, check, finish  # noqa: E402
+
+jsw = bin_module("jku-seat-watch")
+MOODLE = jsw.moodle.MOODLE
+VIEW = MOODLE + "/mod/grouptool/view.php"
+
+
+def panel(name: str, n: int, size: str, extra: str = "", button: str = "") -> str:
+    return (f'<div class="box py-3 generalbox group {extra}"><div class="panel-text"><h2 class="panel-title">{name}</h2>'
+            f'<div class="panel-body"><span class="fillratio">Registered: {n}/{size}</span>'
+            f'<span class="showmembers"><a href="{MOODLE}/mod/grouptool/showmembers.php?agrpid={abs(hash(name)) % 1000}&amp;contextid=1">'
+            f'Show group members</a></span>{button}</div></div></div>')
+
+
+def reg(agrpid: int, label: str) -> str:
+    return f'<button type="submit" name="reg[{agrpid}]" value="{agrpid}" class="regbutton btn btn-primary">{label}</button>'
+
+
+def grouptool(*panels: str) -> str:
+    return (f'<html><body><form id="registration_form" action="{VIEW}" method="post">'
+            '<input type="hidden" name="id" value="42" /><input type="hidden" name="sesskey" value="KEY" />'
+            '<input type="hidden" name="tab" value="selfregistration" />' + "".join(panels) + "</form></body></html>")
+
+
+def confirmation(agrpid: int, ok: bool = True) -> str:
+    fields = (f'<input type="hidden" name="confirm" value="1"><input type="hidden" name="group" value="{agrpid}">' if ok else "")
+    return ('<div class="modal" id="notice"><div class="modal-body"><p>'
+            + ("Do you really want to change to Vienna?" if ok else "You can't change groups: registration is closed") + "</p></div>"
+            f'<div class="modal-footer"><form method="{"post" if ok else "get"}" action="{VIEW}"><input type="hidden" name="id" value="42">'
+            f'{fields}<input type="hidden" name="action" value="reg"><input type="hidden" name="sesskey" value="KEY">'
+            '<input type="hidden" name="tab" value="selfregistration"><button type="submit">Continue</button></form></div></div>')
+
+
+LINZ_MINE = panel("SE1 Linz", 30, "60", "alert alert-success")
+VIENNA_FULL = panel("SE1 Vienna (DLC)", 48, "48", "alert alert-danger group-full")
+VIENNA_FREE = panel("SE1 Vienna (DLC)", 47, "48", "empty", reg(7, "Change group"))
+VIENNA_MINE = panel("SE1 Vienna (DLC)", 48, "48", "alert alert-success")
+LINZ_FREE = panel("SE1 Linz", 29, "60", "empty", reg(6, "Change group"))
+
+
+class Response:
+    def __init__(self, url: str, text: str):
+        self.url, self.text = url, text
+
+    def raise_for_status(self): ...
+
+
+class FakeMoodle:
+    """Answers the grouptool page from a list of pages, one per read (the last repeats), and records posts."""
+
+    def __init__(self, pages: list[str], posts: list[str] | None = None, landing: str = ""):
+        self.pages, self.post_answers, self.landing = list(pages), list(posts or []), landing
+        self.reads, self.posted = 0, []
+        self.s = self
+
+    def page(self, path: str, **params):
+        assert path == "/mod/grouptool/view.php" and set(params) == {"id"}, (path, params)
+        self.reads += 1
+        text = self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+        return Response(self.landing or f"{VIEW}?id={params['id']}", text)
+
+    def post(self, url, data, timeout):
+        self.posted.append((url, dict(data)))
+        return Response(url, self.post_answers.pop(0) if self.post_answers else "")
+
+
+said: list[tuple[str, str]] = []
+logged: list[tuple[str, str | None]] = []
+jsw.announce = lambda w, title, body: said.append((title, body)) or []
+jsw.record = lambda w, outcome, reason, stats: logged.append((outcome, reason))
+state = Path(tempfile.mkdtemp())
+
+
+def watcher(fake: FakeMoodle, swap: bool = False, want: str = "Vienna"):
+    args = jsw.GroupArgs(cm=42, want=want, swap=swap, once=True)
+    tool = jsw.Grouptool(42, connect=lambda: fake)
+    throttle = jsw.Throttle(state / f"{len(list(state.iterdir()))}.json")
+    return lambda: jsw.group_pass(args, tool, throttle)
+
+
+def reset():
+    said.clear()
+    logged.clear()
+
+
+# --- reading the page
+
+gs = jsw.groups(jsw.BeautifulSoup(grouptool(LINZ_MINE, VIENNA_FREE, panel("Bregenz", 3, "∞")), "lxml"))
+check("every group panel is read with its seats", [("SE1 Linz", 30, 60), ("SE1 Vienna (DLC)", 47, 48), ("Bregenz", 3, None)],
+      [(g.name, g.registered, g.size) for g in gs])
+check("the group max is in is the green one", [True, False, False], [g.mine for g in gs])
+check("a group's button and its id come from the button's name", ("reg[7]", "7", "Change group"), (gs[1].button, gs[1].agrpid, gs[1].label))
+check("a group without a size has a seat", True, gs[2].free)
+
+# --- P1: without --swap nothing is posted, and a freed seat is announced once
+
+reset()
+fake = FakeMoodle([grouptool(LINZ_MINE, VIENNA_FULL), grouptool(LINZ_MINE, VIENNA_FREE), grouptool(LINZ_MINE, VIENNA_FREE),
+                   grouptool(LINZ_MINE, VIENNA_FULL), grouptool(LINZ_MINE, VIENNA_FREE)])
+step = watcher(fake)
+step()
+check("a full wanted group announces nothing", [], said)
+step()
+check("a seat freeing is announced", ["Moodle seat free: SE1 Vienna (DLC) 47/48"], [t for t, _ in said])
+step()
+check("a seat still free is not announced again within 30 minutes", 1, len(said))
+step()
+step()
+check("a seat that frees again after the group filled is announced anew", 2, len(said))
+check("without --swap nothing is ever posted", [], fake.posted)
+check("every pass is recorded as ok", ["ok"] * 5, [o for o, _ in logged])
+
+# --- P2: the swap presses the group's button, then grouptool's Continue, then reads the page again
+
+reset()
+fake = FakeMoodle([grouptool(LINZ_MINE, VIENNA_FREE), grouptool(LINZ_FREE, VIENNA_MINE)], posts=[confirmation(7), "<html></html>"])
+done = watcher(fake, swap=True)()
+check("the first post presses the wanted group's button with the form's own fields",
+      (VIEW, {"id": "42", "sesskey": "KEY", "tab": "selfregistration", "reg[7]": "7"}), fake.posted[0])
+check("the second post is grouptool's Continue, confirming reg on that group",
+      {"id": "42", "confirm": "1", "group": "7", "action": "reg", "sesskey": "KEY", "tab": "selfregistration"}, fake.posted[1][1])
+check("a swap the page confirms ends the watch", True, done)
+check("the swap is announced with grouptool's words and the group the page shows",
+      True, said[0][0] == "Moodle: moved you into SE1 Vienna (DLC)" and "Do you really want to change" in said[0][1] and "SE1 Vienna" in said[0][1])
+
+reset()
+fake = FakeMoodle([grouptool(LINZ_MINE, VIENNA_FREE)], posts=[confirmation(7, ok=False)])
+done = watcher(fake, swap=True)()
+check("a confirmation without Continue is a refusal: nothing more is posted", 1, len(fake.posted))
+check("the refusal is a failed pass carrying grouptool's words", True,
+      logged[-1][0] == "fail" and "registration is closed" in logged[-1][1])
+check("a refused swap does not end the watch", False, done)
+
+reset()
+fake = FakeMoodle([grouptool(LINZ_MINE, VIENNA_FREE), grouptool(LINZ_MINE, VIENNA_FREE)], posts=[confirmation(7), ""])
+done = watcher(fake, swap=True)()
+check("a swap the page afterwards does not show is a failed pass", ("fail", False), (logged[-1][0], done))
+check("and it is announced as not done", "Moodle: could not move you into SE1 Vienna (DLC)", said[0][0])
+
+reset()
+no_button = panel("SE1 Vienna (DLC)", 47, "48", "empty")
+fake = FakeMoodle([grouptool(LINZ_MINE, no_button)])
+watcher(fake, swap=True)()
+check("a free group without a button is announced, not pressed", ([], True), (fake.posted, "offers no button" in said[0][1]))
+
+reset()
+queue = panel("SE1 Vienna (DLC)", 48, "48", "alert alert-danger group-full", reg(7, "Change group (queue)"))
+fake = FakeMoodle([grouptool(LINZ_MINE, queue)])
+watcher(fake, swap=True)()
+check("a full group with a queue is announced as one, and never queued on its own",
+      (["Moodle: SE1 Vienna (DLC) has a queue"], []), ([t for t, _ in said], fake.posted))
+
+reset()
+fake = FakeMoodle([grouptool(LINZ_FREE, VIENNA_MINE)])
+check("max already in the wanted group ends the watch", True, watcher(fake)())
+
+# --- P3: what the page does not say, and a session that ended
+
+reset()
+fake = FakeMoodle([grouptool(LINZ_MINE, VIENNA_FULL, panel("SE2 Vienna", 1, "48"))])
+watcher(fake)()
+check("a --want matching two groups is a failed pass naming them", True, logged[-1][0] == "fail" and "SE2 Vienna" in logged[-1][1])
+
+reset()
+ended, fresh = FakeMoodle([""], landing=MOODLE + "/login/index.php"), FakeMoodle([grouptool(LINZ_MINE, VIENNA_FULL)])
+sessions = iter([ended, fresh])
+tool = jsw.Grouptool(42, connect=lambda: next(sessions))
+jsw.group_pass(jsw.GroupArgs(cm=42, want="Vienna", once=True), tool, jsw.Throttle(state / "ended.json"))
+check("a session sent to the login is signed in again once, and the pass reads on", (1, 1, "ok"), (ended.reads, fresh.reads, logged[-1][0]))
+
+reset()
+jsw.announce = lambda w, title, body: ["alert-send"]
+watcher(FakeMoodle([grouptool(LINZ_MINE, VIENNA_FREE)]))()
+check("an announcement that could not be sent is a failed pass", True, logged[-1][0] == "fail" and "alert-send" in logged[-1][1])
+jsw.announce = lambda w, title, body: said.append((title, body)) or []
+
+# --- the exam sitting
+
+ROWS = [{"course": "Machine Learning: Supervised Techniques", "lva_nr": "365.075", "date": "2027-02-03", "start": "2027-02-03T09:00",
+         "place": place, "capacity": cap, "registrations": n, "status": status, "registration_closes": "2027-01-29T23:59"}
+        for place, cap, n, status in (("Vienna", 65, 65, "full"), ("HS 10", 79, 79, "full"), ("Bregenz", None, 29, "open"))]
+
+
+class FakeExams:
+    def __init__(self, rows):
+        self.r = rows
+
+    def rows(self):
+        return self.r
+
+
+def exam_step(rows, place="Vienna"):
+    return jsw.exam_pass(jsw.ExamArgs(lva="365.075", date="2027-02-03", place=place, once=True), FakeExams(rows),
+                         jsw.Throttle(state / "exams.json"))
+
+
+reset()
+exam_step(ROWS)
+check("a full sitting announces nothing", ([], "ok"), (said, logged[-1][0]))
+freed = [dict(r, registrations=64, status="open") if r["place"] == "Vienna" else r for r in ROWS]
+exam_step(freed)
+check("a sitting with a free seat is announced", ["KUSSS exam seat free: Machine Learning: Supervised Techniques 2027-02-03 Vienna"],
+      [t for t, _ in said])
+exam_step(freed)
+check("and not again within 30 minutes", 1, len(said))
+check("a sitting without a limit has a seat", "KUSSS exam seat free: Machine Learning: Supervised Techniques 2027-02-03 Bregenz",
+      (exam_step(ROWS, "Bregenz"), said[-1][0])[1])
+exam_step(ROWS, "nowhere")
+check("a place matching no sitting is a failed pass listing the sittings", True, logged[-1][0] == "fail" and "HS 10" in logged[-1][1])
+check("max registered for the sitting ends the watch", True, exam_step([dict(ROWS[0], status="registered")]))
+
+# --- --until
+
+reset()
+connected = []
+jsw.run(jsw.Watch(until="2000-01-01", once=True), 1, lambda: connected.append(1) or (lambda: True))
+check("past --until nothing is signed into, and the pass is a skip", ([], "skip"), (connected, logged[-1][0]))
+
+finish()
