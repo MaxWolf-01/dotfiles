@@ -35,7 +35,7 @@ let
   };
   askpass = pkgs.writeShellApplication {
     name = "ssh-sk-askpass";
-    runtimeInputs = (with pkgs; [ coreutils gawk gnused iproute2 util-linux ]) ++ [ notify ];
+    runtimeInputs = (with pkgs; [ coreutils gawk gnused iproute2 procps util-linux ]) ++ [ notify ];
     # No errexit: a host it fails to place is still a prompt to show.
     bashOptions = [ "nounset" "pipefail" ];
     text = builtins.readFile ./ssh-sk-askpass.sh;
