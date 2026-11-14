@@ -15,9 +15,10 @@ let
 
   # uv runs lifelog for the collectors' last runs jarvis-sync ships; jq because
   # bin/run-log builds its line with it; curl, sops and gnugrep for the `clawd quota`
-  # report it ships, the last two through with-secrets.
+  # report it ships, the last two through with-secrets; util-linux for the flock it
+  # copies the lifelog folder under, google-health-collect's lock.
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh uv jq curl sops gnugrep
+    bash coreutils rsync openssh uv jq curl sops gnugrep util-linux
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
@@ -696,7 +697,8 @@ in
   systemd.user.timers.google-health-collect = {
     Unit.Description = "Google Health collection (hourly)";
     Timer = {
-      # Done ahead of jarvis-sync's :35, which ships the store.
+      # Done ahead of jarvis-sync's :35, which ships the store. When both start at once
+      # after a wake, jarvis-sync waits for the collector's lock between two days' writes.
       OnCalendar = "*:32:00";
       Persistent = true;
     };
