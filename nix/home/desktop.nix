@@ -44,6 +44,7 @@ in
 
   home.packages = with pkgs; [
     bitwarden-cli # bw
+    chiaki-ng # PS5 Remote Play; its state, registration keys included, is backed up, not declared
     dconf2nix
     # Ubuntu's AppArmor profile for /usr/bin/notify-send lets it call only Notify
     # and GetServerInformation: it cannot ask whether the server has actions, so
