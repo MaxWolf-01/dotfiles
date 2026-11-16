@@ -157,8 +157,14 @@ in
       # reboot is a failure tried again. ExitOnForwardFailure: an ssh that
       # could not make the socket exits rather than holding nothing.
       # StreamLocalBindUnlink: the socket a killed ssh left is made anew.
+      # ForwardAgent twice: ssh checks that the agent socket path from
+      # ./sudo-touch.nix exists even with forwarding off, and that check always
+      # fails, which ExitOnForwardFailure turns into an exit. The first option
+      # turns forwarding off, the second takes the path's place with one that
+      # exists; for each, the first value ssh reads wins over the config's.
       ExecStart = lib.escapeShellArgs [ "${pkgs.openssh}/bin/ssh" "-N" "-oBatchMode=yes" "-oConnectTimeout=10"
         "-oServerAliveInterval=15" "-oServerAliveCountMax=3" "-oExitOnForwardFailure=yes"
+        "-oForwardAgent=no" "-oForwardAgent=/dev/null"
         "-oStreamLocalBindUnlink=yes" "-L" "${peerSocket name}:${socket}" peer.ssh ];
       Environment = [ "SSH_AUTH_SOCK=%t/ssh-agent" ];
       Restart = "always";
