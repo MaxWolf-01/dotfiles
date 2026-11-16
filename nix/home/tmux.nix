@@ -209,6 +209,11 @@ in
       set -as terminal-overrides ',xterm-ghostty:Smulx=\E[4::%p1%dm'
       set -as terminal-overrides ',xterm-ghostty:Setulc=\E[58::2::%p1%{65536}%/%d::%p1%{256}%/%{255}%&%d::%p1%{255}%&%d%;m'
 
+      # The server outlives the ghostty that started it. Without these, panes keep
+      # pointing at that ghostty's store path after an upgrade, and a ghostty
+      # started from a pane loads the old version's resources.
+      set -ga update-environment " GHOSTTY_RESOURCES_DIR GHOSTTY_BIN_DIR TERMINFO"
+
       # Renumber windows when one is closed
       set -g renumber-windows on
 
