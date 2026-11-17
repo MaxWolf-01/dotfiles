@@ -448,6 +448,7 @@
     nerd-fonts.hack
     nodejs
     nvd
+    nixos-rebuild-ng # bin/deploy, which switches remote hosts from here
     nvtopPackages.full
     openssh
     poppler-utils

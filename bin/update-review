@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# update-review: the weekly flake lock bump, reviewed by Claude before any host
+# gets it, and applied by max (agent ticket reviewed-updates-reach-every-host).
+set -uo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: update-review run       bump the lock on a branch, build, review, report
+       update-review show      open the waiting bump's report
+       update-review apply     put the waiting bump on master and deploy it everywhere
+       update-review dismiss   drop the waiting bump
+
+run updates every flake input on the branch update/<date>, in a worktree of
+~/.dotfiles at ~/.cache/update-review/checkout, and builds every host's system
+and this machine's Home Manager with the old lock and the new one. Claude then
+reads what changed (nvd's version diff per host, and any failed build's log),
+looks up the changelogs and advisories that matter, and rates the bump:
+
+  routine     nothing to know beyond "things moved"
+  promising   a feature, speed or stability gain worth knowing about
+  critical    a security fix
+  held        a likely or suspected breaking change, a build that failed, or
+              anything it cannot judge
+
+The report goes to ~/logs/update-review/<date>/report.html, and the rating and
+the report's path to ~/.local/state/update-review/state.json, which the update
+dot in the top bar shows. A run replaces a bump still waiting. Nobody is
+notified; the run's outcome goes to the run log (run-log).
+
+apply rebases the bump onto origin's master, pushes it there, fast-forwards
+master in ~/.dotfiles, and runs `deploy --all`. The dot clears once every host
+switched. dismiss clears it and deletes the branch.
+
+Environment: CLAUDE_MODEL (default claude-opus-5-5), RUN_LOG_DIR as run-log.
+EOF
+}
+
+dotfiles="${DOTFILES:-$HOME/.dotfiles}"
+checkout="$HOME/.cache/update-review/checkout"
+state_dir="$HOME/.local/state/update-review"
+state="$state_dir/state.json"
+reports="$HOME/logs/update-review"
+prompt_file="$dotfiles/.claude/commands/update-review.md"
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+die() { echo "update-review: $*" >&2; exit 1; }
+field() { jq -r ".$1 // empty" "$state" 2>/dev/null; }
+
+drop_bump() {
+    local branch; branch="$(field branch)"
+    git -C "$dotfiles" worktree remove --force "$checkout" 2>/dev/null
+    [ -n "$branch" ] && git -C "$dotfiles" branch -D "$branch" >/dev/null 2>&1
+    rm -f "$state"
+}
+
+# The hosts a bump has to build for: every system in the flake, and this
+# machine's Home Manager while it runs Home Manager alone.
+targets() {
+    nix eval --json "$1#nixosConfigurations" --apply 'builtins.attrNames' \
+        | jq -r '.[] | select(. != "installer") | "nixosConfigurations.\(.).config.system.build.toplevel"'
+    [ -e /etc/NIXOS ] || echo "homeConfigurations.${NIX_HOST:-$(hostname)}.activationPackage"
+}
+
+cmd_run() {
+    local unit=update-review day branch base run_dir
+    day="$(date +%F)"
+    branch="update/$day"
+    run_dir="$reports/$day"
+    fail() { "$here/run-log" "$unit" fail --reason "$1"; die "$1"; }
+
+    git -C "$dotfiles" fetch -q origin master || fail "could not fetch origin's master"
+    base="$(git -C "$dotfiles" rev-parse origin/master)"
+    [ -f "$state" ] && drop_bump
+    mkdir -p "$(dirname "$checkout")" "$run_dir" "$state_dir"
+    git -C "$dotfiles" worktree add -q -B "$branch" "$checkout" "$base" || fail "could not make the worktree at $checkout"
+
+    nix flake update --flake "$checkout" 2> "$run_dir/flake-update.log" || fail "nix flake update failed: $run_dir/flake-update.log"
+    if git -C "$checkout" diff --quiet -- flake.lock; then
+        git -C "$dotfiles" worktree remove --force "$checkout"
+        git -C "$dotfiles" branch -D "$branch" >/dev/null
+        "$here/run-log" "$unit" skip --reason "no flake input moved"
+        echo "update-review: no flake input moved"
+        return 0
+    fi
+    git -C "$checkout" commit -q -m "nix: update flake inputs ($day)" -- flake.lock || fail "could not commit the bump"
+
+    local old="git+file://$dotfiles?rev=$base" new="git+file://$checkout" failed=() target name old_out new_out
+    while read -r target; do
+        name="${target#*Configurations.}"; name="${name%%.*}"
+        echo "update-review: building $name"
+        old_out="$(nix build --no-link --print-out-paths "$old#$target" 2> "$run_dir/build-$name-old.log")"
+        if ! new_out="$(nix build --no-link --print-out-paths "$new#$target" 2> "$run_dir/build-$name.log")"; then
+            failed+=("$name")
+            continue
+        fi
+        rm -f "$run_dir/build-$name.log" "$run_dir/build-$name-old.log"
+        if [ -n "$old_out" ]; then
+            nvd diff "$old_out" "$new_out" > "$run_dir/diff-$name.txt" 2>&1
+        else
+            echo "the old lock does not build for $name; nothing to compare against" > "$run_dir/diff-$name.txt"
+        fi
+    done < <(targets "$new")
+    git -C "$checkout" diff "$base" -- flake.lock > "$run_dir/flake-lock.diff"
+
+    local schema verdict
+    schema='{"type":"object","required":["level","headline","report"],"additionalProperties":false,"properties":{
+      "level":{"enum":["routine","promising","critical","held"]},
+      "headline":{"type":"string","description":"one line: the rating and its main reason"},
+      "report":{"type":"string","description":"the report, in markdown"}}}'
+    verdict="$(cd "$run_dir" && awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { fm = 0; next } !fm' "$prompt_file" | claude -p --safe-mode \
+        --model "${CLAUDE_MODEL:-claude-opus-5-5}" \
+        --tools "Read,Grep,Glob,WebSearch,WebFetch" --allowedTools "Read,Grep,Glob,WebSearch,WebFetch" \
+        --no-session-persistence --output-format json --json-schema "$schema" \
+        "The bump is in this directory, $run_dir. Builds that failed: ${failed[*]:-none}.")" \
+        || fail "claude -p failed: ${verdict: -500}"
+    verdict="$(jq -c 'if type == "array" then .[-1] else . end | .structured_output // empty' <<<"$verdict")"
+    [ -n "$verdict" ] || fail "claude -p returned no verdict"
+
+    local level
+    level="$(jq -r .level <<<"$verdict")"
+    [ ${#failed[@]} -gt 0 ] && level=held
+    jq -r .report <<<"$verdict" > "$run_dir/report.md"
+    pandoc -s --metadata title="Update review $day" -o "$run_dir/report.html" "$run_dir/report.md" \
+        || fail "pandoc could not render $run_dir/report.md"
+    jq -n --arg level "$level" --arg headline "$(jq -r .headline <<<"$verdict")" \
+        --arg report "$run_dir/report.html" --arg branch "$branch" --arg date "$day" \
+        '{level: $level, headline: $headline, report: $report, branch: $branch, date: $date}' > "$state.partial" \
+        && mv "$state.partial" "$state"
+    "$here/run-log" "$unit" ok --stats "$(jq -n --arg level "$level" --argjson failed ${#failed[@]} '{level: $level, failed_builds: $failed}')"
+    echo "update-review: $level, $run_dir/report.html"
+}
+
+cmd_show() {
+    [ -f "$state" ] || die "no bump waits"
+    claude-browser "$(field report)"
+}
+
+cmd_apply() {
+    [ -f "$state" ] || die "no bump waits"
+    echo "update-review: applying the $(field level) bump of $(field date): $(field headline)"
+    git -C "$checkout" fetch -q origin master || die "could not fetch origin's master"
+    git -C "$checkout" rebase -q origin/master || { git -C "$checkout" rebase --abort; die "the bump does not rebase onto origin's master, which moved the lock too; run update-review run again"; }
+    git -C "$checkout" push -q origin HEAD:master || die "could not push the bump to master"
+    [ "$(git -C "$dotfiles" branch --show-current)" = master ] \
+        || die "pushed, but ~/.dotfiles is not on master; check it out, pull, and run deploy --all"
+    git -C "$dotfiles" merge -q --ff-only origin/master \
+        || die "pushed, but master in ~/.dotfiles did not fast-forward; pull, then run deploy --all"
+    "$here/deploy" --all || die "the bump is on master, but some hosts did not switch; deploy those again"
+    drop_bump
+}
+
+case "${1:-}" in
+    run) cmd_run ;;
+    show) cmd_show ;;
+    apply) cmd_apply ;;
+    dismiss) [ -f "$state" ] || die "no bump waits"; drop_bump ;;
+    -h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

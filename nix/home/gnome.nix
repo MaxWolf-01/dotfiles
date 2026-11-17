@@ -11,6 +11,8 @@
 
   # The VPN state dot. Wayland loads a changed extension only at the next login.
   xdg.dataFile."gnome-shell/extensions/vpn-dot@maxwolf-01".source = ../../desktop/vpn-dot;
+  # The update dot: a reviewed flake lock bump waiting (bin/update-review).
+  xdg.dataFile."gnome-shell/extensions/update-dot@maxwolf-01".source = ../../desktop/update-dot;
 
   dconf.settings = {
     "org/gnome/shell/keybindings" = {
@@ -36,6 +38,7 @@
         "copyous@boerdereinar.dev"
         "tilingshell@ferrarodomenico.com"
         "vpn-dot@maxwolf-01"
+        "update-dot@maxwolf-01"
       ];
     };
 
