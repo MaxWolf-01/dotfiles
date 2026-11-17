@@ -104,7 +104,6 @@
       ".env"
       "node_modules"
       "repomix-output.*"
-      "**/uv.lock"
       ".idea"
       ".vscode"
       "*.swp"
