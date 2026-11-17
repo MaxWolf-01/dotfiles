@@ -92,7 +92,9 @@ in
   # Forwarded only where SSH_SK_FORWARD names the agent, which every
   # interactive zsh sets (.zshrc, read by no other shell): a touch request comes
   # from a terminal max or his agents type in, never from a timer or a script
-  # started outside one. Where it is unset, ssh connects without forwarding.
+  # started outside one. Where it is unset, ssh connects without forwarding,
+  # unless it runs with ExitOnForwardFailure, which makes the check below exit
+  # (container-hub.nix's peer forward says how it gets around it).
   # ssh warns 'Cannot forward agent socket path "$SSH_SK_FORWARD"' on every
   # connection, set or not: it checks that the socket exists before it reads the
   # variable (OpenSSH bug 4056, bugzilla.mindrot.org). The braced
