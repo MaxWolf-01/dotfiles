@@ -3,23 +3,30 @@
 # Run nix/home/ssh-sk-askpass.sh the way ssh-agent does, against a stand-in for the YubiKey agent's socket and for
 # the ssh client forwarding it, all in a scratch directory and on loopback. Run it directly; no framework.
 #
-# What max relies on: while a key waits for a touch a notification is up, naming the host whose session asked; and
-# it goes as soon as the wait ends, whether ssh-agent ends it or dies. The notification service is a stand-in on a
-# private session bus (fake-notifications.sh).
+# What max relies on: while a key waits for a touch a notification is up, naming the host whose session asked; the
+# asks of one sudo, which follow each other within moments, show it once; it goes shortly after the last of them ends,
+# whether ssh-agent ends it or dies; a PIN prompt is declined at once; and with no YubiKey plugged in nothing shows.
+# The notification service is a stand-in on a private session bus (fake-notifications.sh).
 
 set -uo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$repo/tests/check.sh"
 . "$repo/tests/fake-notifications.sh"
-needs python3 jq ss setsid
+needs python3 jq ss setsid pgrep waitpid flock
 askpass="$repo/nix/home/ssh-sk-askpass.sh"
 scratch=$(mktemp -d)
 pids=()
 trap 'kill "${pids[@]}" 2>/dev/null; fake_notifications_stop; rm -rf "$scratch"' EXIT
 
 export XDG_RUNTIME_DIR="$scratch/run" SSH_SK_AGENT_SOCK="$scratch/agent" SSH_SK_HOSTS="$scratch/hosts"
+export SSH_SK_HIDRAW="$scratch/hidraw"
 mkdir -p "$XDG_RUNTIME_DIR" "$scratch/bin"
+# A keyboard and a YubiKey, by the first bytes of their HID report descriptors: usage page 0x01 (generic desktop),
+# and 0xF1D0 (FIDO).
+mkdir -p "$SSH_SK_HIDRAW"/hidraw{0,6}/device
+printf '\x05\x01\x09\x06\xa1\x01' >"$SSH_SK_HIDRAW/hidraw0/device/report_descriptor"
+printf '\x06\xd0\xf1\x09\x01\xa1' >"$SSH_SK_HIDRAW/hidraw6/device/report_descriptor"
 ln -s "$repo/bin/notify" "$scratch/bin/notify"
 # A tmux whose one pane runs this test's shell, so the stand-in ssh client below, a child of it, runs in that pane.
 cat >"$scratch/bin/tmux" <<TMUX
@@ -64,11 +71,55 @@ if await_shown 1 5; then
 else
     fail "a notification is up while the key waits for a touch"
 fi
+# A missed touch, as ssh-agent goes on from it: the ask ends, a PIN prompt follows at once, the key waits for a
+# touch once more in a new ssh-sk-helper, and pam_rssh asks again. All of it shows as the one notification. This
+# shell stands in for ssh-agent, the askpass's parent.
 kill -TERM "$asking"
-await_shown 0 5 && passed "ssh-agent's SIGTERM withdraws the notification" ||
-    fail "ssh-agent's SIGTERM withdraws the notification"
 wait "$asking"
 check "the askpass exits 0 on SIGTERM" 0 "$?"
+# ssh-agent reads the answer from a pipe until EOF, and OpenSSH leaves a second copy of the pipe open in the askpass
+# beside its stdout: fd 4 here. Nothing the askpass leaves running may hold either.
+start=$SECONDS
+bash "$askpass" "Enter PIN and confirm user presence for ED25519-SK key SHA256:4bQb:" 4>&1 | cat
+check "a PIN prompt is declined" 1 "${PIPESTATUS[0]}"
+check "at once, its pipe closed" yes "$( [ $((SECONDS - start)) -le 1 ] && echo yes)"
+# A script, so that its process carries the helper's name; its sleep goes with it.
+printf '#!/usr/bin/env bash\ntrap "kill \\$!" TERM\nsleep 600 & wait\n' >"$scratch/bin/ssh-sk-helper"
+chmod +x "$scratch/bin/ssh-sk-helper"
+ssh-sk-helper &
+helper=$!
+pids+=($helper)
+# Past the grace an ask's end has.
+sleep 3
+check "the notification stays up while the key waits once more" 1 "$(shown | grep -c .)"
+kill "$helper"
+wait "$helper" 2>/dev/null
+SSH_ASKPASS_PROMPT=none bash "$askpass" "$message" &
+asking=$!
+pids+=($asking)
+sleep 1
+check "the next ask of the same sudo shows no second notification" 1 \
+    "$(jq -s 'map(select(.event == "notify")) | length' "$fake_notifications_log")"
+kill -TERM "$asking"
+wait "$asking"
+await_shown 0 5 && passed "the last ask's end withdraws the notification" ||
+    fail "the last ask's end withdraws the notification"
+
+# A missed touch on the last ask: the notification goes once the key's second wait is over.
+SSH_ASKPASS_PROMPT=none bash "$askpass" "$message" &
+asking=$!
+pids+=($asking)
+await_shown 1 5 || fail "a notification is up for a new sudo"
+kill -TERM "$asking"
+wait "$asking"
+bash "$askpass" "Enter PIN and confirm user presence for ED25519-SK key SHA256:4bQb:"
+ssh-sk-helper &
+helper=$!
+pids+=($helper)
+sleep 3
+check "the last ask's notification stays up through the key's second wait" 1 "$(shown | grep -c .)"
+kill "$helper"
+await_shown 0 5 && passed "and goes when that wait ends" || fail "and goes when that wait ends"
 
 # No ssh client on the socket: the host is not known, and the notification still shows.
 kill "${pids[1]}"
@@ -85,6 +136,11 @@ fi
 kill -TERM "$asking"
 await_shown 0 5 || fail "the notification with no ssh client goes on SIGTERM"
 
+# A PIN prompt outside any ask shows nothing.
+bash "$askpass" "Enter PIN for ED25519-SK key SHA256:4bQb:"
+check "a PIN prompt with no ask before it is declined" 1 "$?"
+await_shown 0 1 || fail "a PIN prompt with no ask before it shows nothing"
+
 # ssh-agent going without a word (SIGKILL) ends the wait too.
 bash -c 'SSH_ASKPASS_PROMPT=none bash "$1" "$2" & wait' _ "$askpass" "$message" &
 agent=$!
@@ -96,5 +152,13 @@ if await_shown 1 5; then
 else
     fail "a notification is up under a parent that dies"
 fi
+
+# No YubiKey plugged in: every ask fails at once, and none shows.
+rm -r "$SSH_SK_HIDRAW/hidraw6"
+before=$(grep -c '"notify"' "$fake_notifications_log")
+start=$SECONDS
+SSH_ASKPASS_PROMPT=none bash "$askpass" "$message"
+check "with no YubiKey plugged in the askpass exits at once" yes "$( [ $((SECONDS - start)) -le 1 ] && echo yes)"
+check "and shows nothing" "$before" "$(grep -c '"notify"' "$fake_notifications_log")"
 
 finish

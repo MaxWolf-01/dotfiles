@@ -19,8 +19,10 @@
       show-screenshot-ui = [ "<Primary><Shift><Super>s" ];
       toggle-message-tray = [ "<Super>n" ];
       toggle-overview = [];
-      # Free Super+N for workspace switching (handled in wm/keybindings)
-      switch-to-application-1 = [];
+      # Application 1 is the first of favorite-apps, Ghostty: Ctrl+Alt+T brings its
+      # most recent window to the front, or opens one when none is open. A further
+      # window is Ctrl+Alt+Shift+T (media-keys terminal) or Ctrl+Shift+N inside Ghostty.
+      switch-to-application-1 = [ "<Primary><Alt>t" ];
       switch-to-application-2 = [];
       switch-to-application-3 = [];
       switch-to-application-4 = [];
@@ -37,6 +39,16 @@
         "tilingshell@ferrarodomenico.com"
         "vpn-dot@maxwolf-01"
       ];
+      # The order is what switch-to-application-N counts; Ghostty stays first.
+      favorite-apps = [
+        "com.mitchellh.ghostty.desktop"
+        "org.gnome.Nautilus.desktop"
+      ];
+    };
+
+    # Ubuntu Dock's hot keys take over switch-to-application-N.
+    "org/gnome/shell/extensions/dash-to-dock" = {
+      hot-keys = false;
     };
 
     # Path is .../applications/, not .../default-applications/ as the schema id
@@ -95,9 +107,10 @@
       unmaximize = [ "<Super>Down" ];
       # Ubuntu's default adds <Primary><Alt>d, left out so the hub tab's ctrl+alt keys can have it.
       show-desktop = [ "<Primary><Super>d" "<Super>d" ];
-      switch-to-workspace-1 = [ "<Super>1" ];
-      switch-to-workspace-2 = [ "<Super>2" ];
-      switch-to-workspace-3 = [ "<Super>3" ];
+      # Workspaces go unused here, so Super+N stays free.
+      switch-to-workspace-1 = [];
+      switch-to-workspace-2 = [];
+      switch-to-workspace-3 = [];
       # Alt+Tab for windows, Super+Tab for apps
       switch-windows = [ "<Alt>Tab" ];
       switch-windows-backward = [ "<Shift><Alt>Tab" ];
@@ -120,7 +133,7 @@
       search = [ "<Super>f" ];
       www = [ "<Super>c" ];
       screensaver = [ "<Super>l" ];
-      terminal = [ "<Primary><Alt>t" ];
+      terminal = [ "<Primary><Alt><Shift>t" ];
       # Custom keybindings list
       custom-keybindings = [
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"

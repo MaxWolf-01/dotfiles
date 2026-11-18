@@ -880,7 +880,7 @@ PEERS = [
     peer("de-fra-wg-401", "Germany", "Frankfurt"),
     peer("nl-ams-wg-001", "Netherlands", "Amsterdam"),
     peer("de-fra-wg-001", "Germany", "Frankfurt"),
-    peer("de-fra-wg-203", "Germany", "Frankfurt", online=False),
+    peer("de-fra-wg-002", "Germany", "Frankfurt", online=False),
     peer("ch-zrh-wg-001", "Switzerland", "Zurich"),
     peer("de-dus-wg-101", "Germany", "Dusseldorf"),
     peer("us-ash-wg-001", "USA", "Ashburn, VA"),

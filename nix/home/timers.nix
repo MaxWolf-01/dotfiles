@@ -15,9 +15,10 @@ let
 
   # uv runs lifelog for the collectors' last runs jarvis-sync ships; jq because
   # bin/run-log builds its line with it; curl, sops and gnugrep for the `clawd quota`
-  # report it ships, the last two through with-secrets.
+  # report it ships, the last two through with-secrets; util-linux for the flock it
+  # copies the lifelog folder under, google-health-collect's lock.
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh uv jq curl sops gnugrep
+    bash coreutils rsync openssh uv jq curl sops gnugrep util-linux
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
@@ -86,6 +87,12 @@ let
   # with-secrets runs sops exec-env for the Enable Banking application's id, and
   # the collector sops for its private key; jq for bin/run-log.
   erstePath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv sops jq
+  ]);
+
+  # google-health-collect sops-decrypts its OAuth client and refresh token, and is
+  # a uv script; jq for bin/run-log.
+  googleHealthPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv sops jq
   ]);
 
@@ -693,6 +700,40 @@ in
     Timer = {
       # Ten to, in hours neither calendar-collect nor jku-collect takes.
       OnCalendar = "08,20:50:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Google Health → google-health.duckdb ---
+  # The watch's data from the Google Health API, every type at native grain. What a
+  # run reads and replaces: secrets/scripts/google-health-collect --help.
+
+  systemd.user.services.google-health-collect = {
+    Unit = {
+      Description = "Read the watch's data from the Google Health API into the lifelog store";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${googleHealthPath}"
+      ];
+      ExecStart = "${secrets}/scripts/google-health-collect fetch";
+      # Three days are about 140 requests, a minute at the API's pace; a fetch after
+      # the laptop was off for weeks reads every day since, some minutes more.
+      TimeoutStartSec = "1h";
+      Nice = 10;
+    };
+  };
+
+  systemd.user.timers.google-health-collect = {
+    Unit.Description = "Google Health collection (hourly)";
+    Timer = {
+      # Done ahead of jarvis-sync's :35, which ships the store. When both start at once
+      # after a wake, jarvis-sync waits for the collector's lock between two days' writes.
+      OnCalendar = "*:32:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];

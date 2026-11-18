@@ -16,14 +16,12 @@ let
           selected_value = "#000000";
           random = false;
         };
-        show_branded_background_image = false;
-        show_sponsored_sites = false;
-        hide_all_widgets = true;
         show_stats = false;
         show_clock = false;
         show_brave_news = false;
         show_rewards = false;
         show_brave_vpn = false;
+        show_together = false; # Brave Talk
       };
       # Leo's surfaces. The feature itself only goes away through the
       # BraveAIChatEnabled policy: brave-core ignores an unmanaged
@@ -39,7 +37,11 @@ let
         enabled = false;
         show_brave_rewards_button_in_location_bar = false;
       };
-      brave_ads.enabled = false;
+      # Sponsored images and sites on the new tab page, then ads as notifications.
+      brave_ads = {
+        sponsored.enabled = false;
+        notifications.enabled = false;
+      };
       wallet.show_wallet_icon_on_toolbar = false;
       # Brave News, under its old name.
       today = {
