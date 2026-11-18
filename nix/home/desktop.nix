@@ -44,6 +44,17 @@ in
 
   home.packages = with pkgs; [
     bitwarden-cli # bw
+    # PS5 Remote Play; its state, registration keys included, is backed up, not declared.
+    # Sony's PSN push server sends no intermediate certificate, so chiaki-ng
+    # fetches it and verifies the chain against the CA bundle libcurl names.
+    # Nixpkgs' libcurl names none (it falls back to OpenSSL's default paths), so
+    # the chain had no root and remote play over PSN failed; this one names
+    # nixpkgs' own bundle.
+    (chiaki-ng.override {
+      curlFull = curlFull.overrideAttrs (old: {
+        configureFlags = (old.configureFlags or [ ]) ++ [ "--with-ca-bundle=${cacert}/etc/ssl/certs/ca-bundle.crt" ];
+      });
+    })
     dconf2nix
     # Ubuntu's AppArmor profile for /usr/bin/notify-send lets it call only Notify
     # and GetServerInformation: it cannot ask whether the server has actions, so
