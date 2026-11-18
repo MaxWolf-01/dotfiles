@@ -49,10 +49,10 @@ in
     # fetches it and verifies the chain against the CA bundle libcurl names.
     # Nixpkgs' libcurl names none (it falls back to OpenSSL's default paths), so
     # the chain had no root and remote play over PSN failed; this one names
-    # Ubuntu's bundle.
+    # nixpkgs' own bundle.
     (chiaki-ng.override {
       curlFull = curlFull.overrideAttrs (old: {
-        configureFlags = (old.configureFlags or [ ]) ++ [ "--with-ca-bundle=/etc/ssl/certs/ca-certificates.crt" ];
+        configureFlags = (old.configureFlags or [ ]) ++ [ "--with-ca-bundle=${cacert}/etc/ssl/certs/ca-bundle.crt" ];
       });
     })
     dconf2nix
