@@ -44,7 +44,18 @@ in
 
   home.packages = with pkgs; [
     bitwarden-cli # bw
-    chiaki-ng # PS5 Remote Play; its state, registration keys included, is backed up, not declared
+    # PS5 Remote Play; its state, registration keys included, is backed up, not declared.
+    # Sony's PSN push server sends no intermediate certificate, so chiaki-ng
+    # fetches it and rebuilds the chain against the roots libcurl names. Nixpkgs'
+    # libcurl names none (it falls back to OpenSSL's defaults), so the rebuild
+    # failed and remote play over PSN with it; the patch falls back the same way.
+    (chiaki-ng.overrideAttrs (old: {
+      postPatch = (old.postPatch or "") + ''
+        substituteInPlace lib/src/aia_openssl.c --replace-fail \
+          'if((!file && !path) || X509_STORE_load_locations(store, file, path) != 1)' \
+          'if((file || path) ? X509_STORE_load_locations(store, file, path) != 1 : X509_STORE_set_default_paths(store) != 1)'
+      '';
+    }))
     dconf2nix
     # Ubuntu's AppArmor profile for /usr/bin/notify-send lets it call only Notify
     # and GetServerInformation: it cannot ask whether the server has actions, so
