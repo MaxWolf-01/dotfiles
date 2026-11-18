@@ -19,8 +19,11 @@
       show-screenshot-ui = [ "<Primary><Shift><Super>s" ];
       toggle-message-tray = [ "<Super>n" ];
       toggle-overview = [];
-      # Free Super+N for workspace switching (handled in wm/keybindings)
-      switch-to-application-1 = [];
+      # Super+N is workspace switching (wm/keybindings). Application 1 is the first
+      # of favorite-apps, Ghostty: Ctrl+Alt+T brings its most recent window to the
+      # front, or opens one when none is open. A further window is Ctrl+Alt+Shift+T
+      # (media-keys terminal) or Ctrl+Shift+N inside Ghostty.
+      switch-to-application-1 = [ "<Primary><Alt>t" ];
       switch-to-application-2 = [];
       switch-to-application-3 = [];
       switch-to-application-4 = [];
@@ -37,6 +40,17 @@
         "tilingshell@ferrarodomenico.com"
         "vpn-dot@maxwolf-01"
       ];
+      # The order is what switch-to-application-N counts; Ghostty stays first.
+      favorite-apps = [
+        "com.mitchellh.ghostty.desktop"
+        "org.gnome.Nautilus.desktop"
+      ];
+    };
+
+    # Ubuntu Dock's hot keys take over switch-to-application-N, and their own
+    # Super+N clashes with workspace switching.
+    "org/gnome/shell/extensions/dash-to-dock" = {
+      hot-keys = false;
     };
 
     # Path is .../applications/, not .../default-applications/ as the schema id
@@ -120,7 +134,7 @@
       search = [ "<Super>f" ];
       www = [ "<Super>c" ];
       screensaver = [ "<Super>l" ];
-      terminal = [ "<Primary><Alt>t" ];
+      terminal = [ "<Primary><Alt><Shift>t" ];
       # Custom keybindings list
       custom-keybindings = [
         "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/"
