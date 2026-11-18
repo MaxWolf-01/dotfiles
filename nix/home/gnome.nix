@@ -19,10 +19,9 @@
       show-screenshot-ui = [ "<Primary><Shift><Super>s" ];
       toggle-message-tray = [ "<Super>n" ];
       toggle-overview = [];
-      # Super+N is workspace switching (wm/keybindings). Application 1 is the first
-      # of favorite-apps, Ghostty: Ctrl+Alt+T brings its most recent window to the
-      # front, or opens one when none is open. A further window is Ctrl+Alt+Shift+T
-      # (media-keys terminal) or Ctrl+Shift+N inside Ghostty.
+      # Application 1 is the first of favorite-apps, Ghostty: Ctrl+Alt+T brings its
+      # most recent window to the front, or opens one when none is open. A further
+      # window is Ctrl+Alt+Shift+T (media-keys terminal) or Ctrl+Shift+N inside Ghostty.
       switch-to-application-1 = [ "<Primary><Alt>t" ];
       switch-to-application-2 = [];
       switch-to-application-3 = [];
@@ -47,8 +46,7 @@
       ];
     };
 
-    # Ubuntu Dock's hot keys take over switch-to-application-N, and their own
-    # Super+N clashes with workspace switching.
+    # Ubuntu Dock's hot keys take over switch-to-application-N.
     "org/gnome/shell/extensions/dash-to-dock" = {
       hot-keys = false;
     };
@@ -109,9 +107,10 @@
       unmaximize = [ "<Super>Down" ];
       # Ubuntu's default adds <Primary><Alt>d, left out so the hub tab's ctrl+alt keys can have it.
       show-desktop = [ "<Primary><Super>d" "<Super>d" ];
-      switch-to-workspace-1 = [ "<Super>1" ];
-      switch-to-workspace-2 = [ "<Super>2" ];
-      switch-to-workspace-3 = [ "<Super>3" ];
+      # Workspaces go unused here, so Super+N stays free.
+      switch-to-workspace-1 = [];
+      switch-to-workspace-2 = [];
+      switch-to-workspace-3 = [];
       # Alt+Tab for windows, Super+Tab for apps
       switch-windows = [ "<Alt>Tab" ];
       switch-windows-backward = [ "<Shift><Alt>Tab" ];
