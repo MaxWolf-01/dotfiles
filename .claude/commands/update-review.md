@@ -33,10 +33,15 @@ Pick one level:
 
 ## The report
 
-Markdown, short, in plain words. max is technical but not a specialist in each package; say what a change means for his machines, not only its name.
+You return it as data, in the schema the run gives you, and `update-review/render.py` lays it out: a colour per kind of change, a table of changes and one of hosts.
+max skims it, so every text field is short and plain: say what a change means for his machines, not only its name.
 
-1. One line: the level and its reason.
-2. The changes that set the level, each with what it is, which hosts it reaches, and a link to its source.
-3. For held: what would have to be true to apply it, and what to check after.
-4. The rest, briefly: notable version bumps per host, and the closure size change.
-5. Last line: `Apply with update-review apply, or drop it with update-review dismiss.`
+- `headline`: the main reason for the level, in one line; the page shows the level above it.
+- `summary`: two to four sentences on what this bump is.
+- `changes`: one entry per change worth a line, most important first.
+  Its `kind` is what it is (`security`, `breaking`, `feature`, `performance`, `fix`, `routine`); the level is your verdict on the bump as a whole.
+  Group plain version bumps with nothing to say into one `routine` entry per host group rather than listing each.
+  Give every non-routine entry a `source`.
+- `held_because`, for held only: what would have to be true to apply it, and what to check after.
+- `hosts`: one row per host from its nvd diff.
+- `notes`: anything else worth knowing, such as a warning the update printed.
