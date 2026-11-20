@@ -83,6 +83,8 @@ cmd_run() {
     git -C "$dotfiles" fetch -q origin master || fail "could not fetch origin's master"
     base="$(git -C "$dotfiles" rev-parse origin/master)"
     [ -f "$state" ] && drop_bump
+    # A second run on the same day starts from an empty directory, so no file of the first is read as this one's.
+    rm -rf "$run_dir"
     mkdir -p "$(dirname "$checkout")" "$run_dir" "$state_dir"
     git -C "$dotfiles" worktree add -q -B "$branch" "$checkout" "$base" || fail "could not make the worktree at $checkout"
 
@@ -97,11 +99,14 @@ cmd_run() {
     git -C "$checkout" commit -q -m "nix: update flake inputs ($day)" -- flake.lock || fail "could not commit the bump"
 
     local old="git+file://$dotfiles?rev=$base" new="git+file://$checkout" failed=() target name old_out new_out
+    local roots; roots="$(mktemp -d)"
     while read -r target; do
         name="${target#*Configurations.}"; name="${name%%.*}"
+        [ "${target%%.*}" = homeConfigurations ] && name="$(hostname)-home-manager"
         echo "update-review: building $name"
-        old_out="$(nix build --no-link --print-out-paths "$old#$target" 2> "$run_dir/build-$name-old.log")"
-        if ! new_out="$(nix build --no-link --print-out-paths "$new#$target" 2> "$run_dir/build-$name.log")"; then
+        # Out-links keep both builds from the garbage collector until nvd has compared them.
+        old_out="$(nix build --out-link "$roots/$name-old" --print-out-paths "$old#$target" 2> "$run_dir/build-$name-old.log")"
+        if ! new_out="$(nix build --out-link "$roots/$name-new" --print-out-paths "$new#$target" 2> "$run_dir/build-$name.log")"; then
             failed+=("$name")
             continue
         fi
@@ -112,17 +117,14 @@ cmd_run() {
             echo "the old lock does not build for $name; nothing to compare against" > "$run_dir/diff-$name.txt"
         fi
     done < <(targets "$new")
+    rm -rf "$roots"
     git -C "$checkout" diff "$base" -- flake.lock > "$run_dir/flake-lock.diff"
 
-    local schema verdict
-    schema='{"type":"object","required":["level","headline","report"],"additionalProperties":false,"properties":{
-      "level":{"enum":["routine","promising","critical","held"]},
-      "headline":{"type":"string","description":"one line: the rating and its main reason"},
-      "report":{"type":"string","description":"the report, in markdown"}}}'
+    local verdict
     verdict="$(cd "$run_dir" && awk 'NR == 1 && /^---$/ { fm = 1; next } fm && /^---$/ { fm = 0; next } !fm' "$prompt_file" | claude -p --safe-mode \
         --model "${CLAUDE_MODEL:-claude-opus-5-5}" \
         --tools "Read,Grep,Glob,WebSearch,WebFetch" --allowedTools "Read,Grep,Glob,WebSearch,WebFetch" \
-        --no-session-persistence --output-format json --json-schema "$schema" \
+        --no-session-persistence --output-format json --json-schema "$(jq -c . "$dotfiles/update-review/verdict.schema.json")" \
         "The bump is in this directory, $run_dir. Builds that failed: ${failed[*]:-none}.")" \
         || fail "claude -p failed: ${verdict: -500}"
     verdict="$(jq -c 'if type == "array" then .[-1] else . end | .structured_output // empty' <<<"$verdict")"
@@ -131,12 +133,9 @@ cmd_run() {
     local level
     level="$(jq -r .level <<<"$verdict")"
     [ ${#failed[@]} -gt 0 ] && level=held
-    jq -r .report <<<"$verdict" > "$run_dir/report.md"
-    # The house style, its stylesheet inlined so the page stands alone; the fonts stay a link.
-    pandoc -s --embed-resources --template "$dotfiles/update-review/report.html" --css "$dotfiles/update-review/tokens.css" \
-        --metadata title="Update review $day" -V level="$level" -V date="$day" \
-        -o "$run_dir/report.html" "$run_dir/report.md" \
-        || fail "pandoc could not render $run_dir/report.md"
+    jq --arg level "$level" '.level = $level' <<<"$verdict" > "$run_dir/verdict.json"
+    "$dotfiles/update-review/render.py" "$run_dir/verdict.json" "$day" > "$run_dir/report.html" \
+        || fail "could not render $run_dir/verdict.json"
     jq -n --arg level "$level" --arg headline "$(jq -r .headline <<<"$verdict")" \
         --arg report "$run_dir/report.html" --arg branch "$branch" --arg date "$day" \
         '{level: $level, headline: $headline, report: $report, branch: $branch, date: $date}' > "$state.partial" \
