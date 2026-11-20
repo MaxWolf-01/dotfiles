@@ -479,6 +479,38 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # The weekly flake lock bump: bin/update-review builds every host with it and
+  # has Claude rate it; the update dot shows the rating, and max applies it.
+  # nix from the system profile, the claude wrapper from ~/.nix-profile (ownLogin),
+  # and the ssh agent for fetching master from GitHub.
+  systemd.user.services.update-review = {
+    Unit = {
+      Description = "Bump the flake lock, build every host, and review it";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      TimeoutStartSec = "6h"; # every host's system builds twice, NVIDIA modules included
+      Nice = 10;
+      Environment = [
+        "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/usr/bin:/bin"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+        ownLogin
+      ];
+      ExecStart = "${dotfiles}/bin/update-review run";
+    };
+  };
+
+  systemd.user.timers.update-review = {
+    Unit.Description = "Flake lock bump and review (Saturdays 03:00)";
+    Timer = {
+      OnCalendar = "Sat *-*-* 03:00:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   systemd.user.services.repo-retros = {
     Unit = {
       Description = "Repo retros, each when its repo has a commit since its last run";
