@@ -29,6 +29,9 @@
   boot.loader = {
     systemd-boot.enable = true;
     systemd-boot.memtest86.enable = true;
+    # The 1G ESP holds each generation's kernel and initrd, about 80 MB a file
+    # with the NVIDIA modules; unlimited, they filled it on 2026-11-22.
+    systemd-boot.configurationLimit = 5;
     efi.canTouchEfiVariables = true;
     efi.efiSysMountPoint = "/boot/efi";
   };
