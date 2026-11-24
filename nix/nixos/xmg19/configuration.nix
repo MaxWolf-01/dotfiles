@@ -57,7 +57,6 @@
   hardware.graphics.enable = true;
 
   boot = {
-    initrd.kernelModules = [ "nvidia" "nvidia_modeset" "nvidia_uvm" "nvidia_drm" ];
     kernelParams = [
       "nvidia_drm.fbdev=1"
       "nvidia.NVreg_PreserveVideoMemoryAllocations=1"
@@ -91,14 +90,6 @@
     powerManagement.enable = true;
     powerManagement.finegrained = true;
   };
-
-  # finegrained hands the dGPU to runtime PM with a udev rule on the driver's
-  # bind, but the driver binds in the initrd, before that rule exists, and the
-  # coldplug that replays events afterwards sends add, not bind. Without this
-  # rule power/control stays "on" and the card never powers down.
-  services.udev.extraRules = ''
-    ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", TEST=="power/control", ATTR{power/control}="auto"
-  '';
 
   # The recorder's xmg19 sensor set reads the dGPU through nvidia-smi.
   systemd.services.host-recorder.path = [ config.hardware.nvidia.package.bin ];
