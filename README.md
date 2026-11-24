@@ -109,6 +109,7 @@ All `./setup` functions are idempotent — safe to re-run.
 ./setup get_vibetyper
 ./setup hibernation
 ./setup asus_kbd_light         # ASUS ROG laptops
+./setup wifi_powersave         # laptops: Wi-Fi power saving off on AC, on on battery
 ./setup dgpu_runtime_pm        # laptops with a dGPU the driver powers off when idle
 ```
 </details>
