@@ -68,10 +68,16 @@ Measured on 2026-09-23, driver 580.178, kernel 7.0.0-34:
 - Idle on AC, unlocked: D3cold. Idle on battery, locked: D3cold. The card
   goes to sleep within seconds of its last user exiting, on either.
 - gnome-shell holds handles on the card (`nvidia-smi` lists it with 3 MiB)
-  and that does not keep it awake, unless that login has driven a monitor on
-  a dGPU port. Then gnome-shell keeps the card in D0 until logout, after the
-  monitor is gone (a login of 2026-09-30 that began with a monitor on `DP-3`
-  held it until 2026-10-16; the login after the next boot let it sleep).
+  and that does not keep it awake.
+- On driver 580, the first monitor on a dGPU port in a boot kept the card in
+  D0 until the next reboot, logout or no logout. The plug makes nvidia-drm
+  create a console framebuffer on the card (`fb1: nvidia-drmdrmfb` in
+  `journalctl -k`), 580 blocks power-off for as long as that framebuffer is
+  mapped, and the driver never removes it after the unplug
+  (NVIDIA/open-gpu-kernel-modules#759; debugfs on 2026-10-31 showed it as the
+  only thing on the card). 595 blocks power-off only while the kernel writes
+  to it: on 2026-11-04, on 595.99.02, the card went back to D3cold within
+  one boot after hours with monitors on dGPU ports.
 - At login, logind gives the user an ACL entry on the render node
   (`user:max:rw-`), which the lock does not clear, so `dgpu status` reads
   "unlocked" on a locked card. Opening the render node and querying its driver
@@ -149,16 +155,20 @@ History: the host recorder's `dgpu_port` column (D3cold or D0 every 5 s).
   unsaved gone. A session that starts with the monitor in works from the
   start, and so does a monitor on the Thunderbolt port. The journal shows
   `fb1: nvidia-drmdrmfb` at the plug, then `intel: the execbuf ioctl keeps
-  returning ENOMEM`. `MUTTER_DEBUG_MULTI_GPU_FORCE_COPY_MODE` in
-  `nix/home/hosts/zephyrus.nix` is meant to prevent it; not yet tested with a
-  hotplug. The bug: `agent/tickets/hdmi-hotplug-crashes-gnome-shell.md`.
+  returning ENOMEM`. Since `MUTTER_DEBUG_MULTI_GPU_FORCE_COPY_MODE` in
+  `nix/home/hosts/zephyrus.nix` and driver 595 arrived together, hotplugs on
+  both dGPU ports have come up without a crash (2026-11-02); which of the two
+  fixed it is not known. The bug: `agent/tickets/hdmi-hotplug-crashes-gnome-shell.md`.
 - **A kernel upgrade without its NVIDIA modules.** Ubuntu phases updates, and
   `apt upgrade` can install `linux-image-X` while holding back
-  `linux-modules-nvidia-580-open-X`. Booting that kernel leaves the card on
+  `linux-modules-nvidia-595-open-X`. Booting that kernel leaves the card on
   the bus with no driver, which is the one state nothing can power down;
   `dgpu status` then says "no dGPU with a driver bound". Before rebooting into
-  a new kernel: `ls /lib/modules/<version>/kernel/nvidia-580-open/nvidia.ko`,
-  and if it is missing, `sudo apt install linux-modules-nvidia-580-open-generic`.
+  a new kernel: `ls /lib/modules/<version>/kernel/nvidia-595-open/nvidia.ko`,
+  and if it is missing, `sudo apt install linux-modules-nvidia-595-open-generic`.
+  Switching driver series does the same to every older kernel: apt removes
+  the old series' modules for all of them, so only kernels that get the new
+  series' modules still have a driver.
 - **The firmware switch (`dgpu_disable`, Armoury Crate's Eco mode).** Not
   used, and not to be used: on this BIOS both directions run a method
   (`AGOF`/`AGON`) that waits without bound for the card's PCIe link, and Linux
