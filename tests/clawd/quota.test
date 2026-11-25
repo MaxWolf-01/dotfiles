@@ -12,7 +12,10 @@
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/../check.sh"
-needs jq curl
+needs jq uv
+
+# uv's cache and Pythons stay where they are under the scratch HOME: bin/clawd is a uv script.
+export UV_CACHE_DIR=$(uv cache dir) UV_PYTHON_INSTALL_DIR=$(uv python dir)
 
 clawd="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../bin" && pwd)/clawd"
 work=$(mktemp -d)
@@ -27,7 +30,7 @@ login .claude "$future"
 login .claude-work "$future"
 login .claude-old 1
 mkdir -p "$work/home/.claude-nologin"
-# curl reads a file:// URL, so every profile gets this one reply.
+# A file:// URL is read as the file, so every profile gets this one reply.
 mkdir -p "$work/api/api/oauth"
 cat >"$work/api/api/oauth/usage" <<'EOF'
 {"seven_day":{"utilization":99.0,"resets_at":"2026-10-16T04:59:59.854121+00:00","remaining_dollars":null},
@@ -38,7 +41,7 @@ EOF
 
 mkdir -p "$work/api/v1/organizations"
 echo '{"id":"o","type":"organization","name":"X"}' >"$work/api/v1/organizations/me"
-# 4000 cents over three days, two charges on the last.
+# Read whatever the query string; 4000 cents over three days, two charges on the last.
 cat >"$work/api/v1/organizations/cost_report" <<'EOF'
 {"data":[{"starting_at":"2026-10-10T00:00:00Z","results":[{"currency":"USD","amount":"1234.5"}]},
  {"starting_at":"2026-10-11T00:00:00Z","results":[]},
@@ -84,6 +87,32 @@ check "each with-secrets entry holding an organization key, under any name of th
 	"console X org-a|  API credits   \$0.00 spent since Wed 14 Oct, through yesterday|console X org-b|  API credits   \$40.00 spent since Sat 10 Oct, through yesterday" \
 	"$(PATH=$work/bin:$PATH quota | sed -n '/^console/,$p' | paste -sd'|')"
 
+# A with-secrets that cannot answer is an org line naming why, never the same report as no org at all.
+mkdir -p "$work/broken" "$work/half"
+printf '#!/bin/sh\necho "sops: no age key" >&2\nexit 3\n' >"$work/broken/with-secrets"
+cat >"$work/half/with-secrets" <<'EOF'
+#!/usr/bin/env bash
+case $1 in
+--list) printf '%-24s %s\n' org-a "ORGANIZATION_API_KEY" org-b "ACME_DEV_ORGANIZATION__ANTHROPIC_API_KEY" ;;
+org-a) echo "sops: MAC mismatch" >&2; exit 1 ;;
+org-b) printf '%s\n' ACME_DEV_ORGANIZATION__ANTHROPIC_API_KEY=k ;;
+esac
+EOF
+chmod +x "$work/broken/with-secrets" "$work/half/with-secrets"
+check "a with-secrets whose list fails is one entry naming the failure, in --json" \
+	'[{"entry":"with-secrets","error":"with-secrets --list failed (exit 3): sops: no age key"}]' \
+	"$(PATH=$work/broken:$PATH quota --json | jq -c .consoles)"
+check "...and in the text" "console with-secrets with-secrets --list failed (exit 3): sops: no age key" \
+	"$(PATH=$work/broken:$PATH quota | grep '^console')"
+check "an entry with-secrets cannot decrypt is named with why, and the others still report" \
+	'[{"entry":"org-a","error":"with-secrets org-a env failed (exit 1): sops: MAC mismatch"},{"entry":"org-b","org":"X","since":"2026-10-10","spent":40}]' \
+	"$(PATH=$work/half:$PATH quota --json | jq -c .consoles)"
+# PATH less every directory holding a with-secrets; uv and the tools the script runs stay on it.
+bare_path=$(tr ':' '\n' <<<"$PATH" | while IFS= read -r dir; do [ -x "$dir/with-secrets" ] || printf '%s:' "$dir"; done)
+check "a with-secrets missing from PATH is an entry saying it could not be run" \
+	'with-secrets could not run with-secrets: No such file or directory' \
+	"$(PATH=${bare_path%:} quota --json | jq -r '.consoles[] | "\(.entry) \(.error)"')"
+
 json=$(CC_QUOTA_ORG_KEY=k quota --json)
 check "--json is the report on one line" "1" "$(wc -l <<<"$json")"
 check "it holds each profile's buckets, or its error, as the text does" \
@@ -94,5 +123,24 @@ check "and a reset rounded to the minute, in UTC" "2026-10-16T05:00:00Z" \
 check "and each Console org's spend in dollars, with no balance" '[{"entry":"key","org":"X","since":"2026-10-10","spent":40}]' \
 	"$(jq -c '.consoles' <<<"$json")"
 check "and without a key, no Console org" "[]" "$(CC_QUOTA_ORG_KEY= quota --json | jq -c .consoles)"
+
+out=$(CC_QUOTA_ORG_KEY=k CLAWD_QUOTA_API=file://$work/nowhere HOME=$work/home CLAWD_QUOTA_NOW=$now TZ=UTC "$clawd" quota)
+check "an endpoint that refuses is named in its profile's or its org's place, not a crash" \
+	"personal the usage endpoint refused the request|old token expired; open claude in this profile to renew it|work the usage endpoint refused the request|console key the Admin API refused the organization key" \
+	"$(paste -sd'|' <<<"$out")"
+
+# --- what a person reads
+
+# quota as a person runs it, on a terminal script(1) gives it, with no Console org.
+quota_tty() { CC_QUOTA_ORG_KEY= HOME=$work/home CLAWD_QUOTA_API=file://$work/api CLAWD_QUOTA_NOW=$now TZ=UTC script -qec "$clawd quota" /dev/null; }
+if command -v script >/dev/null; then
+	check "on a terminal, the 99% bar is drawn in red" yes "$(quota_tty | grep -qF $'\e[31m███' && echo yes || echo no)"
+	check "...and with NO_COLOR set, plain" no "$(NO_COLOR=1 quota_tty | grep -qF $'\e[' && echo yes || echo no)"
+else
+	skipped "the colour on a terminal" "no script(1) to give clawd one"
+fi
+[[ $(COLUMNS=200 "$clawd" quota --help) == *"organization-scoped API key"* && $(COLUMNS=200 "$clawd" --help) == *quota*"Every plan's quota"* ]] &&
+	passed "clawd quota --help is its own, and clawd --help lists it" ||
+	fail "clawd quota --help is its own, and clawd --help lists it" "$(COLUMNS=200 "$clawd" --help)"
 
 finish

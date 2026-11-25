@@ -13,10 +13,10 @@ let
     bash coreutils yt-dlp openssh
   ]);
 
-  # uv runs lifelog for the collectors' last runs jarvis-sync ships; jq because
-  # bin/run-log builds its line with it; curl, sops and gnugrep for the `clawd quota`
-  # report it ships, the last two through with-secrets; util-linux for the flock it
-  # copies the lifelog folder under, google-health-collect's lock.
+  # uv runs lifelog for the collectors' last runs jarvis-sync ships, and the
+  # `clawd quota` report it ships; jq because bin/run-log builds its line with it;
+  # sops and gnugrep for with-secrets, which that report reads its org keys through;
+  # util-linux for the flock it copies the lifelog folder under, google-health-collect's lock.
   syncPath = lib.makeBinPath (with pkgs; [
     bash coreutils rsync openssh uv jq curl sops gnugrep util-linux
   ]);
@@ -1066,7 +1066,8 @@ in
   # The only scheduled alerter; what it watches and why is in bin/overdue-check.
   # The offset makes pc alert first and this host stay quiet, so a healthy setup
   # notifies once. /usr/bin for journalctl: this host's own, not a nix build, so
-  # it reads a journal written by the same systemd that wrote it.
+  # it reads a journal written by the same systemd that wrote it. uv runs
+  # bin/hosts, which says which host runs each backup.
 
   systemd.user.services.overdue-check = {
     Unit = {
@@ -1082,7 +1083,7 @@ in
       # "the watchdog is broken" to everyone who looks later.
       SuccessExitStatus = "1";
       Environment = [
-        "PATH=${backupPath}:/usr/bin:/bin"
+        "PATH=${backupPath}:${lib.makeBinPath [ pkgs.uv ]}:/usr/bin:/bin"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
       ExecStart = "${dotfiles}/bin/overdue-check --extra-days 7";

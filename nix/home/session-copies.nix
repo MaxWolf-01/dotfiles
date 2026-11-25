@@ -19,9 +19,9 @@ let
   cfg = config.sessionCopies;
   peers = config.containerHub.peers;
   dotfiles = "${config.home.homeDirectory}/.dotfiles";
-  # bin/session-copies is a uv script driving rsync over ssh; sed and jq for
-  # hosts targets; jq for bin/run-log too.
-  path = lib.makeBinPath (with pkgs; [ bash coreutils gnused uv rsync openssh jq ]);
+  # bin/session-copies is a uv script driving rsync over ssh, and asks bin/hosts,
+  # another, for the worker users; jq for bin/run-log.
+  path = lib.makeBinPath (with pkgs; [ bash coreutils uv rsync openssh jq ]);
   sources = lib.attrNames peers ++ lib.optional cfg.workerHosts "the worker hosts";
 in
 {
