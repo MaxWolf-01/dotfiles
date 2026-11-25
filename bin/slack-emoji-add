@@ -1,0 +1,114 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tyro", "requests", "cryptography"]
+# ///
+"""Add images to a Slack workspace as custom emoji, each named after its file.
+
+`party-parrot.png` becomes `:party-parrot:`. Slack takes PNG, JPG and GIF up to
+128 KB; a name already taken is reported and skipped.
+
+Signs in with the login slackdump keeps in ~/.cache/slackdump (see slack-archive
+for making one), so the emoji are added as that user. Slack offers no API for
+this outside Enterprise Grid; the call is the one Slack's own "Add emoji" page
+makes.
+
+Examples:
+
+    slack-emoji-add tldr.png slop.png
+    slack-emoji-add ~/Pictures/discord/emojis/1715-pepeno.png --name pepeno
+    slack-emoji-add *.png --workspace otherteam
+"""
+
+import hashlib
+import hmac
+import json
+import socket
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated
+
+import requests
+import tyro
+from cryptography.hazmat.decrepit.ciphers.modes import CFB
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+
+CACHE = Path.home() / ".cache/slackdump"
+
+# slackdump encrypts the login with AES-256-CFB (github.com/rusq/encio). The key
+# is PBKDF2-SHA512 (4096 rounds, the salt below, from github.com/rusq/secure)
+# over an id of the machine. Change any of these and slackdump's file no longer
+# opens: they are its constants, copied, not ours to choose.
+APP_ID = b"76d19bf515c59483e8923fcad9f1b65025d445e71801688b7edfb9cc2e64497f"
+SALT = bytes.fromhex(
+    "51fcd8f9ab85935dd2852e783f803ace19f120752add7b5ce617db4b72c78306"
+    "10917033420d75f9b814395acfae6aec7d3a2a87f886a8ea257eb5f961e8a55e"
+    "202fa29985a3cccd5c391b6d1b17a9b4eb95ddfbbe3c2c3be97d5d3e783723da"
+    "a535d836a742d6db38ba17128c768338d823023826e3e7e25ecbc990d2462784"
+    "77416bb57a4a4f45aaab50a75835e8a927c1b8a93203023d19775ad20c520801"
+    "fab9b286fd2473c339de4f869319d7d56500f12d0c6f3c21d0c6279905197c0d"
+    "57334f8c2f72975afa085151bc56d4c4ed01ebe26a82c64c0976e3fa87e2d768"
+    "13a5cf32a2166c53502dd258e467187b8a84e3a4491464d50668c74568eb4ab0"
+)
+
+
+@dataclass
+class Args:
+    images: Annotated[list[Path], tyro.conf.Positional]
+    """Image files to add."""
+    name: str = ""
+    """Emoji name for a single image, instead of its file name."""
+    workspace: str = ""
+    """slackdump workspace whose login to use; empty means slackdump's current one."""
+
+
+def machine_id() -> str:
+    """The id encio keys on: hostname-based where /proc/1/cgroup looks like a
+    container, which on a cgroup v2 host (first line `0::/init.scope`) is always."""
+    cgroup = Path("/proc/1/cgroup").read_text().splitlines()[:6]
+    if any(m in line for line in cgroup for m in ("0::/", "docker", "lxc")):
+        return hashlib.sha256(socket.gethostname().encode() + APP_ID).hexdigest()
+    for p in ("/var/lib/dbus/machine-id", "/etc/machine-id"):
+        if Path(p).exists():
+            mid = Path(p).read_text().strip()
+            return hmac.new(mid.encode(), APP_ID, hashlib.sha256).hexdigest()
+    sys.exit("slack-emoji-add: no machine id in /var/lib/dbus or /etc")
+
+
+def load_login(workspace: str) -> tuple[str, dict[str, str]]:
+    workspace = workspace or (CACHE / "workspace.txt").read_text().strip()
+    blob = (CACHE / f"{workspace}.bin").read_bytes()
+    key = hashlib.pbkdf2_hmac("sha512", machine_id().encode(), SALT, 4096, 32)
+    dec = Cipher(algorithms.AES(key), CFB(blob[:16])).decryptor()
+    try:
+        creds = json.loads(dec.update(blob[16:]) + dec.finalize())
+    except ValueError:
+        sys.exit(
+            f"slack-emoji-add: cannot decrypt {CACHE}/{workspace}.bin. slackdump binds "
+            "it to the machine that made it; log in here with `slackdump workspace new`."
+        )
+    return creds["Token"], {c["Name"]: c["Value"] for c in creds["Cookie"]}
+
+
+def main(args: Args) -> None:
+    if args.name and len(args.images) > 1:
+        sys.exit("slack-emoji-add: --name takes a single image")
+    token, cookies = load_login(args.workspace)
+    failed = False
+    for path in args.images:
+        name = args.name or path.stem
+        r = requests.post(
+            "https://slack.com/api/emoji.add",
+            data={"token": token, "mode": "data", "name": name},
+            files={"image": (path.name, path.read_bytes())},
+            cookies=cookies,
+            timeout=30,
+        ).json()
+        print(f":{name}:  {'added' if r['ok'] else r['error']}")
+        failed |= not r["ok"]
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Args, description=__doc__))

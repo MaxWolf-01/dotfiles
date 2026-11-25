@@ -33,6 +33,7 @@ import pty
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -53,8 +54,8 @@ REPO = Path(__file__).resolve().parents[1]
 SHARE = REPO / "bin" / "share"
 MIB = 2**20
 PLAIN = "plain-words-only-the-password-reveals"
-PAGE = f"""<!doctype html><html><head><title>Anzeiger &amp; contacts</title>
-<meta property="og:title" content="Anzeiger contacts"></head><body><p>{PLAIN}</p></body></html>"""
+# its own og:title follows no line break, so as_authored leaves it
+PAGE = f"""<!doctype html><html><head><title>Anzeiger &amp; contacts</title><meta property="og:title" content="Anzeiger contacts"></head><body><p>{PLAIN}</p></body></html>"""
 WANTED_HEADERS = {"x-robots-tag": "noindex, nofollow", "referrer-policy": "no-referrer"}
 
 
@@ -77,6 +78,13 @@ n=$(ls "$SHARE_TEST_DEPLOYS" | wc -l)
 mkdir -p "$SHARE_TEST_DEPLOYS/$n"
 cp -r public "$SHARE_TEST_DEPLOYS/$n/public"
 cp "$3" "$SHARE_TEST_DEPLOYS/$n/wrangler.json"
+"""
+
+
+# Stands in for a browser: writes PNG at --screenshot= and logs its arguments.
+FAKE_BROWSER = r"""#!/usr/bin/env bash
+echo "$@" >> "$FAKE_BROWSER_LOG"
+for a; do case $a in --screenshot=*) printf PNG > "${a#--screenshot=}";; esac; done
 """
 
 
@@ -110,12 +118,29 @@ class Work:
         p.write_text(text)
         return p
 
-    def put(self, path: Path, *flags: str, file: str = "") -> str:
+    def put(self, path: Path, *flags: str, file: str = "", **env: str) -> str:
         """The new share's id. file is the name its link ends in, for a share that is not a page."""
-        url = self.share(str(path), *flags).stdout.strip()
+        url = self.share(str(path), *flags, **env).stdout.strip()
         m = re.fullmatch(r"https://share\.mwolf\.dev/([^/]+)/" + re.escape(file), url)
         expect(m is not None, f"share printed {url!r}, not one URL ending in /{file}")
         return m.group(1)
+
+    def served(self, sid: str) -> str:
+        return (self.root / "public" / sid / "index.html").read_text()
+
+    def listed(self, sid: str) -> dict:
+        return {s["id"]: s for s in json.loads(self.share("list", "--json").stdout)}[sid]
+
+    def browsers(self, *installed: str) -> dict[str, str]:
+        """An environment whose PATH holds what share and the wrangler stub run, and of the browsers share looks
+        for only the fakes named, so this host's own stays out of it."""
+        bin = Path(tempfile.mkdtemp(dir=self.tmp, prefix="bin-"))
+        for tool in ("uv", "bash", "ls", "wc", "mkdir", "cp"):
+            (bin / tool).symlink_to(shutil.which(tool))
+        for name in installed:
+            (bin / name).write_text(FAKE_BROWSER)
+            (bin / name).chmod(0o755)
+        return {"PATH": str(bin), "FAKE_BROWSER_LOG": str(self.tmp / "browser.log")}
 
     def shares(self) -> list[dict]:
         return json.loads((self.root / "shares.json").read_text())
@@ -127,8 +152,15 @@ class Work:
         return len(list(self.deploys.iterdir()))
 
 
-def tree(d: Path) -> dict[str, bytes]:
-    return {str(p.relative_to(d)): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+def tree(d: Path, authored: bool = False) -> dict[str, bytes]:
+    """Every file under d by its path; with authored, each page without the preview tags share writes into it."""
+    return {str(p.relative_to(d)): as_authored(p.read_bytes()) if authored else p.read_bytes()
+            for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+def as_authored(page: bytes) -> bytes:
+    """A served page without the preview tags share writes into it."""
+    return re.sub(rb'\n<meta (?:property|name)="(?:og|twitter):[^"]*" content="[^"]*">', b"", page)
 
 
 # --- the root, with the deploy stubbed
@@ -137,7 +169,7 @@ def tree(d: Path) -> dict[str, bytes]:
 @prop("root: a single page becomes <id>/index.html, recorded in shares.json, and the deploy is the root's public/")
 def single_page(w: Work) -> None:
     sid = w.put(w.file("contacts.html"))
-    expect((w.root / "public" / sid / "index.html").read_text() == PAGE, "the page is not at <id>/index.html as it was")
+    expect(as_authored((w.root / "public" / sid / "index.html").read_bytes()) == PAGE.encode(), "the page is not at <id>/index.html as it was")
     entry = [s for s in w.shares() if s["id"] == sid]
     expect(len(entry) == 1, f"shares.json has {len(entry)} entries for {sid}")
     e = entry[0]
@@ -159,7 +191,7 @@ def layouts(w: Work) -> None:
     w.file("talk/index.html")
     w.file("talk/img/a.svg", "<svg/>")
     sid = w.put(folder)
-    expect(tree(w.root / "public" / sid) == tree(folder), "the folder's contents did not arrive as they are")
+    expect(tree(w.root / "public" / sid, authored=True) == tree(folder), "the folder's contents did not arrive as they are")
     deployed = tree(w.last_deploy() / "public")
     expect(not any("shares.json" in k for k in deployed), "shares.json was deployed")
     expect(deployed.get("_headers", b"").decode().split() == "/* X-Robots-Tag: noindex, nofollow Referrer-Policy: no-referrer".split(),
@@ -204,7 +236,7 @@ def replace(w: Work) -> None:
     w.file("report/index.html", PAGE.replace("contacts", "contacts, second edition"))
     again = w.put(folder, "--replace", sid)
     expect(again == sid, f"--replace made a new id {again}")
-    expect(tree(w.root / "public" / sid) == tree(folder), "the share does not hold exactly the new content")
+    expect(tree(w.root / "public" / sid, authored=True) == tree(folder), "the share does not hold exactly the new content")
     entries = [s for s in w.shares() if s["id"] == sid]
     expect(len(entries) == 1 and "second edition" in entries[0]["title"], f"shares.json holds {entries}")
     pdf = w.put(w.file("a.pdf", "%PDF"), file="a.pdf")
@@ -286,10 +318,155 @@ def password_page_only_encrypted(w: Work) -> None:
         text = (w.root / "public" / sid / page).read_text()
         expect("staticrypt" in text and secret not in text, f"{page} is not StatiCrypt's output")
         expect("<title>Protected Page</title>" in text and "Anzeiger" not in text, f"{page} gives its title away")
+        expect("og:" not in text and "twitter:" not in text, f"{page} carries preview tags")
     for p in w.root.rglob("*"):
         expect(not p.is_file() or secret.encode() not in p.read_bytes(), f"the plain page was written to {p}")
     expect((w.root / "public" / sid / "audio.opus").read_text() == "not a page", "a file that is not a page did not go up as it is")
     expect([s["password"] for s in w.shares() if s["id"] == sid] == [True], "shares.json does not mark the share as a password one")
+
+
+@prop("root: a page goes up with the preview tags it lacks, from its title and description, and its source stays as it was")
+def preview_tags(w: Work) -> None:
+    source = "<html><head><title>Trip &amp; plan</title><meta name=description content='Dates &amp; trains'></head><p>v1</p></html>"
+    page = w.file("trip.html", source)
+    sid = w.put(page)
+    expect(w.served(sid) == (
+        "<html><head>\n"
+        '<meta property="og:title" content="Trip &amp; plan">\n'
+        '<meta property="og:description" content="Dates &amp; trains">\n'
+        f'<meta property="og:url" content="https://share.mwolf.dev/{sid}/">\n'
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:site_name" content="share.mwolf.dev">\n'
+        '<meta name="twitter:card" content="summary">'
+        "<title>Trip &amp; plan</title><meta name=description content='Dates &amp; trains'></head><p>v1</p></html>"),
+        f"the served page is {w.served(sid)!r}")
+    expect(page.read_text() == source, "the source page was changed")
+    listed = w.listed(sid)
+    expect((listed["title"], listed["description"]) == ("Trip & plan", "Dates & trains"), f"share list --json says {listed}")
+
+
+@prop("root: --title and --description name the card and the record, and a tag the page carries stays, in any case")
+def preview_flags(w: Work) -> None:
+    sid = w.put(w.file("own.html", '<head><META Property="OG:Title" content="Own"><meta NAME="twitter:CARD" content="x"></head>'),
+                "--title", 'Grüße "Q"', "--description", "Shifts <draft>")
+    expect(w.served(sid) == (
+        "<head>\n"
+        '<meta property="og:description" content="Shifts &lt;draft&gt;">\n'
+        f'<meta property="og:url" content="https://share.mwolf.dev/{sid}/">\n'
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:site_name" content="share.mwolf.dev">'
+        '<META Property="OG:Title" content="Own"><meta NAME="twitter:CARD" content="x"></head>'),
+        f"the served page is {w.served(sid)!r}")
+    listed = w.listed(sid)
+    expect((listed["title"], listed["description"]) == ('Grüße "Q"', "Shifts <draft>"), f"share list --json says {listed}")
+    folder = w.files / "untitled"
+    w.file("untitled/index.html", "<p>x</p>")
+    w.file("untitled/two.html", "<title>Two</title>")
+    sid = w.put(folder)
+    expect(w.served(sid).startswith('\n<meta property="og:title" content="untitled">\n'), f"the folder's page is {w.served(sid)!r}")
+    expect((w.root / "public" / sid / "two.html").read_text() == "<title>Two</title>", "a page the link does not open got tags")
+    expect(w.listed(sid)["description"] is None, "a page with no description was given one")
+    both = w.put(w.file("both.html", '<head><meta property="og:description" name="description" content="Both"></head>'))
+    expect('<meta property="og:description" content=' not in w.served(both) and w.listed(both)["description"] == "Both", f"a tag naming description twice: {w.served(both)!r} {w.listed(both)}")
+
+
+@prop("root: a page with no <head> gets the tags after its <html>, else its doctype, else at its start behind a byte order mark")
+def preview_anchors(w: Work) -> None:
+    for source, before, after in (("<!DOCTYPE html>\n<html lang=de><p>x</p></html>", "<!DOCTYPE html>\n<html lang=de>\n", "<p>x</p></html>"),
+                                  ("<!doctype html><p>x</p>", "<!doctype html>\n", "<p>x</p>"),
+                                  ("\ufeff<p>x</p>", "\ufeff\n", "<p>x</p>")):
+        page = w.served(w.put(w.file("anchor.html", source), "--title", "T"))
+        expect(page.startswith(before + '<meta property="og:title" content="T">')
+               and page.endswith('<meta name="twitter:card" content="summary">' + after), f"{source!r} was served as {page!r}")
+
+
+@prop("root: a page not in UTF-8 keeps every byte it had, and gets the tags in ASCII")
+def preview_encoding(w: Work) -> None:
+    source = "<head><title>Grüße</title></head><p>Grüße</p>".encode("cp1252")
+    page = w.files / "cp1252.html"
+    page.write_bytes(source)
+    sid = w.put(page, "--title", "Grüße")
+    served = (w.root / "public" / sid / "index.html").read_bytes()
+    expect(served.startswith(b'<head>\n<meta property="og:title" content="Gr&#252;&#223;e">\n')
+           and served.endswith(b'<meta name="twitter:card" content="summary">' + source.removeprefix(b"<head>")),
+           f"served {served!r}")
+
+
+@prop("root: a bare --image puts a 1200x630 screenshot on the card, and a --replace without it derives the card anew and drops the image")
+def preview_screenshot(w: Work) -> None:
+    page = w.file("shot.html", "<head><title>One</title></head>")
+    sid = w.put(page, "--image", "--description", "first", **w.browsers("chromium"))
+    expect(w.served(sid) == (
+        "<head>\n"
+        '<meta property="og:title" content="One">\n'
+        '<meta property="og:description" content="first">\n'
+        f'<meta property="og:url" content="https://share.mwolf.dev/{sid}/">\n'
+        f'<meta property="og:image" content="https://share.mwolf.dev/{sid}/share-preview.png">\n'
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:site_name" content="share.mwolf.dev">\n'
+        '<meta name="twitter:card" content="summary_large_image"><title>One</title></head>'),
+        f"the served page is {w.served(sid)!r}")
+    expect((w.root / "public" / sid / "share-preview.png").read_bytes() == b"PNG", "the screenshot is not in the share")
+    expect("--window-size=1200,630" in (w.tmp / "browser.log").read_text().split(), "the screenshot is not 1200x630")
+    w.file("shot.html", "<title>Two</title>")
+    w.put(page, "--replace", sid, **w.browsers("chromium"))
+    expect(w.served(sid) == (
+        '\n<meta property="og:title" content="Two">\n'
+        f'<meta property="og:url" content="https://share.mwolf.dev/{sid}/">\n'
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:site_name" content="share.mwolf.dev">\n'
+        '<meta name="twitter:card" content="summary"><title>Two</title>'),
+        f"after --replace the served page is {w.served(sid)!r}")
+    expect(os.listdir(w.root / "public" / sid) == ["index.html"], "the replaced share kept its preview image")
+    listed = w.listed(sid)
+    expect((listed["title"], listed["description"]) == ("Two", None), f"after --replace share list --json says {listed}")
+
+
+@prop("root: --image <file> puts that file on the card, a page's own og:image wins, and with no browser the share goes up without one, saying why")
+def preview_image_file(w: Work) -> None:
+    page = w.file("img.html", "<title>T</title>")
+    image = w.file("Cover.JPG", "jpeg")
+    sid = w.put(page, "--image", str(image))
+    expect(f'<meta property="og:image" content="https://share.mwolf.dev/{sid}/share-preview.jpg">' in w.served(sid)
+           and '<meta name="twitter:card" content="summary_large_image">' in w.served(sid), f"the served page is {w.served(sid)!r}")
+    expect((w.root / "public" / sid / "share-preview.jpg").read_bytes() == b"jpeg" and image.read_text() == "jpeg", "the image file did not go up as it is")
+    own = w.put(w.file("own-image.html", '<head><meta property="og:image" content="https://example.com/a.png"></head>'), "--image", str(image))
+    expect(w.served(own).count("og:image") == 1 and '<meta name="twitter:card" content="summary_large_image">' in w.served(own),
+           f"the page with its own og:image is served as {w.served(own)!r}")
+    expect(os.listdir(w.root / "public" / own) == ["index.html"], "an image went up beside a page's own og:image")
+    r = w.share(str(page), "--image", **w.browsers())
+    expect("no Chrome, Chromium or Edge" in r.stderr, f"without a browser share said {r.stderr!r}")
+    sid = r.stdout.strip().rstrip("/").rsplit("/", 1)[-1]
+    expect("og:image" not in w.served(sid) and '<meta name="twitter:card" content="summary">' in w.served(sid), f"the served page is {w.served(sid)!r}")
+
+
+@prop("root: --image is refused on a link that opens no page, with an image file missing or over 25 MiB, and on a share that holds a share-preview file of its own")
+def preview_image_refused(w: Work) -> None:
+    before, deploys = tree(w.root), w.deploy_count()
+    folder = w.files / "clash"
+    w.file("clash/index.html", "<title>T</title>")
+    w.file("clash/share-preview.png", "mine")
+    with open(w.files / "huge.png", "wb") as f:
+        f.truncate(25 * MIB + 1)
+    for args, says in (([str(w.file("a.pdf", "%PDF")), "--image"], "no page"),
+                       ([str(folder), "--image", str(w.files / "missing.png")], "no image file"),
+                       ([str(w.file("own-og.html", '<meta property="og:image" content="x">')), "--image", str(w.files / "missing.png")], "no image file"),
+                       ([str(folder), "--image", str(w.files / "huge.png")], "smaller one"),
+                       ([str(folder), "--image", str(w.file("x.png", "png"))], "share-preview.png")):
+        r = w.share(*args, ok=False)
+        expect(r.returncode != 0 and says in r.stderr, f"share {' '.join(args)}: {r.returncode} {r.stderr!r}")
+    expect(w.deploy_count() == deploys and tree(w.root) == before, "a refused --image deployed or changed the root")
+
+
+@prop("root: --image with --password is refused before the password is asked for")
+def preview_image_with_password(w: Work) -> None:
+    before, deploys = tree(w.root), w.deploy_count()
+    page = w.file("secret-image.html", "<title>T</title>")
+    for image in ([], [str(w.file("y.png", "png"))]):
+        # with no terminal, a password asked for first would fail on that instead
+        r = w.share(str(page), "--password", "--image", *image, ok=False)
+        expect(r.returncode != 0 and "--password" in r.stderr and "terminal" not in r.stderr, f"--image {image} --password: {r.stderr!r}")
+    expect(w.deploy_count() == deploys and tree(w.root) == before, "a refused --image --password deployed or changed the root")
 
 
 # --- the site, as wrangler dev serves a root

@@ -292,7 +292,9 @@ map("n", "<leader>gtd", ":Gitsigns toggle_deleted<CR>", { desc = "Toggle deleted
 map("n", "<leader>gd", ":Gitsigns diffthis<CR>", { desc = "Diff this", silent = true })
 map("n", "<leader>gD", ":Gitsigns diffthis HEAD<CR>", { desc = "Diff with HEAD", silent = true })
 
--- TODO fugitive.vim for blaming entire buffer, ...
+map("n", "<leader>gbb", function() require("blame").toggle() end, { desc = "Toggle blame panel" })
+map("n", "<leader>gbf", function() require("blame").follow() end, { desc = "Toggle blame follow: the line's commit beside the code" })
+map("n", "<leader>gbl", function() require("gitsigns").blame_line { full = true } end, { desc = "Blame line: commit and its hunk" })
 
 -- ====================================================================
 -- Sessions

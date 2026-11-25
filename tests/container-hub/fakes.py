@@ -101,7 +101,7 @@ def uv_dirs() -> dict[str, str]:
 def scrubbed(home: Path, **extra: str) -> dict[str, str]:
     """This environment with HOME moved, no session of its own, no tmux server, and no git or XDG configuration of
     the user's: a global commit hook would stamp the fixture's commits with this run's session."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB", "TMUX"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "MX_", "GIT_", "XDG_", "CONTAINER_HUB", "TMUX", "JOB_"))}
     return {**env, **{k: v for k, v in uv_dirs().items() if v}, "HOME": str(home), "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1", **extra}
 
@@ -128,6 +128,20 @@ def page(path: Path, body: str = "<!doctype html><p>a page</p>") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
     return path
+
+
+def job(home: Path, name: str, session: str | None, tty: bool = True, pid: int | None = None,
+        started: str = "2026-11-01T09:00:00+00:00", command: str = "sudo apt-get install -y pcscd", ended: bool = False) -> Path:
+    """A job as `job run` leaves it in the job state directory under `home`: the meta its runner writes on entry (`cmd_exec`
+    in bin/job, whose shape this copies), naming
+    the session that started it (none where `session` is None) and whether it runs `--tty`, and the status line it
+    writes on exit where the job has `ended`. Its runner is this test's own process unless `pid` names another."""
+    d = home / ".local/state/jobs" / name
+    page(d / "meta", f"pid={pid or os.getpid()}\nstarted={started}\ncwd={home}\nawake=0\ntty={int(tty)}\n"
+                     f"session={session or ''}\ncmd={command}\n")
+    if ended:
+        page(d / "status", "exit=0 ended=2026-11-01T09:01:00Z secs=60\n")
+    return d
 
 
 served = lambda path: "/f" + urllib.parse.quote(str(path))
@@ -202,19 +216,25 @@ class Unix(http.client.HTTPConnection):
         self.sock.connect(str(self.path_))
 
 
-def request(to: int | Path, method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60):
-    """(status, headers, body as JSON where it parses) of a request to a hub: at its port on 127.0.0.1, as a browser
-    reaches it, or at its socket, as a local tool does. A body of bytes goes as it is, any other as JSON."""
+def request(to: int | Path, method: str, path: str, body=None, headers: dict | None = None, timeout: float = 60,
+            raw: bool = False):
+    """(status, headers, body as JSON where it parses, or as it came over the wire where `raw`) of a request to a hub:
+    at its port on 127.0.0.1, as a browser reaches it, or at its socket, as a local tool does. A body of bytes goes as
+    it is, any other as JSON."""
     conn = Unix(to) if isinstance(to, Path) else http.client.HTTPConnection("127.0.0.1", to, timeout=timeout)
     data = body if isinstance(body, bytes) or body is None else json.dumps(body).encode()
     conn.request(method, path, body=data, headers={"Content-Type": "application/json", **(headers or {})})
     r = conn.getresponse()
-    raw = r.read()
+    got = r.read()
     conn.close()
     try:
-        return r.status, r.headers, json.loads(raw)
+        return r.status, r.headers, got if raw else json.loads(got)
     except ValueError:
-        return r.status, r.headers, raw
+        return r.status, r.headers, got
+
+
+GZIP = {"Accept-Encoding": "gzip, deflate, br"}
+"""What a browser says it takes."""
 
 
 def token(port: int) -> str:
@@ -342,26 +362,29 @@ exit 1
         self.registered(session, pid=gone.pid, started=None, **extra)
 
     def statusline(self, session: str, at: float, config_dir: Path | str | None = None, context: tuple | None = None,
-                   five_hour: tuple | None = None, seven_day: tuple | None = None) -> None:
+                   seven_day: tuple | None = None) -> None:
         """What the statusline keeps of a render: Claude Code's statusline input as received, with the account it ran
-        under and when it ran added. A window is (used percentage, resets at); a pro account's input carries none."""
+        under and when it ran added. The week's window is (used percentage, resets at); a pro account's input carries none."""
         data = {"session_id": session, "model": {"id": "claude-opus-5-5", "display_name": "Opus"},
                 "workspace": {"current_dir": str(self.home)}, "config_dir": str(config_dir or self.home / ".claude"), "written_at": at,
                 **({"context_window": {"used_percentage": context[0], "total_input_tokens": context[1],
                                        "context_window_size": 200000}} if context else {}),
-                "rate_limits": {name: {"used_percentage": w[0], "resets_at": w[1]}
-                                for name, w in (("five_hour", five_hour), ("seven_day", seven_day)) if w}}
+                "rate_limits": {"seven_day": {"used_percentage": seven_day[0], "resets_at": seven_day[1]}} if seven_day else {}}
         page(self.home / ".cache/claude-statusline" / f"{session}.json", json.dumps(data))
 
+    def job(self, name: str, session: str | None, **how) -> Path:
+        return job(self.home, name, session, **how)
+
     def turn_record(self, session_dir: Path, number: int, headline: str, questions: tuple[str, ...] = (),
-                    at: float | None = None, **front: dict[str, str]) -> None:
+                    at: float | None = None, todos: tuple[str, ...] = (), **front: dict[str, str]) -> None:
         """A turn record in the shape the mx plugin's RULES.md gives it, written at `at`, else at the hub's clock: its
-        frontmatter's `answered` and `superseded` each a mapping of question tags."""
+        frontmatter's `answered` and `superseded` each a mapping of question and to-do tags."""
         path = session_dir / "turns" / f"{number:02d}.md"
         tables = "".join(f"{name}:\n" + "".join(f"  {tag}: {value}\n" for tag, value in table.items()) for name, table in front.items())
         asked = "\n## Questions\n\n" + "".join(f"- [{q}] **Which way, {q}?** A call only the user can make.\n  - (a) this way *my pick*\n  - (b) that way\n"
                                                     for q in questions) if questions else ""
-        page(path, f"---\ndate: 2026-10-07\n{tables}---\n\n# {headline}\n{asked}")
+        listed = "\n## To do\n\n" + "".join(f"- [{a}] **Do {a}** outside the session.\n" for a in todos) if todos else ""
+        page(path, f"---\ndate: 2026-10-07\n{tables}---\n\n# {headline}\n{asked}{listed}")
         os.utime(path, (at or self.clock.now,) * 2)
 
     @staticmethod

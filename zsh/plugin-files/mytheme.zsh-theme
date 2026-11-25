@@ -70,15 +70,16 @@ typeset -gA JOVIAL_SYMBOL=(
     corner.top    '╭─'
     corner.bottom '╰─'
 
-    git.dirty '✘✘✘'
-    git.clean '✔'
-
-    ## preset arrows
-    # arrow '─>'
-    # arrow '─▶'
-    arrow '─➤'
-    arrow.git-clean '(๑˃̵ᴗ˂̵)و'
-    arrow.git-dirty '(ﾉ˚Д˚)ﾉ'
+    # the typing pointer: outside a repo, in a clean one, in a dirty one;
+    # one cell wide, so commands always start in the same column
+    arrow '○'
+    arrow.git-clean '●'
+    arrow.git-dirty '◐'
+    # after the branch: commits not pushed, commits not pulled (as of the
+    # last fetch), and a branch with no upstream
+    git.ahead '⇡'
+    git.behind '⇣'
+    git.no-upstream '⇡'
 )
 
 
@@ -118,14 +119,15 @@ typeset -gA JOVIAL_PALETTE=(
     conj. '%F{2}'
     # shell typing area pointer
     typing '%F{13}'
+    typing.git-clean '%F{10}'
+    typing.git-dirty '%F{11}'
     # for other common case text color
     normal '%F{13}'
-    success '%F{10}'
     error '%F{9}'
 )
 
 # parts dispaly order from left to right of jovial theme at the first line 
-typeset -ga JOVIAL_PROMPT_ORDER=( host user path dev-env git-info )
+typeset -ga JOVIAL_PROMPT_ORDER=( host user path dev-env git-info venv )
 
 # prompt parts priority from high to low, for `responsive design`.
 # decide whether to still keep dispaly while terminal width is no enough;
@@ -138,6 +140,7 @@ typeset -ga JOVIAL_PROMPT_PRIORITY=(
     user
     host
     dev-env
+    venv
 )
 
 # pin last command execute elapsed, if the threshold is reached
@@ -456,17 +459,15 @@ typeset -gA jovial_affix_lengths=()
 }
 
 @jov.set-typing-pointer() {
-    jovial_parts[typing]="${JOVIAL_PALETTE[typing]}"
-
+    local state=''
     if [[ -n ${jovial_rev_git_dir} ]]; then
         if [[ ${jovial_is_git_dirty} == false ]]; then
-            jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow.git-clean]}"
+            state='.git-clean'
         else
-            jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow.git-dirty]}"
+            state='.git-dirty'
         fi
-    else
-        jovial_parts[typing]+="${JOVIAL_SYMBOL[arrow]}"
     fi
+    jovial_parts[typing]="${JOVIAL_PALETTE[typing${state}]}${JOVIAL_SYMBOL[arrow${state}]}"
 }
 
 @jov.set-venv-info() {
@@ -489,7 +490,9 @@ typeset -gA jovial_affix_lengths=()
 
     if [[ -z ${venv_name} ]]; then
         jovial_parts[venv]=''
+        jovial_part_lengths[venv]=0
     else
+        jovial_part_lengths[venv]=$(( ${#venv_name} + ${jovial_affix_lengths[venv]} ))
         jovial_parts[venv]="${JOVIAL_AFFIXES[venv.prefix]}${JOVIAL_PALETTE[venv]}${venv_name}${JOVIAL_AFFIXES[venv.suffix]}"
     fi
 }
@@ -819,6 +822,21 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
     fi
 }
 
+# prints "<dirty> <ahead> <behind>": dirty is `true` or `false`; ahead and
+# behind are commit counts against the upstream, `-` when the branch has no
+# upstream, `x` when HEAD is detached
+@jov.judge-git-state() {
+    local ahead_behind
+    if ! \git symbolic-ref -q HEAD > /dev/null 2>&1; then
+        ahead_behind='x x'
+    elif ahead_behind="$(\git rev-list --left-right --count 'HEAD...@{upstream}' 2> /dev/null)"; then
+        ahead_behind="${ahead_behind//$'\t'/ }"
+    else
+        ahead_behind='- -'
+    fi
+    echo "$(@jov.judge-git-dirty) ${ahead_behind}"
+}
+
 @jov.git-action-prompt() {
     # always depend on ${jovial_rev_git_dir} path is existed
 
@@ -888,16 +906,16 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
 
 
 # use `exec` to parallel run commands and capture stdout into file descriptor
-#   @jov.set-git-info [true|false]
-# first param is whether git is dirty or not (`true` or `false`), 
-# if first param is not set, will try to read by exec
+#   @jov.set-git-info ["<dirty> <ahead> <behind>"]
+# the param is the output of `@jov.judge-git-state`;
+# if it is not set, will try to read by exec
 @jov.set-git-info() {
-    local is_dirty="$1"
+    local git_state_line="$1"
 
-    local dirty_fd branch_fd action_fd
+    local state_fd branch_fd action_fd
 
-    if [[ -z ${is_dirty} ]]; then
-        exec {dirty_fd}<> <(@jov.judge-git-dirty)
+    if [[ -z ${git_state_line} ]]; then
+        exec {state_fd}<> <(@jov.judge-git-state)
     fi
 
     exec {branch_fd}<> <(@jov.git-branch)
@@ -909,35 +927,37 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
     exec {branch_fd}>& -
     exec {action_fd}>& -
 
-    if [[ -n ${dirty_fd} ]]; then
-        is_dirty="$(<& ${dirty_fd})"
-        exec {dirty_fd}>& -
+    if [[ -n ${state_fd} ]]; then
+        git_state_line="$(<& ${state_fd})"
+        exec {state_fd}>& -
     fi
 
-    local git_state='' state_color='' git_dirty_status=''
- 
-    if [[ ${is_dirty} == true ]]; then
-        git_state='dirty'
-        state_color='error'
-    else
-        git_state='clean'
-        state_color='success'
+    local is_dirty ahead behind
+    read -r is_dirty ahead behind <<< "${git_state_line}"
+
+    local git_sync=''
+    if [[ ${ahead} == '-' ]]; then
+        git_sync="${JOVIAL_SYMBOL[git.no-upstream]}"
+    elif [[ ${ahead} == <-> && ${behind} == <-> ]]; then
+        (( ahead > 0 )) && git_sync+="${JOVIAL_SYMBOL[git.ahead]}${ahead}"
+        (( behind > 0 )) && git_sync+="${JOVIAL_SYMBOL[git.behind]}${behind}"
     fi
+    [[ -n ${git_sync} ]] && git_sync=" ${git_sync}"
 
-    git_dirty_status="${JOVIAL_PALETTE[${state_color}]}${JOVIAL_SYMBOL[git.${git_state}]}"
-
-    jovial_parts[git-info]="${JOVIAL_AFFIXES[git-info.prefix]}${JOVIAL_PALETTE[git]}${git_branch}${git_action}${JOVIAL_AFFIXES[git-info.suffix]}${git_dirty_status}"
+    jovial_parts[git-info]="${JOVIAL_AFFIXES[git-info.prefix]}${JOVIAL_PALETTE[git]}${git_branch}${git_action}${JOVIAL_PALETTE[normal]}${git_sync}${JOVIAL_AFFIXES[git-info.suffix]}"
 
     jovial_part_lengths[git-info]=$((
-        ${#JOVIAL_SYMBOL[git.${git_state}]}
-        + ${jovial_affix_lengths[git-info]}
+        ${jovial_affix_lengths[git-info]}
         + ${#git_branch}
         + ${#git_action}
+        + ${#git_sync}
     ))
 
     local has_changed=false
 
-    if [[ ${jovial_parts[git-info]} != ${jovial_previous_parts[git-info]} ]]; then
+    # the dirty state shows only in the typing pointer, so it counts as a change too
+    if [[ ${jovial_parts[git-info]} != ${jovial_previous_parts[git-info]} \
+        || ${is_dirty} != ${jovial_is_git_dirty} ]]; then
         has_changed=true
     fi
 
@@ -965,7 +985,7 @@ typeset -ga JOVIAL_DEV_ENV_DETECT_FUNCS=(
     jovial_parts[git-info]="${jovial_previous_parts[git-info]}"
     jovial_part_lengths[git-info]="${jovial_previous_lengths[git-info]}"
 
-    @jov.async 'git-info' @jov.judge-git-dirty @jov.set-git-info
+    @jov.async 'git-info' @jov.judge-git-state @jov.set-git-info
 }
 
 # `EPOCHSECONDS` is setup in zsh/datetime module
@@ -1078,7 +1098,6 @@ add-zsh-hook precmd @jov.prompt-prepare
 
     prompts[margin-line]="${sgr_reset}${jovial_parts[margin-line]}"
     prompts[typing]="${sgr_reset}${jovial_parts[typing]}"
-    prompts[venv]="${sgr_reset}${jovial_parts[venv]}"
 
     local -a ordered_parts=()
     for key in ${JOVIAL_PROMPT_ORDER[@]}; do
@@ -1089,7 +1108,7 @@ add-zsh-hook precmd @jov.prompt-prepare
     local corner_bottom="${sgr_reset}${JOVIAL_PALETTE[normal]}${JOVIAL_SYMBOL[corner.bottom]}"
 
     echo "${corner_top}${(j..)ordered_parts}${prompts[current-time]}"
-    echo "${corner_bottom}${prompts[typing]}${prompts[venv]} ${sgr_reset}"
+    echo "${corner_bottom}${prompts[typing]}  ${sgr_reset}"
 }
 
 

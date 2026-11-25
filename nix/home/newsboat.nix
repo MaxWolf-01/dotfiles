@@ -52,6 +52,8 @@ in
       { url = "https://lineick.github.io/feed.xml"; }
       { url = "https://www.benfrederickson.com/atom.xml"; }
       { url = "https://blog.trueberryless.org/blog/rss.xml"; }
+      { url = "https://chalmovsky.com/feed.xml"; }
+      { url = "https://www.joachim-breitner.de/blog/feed.xml"; }
       (codebergFeed "https://codeberg.org/lucidrains/x-evolution.rss")
       (codebergFeed "https://codeberg.org/lucidrains/streaming-deep-rl.rss")
       (codebergFeed "https://codeberg.org/lucidrains/metacontroller.rss")

@@ -81,7 +81,7 @@ tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
 
 Structure:
 - `flake.nix` defines all hosts. PC is a NixOS system (with HM as a module); laptops are HM standalone.
-- `nix/home/` holds one Home Manager module per concern: a program (`firefox.nix`, `ghostty.nix`, `tmux.nix`, ...), a desktop layer (`desktop.nix`, `gnome.nix`, `wayland.nix`), a toolchain (`dotnet.nix`), the systemd user timers (`timers.nix` and `pc-timers.nix`, one file per host that has them), a user (`worker.nix`), the list of machines every host tool reads (`machines.nix`), and `common.nix` for what every machine gets. `ls nix/home/` is the index; each module's own options say what it sets.
+- `nix/home/` holds one Home Manager module per concern: a program (`firefox.nix`, `ghostty.nix`, `tmux.nix`, ...), a desktop layer (`desktop.nix`, `gnome.nix`, `wayland.nix`), a toolchain (`dotnet.nix`), the systemd user timers (`timers.nix` and `pc-timers.nix`, one file per host that has them; a timer more than one host runs is a module of its own, such as `helferline-mirror.nix`), a user (`worker.nix`), the list of machines every host tool reads (`machines.nix`), and `common.nix` for what every machine gets. `ls nix/home/` is the index; each module's own options say what it sets.
 - `nix/home/hosts/` is per-machine: stateVersion, the imports that pick the tier below, the options a module declares where what it does differs by host (`containerHub`, `sessionCopies`, `tmuxServer`), and, on a host that holds the age key, where it is (`SOPS_AGE_KEY_FILE`). A worker user's record, the hand-written half of its `HOST.md`, sits in `<host>-<user>/`, by the machine's name in `machines.nix`, whatever its config file is called (`zephylux-max/` beside `zephyrus.nix`).
 - `docs/<host>.md` is a machine's hardware: which port drives which GPU, thermal limits, traps.
 - `nix/nixos/<host>/` is a NixOS host's system config (pc, xmg19); `nix/nixos/` itself holds the modules both import.
@@ -137,6 +137,13 @@ zephylux, unlocks what a rebooted xmg19 or pc keeps locked: run it whenever
 either was rebooted. What each one's unlock opens is its
 `unlock` in `nix/home/machines.nix`.
 
+## sudo by a YubiKey touch
+
+sudo takes a YubiKey touch before the password: pam_u2f on zephylux, and on pc
+and xmg19 pam_rssh through a second ssh agent, forwarded only there, that holds
+only the YubiKeys' sk keys. Setup, the checks and how to back out:
+`docs/sudo-touch.md`.
+
 ## SFTPGo File Drop
 
 The only service on pc with a public (non-tailnet) surface. Manage accounts with
@@ -187,6 +194,14 @@ message, its body as text; Jarvis reads the same view of the copy `jarvis-sync`
 ships. Read the local copy; never talk to Bridge's
 IMAP or SMTP directly, and never send mail. Setup and limits:
 `nix/home/proton-mail.nix`.
+
+## WhatsApp
+
+The phone's newest WhatsApp backup is mirrored, decrypted, to `~/data/whatsapp`
+(zephylux only, hourly, `whatsapp-chat mirror`); `whatsapp-chat` prints a chat
+from it, and `lifelog whatsapp` reads it as one row per message, which Jarvis
+reads from the copy `jarvis-sync` ships. The backup key stays on the laptop.
+`whatsapp-chat --help` says how.
 
 ## Knowledge Base Publishing
 

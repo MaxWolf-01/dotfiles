@@ -505,6 +505,7 @@ SECRETS = "jku"
 ME = "https://www.kusss.jku.at/kusss/"  # the sign-in lands on www.; its session cookie is not sent to kusss.jku.at
 MYJKU = "https://my.jku.at"
 IDP_HOST = "shibboleth.im.jku.at"
+NIDP = "https://access.jku.at/nidp/"  # JKU's Access Manager, where Shibboleth sends the browser for the password
 SEMESTER = r"\d{4}[WS]"
 # Every page the signed-in session opens, with the parameters each must carry: name -> pattern its
 # value must match. Anything else is refused before the request goes out. KUSSS acts through pages
@@ -520,8 +521,12 @@ READS: dict[str, dict[str, str]] = {
     MYJKU + "/api2/student/fee": {},
 }
 # Where the sign-in's forms may post: the JKU login, and the SAML endpoints of KUSSS and myJKU.
-SIGN_IN_POSTS = (f"https://{IDP_HOST}/idp/profile/SAML2/", "https://www.kusss.jku.at/Shibboleth.sso/SAML2/POST",
+SIGN_IN_POSTS = (f"https://{IDP_HOST}/idp/profile/", NIDP + "saml2/sso", "https://www.kusss.jku.at/Shibboleth.sso/SAML2/POST",
                  MYJKU + "/Shibboleth.sso/SAML2/POST")
+# The password fields: Shibboleth's own login form, and the Access Manager's.
+CREDENTIAL_FIELDS = (("j_username", "j_password"), ("Ecom_User_ID", "Ecom_Password"))
+# How the Access Manager moves on without a form: a script that sets window.location.
+SCRIPT_REDIRECT = re.compile(r"window\.location\.href\s*=\s*'([^']+)'")
 DATE = re.compile(r"(\d\d)\.(\d\d)\.(\d{4}|\d\d)(?:\s+(\d\d:\d\d))?")
 EXAM_COURSE = re.compile(r"^(.*?)\s*\((\w{6}),(" + SEMESTER + r")\)\s*(.*)$")
 
@@ -550,33 +555,49 @@ class Session:
         return BeautifulSoup(self.get(url, **params).content, "lxml")
 
     def through_login(self, r: requests.Response, username: str, password: str) -> requests.Response:
-        """Post the JKU login's forms (local-storage probe, username/password, SAML response) until a page off the login is reached.
+        """Post the JKU login's forms as they come, with the values they carry, until a page off the login is reached.
 
-        Returns early on the login page when it shows the password form a second time: the credentials were refused.
+        Shibboleth hands the browser to the Access Manager, which asks for the password and hands back a SAML
+        response; each form is posted as the browser posts it, its Referer included, which the Access Manager
+        answers an empty page without. Its device-recognition form goes as the page sends it, with the
+        fingerprint field empty. Returns on the password form's second showing: the credentials were refused,
+        and a second try would count against the account's lockout.
         """
-        password_page = None
-        for _ in range(6):
+        password_sent = False
+        for _ in range(12):
+            on_login = r.url.startswith((f"https://{IDP_HOST}/", NIDP))
             form = BeautifulSoup(r.text, "lxml").find("form")
-            if urlparse(r.url).hostname != IDP_HOST or not form:
+            if on_login and form is None and (script := SCRIPT_REDIRECT.search(r.text)):
+                target = urljoin(r.url, script.group(1))
+                if not target.startswith(NIDP):
+                    raise ValueError(f"refusing to follow the login's redirect to {target}: not JKU's login")
+                r = self.s.get(target, headers={"Referer": r.url}, timeout=60)
+                continue
+            if not on_login or form is None:
                 return r
             target = urljoin(r.url, form.get("action", ""))
             if not target.startswith(SIGN_IN_POSTS):
                 raise ValueError(f"refusing to post the sign-in form to {target}: not JKU's login or a SAML endpoint")
             data = {i["name"]: i.get("value", "") for i in form.find_all("input") if i.get("name")}
-            if "j_username" in data:
-                if r.url == password_page:
-                    return r
-                password_page = r.url
-                data |= {"j_username": username, "j_password": password}
-            data["_eventId_proceed"] = ""
-            r = self.s.post(target, data=data, timeout=60)
+            for user_field, password_field in CREDENTIAL_FIELDS:
+                if user_field in data:
+                    if password_sent:
+                        return r
+                    password_sent = True
+                    data |= {user_field: username, password_field: password}
+            if r.url.startswith(f"https://{IDP_HOST}/"):
+                data["_eventId_proceed"] = ""
+            r = self.s.post(target, data=data, headers={"Referer": r.url}, timeout=60)
         return r
 
     def sign_in(self, username: str, password: str) -> None:
         r = self.through_login(self.get(ME + "login.action"), username, password)
         if "logout-confirm.action" not in r.text:
             error = BeautifulSoup(r.text, "lxml").select_one(".output--failure, .form-error, .alert-danger")
-            why = clean(error.get_text(" ")) if error else f"the sign-in ended on {r.url}, not on a KUSSS page"
+            refused = r.url.startswith(NIDP) and BeautifulSoup(r.text, "lxml").find("input", attrs={"name": "Ecom_Password"})
+            why = (clean(error.get_text(" ")) if error
+                   else "JKU's login showed the password form again: it refused the password, or the account is locked" if refused
+                   else f"the sign-in ended on {r.url}, not on a KUSSS page")
             sys.exit(f"kusss: sign-in failed: {why}\n"
                      f"Check the username and password in the sops file `{SECRETS}` (sops-editor), and that JKU's login works in a browser.")
 

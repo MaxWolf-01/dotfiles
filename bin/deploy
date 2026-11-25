@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# deploy: switch hosts to the config committed on master, the one way a host's
+# system changes (agent ticket reviewed-updates-reach-every-host).
+set -uo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: deploy HOST...
+       deploy --all
+
+Switches each HOST to the config master holds in ~/.dotfiles, built here, and
+says afterwards which hosts wait on a reboot into a new kernel. master must be
+pushed: a commit only this checkout holds is refused, so every host runs
+something GitHub has. Uncommitted work in the checkout never reaches a host.
+
+  HOST    a nixosConfigurations name in the flake, reached by the ssh alias of
+          the same name. This machine is switched locally: by nixos-rebuild on
+          NixOS, by home-manager on a machine that only runs Home Manager.
+  --all   every host in the flake, and this machine; a host still running
+          another OS is skipped with a line saying so
+
+sudo on a host asks for a YubiKey touch (docs/sudo-touch.md); a host that takes
+the laptop's key as root (jarvis, yapit-prod) asks for none. A new kernel is
+never booted here: at the end, on a terminal, deploy asks whether to reboot the
+remote hosts that wait on one, and never reboots this machine. After
+switching a host that keeps something locked after a boot (pc, xmg19), it runs
+`hosts unlock` on it, since the switch may have restarted what that opened.
+EOF
+}
+
+dotfiles="${DOTFILES:-$HOME/.dotfiles}"
+# NIX_HOST names this machine's Home Manager config where it differs from the
+# hostname; an interactive shell gets it from ~/.local_exports, a unit does not.
+[ -n "${NIX_HOST:-}" ] || NIX_HOST="$(sed -n 's/^export NIX_HOST="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$HOME/.local_exports" 2>/dev/null)"
+# sudo on pc and xmg19 asks the YubiKey through an agent ssh forwards only when
+# this names it (nix/home/sudo-touch.nix); a shell other than zsh lacks it.
+export SSH_SK_FORWARD="${SSH_SK_FORWARD:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-sk-agent}"
+flake="git+file://$dotfiles?ref=master"
+self="$(hostname)"
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    '') usage >&2; exit 2 ;;
+esac
+
+die() { echo "deploy: $*" >&2; exit 1; }
+
+git -C "$dotfiles" fetch -q origin master || die "could not fetch origin's master; deploy switches only to a pushed commit"
+local_rev="$(git -C "$dotfiles" rev-parse master)"
+remote_rev="$(git -C "$dotfiles" rev-parse origin/master)"
+[ "$local_rev" = "$remote_rev" ] || die "master here ($local_rev) is not origin's ($remote_rev): push or pull first"
+
+# Nix's evaluation cache can name a .drv the garbage collector has since
+# removed, and the build then fails with "path ... is not valid"; a deploy
+# evaluates afresh rather than trust it.
+fresh=(--option eval-cache false)
+
+nixos_hosts() {
+    nix eval --json "$flake#nixosConfigurations" --apply 'builtins.attrNames' \
+        | jq -r '.[] | select(. != "installer")'
+}
+
+if [ "$1" = --all ]; then
+    mapfile -t hosts < <(nixos_hosts) || die "could not list the flake's hosts"
+    printf '%s\n' "${hosts[@]}" | grep -qx "$self" || hosts+=("$self")
+else
+    hosts=("$@")
+fi
+
+echo "deploy: master at ${local_rev:0:12} to ${hosts[*]}"
+failed=() rebooting=() switched=()
+
+# A host waits on a reboot when the kernel it booted is not the kernel of the
+# system it now runs.
+reboot_pending() {
+    local run=(bash -c 'test "$(readlink /run/booted-system/kernel)" != "$(readlink /run/current-system/kernel)"')
+    if [ "$1" = "$self" ]; then "${run[@]}"; else ssh "$1" "${run[@]@Q}"; fi
+}
+
+for host in "${hosts[@]}"; do
+    echo
+    echo "== $host"
+    if [ "$host" = "$self" ] && [ ! -e /etc/NIXOS ]; then
+        home-manager switch --flake "$flake#${NIX_HOST:-$self}" --option warn-dirty false \
+            && switched+=("$host") || failed+=("$host")
+        continue
+    fi
+    if [ "$host" = "$self" ]; then
+        nixos-rebuild switch --flake "$flake#$host" --elevate sudo "${fresh[@]}" \
+            && switched+=("$host") || failed+=("$host")
+    else
+        if ! ssh -o ConnectTimeout=10 "$host" test -e /etc/NIXOS; then
+            echo "skipped: $host is not reachable, or does not run NixOS yet"
+            continue
+        fi
+        elevate=(--elevate sudo)
+        [ "$(ssh "$host" id -u)" = 0 ] && elevate=()
+        nixos-rebuild switch --flake "$flake#$host" --target-host "$host" --use-substitutes "${fresh[@]}" "${elevate[@]}" \
+            && switched+=("$host") || { failed+=("$host"); continue; }
+        # A switch restarts the units it changed, the ssh agent among them, and
+        # with it goes what `hosts unlock` opened: on pc the key its hub reaches
+        # the laptop's with. Unlocking again puts it back; a host with nothing
+        # to unlock says so and changes nothing.
+        "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/hosts" unlock "$host" 2>&1 | grep -v '^hosts: no unlock known'
+    fi
+    reboot_pending "$host" && rebooting+=("$host")
+done
+
+echo
+[ ${#switched[@]} -gt 0 ] && echo "deploy: switched ${switched[*]}"
+[ ${#failed[@]} -gt 0 ] && echo "deploy: FAILED on ${failed[*]}; each stays on the system it ran before" >&2
+
+if [ ${#rebooting[@]} -gt 0 ]; then
+    echo "deploy: a new kernel waits on a reboot on ${rebooting[*]}"
+    remote=()
+    for host in "${rebooting[@]}"; do [ "$host" != "$self" ] && remote+=("$host"); done
+    if [ ${#remote[@]} -gt 0 ] && [ -t 0 ]; then
+        read -r -p "Reboot ${remote[*]} now? [y/N] " answer
+        if [ "$answer" = y ]; then
+            for host in "${remote[@]}"; do
+                if [ "$(ssh "$host" id -u)" = 0 ]; then ssh "$host" systemctl reboot; else ssh -t "$host" sudo systemctl reboot; fi
+                echo "deploy: $host is rebooting"
+            done
+            echo "deploy: pc and xmg19 keep part of their disks locked after a reboot; \`hosts unlock <host>\` opens them"
+        fi
+    fi
+fi
+
+[ ${#failed[@]} -eq 0 ]

@@ -22,6 +22,11 @@ let
     exec ${tmux} new-session -A -s "$1"
   '';
 
+  # What every Ghostty window runs (ghostty.nix). Tested by tests/tmux-window.test.
+  tmuxWindow = pkgs.writeShellScriptBin "tmux-window" ''
+    exec ${pkgs.bash}/bin/bash ${./tmux-window.sh} ${tmux} ${tmuxRestore} "$HOME/.dotfiles/secrets/scripts/creds-unlock"
+  '';
+
   # `tmux` on PATH is the guard in tmux-guard.sh, with the real binary behind
   # it; the script's header says what it refuses. Tested by tests/tmux-guard.test.
   tmuxGuard = lib.hiPrio (pkgs.writeShellScriptBin "tmux" ''
@@ -148,7 +153,7 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
-  config.home.packages = [ tms tmuxGuard ];
+  config.home.packages = [ tms tmuxGuard tmuxWindow ];
 
   # tmux puts every pane in its own tmux-spawn-<uuid>.scope, and systemd-oomd
   # relieves memory pressure by SIGKILLing one whole scope. Panes hold the
@@ -203,6 +208,11 @@ in
       set -ga terminal-overrides ",xterm-ghostty:Tc"
       set -as terminal-overrides ',xterm-ghostty:Smulx=\E[4::%p1%dm'
       set -as terminal-overrides ',xterm-ghostty:Setulc=\E[58::2::%p1%{65536}%/%d::%p1%{256}%/%{255}%&%d::%p1%{255}%&%d%;m'
+
+      # The server outlives the ghostty that started it. Without these, panes keep
+      # pointing at that ghostty's store path after an upgrade, and a ghostty
+      # started from a pane loads the old version's resources.
+      set -ga update-environment " GHOSTTY_RESOURCES_DIR GHOSTTY_BIN_DIR TERMINFO"
 
       # Renumber windows when one is closed
       set -g renumber-windows on

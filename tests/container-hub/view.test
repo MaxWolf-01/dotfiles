@@ -123,10 +123,10 @@ def elsewhere():
 class World:
     """One scenario's hub and hub tab. The hub runs on a scratch HOME holding one tree, repos/alpha and its agent repo:
     tickets map-columns (open) and csv-import (claimed under it, on ORCHESTRATOR's commit), ORCHESTRATOR's session page
-    and both tickets' show pages, open in ORCHESTRATOR's unit. The tab opens in the overview, every page loaded."""
+    and both tickets' show pages, open in ORCHESTRATOR's unit. The tab opens on the homepage, every page loaded."""
 
     def __init__(self, browser, run: Path, name: str):
-        self.hub = self.context = self.tmux_socket = None
+        self.hub = self.context = self.tmux_socket = self.watcher = None
         self.news = 0  # the pages hears() has opened
         self.errors = []
         try:
@@ -136,9 +136,11 @@ class World:
             raise
 
     def build(self, browser, run: Path, name: str) -> None:
-        # A scenario named twice runs twice. The name is cut short because tmux's socket and the hub's live in here, and
-        # a unix socket's path fits in 108 bytes, under a TMPDIR as long as the devShell's too.
-        self.scratch = Path(tempfile.mkdtemp(dir=run, prefix=f"{name[:24]}."))
+        # A scenario named twice runs twice. The name is cut short because the hubs' and tmux's sockets live in here, and
+        # a unix socket's path fits in 107 bytes, under a TMPDIR as long as the devShell's (~/.tmp/nix-shell.XXXXXX) too.
+        self.scratch = Path(tempfile.mkdtemp(dir=run, prefix=f"{name[:8]}."))
+        if len(bytes(self.scratch)) > 107 - len("/no-laptop.sock"):  # the longest socket name a scenario gives
+            raise RuntimeError(f"TMPDIR is too long for the worlds' sockets: {self.scratch} leaves no room for one under it")
         self.home = self.scratch / "home"
         self.code = self.home / "repos" / "alpha"
         self.agent = self.code / "agent"
@@ -319,6 +321,8 @@ exit 1
     def close(self) -> None:
         """Everything the world started stops, whichever step of it fails."""
         try:
+            if self.watcher and self.watcher.poll() is None:
+                os.killpg(self.watcher.pid, signal.SIGKILL)
             if self.context:
                 check("no script errors", [], self.errors)
                 self.context.close()
@@ -503,8 +507,9 @@ exit 1
         page.wait_for_function(ready, timeout=30000)
         return page
 
-    def open_diff(self) -> tuple[str, str]:
-        """A diffview page of the tree's last commit opened in ORCHESTRATOR's unit, by its view's id and its panel."""
+    def open_diff(self, watch: bool = False) -> tuple[str, str]:
+        """A diffview page of the tree's last commit opened in ORCHESTRATOR's unit, by its view's id and its panel; with
+        `watch`, of the working tree since, which a `diffview --watch` follows until the world ends (self.watcher)."""
         hljs = self.home / ".cache/diffview" / f"hljs-{HLJS_VERSION}"
         hljs.mkdir(parents=True)
         (hljs / "highlight.min.js").write_text("")  # fails its pin, so diffview neither fetches nor highlights
@@ -513,8 +518,14 @@ exit 1
         self.git(self.code, "commit", "-q", "-m", "notes")
         diff = self.agent / "diffviews" / "map-columns.html"
         diff.parent.mkdir()
-        subprocess.run([BIN / "diffview", f"{self.code}@HEAD~1..HEAD", "-o", str(diff), "--no-auto-summary"], env=self.env,
-                       check=True, capture_output=True)
+        render = [BIN / "diffview", f"{self.code}@HEAD~1.." + ("" if watch else "HEAD"), "-o", str(diff), "--no-auto-summary"]
+        if watch:
+            # it names the page's address on the hub, which it asks the world's, never a hub of its own on 8377
+            self.watcher = subprocess.Popen([*render, "--watch"], env={**self.env, "CONTAINER_HUB_SOCKET": str(self.scratch / "hub.sock")},
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            until(lambda: Path(f"{diff}.watch.json").exists(), "the watcher's first build")
+        else:
+            subprocess.run(render, env=self.env, check=True, capture_output=True)
         diff_id = self.opened(diff)
         self.view.wait_for_function(f"ws.views().some(v => v.id === {json.dumps(diff_id)} && v.placement === 'docked')", timeout=10000)
         self.frame_at("/diffviews/map-columns.html")
@@ -539,9 +550,43 @@ exit 1
         """The numbered units, in their order on the rail."""
         return self.view.evaluate("wc.state.units.filter(u => u.number).map(u => u.unit)")
 
+    def project(self, name: str, session: str, at: float, account: str = ".claude") -> None:
+        """Another repo, repos/<name>, with an agent repo of its own, and a live orchestrator of `account` whose session
+        page is open in its unit, its last turn ended at `at`."""
+        agent = self.home / "repos" / name / "agent"
+        (agent / "tickets").mkdir(parents=True)
+        self.git(agent.parent, "init", "-q")
+        self.git(agent, "init", "-q")
+        fakes.ticket(agent, f"{name}-work", "claimed")
+        self.git(agent, "add", "tickets")
+        self.git(agent, "commit", "-q", "-m", "file it", "-m", f"Session: {session}")
+        page = agent / "sessions" / session / "index.html"
+        page.parent.mkdir(parents=True)
+        page.write_text(f"<!doctype html><h1>{name}'s session</h1>")
+        os.utime(page, (at, at))
+        self.registered(session, at, account=account)
+        self.opened(page, session)
+
+    def homepage(self, js: str, page=None):
+        """What the homepage shows, read by js over its element (h)."""
+        return (page or self.view).evaluate(f"(h => {js})(document.getElementById('home'))")
+
+    def at_home(self, page=None) -> bool:
+        """Whether the homepage is in sight, filling the main area."""
+        return self.homepage("h.checkVisibility() && h.getBoundingClientRect().width > 400 && h.childElementCount > 0", page)
+
+    def projects(self, page=None) -> list[list[str]]:
+        """The homepage's list of projects, top down, each with its count of live sessions."""
+        return self.homepage("[...h.querySelectorAll('.plist button')].map(b => [b.firstChild.textContent, b.lastChild.textContent])", page)
+
+    def picked(self, page=None):
+        """The project the homepage shows, and the sessions its rows go into."""
+        return self.homepage("[h.querySelector('.plist .current')?.firstChild.textContent ?? null,"
+                             " [...h.querySelectorAll('.pane .srow')].map(b => b.title.replace('session ', ''))]", page)
+
     def rail_units(self, page=None) -> list[str]:
         """Every unit the rail lists, numbered or not."""
-        return (page or self.view).evaluate("[...document.querySelectorAll('#units .nav, #aside-units .nav')].map(b => b.title.replace('session ', ''))")
+        return (page or self.view).evaluate("[...document.querySelectorAll('#units .nav, #aside-units .nav')].map(b => b.dataset.session)")
 
     def pane(self) -> "Pane":
         return Pane(self)
@@ -581,7 +626,7 @@ class Pane:
         until(lambda: self.says() == ["waiting", ""], "the box, idle")
 
     def enter(self) -> None:
-        self.w.view.locator(f'#units button[title="session {ANSWERING}"] .name').click()  # its middle may be the id, which copies
+        self.w.view.locator(f'#units button[data-session="{ANSWERING}"] .name').click()  # its middle may be the id, which copies
         until(lambda: self.w.current() == ANSWERING, "ANSWERING's unit")
         self.w.frame_at(f"/{ANSWERING}/index.html")
 
@@ -607,10 +652,13 @@ class Pane:
     def arrived(self) -> bytes:
         return self.received.read_bytes() if self.received.exists() else b""
 
-    def after_reload(self) -> str:
-        """What the box holds in a hub tab opened afresh."""
+    def after_reload(self, words: str = "") -> str:
+        """What the box holds in a hub tab opened afresh, given a moment to read `words` from the hub."""
         fresh = self.w.fresh_tab(f"(() => {{ try {{ return !!{BOX}.querySelector('textarea'); }} catch {{ return false; }} }})()")
-        text = fresh.evaluate(f"{BOX}.querySelector('textarea').value")  # the try: it throws until the session page is up
+        read = lambda: fresh.evaluate(f"{BOX}.querySelector('textarea').value")  # the try: it throws until the session page is up
+        deadline = time.monotonic() + 5
+        while (text := read()) != words and time.monotonic() < deadline:
+            time.sleep(0.05)
         fresh.close()
         return text
 
@@ -636,7 +684,7 @@ def scenario(fn):
 
 @scenario
 def entering_a_unit(w: World) -> None:
-    check("the overview shows no session page", (None, False), (w.current(), w.shown("session-side")))
+    check("the homepage shows no session page", (None, False), (w.current(), w.shown("session-side")))
     w.view.keyboard.press("Control+Alt+1")
     settles("ctrl+alt+1 goes into the first orchestrator", ORCHESTRATOR, w.current)
     w.frame_of(ORCHESTRATOR)
@@ -647,6 +695,121 @@ def entering_a_unit(w: World) -> None:
     settles("...on screen", [LEFT], w.on_screen)
     check("closing or reloading the hub tab asks nothing", False,
           w.view.evaluate("(e => (dispatchEvent(e), e.defaultPrevented))(new Event('beforeunload', { cancelable: true }))"))
+
+
+@scenario
+def the_homepage_fills_the_main_area(w: World) -> None:
+    """hub-homepage-by-project P3: with no session selected the main area holds the homepage, whatever else is shown."""
+    v = w.view
+    check("the tab opens on the homepage, over the main area, showing the orchestrator's project",
+          (None, True, [["alpha", "1"]], ["alpha", [ORCHESTRATOR]]), (w.current(), w.at_home(), w.projects(), w.picked()))
+    w.enter()
+    settles("going into a unit puts its pages where the homepage was", False, w.at_home)
+    v.keyboard.press("Control+Alt+a")
+    accounts = v.evaluate("[...new Set(wc.state.units.map((u) => u.account))]")
+    v.evaluate(f"localStorage.setItem('hub:accounts:hidden', JSON.stringify({json.dumps(accounts)}))")
+    v.reload()
+    until(lambda: v.evaluate("window.wc?.state && !wc.state.units.length && !ws.views().length"), "every account hidden, no page left")
+    settles("with every account hidden and the rail folded, the homepage still fills the tab, saying there is no session, "
+            "and the rail stays folded", (True, "No session to show yet. start a session", False),
+            lambda: (w.at_home(), w.homepage("h.textContent"), w.shown("rail-side")))
+
+
+@scenario
+def the_homepage_by_project(w: World) -> None:
+    """hub-homepage-by-project: the sessions grouped by project, one project in view, its start and its sparkline."""
+    v = w.view
+    beta, work, nowhere = session_id(0xbe), session_id(0x77), session_id(0x99)
+    w.second()  # alpha holds two live orchestrators, beta one whose turn ended later than either
+    w.project("beta", beta, w.t0 - 30)
+    settles("a project of its own for each repo, each with its count of live sessions, the most live first; the one "
+            "active most recently is picked at first", ([["alpha", "2"], ["beta", "1"]], ["beta", [beta]]), lambda: (w.projects(), w.picked()))
+    v.locator("#home .plist button", has_text="alpha").click()
+    counts = lambda: w.homepage("h.querySelector('.pane .top .q').textContent")
+    settles("picking a project shows its sessions, the latest first, its counts, and its own sparkline of the last 14 "
+            "days, both its orchestrators started today", (["alpha", [SECOND, ORCHESTRATOR]], "alpha", "2 live · 2 active in 7 days", 14, ": 0 0 0 0 0 0 0 0 0 0 0 0 0 2"),
+            lambda: (w.picked(), w.homepage("h.querySelector('.pane h2').textContent"), counts(),
+                     w.homepage("h.querySelectorAll('.started rect').length"), w.homepage("h.querySelector('.started').title.replace(/^[^:]*/, '')")))
+    w.hears(lambda: w.api("/api/dismiss", {"unit": SECOND}))
+    settles("a session set aside is live no more, and still active this week", ("1 live · 2 active in 7 days", ["alpha", [ORCHESTRATOR]]),
+            lambda: (counts(), w.picked()))
+    v.locator("#home .pane .more").click()
+    settles("one link unfolds the rest of the project: the set-aside session too, and its ticket trees and tickets",
+            [["live sessions", [ORCHESTRATOR]], ["set aside or ended, latest", [SECOND]], ["ticket trees this week", []]],
+            lambda: w.homepage("[...h.querySelectorAll('.detail > div')].map(d => [d.querySelector('h3').textContent,"
+                               " [...d.querySelectorAll('.srow')].map(b => b.title.replace('session ', ''))])"))
+    v.locator("#home .pane .foot .link", has_text="board").click()
+    settles("its board link opens the board over the homepage", (True, False),
+            lambda: (v.evaluate("ws.views().some(v => v.params.kind === 'board')"), w.at_home()))
+    v.keyboard.press("Control+Alt+b")
+    settles("...and the board put away, the homepage is back", True, w.at_home)
+    reopened = w.fresh_tab("window.wc && document.querySelectorAll('#home .plist button').length === 2")
+    check("...and the pick survives a reload", ["alpha", [ORCHESTRATOR]], w.picked(reopened))
+    reopened.close()
+
+    v.locator(f'#home .srow[title="session {ORCHESTRATOR}"]').click()
+    settles("a session's row goes into that session", (ORCHESTRATOR, False), lambda: (w.current(), w.at_home()))
+    for how, go in [("ctrl+alt+0", lambda: v.keyboard.press("Control+Alt+0")), ("the rail's home entry", lambda: v.click("#home-entry")),
+                    ("the hub's name", lambda: v.click("#hub-name"))]:
+        v.locator(f'#units button[data-session="{ORCHESTRATOR}"] .name').click()  # beta is the first in the numbers
+        until(lambda: w.current() == ORCHESTRATOR, "ORCHESTRATOR's unit")
+        w.focus("map-columns")
+        go()
+        settles(f"{how} opens the homepage from inside a session", (None, True), lambda: (w.current(), w.at_home()))
+
+    transcript = w.home / ".claude" / "projects" / "-alpha" / f"{session_id(0x12)}.jsonl"  # what the start form offers
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({"type": "user", "cwd": str(w.code), "entrypoint": "cli", "sessionId": session_id(0x12)}) + "\n")
+    v.locator("#home .start", has_text="start a session here").click()
+    settles("\"start a session here\" opens the start form with the project filled in", (True, str(w.code)),
+            lambda: (v.evaluate("document.getElementById('starter').open"),
+                     v.evaluate("document.querySelector('#starter form').elements.project.value")))
+    v.keyboard.press("Escape")
+
+    w.registered(nowhere, w.t0 - 200)
+    outside = w.home / "notes" / "nowhere.html"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("<!doctype html><h1>a page in no repo</h1>")
+    w.opened(outside, nowhere)
+    settles("a session outside any repo is in a group of its own", True, lambda: "no repo" in [n for n, _ in w.projects()])
+    v.locator("#home .plist button", has_text="no repo").click()
+    settles("...which offers no start and no board", (["no repo", [nowhere]], False, False),
+            lambda: (w.picked(), w.homepage("!!h.querySelector('.pane .start')"),
+                     w.homepage("[...h.querySelectorAll('.pane .link')].some(b => b.textContent === 'board')")))
+
+    w.project("gamma", work, w.t0 - 10, account=".claude-work")
+    settles("another account's orchestrator brings its project", True, lambda: "gamma" in [n for n, _ in w.projects()])
+    v.evaluate(f"localStorage.setItem('hub:accounts:hidden', JSON.stringify([wc.state.units.find(u => u.unit === {json.dumps(work)}).account]))")
+    v.reload()
+    until(lambda: v.evaluate("window.wc && document.querySelectorAll('#home .plist button').length > 0"), "the homepage again")
+    settles("...and an account hidden on the rail brings nothing to the homepage", ["alpha", "beta", "no repo"],
+            lambda: sorted(n for n, _ in w.projects()))
+
+
+@scenario
+def the_homepages_numbers(w: World) -> None:
+    """hub-homepage-by-project P1 and P2: at rest one figure, the picked project's sparkline, and nothing the rail shows;
+    every other figure is in one fold, closed at load."""
+    v = w.view
+    w.statusline(ORCHESTRATOR, w.home / ".claude", context_window={"used_percentage": 81.5, "total_input_tokens": 163000})
+    w.second()
+    w.statusline(SECOND, w.home / ".claude", context_window={"used_percentage": 60, "total_input_tokens": 120000})
+    w.project("gamma", session_id(0x77), w.t0 - 20, account=".claude-work")
+    seen = lambda: w.homepage("[...h.querySelectorAll('figure')].filter(f => f.checkVisibility()).map(f => f.querySelector('h3, .q').textContent)")
+    until(lambda: w.homepage("h.querySelectorAll('.plist button').length") == 2, "both projects")
+    settles("at rest the homepage shows one figure, the picked project's sparkline, the fold of numbers closed, and no "
+            "usage, account or context use the rail shows", (["started, last 14 days"], False, False),
+            lambda: (seen(), w.homepage("h.querySelector('details.numbers').open"), w.homepage("/%|\\bclaude\\b|\\bwork\\b/.test(h.innerText)")))
+    v.locator("#home .numbers summary").click()
+    settles("...whose fold holds the five figures", ["started, last 14 days", "sessions started per day, last 14 days, every project",
+            "live sessions per model", "context in use, per live session", "idle the longest", "live sessions per host"], seen)
+    settles("...each live session in them by its context, fullest first, in the tone the rail gives it", [["over", "81%"], ["ahead", "60%"]],
+            lambda: w.homepage("[...h.querySelectorAll('.bars.ctx .bar')].map(b => [b.dataset.tone, b.nextElementSibling.textContent])"))
+    check("...and the sessions started today, per account", ["claude: 2", "work: 1"],
+          sorted(w.homepage("[...h.querySelectorAll('.numbers svg rect title')].map(t => t.textContent)")))
+    w.hears(lambda: w.project("delta", session_id(0xde), w.t0 - 5))
+    check("...the fold staying open as the hub's news redraws the page", (True, True),
+          ("delta" in [n for n, _ in w.projects()], w.homepage("h.querySelector('details.numbers').open")))
 
 
 @scenario
@@ -728,7 +891,7 @@ def links_in_a_page(w: World) -> None:
     until(lambda: clipboard() == "after", "the copy after the code block's")
     check("...and one on a code block copies nothing", False, "copied make check" in w.log())
     w.frame_of("map-columns").press("#link", "Control+Alt+0")
-    settles("ctrl+alt+0 from inside a page goes to the overview", None, w.current)
+    settles("ctrl+alt+0 from inside a page goes to the homepage", (None, True), lambda: (w.current(), w.at_home()))
 
 
 @scenario
@@ -839,7 +1002,7 @@ def keyboard_between_panes(w: World) -> None:
     diff_frame = w.frame_at("/diffviews/map-columns.html")
     check("a diffview page goes to the pane on the right", [LEFT, RIGHT], w.panes())
     v.keyboard.press("Control+Alt+0")
-    until(lambda: w.current() is None, "the overview")
+    until(lambda: w.current() is None, "the homepage")
     v.keyboard.press("Control+Alt+1")
     settles("the camera frames the unit whole: both panes on screen", [LEFT, RIGHT], w.on_screen)
     w.focus("map-columns")
@@ -954,16 +1117,53 @@ def maximize(w: World) -> None:
 
 
 @scenario
+def the_last_page_minimized_while_maximized(w: World) -> None:
+    """A unit's last page minimized while maximized leaves you in that unit, its session page over the main area, with
+    no page of another unit in sight or given the keyboard."""
+    v = w.view
+    w.enter()
+    w.second()
+    w.minimize(w.ids["csv-import"])
+    w.focus("map-columns")
+    v.keyboard.press("Control+Alt+z")
+    settles("the unit's last page maximized", ([LEFT], False, False), lambda: (w.on_screen(), w.shown("rail-side"), w.shown("session-side")))
+    v.keyboard.press("Control+Alt+w")
+    settles("ctrl+alt+w minimizes it", False, lambda: w.ids["map-columns"] in w.docked())
+    w.fence()
+    check("...and you stay in the unit, both sidebars back, the keyboard in its session page rather than another unit's page",
+          (ORCHESTRATOR, w.session_url(w.pages[0]), True, True, True),
+          (w.current(), w.sidebar_url(), w.shown("rail-side"), w.shown("session-side"), w.holds_session()))
+    check("...the session page over the main area, as for a unit with nothing open", True,
+          v.evaluate("document.body.classList.contains('bare') && !document.getElementById('work').checkVisibility({ opacityProperty: true })"))
+
+
+@scenario
 def the_rail_says_when_each_turn_ended(w: World) -> None:
     """Each row on the rail says how long ago its session last finished a turn, and when, on hover."""
     w.second()
-    w.registered(SECOND, w.t0 - 3 * 3600)
+    # SECOND's transcript ended its last turn three hours ago; a /reload-plugins, which mx's every release types into
+    # every session, moved the registry's status time to just now, which says nothing of a turn
+    transcript = w.home / ".claude" / "projects" / "-drop-zone" / f"{SECOND}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    ended = datetime.fromtimestamp(w.t0 - 3 * 3600).astimezone().isoformat()
+    transcript.write_text(fakes.transcript(SECOND, w.home, {**fakes.TURN_END, "timestamp": ended}))
+    w.registered(SECOND, w.t0 - 30)
     w.view.wait_for_function(f"wc.state.units.find(u => u.unit === {json.dumps(SECOND)})?.last < {w.t0 - 3600}", timeout=10000)
-    row = lambda session: w.view.locator(f'#units button[title="session {session}"] .ago')
+    row = lambda session: w.view.locator(f'#units button[data-session="{session}"] .ago')
     settles("ORCHESTRATOR's row: its last turn ended 100 s ago", "1m ago", lambda: row(ORCHESTRATOR).inner_text())
     settles("SECOND's: three hours ago", "3h ago", lambda: row(SECOND).inner_text())
     check("...the time itself on hover, in 24 hours", True,
-          bool(re.fullmatch(r"last turn ended .*\b\d\d:\d\d", row(SECOND).get_attribute("title"))))
+          bool(re.fullmatch(r"last turn ended .*\b\d\d:\d\d", row(SECOND).get_attribute("data-tip"))))
+    ticking = w.context.new_page()  # a tab whose clock the test moves on, which nothing the hub tells moves
+    ticking.clock.install()
+    ticking.goto(w.origin + "/")
+    ticking.wait_for_function("window.wc && ws.views().length > 0", timeout=30000)
+    label = lambda: ticking.locator(f'#units button[data-session="{ORCHESTRATOR}"] .ago').inner_text()
+    before = label()
+    ticking.clock.fast_forward("05:00")
+    since = ticking.evaluate("Date.now() / 1000") - (w.t0 - 100)  # as long ago as the tab's clock now says the turn ended
+    check("...and moves on as time passes, with nothing else changed", ("1m ago", f"{int(since // 60)}m ago"), (before, label()))
+    ticking.close()
 
 
 @scenario
@@ -1177,10 +1377,14 @@ def an_agent_opening_a_page_again(w: World) -> None:
     asked = lambda: w.frame_of("map-columns").evaluate("window.asked")
     w.frame_of("map-columns").evaluate("window.__mark = 1; window.asked = 0; window.reloadWouldLose = () => (asked++, true)")
     w.opened(w.pages[2])
-    until(lambda: asked() >= 2, "the tab to ask the page twice whether a reload would lose anything")
-    check("a page that would lose what is typed in it is not reloaded under it", False, reloaded())
-    w.frame_of("map-columns").evaluate("window.reloadWouldLose = () => false")
-    settles("...and is reloaded once it would lose nothing", True, reloaded)
+    until(lambda: asked() >= 1, "the tab to ask the page whether a reload would lose anything")
+    w.view.wait_for_timeout(500)
+    first = asked()
+    w.view.wait_for_timeout(2500)
+    check("a page that would lose what is typed in it is not reloaded under it, nor asked again on a clock", (False, first),
+          (reloaded(), asked()))
+    w.frame_of("map-columns").evaluate("window.reloadWouldLose = () => false; parent.pageFree(window)")
+    settles("...and is reloaded once it says it would lose nothing", True, reloaded)
     w.frame_of("map-columns").evaluate("window.__mark = 1")
     w.opened(w.pages[2])
     settles("a page that says nothing is reloaded at once", True, reloaded, within=5)
@@ -1191,6 +1395,188 @@ def an_agent_opening_a_page_again(w: World) -> None:
     w.minimize(w.ids["csv-import"])
     w.opened(w.pages[1])
     settles("a minimized page an agent opens again comes back into the layout", True, lambda: w.ids["csv-import"] in w.docked())
+
+
+@scenario
+def diffview_told(w: World) -> None:
+    """hub-pages-told-not-polled: a diffview page in a panel hears from the hub tab's own stream, asking nothing on a
+    clock: it reloads into its watcher's newer build, takes in what a tab of its own saved, and says when its watcher
+    stopped."""
+    w.enter()
+    w.open_diff(watch=True)
+    w.frame_at("/diffviews/map-columns.html").wait_for_function("typeof hubTold === 'function'")  # its look at load asked
+    asked = []
+    w.context.on("request", lambda r: asked.append(r.url.rsplit(".html", 1)[-1]) if ".html." in r.url else None)
+    w.view.wait_for_timeout(5000)
+    check("the page asks the hub nothing while nothing changes", [], asked)
+    frame = lambda: w.frame_at("/diffviews/map-columns.html")
+    built = frame().evaluate("DATA.generated")
+
+    def build():
+        try:
+            return frame().evaluate("DATA.generated")
+        except PlaywrightError:  # read mid-reload
+            return built
+    frame().locator('td.no[data-side="new"][data-no="1"]').first.click()
+    box = frame().locator(".cbox[data-editing] textarea")
+    box.fill("typed in the panel")
+    (w.code / "notes.txt").write_text("one\ntwo\n")
+    until(lambda: json.loads(Path(f"{w.agent}/diffviews/map-columns.html.watch.json").read_text())["g"] != built,
+          "the watcher's newer build")
+    w.view.wait_for_timeout(1000)
+    check("a newer build waits while a comment is being typed", built, build())
+    box.press("Control+Enter")
+    settles("...and is loaded once it is saved", True, lambda: build() != built, within=5)
+    own = w.context.new_page()
+    own.goto(w.origin + w.session_url(w.agent / "diffviews/map-columns.html"))
+    own.locator('td.no[data-side="new"][data-no="2"]').first.click()
+    own.keyboard.type("typed in a tab of its own")
+    own.keyboard.press("Control+Enter")
+    settles("a comment saved in a tab of its own reaches the page in the panel", True,
+            lambda: "typed in a tab of its own" in frame().locator(".cbox .ctext").all_inner_texts(), within=5)
+    own.close()
+    stopped = time.monotonic()
+    os.killpg(w.watcher.pid, signal.SIGKILL)
+    settles("the page says its watcher stopped", 1, lambda: frame().locator(".watchgone").count(), within=5)
+    check("...within 2 seconds", True, time.monotonic() - stopped < 2)
+    asked.clear()
+    w.view.wait_for_timeout(5000)
+    check("...and asks nothing after, its watcher gone", [], asked)
+
+
+@scenario
+def pages_on_new_code(w: World) -> None:
+    """hub-pages-reload-on-new-code: once the hub runs new code, every page whose code changed runs it, a diffview page
+    in a panel and one in a tab of its own, and the hub tab with its frames, each once that loses nothing being typed;
+    a page whose code did not change is not reloaded."""
+    own_bin = w.scratch / "bin"  # the hub's code, as the scenario changes it
+    own_bin.mkdir()
+    for name in ("container-hub", "container-hub.html", "diffview", "diffview.html"):
+        shutil.copy2(BIN / name, own_bin / name)
+    w.kill_hub()
+    w.hub_args[0] = str(own_bin / "container-hub")
+    w.start_hub()
+    w.view.reload()
+    w.view.wait_for_function("window.wc && ws.views().length === 2", timeout=30000)
+    w.enter()
+    w.open_diff()
+    panel = lambda: w.frame_at("/diffviews/map-columns.html")
+    own = w.context.new_page()
+    own.on("pageerror", lambda e: w.errors.append(str(e)))
+    own.goto(w.origin + w.session_url(w.agent / "diffviews/map-columns.html"))
+    own.wait_for_function("navigator.locks.query().then(l => l.held.length > 0)")  # its stream of its own is open
+
+    def read(page, script: str):
+        try:
+            return page().evaluate(script) if callable(page) else page.evaluate(script)
+        except PlaywrightError:  # read mid-reload
+            return None
+    code = "document.querySelector('meta[name=diffview-code]').content"
+    was = read(own, code)
+    for page in (own, panel, w.view):
+        read(page, "window.__mark = 1")
+    panel().locator('td.no[data-side="new"][data-no="1"]').first.click()
+    box = panel().locator(".cbox[data-editing] textarea")
+    box.fill("typed in the panel")
+    template = (own_bin / "diffview.html").read_text()
+    (own_bin / "diffview.html").write_text(template.replace("<head>", "<head>\n<!-- new code -->", 1))
+    settles("a diffview page in a tab of its own runs diffview's new code once the hub does", True,
+            lambda: read(own, code) not in (None, was) and "new code" in read(own, "document.head.innerHTML"), within=15)
+    now = read(own, code)
+    w.view.wait_for_timeout(1500)
+    check("a diffview page in a panel with a comment being typed waits", (was, 1), (read(panel, code), read(panel, "window.__mark")))
+    check("...and the hub tab, whose code did not change, is not reloaded", 1, read(w.view, "window.__mark"))
+    box.press("Control+Enter")
+    settles("...and runs the new code once the comment is saved", now, lambda: read(panel, code), within=5)
+    settles("...the comment saved", True, lambda: "typed in the panel" in (read(panel, "[...document.querySelectorAll('.cbox .ctext')].map(e => e.innerText)") or []))
+
+    read(own, "window.__mark = 1")
+    w.view.locator("#search").fill("map")
+    panel().locator('td.no[data-side="new"][data-no="1"]').first.click()
+    panel().locator(".cbox[data-editing] textarea").fill("typed again")
+    log = w.scratch / "hub.log"
+    restarts = log.read_text().count("running again")
+    (own_bin / "container-hub.html").write_text((own_bin / "container-hub.html").read_text() + "<!-- new code -->\n")
+    w.view.wait_for_timeout(2500)
+    check("a hub tab whose code changed waits while a search is held and a comment typed in a frame", 1, read(w.view, "window.__mark"))
+    w.view.locator("#search").fill("")
+    w.view.wait_for_timeout(1000)
+    check("...the comment still being typed once the search is emptied", 1, read(w.view, "window.__mark"))
+    panel().locator(".cbox[data-editing] textarea").press("Control+Enter")
+    settles("...and runs the new code once the comment is saved", True,
+            lambda: read(w.view, "window.__mark") is None and "<!-- new code -->" in (read(w.view, "document.documentElement.outerHTML") or ""),
+            within=5)
+    check("...told by the hub, which ran no new code of its own for it", restarts, log.read_text().count("running again"))
+    w.view.wait_for_function("window.wc && ws.views().length > 0", timeout=30000)
+    w.frame_at("/diffviews/map-columns.html")
+    check("...its frames with it", now, read(panel, code))
+    check("a diffview page in a tab of its own, whose code did not change, is not reloaded", 1, read(own, "window.__mark"))
+    w.view.wait_for_timeout(2000)  # what the reloaded pages read as they load
+    asked = []
+    w.context.on("request", lambda r: asked.append(r.url))
+    w.view.wait_for_timeout(5000)
+    check("...and no page asks the hub anything after, while nothing changes", [], asked)
+    own.close()
+
+
+@scenario
+def a_late_answer_keeps_the_keyboard(w: World) -> None:
+    """Going into an ended unit reads its pages first; the answer, however late, moves no keyboard that a key moved
+    since: ctrl+alt+f pressed before it lands keeps the search box."""
+    v = w.view
+    ended = "e0e0e0e0-0000-4000-8000-000000000020"
+    transcript = w.home / ".claude/projects/-home-repos-alpha" / f"{ended}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(json.dumps({"type": "ai-title", "aiTitle": "Long done", "sessionId": ended}) + "\n")
+    w.opened(w.page("notes/long-done.html", "an ended session's page"), ended)
+    settles("the ended unit is on the rail", True, lambda: v.evaluate(f"wc.state.units.some(u => u.unit === {json.dumps(ended)})"))
+    held = []
+    hold = lambda route: held.append(route)  # its details, answered only once released below
+    v.route(f"**/api/u/{ended}", hold)
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type(ended[:8])
+    v.keyboard.press("Enter")
+    until(lambda: held or v.evaluate("false"), "the tab to ask for the unit's pages")
+    settles("the unit is entered", ended, w.current)
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type("zz")
+    for route in held:
+        route.continue_()
+    v.unroute(f"**/api/u/{ended}", hold)
+    w.frame_at("/notes/long-done.html")
+    v.wait_for_timeout(500)
+    check("the search box keeps the keyboard and what was typed into it", ["search", "zz"],
+          v.evaluate("[document.activeElement.id, document.getElementById('search').value]"))
+
+
+@scenario
+def a_key_while_a_page_loads(w: World) -> None:
+    """Going into a unit puts the keyboard into its page, which may still be loading: a hub key pressed then is the
+    hub's all the same."""
+    v = w.view
+    ended = "e0e0e0e0-0000-4000-8000-000000000020"
+    transcript = w.home / ".claude/projects/-home-repos-alpha" / f"{ended}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(json.dumps({"type": "ai-title", "aiTitle": "Long done", "sessionId": ended}) + "\n")
+    w.opened(w.page("notes/long-done.html", "an ended session's page"), ended)
+    settles("the ended unit is on the rail", True, lambda: v.evaluate(f"wc.state.units.some(u => u.unit === {json.dumps(ended)})"))
+    held = []
+    hold = lambda route: held.append(route)  # the page, served only once released below
+    v.route("**/notes/long-done.html", hold)
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type(ended[:8])
+    v.keyboard.press("Enter")
+    v.wait_for_function(f"{HOLDS_KEYBOARD} && document.activeElement.contentDocument?.readyState === 'complete'", timeout=10000)
+    check("the unit's page has the keyboard before it has loaded", "about:blank",
+          v.evaluate("document.activeElement.contentWindow.location.href"))
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type("zz")
+    for route in held:
+        route.continue_()
+    v.unroute("**/notes/long-done.html", hold)
+    w.frame_at("/notes/long-done.html")
+    check("ctrl+alt+f pressed then opens the search, which takes what is typed", ["search", "zz"],
+          v.evaluate("[document.activeElement.id, document.getElementById('search').value]"))
 
 
 @scenario
@@ -1242,13 +1628,13 @@ def two_orchestrators_on_one_tree(w: World) -> None:
     w.rule("csv-import", "done")  # as the board has it
     w.enter()  # seen: its news is what comes after
     v.keyboard.press("Control+Alt+0")
-    until(lambda: w.current() is None, "the overview")
+    until(lambda: w.current() is None, "the homepage")
     w.written()  # the hub dates a visit by when it hears of it, and the news below must come after
     second_id = w.second()
     check("a second orchestrator's page lands in its own unit", SECOND, second_id.split("~")[0])
     w.opened(w.pages[2])
     settles("the rail marks both orchestrators as having something new", 2,
-            lambda: v.evaluate("document.querySelectorAll('#units .new').length"))
+            lambda: v.evaluate("document.querySelectorAll('#units .ic.new').length"))
     # hub-rail-marks-sessions-needing-you#P1: an idle session's mark and status line, from its page's records
     if not READER:
         skipped("an idle session's mark and status line", "no mx plugin here, whose session page reader the rail reads a page by")
@@ -1256,11 +1642,15 @@ def two_orchestrators_on_one_tree(w: World) -> None:
         record = w.agent / f"sessions/{ORCHESTRATOR}/turns/01.md"
         record.parent.mkdir()
         record.write_text(QUESTION.format(title="Two ways to import"))
-        rail_row = lambda U: f"[...document.querySelectorAll('#units .unit')].find(b => b.querySelector('button[title=\"session {U}\"]'))"
-        marked_row = lambda U: v.evaluate(f"(r => [r.querySelector('.mark').hasAttribute('data-needs'), r.querySelector('.mark').title,"
-                                          f" r.querySelector('.said')?.textContent ?? null])({rail_row(U)})")
-        settles("the rail fills the mark of an idle session with an open question, and shows its status line under its title",
-                [True, "needs you: 1 open question, a turn record you have not seen", "Two ways to import"], lambda: marked_row(ORCHESTRATOR))
+        rail_row = lambda U: f"[...document.querySelectorAll('#units .unit')].find(b => b.querySelector('button[data-session=\"{U}\"]'))"
+        marked_row = lambda U: v.evaluate(f"(r => [r.querySelector('.mark').hasAttribute('data-needs'), r.querySelector('.mark').dataset.tip ?? null,"
+                                          f" r.querySelector('.ic.needs')?.dataset.tip ?? null])({rail_row(U)})")
+        settles("the rail fills the mark of an idle session with an open question, and counts the question under its title",
+                [True, "needs you: 1 open question, a turn record you have not seen", "1 open question"], lambda: marked_row(ORCHESTRATOR))
+        v.locator(f'#units .unit[data-unit="{ORCHESTRATOR}"]').hover()
+        settles("...its status line in the row's detail, beside the rail on hover", "Two ways to import",
+                lambda: v.evaluate("document.querySelector('#peek.on .said')?.textContent ?? null"))
+        v.mouse.move(900, 600)
         check("...and leaves hollow that of one with no records", [False, "idle, nothing on its page waits on you", None], marked_row(SECOND))
         record.unlink()  # the keys below walk the units in the order of their turns alone
         settles("...and hollow once its page holds nothing for you", False, lambda: marked_row(ORCHESTRATOR)[0])
@@ -1268,12 +1658,12 @@ def two_orchestrators_on_one_tree(w: World) -> None:
     settles("ctrl+alt+enter goes to the orchestrator whose news is oldest", SECOND, w.current)
     settles("...its stand-in for a session page in the sidebar, while it has rendered none", f"/pages/{SECOND}", w.sidebar_url)
     settles("...and the keyboard on its page", (second_id, True), lambda: (w.focused(), w.holds_keyboard()))
-    v.keyboard.press("Control+Alt+2")
-    settles("ctrl+alt+2 goes to the orchestrator that finished a turn before the last", ORCHESTRATOR, w.current)
     v.keyboard.press("Control+Alt+1")
-    settles("ctrl+alt+1 to the one that finished a turn last", SECOND, w.current)
+    settles("ctrl+alt+1 goes to the orchestrator the hub saw first, though the other finished a turn since", ORCHESTRATOR, w.current)
+    v.keyboard.press("Control+Alt+2")
+    settles("ctrl+alt+2 to the one it saw next", SECOND, w.current)
     v.keyboard.press("Control+Alt+j")
-    settles("ctrl+alt+j to the next down the rail", ORCHESTRATOR, w.current)
+    settles("ctrl+alt+j to the next down the rail, round to the top", ORCHESTRATOR, w.current)
     v.keyboard.press("Control+Alt+k")
     settles("ctrl+alt+k back up to the one before", SECOND, w.current)
     # the board over one of two orchestrators on one tree marks that one's tickets
@@ -1290,16 +1680,23 @@ def a_reorder_keeps_focus(w: World) -> None:
     """one-hub-tab#P6: a reorder of the rail never changes which session has the user's focus."""
     v = w.view
     second_id = w.second()
-    v.keyboard.press("Control+Alt+1")
-    until(lambda: w.current() == SECOND, "SECOND's unit, 1 on the rail")
+    v.keyboard.press("Control+Alt+2")
+    until(lambda: w.current() == SECOND, "SECOND's unit, 2 on the rail")
     w.focus_view(second_id)
     w.registered(ORCHESTRATOR, time.time())  # the other orchestrator finishes a turn
-    until(lambda: w.rail() == [ORCHESTRATOR, SECOND], "the rail reordered, the other orchestrator 1")
+    v.wait_for_function(f"wc.state.units.find(u => u.unit === {json.dumps(ORCHESTRATOR)})?.last > {time.time() - 60}", timeout=10000)
+    check("a session finishing a turn moves nothing on the rail", [ORCHESTRATOR, SECOND], w.rail())
+    w.api("/api/pin", {"unit": SECOND, "place": 1})
+    until(lambda: w.rail() == [SECOND, ORCHESTRATOR], "the rail reordered, the unit you are in pinned to 1")
     w.settle()  # the tab redraws in the same task it takes the new numbers in; trellis moves a frame later
     check("...while the unit you are in stays the one you are in", SECOND, w.current())
     check("...and the page you are on keeps the focus, and the keyboard", (second_id, True), (w.focused(), w.holds_keyboard()))
     check("...the rail's keys naming the new order", ["ctrl+alt+1", "ctrl+alt+2"],
-          v.evaluate("[...document.querySelectorAll('#units .cap')].map(e => e.title)"))
+          v.evaluate("[...document.querySelectorAll('#units .cap')].map(e => e.dataset.tip)"))
+    (w.home / ".claude/sessions" / f"{SECOND[:8]}.json").unlink()  # SECOND's process exits, its panes closed
+    settles("a pinned session that ends keeps its place on top, its pin still there to unpin it", ("ended", [SECOND, ORCHESTRATOR], True),
+            lambda: (v.evaluate(f"wc.state.units.find(u => u.unit === {json.dumps(SECOND)})?.state"), w.rail(),
+                     v.evaluate(f"!!document.querySelector('#units .unit[data-unit=\"{SECOND}\"] .pin.on')")))
 
 
 @scenario
@@ -1307,15 +1704,16 @@ def set_aside(w: World) -> None:
     """ctrl+alt+d takes the unit you are in out of the numbers, leaving you where you are."""
     v = w.view
     second_id = w.second()
-    v.keyboard.press("Control+Alt+1")
-    until(lambda: w.current() == SECOND, "SECOND's unit, 1 on the rail")
+    v.keyboard.press("Control+Alt+2")
+    until(lambda: w.current() == SECOND, "SECOND's unit, 2 on the rail")
     w.focus_view(second_id)
     # the tab hears a key in a page once its load has hooked the page, theming it in the same step
     v.wait_for_function(f"!!ws.view({json.dumps(second_id)}).element.querySelector('iframe').contentDocument?.documentElement?.dataset.theme",
                         timeout=10000)
     v.keyboard.press("Control+Alt+d")
     settles("ctrl+alt+d takes the orchestrator you are in out of the numbers", [ORCHESTRATOR], w.rail)
-    check("...to the list of those set aside", True, f"session {SECOND[:8]}" in v.inner_text("#aside-units"))
+    check("...to the list of those set aside, at the rail's foot", ["set aside", SECOND], v.evaluate(
+        "[...document.querySelectorAll('#aside-units > *')].slice(-2).map(e => e.tagName === 'H2' ? e.textContent : e.querySelector('.nav').dataset.session)"))
     check("...and leaves you where you are", (SECOND, True), (w.current(), second_id in w.docked()))
     v.keyboard.press("Control+Alt+j")
     settles("ctrl+alt+j from outside the numbers goes to the first in them", ORCHESTRATOR, w.current)
@@ -1328,24 +1726,226 @@ def set_aside(w: World) -> None:
 
 
 @scenario
-def the_session_id_on_the_rail(w: World) -> None:
-    """Its first 8 characters, the whole id on hover, copied by a click, as the short id beside it is; "copied" rises
-    over what the click copied."""
+def the_rail_stays_put(w: World) -> None:
+    """hub-rail-stable-and-pinned: a click never moves a row; pins, by key and by the pin on a row, put one to five on top."""
     v = w.view
-    row = v.locator("#units .unit", has=v.locator(f'button[title="session {ORCHESTRATOR}"]'))
-    meta = lambda: row.locator(".meta").evaluate("m => [m.querySelector('.sid').textContent, m.querySelector('.session').textContent, m.querySelector('.session').title]")
-    settles("a rail entry shows its session id's first 8 characters once, the whole id on hover, where its short id is those 8",
-            ["", ORCHESTRATOR[:8], ORCHESTRATOR], meta)
-    w.registered(ORCHESTRATOR, w.t0 - 100, name="map-columns-name")
-    settles("...and beside a short id that is a name", ["map-columns-name", ORCHESTRATOR[:8], ORCHESTRATOR], meta)
+    second_id = w.second()
+    v.keyboard.press("Control+Alt+0")
+    until(lambda: w.current() is None, "the overview")
+    w.written()
+    if READER:  # a question the orchestrator asks, unseen, which the rail used to put first
+        record = w.agent / f"sessions/{ORCHESTRATOR}/turns/01.md"
+        record.parent.mkdir(exist_ok=True)
+        record.write_text(QUESTION.format(title="Two ways to import"))
+    w.opened(w.pages[2])
+    w.registered(SECOND, time.time())  # the other one finishes a turn, later than the first
+    v.wait_for_function(f"wc.state.units.find(u => u.unit === {json.dumps(SECOND)})?.last > {time.time() - 60}", timeout=10000)
+    before = w.rail()
+    check("(the two as the hub first saw them)", [ORCHESTRATOR, SECOND], before)
+    v.locator(f'#units button[data-session="{ORCHESTRATOR}"] .name').click()
+    until(lambda: w.current() == ORCHESTRATOR, "the orchestrator's unit")
+    w.settle()
+    check("clicking the first session, which needed you, moves no row", before, w.rail())
+    v.locator(f'#units button[data-session="{SECOND}"] .name').click()
+    until(lambda: w.current() == SECOND, "the second's unit")
+    w.settle()
+    check("...nor does clicking the other", before, w.rail())
+    v.keyboard.press("Control+Alt+p")
+    v.keyboard.press("Control+Alt+1")
+    settles("ctrl+alt+p then 1 pins the session you are in to place 1, on top, the rest numbered on from it",
+            [[SECOND, 1, 1], [ORCHESTRATOR, None, 2]],
+            lambda: v.evaluate("wc.state.units.filter(u => u.number).map(u => [u.unit, u.place, u.number])"))
+    check("...under a heading of its own", "pinned", v.evaluate("document.querySelector('#units h2')?.textContent ?? null"))
+    check("...as the hub has it", {"place": 1}, {k: v for k, v in (w.hub_view(SECOND)["pinned"] or {}).items() if k == "place"})
+    row = v.locator("#units .unit", has=v.locator(f'button[data-session="{ORCHESTRATOR}"]'))
+    row.hover()  # the pin shows under the pointer
+    row.locator(".tools .pin").click()
+    settles("the pin on a row pins it to the first free place", [[SECOND, 1], [ORCHESTRATOR, 2]],
+            lambda: v.evaluate("wc.state.units.filter(u => u.place).map(u => [u.unit, u.place])"))
+    row.locator(".tools .pin").click()
+    v.keyboard.press("Control+Alt+p")
+    v.keyboard.press("Control+Alt+0")
+    settles("...and again unpins it, as ctrl+alt+p then 0 does the one you are in, both back in their places",
+            (0, before), lambda: (v.evaluate("wc.state.units.filter(u => u.place).length"), w.rail()))
+    v.keyboard.press("Control+Alt+p")
+    v.keyboard.press("Escape")
+    v.keyboard.press("Control+Alt+1")
+    settles("a key between ctrl+alt+p and the number lets the pin go: ctrl+alt+1 goes to 1 again", (ORCHESTRATOR, 0),
+            lambda: (w.current(), v.evaluate("wc.state.units.filter(u => u.place).length")))
+
+
+@scenario
+def the_rails_view(w: World) -> None:
+    """hub-rail-stable-and-pinned: the rail's view re-sorts, groups and filters the list under the pins; nothing else
+    moves a row but a session that waits on you in its terminal, which rises."""
+    v = w.view
+    w.second()
+    w.registered(SECOND, time.time())  # finished a turn after the first
+    v.wait_for_function(f"wc.state.units.find(u => u.unit === {json.dumps(SECOND)})?.last > {time.time() - 60}", timeout=10000)
+    check("(the two as the hub first saw them)", [ORCHESTRATOR, SECOND], w.rail())
+    w.registered(SECOND, w.t0 - 100, status="waiting", waitingFor="permission prompt")
+    settles("a session blocked in its terminal rises to the top", [SECOND, ORCHESTRATOR], w.rail)
+    w.registered(SECOND, time.time())
+    settles("...and goes back to its place once it no longer waits", [ORCHESTRATOR, SECOND], w.rail)
+    v.keyboard.press("Control+Alt+v")
+    until(lambda: v.locator("#view").is_visible(), "the view's pills")
+    pill = lambda name: v.locator(f'#view [data-pill="{name}"]')
+    pill("sort:activity").click()
+    settles("sorted by the last turn, the latest first", [SECOND, ORCHESTRATOR], w.rail)
+    check("...its pill filled, and the view's button too", (True, True),
+          (pill("sort:activity").get_attribute("aria-pressed") == "true", "on" in v.locator("#view-button").get_attribute("class")))
+    v.locator(f'#units button[data-session="{SECOND}"] .name').click()
+    until(lambda: w.current() == SECOND, "the second's unit")
+    w.settle()
+    check("...where a click moves nothing either", [SECOND, ORCHESTRATOR], w.rail())
+    pill("sort:started").click()
+    settles("as first seen again", [ORCHESTRATOR, SECOND], w.rail)
+    w.registered(SECOND, time.time(), status="busy")
+    pill("working").click()
+    settles("the sessions at work on top", [SECOND, ORCHESTRATOR], w.rail)
+    pill("working").click()
+    headings = lambda: v.evaluate("[...document.querySelectorAll('#units h2')].map(h => h.textContent)")
+    settles("grouped by project by default, a heading for each", ["alpha"], headings)
+    v.locator('#units h2[data-section="project:alpha"] .fold').click()
+    settles("...each heading a fold: a click shuts its section, the count of its rows in its place", ("alpha2", 0),
+            lambda: (v.inner_text('#units h2[data-section="project:alpha"]').replace("\n", ""), v.locator("#units .unit").count()))
+    v.reload()
+    v.wait_for_function("window.wc && wc.state.units.some(u => u.number)", timeout=30000)
+    check("...kept by the browser profile", "alpha2", v.inner_text('#units h2[data-section="project:alpha"]').replace("\n", ""))
+    v.locator('#units h2[data-section="project:alpha"] .fold').focus()
+    v.keyboard.press("Enter")
+    settles("...and Enter on the heading opens it again", ("alpha", 2),
+            lambda: (v.inner_text('#units h2[data-section="project:alpha"]'), v.locator("#units .unit").count()))
+    check("(the view's choices still open after the reload)", True, v.locator("#view").is_visible())
+    pill("group:project").click()
+    settles("...and one list, with no heading, once the grouping is undone", [], headings)
+    check("...the view's button marking a view other than the default", True, "on" in v.locator("#view-button").get_attribute("class"))
+    pill("filters").click()
+    v.locator('#view-filter [data-pill="project:alpha"]').click()
+    settles("a project left out leaves the rail, its sessions unnumbered", [], w.rail)
+    pill("reset").click()
+    settles("...and the view back to its default lists them again, as first seen, grouped by project",
+            ([ORCHESTRATOR, SECOND], ["alpha"]), lambda: (w.rail(), headings()))
+    v.reload()
+    v.wait_for_function("window.wc && wc.state.units.length > 0", timeout=30000)
+    pill("sort:prompted").click()
+    v.reload()
+    v.wait_for_function("window.wc && wc.state.units.some(u => u.number)", timeout=30000)
+    check("the browser profile keeps the view", "prompted", v.evaluate("JSON.parse(localStorage.getItem('hub:rail-view')).sort"))
+
+
+@scenario
+def the_rails_view_from_the_keyboard(w: World) -> None:
+    """hub-rail-stable-and-pinned: every control of the rail's view, and every section's fold, from the keyboard alone."""
+    v = w.view
+    w.second()
+    w.registered(SECOND, time.time())  # finished a turn after the first
+    v.wait_for_function(f"wc.state.units.find(u => u.unit === {json.dumps(SECOND)})?.last > {time.time() - 60}", timeout=10000)
+    focused = lambda: v.evaluate("document.activeElement?.dataset.pill ?? document.activeElement?.closest('h2')?.dataset.section ?? null")
+    v.keyboard.press("Control+Alt+v")
+    settles("ctrl+alt+v opens the view with the keyboard on its first control", "sort:started", focused)
+    check("...each control's letter shown while the keyboard is there", True,
+          v.evaluate("getComputedStyle(document.querySelector('#view [data-pill=\"sort:activity\"] .cap')).visibility === 'visible'"))
+    v.keyboard.press("t")
+    settles("its letter toggles a control: t sorts by the last turn", [SECOND, ORCHESTRATOR], w.rail)
+    v.keyboard.press("ArrowRight")
+    check("→ moves along the row", "sort:prompted", focused())
+    v.keyboard.press("ArrowLeft")
+    v.keyboard.press("h")
+    check("...← and h back", "sort:started", focused())
+    v.keyboard.press("Enter")
+    settles("...and Enter toggles the one it is on", ("true", [ORCHESTRATOR, SECOND]),
+            lambda: (v.locator('#view [data-pill="sort:started"]').get_attribute("aria-pressed"), w.rail()))
+    v.keyboard.press("t")
+    v.keyboard.press("f")
+    settles("f opens the filter's list, the keyboard on its first host or project", "project:alpha", focused)
+    v.keyboard.press("Enter")
+    settles("...where Enter leaves one out, the filter counting it", ([], "1"),
+            lambda: (w.rail(), v.inner_text('#view [data-pill="filters"] .count')))
+    check("...and naming it on hover", True, "left out: alpha" in v.locator('#view [data-pill="filters"]').get_attribute("data-tip"))
+    v.keyboard.press("Enter")
+    v.keyboard.press("Escape")
+    settles("Esc goes back from the list to the filter", ("filters", True), lambda: (focused(), v.locator("#view-filter").is_hidden()))
+    v.keyboard.press("r")
+    settles("r puts the view back to its default", ([ORCHESTRATOR, SECOND], "true"),
+            lambda: (w.rail(), v.locator('#view [data-pill="sort:started"]').get_attribute("aria-pressed")))
+    v.keyboard.press("Escape")
+    settles("...and Esc gives the keyboard back, the view open", (False, True),
+            lambda: (v.evaluate("document.getElementById('view').contains(document.activeElement)"), v.locator("#view").is_visible()))
+    v.keyboard.press("Control+Alt+e")
+    settles("ctrl+alt+e puts the keyboard on the heading of the section you are in", "project:alpha", focused)
+    v.keyboard.press("Enter")
+    settles("...Enter folds it to its count", ("alpha2", 0),
+            lambda: (v.inner_text('#units h2[data-section="project:alpha"]').replace("\n", ""), v.locator("#units .unit").count()))
+    v.keyboard.press("Enter")
+    v.keyboard.press("Escape")
+    settles("...again opens it, and Esc gives the keyboard back", (2, False),
+            lambda: (v.locator("#units .unit").count(), v.evaluate("!!document.activeElement?.closest('#rail h2')")))
+
+
+@scenario
+def a_tty_job_waiting(w: World) -> None:
+    """A session with a `job run --tty` job of its own running shows a purple dot on the rail, and the job's command
+    where its status line goes, until the job ends (hub-shows-a-waiting-prompt)."""
+    fakes.job(w.home, "apt", ORCHESTRATOR)
+    row = f'#units button[data-session="{ORCHESTRATOR}"]'
+    shown = lambda: w.view.evaluate(f"""(b => b && [b.querySelector(".mark").hasAttribute("data-tty-job"),
+        getComputedStyle(b.querySelector(".mark")).backgroundColor, b.querySelector(".ic.tty")?.dataset.tip ?? null])
+        (document.querySelector({json.dumps(row)}))""")
+    purple = w.view.evaluate("""(() => { const s = document.createElement("span"); s.style.color = "var(--tty-job)";
+        document.body.append(s); const c = getComputedStyle(s).color; s.remove(); return c; })()""")
+    settles("a running --tty job of the session's: a purple dot, and the job under its title, its command on hover",
+            [True, purple, "job apt waits for you: sudo apt-get install -y pcscd"], shown)
+    check("...a colour no other mark uses", True, purple not in w.view.evaluate(
+        """["--accent", "--accent-2", "--alarm", "--muted"].map(v => { const s = document.createElement("span");
+           s.style.color = `var(${v})`; document.body.append(s); const c = getComputedStyle(s).color; s.remove(); return c; })"""))
+    if READER:
+        asked = w.agent / f"sessions/{ORCHESTRATOR}/turns/01.md"
+        asked.parent.mkdir(exist_ok=True)
+        asked.write_text(QUESTION.format(title="One call"))
+        settles("...the dot purple still where its page has an open question, which says so on hover", [True, purple, True],
+                lambda: [*(shown() or [None, None])[:2], "open question" in w.view.evaluate(
+                    f"document.querySelector({json.dumps(row)}).querySelector('.mark').dataset.tip")])
+    w.registered(ORCHESTRATOR, w.t0 - 100, status="waiting", waitingFor="permission prompt")
+    settles("...and where the session is blocked in its terminal too", [True, purple],
+            lambda: (shown() or [None, None])[:2])
+    fakes.job(w.home, "apt", ORCHESTRATOR, ended=True)
+    settles("...and once the job ends, the purple dot goes", False,
+            lambda: (shown() or [None])[0])
+
+
+@scenario
+def the_session_id_on_the_rail(w: World) -> None:
+    """A row names its session: by its name where Claude Code gave it one, else by its id's first 8 characters, and a
+    click copies it, the whole id for those 8; the row's detail holds the whole id, which a click copies too. "copied"
+    rises over what the click copied."""
+    v = w.view
+    row = v.locator("#units .unit", has=v.locator(f'button[data-session="{ORCHESTRATOR}"]'))
+    sid = lambda: row.locator(".sid").evaluate("s => [s.textContent, s.dataset.tip]")
     clipboard = lambda: v.evaluate("navigator.clipboard.readText()")
-    row.locator(".session").click()
-    settles("a click on it copies the whole id", ORCHESTRATOR, clipboard)
+    settles("a row whose session has no name shows its id's first 8 characters, the whole id on hover",
+            [ORCHESTRATOR[:8], f"session {ORCHESTRATOR}: a click copies it"], sid)
+    row.locator(".sid").hover()
+    tip = lambda: v.evaluate("""(t => t.classList.contains('on') && [t.textContent, (r => [Math.round(t.getBoundingClientRect().top) >= Math.round(r.bottom),
+        t.getBoundingClientRect().left <= (r.left + r.right) / 2 && (r.left + r.right) / 2 <= t.getBoundingClientRect().right])(document.querySelector('#units .sid').getBoundingClientRect())])
+        (document.getElementById('tip'))""")
+    settles("its words in the rail's own tooltip, just below it and over its middle, once the pointer rests there",
+            [f"session {ORCHESTRATOR}: a click copies it", [True, True]], tip)
+    check("...and no control on the rail carries the browser's own", [], v.evaluate("[...document.querySelectorAll('#rail [title]')].map(e => e.outerHTML.slice(0, 80))"))
+    row.locator(".sid").click()
+    settles("a click on them copies the whole id", ORCHESTRATOR, clipboard)
     settles("...says so over it", "copied", lambda: v.evaluate("document.querySelector('.hub-copied-tip')?.textContent ?? null"))
     check("...and enters no orchestrator", None, w.current())
+    w.registered(ORCHESTRATOR, w.t0 - 100, name="map-columns-name")
+    settles("a session's name, where it has one, in their place", "map-columns-name", lambda: sid()[0])
     row.locator(".sid").click()
-    settles("a click on the short id copies it", "map-columns-name", clipboard)
+    settles("a click on it copies the name", "map-columns-name", clipboard)
     check("...and enters no orchestrator either", None, w.current())
+    row.locator(".name").hover()
+    settles("the row's detail on hover holds the whole session id", ORCHESTRATOR,
+            lambda: v.evaluate("document.querySelector('#peek.on .session')?.textContent ?? null"))
+    v.locator("#peek .session").click()
+    settles("...which a click copies", ORCHESTRATOR, clipboard)
 
 
 @scenario
@@ -1360,7 +1960,7 @@ def loose_pages(w: World) -> None:
     loose_note.write_text("<!doctype html><h1>a loose note</h1>")
     loose_id = f"loose~{w.api('/api/open', {'target': str(loose_note)})['id']}"
     heard = len(events)
-    v.locator("#aside-units button.nav[title='pages no session opened']").click()
+    v.locator("#aside-units button.nav[data-loose]").click()
     settles("the loose pages, entered, have a stand-in for a session page in the sidebar", ["loose", "/pages/loose"],
             lambda: [w.current(), w.sidebar_url()])
     stand_in = w.frame_at("/pages/loose")
@@ -1379,7 +1979,7 @@ def loose_pages(w: World) -> None:
     settles("...and a click on its line brings it back", (True, "open"), lambda: (loose_id in w.docked(), stand_line()))
     until(lambda: any(e["type"] == "disk" for e in events[heard:]), "the hub's look at the disk after the loose page opened")
     loose_note.unlink()
-    settles("the unit you are in going away, its one page deleted, puts you in the overview, with no session page",
+    settles("the unit you are in going away, its one page deleted, puts you on the homepage, with no session page",
             (None, False), lambda: (w.current(), w.shown("session-side")))
 
 
@@ -1414,6 +2014,70 @@ def the_hub_gone(w: World) -> None:
 
 
 @scenario
+def a_reload_loads_the_unit_on_screen_first(w: World) -> None:
+    """hub-tab-loads-what-it-shows#P1, P2, P4: a tab reloaded in a unit asks for that unit's pages and its session page
+    before another unit's, and for another unit's only once those have loaded, however long that takes, or once you go
+    into it."""
+    w.second()
+    numbered = lambda page, unit: page.evaluate(f"wc.state.units.find(u => u.unit === {json.dumps(unit)}).number")
+    w.view.keyboard.press(f"Control+Alt+{numbered(w.view, ORCHESTRATOR)}")
+    until(lambda: w.current() == ORCHESTRATOR, "ORCHESTRATOR's unit")
+    asked = []
+    page = w.context.new_page()
+    page.on("request", lambda r: asked.append(urllib.parse.urlparse(r.url).path))
+    page.goto(w.origin + "/")
+    w.frame_at("/drop-zone/index.html", page)
+    own = [w.session_url(p) for p in w.pages]
+    check("the reloaded tab asks for every page of the unit it is in before the other unit's",
+          True, max(asked.index(u) for u in own) < asked.index(w.session_url(w.agent / "show/drop-zone/index.html")))
+    page.close()
+
+    held = []
+    page = w.context.new_page()
+    page.route("**/show/csv-import/index.html", lambda route: held.append(route))
+    page.goto(w.origin + "/", wait_until="commit")  # its load waits on every frame's, the held page's too
+    until(lambda: held or page.evaluate("false"), "the reloaded tab to ask for the unit's page")
+    framed = lambda: sorted(page.evaluate("[...document.querySelectorAll('iframe[src]')].map(f => new URL(f.src).pathname)"))
+    w.frame_at(f"/{ORCHESTRATOR}/index.html", page)
+    w.frame_at("/map-columns/index.html", page)
+    page.evaluate("new Promise(r => requestIdleCallback(() => requestIdleCallback(r)))")  # what the rest load on, once nothing is on its way
+    check("while the unit's own page loads, the tab has loaded its pages and its session page alone", sorted(own), framed())
+    page.keyboard.press(f"Control+Alt+{numbered(page, SECOND)}")
+    second = w.frame_at("/drop-zone/index.html", page)
+    check("going into the other unit loads its page, whatever the first still waits on", "drop zone", second.inner_text("h1"))
+    page.wait_for_function(HOLDS_KEYBOARD, timeout=10000)
+    page.keyboard.press("Control+Alt+f")
+    page.keyboard.type("zz")
+    check("...and the hub's keys work in it", ["search", "zz"],
+          page.evaluate("[document.activeElement.id, document.getElementById('search').value]"))
+    for route in held:
+        route.continue_()
+    page.unroute("**/show/csv-import/index.html")
+    page.close()
+
+
+@scenario
+def a_reload_while_the_hub_restarts(w: World) -> None:
+    """hub-tab-loads-what-it-shows#P3: a tab reloaded in a unit, whose first read finds the hub gone (served the page,
+    then restarting), shows the unit's session page once the hub answers, with no click."""
+    w.enter()
+    held = []
+    page = w.context.new_page()
+    page.route("**/api/hub", lambda route: held.append(route))
+    page.goto(w.origin + "/")
+    until(lambda: held or page.evaluate("false"), "the reloaded tab's first read of the hub")
+    w.kill_hub()
+    for route in held:
+        route.continue_()  # to a hub that is gone
+    page.unroute("**/api/hub")
+    page.wait_for_function("window.wc", timeout=30000)
+    w.start_hub()
+    settles("once the hub answers, the reloaded tab is in the unit, its session page in the sidebar",
+            [ORCHESTRATOR, w.session_url(w.pages[0])], lambda: [w.current(page), w.sidebar_url(page)], within=20)
+    page.close()
+
+
+@scenario
 def many_units(w: World) -> None:
     """one-hub-tab#P1: many orchestrators' pages open in one tab, and a page opened then still loads."""
     v = w.view
@@ -1445,7 +2109,7 @@ def a_session_page_nobody_opened(w: World) -> None:
     unopened = w.page(f"sessions/{unit}/index.html", "<h1>unit 0's session</h1>")
     os.utime(unopened, (w.t0 - 300, w.t0 - 300))  # its last turn, as registered
     w.view.wait_for_function(f"wc.state.units.find(u => u.unit === {json.dumps(unit)})?.session_page?.url.startsWith('/f/')", timeout=10000)
-    w.view.locator(f'#units button[title="session {unit}"]').click()
+    w.view.locator(f'#units button[data-session="{unit}"]').click()
     settles("entering a unit whose session page nobody opened shows it in the sidebar", w.session_url(unopened), w.sidebar_url)
 
 
@@ -1490,6 +2154,170 @@ def the_input_box_says_what_the_session_does(w: World) -> None:
 
 
 @scenario
+def a_message_stuck_in_the_session_gets_its_enter_from_the_box(w: World) -> None:
+    """A message the hub typed that Claude Code did not take stays in the box, which says so; Enter there again asks
+    the hub only for an Enter, so the words never go in twice, and once it goes the box clears as after a send. Words
+    changed since are a new message, typed in full. The hub's answers are made up here: what it does in tmux is
+    server.test's."""
+    v = w.view
+    p = w.pane()
+    sent, answers = [], []
+
+    def answering(route) -> None:
+        sent.append((route.request.url.rsplit("/", 1)[-1], route.request.post_data_json))
+        code, body = answers.pop(0)
+        route.fulfill(status=code, content_type="application/json", body=json.dumps(body))
+    v.route("**/api/type", answering)
+    v.route("**/api/enter", answering)
+    error = f"typed into tmux pane {p.id}, but Claude Code did not take it after Enter was pressed 2 time(s); it waits in the session's input box"
+    stuck, went = (502, {"error": error, "pane": p.id, "stuck": True}), (200, {"ok": True, "pane": p.id})
+    p.focus()
+    v.keyboard.type("go on")
+    answers.append(stuck)
+    v.keyboard.press("Enter")
+    settles("a message typed but not taken stays in the box, which says so, and that Enter presses Enter there",
+            ("go on", f"not sent: {error} · Enter here presses Enter there"), lambda: (p.text(), p.how()))
+    answers.append(went)
+    v.keyboard.press("Enter")
+    settles("...Enter again asks the hub only for an Enter, and the box clears as after a send",
+            ([("type", {"unit": ANSWERING, "text": "go on"}), ("enter", {"unit": ANSWERING})], "", f"sent to tmux pane {p.id}"),
+            lambda: (sent, p.text(), p.how()))
+    sent.clear()
+    v.keyboard.type("stop")
+    answers.append(stuck)
+    v.keyboard.press("Enter")
+    until(lambda: p.how().startswith("not sent"), "the second message, stuck")
+    v.keyboard.type(" now")
+    answers.append(went)
+    v.keyboard.press("Enter")
+    # read through the page: Playwright's sync API runs the route's handler only while a call into it is under way
+    settles("...words changed since are a new message, typed in full",
+            ([("type", {"unit": ANSWERING, "text": "stop"}), ("type", {"unit": ANSWERING, "text": "stop now"})], f"sent to tmux pane {p.id}"),
+            lambda: (sent, p.how()))
+    v.unroute("**/api/type")
+    v.unroute("**/api/enter")
+
+
+@scenario
+def what_is_under_way_follows_into_another_browser(w: World) -> None:
+    """Two browsers open on one session show the same words in its box: each change reaches the other as it is typed, a
+    send empties both, and a browser opened later reads them. Words the hub has not got yet are not written over, and
+    reach it once it answers; a session page is told when the other browser changed what is staged on it."""
+    v = w.view
+    p = w.pane()
+    w.page(f"sessions/{ANSWERING}/index.html", """<h1>staged</h1><script>
+      window.told = 0
+      window.waitingChanged = () => { window.told++ }
+    </script>""")
+    profile = w.context.browser.new_context(viewport=VIEWPORT)
+    area = f"{BOX}.querySelector('textarea')"
+    ready = f"(() => {{ try {{ return !!{area} && !!{SIDEBAR_PAGE}.contentWindow.waitingChanged; }} catch {{ return false; }} }})()"
+    there = profile.new_page()
+    there.goto(f"{w.origin}/u/{ANSWERING}")
+    there.wait_for_function(ready, timeout=30000)
+    w.frame_at(f"/{ANSWERING}/index.html")
+    v.wait_for_function(ready, timeout=30000)
+    other = lambda: there.evaluate(f"{area}.value")
+    p.focus()
+    v.keyboard.type("half a thought")
+    settles("words typed in one browser show in the other", "half a thought", other)
+    there.locator("#session-box .reply textarea").click()
+    there.keyboard.press("End")
+    there.keyboard.type(", finished here")
+    settles("...and the other way", "half a thought, finished here", p.text)
+    check("a browser opened later reads them", "half a thought, finished here", p.after_reload("half a thought, finished here"))
+
+    there.route("**/api/draft", lambda route: route.abort())
+    there.keyboard.type(" and more")
+    p.focus()
+    v.keyboard.press("End")
+    v.keyboard.type("!")
+    check("the browser the hub answers keeps saving", "half a thought, finished here!", p.after_reload("half a thought, finished here!"))
+    check("words the hub has not got yet are not written over", "half a thought, finished here and more", other())
+    there.reload()
+    there.wait_for_function(ready, timeout=30000)
+    check("...not by a reload either, with the hub still away", "half a thought, finished here and more", other())
+    there.unroute("**/api/draft")
+    there.reload()
+    there.wait_for_function(ready, timeout=30000)
+    settles("...and they reach the hub and the other browser once it answers", "half a thought, finished here and more", p.text)
+
+    p.focus()
+    v.keyboard.press("Enter")
+    settles("a send empties the box in both browsers", ["", ""], lambda: [p.text(), other()])
+
+    told = lambda tab: tab.evaluate(f"{SIDEBAR_PAGE}.contentWindow.told")
+    v.evaluate(f"(page => page.parent.hubWaiting.save(page, {{ staged: {{}}, seen: [], sent: {{}} }}))({SIDEBAR_PAGE}.contentWindow)")
+    settles("what one browser stages tells the session page in the other", 1, lambda: told(there))
+    check("...and not its own", 0, told(v))
+    profile.close()
+
+
+@scenario
+def a_batch_staged_on_the_session_page_goes_from_its_review(w: World) -> None:
+    """work-through-what-waits-one-item-at-a-time#P2 and #P3, the tab's half: the session page keeps what the user
+    staged through the tab's `hubWaiting`, which the hub holds under the tab's token; the box's own Enter sends its words
+    alone and says what stays staged, and while the page's review is open sends what the review shows; each change to the box's words is told to the page, whose review shows them; the page's send, on the user's own key there, sends the batch with the box's words
+    below it as one message, and a send no key of the user's started is refused."""
+    v = w.view
+    p = w.pane()
+    page = f"{SIDEBAR_PAGE}.contentWindow"
+    # a session page that stages and sends as the mx plugin's page.js does, its batch fixed, its review's Enter sending
+    w.page(f"sessions/{ANSWERING}/index.html", """<h1>staged</h1><script>
+      window.held = !!parent.hubWaiting?.holds(window)
+      window.batch = "Q1: a, after Friday\\nA1: done"
+      window.waitingBatch = () => window.batch
+      window.waitingStaged = () => window.batch ? window.batch.split("\\n").length : 0
+      window.waitingSent = (text) => { window.sentLines = text }
+      window.waitingWords = () => { window.heardWords = parent.hubWaiting.words(window) }
+      window.waitingReviewing = () => !!window.reviewing
+      document.addEventListener("keydown", (e) => { if (e.key === "Enter") parent.hubWaiting.send(window).then((r) => { window.answer = r }) })
+    </script>""")
+    in_page = lambda js: v.evaluate(f"(() => {{ try {{ return {js} }} catch {{ return null }} }})()")
+    settles("the tab holds the unit's own session page", True, lambda: in_page(f"{page}.held ?? null"))
+    check("a send no key of the user's started is refused, and nothing reaches the pane",
+          [False, "a send wants your own key or click on the page", b""],
+          v.evaluate(f"{page}.parent.hubWaiting.send({page}).then((r) => [r.ok, r.error])") + [p.arrived()])
+    kept = {"staged": {"Q1": {"pick": "a", "note": "after Friday"}, "A1": {"act": "done"}}, "seen": [], "sent": {}}
+    check("what the page stages is kept by the hub and read back as kept", [True, kept],
+          v.evaluate(f"(doc => {page}.parent.hubWaiting.save({page}, doc).then(() => {page}.parent.hubWaiting.load({page})).then((r) => [r.ok, r.staged]))({json.dumps(kept)})"))
+    p.focus()
+    v.keyboard.type("hold on")
+    v.keyboard.press("Enter")
+    settles("the box's own Enter sends its words alone, the batch staying on the page", b"\x1b[200~hold on\x1b[201~\r", p.arrived)
+    check("...the page hearing nothing sent", None, in_page(f"{page}.sentLines ?? null"))
+    settles("...and the box saying what stays staged, and how to send it",
+            "2 staged, not sent: r on the session page reviews them", lambda: v.evaluate(f"{BOX}.querySelector('.how').textContent").rsplit(" · ", 1)[-1])
+    after = lambda n: (lambda: p.arrived()[n:])  # what reached the pane since its first n bytes
+    n = len(p.arrived())
+    v.keyboard.type("and then deploy")
+    check("...the box's words the page shows below its batch, told of each change as it is typed", "and then deploy", in_page(f"{page}.heardWords ?? null"))
+    w.focus_session()
+    v.keyboard.press("Enter")
+    settles("the page's send, on the user's Enter there, sends its batch and the box's words below it, as one paste and one Enter",
+            b"\x1b[200~Q1: a, after Friday\rA1: done\r\rand then deploy\x1b[201~\r", after(n))
+    settles("...the page hears the lines that went and that it went, and the box empties",
+            ["Q1: a, after Friday\nA1: done", True, ""], lambda: [in_page(f"{page}.sentLines ?? null"), in_page(f"{page}.answer?.ok ?? null"), p.text()])
+    n = len(p.arrived())
+    v.evaluate(f"{page}.answer = null")
+    v.keyboard.press("Enter")
+    settles("...a batch with the box empty goes alone", b"\x1b[200~Q1: a, after Friday\rA1: done\x1b[201~\r", after(n))
+    v.evaluate(f"{page}.batch = ''; {page}.answer = null")
+    v.keyboard.press("Enter")
+    settles("...and with nothing staged and nothing typed, nothing goes", [False, "nothing to send"],
+            lambda: in_page(f"{page}.answer && [{page}.answer.ok, {page}.answer.error]"))
+    v.evaluate(f"{page}.batch = 'Q1: b'; {page}.sentLines = null; {page}.reviewing = true")
+    n = len(p.arrived())
+    p.focus()
+    v.keyboard.type("ship it")
+    v.keyboard.press("Enter")
+    settles("with the page's review open, the box's own Enter sends what the review shows, the batch with the words below it",
+            b"\x1b[200~Q1: b\r\rship it\x1b[201~\r", after(n))
+    settles("...the page hearing the lines that went, and the box empties", ["Q1: b", ""],
+            lambda: [in_page(f"{page}.sentLines ?? null"), p.text()])
+
+
+@scenario
 def typing_into_the_pane(w: World) -> None:
     v = w.view
     p = w.pane()
@@ -1498,7 +2326,7 @@ def typing_into_the_pane(w: World) -> None:
     v.keyboard.press("Shift+Enter")
     v.keyboard.type("but leave the tests")
     check("shift+enter is a new line in the box, sending nothing", ("go on\nbut leave the tests", 0), (p.text(), w.posted("type")))
-    check("the box's unsent text survives a reload", "go on\nbut leave the tests", p.after_reload())
+    check("the box's unsent text survives a reload", "go on\nbut leave the tests", p.after_reload("go on\nbut leave the tests"))
     v.evaluate(f"{BOX}.querySelector('textarea').dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', bubbles: true, cancelable: true }}))")
     # dispatchEvent returns once the box's handler has run, and a send starts in it
     check("an Enter a page made up sends nothing", ("go on\nbut leave the tests", 0), (p.text(), w.posted("type")))
@@ -1535,7 +2363,7 @@ def typing_into_the_pane(w: World) -> None:
     v.keyboard.press("Control+a")
     v.keyboard.type("then ")
     check("select-all selects the box's text", "then ", p.text())
-    check("...and a reload finds what was typed last", "then ", p.after_reload())
+    check("...and a reload finds what was typed last", "then ", p.after_reload("then "))
 
 
 @scenario
@@ -1730,9 +2558,7 @@ def the_box_resized(w: World) -> None:
     if shot := os.environ.get("HUB_BOX_HALF_SCREENSHOT"):
         v.screenshot(path=shot)
     v.keyboard.press("Control+Alt+r")
-    settles("...again, most of it", 0.85, share)
-    v.keyboard.press("Control+Alt+r")
-    settles("...and again fits it to its text", [True, None, True],
+    settles("...again fits it to its text", [True, None, True],
             lambda: [near(natural)(), v.evaluate("localStorage.getItem('wc:box:height')"),
                      v.evaluate(f"document.activeElement === {BOX}.querySelector('textarea')")])
     v.evaluate(f"{BOX}.querySelector('textarea').focus()")
@@ -1783,9 +2609,9 @@ def jump_and_close_panes(w: World) -> None:
     check("a first click on close asks to be confirmed, in place", "close all 2 panes, shell and all? again to confirm", acts()[1])
     check("...and kills nothing, asking the hub nothing", (0, before), (w.posted("close-panes"), all_panes()))
     settles("...until it lapses, a few seconds on", "2", lambda: acts()[1], within=8)
-    v.locator(f'#units button[title="session {ORCHESTRATOR}"]').click()
+    v.locator(f'#units button[data-session="{ORCHESTRATOR}"]').click()
     until(lambda: w.current() == ORCHESTRATOR, "the orchestrator's unit")
-    row = v.locator(".unit", has=v.locator(f'button[title="session {ANSWERING}"]'))
+    row = v.locator(".unit", has=v.locator(f'button[data-session="{ANSWERING}"]'))
     row.hover()  # the ✕ shows under the pointer
     row.locator(".close").click()
     settles("the ✕ on its row on the rail goes into its unit, and asks the same", (ANSWERING, True),
@@ -1808,24 +2634,52 @@ def usage_and_context(w: World) -> None:
     v = w.view
     t = time.time()
     w.statusline(ORCHESTRATOR, w.home / ".claude", context_window={"used_percentage": 42.5, "total_input_tokens": 85000},
-                 rate_limits={"five_hour": {"used_percentage": 31, "resets_at": t + 3700},
-                              "seven_day": {"used_percentage": 90, "resets_at": t + 6 * 86400 + 3700}})
+                 rate_limits={"seven_day": {"used_percentage": 90, "resets_at": t + 6 * 86400 + 3700}})
     w.statusline("99999999-0000-4000-8000-00000000000f", w.home / ".claude-work",
-                 rate_limits={"five_hour": {"used_percentage": 70, "resets_at": t - 60},
-                              "seven_day": {"used_percentage": 50, "resets_at": None}})
+                 rate_limits={"seven_day": {"used_percentage": 70, "resets_at": t - 60}})
+    w.statusline("99999999-0000-4000-8000-00000000000e", w.home / ".claude-pro",
+                 rate_limits={"seven_day": {"used_percentage": 50, "resets_at": None}})
     w.second()  # running, with no statusline file
     usage_lines = lambda: v.evaluate("""[...document.querySelectorAll('#usage > *')].map(e => [e.textContent, e.dataset.tone ?? '',
         e.querySelector('.fill')?.style.width ?? '', e.querySelector('.tick')?.style.left.split('.')[0] ?? ''])""")
-    settles("the rail's top shows each account's 5h and weekly usage, under the windows' names: a meter in the tone of its "
+    settles("the rail's top shows each account's weekly usage, under the window's name: a meter in the tone of its "
             "pace, a tick at the share of the window gone, the time to its reset", [
-        ["", "", "", ""], ["5h", "", "", ""], ["week", "", "", ""],
-        ["claude", "", "", ""], ["31%1h", "ok", "31%", "79"], ["90%6d", "over", "90%", "13"],
-        ["work", "", "", ""], ["0%fresh", "ok", "0%", ""], ["50%", "ok", "50%", ""]], usage_lines)  # no reset time: no pace to fall behind
+        ["", "", "", ""], ["week", "", "", ""],
+        ["claude", "", "", ""], ["90%6d", "over", "90%", "13"],
+        ["pro", "", "", ""], ["50%", "ok", "50%", ""],  # no reset time: no pace to fall behind
+        ["work", "", "", ""], ["0%fresh", "ok", "0%", ""]], usage_lines)
+    check("...each meter as wide as the row leaves it, several times the context meter's", True,
+          v.evaluate("[...document.querySelectorAll('#usage .meter')].every(m => m.getBoundingClientRect().width > 80)"))
     context_line = lambda key: v.evaluate(
-        f"(e => e && [e.textContent, e.dataset.tone, e.title])(document.querySelector('#units button[title=\"session {key}\"] .ctx'))")
+        f"(e => e && [e.textContent, e.dataset.tone, e.dataset.tip])(document.querySelector('#units button[data-session=\"{key}\"] .ctx'))")
     settles("a running session's rail entry shows its context use", ["42%", "ok", "context 42% used, 85k tokens"], lambda: context_line(ORCHESTRATOR))
     check("...and one with no statusline file shows none", True, v.evaluate(
-        f"(b => !!b && !b.querySelector('.ctx'))(document.querySelector('#units button[title=\"session {SECOND}\"]'))"))
+        f"(b => !!b && !b.querySelector('.ctx'))(document.querySelector('#units button[data-session=\"{SECOND}\"]'))"))
+
+
+@scenario
+def an_account_shown_draws_the_rail_once(w: World) -> None:
+    """A click on an account's name stays quick: the workspace mounts each of the account's pages, and tells of every
+    one, but the rail is drawn once for the click."""
+    v = w.view
+    work = "77777777-0000-4000-8000-000000000077"  # a second account, so that each account's name is a toggle
+    w.registered(work, w.t0 - 307, account=".claude-work")
+    w.opened(w.page("show/unit-7/index.html", "<h1>unit 7</h1>"), work)
+    settles("an orchestrator under another account is on the rail", True, lambda: work in w.rail_units())
+    account = v.evaluate(f"wc.state.units.find((u) => u.unit === {json.dumps(ORCHESTRATOR)}).account")
+    pages = lambda: v.evaluate(f"ws.views().filter((v) => v.params.group === {json.dumps(ORCHESTRATOR)}).length")
+    before = pages()
+    check("the orchestrator's unit has several pages in the workspace", True, before >= 2)
+    click = """(account) => {
+      const seen = new MutationObserver(() => {});
+      seen.observe(document.getElementById("units"), { childList: true });
+      document.querySelector(`#usage button.account[data-account="${account}"]`).click();
+      return seen.takeRecords().length; // the draws of the rail's list made before the click returned
+    }"""
+    check("hiding its account draws the rail once", 1, v.evaluate(click, account))
+    settles("...its pages out of the workspace", 0, pages)
+    check("showing the account again draws the rail once", 1, v.evaluate(click, account))
+    check("...every page of the unit back in the workspace before the click returned", before, pages())
 
 
 @scenario
@@ -1835,14 +2689,14 @@ def an_account_hidden(w: World) -> None:
     work = "77777777-0000-4000-8000-000000000077"  # an orchestrator under another account
     w.registered(work, w.t0 - 307, account=".claude-work")
     w.opened(w.page("show/unit-7/index.html", "<h1>unit 7</h1>"), work)
-    w.statusline(work, w.home / ".claude-work", rate_limits={"five_hour": {"used_percentage": 10, "resets_at": time.time() + 3700}})
+    w.statusline(work, w.home / ".claude-work", rate_limits={"seven_day": {"used_percentage": 10, "resets_at": time.time() + 3700}})
     settles("an orchestrator under another account is on the rail", True, lambda: work in w.rail_units())
     ended_other = "f7f7f7f7-0000-4000-8000-0000000000f7"  # a session of that account that ended, by its transcript
     (w.home / ".claude-work/projects/-home-repos-alpha").mkdir(parents=True, exist_ok=True)
     (w.home / ".claude-work/projects/-home-repos-alpha" / f"{ended_other}.jsonl").write_text("")
     w.opened(w.page("notes/ended-other.html", "an ended session's page"), ended_other)
     settles("...and one of its that ended in the ended list", True,
-            lambda: ended_other in v.evaluate("[...document.querySelectorAll('#aside-units .nav')].map(b => b.title.replace('session ', ''))"))
+            lambda: ended_other in v.evaluate("[...document.querySelectorAll('#aside-units .nav')].map(b => b.dataset.session)"))
     numbers_before = v.evaluate("wc.state.units.filter(u => u.number).length")
     work_name = lambda page=v: page.locator('#usage button.account:text-is("work")')
     shown = lambda page=v: work_name(page).get_attribute("aria-pressed")
@@ -1853,7 +2707,7 @@ def an_account_hidden(w: World) -> None:
     check("...its name no longer pressed", "false", shown())
     check("...out of the numbers", (numbers_before - 1, False), (v.evaluate("wc.state.units.filter(u => u.number).length"),
           v.evaluate(f"wc.state.units.some(u => u.unit === {json.dumps(work)})")))
-    check("...and out of the layout, the overview's too", False, v.evaluate(f"ws.views().some(v => v.params.group === {json.dumps(work)})"))
+    check("...and out of the layout", False, v.evaluate(f"ws.views().some(v => v.params.group === {json.dumps(work)})"))
     v.keyboard.press("Control+Alt+f")
     v.keyboard.type(work[:8])
     settles("...and out of the search", "no session matches",
@@ -1894,8 +2748,8 @@ def continuing_from_a_handoff(w: World) -> None:
     handoff_url = "/f" + urllib.parse.quote(str(handoff.resolve()))
     offer = f"{BOX}.querySelector('.handoff')"
     offers = lambda: v.evaluate(f"(o => o.checkVisibility() ? [o.textContent, o.querySelector('a')?.getAttribute('href') ?? null] : null)({offer})")
-    mark = lambda: v.evaluate(f"""(m => m && [m.hasAttribute('data-handoff'), m.hasAttribute('data-needs'), m.title.endsWith('ready to hand off')])
-        (document.querySelector('#units button[title="session {ANSWERING}"] .mark'))""")
+    mark = lambda: v.evaluate(f"""(m => m && [m.hasAttribute('data-handoff'), m.hasAttribute('data-needs'), m.dataset.tip.endsWith('ready to hand off')])
+        (document.querySelector('#units button[data-session="{ANSWERING}"] .mark'))""")
 
     def commit_handoff(at: int, text: str) -> None:
         """The session writes its handoff and commits it at `at`."""
@@ -1964,7 +2818,7 @@ def continuing_from_a_handoff(w: World) -> None:
     # the stalled session ended, its unit with it, and the one it came from runs again
     v.wait_for_function(f"!wc.state.units.some(u => u.unit === {json.dumps(stalled)}) && "
                         f"wc.state.units.find(u => u.unit === {json.dumps(ANSWERING)})?.state === 'idle'", timeout=20000)
-    v.locator(f'#units button[title="session {ANSWERING}"] .name').click()  # its middle may be the id, which copies
+    v.locator(f'#units button[data-session="{ANSWERING}"] .name').click()  # its middle may be the id, which copies
     settles("back in the session the refusal left", [ANSWERING, True],
             lambda: [w.current(), v.evaluate(f"{offer}?.checkVisibility() ?? false")])
     handed_to = session_id(0x20)
@@ -2102,7 +2956,7 @@ def start_and_resume(w: World) -> None:
     v.route("**/api/resume", answering)
     v.route("**/api/start", lambda route: answering(route) if route.request.method == "POST" else route.continue_())
 
-    row = v.locator(".unit", has=v.locator(f'button[title="session {ended}"]'))
+    row = v.locator(".unit", has=v.locator(f'button[data-session="{ended}"]'))
     until(lambda: row.locator(".resume").count(), "the ended session's row")
     answers.append((409, {"error": "the session still runs (in hub:@0.%3); a second process of it would write its transcript twice"}))
     row.locator(".resume").click()
@@ -2325,8 +3179,9 @@ def finding_an_orchestrator(w: World) -> None:
     search(ended[6][:6], ["Instagram saves pass 1"], "ctrl+alt+f and a prefix of a session id finds that orchestrator alone, folded as it is")
     check("...from a search box ctrl+alt+f put the keyboard in", "search", v.evaluate("document.activeElement.id"))
     v.keyboard.press("Enter")
-    settles("...and enter goes to it, as a click on the rail would", (ended[6], ""),
-            lambda: (w.current(), v.evaluate("document.getElementById('search').value")))
+    settles("...and enter goes to it, as a click on the rail would, the query and what it found kept",
+            (ended[6], ended[6][:6], ["Instagram saves pass 1"]),
+            lambda: (w.current(), v.evaluate("document.getElementById('search').value"), found()))
     w.frame_at("/ended-6.html")  # its page, which has the keyboard once it loads
     v.wait_for_function(HOLDS_KEYBOARD, timeout=10000)
     search(ended[6], ["Instagram saves pass 1"], "a whole session id finds it too")
@@ -2376,11 +3231,13 @@ def finding_an_orchestrator(w: World) -> None:
 
 @scenario
 def what_the_search_finds_comes_in_the_rails_order(w: World) -> None:
-    """The search lists what matches as the rail would: the running before the ended, by state, and the latest turn's
-    end first, whatever fzf scores each line."""
+    """The search lists a title holding the word typed before one that only scatters its letters, and each of those
+    as the rail would: the running before the ended, by state, and the latest turn's end first, whatever fzf scores
+    each line. A term's letters scattered over a session id match nothing."""
     v = w.view
     sessions = {"Map": (session_id(0x20), None), "mild apple pie": (session_id(0x21), w.t0 - 600),
-                "my aged pear": (session_id(0x22), w.t0 - 60)}  # fzf ranks Map, then pie, then pear
+                "my aged pear": (session_id(0x22), w.t0 - 60),  # fzf ranks Map, then pie, then pear
+                "Many ants": (session_id(0x2f), w.t0 - 30)}  # m, a in its title, f only in its session id
     for title, (sid, ran) in sessions.items():
         transcript = w.home / ".claude" / "projects" / "-home-repos-alpha" / f"{sid}.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
@@ -2388,12 +3245,16 @@ def what_the_search_finds_comes_in_the_rails_order(w: World) -> None:
         if ran:
             w.registered(sid, ran)
         w.opened(w.page(f"notes/{sid}.html", "a page"), sid)
-    v.wait_for_function("wc.state.units.filter(u => ['Map', 'mild apple pie', 'my aged pear'].includes(u.title)).length === 3", timeout=10000)
+    v.wait_for_function(f"wc.state.units.filter(u => {json.dumps(list(sessions))}.includes(u.title)).length === 4", timeout=10000)
+    found = lambda: v.evaluate("[...document.querySelectorAll('#units .name')].map(e => e.textContent)")
     v.keyboard.press("Control+Alt+f")
     v.keyboard.type("map")
-    found = lambda: v.evaluate("[...document.querySelectorAll('#units .name')].map(e => e.textContent)")
-    settles("the two running sessions first, the one whose turn ended last on top, the ended one fzf scores best last",
-            ["my aged pear", "mild apple pie", "Map"], found)
+    settles("the ended session whose title holds the word first, then the running ones that scatter its letters, the "
+            "one whose turn ended last on top", ["Map", "my aged pear", "mild apple pie"], found)
+    v.keyboard.press("Escape")
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.type("maf")
+    settles("a term whose last letter only a session id holds, scattered, finds nothing", [], found)
     v.keyboard.press("Escape")
 
 
@@ -2428,7 +3289,9 @@ def finding_a_session_no_unit_holds(w: World) -> None:
     settles("its box offers to resume it", True, lambda: v.evaluate(f"!!{BOX}?.querySelector('.how .resume-now')"))
     v.locator("#session-box .reply .how .resume-now").click()
     settles("...which asks this host's hub to resume that session", [{"unit": quiet}], lambda: sent)
-    v.locator(f'button[title="session {ORCHESTRATOR}"]').click()
+    v.keyboard.press("Control+Alt+f")
+    v.keyboard.press("Escape")
+    v.locator(f'#units button[data-session="{ORCHESTRATOR}"]').click()
     settles("once you leave it, the rail is as it was", (ORCHESTRATOR, False),
             lambda: (w.current(), "Quiet refactor of the parser" in rail_names()))
 
@@ -2469,7 +3332,7 @@ def on_the_phone(w: World) -> None:
         check("...the rail alone in sight", (True, False), (w.shown("rail-side", ph), w.shown("session-side", ph)))
         check("...and none of the desk's frames loads, out of sight, slowing the phone's every tap", 0,
               until(lambda: (n := ph.evaluate(DESK_FRAMES))[0] and n, "the desk's frames")[1])
-        ph.locator(f'#units button[title="session {ANSWERING}"] .name').tap()
+        ph.locator(f'#units button[data-session="{ANSWERING}"] .name').tap()
         w.frame_at(f"/{ANSWERING}/index.html", ph)
         settles("a tap on a session's row goes to its session page, with its box", (["session", False], ANSWERING, True, False),
                 lambda: (ph.evaluate(SCREEN), w.current(ph), w.shown("session-side", ph), w.shown("rail-side", ph)))
@@ -2626,10 +3489,10 @@ def a_peers_sessions(w: World) -> None:
         w.view.reload()
         key = f"laptop/{PEER}"
         w.view.wait_for_function(f"window.wc && wc.state.units.some(u => u.unit === {json.dumps(key)})", timeout=30000)
-        hosts = lambda: w.view.evaluate("[...document.querySelectorAll('#units .nav')].map(b => [b.title.replace('session ', ''), b.querySelector('.host')?.textContent])")
+        hosts = lambda: w.view.evaluate("[...document.querySelectorAll('#units .nav')].map(b => [b.dataset.session, b.querySelector('.host')?.textContent])")
         settles("one rail holds both hosts' sessions, each row naming its host", sorted([[ORCHESTRATOR, "pc"], [PEER, "laptop"]]),
                 lambda: sorted(hosts()))
-        w.view.locator(f'#units button[title="session {PEER}"] .name').click()
+        w.view.locator(f'#units button[data-session="{PEER}"] .name').click()
         until(lambda: w.current() == key, "the laptop's unit")
         check("its session page is the laptop's hub's, through the relay", f"/h/laptop/pages/{PEER}",
               urllib.parse.urlsplit(until(w.sidebar_url, "the session sidebar")).path)
@@ -2651,18 +3514,18 @@ def a_peers_sessions(w: World) -> None:
                 lambda: received.read_bytes() if received.exists() else b"")
 
         stop(laptop)
-        aside = lambda: w.view.evaluate("[...document.querySelectorAll('#aside-units > *')].map(e => e.tagName === 'H2' ? e.textContent.replace(/; as read at .*/, '') : e.querySelector('.nav').title.replace('session ', ''))")
+        aside = lambda: w.view.evaluate("[...document.querySelectorAll('#aside-units > *')].map(e => e.tagName === 'H2' ? e.textContent.replace(/; as read at .*/, '') : e.querySelector('.nav').dataset.session)")
         settles("with the laptop down, its session shows under the laptop, as last read, and not among the ended",
                 ["laptop does not answer", PEER], aside, within=20)
         check("...its mark the state it was last read in, faded", ["idle", True],
-              w.view.evaluate(f"(m => [m.dataset.state, 'unreachable' in m.dataset])(document.querySelector('#aside-units button[title=\"session {PEER}\"] .mark'))"))
+              w.view.evaluate(f"(m => [m.dataset.state, 'unreachable' in m.dataset])(document.querySelector('#aside-units button[data-session=\"{PEER}\"] .mark'))"))
         settles("...and its box sends nothing, saying why", "none", lambda: (box() or [None])[0])
         settles("...in so many words", True, lambda: box()[1].startswith("laptop does not answer; as read at "))
         check("...and offers none of what it refuses: no jump, no close, no handoff", [False, False],
               w.view.evaluate(f"(b => [b.querySelector('.acts').checkVisibility(), b.querySelector('.offer')?.checkVisibility() ?? false])({BOX})"))
         # A tab opened while the laptop is down: each page of its unit is a notice in the hub's style, in place of the page.
         notices = lambda page: page.evaluate("""[...document.querySelectorAll('#session-frames > .current iframe, #work iframe')]
-          .filter(f => f.getAttribute('src').startsWith('/h/laptop/') && !f.closest('.figure')).map(f => {
+          .filter(f => f.getAttribute('src')?.startsWith('/h/laptop/') && !f.closest('.figure')).map(f => {
             const d = f.contentDocument, own = d?.querySelector('meta[name="hub-unreachable"]');
             return [f.getAttribute('src').split('/').pop(), own ? d.querySelector('h1').textContent : null];
           }).concat([...document.querySelectorAll('#work .figure')].filter(b => b.querySelector('img').getAttribute('src').startsWith('/h/laptop/'))
@@ -2720,6 +3583,98 @@ def a_peers_sessions(w: World) -> None:
         stop(laptop)
 
 
+TOLD = session_id(0x26)  # a session on the laptop, running, an agent's page new in its unit
+
+
+@scenario
+def numbers_told(w: World) -> None:
+    """hub-numbers-event-carries-numbers: the world's hub is pc's, relaying a laptop's hub. A statusline's numbers
+    changed on either host, and a unit visited on either, reach the tab in the event that tells it, which then asks
+    neither hub anything, and shows what a tab that reads it all shows."""
+    home = w.scratch / "lap"
+    env = {**w.env, "HOME": str(home)}
+    fakes.page(home / ".claude/sessions/told.json", json.dumps({"pid": os.getpid(), "procStart": SELF_STARTED, "sessionId": TOLD,
+                                                                 "status": "idle", "statusUpdatedAt": int(w.t0 * 1000) - 600_000}))
+    lap = subprocess.Popen([str(BIN / "container-hub"), "--socket", str(w.scratch / "lap.sock"), "--url", "http://laptop.invalid",
+                            "--state", str(w.scratch / "lap-state"), "--host", "laptop"],
+                           env=env, stdout=subprocess.DEVNULL, stderr=(w.scratch / "lap.log").open("a"), start_new_session=True)
+    on_laptop = lambda path, body: json.loads(subprocess.run(
+        ["curl", "-sf", "--unix-socket", str(w.scratch / "lap.sock"), "-H", "Content-Type: application/json", "-d", json.dumps(body),
+         f"http://hub{path}"], check=True, capture_output=True).stdout)
+    try:
+        until(lambda: (w.scratch / "lap.sock").exists() or lap.poll() is not None, "the laptop's hub to listen")
+        on_laptop("/api/open", {"target": str(fakes.page(home / "notes/new.html", "<!doctype html><h1>new</h1>")), "session": TOLD})
+        w.kill_hub()
+        w.hub_args += ["--host", "pc", "--peer", f"laptop={w.scratch / 'lap.sock'}"]
+        w.start_hub()
+        w.view.reload()
+        key = f"laptop/{TOLD}"
+        w.view.wait_for_function(f"window.wc && wc.state.units.some(u => u.unit === {json.dumps(key)})", timeout=30000)
+        w.settle()
+        rail = lambda page=w.view: page.evaluate("""[...document.querySelectorAll('#usage > *, #units .nav, #aside-units .nav')]
+            .map(e => [e.title, e.textContent, e.dataset.tone ?? ''])""")
+        ctx = lambda session: w.view.evaluate(f"document.querySelector('#units button[data-session=\"{session}\"] .ctx')?.textContent ?? null")
+        new = lambda session: w.view.evaluate(f"!!document.querySelector('#units button[data-session=\"{session}\"] .ic.new')")
+        check("the laptop's session has an agent's page new in its unit, the tab elsewhere", (True, True), (new(TOLD), w.current() != key))
+        asked = []
+        w.context.on("request", lambda r: asked.append(urllib.parse.urlsplit(r.url).path) if "/api/" in r.url else None)
+        while True:  # the reads the tab makes as its streams open, the relay's "reached" among them, done with first
+            before = len(asked)
+            w.view.wait_for_timeout(2000)
+            if len(asked) == before:
+                break
+        asked.clear()
+
+        t = time.time()
+        w.statusline(ORCHESTRATOR, w.home / ".claude", context_window={"used_percentage": 42.5, "total_input_tokens": 85000},
+                     rate_limits={"seven_day": {"used_percentage": 31, "resets_at": t + 3700}})
+        settles("pc's statusline changed shows its numbers on the rail", "42%", lambda: ctx(ORCHESTRATOR))
+        fakes.page(home / ".cache/claude-statusline" / f"{TOLD}.json", json.dumps({
+            "session_id": TOLD, "config_dir": str(home / ".claude-lap"), "written_at": t, "model": {"display_name": "Opus"},
+            "context_window": {"used_percentage": 64, "total_input_tokens": 128000},
+            "rate_limits": {"seven_day": {"used_percentage": 12, "resets_at": t + 3700}}}))
+        settles("...and the laptop's, through the relay, its usage too", ("64%", True),
+                lambda: (ctx(TOLD), w.view.locator('#usage button.account:text-is("lap")').count() == 1))
+        fakes.page(home / ".cache/claude-statusline" / f"{session_id(0x27)}.json", json.dumps({
+            "session_id": session_id(0x27), "config_dir": str(w.home / ".claude"), "written_at": t + 1,
+            "rate_limits": {"seven_day": {"used_percentage": 47, "resets_at": t + 3700}}}))
+        week = lambda name: w.view.evaluate(f"""[...document.querySelectorAll('#usage button.account')]
+            .find(b => b.textContent === {json.dumps(name)})?.nextElementSibling?.querySelector('.pct')?.textContent ?? null""")
+        settles("an account both hubs read shows the newer reading, here the laptop's over pc's own", "47%",
+                lambda: week("claude"))
+        on_laptop("/api/visit", {"unit": TOLD})
+        settles("a visit on the laptop takes the new page off its row", False, lambda: new(TOLD))
+        w.api("/api/visit", {"unit": ORCHESTRATOR})
+        w.view.wait_for_timeout(3000)  # the rounds that follow each change, and any read they would make
+        check("...and for none of it, nor what the hubs' rounds tell after, does the tab ask either hub anything", [], asked)
+        check("...while its rail is what a tab that reads it all shows", rail(w.fresh_tab("window.wc && wc.state.units.length > 0")), rail())
+        if not READER:
+            skipped("a turn record after the tab's own visit", "no mx plugin here, whose session page reader the rail reads a page by")
+        else:  # a record whose headline is the last one's changes the numbers alone: its unit's row, now unseen
+            w.view.locator(f'#units button[data-session="{ORCHESTRATOR}"] .name').click()
+            until(lambda: w.current() == ORCHESTRATOR, "ORCHESTRATOR's unit")
+            w.view.keyboard.press("Control+Alt+0")
+            until(lambda: w.current() is None, "the homepage")
+            w.written()
+            record = lambda n: fakes.page(w.agent / f"sessions/{ORCHESTRATOR}/turns/{n:02d}.md", "---\ndate: 2026-10-07\n---\n\n# Same headline\n")
+            record(1)
+            unseen = lambda: w.view.evaluate(f"document.querySelector('#units button[data-session=\"{ORCHESTRATOR}\"]')"
+                                             ".closest('.unit').querySelector('.mark').dataset.tip.includes('a turn record you have not seen')")
+            settles("a turn record written after the tab's own visit shows unseen on its row", True, unseen)
+            w.view.locator(f'#units button[data-session="{ORCHESTRATOR}"] .name').click()
+            until(lambda: w.current() == ORCHESTRATOR, "ORCHESTRATOR's unit")
+            w.view.keyboard.press("Control+Alt+0")
+            until(lambda: w.current() is None, "the homepage")
+            w.written()
+            settles("...seen once visited", False, unseen)
+            w.view.wait_for_timeout(1500)  # the visit's round, whose numbers event the tab holds the visit through
+            record(2)
+            settles("...and the next one, which changes the numbers alone, shows unseen again", True, unseen)
+    finally:
+        os.killpg(lap.pid, signal.SIGKILL)
+        lap.wait()
+
+
 COPIED = session_id(0x22)  # a session on the laptop, idle at the last pull of it, the laptop down since
 GONE = session_id(0x25)  # a session on the laptop, ended before the last pull, and no unit
 
@@ -2746,9 +3701,9 @@ def a_down_hosts_copies(w: World) -> None:
     key = f"laptop/{COPIED}"
     w.view.wait_for_function(f"window.wc && wc.state.units.some(u => u.unit === {json.dumps(key)})", timeout=30000)
     at = datetime.fromtimestamp(pulled).strftime("%H:%M")  # as the tab says a time, in the browser's zone, which is this host's
-    row = f'#aside-units button[title="session {COPIED}"]'
+    row = f'#aside-units button[data-session="{COPIED}"]'
     check("the laptop down, its session idle at the last pull is listed under it, with when its copy was pulled and the "
-          "session's state then", ["laptop does not answer", f"copy · idle {at}"],
+          "session's state then", ["laptop does not answer", f"copy, idle {at}"],
           [w.view.evaluate(f"document.querySelector('{row}').closest('.unit').previousElementSibling.textContent.replace(/; as read at .*/, '')"),
            w.view.evaluate(f"document.querySelector('{row} .copy').textContent")])
     w.view.locator(f"{row} .name").click()
@@ -2818,7 +3773,7 @@ cd {home} && HOME={home} USER={user} exec sh -c "$*"
         check("the rail offers to move every idle or ended session of each host to the other",
               ["move laptop's idle and ended sessions to pc", "move pc's idle and ended sessions to laptop"],
               w.view.evaluate("[...document.querySelectorAll('#host-moves .move-host')].map(b => b.textContent)"))
-        row = f'#aside-units button[title="session {MOVING}"]'
+        row = f'#aside-units button[data-session="{MOVING}"]'
         w.view.locator(f"{row} .name").click()
         until(lambda: w.current() == key, "the laptop's unit")
         how = lambda: w.view.evaluate(f"{BOX}?.querySelector('.how')?.textContent ?? ''")
@@ -2872,7 +3827,7 @@ def main(args: Args) -> None:
     names = list(args.scenarios or SCENARIOS)
     if args.shuffle:
         random.Random(args.shuffle).shuffle(names)
-    scratch = Path(tempfile.mkdtemp(prefix="container-hub-view-test."))  # every world's, and what they share
+    scratch = Path(tempfile.mkdtemp(prefix="hub-view."))  # every world's, and what they share; short, as World.build says
     # trellis, which a hub fetches on first use into its HOME's cache: fetched once, by the first world's hub
     (scratch / "trellis").mkdir()
     try:

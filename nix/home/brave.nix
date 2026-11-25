@@ -16,14 +16,12 @@ let
           selected_value = "#000000";
           random = false;
         };
-        show_branded_background_image = false;
-        show_sponsored_sites = false;
-        hide_all_widgets = true;
         show_stats = false;
         show_clock = false;
         show_brave_news = false;
         show_rewards = false;
         show_brave_vpn = false;
+        show_together = false; # Brave Talk
       };
       # Leo's surfaces. The feature itself only goes away through the
       # BraveAIChatEnabled policy: brave-core ignores an unmanaged
@@ -39,7 +37,11 @@ let
         enabled = false;
         show_brave_rewards_button_in_location_bar = false;
       };
-      brave_ads.enabled = false;
+      # Sponsored images and sites on the new tab page, then ads as notifications.
+      brave_ads = {
+        sponsored.enabled = false;
+        notifications.enabled = false;
+      };
       wallet.show_wallet_icon_on_toolbar = false;
       # Brave News, under its old name.
       today = {
@@ -75,14 +77,18 @@ in
   # prefs are merged into each profile's Preferences instead -- while Brave is
   # down, because a running Brave rewrites that file from memory on exit.
   home.activation.braveProfilePrefs = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-    if ${pkgs.procps}/bin/pgrep -x -u "$USER" 'brave|\.brave-wrapped' > /dev/null; then
-      echo "brave: running, profile prefs untouched -- quit it and switch again"
+    bravePending=()
+    for prefs in "$HOME/.config/BraveSoftware/Brave-Browser"/*/Preferences; do
+      [[ -e $prefs ]] || continue
+      # Chromium's own: the profile picker's and the guest session's, which it resets.
+      [[ $prefs == */"System Profile"/* || $prefs == */"Guest Profile"/* ]] && continue
+      ${pkgs.jq}/bin/jq -e --argjson patch '${builtins.toJSON profilePrefs}' '. * $patch == .' "$prefs" > /dev/null \
+        || bravePending+=("$prefs")
+    done
+    if (( ''${#bravePending[@]} )) && ${pkgs.procps}/bin/pgrep -x -u "$USER" 'brave|\.brave-wrapped' > /dev/null; then
+      echo "brave: running, prefs left unapplied in ''${#bravePending[@]} profile(s) -- quit it and switch again"
     else
-      for prefs in "$HOME/.config/BraveSoftware/Brave-Browser"/*/Preferences; do
-        [[ -e $prefs ]] || continue
-        if ${pkgs.jq}/bin/jq -e --argjson patch '${builtins.toJSON profilePrefs}' '. * $patch == .' "$prefs" > /dev/null; then
-          continue
-        fi
+      for prefs in "''${bravePending[@]}"; do
         if [[ -v DRY_RUN ]]; then
           echo "would update brave prefs in $prefs"
         else
@@ -93,5 +99,6 @@ in
         fi
       done
     fi
+    unset bravePending
   '';
 }

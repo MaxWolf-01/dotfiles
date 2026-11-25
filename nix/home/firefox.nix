@@ -59,6 +59,14 @@ in
     # firejail whitelist + backup paths in dirs.txt), then drop this pin.
     configPath = ".mozilla/firefox";
 
+    # desktop/firefox-tab-map.js runs at startup with full privileges and logs
+    # which process serves which tabs, for bin/proc-load. Firefox's release
+    # builds sandbox autoconfig unless this default pref turns it off.
+    package = pkgs.firefox.override {
+      extraPrefsFiles = [ "${../../desktop/firefox-tab-map.js}" ];
+      extraAutoConfig = ''pref("general.config.sandbox_enabled", false);'';
+    };
+
     policies = {
       DisableTelemetry = true;
       DisableFirefoxStudies = true;
@@ -171,6 +179,11 @@ in
         "widget.use-xdg-desktop-portal.open-uri" = 1;
         "media.eme.enabled" = true;
         "media.webspeech.synth.enabled" = false;
+        # With GNOME's toolkit-accessibility flag on, Firefox's accessibility
+        # engine kept its main process at about half a core. VibeTyper may
+        # turn that flag on, so Firefox opts out itself. VibeTyper's own logs
+        # show it never resolved the focused app this way.
+        "accessibility.force_disabled" = 1;
       };
     };
   };

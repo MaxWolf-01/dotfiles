@@ -15,9 +15,10 @@ let
 
   # uv runs lifelog for the collectors' last runs jarvis-sync ships, and the
   # `clawd quota` report it ships; jq because bin/run-log builds its line with it;
-  # sops and gnugrep for with-secrets, which that report reads its org keys through.
+  # sops and gnugrep for with-secrets, which that report reads its org keys through;
+  # util-linux for the flock it copies the lifelog folder under, google-health-collect's lock.
   syncPath = lib.makeBinPath (with pkgs; [
-    bash coreutils rsync openssh uv jq curl sops gnugrep
+    bash coreutils rsync openssh uv jq curl sops gnugrep util-linux
   ]);
 
   mirrorPath = lib.makeBinPath (with pkgs; [
@@ -57,6 +58,10 @@ let
     bash coreutils uv jq slackdump
   ]);
 
+  slackPushPath = lib.makeBinPath (with pkgs; [
+    bash coreutils rsync openssh
+  ]);
+
   dashboardPath = lib.makeBinPath (with pkgs; [
     bash coreutils uv openssh jq
   ]);
@@ -85,10 +90,22 @@ let
     bash coreutils uv sops jq
   ]);
 
+  # google-health-collect sops-decrypts its OAuth client and refresh token, and is
+  # a uv script; jq for bin/run-log.
+  googleHealthPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv sops jq
+  ]);
+
   # with-secrets runs sops exec-env for the WakaTime app's id and secret, which
   # renew wakatime-sync's token; jq for bin/run-log.
   wakatimePath = lib.makeBinPath (with pkgs; [
     bash coreutils uv sops jq
+  ]);
+
+  # bin/whatsapp-chat is a uv script; ssh and rsync reach the phone, sops opens the
+  # backup key; jq for bin/run-log.
+  whatsappPath = lib.makeBinPath (with pkgs; [
+    bash coreutils uv openssh rsync sops jq
   ]);
 
   # sops for the Bridge password, uv for lifelog's header index, jq for bin/run-log.
@@ -211,7 +228,7 @@ in
         "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${dotfiles}/backup/jarvis_backup.sh ${secrets}/backup/restic/jarvis/rsyncnet.conf";
+      ExecStart = "${dotfiles}/backup/sshfs_backup.sh ${secrets}/backup/restic/jarvis/rsyncnet.conf";
     };
   };
 
@@ -244,7 +261,7 @@ in
         "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
         "SSH_AUTH_SOCK=${sshAuthSock}"
       ];
-      ExecStart = "${dotfiles}/backup/jarvis_backup.sh ${secrets}/backup/restic/jarvis/pc.conf";
+      ExecStart = "${dotfiles}/backup/sshfs_backup.sh ${secrets}/backup/restic/jarvis/pc.conf";
     };
   };
 
@@ -254,6 +271,36 @@ in
       OnCalendar = "daily";
       Persistent = true;
       RandomizedDelaySec = "40m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- yapit prod → rsync.net (dumps staged on the VPS, then via SSHFS) ---
+
+  systemd.user.services.yapit-rsyncnet = {
+    Unit = {
+      Description = "Restic backup to rsync.net (yapit prod via SSHFS)";
+      X-SwitchMethod = "keep-old";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      TimeoutStartSec = "2h";
+      Environment = [
+        "PATH=${backupPath}:${lib.makeBinPath [ pkgs.sshfs ]}:/usr/bin"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/backup/sshfs_backup.sh ${secrets}/backup/restic/yapit/rsyncnet.conf";
+    };
+  };
+
+  systemd.user.timers.yapit-rsyncnet = {
+    Unit.Description = "Daily backup to rsync.net (yapit prod)";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
     };
     Install.WantedBy = [ "timers.target" ];
   };
@@ -283,6 +330,7 @@ in
         "working-xmg19.service"
         "jarvis-rsyncnet.service"
         "jarvis-pc.service"
+        "yapit-rsyncnet.service"
       ];
     };
   };
@@ -335,9 +383,43 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Talks playlist → library ---
+
+  # bin/yoink-playlist hands each new video to yoink-talk, which needs with-secrets, uv,
+  # ffmpeg and claude; the wrapper in .nix-profile picks claude's login (see ownLogin).
+  # ssh reaches pc, where the download goes when YouTube refuses the VPN's address.
+  systemd.user.services.yoink-playlist = {
+    Unit = {
+      Description = "Yoink new videos of the talks playlist into the library";
+      After = [ "network-online.target" "ssh-agent.service" ];
+      Wants = [ "network-online.target" "ssh-agent.service" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Nice = 10; # decoding a long video should not be felt at the keyboard
+      TimeoutStartSec = "12h";
+      Environment = [
+        "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        ownLogin
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/bin/yoink-playlist ${secrets}/backup/yoink-playlists.txt --record";
+    };
+  };
+
+  systemd.user.timers.yoink-playlist = {
+    Unit.Description = "Daily yoink of the talks playlist";
+    Timer = {
+      OnCalendar = "daily";
+      Persistent = true;
+      RandomizedDelaySec = "30m";
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   systemd.user.services.yapit-health-report = {
     Unit = {
-      Description = "Yapit daily health report";
+      Description = "Yapit weekly health report";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
@@ -345,41 +427,17 @@ in
       Type = "oneshot";
       WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
       # ${home}/bin for run-log and alert-send: the script records each run and
-      # mails what needs a person with them
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
+      # mails what needs a person with them. mx/bin for model-runs, which the
+      # analysis agent runs under.
+      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/repos/github/MaxWolf-01/agents/mx/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
       ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/report.sh";
     };
   };
 
   systemd.user.timers.yapit-health-report = {
-    Unit.Description = "Yapit health report (10pm daily)";
+    Unit.Description = "Yapit health report (Monday 10pm, weekly)";
     Timer = {
-      OnCalendar = "*-*-* 22:00:00";
-      Persistent = true;
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
-
-  systemd.user.services.yapit-dep-scout = {
-    Unit = {
-      Description = "Yapit dependency scout";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      WorkingDirectory = "${home}/repos/code/yapit-tts/yapit";
-      # ${home}/bin for run-log and alert-send: the script records each run and
-      # mails what needs a person with them
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/bin:${home}/.claude/local:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
-      ExecStart = "${home}/repos/code/yapit-tts/yapit/scripts/dep-scout.sh";
-    };
-  };
-
-  systemd.user.timers.yapit-dep-scout = {
-    Unit.Description = "Yapit dependency scout (biweekly)";
-    Timer = {
-      OnCalendar = "Mon *-*-1..7,15..21 20:00:00";
+      OnCalendar = "Mon *-*-* 22:00:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
@@ -389,8 +447,7 @@ in
   # mx's weekly retros, run from the agents repo's checkout: on Monday the workflow retro, of the
   # agents repo and every Claude Code session; on Tuesday the repo retro of each repo on
   # ./repo-retros, one after another. bin/workflow-retro says what each records. Each kind gets a
-  # night of its own to end inside the window claude-ping opens at 23:30 (why: the claude-ping
-  # comment below), though a long night of repo retros can still run past it. Persistent: a laptop
+  # night of its own. Persistent: a laptop
   # asleep at 02:00 runs them on waking. When both catch up on the same waking, the repo retros
   # wait for the workflow retro to end.
   # Both are oneshots, which have no start timeout by default, so a wedged run would leave the unit
@@ -422,6 +479,38 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # The weekly flake lock bump: bin/update-review builds every host with it and
+  # has Claude rate it; the update dot shows the rating, and max applies it.
+  # nix from the system profile, the claude wrapper from ~/.nix-profile (ownLogin),
+  # and the ssh agent for fetching master from GitHub.
+  systemd.user.services.update-review = {
+    Unit = {
+      Description = "Bump the flake lock, build every host, and review it";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      TimeoutStartSec = "6h"; # every host's system builds twice, NVIDIA modules included
+      Nice = 10;
+      Environment = [
+        "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/usr/bin:/bin"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+        ownLogin
+      ];
+      ExecStart = "${dotfiles}/bin/update-review run";
+    };
+  };
+
+  systemd.user.timers.update-review = {
+    Unit.Description = "Flake lock bump and review (Saturdays 03:00)";
+    Timer = {
+      OnCalendar = "Sat *-*-* 03:00:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   systemd.user.services.repo-retros = {
     Unit = {
       Description = "Repo retros, each when its repo has a commit since its last run";
@@ -447,6 +536,7 @@ in
   };
 
   # --- GitHub repo mirror (clone missing, fetch existing) ---
+  # A local backup, so it does not prune: a branch deleted on GitHub survives here.
 
   systemd.user.services.github-mirror = {
     Unit = {
@@ -647,6 +737,40 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- Google Health → google-health.duckdb ---
+  # The watch's data from the Google Health API, every type at native grain. What a
+  # run reads and replaces: secrets/scripts/google-health-collect --help.
+
+  systemd.user.services.google-health-collect = {
+    Unit = {
+      Description = "Read the watch's data from the Google Health API into the lifelog store";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${googleHealthPath}"
+      ];
+      ExecStart = "${secrets}/scripts/google-health-collect fetch";
+      # Three days are about 140 requests, a minute at the API's pace; a fetch after
+      # the laptop was off for weeks reads every day since, some minutes more.
+      TimeoutStartSec = "1h";
+      Nice = 10;
+    };
+  };
+
+  systemd.user.timers.google-health-collect = {
+    Unit.Description = "Google Health collection (hourly)";
+    Timer = {
+      # Done ahead of jarvis-sync's :35, which ships the store. When both start at once
+      # after a wake, jarvis-sync waits for the collector's lock between two days' writes.
+      OnCalendar = "*:32:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Browsing-time dashboard (localhost + tailnet, port 8930) ---
 
   systemd.user.services.browsing-dash = {
@@ -753,6 +877,43 @@ in
     Install.WantedBy = [ "timers.target" ];
   };
 
+  # --- WhatsApp backup → ~/data/whatsapp ---
+  # The phone's newest full backup and the daily increments since, decrypted and
+  # merged on the laptop, for whatsapp-chat and lifelog's whatsapp view; jarvis-sync
+  # ships it. What a run does: `whatsapp-chat --help`.
+  # Hourly, ahead of jarvis-sync's :05: WhatsApp backs up once a day, and a run with
+  # nothing new copies and writes nothing.
+
+  systemd.user.services.whatsapp-mirror = {
+    Unit = {
+      Description = "Mirror the phone's WhatsApp backup, decrypted, into ~/data/whatsapp";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${whatsappPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = "${dotfiles}/bin/whatsapp-chat mirror --record";
+      # Copying 100 MB from the phone over a slow link can take minutes; a hung
+      # oneshot would make every later firing a silent no-op.
+      TimeoutStartSec = "30m";
+      Nice = 10;
+      IOSchedulingClass = "idle";
+    };
+  };
+
+  systemd.user.timers.whatsapp-mirror = {
+    Unit.Description = "WhatsApp backup mirror (hourly)";
+    Timer = {
+      OnCalendar = "*:00";
+      Persistent = true;
+    };
+    Install.WantedBy = [ "timers.target" ];
+  };
+
   # --- Officebuddy invoices → a scan-to-pay mail each ---
   # Reads the mirror's copy (above); what it mails and when: bin/officebuddy-invoice.
   # Daily is plenty against a 14-day payment term.
@@ -793,6 +954,7 @@ in
       Description = "Add new Slack messages to the local archive";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
+      OnSuccess = [ "slack-archive-push.service" ];
     };
     Service = {
       Type = "oneshot";
@@ -812,6 +974,40 @@ in
       RandomizedDelaySec = "10m";
     };
     Install.WantedBy = [ "timers.target" ];
+  };
+
+  # --- Slack archive → PC ---
+  # pc reads a copy rather than syncing its own: slackdump takes any cgroup-v2
+  # host for a container and then keys its stored login on the hostname, so a
+  # login copied from here never opens on pc. Started by each successful sync,
+  # when nothing writes the archive, so the database and its WAL travel as one.
+
+  systemd.user.services.slack-archive-push = {
+    Unit = {
+      Description = "Copy the Slack archive to pc";
+      After = [ "network-online.target" ];
+      Wants = [ "network-online.target" ];
+    };
+    Service = {
+      Type = "oneshot";
+      Environment = [
+        "PATH=${slackPushPath}"
+        "SSH_AUTH_SOCK=${sshAuthSock}"
+      ];
+      ExecStart = pkgs.writeShellScript "slack-archive-push" ''
+        set -euo pipefail
+        src=${home}/work/helferline/slack
+        # --delete against a missing or empty archive would empty pc's copy.
+        if [ ! -s "$src/slackdump.sqlite" ]; then
+          echo "slack-archive-push: no archive at $src" >&2
+          exit 1
+        fi
+        rsync -a --delete "$src/" pc:work/helferline/slack/
+      '';
+      # oneshot has no start timeout of its own; a push hung on a dead link
+      # would hold every later one back.
+      TimeoutStartSec = "1h";
+    };
   };
 
   # --- Documents → jarvis (read-only mirror for the agent) ---
@@ -1055,41 +1251,6 @@ in
       OnCalendar = "09,21:20:00";
       Persistent = true;
       RandomizedDelaySec = "10m";
-    };
-    Install.WantedBy = [ "timers.target" ];
-  };
-
-  # --- Claude usage-window anchor ---
-  # The 5-hour window starts with your first message, so these pings pin it to a
-  # fixed grid: 08:30 → 13:30 → 18:30 → 23:30. Deliberately no 04:30 ping: it
-  # would open a window running to 09:30 that swallows the 08:30 anchor, and
-  # that anchor is the one that matters — it leaves ~2.5h of window in hand when
-  # the workday starts around 11:00, then a fresh 5h block at 13:30.
-  # 04:30–08:30 is the only gap, and it sits inside sleep.
-
-  systemd.user.services.claude-ping = {
-    Unit = {
-      Description = "Anchor the Claude 5-hour usage window";
-      After = [ "network-online.target" ];
-      Wants = [ "network-online.target" ];
-    };
-    Service = {
-      Type = "oneshot";
-      WorkingDirectory = "/tmp";
-      # ~/.nix-profile/bin ahead of ~/.local/bin: its `claude` is the wrapper
-      # (claude-token.nix), and the ping has to open the profile's own window.
-      Environment = [ "PATH=${home}/.nix-profile/bin:${home}/.local/bin:/usr/local/bin:/usr/bin:/bin" ownLogin ];
-      ExecStart = "${dotfiles}/bin/clawd ping";
-    };
-  };
-
-  systemd.user.timers.claude-ping = {
-    Unit.Description = "Claude window anchor (08:30, then every 5h to 23:30)";
-    Timer = {
-      OnCalendar = "*-*-* 08,13,18,23:30:00";
-      # Laptop: a missed anchor replays once on resume, which is no worse than
-      # the window you would have opened with your first message anyway.
-      Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
   };

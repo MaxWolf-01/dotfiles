@@ -1,6 +1,6 @@
 # Monitoring
 
-Every scheduled job here — backups, syncs, the DNS audit, yapit's nightly
+Every scheduled job here — backups, syncs, the DNS audit, yapit's weekly
 report — writes down what it did. A notification is reserved for something that
 needs a person and will not resolve itself.
 
@@ -38,9 +38,9 @@ Everything that can send one, and where it points:
 | `❌ <unit> - Backup Failed` | `backup/restic_backup.sh` | that run left no snapshot; the message carries restic's own error | the same run is a `fail` line in `~/logs/runs/<unit>.jsonl`, with the path to the error log |
 | `⚠️ <unit> - Integrity Check Failed` | `backup/restic_backup.sh` | `restic check` found damage in the repository; the message, the attachment, and the `check_log` path in the job run log carry restic's full output | `/backup-audit <unit>`, which opens the repo and reports what is broken |
 | `🕸️ <n> overdue: <unit> +<rest>` / `🕸️ <n> expiring: <credential file> +<rest>` / `🕸️ <n> unchecked: <unit> +<rest>` | `bin/overdue-check` | under `Overdue:`, a unit or repo with no successful run inside its bound. Under `Expiring:`, a credential in `creds/env/` near the date its `<NAME>__VALID_UNTIL` gives, a Claude Code setup-token's `CLAUDE__VALID_UNTIL` among them (how near: `overdue-check --help`). Under `Could not check:`, one whose evidence could not be read at all: a repository that answers but cannot be opened, a credential with no date, or an age key still locked after a reboot | overdue: the unit's job run log, then its bound (below). Expiring: the line names the renewal. Could not check: `/backup-audit`, which opens the repositories |
-| `⚠️ Yapit health` / `⚠️ Yapit deps` | `scripts/report.sh` / `scripts/dep-scout.sh` in `~/repos/code/yapit-tts/yapit` | last night's agent found issues, or a dependency needs acting on | the report itself, on the yapit dashboard |
+| `⚠️ Yapit health` | `scripts/report.sh` in `~/repos/code/yapit-tts/yapit` | the week's report found issues | the report itself, on the yapit dashboard |
 | `❌ / ✅ yapit deploy: <commit>` | `scripts/deploy.sh`, run by hand from the yapit repo | a production deploy failed partway, or shipped — deploys are rare and hand-run, so completion mails too | the deploy terminal output and `.deploys.log` in the repo |
-| `✅ / ❌ / ⚠️ instagram-saves: ...` | `secrets/scripts/instagram-saves --record`, hourly on pc | every saved Instagram post is downloaded and the unit can go (`✅`), the run broke (`❌`), or Instagram has refused this IP for a day (`⚠️`, at most one a day) | the job run log, then `ledger.tsv` in `~/data/encrypted/instagram-saves` on pc: one line per attempt, with the reason it ended that way |
+| `✅ / ❌ instagram-saves: ...` | `secrets/scripts/instagram-saves --logged-in --record`, daily on pc | every saved post that needed a login was requested (`✅`, once per export; the timer stays and idles until the next one), or the run broke (`❌`). A refused session mails nothing; a week of runs that download nothing is an overdue mail | the job run log, whose `refused` names the account, then `ledger.tsv` in `~/data/encrypted/instagram-saves` on pc. A dead session is made again with `instagram-saves login <account> --dest ~/data/encrypted/instagram-saves` on pc |
 | `💶 Officebuddy <invoice>: <amount> due <date>` / `⚠️ Officebuddy invoice unreadable: <subject>` | `bin/officebuddy-invoice`, daily on zephylux | not an alarm: a new Officebuddy invoice to pay, with a QR code George scans (`💶`), or one whose PDF could not be read for certain, so it carries no code and is paid by hand (`⚠️`) | the invoice PDF attached to the mail; `⚠️` names the message to `notmuch show` |
 | `❌ memory-test: <host>'s RAM fails, <n> errors` | `bin/memory-test --record`, weekly on pc (`nix/nixos/pc/hardware-alerts.nix`) | `stressapptest` found bits the RAM did not keep: everything the host writes, backups included, may be silently wrong until the RAM is replaced | the failing addresses in the mail; the run in `~/logs/runs/memory-test.jsonl` |
 | `🗄️ ZFS … for <pool> on <host>` / `🗄️ ZFS device fault for pool <pool> on <host>` | zed on pc, through `nix/nixos/pc/hardware-alerts.nix` | ZFS found data errors, a scrub or resilver finished on an unhealthy pool, or a disk faulted, degraded or went missing; at most one per event class an hour | `zpool status -v <pool>` on the host |
@@ -51,7 +51,7 @@ Everything that can send one, and where it points:
 
 Nothing else sends on its own. A green backup, a skipped one, an integrity
 check whose connection dropped under it, a newly blocked domain, an exit node
-rotation, a routine dependency report: job run log and dashboard only. `🔍` in a
+rotation: job run log and dashboard only. `🔍` in a
 yapit title means the report had no readable status line, so the setup could
 not tell whether the agent found anything and says so rather than staying
 quiet.

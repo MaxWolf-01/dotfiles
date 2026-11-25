@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# tier: full-path (nix)
+# Evaluate the flake's real host configs and check what sudo by a YubiKey touch puts in them. Run it directly; no
+# framework.
+#
+# What max relies on: on pc and xmg19 the touch comes before the password and never replaces it, and the keys it
+# takes are only the YubiKeys' sk keys, in a file root owns; from the laptop, the YubiKey agent is forwarded to pc
+# and xmg19, from interactive shells only, and no agent to anywhere else; pc's and xmg19's own ssh config forwards nothing; and both systems build.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+. "$repo/tests/check.sh"
+needs nix jq ssh
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+nix eval --json --impure --expr "
+let
+  f = builtins.getFlake \"git+file://$repo\";
+  server = host: let c = f.nixosConfigurations.\${host}.config; in {
+    sudo = c.security.pam.services.sudo.text;
+    keys = c.environment.etc.\"ssh/sudo-touch/max\";
+    sshConfig = c.home-manager.users.max.home.file.\".ssh/config\".source;
+    blocks = builtins.attrNames c.home-manager.users.max.programs.ssh.settings;
+  };
+  laptop = f.homeConfigurations.zephyrus.config;
+in {
+  pc = server \"pc\";
+  xmg19 = server \"xmg19\";
+  laptop = {
+    sshConfig = laptop.home.file.\".ssh/config\".source;
+    blocks = builtins.attrNames laptop.programs.ssh.settings;
+    zsh = laptop.programs.zsh.initContent;
+  };
+}" >"$scratch/eval.json" 2>"$scratch/err" || { fail "the flake's host configs evaluate" "$(tail -20 "$scratch/err")"; finish; }
+
+for host in pc xmg19; do
+    sudo=$(jq -r ".$host.sudo" "$scratch/eval.json" | grep '^auth ')
+    touches=$(grep 'libpam_rssh\.so' <<<"$sudo")
+    last=$(grep -n 'libpam_rssh\.so' <<<"$sudo" | tail -1 | cut -d: -f1)
+    unix=$(grep -n 'pam_unix\.so' <<<"$sudo" | cut -d: -f1)
+    check "$host: sudo asks for a touch ten times, so max has ten of the key's waits to reach it" 10 "$(grep -c . <<<"$touches")"
+    check "$host: every ask is the same touch" 1 "$(sed 's/ #.*//' <<<"$touches" | sort -u | grep -c .)"
+    check "$host: the touch is sufficient, so the password stays" sufficient "$(cut -d' ' -f2 <<<"$touches" | sort -u)"
+    check "$host: the touch comes before the password" yes "$([ "${last:-0}" -gt 0 ] && [ "$last" -lt "${unix:-0}" ] && echo yes)"
+    keyfile=$(grep -o 'auth_key_file=[^ ]*' <<<"$sudo" | cut -d= -f2 | sort -u)
+    check "$host: the keys are read from the file NixOS writes for the user who ran sudo" '/etc/ssh/sudo-touch/$ruser' "$keyfile"
+    check "$host: that file is a link into the store, which root owns" symlink "$(jq -r ".$host.keys.mode" "$scratch/eval.json")"
+    source=$(jq -r ".$host.keys.source" "$scratch/eval.json")
+    check "$host: it holds the YubiKeys' sk keys and nothing else" "" \
+        "$(grep -vE '^(#|$|sk-ssh-ed25519@openssh\.com )' "$source")"
+    grep -q '^sk-ssh-ed25519@openssh\.com ' "$source" ||
+        skipped "$host: the file holds a key" "none is registered yet (sudo-touch-setup)"
+done
+
+# What the evaluation cannot show: that the systems these settings are part of build.
+for host in pc xmg19; do
+    if nix build --no-link "git+file://$repo#nixosConfigurations.$host.config.system.build.toplevel" 2>"$scratch/err"; then
+        passed "$host's system builds"
+    else
+        fail "$host's system builds" "$(tail -20 "$scratch/err")"
+    fi
+done
+
+# Every block name the config holds, each alias of a block on its own, and a host it does not know.
+forwarding() {
+    local config="$1" blocks="$2" name
+    for name in $(jq -r '.[]' <<<"$blocks" | tr ' ' '\n' | grep -vx '\*') somewhere.example; do
+        echo "$name $(ssh -G -F "$config" "$name" 2>/dev/null | awk '$1 == "forwardagent" { print $2 }')"
+    done | LC_ALL=C sort
+}
+
+laptop=$(forwarding "$(jq -r .laptop.sshConfig "$scratch/eval.json")" "$(jq -c .laptop.blocks "$scratch/eval.json")")
+agent='$SSH_SK_FORWARD'
+check "from the laptop, only pc and xmg19 are forwarded an agent, the one SSH_SK_FORWARD names" \
+    "$(printf '%s\n' "pc $agent" "xmg $agent" "xmg19 $agent")" "$(grep -v ' no$' <<<"$laptop")"
+check "interactive zsh names the YubiKey agent in SSH_SK_FORWARD" \
+    'export SSH_SK_FORWARD="$XDG_RUNTIME_DIR/ssh-sk-agent"' \
+    "$(jq -r .laptop.zsh "$scratch/eval.json" | grep -o 'export SSH_SK_FORWARD=.*')"
+for host in pc xmg19; do
+    check "$host's own ssh config forwards no agent" "" \
+        "$(forwarding "$(jq -r ".$host.sshConfig" "$scratch/eval.json")" "$(jq -c ".$host.blocks" "$scratch/eval.json")" | grep -v ' no$')"
+done
+
+finish

@@ -13,6 +13,7 @@ set -uo pipefail
 job="$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)/job"
 export JOB_STATE_DIR
 JOB_STATE_DIR=$(mktemp -d)
+scratch=$(mktemp -d)
 cleanup() {
     for s in $(tmux list-sessions -F '#S' 2>/dev/null | grep '^job-jt-' || true); do
         tmux kill-session -t "=$s" 2>/dev/null
@@ -23,13 +24,23 @@ cleanup() {
     # So does the tee copying that runner's output to its pane, held open by a
     # command still writing to it; tee ignores TERM, which is for the command.
     pkill -KILL -f "tee -a $JOB_STATE_DIR/" 2>/dev/null
-    rm -rf "$JOB_STATE_DIR"
+    fake_notifications_stop
+    rm -rf "$JOB_STATE_DIR" "$scratch"
 }
 trap cleanup EXIT
 
 . "$(dirname "${BASH_SOURCE[0]}")/check.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/fake-notifications.sh"
 
-needs tmux
+needs tmux jq
+# A --tty job notifies through the repo's own notify, on a stand-in for the desktop's notification service. Only
+# notify joins PATH: the rest of bin/ would change what the other cases run, nosleep for one.
+mkdir -p "$scratch/bin" "$scratch/run"
+ln -s "$(dirname "$job")/notify" "$scratch/bin/notify"
+export PATH="$scratch/bin:$PATH" XDG_RUNTIME_DIR="$scratch/run"
+# The session a job records is its caller's; this test names one where it needs one.
+unset CLAUDE_CODE_SESSION_ID
+fake_notifications_start "$scratch"
 
 # --- the exit code is the outcome
 
@@ -174,15 +185,37 @@ check "a daemon the command started holds no copy of the job's output open" \
 kill "$(cat "$JOB_STATE_DIR/daemon.pid")"
 
 # --tty is for the prompt a human answers: the command reads the pane.
-"$job" run jt-tty --tty -- bash -c '[ -t 0 ] && [ -t 1 ] && echo on-a-terminal; read -r -s -p "passphrase: " pw; echo; echo "read ${#pw} characters"; exit 7' >/dev/null
+CLAUDE_CODE_SESSION_ID=2feeb721-0000-4000-8000-000000000001 "$job" run jt-tty --tty -- bash -c '[ -t 0 ] && [ -t 1 ] && echo on-a-terminal; read -r -s -p "passphrase: " pw; echo; echo "read ${#pw} characters"; exit 7' >/dev/null
 "$job" wait jt-tty --watch 'passphrase:' --deadline 10 --interval 1 >/dev/null
 check "a --tty job shows its prompt" 3 $?
+check "its meta says it is a --tty job of the session that started it" \
+    "tty=1 session=2feeb721-0000-4000-8000-000000000001" \
+    "$(grep -E '^(tty|session)=' "$JOB_STATE_DIR/jt-tty/meta" | paste -sd' ')"
+check "a notification says it waits for max" "job jt-tty waits for you" "$(shown | jq -r .summary)"
+check "naming its command" yes "$(shown | jq -r .body | grep -qF 'read -r -s -p' && echo yes)"
+check "with a button that goes to its tmux session" '{"go":"Go to job-jt-tty"}' "$(shown | jq -c .actions)"
 tmux send-keys -t "=job-jt-tty:" -l hunter2
 tmux send-keys -t "=job-jt-tty:" Enter
 "$job" wait jt-tty --deadline 10 --interval 1 >/dev/null
 check "a --tty job waits to its command's exit" 1 $?
 check "and its status line keeps the command's own code" \
     "7" "$(sed -n 's/.*exit=\([0-9]*\).*/\1/p' "$JOB_STATE_DIR/jt-tty/status")"
+check "and the notification went when it ended" "" "$(shown)"
+check "a job without --tty, started outside a session, says so in its meta" "tty=0 session=" \
+    "$(grep -E '^(tty|session)=' "$JOB_STATE_DIR/jt-ok/meta" | paste -sd' ')"
+
+# A runner that dies without a word takes its notification with it.
+"$job" run jt-tty-killed --tty -- bash -c 'sleep 6133' sk4Hq9ZtW2mV7xLp3RfN8bYc6DgJ1aKe >/dev/null
+await_shown 1 5 || fail "a --tty job that is killed notified first"
+check "a token on its command line is [redacted] in the notification" "bash -c sleep 6133 [redacted]" \
+    "$(shown | jq -r .body)"
+runner=$(sed -n 's/^pid=//p' "$JOB_STATE_DIR/jt-tty-killed/meta")
+left=$(pgrep -P "$runner")
+kill -9 "$runner"
+await_shown 0 5 && passed "the notification goes when the runner is killed" ||
+    fail "the notification goes when the runner is killed"
+# The command outlives its killed runner; it is the test's to end.
+kill $left 2>/dev/null
 check "the command had the pane's terminal and read what was typed into it" \
     "on-a-terminal
 read 7 characters" "$(pane jt-tty | grep -oE '^(on-a-terminal|read [0-9]+ characters)')"

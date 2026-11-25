@@ -346,38 +346,38 @@ in
     };
   };
 
-  # --- Instagram saved posts, logged out ---
-  # Instagram blocks this IP for logged-out requests after a few thousand of
-  # them, so the job stops itself and the next hour picks up what is left; the
-  # ledger beside the downloads decides what that is. The job is finite: its run
-  # log carries `remaining`, and mails once it reaches zero. The downloads live
-  # in the encrypted dataset, and while it is locked every run records a skip.
+  # --- Instagram saved posts that need a login ---
+  # The logged-out download is finished; what is left are the posts it found
+  # unavailable, requested logged in as the account that saved them, from this
+  # host because the sessions were made here. The pace is what keeps the
+  # accounts from being locked: a few minutes per post and a small cap per
+  # account per day. The job is finite and mails once nothing is left; the
+  # accounts are whichever have a session in the archive's sessions/.
 
   systemd.user.services.instagram-saves = {
     Unit = {
-      Description = "Download saved Instagram posts, logged out";
+      Description = "Download saved Instagram posts that need a login, a few a day";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
     Service = {
       Type = "oneshot";
-      # 2 is Instagram refusing this IP and 1 is a post that failed and will be
-      # retried — the expected rhythm, not a broken unit. A run that breaks
-      # outright says so in its run log and by mail.
+      # 2 is a refused session and 1 a post that will be retried; the script
+      # mails the refusal itself, and a run that breaks outright exits 3.
       SuccessExitStatus = "1 2";
       Environment = [
         "PATH=${igSavesPath}"
       ];
-      ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/data/encrypted/instagram-saves/saved.tsv --dest ${home}/data/encrypted/instagram-saves --require-mount ${home}/data/encrypted --record";
+      ExecStart = "${secrets}/scripts/instagram-saves fetch ${home}/data/encrypted/instagram-saves/saved.tsv --dest ${home}/data/encrypted/instagram-saves --require-mount ${home}/data/encrypted --record --logged-in --limit 60 --pause 180 360";
     };
   };
 
   systemd.user.timers.instagram-saves = {
-    Unit.Description = "Hourly resume of the saved-post download";
+    Unit.Description = "Daily batch of the logged-in saved-post download";
     Timer = {
-      OnCalendar = "hourly";
+      OnCalendar = "*-*-* 10:00";
       Persistent = true;
-      RandomizedDelaySec = "10m";
+      RandomizedDelaySec = "2h";
     };
     Install.WantedBy = [ "timers.target" ];
   };

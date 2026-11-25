@@ -21,6 +21,7 @@ page saves by, claude-browser and diffview handing it pages, a hub with no port 
 
 import contextlib
 import fcntl
+import gzip
 import http.client
 import http.server
 import json
@@ -45,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fakes  # noqa: E402  (the hub's module in this process, its clock, and the world it reads)
 from check import BIN, check, finish, free_port, needs, settles, skipped  # noqa: E402
-from fakes import READER, page, served, ticket  # noqa: E402
+from fakes import GZIP, READER, page, served, ticket  # noqa: E402
 
 needs("tmux")
 ORCHESTRATOR = "aaaaaaaa-0000-4000-8000-000000000001"
@@ -122,11 +123,53 @@ try:
 
     # The session's program, standing in for Claude Code: it asks its terminal for bracketed paste as Claude Code
     # does, and records every byte that reaches it, so what arrives is what typing in the pane would have sent. It
-    # shows what it gets, as Claude Code's prompt does, which is what the hub waits on between the pieces of a paste.
+    # shows what it gets in an input box drawn as Claude Code draws its own, which is what the hub waits on between the
+    # pieces of a paste and reads to see an Enter taken. A taken Enter empties the box, ctrl+u too. A second argument
+    # is a draft the box holds from the start.
+    # A path to slow.png it reads as Claude Code reads a large screenshot, its footer showing hub.PASTING meanwhile,
+    # and it records a "!" before any input that reaches it then. An Enter it loses, as Claude Code does one arriving
+    # while it reads an image or still starts, lands in the box as a newline: one arriving during that read, the first
+    # after a text holding "loses one Enter", the first two after "loses two Enters", and every one after "loses every
+    # Enter".
     received = SCRATCH / "received"
     recorder = SCRATCH / "recorder.py"
-    recorder.write_text("import os, sys, tty\ntty.setraw(0)\nos.write(1, b'\\x1b[?2004h')\nout = open(sys.argv[1], 'ab', buffering=0)\n"
-                        "while data := os.read(0, 4096):\n    out.write(data)\n    os.write(1, data.replace(b'\\x1b', b''))\n")
+    recorder.write_text(f"""\
+import os, select, sys, time, tty
+tty.setraw(0)
+os.write(1, b'\\x1b[?2004h')
+out = open(sys.argv[1], 'ab', buffering=0)
+line, pasting, reading, lost = (sys.argv[2] if len(sys.argv) > 2 else '').encode(), False, 0.0, 0
+def draw():
+    rule = '\\u2500' * 40
+    box = ('\\u276f ' + line.decode(errors='replace')).replace('\\r', '\\r\\n  ')
+    os.write(1, ('\\x1b[2J\\x1b[H' + rule + '\\r\\n' + box + '\\r\\n' + rule + ('\\r\\n' + {hub.PASTING!r} if reading else '')).encode())
+draw()
+while True:
+    if reading and not select.select([0], [], [], max(0.0, reading - time.monotonic()))[0]:
+        reading = 0.0
+        draw()
+        continue
+    if not (data := os.read(0, 4096)):
+        break
+    out.write(b'!' * bool(reading) + data)
+    if b'slow.png' in data:
+        reading = time.monotonic() + 3 * {hub.SETTLED}
+    while data:
+        mark = next((m for m in (b'\\x1b[200~', b'\\x1b[201~') if data.startswith(m)), None)
+        if mark:
+            pasting, data = mark == b'\\x1b[200~', data[len(mark):]
+            continue
+        key, data = data[:1], data[1:]
+        if key == b'\\x15':
+            line, lost = b'', 0
+        elif key != b'\\r' or pasting:
+            line += key
+        elif reading or b'loses every Enter' in line or b'loses one Enter' in line and not lost or b'loses two Enters' in line and lost < 2:
+            line, lost = line + b'\\r', lost + 1
+        else:
+            line, lost = b'', 0
+    draw()
+""")
     tmux = lambda *args: subprocess.run([TMUX, "-S", TMUX_SOCKET, *args], env=ENV, capture_output=True, text=True, check=True).stdout.strip()
     # no config: the user's own would load plugins whose tmux calls name no socket
     tmux("-f", "/dev/null", "new-session", "-d", "-s", "answering", "-x", "100", "-y", "20", shlex.join(["exec", sys.executable, str(recorder), str(received)]))
@@ -167,6 +210,38 @@ try:
               (200, True, b"\x1b[200~/drops/a.png\x1b[201~\r"),
               (status_code, time.monotonic() - began >= hub.SETTLED, arrives(b"\x1b[200~/drops/a.png\x1b[201~\r")))
         received.write_bytes(b"")
+        check("an image Claude Code is still reading, PASTING on screen for longer than the pane takes to settle, gets "
+              "its Enter once it is read", (200, b"\x1b[200~/drops/slow.png\x1b[201~\r"),
+              (typed("/drops/slow.png")[0], arrives(b"\x1b[200~/drops/slow.png\x1b[201~\r")))
+        received.write_bytes(b"")
+        check("an Enter the session loses, its text still in its box, is pressed once more, and the text sent",
+              (200, b"\x1b[200~this loses one Enter\x1b[201~\r\r"),
+              (typed("this loses one Enter")[0], arrives(b"\x1b[200~this loses one Enter\x1b[201~\r\r")))
+        received.write_bytes(b"")
+        status_code, answer = typed("this loses two Enters")
+        check("a text the session still holds after the second Enter is said not to be sent, stuck, and no third Enter goes",
+              (502, True, True, b"\x1b[200~this loses two Enters\x1b[201~\r\r"),
+              (status_code, answer.get("stuck"), "pressed 2 time(s)" in answer.get("error", ""),
+               arrives(b"\x1b[200~this loses two Enters\x1b[201~\r\r")))
+        entered = lambda: hub.enter_into({"unit": ANSWERER})
+        check("...an Enter asked for after it is pressed, and sends it", (200, b"\x1b[200~this loses two Enters\x1b[201~\r\r\r"),
+              (entered()[0], arrives(b"\x1b[200~this loses two Enters\x1b[201~\r\r\r")))
+        received.write_bytes(b"")
+        status_code, answer = entered()
+        check("an Enter asked for where the session's box holds nothing is refused, unpressed, and nothing is stuck",
+              (409, False, b""), (status_code, answer.get("stuck", False), arrives(b"")))
+        in_pane("busy", tmux=f"answering:@0.{pane}")  # a turn runs, which may have opened a permission prompt since
+        status_code, answer = typed("this loses every Enter")
+        check("a session no longer idle gets no second Enter, whatever its box holds",
+              (502, True, b"\x1b[200~this loses every Enter\x1b[201~\r"),
+              (status_code, "pressed 1 time(s)" in answer.get("error", ""), arrives(b"\x1b[200~this loses every Enter\x1b[201~\r")))
+        status_code, answer = entered()
+        check("...nor an Enter asked for, the text still stuck", (409, True, b"\x1b[200~this loses every Enter\x1b[201~\r"),
+              (status_code, answer.get("stuck"), arrives(b"\x1b[200~this loses every Enter\x1b[201~\r")))
+        in_pane(tmux=f"answering:@0.{pane}")
+        tmux("send-keys", "-t", pane, "C-u")
+        arrives(b"\x1b[200~this loses every Enter\x1b[201~\r\x15")
+        received.write_bytes(b"")
         check("nothing but whitespace is not sent", 400, typed(" \n ")[0])
         tmux("copy-mode", "-t", pane)  # scrolled up in, where copy mode would take the Enter
         check("a pane in copy mode leaves it, and the session gets the paste and the Enter", (200, b"\x1b[200~go on\x1b[201~\r", "0"),
@@ -191,15 +266,13 @@ try:
         check("a pane that does not hold the session's process is sent nothing", (409, True, b""),
               (status_code, "no longer holds" in answer.get("error", ""), arrives(b"")))
         # --- hub-reloads-mx: /reload-plugins typed into a session whose input box is empty, and only there. Each pane
-        # draws Claude Code's input box, between its two rules, then runs the recorder.
+        # runs the recorder, its input box holding the draft given.
         page(HOME / ".claude" / "plugins" / "installed_plugins.json", json.dumps({"plugins": {"mx@MaxWolf-01": [{"version": "1.0.55"}]}}))
-        rule = "─" * 30
         reloads = {}
-        for session, line in ((ORCHESTRATOR, "❯ "), (WORKER, "❯ half a thought")):
+        for session, draft in ((ORCHESTRATOR, ""), (WORKER, "half a thought")):
             got = SCRATCH / f"received-{session[:8]}"
-            drawn = f'printf "%s\\n%s\\n%s\\n" {shlex.quote(rule)} {shlex.quote(line)} {shlex.quote(rule)}'
             tmux("new-session", "-d", "-s", session[:8], "-x", "100", "-y", "20",
-                 f"sh -c {shlex.quote(drawn + '; exec ' + shlex.join([sys.executable, str(recorder), str(got)]))}")
+                 shlex.join(["exec", sys.executable, str(recorder), str(got), draft]))
             box_pane, box_pid = tmux("display-message", "-p", "-t", f"{session[:8]}:", "#{pane_id} #{pane_pid}").split()
             deadline = time.monotonic() + 10
             while not (got.exists() and "❯" in tmux("capture-pane", "-p", "-t", box_pane)) and time.monotonic() < deadline:
@@ -212,7 +285,7 @@ try:
         check("a session due a newer mx, its input box empty, has /reload-plugins typed in, and the hub says so",
               ("1.0.55", True, b"\x1b[200~/reload-plugins\x1b[201~\r"),
               (reloads[ORCHESTRATOR][0], "typed /reload-plugins" in reloads[ORCHESTRATOR][1], reloads[ORCHESTRATOR][2].read_bytes()))
-        check("...one with a draft in its box has nothing typed, and is reloaded at a later look",
+        check("...one with a draft in its box has nothing typed, and is reloaded once its registry next changes",
               ("1.0.55", "", b"", {ORCHESTRATOR: "1.0.55"}),
               (reloads[WORKER][0], reloads[WORKER][1], reloads[WORKER][2].read_bytes(), hub.RELOADED))
         registered(ORCHESTRATOR)
@@ -536,13 +609,14 @@ while data := os.read(0, 4096):
     # window of the tmux session `hub`, Claude Code typed into its shell
 
     # Claude Code's stand-in, on the PATH of the panes' shells: it registers under the id it is given, as Claude Code
-    # does, idle in its pane unless `registers` says otherwise, that it does not register, or that it exits at once; records its
-    # arguments, account and directory, and every byte typed into it once it runs. A person's session, as the hub
+    # does, idle in its pane unless `registers` says otherwise, that it does not register, that it exits at once, or that it
+    # spends `starting` seconds registered with no status; records its arguments, account and directory, and every byte
+    # typed into it once it runs, after a "!" where some were typed before. A person's session, as the hub
     # sees one started under max's own login: run inside a dispatched worker, it sheds the worker's DISPATCH_WORKLOG.
     fake_bin, launched, typed_after, registers = SCRATCH / "fake-bin", SCRATCH / "launched", SCRATCH / "typed-after", SCRATCH / "registers"
     fake_bin.mkdir()
     (fake_bin / "claude").write_text(f"""#!{sys.executable}
-import json, os, sys, tty
+import json, os, select, sys, time, tty
 if "DISPATCH_WORKLOG" in os.environ:
     os.execve(sys.argv[0], sys.argv, {{k: v for k, v in os.environ.items() if k != "DISPATCH_WORKLOG"}})
 args = sys.argv[1:]
@@ -552,16 +626,22 @@ with open({str(launched)!r}, "a") as f:
 change = json.load(open({str(registers)!r})) if os.path.exists({str(registers)!r}) else {{}}
 if change == "exit":  # Claude Code failing at its start, before it registers
     sys.exit(1)
+tty.setraw(0)
 if change is not None:
     started = open(f"/proc/{{os.getpid()}}/stat").read().rsplit(")", 1)[1].split()[19]
+    starting = change.pop("starting", 0)
     entry = {{"pid": os.getpid(), "procStart": started, "kind": "interactive", "cwd": os.getcwd(), "status": "idle",
              "sessionId": args[args.index("--session-id" if "--session-id" in args else "--resume") + 1],
              "tmux": "hub:@0." + os.environ["TMUX_PANE"], **change}}
     os.makedirs(account + "/sessions", exist_ok=True)
+    if starting:  # registered with no status, its prompt not yet taking input, as Claude Code starts
+        open(f"{{account}}/sessions/{{os.getpid()}}.json", "w").write(json.dumps({{k: v for k, v in entry.items() if k != "status"}}))
+        time.sleep(starting)
     open(f"{{account}}/sessions/{{os.getpid()}}.json", "w").write(json.dumps(entry))
-tty.setraw(0)
 os.write(1, b"\\x1b[?2004h")
 out = open({str(typed_after)!r}, "ab", buffering=0)
+if select.select([0], [], [], 0)[0]:  # typed before its prompt took input
+    out.write(b"!")
 while data := os.read(0, 4096):
     out.write(data)
     os.write(1, data.replace(b"\\x1b", b""))
@@ -708,6 +788,11 @@ while data := os.read(0, 4096):
         check("a session that starts blocked in its terminal is a unit, but takes no first prompt, the box saying why",
               (409, "waiting", True, b""), (status_code, (view(answer.get("unit") or "") or {}).get("state"),
                                             "dialog open" in answer.get("error", ""), reached(b"")))
+        registers.write_text(json.dumps({"starting": 1.0}))
+        typed_after.unlink(missing_ok=True)
+        status_code, answer = hub.start({"project": str(alpha), "prompt": "go"})
+        check("a session registered with no status yet, still starting, takes its first prompt only once it is idle",
+              (200, b"\x1b[200~go\x1b[201~\r"), (status_code, reached(b"\x1b[200~go\x1b[201~\r")))
         registers.unlink()
     finally:
         stop_tmux()
@@ -901,7 +986,7 @@ while data := os.read(0, 4096):
     check("a request for another Host is refused", 403, request("GET", member_url, headers={"Host": "attacker.example:80"})[0])
     bare = socket.create_connection(("127.0.0.1", PORT), timeout=10)
     bare.sendall(b"GET /.health HTTP/1.0\r\n\r\n")
-    check("a request that names no Host is refused", b"HTTP/1.0 403", bare.recv(4096)[:12])
+    check("a request that names no Host is refused", b" 403 ", bare.recv(4096)[8:13])
     bare.close()
     check("a write for another Host is refused", 403,
           request("POST", "/api/open", {"target": str(note)}, {"Host": "attacker.example:80", "Origin": ORIGIN})[0])
@@ -923,11 +1008,11 @@ while data := os.read(0, 4096):
             time.sleep(0.05)
         registered(ANSWERER, pid=int(pane_pid), started=start_of(pane_pid), tmux=f"guarded:@0.{pane}")
         TMUX_CALLS.write_text("")
-        acting = [("/api/type", {"unit": ANSWERER, "text": "rm -rf ~"}), ("/api/jump", {"unit": ANSWERER}),
+        acting = [("/api/type", {"unit": ANSWERER, "text": "rm -rf ~"}), ("/api/enter", {"unit": ANSWERER}), ("/api/jump", {"unit": ANSWERER}),
                   ("/api/close-panes", {"unit": ANSWERER}), ("/api/hand-off", {"unit": ANSWERER, "offer": "write"}),
                   ("/api/start", {"project": str(alpha)}), ("/api/resume", {"unit": STRANGER})]
-        check("a page the hub serves can neither type, jump, close, hand off, start nor resume without the tab's token, the "
-              "session idle in its pane", ([403] * 12, set(), b"", True),
+        check("a page the hub serves can neither type, press Enter, jump, close, hand off, start nor resume without the tab's "
+              "token, the session idle in its pane", ([403] * 14, set(), b"", True),
               ([request("POST", route, body, {"Origin": ORIGIN, "X-Hub-Token": t})[0] for route, body in acting for t in ("", "guessed")],
                acted(), arrives(b""), pane in tmux("list-panes", "-a", "-F", "#{pane_id}").split()))
         check("...which the tab's token types into", (200, b"\x1b[200~go on\x1b[201~\r"),
@@ -942,6 +1027,35 @@ while data := os.read(0, 4096):
           (lambda r: (r[0], r[1].get("path", "").startswith(str(HOME / ".cache/container-hub/drops" / ANSWERER))))(dropped(ANSWERER)))
     check("a dropped file over the size cap is refused before it is read", 413,
           announced(f"/api/drop?unit={ANSWERER}&name=huge.png", {"Origin": ORIGIN, "X-Hub-Token": token, "Content-Length": str(200 * 2**20 + 1)}))
+    # work-through-what-waits-one-item-at-a-time#P2: what the user staged on a session page's items outlives the tab
+    staged = lambda body, t=token: request("POST", "/api/staged", body, {"Origin": ORIGIN, "X-Hub-Token": t})
+    kept = {"staged": {"Q13": {"pick": "a", "note": "after Friday's deploy"}, "A1": {"act": "done"}}, "seen": ["agent/show/x/index.html"], "sent": {}}
+    check("a page the hub serves can neither read nor keep what the user staged without the tab's token", (403, 403),
+          (staged({"unit": ANSWERER}, "")[0], staged({"unit": ANSWERER, "staged": kept}, "guessed")[0]))
+    check("what the tab stages on a session's items is kept in --state as a file of the session's, and read back as written",
+          ((200, {"ok": True}), True, (200, {"staged": kept})),
+          (staged({"unit": ANSWERER, "staged": kept}), (hub.STATE / "staged" / f"{ANSWERER}.json").is_file(), staged({"unit": ANSWERER})))
+    check("...and once dropped, none is kept", ((200, {"ok": True}), (200, {"staged": None})),
+          (staged({"unit": ANSWERER, "staged": None}), staged({"unit": ANSWERER})))
+    check("...and something other than an object is refused", 400, staged({"unit": ANSWERER, "staged": "Q13: a"})[0])
+    check("...as is a unit the hub does not hold, and the loose pages, which have no session", (404, 404),
+          (staged({"unit": "99999999-0000-4000-8000-000000000099", "staged": kept})[0], staged({"unit": "loose"})[0]))
+    # the words in a box, as any browser open on the session reads them
+    draft = lambda body, t=token: request("POST", "/api/draft", body, {"Origin": ORIGIN, "X-Hub-Token": t})
+    words = "half a thought about Friday"
+    check("a page the hub serves can neither read nor keep the words in a box without the tab's token", (403, 403),
+          (draft({"unit": ANSWERER}, "")[0], draft({"unit": ANSWERER, "draft": words}, "guessed")[0]))
+    told = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
+    check("the hub keeps the words in a box and reads them back", ((200, {"ok": True}), (200, {"draft": words})),
+          (draft({"unit": ANSWERER, "draft": words, "by": "tab-1"}), draft({"unit": ANSWERER})))
+    while not (line := told.readline().decode()).startswith("data:") or json.loads(line[5:])["type"] != "under-way":
+        pass
+    told.close()
+    check("...every tab is told which unit's words changed and by whom, the stream any served page reads carrying none of them",
+          {"type": "under-way", "kind": "draft", "unit": ANSWERER, "by": "tab-1"}, json.loads(line[5:]))
+    check("...and an empty box keeps nothing", ((200, {"ok": True}), (200, {"draft": None}), False),
+          (draft({"unit": ANSWERER, "draft": ""}), draft({"unit": ANSWERER}), (hub.STATE / "draft" / f"{ANSWERER}.json").exists()))
+    check("...and words that are no string are refused", 400, draft({"unit": ANSWERER, "draft": {"text": words}})[0])
 
     # --- what /f/ serves: the agent directories, the files git tracks around them, and what was opened or shared
 
@@ -1040,13 +1154,73 @@ while data := os.read(0, 4096):
     trellis_cache = HOME / ".cache/container-hub" / ("trellis-" + re.search(r'TRELLIS_VERSION = "(.+)"', (BIN / "container-hub").read_text())[1])
     trellis_cache.mkdir(parents=True, exist_ok=True)
     (trellis_cache / "style.css").write_text("body { background: url(https://attacker.example/x) }")
-    status_code, body = request("GET", "/static/trellis/style.css")
+    trellis_path = "/static/trellis/" + trellis_cache.name.removeprefix("trellis-")
+    status_code, body = request("GET", trellis_path + "/style.css")
     check("a cached trellis file that differs from its pin is refused", 502, status_code)
     check("...naming the file", True, b"style.css does not match its pinned sha256" in body)
     check("...on the hub's stderr too", True, "style.css does not match its pinned sha256" in (SCRATCH / "hub.log").read_text())
     check("...and left in place rather than fetched over", "body { background: url(https://attacker.example/x) }",
           (trellis_cache / "style.css").read_text())
     (trellis_cache / "style.css").unlink()
+
+    # --- compressed, and cached until it changes: what the phone fetches over its slow link
+
+    fetched = lambda path, headers=None: fakes.request(PORT, "GET", path, headers=headers, raw=True)
+    fast = alpha / "agent/show/fast-phone"
+    kinds = {  # the kind of text, and a body big enough that gzip shrinks it
+        "a session page": served(page(fast / "index.html", "<!doctype html><h1>turns</h1>" + "<p>a turn of the session</p>\n" * 400)),
+        "its script": served(page(fast / "tool-calls.js", "const calls = [" + '{"tool": "Bash", "ok": true},\n' * 400 + "];\n")),
+        "a stylesheet": served(page(fast / "page.css", "p { margin: 0 }\n" * 400)),
+        "markdown": served(page(fast / "report.md", "## Comments\n\n" + "- a line of the report\n" * 400)),
+        "an SVG": served(page(fast / "figure.svg", '<svg xmlns="http://www.w3.org/2000/svg">' + '<rect width="1" height="1"/>' * 400 + "</svg>")),
+        "JSON on disk": served(page(fast / "numbers.json", json.dumps([{"n": n} for n in range(400)]))),
+        "the hub tab": "/",
+        "the rail's index": "/api/hub",
+    }
+    answers = {kind: (fetched(url), fetched(url, GZIP)) for kind, url in kinds.items()}
+    check("each kind of text goes gzipped to a client that takes gzip, and as it is to one that does not",
+          {kind: (200, None, "gzip") for kind in kinds},
+          {kind: (zipped[0], plain[1]["Content-Encoding"], zipped[1]["Content-Encoding"]) for kind, (plain, zipped) in answers.items()})
+    check("...and decoded, it is what the client that does not take gzip was sent", {kind: True for kind in kinds},
+          {kind: gzip.decompress(zipped[2]) == plain[2] for kind, (plain, zipped) in answers.items()})
+    check("...less than half its size", {kind: True for kind in kinds},
+          {kind: len(zipped[2]) < len(plain[2]) / 2 for kind, (plain, zipped) in answers.items()})
+    check("...and each says the encoding it is sent in depends on the client's Accept-Encoding", {kind: "Accept-Encoding" for kind in kinds},
+          {kind: zipped[1]["Vary"] for kind, (_, zipped) in answers.items()})
+    png = fast / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(4000))
+    check("an image that is no SVG goes as it is, gzip or not", None, fetched(served(png), GZIP)[1]["Content-Encoding"])
+
+    session_page = kinds["a session page"]
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
+    conn.request("GET", session_page)
+    answer = conn.getresponse()
+    check("the hub answers in HTTP/1.1, whose ETag alone Chromium revalidates by, one request to a connection", (11, "close"),
+          (answer.version, answer.headers["Connection"]))
+    conn.close()
+    status_code, got, _ = fetched(session_page, GZIP)
+    tag = got["ETag"]
+    check("a file is the browser's to keep, asking again on every use whether it changed", (200, "no-cache", True),
+          (status_code, got["Cache-Control"], bool(tag)))
+    status_code, again, body = fetched(session_page, {**GZIP, "If-None-Match": tag})
+    check("...and asked again unchanged, it costs no body: a 304", (304, b"", tag), (status_code, body, again["ETag"]))
+    check("...as does the page's script, the hub tab and the rail's index", {k: 304 for k in ("its script", "the hub tab", "the rail's index")},
+          {k: fetched(kinds[k], {"If-None-Match": answers[k][0][1]["ETag"]})[0] for k in ("its script", "the hub tab", "the rail's index")})
+    (fast / "index.html").write_text("<!doctype html><h1>turns</h1><p>a turn written since</p>")
+    status_code, _, body = fetched(session_page, {"If-None-Match": tag})
+    check("...while asked after it changed, it is the new page", (200, True), (status_code, b"a turn written since" in body))
+    check("an answer that is no page goes uncached: a missing file", "no-store", fetched(served(fast / "gone.html"))[1]["Cache-Control"])
+
+    tab = fetched("/")[2].decode()
+    check("the hub tab loads trellis from the address of the version the hub pins", [trellis_path + "/style.css", trellis_path + "/index.js"],
+          re.findall(r'"(/static/trellis/[^"]+)"', tab))
+    status_code, got, body = fetched(trellis_path + "/index.js", GZIP)
+    if status_code == 502 and b"curl" in body:
+        skipped("a trellis file kept for good", "trellis could not be fetched from its CDN")
+    else:
+        check("...where each file is the browser's to keep for good, a new version being a new address", (200, "public, max-age=31536000, immutable", "gzip"),
+              (status_code, got["Cache-Control"], got["Content-Encoding"]))
+    check("...and no other version is served", 404, fetched("/static/trellis/0.0.1/index.js")[0])
 
     # --- the state-write protocol a diffview page saves its comments by: a page writes its state whole, so a second
     # page on the same review would erase the first; the hub takes writes from the page that owns the file, and
@@ -1132,8 +1306,11 @@ while data := os.read(0, 4096):
 
     # --- the event stream: what a listening hub tab hears
 
-    events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
-    events.readline()
+    events = urllib.request.urlopen(urllib.request.Request(f"{ORIGIN}/events", headers=GZIP), timeout=10)
+    check("the event stream goes uncompressed and uncached to a client that takes gzip, so an event reaches it at once",
+          (None, "no-store"), (events.headers["Content-Encoding"], events.headers["Cache-Control"]))
+    while not events.readline().startswith(b"data:"):  # the event it opens with, naming the pages' code
+        pass
     again = open_page(alpha / "agent/show/csv-import/index.html", WORKER)
     while not (line := events.readline().decode()).startswith("data:"):
         pass
@@ -1166,7 +1343,7 @@ while data := os.read(0, 4096):
     events.close()
     events = urllib.request.urlopen(f"{ORIGIN}/events", timeout=10)
     events.readline()
-    statusline(WORKER, clock.now + 1, context=(43, 86000), five_hour=(31, clock.now + 3600), seven_day=(12, clock.now + 3 * 86400))
+    statusline(WORKER, clock.now + 1, context=(43, 86000), seven_day=(12, clock.now + 3 * 86400))
     heard = None
     while heard not in ("numbers", "disk"):
         if (line := events.readline().decode()).startswith("data:"):
@@ -1201,7 +1378,8 @@ while data := os.read(0, 4096):
             heard += [line] if line.startswith("data:") else []
     stream.close()  # the socket stays open while the response holds it, and a tab listening would launch none
     quiet.close()
-    check("a hub tab that starts listening hears nothing while nothing changes", [], heard)
+    check("a hub tab that starts listening hears nothing while nothing changes, after the code it opens with", ["code"],
+          [json.loads(line[5:])["type"] for line in heard])
 
     # --- claude-browser with a hub
 
@@ -1218,13 +1396,14 @@ while data := os.read(0, 4096):
     local_state.parent.mkdir(parents=True)
     local_state.write_text(json.dumps({"profile": {"info_cache": {"Default": {"name": "Personal"}}}}))
 
-    def browse(*args: str, cwd: Path = gamma, hub_socket: Path | None = None, **sessions: str) -> list[str]:
-        """What claude-browser handed the browser; what it said on the way is in browse.said. It finds the hub on the
-        socket the test's hub takes by default, under HOME, unless given another."""
+    def browse(*args: str, cwd: Path = gamma, hub_socket: Path | None = None, check: bool = True, **sessions: str) -> list[str]:
+        """What claude-browser handed the browser; what it said on the way is in browse.said, its exit code in
+        browse.code. It finds the hub on the socket the test's hub takes by default, under HOME, unless given another."""
         record.unlink(missing_ok=True)
-        browse.said = subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=True, capture_output=True, timeout=30, text=True,
-                                     env={**ENV, **({"CONTAINER_HUB_SOCKET": str(hub_socket)} if hub_socket else {}),
-                                          "CLAUDE_CODE_SESSION_ID": WORKER, **sessions, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"}).stderr
+        run = subprocess.run([BIN / "claude-browser", *args], cwd=cwd, check=check, capture_output=True, timeout=30, text=True,
+                             env={**ENV, **({"CONTAINER_HUB_SOCKET": str(hub_socket)} if hub_socket else {}),
+                                  "CLAUDE_CODE_SESSION_ID": WORKER, **sessions, "PATH": f"{stubs}:{BIN}:{ENV['PATH']}"})
+        browse.said, browse.code = run.stderr, run.returncode
         return record.read_text().splitlines() if record.exists() else []
 
     fresh = page(gamma / "agent/show/one-flow/figure.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
@@ -1281,9 +1460,9 @@ while data := os.read(0, 4096):
           "--lane" in usage_text and all(lane in usage_text for lane in ("session", "concept", "output", "code")))
     check("the hub's own pages open as tabs, not members", [ORIGIN + "/"], browse(ORIGIN + "/")[1:])
     check("...so no unit holds them", False, any(m["url"] in ("/", ORIGIN + "/") for m in every_member()))
-    missing = "agent/show/one-flow/never-written.html"
-    check("a page the hub refuses opens as a plain tab", ["--profile-directory=Default", missing], browse(missing))
-    check("...and claude-browser says why", True, "refused the page (404" in browse.said and "does not exist" in browse.said)
+    for missing in ("agent/show/one-flow/never-written.html", "agent/show/one-flow/turn-01:23:29.html"):
+        check(f"claude-browser given a file that does not exist ({missing}) fails, names the path it looked at, and opens nothing",
+              ([], 1, f"claude-browser: no file at {gamma}/{missing}, so nothing opens\n"), (browse(missing, check=False), browse.code, browse.said))
 
     class NotAHub(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
@@ -1552,7 +1731,7 @@ while data := os.read(0, 4096):
 
     new_bin, fake = SCRATCH / "new-bin", SCRATCH / "fake-tmux"
     new_bin.mkdir()
-    for name in ("container-hub", "container-hub.html", "diffview"):
+    for name in ("container-hub", "container-hub.html", "diffview", "diffview.html"):
         shutil.copy2(BIN / name, new_bin / name)
     (fake / "bin").mkdir(parents=True)
     (fake / "bin/tmux").write_text(f"""#!/usr/bin/env bash
@@ -1599,6 +1778,12 @@ esac
     def connected(stream) -> bool:
         return any(b"connected" in stream.readline() for _ in range(2))
 
+    def opened_with(stream) -> dict:
+        """The event a stream opens with, once it said it is connected."""
+        while not (line := stream.readline()).startswith(b"data:"):
+            pass
+        return json.loads(line[5:])
+
     def ends(stream, within: float) -> bool:
         deadline = time.monotonic() + within
         while (line := stream.readline()) and time.monotonic() < deadline:
@@ -1628,6 +1813,50 @@ esac
         check("...and on the socket it had, as well as its port, so a tool asking meanwhile waits rather than finds none",
               (200, {"saves": True, "new": True}, bound),
               (*over_socket("GET", "/.health", hub_socket=new_socket), new_socket.stat().st_ino))
+        # --- hub-pages-reload-on-new-code: the version of the pages' code rides on each stream's open
+        events = urllib.request.urlopen(f"{new_origin}/events", timeout=30)
+        connected(events)
+        before = opened_with(events)
+        check("each event stream opens naming the code a hub tab and a diffview page are served now", ("code", True, True),
+              (before["type"], bool(before["hub"]), bool(before["diffview"])))
+        with urllib.request.urlopen(f"{new_origin}/events/pages", timeout=30) as pages_stream:
+            connected(pages_stream)
+            check("...a diffview page's stream of its own too", before, opened_with(pages_stream))
+        served = lambda: request("GET", "/f" + urllib.parse.quote(str(code_diff)), origin=new_origin)[1]
+        runs = lambda page: re.search(rb'<meta name="diffview-code" content="(\w+)">', page)[1].decode()
+        check("...the versions the hub tab and a diffview page carry, as they are served",
+              (before["hub"], before["diffview"]),
+              (re.search(rb'const CODE = "(\w+)"', request("GET", "/", origin=new_origin)[1])[1].decode(), runs(served())))
+        hljs_at = b'<div id="toast"></div>\n<script>'
+        carried = lambda page: page.split(hljs_at, 1)[1].split(b"</script>", 1)[0]
+        code_diff.write_bytes(code_diff.read_bytes().replace(hljs_at, hljs_at + b"/* the page's own */", 1))
+        on_disk = code_diff.read_bytes()
+        template = (new_bin / "diffview.html").read_text()
+        pages_stream = urllib.request.urlopen(f"{new_origin}/events/pages", timeout=30)
+        connected(pages_stream)
+        opened_with(pages_stream)
+        (new_bin / "diffview.html").write_text(template.replace("<head>", "<head>\n<!-- new code -->", 1))
+        after = opened_with(events)
+        check("diffview.html changing on disk is told to an open stream, naming diffview's new code and the hub tab's code "
+              "as it was", ("code", before["hub"], True), (after["type"], after["hub"], after["diffview"] != before["diffview"]))
+        check("...a diffview page's stream of its own too", after, opened_with(pages_stream))
+        pages_stream.close()
+        check("...by the hub running on, its own code unchanged", (serving, (200, {"saves": True, "new": True})),
+              (server_of(new_hub), request("GET", "/.health", origin=new_origin)))
+        page = served()
+        check("a diffview page rendered before is served on the template on disk, its data with it",
+              (True, after["diffview"], True), (b"<!-- new code -->" in page, runs(page), json.dumps(str(code_diff.resolve())).encode() in page))
+        check("...its file left as it was", on_disk, code_diff.read_bytes())
+        check("...and the highlight.js it carries, which the hub does not fetch again", carried(on_disk), carried(page))
+        (new_bin / "container-hub.html").write_text((new_bin / "container-hub.html").read_text() + "<!-- new code -->\n")
+        last = opened_with(events)
+        check("container-hub.html changing on disk is told to an open stream, naming the hub tab's new code and "
+              "diffview's as it was", (True, after["diffview"]), (last["hub"] != after["hub"], last["diffview"]))
+        events.close()
+        events = urllib.request.urlopen(f"{new_origin}/events", timeout=30)
+        connected(events)
+        check("...and a stream opened since opens naming it", last, opened_with(events))
+        events.close()
         (new_bin / "container-hub").write_text(script + "\ndef half_written(\n")
         time.sleep(4)  # a watch round, and the wait for a whole file, twice over
         check("a script that does not compile leaves the hub on the code it runs", (None, (200, {"saves": True, "new": True})),

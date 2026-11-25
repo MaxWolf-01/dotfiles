@@ -3,18 +3,28 @@
 # requires-python = ">=3.11"
 # dependencies = ["tyro", "wa-crypt-tools"]
 # ///
-"""Print a WhatsApp chat as plain text, read from the phone's own encrypted backup.
+"""Print a WhatsApp chat as plain text, read from the laptop's mirror of the phone's own encrypted backup.
 
-Each run copies the newest full backup (msgstore.db.crypt15) from the phone over
-the ssh alias phone, decrypts it with the 64-digit key in
-secrets/creds/raw/whatsapp-backup-key, and reads the chat from it. The encrypted
-copy stays in ~/.cache/whatsapp-chat; the decrypted database lives only in
-XDG_RUNTIME_DIR, which is RAM, and is rebuilt when a newer backup arrives. When
-the phone does not answer, the cached backup is read.
+The mirror is ~/data/whatsapp: msgstore.db, the newest full backup decrypted with the
+daily increments the phone wrote since merged into it, and names.json, what each
+person, group, message type and kind of chat is called, which lifelog's whatsapp view
+reads beside it on the laptop and in Jarvis's container. Each run first brings the
+mirror up to date: it copies the newest full backup (msgstore.db.crypt15) and its
+increments (msgstore-increment-<n>.db.crypt15) from the phone over the ssh alias
+phone into ~/.cache/whatsapp-chat, decrypts them with the 64-digit key in
+secrets/creds/raw/whatsapp-backup-key when the newest of them is newer than the
+mirror's copy, and rewrites names.json only when what it holds changed. When the
+phone does not answer, the cached backup is read; when the mirror cannot be brought
+up to date, list and show read it as it was. `mirror` does that alone, for the timer that keeps the
+mirror current, and also copies the phone's voice notes, yours and theirs, which the
+backup does not hold, into ~/data/whatsapp/Media/WhatsApp Voice Notes: the path a voice
+note's message_media.file_path names, from the mirror's root. A voice note gone from the
+phone stays in the mirror. The key never leaves the laptop.
 
-Messages are as recent as the phone's last full backup, whose time goes to stderr
-on every run. Newer daily increments on the phone are not read; stderr says when
-there are some.
+Messages are as recent as the phone's last increment, or its last full backup where
+none followed it, whose time goes to stderr on every run. An increment holds less than
+a full backup: a message's time to the second, no transcript of a new voice note, no
+calls and no HD copy of a photo; the next full backup brings them in.
 
 Names come from the phone's address book where Termux:API answers
 termux-contact-list over that ssh, else from the name a person set in WhatsApp,
@@ -27,15 +37,19 @@ Examples:
     whatsapp-chat show anna --last 50
     whatsapp-chat show 175 --since 7d
     whatsapp-chat show "Adventure Hikers" --since 2026-10-01 --offline
+    whatsapp-chat mirror --record
 """
 
+import io
 import json
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import zipfile
 import zlib
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -44,11 +58,17 @@ from typing import Annotated
 import tyro
 
 PHONE = "phone"
-PHONE_DIR = "storage/shared/Android/media/com.whatsapp/WhatsApp/Databases"
+WHATSAPP = "storage/shared/Android/media/com.whatsapp/WhatsApp"
+PHONE_DIR = f"{WHATSAPP}/Databases"
+VOICE_NOTES = "Media/WhatsApp Voice Notes"
 BACKUP = "msgstore.db.crypt15"
+INCREMENT = re.compile(r"msgstore-increment-(\d+)\.db\.crypt15")
 KEY = Path.home() / ".dotfiles/secrets/creds/raw/whatsapp-backup-key"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "whatsapp-chat"
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "whatsapp-chat"
+INCREMENTS = CACHE / "increments"
+MIRROR = Path.home() / "data/whatsapp"
+UNIT = "whatsapp-mirror"
+RUN_LOG = Path(__file__).resolve().parent / "run-log"
 SSH = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
 
 # An address-book number written without a country code ("0660 …") is read as one
@@ -74,6 +94,9 @@ KINDS = {
     90: "call",
 }
 SYSTEM = 7
+
+# chat's jid server, for the chats that are not one person's.
+CHAT_KINDS = {"g.us": "group", "newsletter": "channel", "broadcast": "broadcast"}
 
 # How many of the chats an ambiguous name matches `show` lists, most recent first.
 AMBIGUOUS_SHOWN = 15
@@ -107,15 +130,36 @@ class Show:
     """Read the cached backup without asking the phone for a newer one."""
 
 
-Cmd = Annotated[List, tyro.conf.subcommand(name="list")] | Annotated[Show, tyro.conf.subcommand(name="show")]
+@dataclass
+class Mirror:
+    """Bring the mirror up to date and print nothing: the first step of list and show, alone."""
+
+    record: bool = False
+    """Append the run's outcome to ~/logs/runs/whatsapp-mirror.jsonl (bin/run-log): skip where the phone did not answer, fail where the mirror could not be brought up to date, ok with the backup's time and size, how many increments it holds, what was rewritten and how many voice notes the mirror holds otherwise."""
+
+
+Cmd = (
+    Annotated[List, tyro.conf.subcommand(name="list")]
+    | Annotated[Show, tyro.conf.subcommand(name="show")]
+    | Annotated[Mirror, tyro.conf.subcommand(name="mirror")]
+)
 
 
 def main() -> None:
     cmd = tyro.cli(Cmd, description=__doc__)
     os.umask(0o077)
-    if not cmd.offline:
-        pull()
-    db = sqlite3.connect(f"file:{decrypted()}?mode=ro", uri=True)
+    if isinstance(cmd, Mirror):
+        mirror(cmd.record)
+        return
+    if not cmd.offline and (missed := pull()):
+        note(f"no backup was copied from the phone, so this reads the cached backup ({missed.reason})")
+    try:
+        update()
+    except Exception as e:
+        if not (MIRROR / "msgstore.db").exists():
+            raise
+        note(f"the mirror could not be brought up to date, so this reads it as it was: {type(e).__name__}: {e}")
+    db = sqlite3.connect(f"file:{MIRROR / 'msgstore.db'}?mode=ro", uri=True)
     names = Names(db, contacts())
     if isinstance(cmd, List):
         print_chats(db, names, cmd.query, cmd.limit)
@@ -126,31 +170,36 @@ def main() -> None:
 # --- getting the database --------------------------------------------------------
 
 
-def pull() -> None:
-    """The newest backup and address book into CACHE, or a note on stderr of why not."""
-    CACHE.mkdir(parents=True, exist_ok=True)
-    rsync = subprocess.run(
-        ["rsync", "-t", "-e", " ".join(SSH), f"{PHONE}:{PHONE_DIR}/{BACKUP}", str(CACHE / BACKUP)],
-        capture_output=True,
-        text=True,
-    )
-    if rsync.returncode != 0:
-        if not (CACHE / BACKUP).exists():
-            sys.exit(f"whatsapp-chat: could not copy the backup from the phone, and none is cached:\n{rsync.stderr.strip()}")
-        note(f"the phone did not answer, so this reads the cached backup ({rsync.stderr.strip().splitlines()[-1]})")
-        return
+@dataclass
+class Missed:
+    """Why a pull copied nothing."""
 
-    newer = subprocess.run(
-        SSH + [PHONE, f"find {PHONE_DIR} -maxdepth 1 -name 'msgstore-increment-*.db.crypt15' -newer {PHONE_DIR}/{BACKUP}"],
-        capture_output=True,
-        text=True,
-    ).stdout.split()
-    if newer:
-        note(f"{len(newer)} newer incremental backup(s) on the phone are not read; a full backup from WhatsApp brings them in")
+    reason: str
+    """ssh's or rsync's first word on it."""
+    away: bool
+    """Whether ssh could not reach the phone at all, rather than the phone answering without the backup."""
+
+
+def pull() -> Missed | None:
+    """The newest backup, its increments and the address book into CACHE: None where they were copied, else why
+    not."""
+    INCREMENTS.mkdir(parents=True, exist_ok=True)
+    for rsync in (
+        ["rsync", "-t", "-e", " ".join(SSH), f"{PHONE}:{PHONE_DIR}/{BACKUP}", str(CACHE / BACKUP)],
+        # A full backup renames the increments before it with a date suffix (msgstore-increment-1-2026-11-04.1…),
+        # which the first filter leaves out, and --delete drops their cached copies.
+        ["rsync", "-rt", "--delete", "--exclude=msgstore-increment-*-*", "--include=msgstore-increment-*.db.crypt15",
+         "--exclude=*", "-e", " ".join(SSH), f"{PHONE}:{PHONE_DIR}/", f"{INCREMENTS}/"],
+    ):
+        run = subprocess.run(rsync, capture_output=True, text=True)
+        if run.returncode != 0:
+            # rsync exits 255 when ssh did.
+            return Missed(said(run), away=run.returncode == 255)
 
     book = subprocess.run(SSH + [PHONE, "termux-contact-list"], capture_output=True, text=True)
     if (entries := address_book(book.stdout)) is not None:
-        (CACHE / "contacts.json").write_text(json.dumps(entries))
+        write_changed(CACHE / "contacts.json", json.dumps(entries))
+    return None
 
 
 def address_book(answer: str) -> list[dict] | None:
@@ -166,30 +215,149 @@ def address_book(answer: str) -> list[dict] | None:
     return entries if isinstance(entries, list) else None
 
 
-def decrypted() -> Path:
-    """The plain database for the cached backup, decrypting it only when the backup is newer."""
-    from wa_crypt_tools.lib.db.dbfactory import DatabaseFactory
-    from wa_crypt_tools.lib.key.keyfactory import KeyFactory
+def pull_voice_notes() -> str | None:
+    """The phone's voice notes into the mirror, adding new ones and deleting none: None where they were copied, else
+    rsync's first word on why not."""
+    rsync = subprocess.run(
+        ["rsync", "-rt", "--exclude=.nomedia", "--mkpath", "-e", " ".join(SSH),
+         f"{PHONE}:{WHATSAPP}/{VOICE_NOTES}/", f"{MIRROR / VOICE_NOTES}/"],
+        capture_output=True,
+        text=True,
+    )
+    return None if rsync.returncode == 0 else said(rsync)
 
+
+def said(rsync: subprocess.CompletedProcess) -> str:
+    """rsync's first word on why it failed: ssh says why first, and rsync's own last line only says that ssh did."""
+    return (rsync.stderr.strip().splitlines() or [f"rsync exited {rsync.returncode}"])[0]
+
+
+@dataclass
+class Updated:
+    backup: int
+    """When the phone took the newest backup, full or increment, that the mirror holds, in nanoseconds since the
+    epoch."""
+    increments: int
+    decrypted: bool
+    named: bool
+    """Whether names.json was rewritten."""
+
+
+def update() -> Updated:
+    """Bring the mirror up to the cached backup and its increments, decrypting them only when the newest of them is
+    newer than the mirror's copy, and writing names.json only when what it holds changed."""
     backup = CACHE / BACKUP
-    plain = RUNTIME / "msgstore.db"
-    stamp = backup.stat().st_mtime
-    note(f"backup of {datetime.fromtimestamp(stamp):%Y-%m-%d %H:%M}, {age(datetime.now().timestamp() - stamp)} old")
-    if plain.exists() and plain.stat().st_mtime == stamp:
-        return plain
+    if not backup.exists():
+        sys.exit("whatsapp-chat: no backup is cached, so there is nothing to read; the next run that reaches the phone copies one")
+    plain = MIRROR / "msgstore.db"
+    steps = increments(backup)
+    stamp = (steps[-1] if steps else backup).stat().st_mtime_ns
+    since = f", with {len(steps)} increment(s) since" if steps else ""
+    note(f"backup of {datetime.fromtimestamp(backup.stat().st_mtime):%Y-%m-%d %H:%M}{since}: "
+         f"{age(datetime.now().timestamp() - stamp / 1e9)} old")
+    # The mirror's copy carries the newest backup's mtime, which is how it is known to be current.
+    fresh = not (plain.exists() and plain.stat().st_mtime_ns == stamp)
+    if fresh:
+        key = backup_key()
+        data = zlib.decompress(decrypt(backup, key))
+        if steps:
+            data = merged(data, [zlib.decompress(decrypt(step, key)) for step in steps])
+        replace(plain, data, stamp)
+    db = sqlite3.connect(f"file:{plain}?mode=ro", uri=True)
+    try:
+        named = write_changed(MIRROR / "names.json", names_file(db, Names(db, contacts())))
+    finally:
+        db.close()
+    return Updated(stamp, len(steps), fresh, named)
 
+
+def increments(backup: Path) -> list[Path]:
+    """The cached increments that carry the full backup forward, in order: increment 1, 2, … for as long as each is
+    cached and newer than the one before it, the first newer than the full backup."""
+    cached = {int(m[1]): p for p in INCREMENTS.glob("*") if (m := INCREMENT.fullmatch(p.name))}
+    chain, after = [], backup.stat().st_mtime_ns
+    while (step := cached.get(len(chain) + 1)) and step.stat().st_mtime_ns > after:
+        chain.append(step)
+        after = step.stat().st_mtime_ns
+    if left := len(cached) - len(chain):
+        note(f"{left} cached increment(s) are not read: they do not follow on from the full backup")
+    return chain
+
+
+def backup_key() -> str:
     sops = subprocess.run(["sops", "-d", str(KEY)], capture_output=True, text=True)
     if sops.returncode != 0:
         sys.exit(f"whatsapp-chat: could not decrypt the backup key {KEY}:\n{sops.stderr.strip()}")
+    return sops.stdout.strip()
+
+
+def decrypt(backup: Path, key: str) -> bytes:
+    """A backup, full or increment, decrypted but still zlib-compressed."""
+    from wa_crypt_tools.lib.db.dbfactory import DatabaseFactory
+    from wa_crypt_tools.lib.key.keyfactory import KeyFactory
+
     with backup.open("rb") as f:
         db = DatabaseFactory.from_file(f)
-        data = zlib.decompress(db.decrypt(KeyFactory.from_hex(sops.stdout.strip()), f.read()))
-    RUNTIME.mkdir(parents=True, exist_ok=True)
-    partial = plain.with_suffix(".partial")
+        return db.decrypt(KeyFactory.from_hex(key), f.read())
+
+
+def write_changed(path: Path, text: str) -> bool:
+    """Write text to path unless it holds that already, so an unchanged file keeps its mtime and no copy ships it
+    again; whether it was written."""
+    if path.exists() and path.read_text() == text:
+        return False
+    replace(path, text.encode())
+    return True
+
+
+def replace(path: Path, data: bytes, mtime_ns: int | None = None) -> None:
+    """Put data at path whole or not at all, so a reader never opens half of it."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.{os.getpid()}.partial")
     partial.write_bytes(data)
-    os.utime(partial, (stamp, stamp))
-    partial.replace(plain)
-    return plain
+    if mtime_ns is not None:
+        os.utime(partial, ns=(mtime_ns, mtime_ns))
+    partial.replace(path)
+
+
+def mirror(record: bool) -> None:
+    def log(outcome: str, *more: str) -> None:
+        if record and subprocess.run([str(RUN_LOG), UNIT, outcome, *more]).returncode != 0:
+            note("run-log failed")
+
+    missed = pull()
+    if missed and missed.away and not (CACHE / BACKUP).exists():
+        note(f"the phone did not answer, and no backup is cached: {missed.reason}")
+        log("skip", "--reason", f"phone not reached, no backup cached: {missed.reason}")
+        return
+    try:
+        done = update()
+    except SystemExit as e:
+        log("fail", "--reason", " ".join(str(e.code).split()))
+        raise
+    except Exception as e:
+        log("fail", "--reason", " ".join(f"{type(e).__name__}: {e}".split()))
+        raise
+    if missed and missed.away:
+        note(f"the phone did not answer, so the mirror holds the cached backup ({missed.reason})")
+        log("skip", "--reason", f"phone not reached: {missed.reason}")
+        return
+    if missed:
+        # The phone answered, so the cause is on it: backups switched off, a moved folder, a lost permission.
+        log("fail", "--reason", f"the phone answered, but its backup could not be copied: {missed.reason}")
+        sys.exit(f"whatsapp-chat: the phone answered, but its backup could not be copied: {missed.reason}")
+    if failed := pull_voice_notes():
+        log("fail", "--reason", f"the voice notes could not be copied: {failed}")
+        sys.exit(f"whatsapp-chat: the voice notes could not be copied: {failed}")
+    stats = {
+        "backup": datetime.fromtimestamp(done.backup / 1e9).astimezone().isoformat(timespec="seconds"),
+        "bytes": (MIRROR / "msgstore.db").stat().st_size,
+        "increments": done.increments,
+        "decrypted": done.decrypted,
+        "names_written": done.named,
+        "voice_notes": sum(1 for f in (MIRROR / VOICE_NOTES).rglob("*") if f.is_file()),
+    }
+    log("ok", "--stats", json.dumps(stats))
 
 
 def contacts() -> dict[str, str]:
@@ -209,6 +377,207 @@ def number(written: str) -> str:
     if digits.startswith("0"):
         return HOME_COUNTRY_CODE + digits[1:]
     return digits
+
+
+# --- merging the increments -----------------------------------------------------
+#
+# An increment, decrypted, is a zip: header.json lists the tables it changes, each with a file of the ids of rows it
+# deleted and files of whole rows it added or changed, and the messages it added or changed sit in messages.bin, not as
+# rows but as WhatsApp's history-sync protobuf, each carrying its row's _id. The field numbers below are that
+# protobuf's (HistorySync, Conversation, WebMessageInfo, Message), as whatsmeow's waproto.proto names them; they are
+# read here without a protobuf library, and only for the columns this script and lifelog read.
+
+# A Message's content: its field number, the message_type WhatsApp's own rows give it, and the field of it holding the
+# text that goes to text_data, where one does.
+CONTENT = {
+    1: (0, None),  # conversation: the text is the field itself
+    6: (0, 1),  # extendedTextMessage
+    3: (1, 3),  # imageMessage, its caption
+    8: (2, None),  # audioMessage
+    9: (3, 7),  # videoMessage, its caption
+    4: (4, 1),  # contactMessage, its display name
+    5: (5, 3),  # locationMessage, its name
+    7: (9, 3),  # documentMessage, its title
+    13: (14, None),  # contactsArrayMessage
+    18: (16, None),  # liveLocationMessage
+    26: (20, None),  # stickerMessage
+    28: (24, 6),  # groupInviteMessage, its caption
+    25: (55, None),  # templateMessage
+    45: (62, None),  # interactiveMessage
+    49: (66, None),  # pollCreationMessage
+    60: (66, None),  # pollCreationMessageV2
+    64: (66, None),  # pollCreationMessageV3
+}
+# FutureProofMessage wrappers (view once, ephemeral, edited, document with caption, …): the content is their field 1.
+WRAPPERS = (37, 40, 53, 55, 58, 59, 62, 74, 91)
+PROTOCOL, EDITED = 12, 14  # protocolMessage, and in it the edit's new message
+CONTEXT = 17  # every content message's contextInfo: the message it replies to
+# What WhatsApp's rows call content this table does not know, an album among it.
+OTHER = 99
+REVOKED, DELETED = 1, 15  # messageStubType of a message deleted for everyone, and its message_type
+
+
+def merged(full: bytes, steps: list[bytes]) -> bytes:
+    """The full backup's database with each increment applied in turn."""
+    db = sqlite3.connect(":memory:")
+    db.deserialize(full)
+    for step in steps:
+        apply(db, zipfile.ZipFile(io.BytesIO(step)))
+    db.commit()
+    return db.serialize()
+
+
+def apply(db: sqlite3.Connection, step: zipfile.ZipFile) -> None:
+    head = json.loads(step.read("header.json"))
+    for table in (t for group in head["entities"].values() for t in group):
+        name, key = table["table_name"], table["table_id_field"]
+        columns = {c for _, c, *_ in db.execute(f"pragma table_info({name})")}
+        if not columns:
+            continue  # a table newer than the full backup, which nothing here reads
+        columns.add("rowid")  # no column table_info names, and parent_group_participants is keyed by it
+        for f in table.get("deleted_id_files", []):
+            db.executemany(f"delete from {name} where {key} = ?", [(i,) for i in json.loads(step.read(f))["deleted_ids"]])
+        for f in table.get("modified_entity_files", []):
+            for row in json.loads(step.read(f))[name]:
+                # A column an older database lacks is left out, rather than failing the row.
+                kept = [c for c in row if c in columns]
+                db.execute(f"insert or replace into {name} ({', '.join(kept)}) values ({', '.join('?' * len(kept))})",
+                           [row[c] for c in kept])
+    for f in head.get("deleted_messages", {}).get("deleted_message_ids_files", []):
+        gone = [(i,) for i in json.loads(step.read(f))["deleted_ids"]]
+        for table, key in (("message", "_id"), ("message_media", "message_row_id"), ("message_quoted", "message_row_id")):
+            db.executemany(f"delete from {table} where {key} = ?", gone)
+    rows = Rows(db)
+    for chunk in delimited(step.read(head["added_messages"]["filename"])):
+        for conversation in fields(chunk)[2]:
+            conversation = fields(conversation)
+            chat = rows.chat(string(conversation, 1))
+            for sync in conversation[2]:
+                sync = fields(sync)
+                rows.message(chat, first(sync, 2), fields(first(sync, 1)))
+
+
+class Rows:
+    """Where an increment's messages go: the rows of message, message_media and message_quoted they make."""
+
+    def __init__(self, db: sqlite3.Connection):
+        self.db = db
+        self.jids = dict(db.execute("select raw_string, _id from jid"))
+        self.chats = dict(db.execute("select jid_row_id, _id from chat"))
+        phone_of = dict(db.execute("select lid_row_id, jid_row_id from jid_map"))
+        self.twin = phone_of | {phone: lid for lid, phone in phone_of.items()}
+
+    def chat(self, jid: str) -> int:
+        """The chat row of a conversation, which may name it by the phone number or the lid the chat row does not."""
+        row = self.jids.get(jid)
+        found = self.chats.get(row) or self.chats.get(self.twin.get(row))
+        if found is None:
+            raise ValueError(f"an increment names a chat the database lacks: {jid}")
+        return found
+
+    def message(self, chat: int, row: int, info: dict) -> None:
+        key = fields(first(info, 1))
+        sender = string(info, 5) or string(key, 4)
+        if stub := first(info, 24):
+            kind, text, context = (DELETED if stub == REVOKED else SYSTEM), None, {}
+        else:
+            kind, text, context = content(fields(first(info, 2, b"")))
+        # A message the database holds keeps its time, to the millisecond where the increment has only seconds, and
+        # its place in the chat; and its kind and text, where the increment says only that it is content this script
+        # does not know or a system notice.
+        self.db.execute(
+            """insert into message (_id, chat_row_id, from_me, key_id, sender_jid_row_id, timestamp, message_type,
+                                    text_data, sort_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               on conflict (_id) do update set chat_row_id = excluded.chat_row_id, from_me = excluded.from_me,
+                 key_id = excluded.key_id, sender_jid_row_id = excluded.sender_jid_row_id,
+                 message_type = iif(excluded.message_type in (?, ?), message_type, excluded.message_type),
+                 text_data = iif(excluded.message_type in (?, ?), text_data, excluded.text_data)""",
+            (row, chat, first(key, 2, 0), string(key, 3), self.jids.get(sender, 0), first(info, 3, 0) * 1000, kind, text,
+             row, OTHER, SYSTEM, OTHER, SYSTEM),
+        )
+        # mediaData's localPath, which is message_media.file_path: where a voice note sits under the mirror.
+        if path := info.get(38) and string(fields(first(info, 38)), 1):
+            self.db.execute(
+                """insert into message_media (message_row_id, chat_row_id, file_path) values (?, ?, ?)
+                   on conflict (message_row_id) do update set file_path = excluded.file_path""",
+                (row, chat, path),
+            )
+        if replied := string(context, 1):
+            quoted_kind, quoted_text, _ = content(fields(first(context, 3, b"")))
+            # The message replied to, where the database holds it, says who wrote it; the increment names only its
+            # author's jid, and not as "me".
+            author = self.db.execute("select from_me, sender_jid_row_id from message where chat_row_id = ? and key_id = ?",
+                                     (chat, replied)).fetchone()
+            from_me, quoted_sender = author or (0, self.jids.get(string(context, 2), 0))
+            self.db.execute(
+                """insert or replace into message_quoted (message_row_id, chat_row_id, parent_message_chat_row_id,
+                     from_me, sender_jid_row_id, key_id, message_type, text_data) values (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (row, chat, chat, from_me, quoted_sender or 0, replied, quoted_kind, quoted_text),
+            )
+
+
+def content(message: dict) -> tuple[int, str | None, dict]:
+    """A Message's message_type, its text, and the contextInfo saying what it replies to."""
+    for wrapper in WRAPPERS:
+        if inner := message.get(wrapper) and fields(first(message, wrapper)).get(1):
+            return content(fields(inner[0]))
+    if (protocol := message.get(PROTOCOL)) and (edit := fields(protocol[0]).get(EDITED)):
+        return content(fields(edit[0]))
+    if text := string(message, 1):
+        return 0, text, {}
+    for number, (kind, at) in CONTENT.items():
+        if found := message.get(number):
+            inner = fields(found[0])
+            return kind, at and string(inner, at), fields(first(inner, CONTEXT, b""))
+    return OTHER, None, {}
+
+
+def fields(buf: bytes) -> defaultdict[int, list]:
+    """One protobuf message's fields by number, each a list of its values: an int where it is a varint, else bytes."""
+    found, i = defaultdict(list), 0
+    while i < len(buf):
+        tag, i = varint(buf, i)
+        number, wire = tag >> 3, tag & 7
+        if wire == 0:
+            value, i = varint(buf, i)
+        elif wire == 2:
+            size, i = varint(buf, i)
+            value, i = buf[i:i + size], i + size
+        elif wire in (1, 5):
+            size = 8 if wire == 1 else 4
+            value, i = buf[i:i + size], i + size
+        else:
+            raise ValueError(f"a protobuf field of wire type {wire}, which no increment has held")
+        found[number].append(value)
+    return found
+
+
+def delimited(buf: bytes):
+    """The messages of a file of them, each after its length."""
+    i = 0
+    while i < len(buf):
+        size, i = varint(buf, i)
+        yield buf[i:i + size]
+        i += size
+
+
+def varint(buf: bytes, i: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = buf[i]
+        i += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, i
+
+
+def first(found: dict, number: int, default=None):
+    return found[number][0] if found.get(number) else default
+
+
+def string(found: dict, number: int) -> str | None:
+    return value.decode() if (value := first(found, number)) is not None else None
 
 
 # --- names -----------------------------------------------------------------------
@@ -249,6 +618,24 @@ class Names:
         return chosen or f"{user}@{server}"
 
 
+def names_file(db: sqlite3.Connection, names: Names) -> str:
+    """names.json: what every row of the jid table is called, by its raw_string (user@server, with the device where it
+    names one) or, where it has none, user@server, and what each message type and each
+    kind of chat is, for a reader of the mirror without this script. The same database and address book give the
+    same text."""
+    return json.dumps(
+        {
+            "names": [{"jid": jid, "name": name} for jid, name in sorted({
+                jid: names(i) for i, jid in db.execute("select _id, coalesce(raw_string, user || '@' || server) from jid")
+            }.items())],
+            "kinds": [{"type": t, "kind": k} for t, k in {0: "text", **KINDS}.items()],
+            "system": SYSTEM,
+            "chat_kinds": [{"server": server, "kind": k} for server, k in CHAT_KINDS.items()],
+        },
+        ensure_ascii=False,
+    )
+
+
 # --- chats -----------------------------------------------------------------------
 
 
@@ -263,7 +650,6 @@ class Chat:
 
 
 def chats(db: sqlite3.Connection, names: Names) -> list[Chat]:
-    kinds = {"g.us": "group", "newsletter": "channel", "broadcast": "broadcast"}
     rows = db.execute(
         """select c._id, c.jid_row_id, j.server, count(m._id), max(m.timestamp)
            from chat c join jid j on j._id = c.jid_row_id
@@ -271,7 +657,7 @@ def chats(db: sqlite3.Connection, names: Names) -> list[Chat]:
            group by c._id order by max(m.timestamp) desc""",
         (SYSTEM,),
     )
-    return [Chat(i, jid, kinds.get(server, "dm"), names(jid), n, last) for i, jid, server, n, last in rows if n]
+    return [Chat(i, jid, CHAT_KINDS.get(server, "dm"), names(jid), n, last) for i, jid, server, n, last in rows if n]
 
 
 def print_chats(db: sqlite3.Connection, names: Names, query: str, limit: int) -> None:

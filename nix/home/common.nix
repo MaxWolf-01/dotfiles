@@ -7,6 +7,7 @@
   ];
 
   programs.home-manager.enable = true;
+  news.display = "silent";
 
   nix.gc = {
     automatic = true;
@@ -44,7 +45,7 @@
   # layer instead, which outranks the user config anyway.
   home.sessionVariables = {
     NPM_CONFIG_USERCONFIG = "${config.xdg.configHome}/npm/npmrc";
-    NPM_CONFIG_MIN_RELEASE_AGE = "7";
+    NPM_CONFIG_MIN_RELEASE_AGE = "2";
     # Global installs and `npm link` need a writable prefix; the default derives
     # from node's location, which is the read-only nix store.
     NPM_CONFIG_PREFIX = "${config.home.homeDirectory}/.local";
@@ -103,7 +104,6 @@
       ".env"
       "node_modules"
       "repomix-output.*"
-      "**/uv.lock"
       ".idea"
       ".vscode"
       "*.swp"
@@ -355,7 +355,7 @@
         User = "root";
       };
       yapit-prod = {
-        HostName = "100.124.59.34";
+        HostName = "100.64.187.19";
         User = "root";
       };
       # accept-new for the reason given at zephylux below: the backups pc writes
@@ -447,6 +447,7 @@
     nerd-fonts.hack
     nodejs
     nvd
+    nixos-rebuild-ng # bin/deploy, which switches remote hosts from here
     nvtopPackages.full
     openssh
     poppler-utils
@@ -461,6 +462,10 @@
     tree
     uv
     vim
+    # util-linux's waitpid alone, for bin/notify: Ubuntu's util-linux leaves it
+    # out, and the whole package would put a mount without setuid ahead of the
+    # system's.
+    (runCommand "waitpid" { } "mkdir -p $out/bin && ln -s ${util-linux}/bin/waitpid $out/bin/")
     wakatime-cli
     yt-dlp
 

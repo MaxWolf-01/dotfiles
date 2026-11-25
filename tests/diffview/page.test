@@ -26,6 +26,7 @@ import queue
 import re
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -56,6 +57,11 @@ os.environ["CONTAINER_HUB_PORT"] = str(HUB_PORT)   # where the hub diffview star
 # uv's own directories stay where they are, or a hub under that home resolves its dependencies anew
 HUB_ENV = {**os.environ, "HOME": str(HUB_HOME), **{k: subprocess.run(["uv", *a], capture_output=True, text=True, check=True).stdout.strip()
                                                      for k, a in (("UV_CACHE_DIR", ("cache", "dir")), ("UV_PYTHON_INSTALL_DIR", ("python", "dir")))}}
+
+
+def result_line(text: str) -> str:
+    """The shell line a stand-in `claude` ends on: the stream-json result event `model-runs` reads as the answer."""
+    return f"""jq -cn --arg r "{text}" '{{type:"result",subtype:"success",result:$r}}'\n"""
 
 
 def hub_answers() -> bool:
@@ -915,7 +921,7 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
     mode.write_text("summary one")
     (shim / "claude").write_text('#!/usr/bin/env bash\nm=$(cat "$MODE_FILE")\n'
                                  'case "$m" in fail) echo shim refused >&2; exit 1;; slow*) sleep 4; m=${m#slow };; esac\n'
-                                 'cat >/dev/null\necho "$m"\n')
+                                 'cat >/dev/null\n' + result_line("$m"))
     (shim / "claude").chmod(0o755)
     env = {**HUB_ENV, "PATH": f"{shim}:{os.environ['PATH']}", "MODE_FILE": str(mode)}
     out = pages / f"rewrite-{os.getpid()}.html"
@@ -993,18 +999,36 @@ def rewrite_case(root: Path, repo: Path, pages: Path, browser) -> None:
         check("a watched page follows the file between rebuilds", True, shown())
         check("and nothing it asked the watcher for failed, the waits for a state file and a new summary included", [], failed_requests)
         other.close()
+        asked: list[str] = []
+        page.on("request", lambda r: asked.append(r.url.rsplit(".html", 1)[-1]) if ".html." in r.url else None)
+        page.wait_for_timeout(5_000)
+        check("a watched page the hub serves, left alone, asks for neither its watch record nor its state file", [], asked)
         w.stop()
+        stopped = time.monotonic()
         try:
             page.wait_for_selector(".watchgone", timeout=10_000)
         except PlaywrightTimeout:
             pass
-        check("a page whose watcher has stopped says so, with the command that started it", True,
-              page.locator(".watchgone code").count() > 0
-              and page.locator(".watchgone code").first.inner_text() == shlex.join(["diffview", f"{repo}@base..", "--watch", "-o", str(out)]))
+        check("a page whose watcher has stopped says so within 2 seconds, with the command that started it", (True, True),
+              (time.monotonic() - stopped < 2,
+               page.locator(".watchgone code").count() > 0
+               and page.locator(".watchgone code").first.inner_text() == shlex.join(["diffview", f"{repo}@base..", "--watch", "-o", str(out)])))
         built = build(page)
         w = Watcher(f"{repo}@base..", out, "--no-auto-summary", env=env)
         check("the watcher started again", True, w.printed("watching"))
         check("and the page catches up, the warning gone", (True, 0), (rebuilt(page, built), page.locator(".watchgone").count()))
+        # a watcher killed outright writes nothing on its way out: its record's lock goes with it. The watcher is the
+        # python `uv run` started, which a kill of uv would leave running
+        for pid in subprocess.run(["pgrep", "-P", str(w.proc.pid)], capture_output=True, text=True).stdout.split():
+            os.kill(int(pid), signal.SIGKILL)
+        w.proc.wait(timeout=5)
+        stopped = time.monotonic()
+        try:
+            page.wait_for_selector(".watchgone", timeout=10_000)
+        except PlaywrightTimeout:
+            pass
+        check("a watcher killed outright is shown stopped within 2 seconds too", (1, True),
+              (page.locator(".watchgone").count(), time.monotonic() - stopped < 2))
         page.close()
     finally:
         w.stop()
@@ -1025,7 +1049,7 @@ def retry_case(root: Path, pages: Path, browser) -> None:
     shim, mode = root / "retry-shim", root / "retry-mode"
     shim.mkdir()
     mode.write_text("fail")
-    (shim / "claude").write_text(f'#!/bin/sh\ncat >/dev/null\n[ "$(cat {mode})" = fail ] && {{ echo logged out >&2; exit 1; }}\ncat {mode}\n')
+    (shim / "claude").write_text(f'#!/bin/sh\ncat >/dev/null\n[ "$(cat {mode})" = fail ] && {{ echo logged out >&2; exit 1; }}\n' + result_line(f"$(cat {mode})"))
     (shim / "claude").chmod(0o755)
     out = pages / f"retry-{os.getpid()}.html"
     sidecar = Path(f"{out}.summary.json")
@@ -1364,28 +1388,23 @@ def tabs_case(repo: Path, pages: Path, browser, notes: Path) -> None:
 
 
 def heartbeat_case(url: str, browser) -> None:
-    """An open page fetches its state file every two seconds, and at once when its tab comes to the front: that
-    is how it follows the file. The clock is faked so a minute
-    takes no time; each tick gets a moment for its fetch to return, since a tick finding one in flight leaves it be."""
+    """A page the hub serves fetches its state file only when the hub tells it the file changed, and at once when its
+    tab comes to the front. The clock is faked so a minute takes no time."""
     page = browser.new_page()
     fetches: list[str] = []
     page.on("request", lambda r: fetches.append(r.url) if r.url.endswith(".state.json") and r.method == "GET" else None)
     page.clock.install()
     page.goto(url)
     page.wait_for_selector("tbody.hunk")
-    at_load = len(fetches)
-    page.clock.run_for(2_100)
-    page.wait_for_timeout(200)
-    check("a page fetches its file within two seconds of opening", at_load + 1, len(fetches))
+    page.wait_for_timeout(500)   # the stream opened, and the one look it makes then
     before = len(fetches)
     for _ in range(30):
         page.clock.run_for(2_000)
         page.wait_for_timeout(60)
-    check("and thirty times a minute from then on", 30, len(fetches) - before)
-    before = len(fetches)
+    check("a page the hub serves fetches its file not once in a minute of nothing changing", 0, len(fetches) - before)
     page.evaluate("dispatchEvent(new Event('focus'))")
     page.wait_for_timeout(200)
-    check("a tab coming to the front fetches at once, no tick needed", before + 1, len(fetches))
+    check("a tab coming to the front fetches at once", before + 1, len(fetches))
     page.close()
 
 
@@ -1395,11 +1414,11 @@ def quiet_case(root: Path, repo: Path, pages: Path, base: str, browser) -> None:
     fault on a page that has none."""
     shim = root / "slow-claude"   # stands in for `claude -p`, slow enough that the page opens before the summary lands
     shim.mkdir()
-    (shim / "claude").write_text('#!/usr/bin/env bash\ncat >/dev/null\nsleep 3\necho "a summary worth the wait"\n')
+    (shim / "claude").write_text('#!/usr/bin/env bash\ncat >/dev/null\nsleep 3\n' + result_line("a summary worth the wait"))
     (shim / "claude").chmod(0o755)
     out = pages / f"quiet-{os.getpid()}.html"
     subprocess.run([str(DIFFVIEW), f"{repo}@base..HEAD", "-o", str(out)], check=True, capture_output=True,
-                   env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"})
+                   env={**HUB_ENV, "PATH": f"{shim}:{os.environ['PATH']}"})
     page = browser.new_page()
     failed: list[str] = []
     page.on("response", lambda r: failed.append(f"{r.status} {r.url}") if r.status >= 400 else None)

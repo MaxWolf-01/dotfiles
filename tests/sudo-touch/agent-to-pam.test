@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# tier: full-path (nix, ssh-agent, PAM through pam_wrapper)
+# Drive sudo by a YubiKey touch from the laptop's agent to pc's PAM line, with OpenSSH's software security key in
+# place of a YubiKey and pam_wrapper in place of root (rig.nix). Run it directly; no framework.
+#
+# The agent runs as the laptop's unit runs it, with its askpass and environment; pam_rssh runs with the arguments
+# pc's sudo gives it, reading a scratch copy of the keys file. What max relies on: a sudo the agent can answer
+# waits for the touch, shows as a notification meanwhile, and goes through once touched; a key the file does not
+# list is no way in; and with no agent or no key in it, the stack goes on to the password.
+
+set -uo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+. "$repo/tests/check.sh"
+. "$repo/tests/fake-notifications.sh"
+needs nix jq ssh
+scratch=$(mktemp -d)
+agent_pid=
+trap '[ -z "$agent_pid" ] || kill "$agent_pid" 2>/dev/null; fake_notifications_stop; rm -rf "$scratch"' EXIT
+
+nix eval --json --impure --expr "
+let
+  f = builtins.getFlake \"git+file://$repo\";
+  unit = f.homeConfigurations.zephyrus.config.systemd.user.services.ssh-sk-agent.Service;
+  sshConfig = f.homeConfigurations.zephyrus.config.home.file.\".ssh/config\".source;
+  zsh = f.homeConfigurations.zephyrus.config.programs.zsh.initContent;
+in {
+  execStart = unit.ExecStart;
+  execStartPost = unit.ExecStartPost;
+  inherit sshConfig zsh;
+  environment = unit.Environment;
+  sudo = f.nixosConfigurations.pc.config.security.pam.services.sudo.text;
+  # What the unit's strings and the ssh config name, so the build below makes them.
+  drvs = builtins.attrNames (builtins.getContext (toString unit.ExecStart + toString unit.ExecStartPost + toString unit.Environment + toString sshConfig));
+}" >"$scratch/eval.json" 2>"$scratch/err" || { fail "the flake's host configs evaluate" "$(tail -20 "$scratch/err")"; finish; }
+rig=$(nix build --no-link --print-out-paths --impure --expr "
+  import $repo/tests/sudo-touch/rig.nix { pkgs = (builtins.getFlake \"git+file://$repo\").inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}; }" \
+    2>"$scratch/err") || { fail "the rig builds" "$(tail -20 "$scratch/err")"; finish; }
+jq -r '.drvs[] | . + "^out"' "$scratch/eval.json" | xargs nix build --no-link 2>"$scratch/err" ||
+    { fail "the agent unit's programs build" "$(tail -20 "$scratch/err")"; finish; }
+
+# The unit, with %t made this scratch directory, and the rig's provider allowed in.
+run="$scratch/run"
+mkdir -p "$run"
+export XDG_RUNTIME_DIR="$run"
+# The unit's askpass notifies on whatever session bus it inherits: here a stand-in for the desktop's.
+fake_notifications_start "$scratch"
+while read -r assignment; do
+    export "${assignment//%t/$run}"
+done < <(jq -r '.environment[]' "$scratch/eval.json")
+export SK_DUMMY_TOUCH="$scratch/touched"
+read -ra exec_start <<<"$(jq -r '.execStart[]' "$scratch/eval.json")"
+# The allowlist is matched against the provider's resolved path.
+"${exec_start[@]//%t/$run}" -P "$(realpath "$rig/lib/sk-dummy.so")" >"$scratch/agent.log" 2>&1 &
+agent_pid=$!
+# Where the laptop's ssh forwards from: the SSH_SK_FORWARD interactive zsh sets, its $XDG_RUNTIME_DIR being the unit's %t.
+check "the laptop's ssh forwards the agent SSH_SK_FORWARD names" '$SSH_SK_FORWARD' \
+    "$(ssh -G -F "$(jq -r .sshConfig "$scratch/eval.json")" pc 2>/dev/null | awk '$1 == "forwardagent" { print $2 }')"
+forwarded=$(jq -r .zsh "$scratch/eval.json" | sed -n 's/^export SSH_SK_FORWARD="\(.*\)"$/\1/p')
+forwarded="${forwarded//\$XDG_RUNTIME_DIR/$run}"
+timeout 5 bash -c "until [ -S '$forwarded' ]; do sleep 0.05; done" ||
+    { fail "the agent listens where the laptop's ssh forwards from ($forwarded)" "$(cat "$scratch/agent.log")"; finish; }
+
+# The unit's loader, on an agent holding nothing (no key is registered yet): the unit stays up.
+load=$(jq -r '.execStartPost | if type == "array" then .[0] else . end' "$scratch/eval.json")
+"$load" >"$scratch/load.log" 2>&1
+check "the loader leaves an agent holding nothing running" 0 "$?"
+# ...and on one someone added an everyday key to: it empties the agent and fails the unit.
+"$rig/bin/ssh-keygen" -q -t ed25519 -N '' -C everyday -f "$scratch/everyday" </dev/null
+"$rig/bin/ssh-add" -q "$scratch/everyday" 2>/dev/null
+"$load" >"$scratch/load.log" 2>&1
+check "the loader refuses an agent holding a key that is not an sk key" 1 "$?"
+check "and empties it" "" "$("$rig/bin/ssh-add" -L 2>/dev/null | grep -v '^The agent has no identities')"
+
+"$rig/bin/ssh-keygen" -q -t ed25519-sk -w "$rig/lib/sk-dummy.so" -N '' -C keychain -f "$scratch/keychain" </dev/null
+"$rig/bin/ssh-keygen" -q -t ed25519-sk -w "$rig/lib/sk-dummy.so" -N '' -C elsewhere -f "$scratch/elsewhere" </dev/null
+"$rig/bin/ssh-add" -q -S "$rig/lib/sk-dummy.so" "$scratch/keychain" 2>/dev/null
+
+# pc's pam_rssh line, reading the keys from here, then a stand-in for what follows it in the stack.
+# pam_rssh reaches the agent through the link a login from the laptop makes (sudo-touch-login.zsh).
+rssh=$(jq -r .sudo "$scratch/eval.json" | grep '^auth .*libpam_rssh\.so' |
+    sed "s|/etc/ssh/sudo-touch/|$scratch/keys/|; s|ssh_agent_addr=[^ ]*|ssh_agent_addr=$scratch/sk-agent.sock|; s| #.*||")
+check "pc's sudo reads the agent from the link a login makes" yes \
+    "$(jq -r .sudo "$scratch/eval.json" | grep -q 'ssh_agent_addr=/home/\$ruser/\.ssh/sk-agent\.sock' && echo yes)"
+ln -s "$SSH_AUTH_SOCK" "$scratch/sk-agent.sock"
+mkdir -p "$scratch/keys" "$scratch/pam.d"
+stack() {
+    printf '%s\nauth required %s\n' "$rssh" "$rig/lib/$1" >"$scratch/pam.d/sudo"
+}
+pamtester() {
+    LD_PRELOAD="$rig/lib/libpam_wrapper.so" PAM_WRAPPER=1 PAM_WRAPPER_SERVICE_DIR="$scratch/pam.d" \
+        "$rig/bin/pamtester" -I "ruser=$USER" sudo "$USER" authenticate </dev/null >/dev/null 2>&1
+}
+# What follows the touch denies, so a success is the touch's alone.
+stack pam_deny.so
+cp "$scratch/keychain.pub" "$scratch/keys/$USER"
+pamtester &
+sudo_pid=$!
+if await_shown 1 10; then
+    check "while the key waits for a touch, a notification asks for one" yes \
+        "$(shown | jq -r .summary | grep -q '^Touch a YubiKey for ' && echo yes)"
+    check "sudo is still waiting" yes "$(kill -0 "$sudo_pid" 2>/dev/null && echo yes)"
+else
+    fail "a notification shows while the key waits for a touch" "$(cat "$scratch/agent.log")"
+fi
+touch "$SK_DUMMY_TOUCH"
+wait "$sudo_pid"
+check "once touched, sudo goes through on the touch alone" 0 "$?"
+await_shown 0 5 && passed "and the notification is gone" || fail "and the notification is gone"
+
+# A touch that does not come before the key gives up: sudo asks again, as long as the asks last, and goes through on
+# the touch at a later one.
+rm "$SK_DUMMY_TOUCH"
+asks() { jq -s 'map(select(.event == "notify")) | length' "$fake_notifications_log"; }
+asked=$(asks)
+pamtester &
+sudo_pid=$!
+# Polled: a second notification is the sign of a second ask, and the deadline the backstop for one that never comes.
+for _ in $(seq 150); do [ "$(asks)" -ge $((asked + 2)) ] && break; sleep 0.1; done
+check "the key gave up on the first ask, and sudo asks for a touch again" yes \
+    "$([ "$(asks)" -ge $((asked + 2)) ] && kill -0 "$sudo_pid" 2>/dev/null && echo yes)"
+touch "$SK_DUMMY_TOUCH"
+wait "$sudo_pid"
+check "touched at a later ask, sudo goes through" 0 "$?"
+
+cp "$scratch/elsewhere.pub" "$scratch/keys/$USER"
+pamtester
+check "a key the file does not list is no way in" 1 "$([ $? -ne 0 ] && echo 1)"
+
+# What follows the touch lets anyone in, standing in for the password: reaching it is falling through.
+stack pam_permit.so
+pamtester
+check "with the agent holding no listed key, sudo goes on to the password" 0 "$?"
+rm "$scratch/sk-agent.sock"
+pamtester
+check "with no agent at all, sudo goes on to the password" 0 "$?"
+
+finish

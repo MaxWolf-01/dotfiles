@@ -64,7 +64,11 @@ return {
     -- Cmdline completion (like : commands and / search)
     cmdline = {
       enabled = true,
-      keymap = { preset = 'cmdline' },
+      keymap = {
+        preset = 'cmdline',
+        -- runs the highlighted item; with nothing highlighted, runs the line as typed
+        ['<CR>'] = { 'accept_and_enter', 'fallback' },
+      },
       completion = {
         menu = { auto_show = false },
         ghost_text = { enabled = true },
