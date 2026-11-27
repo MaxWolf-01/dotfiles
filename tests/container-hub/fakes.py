@@ -397,7 +397,7 @@ exit 1
     # --- what the hub decides
 
     def opened(self, target, session: str | None = None, **body) -> dict:
-        """What the hub answers an agent that opens a page, as claude-browser asks it."""
+        """What the hub answers an agent that opens a page, as container-hub open asks it."""
         return self.hub.open_page({"target": str(target), **({"session": session} if session else {}), **body}, self.origins, from_page=False)[1]
 
     def clicked(self, target, unit: str, **body) -> dict:
