@@ -444,20 +444,19 @@ in
   };
 
   # --- Retros ---
-  # mx's weekly retros, run from the agents repo's checkout: on Monday the workflow retro, of the
-  # agents repo and every Claude Code session; on Tuesday the repo retro of each repo on
-  # ./repo-retros, one after another. bin/workflow-retro says what each records. Each kind gets a
-  # night of its own. Persistent: a laptop
-  # asleep at 02:00 runs them on waking. When both catch up on the same waking, the repo retros
-  # wait for the workflow retro to end.
+  # mx's retros, run from the agents repo's checkout and checked every night: the workflow retro,
+  # of the agents repo and every Claude Code session, then the repo retro of each repo on
+  # ./repo-retros, one after another, each only when `retro --help`'s --after-merges says it is due.
+  # bin/workflow-retro says what each records. Persistent: a laptop asleep at 02:00 checks on
+  # waking. The repo retros wait for the workflow retro to end.
   # Both are oneshots, which have no start timeout by default, so a wedged run would leave the unit
-  # activating and every later week a silent no-op. On TERM the retro gives its stage a minute to
+  # activating and every later night a silent no-op. On TERM the retro gives its stage a minute to
   # end and then logs. The default 90s stop timeout would cut that short and lose the job run log
   # line, hence 3min.
 
   systemd.user.services.workflow-retro = {
     Unit = {
-      Description = "Workflow retro, when max did anything since its last run";
+      Description = "Workflow retro, when it is due";
       After = [ "network-online.target" ];
       Wants = [ "network-online.target" ];
     };
@@ -471,9 +470,9 @@ in
   };
 
   systemd.user.timers.workflow-retro = {
-    Unit.Description = "Workflow retro (Mondays 02:00)";
+    Unit.Description = "Workflow retro check (nightly 02:00)";
     Timer = {
-      OnCalendar = "Mon *-*-* 02:00:00";
+      OnCalendar = "*-*-* 02:00:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
@@ -513,7 +512,7 @@ in
 
   systemd.user.services.repo-retros = {
     Unit = {
-      Description = "Repo retros, each when its repo has a commit since its last run";
+      Description = "Repo retros, each when it is due";
       After = [ "network-online.target" "workflow-retro.service" ];
       Wants = [ "network-online.target" ];
     };
@@ -527,9 +526,9 @@ in
   };
 
   systemd.user.timers.repo-retros = {
-    Unit.Description = "Repo retros (Tuesdays 02:00)";
+    Unit.Description = "Repo retro checks (nightly 02:00)";
     Timer = {
-      OnCalendar = "Tue *-*-* 02:00:00";
+      OnCalendar = "*-*-* 02:00:00";
       Persistent = true;
     };
     Install.WantedBy = [ "timers.target" ];
