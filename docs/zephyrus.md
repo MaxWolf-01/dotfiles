@@ -192,6 +192,17 @@ History: the host recorder's `dgpu_port` column (D3cold or D0 every 5 s).
   (`(DP): not active, tearing down` in `journalctl -k`), and the dock's
   monitors stayed black until it was replugged. Replug it into the Thunderbolt
   port; that night it went into the USB-C 3.2 port instead (see Ports).
+- **A suspend that never wakes.** On 2026-11-11 and 2026-11-26 the laptop
+  went into s2idle and did not come back; the kernel log ends on
+  `PM: suspend entry (s2idle)` and only a hard reset recovered it, the screen
+  showing the text console. Nothing after the suspend entry reached the disk,
+  so where it stopped is unknown. The likeliest cause is the Realtek RTS525A
+  SD card reader (`0000:2d:00.0`, root port `00:1c.6`): on most resumes its
+  link does not come up (`Data Link Layer Link Active not set`) and its
+  resume times out (`rtsx_pci … pci_pm_resume returns -110`). The slot is
+  unused, so `./setup card_reader_off` keeps its drivers unloaded (since
+  2026-11-27). If a suspend hangs again regardless, boot with
+  `no_console_suspend` so the console shows the step it stopped at.
 - **`reboot -h 0`** is not a thing on systemd; `reboot`.
 
 ## What can reach it
