@@ -6,8 +6,8 @@
 """The container hub: one local server for every page an agent opens, and the one hub tab that shows them, a unit per
 orchestrator.
 
-`claude-browser` hands every page here. A unit is one orchestrator session: a page goes to the unit of the
-session that opened it ($MX_ORIGIN_SESSION, as claude-browser passes it), a session page to its own session's,
+`container-hub open` (its own --help) hands every page here. A unit is one orchestrator session: a page goes to the unit of the
+session that opened it ($MX_ORIGIN_SESSION, as `container-hub open` passes it), a session page to its own session's,
 and a page no session opened to the loose pages. Every session running on the host is a unit from its start,
 one started in a terminal included, but a dispatched worker's and one nobody types into (`claude -p`, an SDK's); until
 it opens a page, its unit holds the stand-in for its session page (below), and it goes once its session ends. A unit is
@@ -203,7 +203,7 @@ longer holds it, its handoff is another or was committed again since the box off
 time.
 
 The hub listens on a unix socket (--socket) that only its own user can open, and on 127.0.0.1:<port> as well where
-it is given a port, which every user of the host can open. The tools on the host (claude-browser, diffview, the Stop
+it is given a port, which every user of the host can open. The tools on the host (`container-hub open`, diffview, the Stop
 hook) reach it on the socket, and a browser on another device through `tailscale serve`, which puts the socket on the
 tailnet over HTTPS. The hub knows that address by the X-Forwarded-Host tailscaled sends. Serving a socket takes root.
 Where the hub runs as a user, `tailscale serve` puts its port on the tailnet instead, and --tailnet names that address.
@@ -489,7 +489,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -529,10 +529,10 @@ FIGURE = re.compile(r"\.(svg|png|jpe?g|gif|webp|avif)$", re.IGNORECASE)
 
 
 SOCKET_PATH_MAX = 107
-"""The longest unix socket path, in bytes, that both the hub's bind and curl (claude-browser's) take: sun_path holds
-108, and each keeps one of them for the terminating NUL."""
+"""The longest unix socket path, in bytes, that the hub's bind and a client's connect take: sun_path holds 108, and
+each keeps one of them for the terminating NUL."""
 SOCKET = Path(os.environ.get("CONTAINER_HUB_SOCKET") or "~/.local/state/container-hub/hub.sock").expanduser()
-"""Where the hub listens, and where claude-browser, diffview and the Stop hook look for it."""
+"""Where the hub listens, and where `container-hub open`, diffview and the Stop hook look for it."""
 HOSTNAME = socket.gethostname().split(".")[0]
 USER = pwd.getpwuid(os.getuid()).pw_name
 
@@ -6207,5 +6207,82 @@ def listen(args: Args) -> tuple[list[socketserver.BaseServer], dict[str, int]]:
     return servers, held
 
 
+# --------------------------------------------------------------------------
+# `container-hub open`: an agent's pages, handed to the hub that runs here
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Open:
+    """Put pages on the container hub, in the unit of the session that opens them: $MX_ORIGIN_SESSION, so a dispatched
+    worker's page lands with its orchestrator, else $CLAUDE_CODE_SESSION_ID. Nothing opens: a hub tab that listens shows
+    each page, and one opened later finds it in its unit. Each page gets one line on stderr, the hub's: which unit and
+    lane it joined, or why it goes nowhere (a page meant for agents). The hub's own pages (its root, a unit's /u/<id>),
+    and every page where no hub answers or the hub refuses it, go to xdg-open instead, with a line saying why where the
+    hub was asked. Exits 1 where a file does not exist, after handing over the rest."""
+
+    targets: tyro.conf.Positional[tuple[str, ...]]
+    """URLs or files: anything a browser renders, at a URL or a path anywhere on disk."""
+    lane: Literal["session", "concept", "output", "code"] | None = None
+    """The lane of its unit a page goes to; without one the hub works it out from what the page is (see the hub's
+    --help), and a lane given once holds when the page is opened again without one."""
+
+
+def hub_ask(method: str, target: str, body: dict | None = None, timeout: float = 8) -> tuple[int, bytes]:
+    """The hub's answer on SOCKET; status 0 where nothing answers within `timeout` seconds."""
+    conn = PeerConnection(SOCKET, timeout=timeout)
+    try:
+        conn.request(method, target, body=json.dumps(body).encode() if body is not None else None,
+                     headers={"Content-Type": "application/json"} if body is not None else {})
+        answer = conn.getresponse()
+        return answer.status, answer.read()
+    except (OSError, http.client.HTTPException):
+        return 0, b""
+    finally:
+        conn.close()
+
+
+def open_pages(args: Open) -> int:
+    say = lambda line: print(f"container-hub open: {line}", file=sys.stderr)
+    status, health = hub_ask("GET", "/.health", timeout=4)
+    try:
+        hub = str(json.loads(health).get("url") or "").rstrip("/") if status == 200 else ""
+    except ValueError:
+        hub = ""
+    session = os.environ.get("MX_ORIGIN_SESSION") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    missing = 0
+    for given in args.targets:
+        path = Path(given).expanduser()
+        if path.exists():
+            target = str(path.resolve())
+        elif re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", given):
+            target = given
+        else:
+            say(f"no file at {path.resolve()}, so nothing opens")
+            missing = 1
+            continue
+        own = bool(hub) and (target == f"{hub}/" or target.startswith((f"{hub}/u/", f"{hub}/c/")))
+        if status and not own:
+            asked, answer = hub_ask("POST", "/api/open", {"target": target, "cwd": os.getcwd()}
+                                    | ({"session": session} if session else {}) | ({"lane": args.lane} if args.lane else {}))
+            try:
+                taken = json.loads(answer)
+            except ValueError:
+                taken = None
+            taken = taken if isinstance(taken, dict) else {}
+            if asked == 200 and isinstance(taken.get("say"), str) and "open" in taken:
+                say(taken["say"])
+                continue
+            if asked == 200:
+                say(f"what answers at {SOCKET} is no container hub, so xdg-open opens it")
+            elif asked:
+                why = taken.get("error") or ""
+                say(f"the container hub at {SOCKET} refused it ({asked}{': ' + why if why else ''}), so xdg-open opens it")
+        subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return missing
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["open"]:
+        sys.exit(open_pages(tyro.cli(Open, args=sys.argv[2:], prog="container-hub open", description=Open.__doc__)))
     main(tyro.cli(Args, description=__doc__))

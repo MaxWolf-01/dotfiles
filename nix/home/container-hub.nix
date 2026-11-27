@@ -1,6 +1,6 @@
 # container-hub: the one server every page an agent opens goes through, and the
 # hub tab that shows max's sessions. It listens on a unix socket only max can
-# open; claude-browser hands it each page there. What a unit is, how a page
+# open; `container-hub open` hands it each page there. What a unit is, how a page
 # finds its own, and where the hub listens: bin/container-hub --help. Up from
 # login, so the hub tab is the way back to every unit after a reboot.
 #
